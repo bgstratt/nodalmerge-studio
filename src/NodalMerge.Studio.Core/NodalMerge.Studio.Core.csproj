@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>NodalMerge.Studio.Core</RootNamespace>
+    <AssemblyName>NodalMerge.Studio.Core</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NodalMerge.Studio.Contracts\NodalMerge.Studio.Contracts.csproj" />
+  </ItemGroup>
+
+</Project>

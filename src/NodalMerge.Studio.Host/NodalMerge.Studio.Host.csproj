@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <RootNamespace>NodalMerge.Studio.Host</RootNamespace>
+    <AssemblyName>NodalMerge.Studio.Host</AssemblyName>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NodalMerge.Studio.Core\NodalMerge.Studio.Core.csproj" />
+    <ProjectReference Include="..\NodalMerge.Studio.Storage\NodalMerge.Studio.Storage.csproj" />
+    <ProjectReference Include="..\NodalMerge.Studio.Projections\NodalMerge.Studio.Projections.csproj" />
+    <ProjectReference Include="..\NodalMerge.Studio.Tasks\NodalMerge.Studio.Tasks.csproj" />
+    <ProjectReference Include="..\NodalMerge.Studio.Merge\NodalMerge.Studio.Merge.csproj" />
+    <ProjectReference Include="..\NodalMerge.Studio.AgentRuntime\NodalMerge.Studio.AgentRuntime.csproj" />
+    <ProjectReference Include="..\NodalMerge.Studio.Orchestrator\NodalMerge.Studio.Orchestrator.csproj" />
+    <ProjectReference Include="..\NodalMerge.Studio.McpServer\NodalMerge.Studio.McpServer.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(NodalMergeDotNetHostProject)')">
+    <ProjectReference Include="$(NodalMergeDotNetHostProject)" />
+  </ItemGroup>
+
+</Project>

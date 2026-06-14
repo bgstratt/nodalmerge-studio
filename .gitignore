@@ -1,0 +1,25 @@
+# .NET build artifacts
+**/bin/
+**/obj/
+**/TestResults/
+*.user
+*.suo
+*.cache
+*.coverage
+*.trx
+*.dmp
+
+# IDE
+.vs/
+.idea/
+
+# Local secrets and overrides
+appsettings.*.local.json
+**/secrets.json
+
+# Local artifacts
+artifacts/
+
+# OS
+.DS_Store
+Thumbs.db

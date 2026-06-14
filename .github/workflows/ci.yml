@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nodalmerge-studio
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: nodalmerge-studio
+
+      # When nodalmerge is available as a sibling repo in CI, add a second checkout
+      # and run pack-local-artifacts.ps1 before restore.
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: nodalmerge-studio/global.json
+
+      - name: Restore
+        run: dotnet restore NodalMerge.Studio.slnx --configfile NuGet.config -p:NodalMergePackageVersion=0.1.0-local
+
+      - name: Build
+        run: dotnet build NodalMerge.Studio.slnx -c Release -p:CI=true -p:NodalMergePackageVersion=0.1.0-local
+        env:
+          CI: true
+
+      - name: Test (unit)
+        run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category!=Integration" -p:NodalMergePackageVersion=0.1.0-local
+
+      - name: Test (integration)
+        if: env.NODALMERGE_NATIVE_AVAILABLE == 'true'
+        run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category=Integration" -p:NodalMergePackageVersion=0.1.0-local
+        env:
+          NODALMERGE_NATIVE_AVAILABLE: ${{ vars.NODALMERGE_NATIVE_AVAILABLE }}

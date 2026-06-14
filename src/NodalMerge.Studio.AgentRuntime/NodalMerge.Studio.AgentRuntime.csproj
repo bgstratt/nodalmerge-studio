@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>NodalMerge.Studio.AgentRuntime</RootNamespace>
+    <AssemblyName>NodalMerge.Studio.AgentRuntime</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+    <ProjectReference Include="..\NodalMerge.Studio.Core\NodalMerge.Studio.Core.csproj" />
+    <ProjectReference Include="..\NodalMerge.Studio.Projections\NodalMerge.Studio.Projections.csproj" />
+    <ProjectReference Include="..\NodalMerge.Studio.Tasks\NodalMerge.Studio.Tasks.csproj" />
+    <ProjectReference Include="..\NodalMerge.Studio.Merge\NodalMerge.Studio.Merge.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,20 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/NodalMerge.Studio.Contracts/NodalMerge.Studio.Contracts.csproj" />
+    <Project Path="src/NodalMerge.Studio.Core/NodalMerge.Studio.Core.csproj" />
+    <Project Path="src/NodalMerge.Studio.Storage/NodalMerge.Studio.Storage.csproj" />
+    <Project Path="src/NodalMerge.Studio.Projections/NodalMerge.Studio.Projections.csproj" />
+    <Project Path="src/NodalMerge.Studio.Tasks/NodalMerge.Studio.Tasks.csproj" />
+    <Project Path="src/NodalMerge.Studio.Merge/NodalMerge.Studio.Merge.csproj" />
+    <Project Path="src/NodalMerge.Studio.AgentRuntime/NodalMerge.Studio.AgentRuntime.csproj" />
+    <Project Path="src/NodalMerge.Studio.Orchestrator/NodalMerge.Studio.Orchestrator.csproj" />
+    <Project Path="src/NodalMerge.Studio.McpServer/NodalMerge.Studio.McpServer.csproj" />
+    <Project Path="src/NodalMerge.Studio.Host/NodalMerge.Studio.Host.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/NodalMerge.Studio.Contracts.Tests/NodalMerge.Studio.Contracts.Tests.csproj" />
+    <Project Path="tests/NodalMerge.Studio.Core.Tests/NodalMerge.Studio.Core.Tests.csproj" />
+    <Project Path="tests/NodalMerge.Studio.Projections.Tests/NodalMerge.Studio.Projections.Tests.csproj" />
+    <Project Path="tests/NodalMerge.Studio.Integration.Tests/NodalMerge.Studio.Integration.Tests.csproj" />
+  </Folder>
+</Solution>
