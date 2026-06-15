@@ -80,8 +80,8 @@ export class LmApiProxy implements vscode.Disposable {
     }
     const model = models[0];
 
-    const vsMessages = toVsMessages(req.messages ?? []);
-    const vsTools    = toVsTools(req.tools ?? []);
+    const { vsTools, origToSafe, safeToOrig } = toVsTools(req.tools ?? []);
+    const vsMessages = toVsMessages(req.messages ?? [], origToSafe);
     const cts        = new vscode.CancellationTokenSource();
 
     const response = await model.sendRequest(vsMessages, { tools: vsTools }, cts.token);
@@ -94,11 +94,13 @@ export class LmApiProxy implements vscode.Disposable {
       if (part instanceof vscode.LanguageModelTextPart) {
         textContent += part.value;
       } else if (part instanceof vscode.LanguageModelToolCallPart) {
+        // Map back sanitized tool name to original name expected by the host
+        const originalName = safeToOrig[part.name] ?? part.name;
         toolCalls.push({
           id:       part.callId,
           type:     'function',
           function: {
-            name:      part.name,
+            name:      originalName,
             arguments: JSON.stringify(part.input)
           }
         });
@@ -130,7 +132,7 @@ export class LmApiProxy implements vscode.Disposable {
 
 // ── Conversion helpers ─────────────────────────────────────────────────────
 
-function toVsMessages(msgs: OaiMessage[]): vscode.LanguageModelChatMessage[] {
+function toVsMessages(msgs: OaiMessage[], origToSafe: Record<string, string> = {}): vscode.LanguageModelChatMessage[] {
   const out: vscode.LanguageModelChatMessage[] = [];
   for (const msg of msgs) {
     if (msg.role === 'system' || msg.role === 'user') {
@@ -141,7 +143,9 @@ function toVsMessages(msgs: OaiMessage[]): vscode.LanguageModelChatMessage[] {
       for (const tc of msg.tool_calls ?? []) {
         let input: unknown = {};
         try { input = JSON.parse(tc.function.arguments || '{}'); } catch { /* use empty object */ }
-        parts.push(new vscode.LanguageModelToolCallPart(tc.id, tc.function.name, input));
+        // Use sanitized tool name if available
+        const safeName = origToSafe[tc.function.name] ?? tc.function.name;
+        parts.push(new vscode.LanguageModelToolCallPart(tc.id, safeName, input));
       }
       out.push(vscode.LanguageModelChatMessage.Assistant(parts.length === 1 && parts[0] instanceof vscode.LanguageModelTextPart
         ? parts[0].value
@@ -158,14 +162,24 @@ function toVsMessages(msgs: OaiMessage[]): vscode.LanguageModelChatMessage[] {
   return out;
 }
 
-function toVsTools(tools: OaiTool[]): vscode.LanguageModelChatTool[] {
-  return tools
+function toVsTools(tools: OaiTool[]): { vsTools: vscode.LanguageModelChatTool[]; origToSafe: Record<string,string>; safeToOrig: Record<string,string> } {
+  const origToSafe: Record<string,string> = {};
+  const safeToOrig: Record<string,string> = {};
+  const vsTools = tools
     .filter(t => t.type === 'function')
-    .map(t => ({
-      name:        t.function.name,
-      description: t.function.description ?? '',
-      inputSchema: t.function.parameters as Record<string, unknown> | undefined,
-    }));
+    .map(t => {
+      const orig = t.function.name;
+      // sanitize to allowed characters (alphanumeric, hyphen, underscore)
+      const safe = String(orig).replace(/[^A-Za-z0-9-_]/g, '_');
+      origToSafe[orig] = safe;
+      safeToOrig[safe] = orig;
+      return {
+        name:        safe,
+        description: t.function.description ?? '',
+        inputSchema: t.function.parameters as Record<string, unknown> | undefined,
+      };
+    });
+  return { vsTools, origToSafe, safeToOrig };
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {

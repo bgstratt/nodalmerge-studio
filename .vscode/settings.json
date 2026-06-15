@@ -1,0 +1,10 @@
+{
+    "nodalmerge.agentProfiles": [
+        {
+            "id": "orchestrator",
+            "label": "Orchestrator",
+            "domain": "orchestration",
+            "provider": "vscode-lm"
+        }
+    ]
+}

@@ -193,7 +193,7 @@ export function renderDag(
         fill,
         stroke:         isCursor ? '#fff' : '#1e1e1e',
         'stroke-width': isCursor ? '2.5' : '1',
-        style:          'cursor:pointer',
+        class:          'clickable',
         // data attrs for click delegation in main.ts
         'data-branch-id':   branchId,
         'data-node-index':  nodeIndex,

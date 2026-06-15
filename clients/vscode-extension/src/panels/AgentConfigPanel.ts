@@ -309,6 +309,11 @@ const AGENT_CONFIG_CSS = `
     padding: 9px 16px; border-top: 1px solid var(--nm-border);
     display: flex; align-items: center; gap: 8px; flex-shrink: 0;
   }
+  .hidden { display: none; }
+  .flex-row { display:flex; gap:6px; align-items:center; }
+  .readonly { opacity: 0.6; }
+  .muted { font-size:0.82em; opacity:0.6; padding:6px 0; }
+  .grow { flex: 1; }
   .save-bar .status { font-size: 0.8em; opacity: 0.5; flex: 1; }
   .spawn-form { max-width: 440px; }
   .spawn-form .field { margin-bottom: 12px; }
@@ -360,7 +365,7 @@ const AGENT_CONFIG_HTML = `
         <input type="text" id="spawn-goal" placeholder="e.g. Refactor the auth module">
       </div>
       <button id="btn-spawn">&#x25B6; Quick Spawn</button>
-      <div id="spawn-result" class="spawn-result" style="display:none"></div>
+      <div id="spawn-result" class="spawn-result hidden"></div>
     </div>
   </div>
 
@@ -451,12 +456,15 @@ const AGENT_CONFIG_JS = `
     const curProvider = p.provider || 'anthropic';
     const isVsLm = curProvider === 'vscode-lm';
     const area = document.getElementById('profile-form-area');
+    const modelRowClass = isVsLm ? 'field hidden' : 'field';
+    const baseUrlRowClass = isVsLm ? 'field hidden' : 'field';
+    const apiKeyRowClass = isVsLm ? 'field hidden' : 'field';
     area.innerHTML =
       '<div class="form-box">' +
       '<h3>' + (isNew ? 'Add Profile' : 'Edit Profile') + '</h3>' +
       '<div class="field"><label>ID (agent type key)</label>' +
         '<input type="text" id="pf-id" value="' + esc(p.id) + '"' +
-        (isNew ? '' : ' readonly style="opacity:0.6"') +
+        (isNew ? '' : ' readonly class="readonly"') +
         ' placeholder="e.g. worker"></div>' +
       '<div class="field"><label>Display Label</label>' +
         '<input type="text" id="pf-label" value="' + esc(p.label) + '" placeholder="e.g. Worker Agent"></div>' +
@@ -468,24 +476,24 @@ const AGENT_CONFIG_JS = `
           '<option value="openai"'    + (curProvider === 'openai'    ? ' selected' : '') + '>OpenAI compatible (OpenAI, DeepSeek, Azure, LM Studio, etc.)</option>' +
           '<option value="anthropic"' + (curProvider === 'anthropic' ? ' selected' : '') + '>Anthropic (claude-*)</option>' +
         '</select></div>' +
-      '<div id="pf-model-row" class="field"' + (isVsLm ? ' style="display:none"' : '') + '>' +
+      '<div id="pf-model-row" class="' + modelRowClass + '">' +
         '<label>Model</label>' +
         '<input type="text" id="pf-model" value="' + esc(p.model || '') + '" placeholder="e.g. claude-sonnet-4-6 or gpt-4o"></div>' +
-      '<div id="pf-baseurl-row" class="field"' + (isVsLm ? ' style="display:none"' : '') + '>' +
+      '<div id="pf-baseurl-row" class="' + baseUrlRowClass + '">' +
         '<label>Base URL (leave blank for default)</label>' +
         '<input type="text" id="pf-baseurl" value="' + esc(p.baseUrl || '') + '"' +
         ' placeholder="' + (curProvider === 'openai' ? 'https://api.openai.com' : 'https://api.anthropic.com') + '"></div>' +
-      '<div id="pf-apikey-row" class="field"' + (isVsLm ? ' style="display:none"' : '') + '>' +
+      '<div id="pf-apikey-row" class="' + apiKeyRowClass + '">' +
         '<label>API Key</label>' +
-        '<div style="display:flex;gap:6px;align-items:center">' +
-          '<input type="password" id="pf-apikey" placeholder="' + (p.apiKeyRef ? '(key stored)' : 'Paste key to store') + '" style="flex:1">' +
+        '<div class="flex-row">' +
+          '<input type="password" id="pf-apikey" placeholder="' + (p.apiKeyRef ? '(key stored)' : 'Paste key to store') + '" class="grow">' +
           '<button id="pf-store-key" class="ghost">Store Key</button>' +
         '</div>' +
-        '<div id="pf-key-status" style="font-size:0.78em;opacity:0.5;margin-top:3px">' +
+        '<div id="pf-key-status" class="muted">' +
           (p.apiKeyRef ? 'Key stored (' + esc(p.apiKeyRef) + ')' : 'No key stored') +
         '</div>' +
       '</div>' +
-      (isVsLm ? '<div class="field" style="font-size:0.82em;opacity:0.6;padding:6px 0">Uses your VS Code Copilot or Cursor subscription — no API key required.</div>' : '') +
+      (isVsLm ? '<div class="field muted">Uses your VS Code Copilot or Cursor subscription — no API key required.</div>' : '') +
       '<div class="field"><label>System Prompt Hint (optional)</label>' +
         '<textarea id="pf-prompt">' + esc(p.systemPromptHint || '') + '</textarea></div>' +
       '<div class="form-actions">' +
@@ -496,9 +504,9 @@ const AGENT_CONFIG_JS = `
     // Toggle field visibility when provider changes
     document.getElementById('pf-provider').addEventListener('change', function() {
       const isVs = this.value === 'vscode-lm';
-      document.getElementById('pf-model-row').style.display  = isVs ? 'none' : '';
-      document.getElementById('pf-baseurl-row').style.display = isVs ? 'none' : '';
-      document.getElementById('pf-apikey-row').style.display  = isVs ? 'none' : '';
+      document.getElementById('pf-model-row').classList.toggle('hidden', isVs);
+      document.getElementById('pf-baseurl-row').classList.toggle('hidden', isVs);
+      document.getElementById('pf-apikey-row').classList.toggle('hidden', isVs);
     });
 
     document.getElementById('pf-store-key').addEventListener('click', function() {
@@ -683,12 +691,15 @@ const AGENT_CONFIG_JS = `
       btn.disabled    = false;
       btn.textContent = '\\u25B6 Quick Spawn';
       const result = document.getElementById('spawn-result');
-      result.style.display = '';
-      result.className     = 'spawn-result ' + (msg.success ? 'ok' : 'err');
-      result.textContent   = msg.success ? 'Spawned successfully!' : ('Error: ' + (msg.message || 'unknown'));
+      if (result) {
+        result.classList.remove('hidden');
+        result.className     = 'spawn-result ' + (msg.success ? 'ok' : 'err');
+        result.textContent   = msg.success ? 'Spawned successfully!' : ('Error: ' + (msg.message || 'unknown'));
+      }
       if (msg.success) {
-        document.getElementById('spawn-goal').value = '';
-        setTimeout(function() { result.style.display = 'none'; }, 5000);
+        const g = document.getElementById('spawn-goal');
+        if (g && 'value' in g) { g.value = ''; }
+        setTimeout(function() { if (result) result.classList.add('hidden'); }, 5000);
       }
     }
   });

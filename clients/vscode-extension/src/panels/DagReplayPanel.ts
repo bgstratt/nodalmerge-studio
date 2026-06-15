@@ -171,6 +171,13 @@ export class DagReplayPanel implements vscode.Disposable {
       --nm-btn-fg: var(--vscode-button-foreground);
       --nm-btn-h:  var(--vscode-button-hoverBackground);
     }
+    .hidden { display: none; }
+    .status-dot[data-status="idle"] { background: #555; }
+    .status-dot[data-status="connecting"] { background: #cca700; }
+    .status-dot[data-status="connected"] { background: #4dac26; }
+    .status-dot[data-status="disconnected"] { background: #888; }
+    .status-dot[data-status="error"] { background: #f14c4c; }
+    #dag-svg .clickable { cursor: pointer; }
     * { box-sizing: border-box; }
     body {
       background: var(--nm-bg); color: var(--nm-fg);
@@ -235,7 +242,7 @@ export class DagReplayPanel implements vscode.Disposable {
     <input type="range" id="scrubber" min="0" max="0" value="0" step="1">
     <span id="scrub-pos"></span>
   </div>
-  <div id="playback-bar" style="display:none">
+  <div id="playback-bar" class="hidden">
     <span>PLAYBACK</span>
     <button id="btn-live">▶ Live</button>
     <button id="btn-branch">⎇ Branch from here</button>

@@ -62,7 +62,7 @@ function render(): void {
 
   // Playback action bar
   if (playbackBar) {
-    playbackBar.style.display = isPlayback ? '' : 'none';
+    playbackBar.classList.toggle('hidden', !isPlayback);
   }
 }
 
@@ -75,7 +75,7 @@ function setStatus(s: WsStatus | 'idle'): void {
     idle: '#555', connecting: '#cca700', connected: '#4dac26',
     disconnected: '#888', error: '#f14c4c',
   };
-  if (statusDot)  { statusDot.style.background = colors[s] ?? '#555'; }
+  if (statusDot)  { statusDot.setAttribute('data-status', String(s)); }
   if (statusText) { statusText.textContent = labels[s] ?? s; }
 }
 

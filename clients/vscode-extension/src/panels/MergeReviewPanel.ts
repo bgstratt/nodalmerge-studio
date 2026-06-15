@@ -169,6 +169,7 @@ const REVIEW_CSS = `
     font-family: var(--nm-font); font-size: var(--nm-size);
     margin: 0; padding: 0 20px 40px;
   }
+  .hidden { display: none; }
   h1 { font-size: 1.1em; font-weight: 700; margin: 18px 0 6px; }
   .meta-grid {
     display: grid;
@@ -226,7 +227,7 @@ const REVIEW_CSS = `
 
 const REVIEW_HTML = `
   <div id="loading">Loading proposal…</div>
-  <div id="content" style="display:none">
+  <div id="content" class="hidden">
     <h1 id="title">Merge Review</h1>
     <div class="meta-grid">
       <span class="meta-label">Status</span>      <span id="status-badge"></span>
@@ -246,11 +247,11 @@ const REVIEW_HTML = `
       <h2>Change description</h2>
       <p id="change-description"></p>
     </section>
-    <section id="section-verification" style="display:none">
+    <section id="section-verification" class="hidden">
       <h2>Verification results</h2>
       <p id="verification-results"></p>
     </section>
-    <section id="section-rollback" style="display:none">
+    <section id="section-rollback" class="hidden">
       <h2>Rollback plan</h2>
       <p id="rollback-plan"></p>
     </section>
@@ -290,7 +291,7 @@ const REVIEW_JS = `
 
   function showIf(id, cond) {
     var el = document.getElementById(id);
-    if (el) el.style.display = cond ? '' : 'none';
+    if (el) el.classList.toggle('hidden', !cond);
   }
 
   function setDisabled(id, disabled) {
@@ -317,8 +318,10 @@ const REVIEW_JS = `
     var p = msg.proposal;
     var status = (p.status || '').toLowerCase().replace(/\\s+/g, '');
 
-    document.getElementById('loading').style.display = 'none';
-    document.getElementById('content').style.display = '';
+    var loadingEl = document.getElementById('loading');
+    var contentEl = document.getElementById('content');
+    if (loadingEl) loadingEl.classList.add('hidden');
+    if (contentEl) contentEl.classList.remove('hidden');
 
     setText('title', 'Merge Review: ' + (p.sourceBranch || ''));
     var badgeClass = 'badge ' + status;
