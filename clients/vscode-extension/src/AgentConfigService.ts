@@ -24,6 +24,14 @@ export interface TopologyTemplate {
   workers?:     TopologyWorker[];
 }
 
+/** LLM connection fields passed to POST /studio/agents/spawn. */
+export interface SpawnLlmConfig {
+  provider: string;
+  model:    string;
+  baseUrl:  string;
+  apiKey:   string;
+}
+
 const DEFAULT_PROFILES: AgentProfile[] = [
   { id: 'orchestrator', label: 'Orchestrator', domain: 'orchestration', model: '' },
   { id: 'worker',       label: 'Worker',       domain: 'general',       model: '' },
@@ -81,6 +89,42 @@ export class AgentConfigService {
         await this.saveProfiles(profiles);
       }
     }
+  }
+
+  /**
+   * Resolves LLM credentials for spawning an agent loop.
+   * VS Code LM uses an empty apiKey (required by the host gate) and the local LM proxy URL.
+   */
+  async resolveSpawnLlmConfig(
+    profileId: string,
+    secrets: vscode.SecretStorage,
+    lmProxyBaseUrl: string,
+  ): Promise<SpawnLlmConfig | undefined> {
+    const p = this.getProfiles().find(pr => pr.id === profileId);
+    if (!p) { return undefined; }
+
+    if (p.provider === 'vscode-lm') {
+      if (!lmProxyBaseUrl || lmProxyBaseUrl.endsWith(':0')) {
+        return undefined;
+      }
+      return {
+        provider: 'openai',
+        model:    p.model ?? '',
+        baseUrl:  lmProxyBaseUrl,
+        apiKey:   '',
+      };
+    }
+
+    const apiKey = await this.resolveApiKey(p, secrets);
+    const baseUrl = p.baseUrl?.trim();
+    if (!baseUrl || apiKey === undefined) { return undefined; }
+
+    return {
+      provider: p.provider ?? 'anthropic',
+      model:    p.model ?? '',
+      baseUrl,
+      apiKey,
+    };
   }
 
   async pickProfile(placeHolder = 'Select an agent profile'): Promise<AgentProfile | undefined> {

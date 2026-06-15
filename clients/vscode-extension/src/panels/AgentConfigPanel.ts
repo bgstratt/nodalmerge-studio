@@ -108,47 +108,48 @@ export class AgentConfigPanel implements vscode.Disposable {
       return;
     }
 
-    const profiles = this.configService.getProfiles();
-
-    const resolveProfile = async (profileId: string) => {
-      const p = profiles.find(pr => pr.id === profileId);
-      const isVscodeLm = p?.provider === 'vscode-lm';
-      return {
-        provider: isVscodeLm ? 'openai' : (p?.provider || 'anthropic'),
-        model:    p?.model,
-        baseUrl:  isVscodeLm ? this.lmProxyBaseUrl : p?.baseUrl,
-        apiKey:   isVscodeLm ? '' : (p ? await this.configService.resolveApiKey(p, this.secrets) : undefined),
-      };
-    };
-
     try {
-      const orchCfg = await resolveProfile(template.orchestrator);
-      const orchWu  = await this.post<{ workUnitId: string }>('/studio/workunits', {
+      const orchCfg = await this.configService.resolveSpawnLlmConfig(
+        template.orchestrator, this.secrets, this.lmProxyBaseUrl,
+      );
+      if (!orchCfg) {
+        const orchProfile = this.configService.getProfiles().find(pr => pr.id === template.orchestrator);
+        if (orchProfile?.provider === 'vscode-lm') {
+          throw new Error(
+            `Profile "${template.orchestrator}": VS Code LM proxy is not running. Reload the extension window.`,
+          );
+        }
+        throw new Error(
+          `Profile "${template.orchestrator}" is missing LLM credentials — set Provider to VS Code LM ` +
+          `(Edit → Save on the form → Save Profiles), or configure base URL + API key.`,
+        );
+      }
+
+      const orchWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
         goal,
         owner: template.orchestrator,
       });
       await this.post('/studio/agents/spawn', {
         agentType:  template.orchestrator,
         workUnitId: orchWu.workUnitId,
-        provider:   orchCfg.provider || undefined,
-        model:      orchCfg.model    || undefined,
-        baseUrl:    orchCfg.baseUrl  || undefined,
-        apiKey:     orchCfg.apiKey   || undefined,
+        ...orchCfg,
       });
 
       for (const worker of template.workers ?? []) {
-        const workerCfg = await resolveProfile(worker.profile);
-        const workerWu  = await this.post<{ workUnitId: string }>('/studio/workunits', {
+        const workerCfg = await this.configService.resolveSpawnLlmConfig(
+          worker.profile, this.secrets, this.lmProxyBaseUrl,
+        );
+        if (!workerCfg) {
+          throw new Error(`Profile "${worker.profile}" is missing LLM credentials (set VS Code LM or an API key).`);
+        }
+        const workerWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
           goal:  `[${worker.profile}] ${goal}`,
           owner: worker.profile,
         });
         await this.post('/studio/agents/spawn', {
           agentType:  worker.profile,
           workUnitId: workerWu.workUnitId,
-          provider:   workerCfg.provider || undefined,
-          model:      workerCfg.model    || undefined,
-          baseUrl:    workerCfg.baseUrl  || undefined,
-          apiKey:     workerCfg.apiKey   || undefined,
+          ...workerCfg,
         });
       }
 
@@ -529,6 +530,7 @@ const AGENT_CONFIG_JS = `
       else       { profiles[idx] = profile; }
       document.getElementById('profile-form-area').innerHTML = '';
       renderProfiles();
+      vscode.postMessage({ type: 'saveProfiles', profiles: profiles });
     });
     document.getElementById('pf-cancel').addEventListener('click', function() {
       document.getElementById('profile-form-area').innerHTML = '';

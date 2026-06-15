@@ -57,7 +57,11 @@
               "id":               { "type": "string", "description": "Agent type identifier (used as agentType when spawning)." },
               "label":            { "type": "string", "description": "Display name shown in UI." },
               "domain":           { "type": "string", "description": "Task domain this agent handles (e.g. 'docs', 'code', 'demo')." },
-              "modelHint":        { "type": "string", "description": "Preferred model identifier (e.g. 'claude-opus-4-8')." },
+              "provider":         { "type": "string", "enum": ["anthropic", "openai", "vscode-lm"], "description": "LLM provider for this profile." },
+              "model":            { "type": "string", "description": "Model identifier (e.g. claude-sonnet-4-6, gpt-4o)." },
+              "baseUrl":          { "type": "string", "description": "API base URL (not used for vscode-lm)." },
+              "apiKeyRef":        { "type": "string", "description": "Secret storage key for the API key." },
+              "modelHint":        { "type": "string", "description": "Deprecated — use model instead." },
               "systemPromptHint": { "type": "string", "description": "Optional context passed to the agent when spawned." }
             }
           }

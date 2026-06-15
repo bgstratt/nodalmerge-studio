@@ -40,6 +40,8 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
   private readonly baseUrl: string;
   private readonly notifications: NotificationManager | undefined;
   private readonly configService: AgentConfigService | undefined;
+  private readonly secrets: vscode.SecretStorage | undefined;
+  private readonly lmProxyBaseUrl: string | undefined;
   private readonly disposables: vscode.Disposable[] = [];
   private pollTimer?: ReturnType<typeof setInterval>;
 
@@ -48,11 +50,15 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
     baseUrl: string,
     notifications?: NotificationManager,
     configService?: AgentConfigService,
+    secrets?: vscode.SecretStorage,
+    lmProxyBaseUrl?: string,
   ) {
     this.panel         = panel;
     this.baseUrl       = baseUrl;
     this.notifications = notifications;
     this.configService = configService;
+    this.secrets       = secrets;
+    this.lmProxyBaseUrl = lmProxyBaseUrl;
     this.panel.webview.html = buildDashboardHtml();
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.onDidChangeViewState(e => {
@@ -71,6 +77,8 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
     baseUrl: string,
     notifications?: NotificationManager,
     configService?: AgentConfigService,
+    secrets?: vscode.SecretStorage,
+    lmProxyBaseUrl?: string,
   ): void {
     if (WorkspaceDashboardPanel.current) {
       WorkspaceDashboardPanel.current.panel.reveal(vscode.ViewColumn.Two);
@@ -82,7 +90,9 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
       vscode.ViewColumn.Two,
       { enableScripts: true, retainContextWhenHidden: true }
     );
-    WorkspaceDashboardPanel.current = new WorkspaceDashboardPanel(panel, baseUrl, notifications, configService);
+    WorkspaceDashboardPanel.current = new WorkspaceDashboardPanel(
+      panel, baseUrl, notifications, configService, secrets, lmProxyBaseUrl,
+    );
   }
 
   private startPolling(): void {
@@ -151,7 +161,25 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
             ?? await vscode.window.showInputBox({ prompt: 'Work Unit ID', ignoreFocusOut: true })
             ?? '';
           if (!workUnitId) { return; }
-          await this.post('/studio/agents/spawn', { agentType, workUnitId });
+
+          let spawnBody: Record<string, string> = { agentType, workUnitId };
+          if (this.configService && this.secrets && this.lmProxyBaseUrl) {
+            const llm = await this.configService.resolveSpawnLlmConfig(
+              agentType, this.secrets, this.lmProxyBaseUrl,
+            );
+            if (!llm) {
+              void vscode.window.showErrorMessage(
+                `NodalMerge: Profile "${agentType}" has no LLM credentials — set VS Code LM or an API key in Agent Config.`,
+              );
+              return;
+            }
+            spawnBody = { ...spawnBody, ...llm };
+          } else {
+            void vscode.window.showWarningMessage(
+              'NodalMerge: Spawning without LLM credentials — the agent loop will not start. Use Agent Config → Quick Spawn instead.',
+            );
+          }
+          await this.post('/studio/agents/spawn', spawnBody);
           void this.poll();
           break;
         }

@@ -46,6 +46,10 @@ export class HostManager implements vscode.Disposable {
       this._ready = true;
       this.applyStatus('ready');
       this.output.appendLine(`[NodalMerge] Adopted running host on port ${this.port}.`);
+      this.output.appendLine(
+        '[NodalMerge] Host logs will not appear here. Stop the process on that port, then run ' +
+        '"NodalMerge: Restart Studio Host" so the extension owns the host and streams logs.',
+      );
       return;
     }
 

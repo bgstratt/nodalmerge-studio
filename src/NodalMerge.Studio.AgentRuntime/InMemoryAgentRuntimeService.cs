@@ -85,14 +85,18 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         var agentId = $"{agentType}-{Guid.NewGuid():N}";
 
         CancellationTokenSource? cts = null;
-        if (model is not null && baseUrl is not null && apiKey is not null)
+        var resolvedProvider = provider ?? "anthropic";
+        var canStartLoop = !string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
+            && (!string.IsNullOrWhiteSpace(model)
+                || resolvedProvider.Equals("openai", StringComparison.OrdinalIgnoreCase));
+        if (canStartLoop)
         {
             cts = new CancellationTokenSource();
-            var resolvedProvider = provider ?? "anthropic";
+            var loopModel = model ?? string.Empty;
             if (agentType == "orchestrator")
-                StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, model, baseUrl, apiKey, cts);
+                StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, loopModel, baseUrl!, apiKey, cts);
             else if (agentType == "worker" && taskId is not null)
-                StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, model, baseUrl, apiKey, cts);
+                StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl!, apiKey, cts);
             else
                 cts.Dispose();
         }

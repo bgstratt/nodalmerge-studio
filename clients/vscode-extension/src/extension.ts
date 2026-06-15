@@ -42,7 +42,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
 
     vscode.commands.registerCommand(COMMANDS.OPEN_DASHBOARD, () => {
-      WorkspaceDashboardPanel.createOrShow(manager.hostBaseUrl, notificationManager, agentConfig);
+      WorkspaceDashboardPanel.createOrShow(
+        manager.hostBaseUrl, notificationManager, agentConfig, context.secrets, lmProxy.baseUrl,
+      );
     }),
 
     vscode.commands.registerCommand(COMMANDS.OPEN_MERGE_REVIEW, (proposalId: string) => {
