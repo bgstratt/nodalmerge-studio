@@ -1,0 +1,109 @@
+{
+  "name": "nodalmerge-studio",
+  "displayName": "NodalMerge Studio",
+  "description": "Agent-native collaborative workspace — branch visualization, merge review, and agent orchestration for NodalMerge.",
+  "publisher": "nodalmerge",
+  "version": "0.1.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "nodalmerge.restartHost",
+        "title": "NodalMerge: Restart Studio Host"
+      },
+      {
+        "command": "nodalmerge.showOutput",
+        "title": "NodalMerge: Show Output"
+      },
+      {
+        "command": "nodalmerge.openDashboard",
+        "title": "NodalMerge: Open Workspace Dashboard"
+      },
+      {
+        "command": "nodalmerge.openMergeReview",
+        "title": "NodalMerge: Open Merge Review"
+      },
+      {
+        "command": "nodalmerge.openDagReplay",
+        "title": "NodalMerge: Open DAG Replay"
+      },
+      {
+        "command": "nodalmerge.openAgentConfig",
+        "title": "NodalMerge: Open Agent Config"
+      }
+    ],
+    "configuration": {
+      "title": "NodalMerge Studio",
+      "properties": {
+        "nodalmerge.hostPort": {
+          "type": "number",
+          "default": 5080,
+          "description": "Port the Studio Host listens on."
+        },
+        "nodalmerge.agentProfiles": {
+          "type": "array",
+          "default": [],
+          "description": "Named agent profiles. Each profile maps an agentType string to a display label, task domain, and optional model hint.",
+          "items": {
+            "type": "object",
+            "required": ["id", "label", "domain"],
+            "properties": {
+              "id":               { "type": "string", "description": "Agent type identifier (used as agentType when spawning)." },
+              "label":            { "type": "string", "description": "Display name shown in UI." },
+              "domain":           { "type": "string", "description": "Task domain this agent handles (e.g. 'docs', 'code', 'demo')." },
+              "modelHint":        { "type": "string", "description": "Preferred model identifier (e.g. 'claude-opus-4-8')." },
+              "systemPromptHint": { "type": "string", "description": "Optional context passed to the agent when spawned." }
+            }
+          }
+        },
+        "nodalmerge.topologyTemplates": {
+          "type": "array",
+          "default": [],
+          "description": "Named topology templates defining orchestrator + worker role assignments.",
+          "items": {
+            "type": "object",
+            "required": ["name", "orchestrator"],
+            "properties": {
+              "name":         { "type": "string" },
+              "orchestrator": { "type": "string", "description": "Profile id for the orchestrator agent." },
+              "workers": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["profile"],
+                  "properties": {
+                    "profile": { "type": "string", "description": "Profile id for this worker." },
+                    "branch":  { "type": "string", "description": "Optional suggested branch name." }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "nodalmerge.defaultTopology": {
+          "type": "string",
+          "default": "",
+          "description": "Name of the topology template to use when spawning a new workspace."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile":   "node esbuild.config.mjs",
+    "watch":     "node esbuild.config.mjs --watch",
+    "package":   "node esbuild.config.mjs --production && vsce package --no-dependencies",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node":   "^22.0.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild":       "^0.25.0",
+    "typescript":    "^5.6.0"
+  }
+}

@@ -15,6 +15,9 @@
     <Project Path="tests/NodalMerge.Studio.Contracts.Tests/NodalMerge.Studio.Contracts.Tests.csproj" />
     <Project Path="tests/NodalMerge.Studio.Core.Tests/NodalMerge.Studio.Core.Tests.csproj" />
     <Project Path="tests/NodalMerge.Studio.Projections.Tests/NodalMerge.Studio.Projections.Tests.csproj" />
+    <Project Path="tests/NodalMerge.Studio.Tasks.Tests/NodalMerge.Studio.Tasks.Tests.csproj" />
+    <Project Path="tests/NodalMerge.Studio.Merge.Tests/NodalMerge.Studio.Merge.Tests.csproj" />
+    <Project Path="tests/NodalMerge.Studio.AgentRuntime.Tests/NodalMerge.Studio.AgentRuntime.Tests.csproj" />
     <Project Path="tests/NodalMerge.Studio.Integration.Tests/NodalMerge.Studio.Integration.Tests.csproj" />
   </Folder>
 </Solution>

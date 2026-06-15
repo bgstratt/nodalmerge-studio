@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Extension (Dev)",
+            "type": "extensionHost",
+            "request": "launch",
+            "args": ["--extensionDevelopmentPath=${workspaceFolder}/clients/vscode-extension"],
+            "outFiles": ["${workspaceFolder}/clients/vscode-extension/out/**/*.js"],
+            "preLaunchTask": "compile-extension",
+            "sourceMaps": true
+        }
+    ]
+}

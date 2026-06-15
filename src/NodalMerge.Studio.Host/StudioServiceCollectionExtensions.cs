@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.DependencyInjection;
 using NodalMerge.Studio.AgentRuntime;
 using NodalMerge.Studio.Merge;
@@ -11,13 +12,27 @@ namespace NodalMerge.Studio.Host;
 
 public static class StudioServiceCollectionExtensions
 {
-    public static IServiceCollection AddStudioServices(this IServiceCollection services)
+    public static IServiceCollection AddStudioServices(this IServiceCollection services, HttpClient? llmHttpClient = null)
     {
-        services.AddStudioStorage();
+        services.ConfigureHttpJsonOptions(options =>
+        {
+            options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
+        });
+
+        services.AddCors(options =>
+        {
+            options.AddDefaultPolicy(policy =>
+            {
+                // Studio Host binds to 127.0.0.1 only; permissive CORS is safe for local-only access.
+                policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod();
+            });
+        });
+
+        services.AddNodalMergeStorage();
         services.AddStudioProjections();
         services.AddStudioTasks();
         services.AddStudioMerge();
-        services.AddStudioAgentRuntime();
+        services.AddStudioAgentRuntime(llmHttpClient);
         services.AddStudioOrchestrator();
         services.AddStudioMcpServer();
         return services;

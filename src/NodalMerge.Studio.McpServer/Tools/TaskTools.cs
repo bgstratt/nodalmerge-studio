@@ -34,8 +34,7 @@ public sealed class TaskTools(ITaskService tasks)
         int? priority = null,
         CancellationToken cancellationToken = default)
     {
-        var existing = (await tasks.ListAsync(cancellationToken: cancellationToken).ConfigureAwait(false))
-            .FirstOrDefault(t => t.TaskId == taskId);
+        var existing = await tasks.GetAsync(taskId, cancellationToken).ConfigureAwait(false);
 
         if (existing is null)
         {

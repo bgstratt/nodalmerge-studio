@@ -14,6 +14,8 @@ public interface ITaskService
 {
     Task<StudioTask> CreateAsync(StudioTask task, CancellationToken cancellationToken = default);
 
+    Task<StudioTask?> GetAsync(string taskId, CancellationToken cancellationToken = default);
+
     Task<StudioTask> UpdateAsync(StudioTask task, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<StudioTask>> ListAsync(string? workUnitId = null, CancellationToken cancellationToken = default);
@@ -25,11 +27,15 @@ public interface IMergeService
 {
     Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default);
 
+    Task<MergeProposal?> GetAsync(string proposalId, CancellationToken cancellationToken = default);
+
     Task<MergeProposal> ValidateAsync(string proposalId, CancellationToken cancellationToken = default);
 
     Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus decision, CancellationToken cancellationToken = default);
 
     Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken cancellationToken = default);
 }
 
 public interface IWorkUnitService
@@ -112,9 +118,19 @@ public interface ISnapshotService
     Task<string> CompareAsync(string agentId, string workUnitId, string otherAgentId, CancellationToken cancellationToken = default);
 }
 
+public sealed record AgentInfo(string AgentId, string WorkUnitId, string Status);
+
 public interface IAgentControlService
 {
-    Task<string> SpawnAsync(string agentType, string workUnitId, CancellationToken cancellationToken = default);
+    Task<string> SpawnAsync(
+        string agentType,
+        string workUnitId,
+        string? taskId = null,
+        string? model = null,
+        string? baseUrl = null,
+        string? apiKey = null,
+        string? provider = null,
+        CancellationToken cancellationToken = default);
 
     Task PauseAsync(string agentId, CancellationToken cancellationToken = default);
 
@@ -123,6 +139,8 @@ public interface IAgentControlService
     Task StopAsync(string agentId, CancellationToken cancellationToken = default);
 
     Task<string> GetStatusAsync(string agentId, CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<AgentInfo>> ListActiveAsync(CancellationToken cancellationToken = default);
 }
 
 public interface IWorkspaceService

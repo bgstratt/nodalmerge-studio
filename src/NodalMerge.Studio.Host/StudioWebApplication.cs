@@ -6,12 +6,22 @@ namespace NodalMerge.Studio.Host;
 
 public static class StudioWebApplication
 {
-    public static WebApplication Build(string[] args, Action<IWebHostBuilder>? configureWebHost = null)
+    public static WebApplication Build(
+        string[] args,
+        Action<IWebHostBuilder>? configureWebHost = null,
+        HttpClient? llmHttpClient = null,
+        Action<IServiceCollection>? configureServices = null)
     {
         var app = HostApplication.Build(
             args,
             configureWebHost: configureWebHost,
-            configureServices: services => services.AddStudioServices());
+            configureServices: services =>
+            {
+                services.AddStudioServices(llmHttpClient);
+                configureServices?.Invoke(services);
+            });
+
+        app.UseCors();
 
         app.MapGet("/health", () => Results.Ok(new
         {
@@ -29,6 +39,7 @@ public static class StudioWebApplication
             timestampUtc = DateTimeOffset.UtcNow
         }));
 
+        app.MapStudioRestEndpoints();
         app.MapMcp();
         return app;
     }

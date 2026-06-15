@@ -1,52 +1,27 @@
 using Microsoft.Extensions.DependencyInjection;
-using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
 public static class ServiceCollectionExtensions
 {
-    public static IServiceCollection AddStudioStorage(this IServiceCollection services)
+    public static IServiceCollection AddNodalMergeStorage(this IServiceCollection services)
     {
-        services.AddSingleton<IStudioNodeStore, InMemoryStudioNodeStore>();
-        services.AddSingleton<IBranchService, StubBranchService>();
-        services.AddSingleton<IKnownGoodStateService, StubKnownGoodStateService>();
+        services.AddSingleton<IStudioNodeStore, NodalMergeStudioNodeStore>();
+        services.AddSingleton<IBranchService, NodalMergeBranchService>();
+        services.AddSingleton<IKnownGoodStateService, InMemoryKnownGoodStateService>();
         services.AddSingleton<IReplayService, StubReplayService>();
         return services;
     }
-}
 
-internal sealed class StubBranchService : IBranchService
-{
-    public Task<string> CreateBranchAsync(string name, string? fromBranchId = null, CancellationToken cancellationToken = default) =>
-        Task.FromResult(name);
-
-    public Task CheckoutBranchAsync(string branchId, CancellationToken cancellationToken = default) =>
-        Task.CompletedTask;
-
-    public Task<IReadOnlyList<string>> ListBranchesAsync(CancellationToken cancellationToken = default) =>
-        Task.FromResult<IReadOnlyList<string>>([]);
-
-    public Task<BranchStatus> GetStatusAsync(string branchId, CancellationToken cancellationToken = default) =>
-        Task.FromResult(new BranchStatus(branchId, "active", 0));
-}
-
-internal sealed class StubKnownGoodStateService : IKnownGoodStateService
-{
-    public Task<KnownGoodState> MarkKnownGoodAsync(
-        KnownGoodState state,
-        CancellationToken cancellationToken = default) =>
-        Task.FromResult(state);
-
-    public Task<IReadOnlyList<KnownGoodState>> FindKnownGoodAsync(
-        string branchId,
-        CancellationToken cancellationToken = default) =>
-        Task.FromResult<IReadOnlyList<KnownGoodState>>([]);
-
-    public Task<KnownGoodState?> CheckoutKnownGoodAsync(
-        string stateId,
-        CancellationToken cancellationToken = default) =>
-        Task.FromResult<KnownGoodState?>(null);
+    public static IServiceCollection AddInMemoryStorage(this IServiceCollection services)
+    {
+        services.AddSingleton<IStudioNodeStore, InMemoryStudioNodeStore>();
+        services.AddSingleton<IBranchService, InMemoryBranchService>();
+        services.AddSingleton<IKnownGoodStateService, InMemoryKnownGoodStateService>();
+        services.AddSingleton<IReplayService, StubReplayService>();
+        return services;
+    }
 }
 
 internal sealed class StubReplayService : IReplayService
@@ -56,11 +31,11 @@ internal sealed class StubReplayService : IReplayService
         string? fromNode = null,
         string? toNode = null,
         CancellationToken cancellationToken = default) =>
-        Task.FromResult("{}");
+        Task.FromResult($"{{\"branchId\":\"{branchId}\",\"note\":\"replay not yet wired to NodalMerge engine\"}}");
 
     public Task<string> RollbackAsync(string branchId, string knownGoodStateId, CancellationToken cancellationToken = default) =>
-        Task.FromResult("{}");
+        Task.FromResult($"{{\"branchId\":\"{branchId}\",\"knownGoodStateId\":\"{knownGoodStateId}\",\"note\":\"rollback not yet wired to NodalMerge engine\"}}");
 
     public Task<string> InspectAsync(string branchId, string? nodeId = null, CancellationToken cancellationToken = default) =>
-        Task.FromResult("{}");
+        Task.FromResult($"{{\"branchId\":\"{branchId}\",\"note\":\"inspect not yet wired to NodalMerge engine\"}}");
 }

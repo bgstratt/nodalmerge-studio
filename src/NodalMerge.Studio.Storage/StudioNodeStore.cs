@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+
 namespace NodalMerge.Studio.Storage;
 
 public static class StudioNodeKind
@@ -6,6 +8,7 @@ public static class StudioNodeKind
     public const string TaskV1 = "studio/task/v1";
     public const string MergeProposalV1 = "studio/merge-proposal/v1";
     public const string KnownGoodStateV1 = "studio/known-good-state/v1";
+    public const string BranchV1 = "studio/branch/v1";
 }
 
 public interface IStudioNodeStore
@@ -17,7 +20,7 @@ public interface IStudioNodeStore
 
 public sealed class InMemoryStudioNodeStore : IStudioNodeStore
 {
-    private readonly Dictionary<(string Kind, string EntityId), string> _nodes = new();
+    private readonly ConcurrentDictionary<(string Kind, string EntityId), string> _nodes = new();
 
     public Task WriteNodeAsync(string kind, string entityId, string payloadJson, CancellationToken cancellationToken = default)
     {

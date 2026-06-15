@@ -11,6 +11,8 @@ public enum TaskStatus
 
 /// <summary>
 /// Actionable work intent. Tasks MUST NOT contain DAG node references.
+/// Domain is a free-form routing hint (e.g. "docs", "code", "demo") used
+/// by the orchestrator to match tasks to agent profiles.
 /// </summary>
 public sealed record StudioTask(
     string TaskId,
@@ -19,4 +21,19 @@ public sealed record StudioTask(
     string Description,
     TaskStatus Status,
     string? Assignee,
-    int Priority);
+    int Priority,
+    string? Domain = null);
+
+public static class TaskTransitions
+{
+    public static bool CanTransition(TaskStatus from, TaskStatus to) =>
+        (from, to) switch
+        {
+            (TaskStatus.Open, TaskStatus.InProgress) => true,
+            (TaskStatus.InProgress, TaskStatus.Blocked) => true,
+            (TaskStatus.Blocked, TaskStatus.InProgress) => true,
+            (TaskStatus.InProgress, TaskStatus.Completed) => true,
+            (_, TaskStatus.Cancelled) when from is not (TaskStatus.Completed or TaskStatus.Cancelled) => true,
+            _ => false
+        };
+}

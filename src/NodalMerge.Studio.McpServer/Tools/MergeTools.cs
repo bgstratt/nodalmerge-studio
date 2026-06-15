@@ -9,7 +9,7 @@ namespace NodalMerge.Studio.McpServer.Tools;
 [McpServerToolType]
 public sealed class MergeTools(IMergeService merge)
 {
-    [McpServerTool(Name = McpToolNames.MergePropose), Description("Submit a merge proposal.")]
+    [McpServerTool(Name = McpToolNames.MergePropose), Description("Submit a merge proposal from a work branch.")]
     public async Task<string> ProposeAsync(
         string sourceBranch,
         string targetBranch,
@@ -32,14 +32,28 @@ public sealed class MergeTools(IMergeService merge)
             MergeProposalStatus.Draft);
 
         var created = await merge.ProposeAsync(proposal, cancellationToken).ConfigureAwait(false);
-        return McpJson.Ok(new { proposalId = created.ProposalId });
+        return McpJson.Ok(new { proposalId = created.ProposalId, status = created.Status.ToString() });
     }
 
-    [McpServerTool(Name = McpToolNames.MergeValidate), Description("Validate a merge proposal for review.")]
-    public async Task<string> ValidateAsync(string proposalId, CancellationToken cancellationToken = default) =>
-        McpJson.Ok(await merge.ValidateAsync(proposalId, cancellationToken).ConfigureAwait(false));
+    [McpServerTool(Name = McpToolNames.MergeValidate), Description("Validate a draft proposal, moving it to ReadyForReview.")]
+    public async Task<string> ValidateAsync(string proposalId, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var proposal = await merge.ValidateAsync(proposalId, cancellationToken).ConfigureAwait(false);
+            return McpJson.Ok(proposal);
+        }
+        catch (KeyNotFoundException)
+        {
+            return McpJson.Error(McpToolNames.MergeValidate, $"Proposal '{proposalId}' was not found.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            return McpJson.Error(McpToolNames.MergeValidate, ex.Message);
+        }
+    }
 
-    [McpServerTool(Name = McpToolNames.MergeReview), Description("Review a merge proposal (human approval required in v1).")]
+    [McpServerTool(Name = McpToolNames.MergeReview), Description("Human review of a proposal (AP-4). Decision must be Approved or Rejected.")]
     public async Task<string> ReviewAsync(
         string proposalId,
         string decision,
@@ -48,14 +62,39 @@ public sealed class MergeTools(IMergeService merge)
         if (!Enum.TryParse<MergeProposalStatus>(decision, ignoreCase: true, out var status) ||
             status is not (MergeProposalStatus.Approved or MergeProposalStatus.Rejected))
         {
-            return McpJson.Error(McpToolNames.MergeReview, "Decision must be Approved or Rejected.");
+            return McpJson.Error(McpToolNames.MergeReview, "Decision must be 'Approved' or 'Rejected'.");
         }
 
-        var proposal = await merge.ReviewAsync(proposalId, status, cancellationToken).ConfigureAwait(false);
-        return McpJson.Ok(proposal);
+        try
+        {
+            var proposal = await merge.ReviewAsync(proposalId, status, cancellationToken).ConfigureAwait(false);
+            return McpJson.Ok(proposal);
+        }
+        catch (KeyNotFoundException)
+        {
+            return McpJson.Error(McpToolNames.MergeReview, $"Proposal '{proposalId}' was not found.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            return McpJson.Error(McpToolNames.MergeReview, ex.Message);
+        }
     }
 
-    [McpServerTool(Name = McpToolNames.MergeApply), Description("Apply an approved merge proposal.")]
-    public async Task<string> ApplyAsync(string proposalId, CancellationToken cancellationToken = default) =>
-        McpJson.Ok(await merge.ApplyAsync(proposalId, cancellationToken).ConfigureAwait(false));
+    [McpServerTool(Name = McpToolNames.MergeApply), Description("Apply an approved merge proposal (AP-4 gate: only Approved proposals may be applied).")]
+    public async Task<string> ApplyAsync(string proposalId, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var proposal = await merge.ApplyAsync(proposalId, cancellationToken).ConfigureAwait(false);
+            return McpJson.Ok(proposal);
+        }
+        catch (KeyNotFoundException)
+        {
+            return McpJson.Error(McpToolNames.MergeApply, $"Proposal '{proposalId}' was not found.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            return McpJson.Error(McpToolNames.MergeApply, ex.Message);
+        }
+    }
 }

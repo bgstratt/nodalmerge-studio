@@ -1,5 +1,6 @@
 using NodalMerge.Studio.Contracts.Domain;
 using StudioTaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
+using TaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.Core.Tests;
 
@@ -51,4 +52,23 @@ public class StudioTaskTests
         Assert.Equal("work-1", task.WorkUnitId);
         Assert.DoesNotContain("node", task.GetType().GetProperties().Select(p => p.Name), StringComparer.OrdinalIgnoreCase);
     }
+}
+
+public class TaskTransitionTests
+{
+    [Theory]
+    [InlineData(TaskStatus.Open, TaskStatus.InProgress, true)]
+    [InlineData(TaskStatus.InProgress, TaskStatus.Blocked, true)]
+    [InlineData(TaskStatus.Blocked, TaskStatus.InProgress, true)]
+    [InlineData(TaskStatus.InProgress, TaskStatus.Completed, true)]
+    [InlineData(TaskStatus.Open, TaskStatus.Cancelled, true)]
+    [InlineData(TaskStatus.InProgress, TaskStatus.Cancelled, true)]
+    [InlineData(TaskStatus.Blocked, TaskStatus.Cancelled, true)]
+    [InlineData(TaskStatus.Open, TaskStatus.Completed, false)]
+    [InlineData(TaskStatus.Open, TaskStatus.Blocked, false)]
+    [InlineData(TaskStatus.Completed, TaskStatus.Open, false)]
+    [InlineData(TaskStatus.Completed, TaskStatus.Cancelled, false)]
+    [InlineData(TaskStatus.Cancelled, TaskStatus.Open, false)]
+    public void CanTransition_enforces_task_lifecycle(TaskStatus from, TaskStatus to, bool expected) =>
+        Assert.Equal(expected, TaskTransitions.CanTransition(from, to));
 }

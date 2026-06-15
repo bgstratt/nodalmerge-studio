@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Orchestrator;
 
@@ -9,19 +11,37 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
 {
     private readonly ConcurrentDictionary<string, WorkUnit> _workUnits = new();
     private readonly IBranchService _branchService;
+    private readonly IMergeService _mergeService;
+    private readonly IKnownGoodStateService _knownGoodStateService;
+    private readonly IAgentControlService _agentControl;
+    private readonly IStudioNodeStore _nodeStore;
 
-    public InMemoryWorkUnitService(IBranchService branchService)
+    public InMemoryWorkUnitService(
+        IBranchService branchService,
+        IMergeService mergeService,
+        IKnownGoodStateService knownGoodStateService,
+        IAgentControlService agentControl,
+        IStudioNodeStore nodeStore)
     {
-        _branchService = branchService;
+        _branchService         = branchService;
+        _mergeService          = mergeService;
+        _knownGoodStateService = knownGoodStateService;
+        _agentControl          = agentControl;
+        _nodeStore             = nodeStore;
     }
 
-    public Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken cancellationToken = default)
+    public async Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken cancellationToken = default)
     {
         _workUnits[workUnit.WorkUnitId] = workUnit;
-        return Task.FromResult(workUnit);
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnit.WorkUnitId,
+            JsonSerializer.Serialize(workUnit),
+            cancellationToken).ConfigureAwait(false);
+        return workUnit;
     }
 
-    public Task<WorkUnit> UpdateStatusAsync(
+    public async Task<WorkUnit> UpdateStatusAsync(
         string workUnitId,
         WorkUnitStatus status,
         CancellationToken cancellationToken = default)
@@ -34,7 +54,12 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
 
         var updated = workUnit with { Status = status, UpdatedAt = DateTimeOffset.UtcNow };
         _workUnits[workUnitId] = updated;
-        return Task.FromResult(updated);
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+        return updated;
     }
 
     public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default)
@@ -78,32 +103,62 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }
 
-    public Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default)
+    public async Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default)
     {
         var workUnit = GetRequired(workUnitId);
-        _workUnits[workUnitId] = workUnit with
+        var updated = workUnit with
         {
             AssignedAgent = agentId,
-            Status = WorkUnitStatus.Active,
-            UpdatedAt = DateTimeOffset.UtcNow
+            Status        = WorkUnitStatus.Active,
+            UpdatedAt     = DateTimeOffset.UtcNow,
         };
-        return Task.CompletedTask;
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
     }
 
-    public Task<WorkspaceSummary> GetSummaryAsync(string? branchId = null, CancellationToken cancellationToken = default)
+    public async Task<WorkspaceSummary> GetSummaryAsync(string? branchId = null, CancellationToken cancellationToken = default)
     {
-        var units = _workUnits.Values
+        var activeUnits = _workUnits.Values
             .Where(w => branchId is null || w.BranchId == branchId)
             .Where(w => w.Status is WorkUnitStatus.Created or WorkUnitStatus.Active or WorkUnitStatus.Waiting)
             .Select(w => w.WorkUnitId)
             .ToList();
 
-        return Task.FromResult(new WorkspaceSummary(
-            units,
-            [],
-            [],
-            [],
-            []));
+        var failures = _workUnits.Values
+            .Where(w => branchId is null || w.BranchId == branchId)
+            .Where(w => w.Status is WorkUnitStatus.Failed)
+            .Select(w => w.WorkUnitId)
+            .ToList();
+
+        var allProposals = await _mergeService.ListAsync(branchId, cancellationToken).ConfigureAwait(false);
+        var pendingMerges = allProposals
+            .Where(p => p.Status is MergeProposalStatus.Draft or MergeProposalStatus.ReadyForReview)
+            .Select(p => p.ProposalId)
+            .ToList();
+
+        IReadOnlyList<string> knownGoodStates = branchId is not null
+            ? (await _knownGoodStateService.FindKnownGoodAsync(branchId, cancellationToken).ConfigureAwait(false))
+                .Select(k => k.StateId).ToList()
+            : [];
+
+        var allAgents = await _agentControl.ListActiveAsync(cancellationToken).ConfigureAwait(false);
+        var activeAgents = branchId is null
+            ? allAgents.Select(a => a.AgentId).ToList()
+            : allAgents
+                .Where(a => _workUnits.TryGetValue(a.WorkUnitId, out var wu) && wu.BranchId == branchId)
+                .Select(a => a.AgentId)
+                .ToList();
+
+        return new WorkspaceSummary(
+            activeUnits,
+            activeAgents,
+            pendingMerges,
+            failures,
+            knownGoodStates);
     }
 
     private WorkUnit GetRequired(string workUnitId)
