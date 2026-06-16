@@ -401,6 +401,77 @@ This is the "checkout S0, try with a different model" operation. The new work un
 
 ---
 
+## Slice 10f.5 — Intent Graph & Conflict Resolver
+
+This slice introduces a pre-execution coordination primitive that prevents uncontrolled concurrent edits to overlapping semantic regions. It shifts the model from "agents edit files" to "agents publish change intents" and the system decides safe parallelism before any workspace write occurs.
+
+### Motivation
+Fan-out without intent coordination leads to race conditions, wasted recomputation, nondeterministic outputs, and merge storms. The right correctness frontier is not a better merger — it's preventing overlapping semantic edits or containing them with scheduling and revalidation.
+
+### Key concepts
+- **Change Intent**: a structured declaration of intent produced by the planner, e.g. `{ intent: "modify", target: "Foo.cs", region: "method:CalculateTax", type: "semantic_patch", baseSnapshot: "hash" }`.
+- **Intent Graph**: a per-work-unit index of all intents (local and enqueued) used to detect overlaps before execution.
+- **Conflict Warning / Lock**: scheduler metadata indicating overlapping intents; used to serialize or reroute execution.
+
+### Domain additions
+**`src/NodalMerge.Studio.Contracts/Domain/ChangeIntent.cs`** (new)
+
+```csharp
+public sealed record ChangeIntent(
+    string IntentId,
+    string WorkUnitId,
+    string IntentType,         // modify | create | delete | rename
+    string TargetPath,         // file path or logical id
+    string RegionDescriptor,   // lines, AST node id, or semantic tag
+    string BaseSnapshotHash,   // snapshot hash used for optimistic strategies
+    IReadOnlyList<string>? FilesTouchedHint,
+    DateTimeOffset CreatedAt);
+```
+
+**`src/NodalMerge.Studio.Core/Services/IIntentGraphService.cs`** (new)
+
+```csharp
+public interface IIntentGraphService
+{
+    Task RecordIntentAsync(ChangeIntent intent, CancellationToken ct = default);
+    Task<IReadOnlyList<ChangeIntent>> QueryIntentsAsync(string workUnitId, CancellationToken ct = default);
+    Task<IReadOnlyList<ChangeIntent>> QueryOverlappingAsync(ChangeIntent intent, CancellationToken ct = default);
+    Task RemoveIntentAsync(string intentId, CancellationToken ct = default);
+}
+```
+
+### Scheduler integration
+- On planner output, the orchestrator produces `ChangeIntent` entries instead of raw file edits.
+- `IWorkScheduler.EnqueueAsync` consults `IIntentGraphService.QueryOverlappingAsync` to build a conflict map at enqueue time.
+- If overlaps exist the scheduler can: attach a `ConflictWarning` to the scheduled item, acquire region locks, serialize execution, or signal the planner for intent refinement.
+
+### Scheduling strategies
+- **Option A — Strict partitioning**: detected overlap → do not run in parallel; enqueue preserves ordering. Simplest and deterministic.
+- **Option B — Region locking (recommended default)**: scheduler acquires region locks (e.g., `lock(Foo.cs:method:CalculateTax)`); competing intents are queued or rerouted. Balances safety and parallelism.
+- **Option C — Optimistic execution**: allow execution with `BaseSnapshotHash`, validate after run; on divergence, rebase or re-run agent. Maximizes parallelism at cost of recomputation.
+
+### Planner / Agent revalidation loop
+- If the scheduler rejects or queues an intent due to conflict, the planner/agent receives a structured revalidation request with the updated projection and the overlapping region metadata.
+- The agent can: refine intent (narrow region), split work into smaller intents, rebase against the latest snapshot, or accept serialization.
+
+### Relationship to CRDT / RGA
+- RGA/CRDTs remain the execution layer for composing concurrent text or artifact changes, not the coordination layer. The Intent Graph ensures coordination decisions are made before RGA patch application.
+
+### Artifact Lineage & UI signals
+- Record `ChangeIntent` artifacts via `IArtifactLineageService.RecordAsync` so intent history is queryable and replayable.
+- Expose `GET /studio/workunits/{id}/intents` and `GET /studio/scheduler/pending?includeIntentGraph=1` for dashboard and pre-execution visualization.
+- In the DAG UI, show overlapping intents as a conflict overlay with buttons: "Queue", "Branch & Replan", "Refine Intent".
+
+### Success criteria
+- Planner outputs `ChangeIntent` records for a generated plan; `GET /studio/workunits/{id}/intents` returns them.
+- Enqueueing a work unit with overlapping intents produces a `ConflictWarning` and either region locks or a queued item depending on scheduler config.
+- Two workers with non-overlapping intents run in parallel; overlapping intents are serialized or cause replanning according to selected strategy.
+- Revalidation loop: when an intent is queued due to overlap, the agent receives a structured revalidation message and produces a refined intent that can be enqueued and executed.
+
+This slice completes the pre-execution conflict detection layer that Phase 3 has been missing. With `10f.5` in place, Phase 4 fan-out becomes safe, deterministic, and tractable for real distributed workloads.
+
+---
+
 ## Slice 10g — Knowledge Artifacts
 
 Agents currently rediscover context on every run. A `Research` artifact from run 1 that says "the codebase targets .NET 8 and has no Redis dependency" is thrown away — run 2 re-discovers it. A `Constraint` that says "auth middleware must not store session tokens" exists only in the LLM's context window, not in the workspace.
