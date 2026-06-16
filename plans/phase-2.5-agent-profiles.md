@@ -1,308 +1,319 @@
-# Phase 2.5 — Agent Profiles & Specialized Context
+# Phase 2.5 — Pipeline Stages & Artifact-Centered Execution
 
-Phase 2 (slices 8a–8f) delivers a working vertical slice: one orchestrator, one worker, any LLM provider, human merge gate, integration tests. Phase 2.5 externalizes the hardcoded behavior from the loop classes into data, so that new agent roles — planners, reviewers, domain specialists — can be configured without code changes. This is the prerequisite for Phase 3 (multi-agent fanout), because once you're spawning several workers you immediately need to know *what kind of worker* each one is.
+## Core conceptual shift
 
----
+The original plan had persona-based worker roles (Implementer, Reviewer, etc.). We're replacing that with a **pipeline of stages over a shared workspace**, where each stage transforms an artifact.
 
-## Pre-2.5: Live validation checklist
+> Instead of "who the agent is" → "what stage the work is in."
 
-Run these four tests (in order) against a real LLM before writing any 2.5 code. They validate that the Phase 2 stack is solid. Use VS Code LM (Copilot) or any OpenAI-compatible key; set up a profile + topology template in the Agent Config panel and hit Quick Spawn.
+```
+Goal → [Orchestrate] → [Plan] → [Execute+Propose] → [Review] → [Apply]
+         task list      plan       branch changes +    approve/     disk
+                                   merge proposal      reject
+```
 
-### Test 1 — Orchestrator creates tasks
-
-Expected loop: `workspace.summary` → `task.create` (× N) → `end_turn`
-
-Pass: dashboard shows ≥ 1 task under the work unit.
-
-### Test 2 — Orchestrator spawns worker
-
-Expected loop: `task.create` → `agent.spawn` (with injected credentials + provider) → `end_turn`
-
-Pass: a second agent appears in the agent list; credentials propagated correctly (check host log).
-
-### Test 3 — Worker completes cleanly
-
-Expected loop: `task.update(InProgress)` → work iterations → `merge.propose` → `merge.validate` → `end_turn`
-
-Pass: Merge Review panel shows a proposal; no loop timeout.
-
-### Test 4 — Process restart + resume
-
-Sequence: Quick Spawn → wait for tasks to appear → kill host → restart host → confirm work unit / tasks still visible.
-
-Pass: state survives restart (AP-1 / AP-5 validation). If this fails, there's a DAG storage issue to fix before 2.5.
+Key consequences:
+- `Reviewer` is a **function applied to proposals**, not a spawned worker identity. In Phase 2.5 it is the human gate. Phase 3 can add an automated reviewer agent.
+- `Worker` is the **generic executor** — any LLM operating at the Execute stage. Not "an implementer" — just a stage with specific allowed tools and a stage-scoped prompt.
+- The orchestrator routes by **artifact state** (what exists), not by persona (what type of agent to call).
+- In Phase 2.5, Execute and Propose are collapsed: the worker produces changes *and* wraps them into a merge proposal. Phase 3 splits them if needed.
 
 ---
 
-## What Phase 2.5 adds
+## Pre-2.5 status
+
+✅ Pre-2.5 validation complete — end-to-end run produced `success.md` in the target repo via the merge apply write-back path.
+
+---
+
+## What 2.5 adds
 
 | Today | After 2.5 |
 |-------|-----------|
-| `agentType = "orchestrator" / "worker"` — routing key only | `AgentProfile` record in the DAG with role, systemPrompt, allowedTools, maxIterations |
-| System prompts hardcoded in loop classes | System prompt loaded from profile at spawn; defaults unchanged if no profile |
-| Loops can call all 32 MCP tools | `allowedTools` in profile filters the tool list the LLM sees (and the dispatcher enforces) |
-| Context assembled ad hoc in seed message | `AgentWorkspaceProjection` — a single structured context document injected at turn 0 |
-| Orchestrator spawns `agentType="worker"` | Orchestrator spawns `profileId=<implementer>` via rule-based selector |
+| `agentType = "orchestrator" / "worker"` — routing key only | `AgentProfile` with `PipelineStage`, stage-scoped tools, stage-appropriate prompt |
+| Persona roles: Implementer, Reviewer | Pipeline stages: Orchestrate, Plan, Execute, Review (Reviewer is the human gate in 2.5) |
+| No diff in Merge Review panel | `workspaceChanges` diff rendered inline with +/- syntax coloring |
+| Context assembled ad hoc | `AgentWorkspaceProjection` includes artifact chain (plan → changes → proposals) |
+| Orchestrator spawns a generic "worker" | Orchestrator reads artifact state, routes to the appropriate next stage |
 
 ---
 
-## Concept: two kinds of "profile"
+## Slice 9a — Diff in Merge Review panel
 
-The VS Code extension already has `AgentProfile` (in `AgentConfigService.ts`) which stores **LLM config**: provider, model, baseUrl, apiKey. Those stay in extension settings/secrets — credentials never touch the DAG.
+`MergeProposal.workspaceChanges` already carries a unified diff. The review panel just doesn't show it.
 
-Phase 2.5 adds a **server-side `AgentProfile`** that stores **behavioral config**: role, system prompt, allowed tools, iteration limits. This lives in the DAG (AP-1). The two concepts are related but separate: at spawn time, the extension resolves LLM config and the host resolves behavioral config; both feed into the running loop.
+**Files touched:**
+- `clients/vscode-extension/src/panels/MergeReviewPanel.ts`
+
+**Changes:**
+1. Add `workspaceChanges?: string | null` to the `MergeProposal` interface.
+2. Add a `<section id="section-diff">` in `REVIEW_HTML` (after the Change Description section).
+3. Render as `<pre>` with per-line coloring: lines starting with `+` green, `-` red, `@@` muted blue. Collapse if empty.
+
+**Success criteria:**
+- Merge Review panel shows the diff for proposals that have `workspaceChanges`.
+- Panel still renders correctly for proposals without it.
 
 ---
 
-## Slice 9a — AgentProfile DAG entity
+## Slice 9b — AgentProfile with pipeline stage model
 
-**Scope:** Add `AgentProfile` as a first-class domain record stored in the DAG. No loop changes yet — just the data model, service, and CRUD endpoints. This lets you create and manage profiles before wiring them to agents.
+Introduces `AgentProfile` as a server-side DAG entity. The key difference from the old plan: roles are pipeline stages, not personas.
 
-### New domain record
+### Domain record
 
 **`src/NodalMerge.Studio.Contracts/Domain/AgentProfile.cs`** (new)
 
 ```csharp
 namespace NodalMerge.Studio.Contracts.Domain;
 
-public enum AgentRole
+public enum PipelineStage
 {
-    General,
-    Orchestrator,
-    Planner,
-    Implementer,
-    Reviewer,
+    Orchestrate,  // goal → task list; coordinates all other stages
+    Plan,         // task → structured plan (steps, file touchpoints, assumptions)
+    Execute,      // plan → file changes on an isolated branch + merge proposal
+    Review,       // proposal → approved / rejected / revision-requested
+    Merge,        // multiple approved proposals → reconciled final state (Phase 3)
 }
 
 public sealed record AgentProfile(
     string AgentProfileId,
     string Name,
-    AgentRole Role,
+    PipelineStage Stage,
     string SystemPrompt,
-    IReadOnlyList<string> AllowedTools,   // empty = all nm.v1.* tools permitted
-    int MaxIterations,
-    IReadOnlyList<string> Capabilities);  // semantic tags: "code", "docs", "testing"
+    IReadOnlyList<string> AllowedTools,   // empty = all nm.v1.* tools
+    int MaxIterations);
 ```
+
+Note: `Reviewer` is not in this enum as a spawnable agent type — `Review` is the stage, and in Phase 2.5 it is the human gate. An automated reviewer agent (Phase 3) would have `Stage = Review`.
 
 ### Storage
 
 **`src/NodalMerge.Studio.Storage/StudioNodeKind.cs`**
-- Add `public const string AgentProfile = "studio/agent-profile/v1";`
+- Add `public const string AgentProfileV1 = "studio/agent-profile/v1";`
 
 **`src/NodalMerge.Studio.Core/Services/ServiceContracts.cs`**
-- Add `IAgentProfileService`:
+- Add `IAgentProfileService` with `CreateAsync`, `GetAsync`, `UpdateAsync`, `ListAsync`.
 
-```csharp
-public interface IAgentProfileService
-{
-    Task<AgentProfile> CreateAsync(AgentProfile profile, CancellationToken ct = default);
-    Task<AgentProfile?> GetAsync(string profileId, CancellationToken ct = default);
-    Task<AgentProfile> UpdateAsync(AgentProfile profile, CancellationToken ct = default);
-    Task<IReadOnlyList<AgentProfile>> ListAsync(CancellationToken ct = default);
-}
-```
+**`src/NodalMerge.Studio.Storage/AgentProfileService.cs`** (new)
+- Backed by `IStudioNodeStore`. Seeds defaults on first start.
 
-**`src/NodalMerge.Studio.AgentRuntime/InMemoryAgentProfileService.cs`** (new)
-- `ConcurrentDictionary<string, AgentProfile>` — used by integration tests.
+### Default profiles seeded on first start
 
-**`src/NodalMerge.Studio.Storage/NodalMergeAgentProfileService.cs`** (new)
-- Real implementation backed by `IStudioNodeStore` at `StudioNodeKind.AgentProfile`.
-- Seeded with four default profiles on first start if store is empty (see below).
+| ProfileId | Stage | AllowedTools | MaxIterations |
+|-----------|-------|-------------|---------------|
+| `orchestrator` | Orchestrate | *(all)* | 25 |
+| `planner` | Plan | `task.create`, `task.list`, `workunit.get`, `workspace.summary` | 15 |
+| `worker` | Execute | `task.update`, `task.list`, `task.assign`, `file.read`, `file.write`, `file.delete`, `merge.propose`, `merge.validate`, `branch.create`, `branch.status`, `snapshot.get` | 20 |
 
-### Default profile seed
-
-On host start, if no profiles exist, seed:
-
-| ProfileId | Name | Role | AllowedTools | MaxIterations |
-|-----------|------|------|--------------|---------------|
-| `orchestrator` | Orchestrator | Orchestrator | *(all)* | 25 |
-| `planner` | Planner | Planner | task.create, task.list, workunit.get, workspace.summary | 15 |
-| `implementer` | Implementer | Implementer | task.update, task.list, task.assign, merge.propose, merge.validate, branch.create, branch.status, snapshot.get | 20 |
-| `reviewer` | Reviewer | Reviewer | merge.validate, merge.review, projection.get, snapshot.compare | 10 |
-
-These replace the hardcoded "orchestrator" / "worker" agentType routing.
+`worker` handles both Execute and Propose in Phase 2.5 (it writes changes *and* calls `merge.propose`). A dedicated `proposer` profile is Phase 3 scope.
 
 ### REST endpoints
 
 **`src/NodalMerge.Studio.Host/StudioRestEndpoints.cs`**
-- `GET /studio/agent-profiles` → `IAgentProfileService.ListAsync`
-- `GET /studio/agent-profiles/{id}` → `IAgentProfileService.GetAsync`
-- `POST /studio/agent-profiles` → `IAgentProfileService.CreateAsync`
-- `PUT /studio/agent-profiles/{id}` → `IAgentProfileService.UpdateAsync`
+- `GET /studio/agent-profiles` → list
+- `GET /studio/agent-profiles/{id}` → get
+- `POST /studio/agent-profiles` → create
+- `PUT /studio/agent-profiles/{id}` → update
 
 ### Extension panel
 
 **`clients/vscode-extension/src/panels/AgentConfigPanel.ts`**
-- Add "Behavior Profiles" tab (alongside Profiles, Templates, Quick Spawn).
-- Table: ProfileId | Name | Role | AllowedTools count | MaxIterations | Edit
-- Form: editable Name, Role (dropdown), SystemPrompt (textarea), AllowedTools (multi-select or comma-separated), MaxIterations (number), Capabilities (comma-separated tags).
-- Backed by REST — reads from `/studio/agent-profiles`, writes via POST/PUT.
-- Quick Spawn: profile selector now shows behavior profiles (not just LLM config profiles); user picks one, extension maps it to the correct topology.
+- Add "Pipeline Profiles" tab.
+- Table: ProfileId | Name | Stage | Tools count | MaxIterations | Edit.
+- Form: Name, Stage (dropdown of `PipelineStage` values), SystemPrompt (textarea), AllowedTools (comma-separated), MaxIterations.
+- Quick Spawn profile selector shows pipeline profiles alongside LLM config profiles.
 
 ### Success criteria
-- Four default behavior profiles appear in the Behavior Profiles tab on first launch.
-- Create/edit a profile; restart host; profile persists.
+- Three default profiles visible in Pipeline Profiles tab on first launch.
+- Create/edit a profile; restart; profile persists.
 - `GET /studio/agent-profiles` returns the list.
-- All 82 existing tests still pass (in-memory path unchanged).
+- All existing tests pass.
 
 ---
 
-## Slice 9b — Profile-driven loop configuration
+## Slice 9c — Profile-driven loop configuration
 
-**Scope:** Loops load system prompt, maxIterations, and allowedTools from a resolved `AgentProfile` at spawn time. The hardcoded defaults remain as fallbacks if no profile is specified.
+Loops load system prompt, maxIterations, and allowedTools from a resolved `AgentProfile` at spawn time. Hardcoded defaults remain as fallback when no profile is provided.
 
-### Spawn signature extension
+### Spawn signature
 
 **`src/NodalMerge.Studio.Core/Services/ServiceContracts.cs`**
-- `IAgentControlService.SpawnAsync` gains `string? profileId = null` before the CancellationToken.
+- `IAgentControlService.SpawnAsync` gains `string? profileId = null`.
 
 **`src/NodalMerge.Studio.Host/StudioRestEndpoints.cs`**
-- `SpawnAgentBody` gains `string? ProfileId = null`; passed through to `SpawnAsync`.
+- `SpawnAgentBody` gains `string? ProfileId = null`, passed through.
 
-**`src/NodalMerge.Studio.McpServer/Tools/AgentTools.cs`**
-- `nm.v1.agent.spawn` tool definition gains optional `profileId` parameter.
-- `AgentSpawnAsync` passes `Str(input, "profileId")` to `agentControl.SpawnAsync`.
-
-**`src/NodalMerge.Studio.AgentRuntime/McpToolDispatcher.cs`**
-- `AgentSpawnAsync` call site: pass `Str(input, "profileId")` to service.
-
-### AgentRecord
-
-**`src/NodalMerge.Studio.AgentRuntime/InMemoryAgentRuntimeService.cs`**
-- `AgentRecord` gains `string? ProfileId` and resolved `AgentProfile? Profile`.
-- `SpawnAsync`: if `profileId` is provided, call `IAgentProfileService.GetAsync(profileId)` and store the snapshot in the record.
+**`src/NodalMerge.Studio.McpServer/Tools/AgentTools.cs`** (or `AgentSpawnAsync` in dispatcher)
+- `nm.v1.agent.spawn` gains optional `profileId` parameter.
 
 ### Loop constructors
 
-**`src/NodalMerge.Studio.AgentRuntime/OrchestratorAgentLoop.cs`**
-- Constructor accepts `AgentProfile? profile`.
-- System prompt: `profile?.SystemPrompt ?? OrchestratorSystemPrompt.Default`
-- Max iterations: `profile?.MaxIterations ?? 25`
-- Tool list passed to `LlmClient.SendAsync`: filtered to `profile.AllowedTools` if non-empty; full list otherwise.
-- `InjectSpawnCredentials`: also injects `"profileId"` when orchestrator knows which profile to give a worker (resolved by selector in 9d; for now injects the same orchestrator profileId as a passthrough).
+**`OrchestratorAgentLoop.cs` and `WorkerAgentLoop.cs`**
+- Accept `AgentProfile? profile`.
+- System prompt: `profile?.SystemPrompt ?? <hardcoded default>`
+- MaxIterations: `profile?.MaxIterations ?? <hardcoded default>`
+- Tool list passed to LLM: filtered to `profile.AllowedTools` if non-empty; full list otherwise.
 
-**`src/NodalMerge.Studio.AgentRuntime/WorkerAgentLoop.cs`**
-- Same pattern: `AgentProfile?` in constructor.
+### Dispatcher enforcement
 
-### Tool enforcement in dispatcher
-
-**`src/NodalMerge.Studio.AgentRuntime/McpToolDispatcher.cs`**
-- Constructor gains `IReadOnlyList<string>? allowedTools = null`.
-- `DispatchAsync`: if `_allowedTools` is non-empty and `toolName` is not in the set, return `ToError($"Tool '{toolName}' is not permitted for this agent's profile.")`.
-- This is a safety net; the LLM tool list is already filtered at loop construction.
+**`McpToolDispatcher.cs`**
+- Gains `IReadOnlyList<string>? allowedTools = null`.
+- Rejects calls to unlisted tools with a permission error. Safety net behind the LLM-level filtering.
 
 ### Success criteria
-- Spawn an orchestrator with `profileId=orchestrator`; loop uses that profile's system prompt (verify via log).
-- Spawn a `reviewer` profile; attempt to call `nm.v1.task.create` from it; dispatcher returns a permission error.
-- No change to integration tests — they pass null profileId and get default behavior.
+- Spawn with `profileId=worker`; dispatcher rejects `nm.v1.task.create` (not in worker's tool list).
+- Spawn with `profileId=planner`; dispatcher rejects `nm.v1.merge.propose`.
+- No profile → existing behavior unchanged; all integration tests pass.
 
 ---
 
-## Slice 9c — AgentWorkspaceProjection
+## Slice 9d — AgentWorkspaceProjection with artifact chain
 
-**Scope:** Replace ad hoc context assembly in loop seed messages with a single structured projection that any agent can call on any turn. This standardizes what context agents see and makes it tunable without changing loop code.
+The projection tells each agent where in the pipeline the work is and what artifacts already exist upstream. This is what lets the orchestrator make routing decisions without hardcoding logic.
 
-### New projection type
+**Critical design note**: `ArtifactChain` is a lineage graph, not a routing struct. The prior design (`string? Plan + IReadOnlyList<string> ProposalIds`) could answer "does a plan exist?" but could not answer "what produced this proposal?", "what is its parent?", or "where does replay start?" A flat ID list has no parent traversal and makes branching, replay, and DAG visualization significantly harder in every later phase. The model below fixes this before anything is built on top of it.
 
-**`src/NodalMerge.Studio.Contracts/Projections/ProjectionContracts.cs`**
-- Add `AgentWorkspace` to `ProjectionType` enum.
-- Add payload record:
+### Artifact identity model
+
+**`src/NodalMerge.Studio.Contracts/Domain/ArtifactRef.cs`** (new)
 
 ```csharp
-public sealed record AgentWorkspaceProjectionPayload(
-    string AgentId,
-    string AgentRole,
-    WorkUnitProjectionPayload WorkUnit,
-    IReadOnlyList<StudioTask> AssignedTasks,
-    IReadOnlyList<string> PendingProposals,
-    IReadOnlyList<string> AvailableTools,      // profile.AllowedTools or all tools
-    IReadOnlyList<string> Capabilities);
+namespace NodalMerge.Studio.Contracts.Domain;
+
+public enum ArtifactType
+{
+    Goal,               // the root work unit intent
+    Plan,               // structured plan produced by a planner
+    Task,               // a discrete unit of work within a plan
+    Research,           // discovered facts: codebase analysis, API contracts, dependency inventory
+    Decision,           // architectural choice with rationale and trade-offs
+    Constraint,         // invariant or requirement that all descendant runs must respect
+    BranchChangeset,    // file changes on an execution branch (pre-proposal)
+    MergeProposal,      // a formal proposal wrapping a BranchChangeset
+    MergeResult,        // the applied workspace state after a proposal is merged
+}
+
+public enum ArtifactStatus
+{
+    Active,       // in use; not yet terminal
+    Approved,     // proposal approved by human (or automated reviewer)
+    Rejected,     // explicitly rejected
+    Superseded,   // replaced by a merger's reconciled output
+    Applied,      // merge result written back to disk
+}
+
+public sealed record ArtifactRef(
+    string ArtifactId,
+    ArtifactType Type,
+    string? ParentArtifactId,      // null only for Goal (root)
+    ArtifactStatus Status,
+    DateTimeOffset CreatedAt,
+    string? OwnedByWorkUnitId,
+    string? OwnedByAgentId);
 ```
 
-### Projection materialization
+This gives every artifact a parent. The chain is now:
 
-**`src/NodalMerge.Studio.Projections/ProjectionManager.cs`**
-- Handle `ProjectionType.AgentWorkspace` in `GetAsync`.
-- Assemble from: `IWorkUnitService.GetAsync(request.WorkUnitId)`, `ITaskService.ListAsync(request.WorkUnitId)`, `IMergeService.ListAsync()` (filtered to pending), available tools from profile (passed via a new `GetAgentWorkspaceAsync` overload or resolved from DI-injected `IAgentProfileService`).
-- `ProjectionRequest.AgentId` (already on the record) identifies which agent's context to build.
+```
+Goal
+ └─ Plan
+     └─ Task A
+         ├─ BranchChangeset
+         │   └─ MergeProposal A
+         └─ MergeProposal B (fork — different model run)
+```
+
+You can walk up to answer "what produced this?", walk down to answer "what did this produce?", and filter by type and status to route without special-case logic.
+
+### Projection payload
+
+**`src/NodalMerge.Studio.Contracts/Projections/ProjectionContracts.cs`**
+
+```csharp
+public sealed record ArtifactChain(
+    IReadOnlyList<ArtifactRef> Artifacts);     // ordered by CreatedAt; full graph for this work unit
+
+public sealed record AgentWorkspaceProjectionPayload(
+    string AgentId,
+    PipelineStage Stage,
+    WorkUnitProjectionPayload WorkUnit,
+    IReadOnlyList<StudioTask> AssignedTasks,
+    ArtifactChain Artifacts,
+    IReadOnlyList<string> AvailableTools);
+```
+
+Convenience accessors the projection manager populates (not stored separately — derived from `Artifacts`):
+- `Plan`: first `ArtifactRef` with `Type == Plan && Status == Active`
+- `PendingProposals`: all `Type == MergeProposal && Status == Active`
+- `ApprovedProposals`: all `Type == MergeProposal && Status == Approved`
+- `InheritedConstraints`: all `Type == Constraint` from this work unit and its ancestors — walked up the `ParentWorkUnitId` chain
+
+These replace the old flat fields. Routing logic in 9e reads from `Artifacts` directly.
+
+`InheritedConstraints` is the mechanism by which knowledge artifacts propagate: a constraint recorded on the root work unit automatically becomes part of every descendant's projection context. Agents never need to rediscover that "auth middleware must not store session tokens" — it is in the projection from turn 0.
+
+### Population
+
+**`src/NodalMerge.Studio.Core/ProjectionManager.cs`** (or `AgentWorkspaceProjectionBuilder`)
+- On projection build: query `IStudioNodeStore` for all artifact records owned by the work unit.
+- Assemble `ArtifactRef` list in creation order.
+- Return `ArtifactChain` with full graph.
+
+Each service that produces an artifact (planner loop, worker loop, merge propose tool) writes an `ArtifactRef` to the store when the artifact is created. The `ArtifactId` is the natural ID of the artifact (e.g., `MergeProposalId` for a proposal, plan branch path for a plan). This is the Phase 2.5 write path — the Phase 3 slice 10d adds the backing store query for the full graph.
 
 ### Loop changes
 
-**`src/NodalMerge.Studio.AgentRuntime/OrchestratorAgentLoop.cs`**
-- Turn 0 seed message: instead of `"Begin orchestrating work unit {workUnitId}..."`, call `projectionManager.GetAsync(new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal, workUnitId, AgentId: agentId))` and serialize the result into the seed message.
-- This gives the orchestrator a complete picture upfront: goal, existing tasks, pending proposals, available tools.
-
-**`src/NodalMerge.Studio.AgentRuntime/WorkerAgentLoop.cs`**
-- Same: seed with `AgentWorkspaceProjection` so worker sees its assigned tasks immediately.
-
-### MCP tool change
-
-`nm.v1.projection.get` already accepts `ProjectionType` and `agentId` in `ProjectionRequest`. No signature change needed — just the new enum value handled in `ProjectionManager`.
+**`OrchestratorAgentLoop.cs` and `WorkerAgentLoop.cs`**
+- Turn 0 seed calls `projectionManager.GetAsync(ProjectionType.AgentWorkspace, ...)` and serializes into the opening message.
+- This replaces the ad hoc "Begin orchestrating work unit {id}..." strings.
 
 ### Success criteria
-- Orchestrator's first LLM message includes structured JSON with workUnit goal, task list, and tool names (visible in host log).
-- Worker's first message includes the task assigned to it.
-- `nm.v1.projection.get` with `type: "AgentWorkspace"` returns the payload via MCP.
+- Orchestrator's turn-0 LLM message includes `artifacts` array with typed, parented refs — not flat ID lists.
+- `nm.v1.projection.get` with `type: "AgentWorkspace"` returns the full `ArtifactChain`.
+- After a worker produces a proposal: `Artifacts` contains `[Goal, Plan (if ran), Task, BranchChangeset, MergeProposal]` with correct parent chain.
+- Routing in 9e reads artifact type + status from the chain; no string parsing of plan text needed.
 
 ---
 
-## Slice 9d — Rule-based profile selection
+## Slice 9e — Artifact-state-driven routing in orchestrator
 
-**Scope:** Orchestrator selects a worker profile by role/capabilities rather than hardcoding `agentType="worker"`. This is the minimal step that makes Phase 3 (multiple specialized workers) compositional instead of ad hoc.
+Orchestrator reads the artifact chain from the projection and routes to the appropriate next pipeline stage. This replaces hardcoded `agentType="worker"` spawning.
 
-### Selector interface
+### Routing logic (in `OrchestratorAgentLoop` or injected as `IPipelineRouter`)
 
-**`src/NodalMerge.Studio.Core/Services/ServiceContracts.cs`**
-
-```csharp
-public interface IAgentProfileSelectorService
-{
-    Task<AgentProfile?> SelectAsync(
-        AgentRole role,
-        IReadOnlyList<string>? requiredCapabilities = null,
-        CancellationToken ct = default);
-}
+```
+if no tasks exist          → spawn Planner (or self-plan if no Planner profile configured)
+if plan exists, no branch changes → spawn Worker (Execute stage)
+if branch has changes, no proposal → worker should self-propose; orchestrator can prompt it
+if proposal pending review → surface to human (already handled by merge gate)
+if proposal approved      → call nm.v1.merge.apply
 ```
 
-### Rule-based implementation
+The orchestrator uses `nm.v1.projection.get` with `type: "AgentWorkspace"` to read the current state before each routing decision. It does not hardcode stage transitions — it reads artifact presence.
 
-**`src/NodalMerge.Studio.AgentRuntime/RuleBasedAgentProfileSelector.cs`** (new)
+### `InjectSpawnCredentials` update
 
-Selection order:
-1. Find profiles with `Role == role` whose `Capabilities` are a superset of `requiredCapabilities`.
-2. If none, find any profile with `Role == role`.
-3. Fallback: `Role == AgentRole.General`.
-
-For Phase 2.5 this is enough. Phase 3 can replace or augment with LLM-driven selection.
-
-### Orchestrator integration
-
-**`src/NodalMerge.Studio.AgentRuntime/OrchestratorAgentLoop.cs`**
-- Inject `IAgentProfileSelectorService`.
-- When orchestrator calls `nm.v1.agent.spawn`, apply selector before injecting credentials: `var workerProfile = await selector.SelectAsync(AgentRole.Implementer)`.
-- `InjectSpawnCredentials` injects `"profileId": workerProfile.AgentProfileId` alongside model/baseUrl/apiKey/provider.
-
-### Topology templates in extension
-
-**`clients/vscode-extension/src/AgentConfigService.ts`**
-- `TopologyTemplate.workers[].profile` already holds a string ID; rename to `behaviorProfileId` to distinguish it from the LLM config profile.
-- Quick Spawn: send `profileId` in the spawn body using the topology template's `behaviorProfileId`.
+**`OrchestratorAgentLoop.cs`**
+- When spawning, inject `profileId` resolved from the target stage (e.g., `worker` for Execute stage).
+- This replaces the current `agentType="worker"` passthrough.
 
 ### Success criteria
-- Create a topology template that references `implementer` as the worker behavior profile.
-- Quick Spawn: orchestrator spawns, then spawns a worker with `profileId=implementer`; worker's tool list is restricted to implementer's `allowedTools`; confirm via dispatcher log.
-- Changing the topology to `reviewer` profile routes to a different set of tools without code changes.
+- Quick Spawn a goal with no plan: orchestrator spawns a worker that produces file changes and a merge proposal.
+- Merge Review panel shows the diff (9a) and the proposal.
+- Human approves → apply writes back to the filesystem.
+- Test with two sequential goals: second run routes correctly even if first proposal already exists.
 
 ---
 
-## Slice ordering rationale
+## Slice ordering
 
-9a → 9b → 9c → 9d
+9a → 9b → 9c → 9d → 9e
 
-- **9a first** because every subsequent slice depends on `AgentProfile` existing as a domain entity.
-- **9b before 9c** because the loop constructors need profile config before the projection can reference `AvailableTools`.
-- **9c before 9d** because the workspace projection is what makes the orchestrator's selection decision visible to the worker on turn 0 — the worker needs the context to know what it's supposed to do.
-- **9d last** because profile selection is only useful once the profiles are wired into the loops.
+- **9a first**: zero risk, immediate UX value, requires no server changes.
+- **9b before 9c**: profiles must exist before loops can load them.
+- **9c before 9d**: loop config determines which tools the projection reports as available.
+- **9d before 9e**: orchestrator needs the artifact chain to route by state.
 
 ---
 
@@ -310,23 +321,19 @@ For Phase 2.5 this is enough. Phase 3 can replace or augment with LLM-driven sel
 
 | File | Reason |
 |------|--------|
-| `McpToolNames.cs` | No new MCP tools needed — profiles are admin-managed via REST, not queried by agents |
-| `LlmClient.cs` | Provider abstraction is complete; no changes |
-| `mcp-v1-contract.md` | `nm.v1.agent.spawn` gains optional `profileId` — additive, backward compatible |
+| `LlmClient.cs` | Provider abstraction complete; no changes needed |
 | Integration tests | Pass `null` for `profileId`; default behavior unchanged |
+| `mcp-v1-contract.md` | `nm.v1.agent.spawn` gains optional `profileId` — additive, backward-compatible |
+| Merger/Reducer logic | Phase 3 scope |
+| Automated reviewer agent | Phase 3 scope — in 2.5 Review is the human gate |
 
 ---
 
 ## Phase 3 pointer
 
-After 9d, spawning five specialized workers becomes:
-
-```
-OrchestratorAgentLoop
-  → selector.SelectAsync(AgentRole.Implementer, ["code"])   → profileId=implementer
-  → nm.v1.agent.spawn × N (each with profileId=implementer, isolated branch)
-  → selector.SelectAsync(AgentRole.Reviewer, ["code"])       → profileId=reviewer
-  → nm.v1.agent.spawn (reviewer, waits on all implementer merges)
-```
-
-Phase 3 concerns: branch isolation per worker, merge fan-in strategy, streaming agent status to the DAG replay panel, failure recovery (dead letter → human escalation). None of those require changes to the profile or projection system.
+After 9e, the pipeline is complete for single-worker runs. Phase 3 extends it:
+- Fan-out: orchestrator spawns N workers in parallel on isolated branches
+- Merger/Reducer stage that reconciles overlapping proposals
+- Automated reviewer agent (Stage = Review) as an optional quality gate before human review
+- Streaming pipeline stage state to the DAG replay panel
+- Dead-letter / failure escalation path

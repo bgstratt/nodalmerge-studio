@@ -1,6 +1,15 @@
 import * as vscode from 'vscode';
 import type { AgentConfigService, AgentProfile, TopologyTemplate } from '../AgentConfigService';
 
+export interface PipelineProfile {
+  agentProfileId: string;
+  name: string;
+  stage: string;
+  systemPrompt: string;
+  allowedTools: string[];
+  maxIterations: number;
+}
+
 export class AgentConfigPanel implements vscode.Disposable {
   static current: AgentConfigPanel | undefined;
   private static readonly viewType = 'nodalmerge.agentConfig';
@@ -56,11 +65,16 @@ export class AgentConfigPanel implements vscode.Disposable {
   }
 
   private async sendConfig(): Promise<void> {
+    let pipelineProfiles: PipelineProfile[] = [];
+    try {
+      pipelineProfiles = await this.get<PipelineProfile[]>('/studio/agent-profiles');
+    } catch { /* server may not be running yet */ }
     void this.panel.webview.postMessage({
       type:            'config',
       profiles:        this.configService.getProfiles(),
       templates:       this.configService.getTemplates(),
       defaultTopology: this.configService.getDefaultTopology(),
+      pipelineProfiles,
     });
   }
 
@@ -87,15 +101,42 @@ export class AgentConfigPanel implements vscode.Disposable {
         const profile   = profiles.find(p => p.id === profileId);
         if (profile && key) {
           await this.configService.storeApiKey(profile, key, this.secrets);
+          const apiKeyRef = profile.apiKeyRef ?? `nodalmerge.apikey.${profileId}`;
           void vscode.window.showInformationMessage(`NodalMerge: API key stored for profile "${profileId}".`);
-          void this.panel.webview.postMessage({ type: 'apiKeySaved', profileId });
+          void this.panel.webview.postMessage({ type: 'apiKeySaved', profileId, apiKeyRef });
         }
+        break;
+      }
+
+      case 'savePipelineProfile': {
+        const p = msg.profile as PipelineProfile;
+        const exists = await this.get<unknown>('/studio/agent-profiles/' + p.agentProfileId).then(() => true).catch(() => false);
+        const endpoint = '/studio/agent-profiles' + (exists ? '/' + p.agentProfileId : '');
+        const method   = exists ? 'PUT' : 'POST';
+        const body = exists
+          ? { name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations }
+          : { agentProfileId: p.agentProfileId, name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations };
+        await (method === 'PUT'
+          ? fetch(this.baseUrl + endpoint, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+          : this.post(endpoint, body));
+        void vscode.window.showInformationMessage(`NodalMerge: Pipeline profile "${p.agentProfileId}" saved.`);
+        void this.sendConfig();
         break;
       }
 
       case 'quickSpawn':
         await this.handleQuickSpawn(msg.templateName as string, msg.goal as string);
         break;
+
+      case 'getModels': {
+        const models = await this.fetchModels(
+          msg.provider as string,
+          msg.baseUrl as string | undefined,
+          msg.apiKey as string | undefined,
+        );
+        void this.panel.webview.postMessage({ type: 'models', models });
+        break;
+      }
     }
   }
 
@@ -125,37 +166,24 @@ export class AgentConfigPanel implements vscode.Disposable {
         );
       }
 
+      const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
       const orchWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
         goal,
         owner: template.orchestrator,
+        ...(repositoryPath ? { repositoryPath } : {}),
       });
+      // Always use 'orchestrator' as the agentType so the server starts the correct loop,
+      // regardless of what the user named their LLM profile.  Workers are spawned by
+      // the orchestrator via nm.v1.agent.spawn once it has created tasks with taskIds.
       await this.post('/studio/agents/spawn', {
-        agentType:  template.orchestrator,
+        agentType:  'orchestrator',
         workUnitId: orchWu.workUnitId,
         ...orchCfg,
       });
 
-      for (const worker of template.workers ?? []) {
-        const workerCfg = await this.configService.resolveSpawnLlmConfig(
-          worker.profile, this.secrets, this.lmProxyBaseUrl,
-        );
-        if (!workerCfg) {
-          throw new Error(`Profile "${worker.profile}" is missing LLM credentials (set VS Code LM or an API key).`);
-        }
-        const workerWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
-          goal:  `[${worker.profile}] ${goal}`,
-          owner: worker.profile,
-        });
-        await this.post('/studio/agents/spawn', {
-          agentType:  worker.profile,
-          workUnitId: workerWu.workUnitId,
-          ...workerCfg,
-        });
-      }
-
       void this.panel.webview.postMessage({ type: 'spawnResult', success: true });
       void vscode.window.showInformationMessage(
-        `NodalMerge: Spawned "${templateName}" topology for: ${goal}`,
+        `NodalMerge: Spawned orchestrator for "${templateName}": ${goal}`,
       );
     } catch (err) {
       void this.panel.webview.postMessage({
@@ -163,6 +191,50 @@ export class AgentConfigPanel implements vscode.Disposable {
       });
       void vscode.window.showErrorMessage('NodalMerge: Quick spawn failed — ' + String(err));
     }
+  }
+
+  private async fetchModels(provider: string, baseUrl?: string, apiKey?: string): Promise<string[]> {
+    if (provider === 'vscode-lm') {
+      try {
+        const models = await vscode.lm.selectChatModels(undefined);
+        return models.map(m => m.id);
+      } catch { return []; }
+    }
+    if (provider === 'anthropic') {
+      return [
+        'claude-fable-5',
+        'claude-opus-4-8',
+        'claude-sonnet-4-6',
+        'claude-haiku-4-5-20251001',
+        'claude-3-5-sonnet-20241022',
+        'claude-3-5-haiku-20241022',
+      ];
+    }
+    if (provider === 'openai' && baseUrl) {
+      try {
+        const url = `${baseUrl.replace(/\/+$/, '')}/v1/models`;
+        const headers: Record<string, string> = {};
+        if (apiKey) { headers['Authorization'] = `Bearer ${apiKey}`; }
+        const res  = await fetch(url, { headers });
+        if (!res.ok) { return []; }
+        const data = await res.json() as { data?: Array<{ id: string }> };
+        const ids  = (data.data ?? []).map((m: { id: string }) => m.id).sort();
+        if (baseUrl.includes('openai.com')) {
+          return ids.filter((id: string) => /^(gpt-|o\d)/.test(id));
+        }
+        return ids;
+      } catch { return []; }
+    }
+    return [];
+  }
+
+  private async get<T>(path: string): Promise<T> {
+    const res = await fetch(this.baseUrl + path);
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error('GET ' + path + ' → ' + String(res.status) + ': ' + text);
+    }
+    return res.json() as Promise<T>;
   }
 
   private async post<T = unknown>(path: string, body: unknown): Promise<T> {
@@ -334,6 +406,7 @@ const AGENT_CONFIG_HTML = `
     <button class="tab-btn active" data-tab="profiles">Profiles</button>
     <button class="tab-btn" data-tab="templates">Topology Templates</button>
     <button class="tab-btn" data-tab="spawn">Quick Spawn</button>
+    <button class="tab-btn" data-tab="pipeline-profiles">Pipeline Profiles</button>
   </div>
 
   <div id="pane-profiles" class="tab-pane visible">
@@ -369,6 +442,15 @@ const AGENT_CONFIG_HTML = `
     </div>
   </div>
 
+  <div id="pane-pipeline-profiles" class="tab-pane">
+    <div id="pipeline-profile-form-area"></div>
+    <table>
+      <thead><tr><th>ID</th><th>Name</th><th>Stage</th><th>Tools</th><th>Max Iter</th><th></th></tr></thead>
+      <tbody id="pipeline-profile-tbody"></tbody>
+    </table>
+    <button class="add-btn" id="btn-add-pipeline-profile">+ Add Pipeline Profile</button>
+  </div>
+
   <div class="save-bar">
     <span class="status" id="save-status"></span>
     <button id="btn-save-profiles">Save Profiles</button>
@@ -382,6 +464,7 @@ const AGENT_CONFIG_JS = `
   let profiles = [];
   let templates = [];
   let defaultTopology = '';
+  var onModelsLoaded = null;
 
   // ── Tab switching ──────────────────────────────────────────────────────────
   document.querySelectorAll('.tab-btn').forEach(function(btn) {
@@ -456,7 +539,8 @@ const AGENT_CONFIG_JS = `
     const curProvider = p.provider || 'anthropic';
     const isVsLm = curProvider === 'vscode-lm';
     const area = document.getElementById('profile-form-area');
-    const modelRowClass = isVsLm ? 'field hidden' : 'field';
+    // Always show the model field so users can supply a model hint for vscode-lm.
+    const modelRowClass = 'field';
     const baseUrlRowClass = isVsLm ? 'field hidden' : 'field';
     const apiKeyRowClass = isVsLm ? 'field hidden' : 'field';
     area.innerHTML =
@@ -476,9 +560,17 @@ const AGENT_CONFIG_JS = `
           '<option value="openai"'    + (curProvider === 'openai'    ? ' selected' : '') + '>OpenAI compatible (OpenAI, DeepSeek, Azure, LM Studio, etc.)</option>' +
           '<option value="anthropic"' + (curProvider === 'anthropic' ? ' selected' : '') + '>Anthropic (claude-*)</option>' +
         '</select></div>' +
-      '<div id="pf-model-row" class="' + modelRowClass + '">' +
-        '<label>Model</label>' +
-        '<input type="text" id="pf-model" value="' + esc(p.model || '') + '" placeholder="e.g. claude-sonnet-4-6 or gpt-4o"></div>' +
+      '<div id="pf-model-row" class="field">' +
+        '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">' +
+          '<label style="margin:0;flex:1;font-size:0.8em;opacity:0.6">Model</label>' +
+          '<button type="button" id="pf-refresh-models" class="ghost" style="padding:1px 8px;font-size:0.75em">&#x21BB; Refresh</button>' +
+        '</div>' +
+        '<select id="pf-model-select"><option value="__custom__">— enter manually —</option>' +
+          (p.model ? '<option value="' + esc(p.model) + '" selected>' + esc(p.model) + '</option>' : '') +
+        '</select>' +
+        '<input type="text" id="pf-model-custom" style="margin-top:4px;' + (p.model ? 'display:none;' : '') + '" value="' + esc(p.model || '') + '" placeholder="' + (isVsLm ? 'blank = active VS Code model' : 'e.g. claude-sonnet-4-6') + '">' +
+        '<div id="pf-model-loading" class="muted hidden" style="font-size:0.8em;padding:2px 0">Fetching models…</div>' +
+      '</div>' +
       '<div id="pf-baseurl-row" class="' + baseUrlRowClass + '">' +
         '<label>Base URL (leave blank for default)</label>' +
         '<input type="text" id="pf-baseurl" value="' + esc(p.baseUrl || '') + '"' +
@@ -501,12 +593,66 @@ const AGENT_CONFIG_JS = `
         '<button class="ghost" id="pf-cancel">Cancel</button>' +
       '</div></div>';
 
-    // Toggle field visibility when provider changes
+    // Toggle field visibility when provider changes. Keep model visible; update its placeholder.
     document.getElementById('pf-provider').addEventListener('change', function() {
       const isVs = this.value === 'vscode-lm';
-      document.getElementById('pf-model-row').classList.toggle('hidden', isVs);
       document.getElementById('pf-baseurl-row').classList.toggle('hidden', isVs);
       document.getElementById('pf-apikey-row').classList.toggle('hidden', isVs);
+      const m = document.getElementById('pf-model-custom');
+      if (m) {
+        m.setAttribute('placeholder', isVs ? 'blank = active VS Code model' : 'e.g. claude-sonnet-4-6 or gpt-4o');
+      }
+      requestModels();
+    });
+
+    function requestModels() {
+      var providerEl = document.getElementById('pf-provider');
+      var baseUrlEl  = document.getElementById('pf-baseurl');
+      var apiKeyEl   = document.getElementById('pf-apikey');
+      if (!providerEl) { return; }
+      var loading = document.getElementById('pf-model-loading');
+      if (loading) { loading.classList.remove('hidden'); }
+      vscode.postMessage({
+        type:     'getModels',
+        provider: providerEl.value,
+        baseUrl:  baseUrlEl ? baseUrlEl.value.trim() : undefined,
+        apiKey:   apiKeyEl  ? apiKeyEl.value.trim()  : undefined,
+      });
+    }
+    function getModelValue() {
+      var sel    = document.getElementById('pf-model-select');
+      var custom = document.getElementById('pf-model-custom');
+      if (sel && sel.value !== '__custom__') { return sel.value.trim(); }
+      return custom ? custom.value.trim() : '';
+    }
+    onModelsLoaded = function(models) {
+      var sel     = document.getElementById('pf-model-select');
+      var custom  = document.getElementById('pf-model-custom');
+      var loading = document.getElementById('pf-model-loading');
+      if (loading) { loading.classList.add('hidden'); }
+      if (!sel) { return; }
+      var currentVal = custom ? custom.value.trim() : '';
+      sel.innerHTML  = '<option value="__custom__">— enter manually —</option>';
+      models.forEach(function(id) {
+        var opt = document.createElement('option');
+        opt.value = id; opt.textContent = id;
+        if (id === currentVal) { opt.selected = true; }
+        sel.appendChild(opt);
+      });
+      if (sel.value === '__custom__') {
+        if (custom) { custom.style.display = ''; }
+      } else {
+        if (custom) { custom.style.display = 'none'; custom.value = sel.value; }
+      }
+    };
+    document.getElementById('pf-model-select').addEventListener('change', function() {
+      var custom = document.getElementById('pf-model-custom');
+      if (!custom) { return; }
+      if (this.value === '__custom__') { custom.style.display = ''; }
+      else { custom.style.display = 'none'; custom.value = this.value; }
+    });
+    document.getElementById('pf-refresh-models').addEventListener('click', function() {
+      requestModels();
     });
 
     document.getElementById('pf-store-key').addEventListener('click', function() {
@@ -523,26 +669,42 @@ const AGENT_CONFIG_JS = `
       const label    = document.getElementById('pf-label').value.trim();
       const domain   = document.getElementById('pf-domain').value.trim();
       const provider = document.getElementById('pf-provider').value;
-      const model    = provider === 'vscode-lm' ? '' : document.getElementById('pf-model').value.trim();
+      // Always capture the model field; an empty value will mean "use active VS Code model".
+      const model    = getModelValue();
       const baseUrl  = provider === 'vscode-lm' ? '' : document.getElementById('pf-baseurl').value.trim();
       const prompt   = document.getElementById('pf-prompt').value.trim();
       if (!id || !label || !domain) { alert('ID, Label, and Domain are required.'); return; }
+      // If a key was typed in the password field, store it when saving — no need for a separate "Store Key" click.
+      const keyEl     = document.getElementById('pf-apikey');
+      const pendingKey = (keyEl && provider !== 'vscode-lm') ? keyEl.value.trim() : '';
+      // Determine apiKeyRef: use the pending key's deterministic ref, OR carry forward the existing ref from the live profiles array.
+      const liveProfile = isNew ? null : profiles.find(function(pr) { return pr.id === p.id; });
+      const existingRef = liveProfile ? liveProfile.apiKeyRef : (isNew ? undefined : p.apiKeyRef);
+      const apiKeyRef   = provider === 'vscode-lm' ? undefined
+        : (pendingKey ? ('nodalmerge.apikey.' + id) : existingRef);
       const profile = {
         id, label, domain, provider,
         model:            model   || undefined,
         baseUrl:          baseUrl || undefined,
-        apiKeyRef:        provider === 'vscode-lm' ? undefined : (isNew ? undefined : p.apiKeyRef),
+        apiKeyRef:        apiKeyRef,
         systemPromptHint: prompt  || undefined,
       };
       if (isNew) { profiles.push(profile); }
       else       { profiles[idx] = profile; }
+      onModelsLoaded = null;
       document.getElementById('profile-form-area').innerHTML = '';
       renderProfiles();
       vscode.postMessage({ type: 'saveProfiles', profiles: profiles });
+      // Store the key AFTER saving the profile so the ref is already in place.
+      if (pendingKey) {
+        vscode.postMessage({ type: 'setApiKey', profileId: id, key: pendingKey });
+      }
     });
     document.getElementById('pf-cancel').addEventListener('click', function() {
+      onModelsLoaded = null;
       document.getElementById('profile-form-area').innerHTML = '';
     });
+    setTimeout(function() { requestModels(); }, 0);
   }
 
   document.getElementById('btn-add-profile').addEventListener('click', function() {
@@ -669,21 +831,116 @@ const AGENT_CONFIG_JS = `
     setStatus('Templates saved.');
   });
 
+  // ── Pipeline Profiles ─────────────────────────────────────────────────────
+  var pipelineProfiles = [];
+  var PIPELINE_STAGES = ['Orchestrate', 'Plan', 'Execute', 'Review', 'Merge'];
+
+  function renderPipelineProfiles() {
+    const tbody = document.getElementById('pipeline-profile-tbody');
+    if (!tbody) { return; }
+    tbody.innerHTML = '';
+    pipelineProfiles.forEach(function(p, i) {
+      const toolCount = p.allowedTools && p.allowedTools.length > 0 ? p.allowedTools.length + ' tools' : 'all tools';
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td class="mono">' + esc(p.agentProfileId) + '</td>' +
+        '<td>' + esc(p.name) + '</td>' +
+        '<td class="mono">' + esc(p.stage) + '</td>' +
+        '<td class="mono">' + esc(toolCount) + '</td>' +
+        '<td class="mono">' + esc(String(p.maxIterations)) + '</td>' +
+        '<td><div class="act-cell">' +
+          '<button class="ghost" data-action="edit" data-idx="' + i + '">Edit</button>' +
+        '</div></td>';
+      tbody.appendChild(tr);
+    });
+  }
+
+  document.getElementById('pipeline-profile-tbody').addEventListener('click', function(e) {
+    const btn = e.target.closest('button');
+    if (!btn) { return; }
+    const idx = parseInt(btn.getAttribute('data-idx'), 10);
+    if (btn.getAttribute('data-action') === 'edit') { showPipelineProfileForm(idx); }
+  });
+
+  function showPipelineProfileForm(idx) {
+    const isNew = idx === -1;
+    const p = isNew
+      ? { agentProfileId: '', name: '', stage: 'Execute', systemPrompt: '', allowedTools: [], maxIterations: 20 }
+      : pipelineProfiles[idx];
+    const stageOptions = PIPELINE_STAGES.map(function(s) {
+      return '<option value="' + s + '"' + (p.stage === s ? ' selected' : '') + '>' + s + '</option>';
+    }).join('');
+    const area = document.getElementById('pipeline-profile-form-area');
+    area.innerHTML =
+      '<div class="form-box">' +
+      '<h3>' + (isNew ? 'Add Pipeline Profile' : 'Edit Pipeline Profile') + '</h3>' +
+      '<div class="field"><label>Profile ID</label>' +
+        '<input type="text" id="pp-id" value="' + esc(p.agentProfileId) + '"' +
+        (isNew ? '' : ' readonly class="readonly"') +
+        ' placeholder="e.g. planner"></div>' +
+      '<div class="field"><label>Name</label>' +
+        '<input type="text" id="pp-name" value="' + esc(p.name) + '" placeholder="e.g. Planner"></div>' +
+      '<div class="field"><label>Pipeline Stage</label>' +
+        '<select id="pp-stage">' + stageOptions + '</select></div>' +
+      '<div class="field"><label>Allowed Tools (comma-separated, empty = all tools)</label>' +
+        '<input type="text" id="pp-tools" value="' + esc((p.allowedTools || []).join(', ')) + '" placeholder="e.g. nm_v1_task_create, nm_v1_task_list"></div>' +
+      '<div class="field"><label>Max Iterations</label>' +
+        '<input type="text" id="pp-maxiter" value="' + esc(String(p.maxIterations)) + '" placeholder="20"></div>' +
+      '<div class="field"><label>System Prompt (optional)</label>' +
+        '<textarea id="pp-prompt" style="min-height:80px">' + esc(p.systemPrompt || '') + '</textarea></div>' +
+      '<div class="form-actions">' +
+        '<button id="pp-save">Save</button>' +
+        '<button class="ghost" id="pp-cancel">Cancel</button>' +
+      '</div></div>';
+
+    document.getElementById('pp-save').addEventListener('click', function() {
+      const id       = document.getElementById('pp-id').value.trim();
+      const name     = document.getElementById('pp-name').value.trim();
+      const stage    = document.getElementById('pp-stage').value;
+      const toolsRaw = document.getElementById('pp-tools').value.trim();
+      const maxIter  = parseInt(document.getElementById('pp-maxiter').value.trim(), 10) || 20;
+      const prompt   = document.getElementById('pp-prompt').value.trim();
+      if (!id || !name) { alert('Profile ID and Name are required.'); return; }
+      const allowedTools = toolsRaw ? toolsRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+      const profile = { agentProfileId: id, name: name, stage: stage, systemPrompt: prompt, allowedTools: allowedTools, maxIterations: maxIter };
+      vscode.postMessage({ type: 'savePipelineProfile', profile: profile });
+      document.getElementById('pipeline-profile-form-area').innerHTML = '';
+    });
+    document.getElementById('pp-cancel').addEventListener('click', function() {
+      document.getElementById('pipeline-profile-form-area').innerHTML = '';
+    });
+  }
+
+  document.getElementById('btn-add-pipeline-profile').addEventListener('click', function() {
+    showPipelineProfileForm(-1);
+  });
+
   // ── Extension host messages ────────────────────────────────────────────────
   window.addEventListener('message', function(event) {
     const msg = event.data;
+    if (msg.type === 'models') {
+      if (onModelsLoaded) { onModelsLoaded(msg.models || []); }
+      return;
+    }
     if (msg.type === 'config') {
-      profiles        = msg.profiles        || [];
-      templates       = msg.templates       || [];
-      defaultTopology = msg.defaultTopology || '';
+      profiles         = msg.profiles        || [];
+      templates        = msg.templates       || [];
+      defaultTopology  = msg.defaultTopology || '';
+      pipelineProfiles = msg.pipelineProfiles || [];
       renderProfiles();
       renderTemplates();
       updateSpawnTemplates();
+      renderPipelineProfiles();
       return;
     }
     if (msg.type === 'apiKeySaved') {
       const statusEl = document.getElementById('pf-key-status');
-      if (statusEl) { statusEl.textContent = 'Key stored (' + esc(msg.profileId) + ')'; }
+      if (statusEl) { statusEl.textContent = 'Key stored (' + esc(msg.apiKeyRef || msg.profileId) + ')'; }
+      // Update the in-memory profiles array so a subsequent Save preserves the apiKeyRef.
+      if (msg.apiKeyRef) {
+        const pi = profiles.findIndex(function(pr) { return pr.id === msg.profileId; });
+        if (pi >= 0) { profiles[pi] = Object.assign({}, profiles[pi], { apiKeyRef: msg.apiKeyRef }); }
+      }
       return;
     }
     if (msg.type === 'spawnResult') {

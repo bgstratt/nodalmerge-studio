@@ -4,12 +4,13 @@ using ModelContextProtocol.Server;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Versioning;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 using StudioTaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
 [McpServerToolType]
-public sealed class WorkUnitTools(IWorkUnitService workUnits, IOrchestratorService orchestrator)
+public sealed class WorkUnitTools(IWorkUnitService workUnits, IOrchestratorService orchestrator, WorkspaceOptions workspaceOptions)
 {
     [McpServerTool(Name = McpToolNames.WorkUnitCreate), Description("Create a work unit from goal and branch.")]
     public async Task<string> CreateAsync(
@@ -19,7 +20,7 @@ public sealed class WorkUnitTools(IWorkUnitService workUnits, IOrchestratorServi
         string? successCriteria = null,
         CancellationToken cancellationToken = default)
     {
-        var workUnit = await orchestrator.CreateWorkUnitAsync(goal, owner!, successCriteria, cancellationToken)
+        var workUnit = await orchestrator.CreateWorkUnitAsync(goal, owner!, successCriteria, workspaceOptions.SeedRepositoryPath, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
         workUnit = workUnit with { BranchId = branchId };
         await workUnits.CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);

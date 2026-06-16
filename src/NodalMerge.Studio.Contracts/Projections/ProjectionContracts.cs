@@ -1,3 +1,5 @@
+using NodalMerge.Studio.Contracts.Domain;
+
 namespace NodalMerge.Studio.Contracts.Projections;
 
 /// <summary>
@@ -9,7 +11,8 @@ public enum ProjectionType
     AuthoritativeState,
     Task,
     MergeProposal,
-    ExecutionSnapshot
+    ExecutionSnapshot,
+    AgentWorkspace,
 }
 
 public enum ProjectionLevel
@@ -66,6 +69,14 @@ public sealed record ExecutionSnapshotProjectionPayload(
     string? CurrentGoal,
     IReadOnlyList<string> FailureHistory,
     IReadOnlyList<string> RecoveryHints);
+
+public sealed record ArtifactChain(
+    IReadOnlyList<ArtifactRef> Artifacts);
+
+public sealed record AgentWorkspaceProjectionPayload(
+    string? AgentId,
+    string? WorkUnitId,
+    ArtifactChain Artifacts);
 
 public static class ProjectionCatalog
 {

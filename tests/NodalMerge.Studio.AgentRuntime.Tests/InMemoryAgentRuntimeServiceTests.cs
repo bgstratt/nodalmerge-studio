@@ -1,14 +1,26 @@
+using Microsoft.Extensions.Logging.Abstractions;
 using NodalMerge.Studio.AgentRuntime;
+using NodalMerge.Studio.Contracts.Domain;
+using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.AgentRuntime.Tests;
 
 public class InMemoryAgentRuntimeServiceTests
 {
-    private static InMemoryAgentRuntimeService Build() => new(new NoopServiceProvider());
+    private static InMemoryAgentRuntimeService Build() =>
+        new(new NoopServiceProvider(), NullLogger<InMemoryAgentRuntimeService>.Instance, new NoopAgentProfileService());
 
     private sealed class NoopServiceProvider : IServiceProvider
     {
         public object? GetService(Type serviceType) => null;
+    }
+
+    private sealed class NoopAgentProfileService : IAgentProfileService
+    {
+        public Task<AgentProfile> CreateAsync(AgentProfile profile, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<AgentProfile?> GetAsync(string profileId, CancellationToken ct = default) => Task.FromResult<AgentProfile?>(null);
+        public Task<AgentProfile> UpdateAsync(AgentProfile profile, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<AgentProfile>> ListAsync(CancellationToken ct = default) => Task.FromResult<IReadOnlyList<AgentProfile>>([]);
     }
 
     // ── SpawnAsync ───────────────────────────────────────────────────────────

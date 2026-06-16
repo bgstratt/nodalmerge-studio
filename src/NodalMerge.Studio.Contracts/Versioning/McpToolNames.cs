@@ -2,50 +2,58 @@ namespace NodalMerge.Studio.Contracts.Versioning;
 
 /// <summary>
 /// Frozen v1 MCP tool names. Do not rename or remove without bumping contract version.
+/// Names must match ^[a-zA-Z0-9_-]{1,128}$ (Anthropic tool name constraint).
 /// </summary>
 public static class McpToolNames
 {
-    public const string ProjectionGet = "nm.v1.projection.get";
-    public const string ProjectionList = "nm.v1.projection.list";
+    public const string ProjectionGet = "nm_v1_projection_get";
+    public const string ProjectionList = "nm_v1_projection_list";
 
-    public const string WorkUnitCreate = "nm.v1.workunit.create";
-    public const string WorkUnitGet = "nm.v1.workunit.get";
-    public const string WorkUnitUpdate = "nm.v1.workunit.update";
-    public const string WorkUnitList = "nm.v1.workunit.list";
+    public const string WorkUnitCreate = "nm_v1_workunit_create";
+    public const string WorkUnitGet = "nm_v1_workunit_get";
+    public const string WorkUnitUpdate = "nm_v1_workunit_update";
+    public const string WorkUnitList = "nm_v1_workunit_list";
 
-    public const string TaskCreate = "nm.v1.task.create";
-    public const string TaskUpdate = "nm.v1.task.update";
-    public const string TaskList = "nm.v1.task.list";
-    public const string TaskAssign = "nm.v1.task.assign";
+    public const string TaskCreate = "nm_v1_task_create";
+    public const string TaskUpdate = "nm_v1_task_update";
+    public const string TaskList = "nm_v1_task_list";
+    public const string TaskAssign = "nm_v1_task_assign";
 
-    public const string BranchCreate = "nm.v1.branch.create";
-    public const string BranchCheckout = "nm.v1.branch.checkout";
-    public const string BranchList = "nm.v1.branch.list";
-    public const string BranchStatus = "nm.v1.branch.status";
+    public const string BranchCreate = "nm_v1_branch_create";
+    public const string BranchCheckout = "nm_v1_branch_checkout";
+    public const string BranchList = "nm_v1_branch_list";
+    public const string BranchStatus = "nm_v1_branch_status";
 
-    public const string MergePropose = "nm.v1.merge.propose";
-    public const string MergeValidate = "nm.v1.merge.validate";
-    public const string MergeReview = "nm.v1.merge.review";
-    public const string MergeApply = "nm.v1.merge.apply";
+    public const string MergePropose = "nm_v1_merge_propose";
+    public const string MergeValidate = "nm_v1_merge_validate";
+    public const string MergeReview = "nm_v1_merge_review";
+    public const string MergeApply = "nm_v1_merge_apply";
 
-    public const string ReplayRange = "nm.v1.replay.range";
-    public const string ReplayRollback = "nm.v1.replay.rollback";
-    public const string ReplayInspect = "nm.v1.replay.inspect";
+    public const string ReplayRange = "nm_v1_replay_range";
+    public const string ReplayRollback = "nm_v1_replay_rollback";
+    public const string ReplayInspect = "nm_v1_replay_inspect";
 
-    public const string StateMarkKnownGood = "nm.v1.state.markKnownGood";
-    public const string StateFindKnownGood = "nm.v1.state.findKnownGood";
-    public const string StateCheckoutKnownGood = "nm.v1.state.checkoutKnownGood";
+    public const string StateMarkKnownGood = "nm_v1_state_markKnownGood";
+    public const string StateFindKnownGood = "nm_v1_state_findKnownGood";
+    public const string StateCheckoutKnownGood = "nm_v1_state_checkoutKnownGood";
 
-    public const string SnapshotGet = "nm.v1.snapshot.get";
-    public const string SnapshotCompare = "nm.v1.snapshot.compare";
+    public const string SnapshotGet = "nm_v1_snapshot_get";
+    public const string SnapshotCompare = "nm_v1_snapshot_compare";
 
-    public const string AgentSpawn = "nm.v1.agent.spawn";
-    public const string AgentPause = "nm.v1.agent.pause";
-    public const string AgentResume = "nm.v1.agent.resume";
-    public const string AgentStatus = "nm.v1.agent.status";
-    public const string AgentStop = "nm.v1.agent.stop";
+    public const string AgentSpawn = "nm_v1_agent_spawn";
+    public const string AgentPause = "nm_v1_agent_pause";
+    public const string AgentResume = "nm_v1_agent_resume";
+    public const string AgentStatus = "nm_v1_agent_status";
+    public const string AgentStop = "nm_v1_agent_stop";
 
-    public const string WorkspaceSummary = "nm.v1.workspace.summary";
+    public const string WorkspaceSummary = "nm_v1_workspace_summary";
+
+    public const string WorkspaceRead   = "nm_v1_workspace_read";
+    public const string WorkspaceWrite  = "nm_v1_workspace_write";
+    public const string WorkspaceDelete = "nm_v1_workspace_delete";
+    public const string WorkspaceList   = "nm_v1_workspace_list";
+    public const string WorkspaceDiff   = "nm_v1_workspace_diff";
+    public const string WorkspaceExists = "nm_v1_workspace_exists";
 
     public static IReadOnlyList<string> All { get; } =
     [
@@ -80,6 +88,12 @@ public static class McpToolNames
         AgentResume,
         AgentStatus,
         AgentStop,
-        WorkspaceSummary
+        WorkspaceSummary,
+        WorkspaceRead,
+        WorkspaceWrite,
+        WorkspaceDelete,
+        WorkspaceList,
+        WorkspaceDiff,
+        WorkspaceExists
     ];
 }

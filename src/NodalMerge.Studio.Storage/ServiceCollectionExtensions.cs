@@ -11,6 +11,9 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IBranchService, NodalMergeBranchService>();
         services.AddSingleton<IKnownGoodStateService, InMemoryKnownGoodStateService>();
         services.AddSingleton<IReplayService, StubReplayService>();
+        services.AddSingleton<IAgentProfileService, AgentProfileService>();
+        services.AddSingleton<IArtifactRefService, InMemoryArtifactRefService>();
+        AddFileWorkspaceService(services);
         return services;
     }
 
@@ -20,7 +23,16 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IBranchService, InMemoryBranchService>();
         services.AddSingleton<IKnownGoodStateService, InMemoryKnownGoodStateService>();
         services.AddSingleton<IReplayService, StubReplayService>();
+        services.AddSingleton<IAgentProfileService, AgentProfileService>();
+        services.AddSingleton<IArtifactRefService, InMemoryArtifactRefService>();
+        AddFileWorkspaceService(services);
         return services;
+    }
+
+    private static void AddFileWorkspaceService(IServiceCollection services)
+    {
+        services.AddSingleton<IFileWorkspaceService>(sp =>
+            new FileSystemWorkspaceService(sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions()));
     }
 }
 

@@ -50,6 +50,10 @@ public interface IWorkUnitService
     Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken cancellationToken = default);
 }
 
 public interface IOrchestratorService
@@ -58,6 +62,10 @@ public interface IOrchestratorService
         string goal,
         string owner,
         string? successCriteria = null,
+        string? repositoryPath = null,
+        string? parentWorkUnitId = null,
+        IReadOnlyList<string>? dependsOn = null,
+        IReadOnlyList<string>? fileScope = null,
         CancellationToken cancellationToken = default);
 
     Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default);
@@ -130,6 +138,7 @@ public interface IAgentControlService
         string? baseUrl = null,
         string? apiKey = null,
         string? provider = null,
+        string? profileId = null,
         CancellationToken cancellationToken = default);
 
     Task PauseAsync(string agentId, CancellationToken cancellationToken = default);
@@ -141,11 +150,44 @@ public interface IAgentControlService
     Task<string> GetStatusAsync(string agentId, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<AgentInfo>> ListActiveAsync(CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<AgentInfo>> ListAllAsync(CancellationToken cancellationToken = default);
+}
+
+public interface IArtifactRefService
+{
+    Task WriteAsync(ArtifactRef artifact, CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<ArtifactRef>> ListAsync(string workUnitId, CancellationToken cancellationToken = default);
+}
+
+public interface IAgentProfileService
+{
+    Task<AgentProfile> CreateAsync(AgentProfile profile, CancellationToken cancellationToken = default);
+
+    Task<AgentProfile?> GetAsync(string profileId, CancellationToken cancellationToken = default);
+
+    Task<AgentProfile> UpdateAsync(AgentProfile profile, CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<AgentProfile>> ListAsync(CancellationToken cancellationToken = default);
 }
 
 public interface IWorkspaceService
 {
     Task<WorkspaceSummary> GetSummaryAsync(string? branchId = null, CancellationToken cancellationToken = default);
+}
+
+public interface IFileWorkspaceService
+{
+    Task InitBranchAsync(string branchId, string? seedFromBranchId = null, CancellationToken ct = default);
+    Task<string?> ReadAsync(string branchId, string relativePath, CancellationToken ct = default);
+    Task WriteAsync(string branchId, string relativePath, string content, CancellationToken ct = default);
+    Task DeleteAsync(string branchId, string relativePath, CancellationToken ct = default);
+    Task<bool> ExistsAsync(string branchId, string relativePath, CancellationToken ct = default);
+    Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, CancellationToken ct = default);
+    Task<string> DiffAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default);
+    Task ApplyBranchAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default);
+    Task<string?> GetWorkingDirectoryAsync(string branchId, CancellationToken ct = default);
 }
 
 public sealed record WorkspaceSummary(

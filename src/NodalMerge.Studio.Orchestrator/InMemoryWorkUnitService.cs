@@ -15,23 +15,29 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
     private readonly IKnownGoodStateService _knownGoodStateService;
     private readonly IAgentControlService _agentControl;
     private readonly IStudioNodeStore _nodeStore;
+    private readonly WorkspaceOptions _workspaceOptions;
 
     public InMemoryWorkUnitService(
         IBranchService branchService,
         IMergeService mergeService,
         IKnownGoodStateService knownGoodStateService,
         IAgentControlService agentControl,
-        IStudioNodeStore nodeStore)
+        IStudioNodeStore nodeStore,
+        WorkspaceOptions workspaceOptions)
     {
         _branchService         = branchService;
         _mergeService          = mergeService;
         _knownGoodStateService = knownGoodStateService;
         _agentControl          = agentControl;
         _nodeStore             = nodeStore;
+        _workspaceOptions      = workspaceOptions;
     }
 
     public async Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken cancellationToken = default)
     {
+        if (workUnit.ParentWorkUnitId is not null && !_workUnits.ContainsKey(workUnit.ParentWorkUnitId))
+            throw new KeyNotFoundException($"Parent work unit '{workUnit.ParentWorkUnitId}' was not found.");
+
         _workUnits[workUnit.WorkUnitId] = workUnit;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.WorkUnitV1,
@@ -82,8 +88,19 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         string goal,
         string owner,
         string? successCriteria = null,
+        string? repositoryPath = null,
+        string? parentWorkUnitId = null,
+        IReadOnlyList<string>? dependsOn = null,
+        IReadOnlyList<string>? fileScope = null,
         CancellationToken cancellationToken = default)
     {
+        // First work unit with a repositoryPath seeds the main branch for this session.
+        if (!string.IsNullOrWhiteSpace(repositoryPath) &&
+            string.IsNullOrWhiteSpace(_workspaceOptions.SeedRepositoryPath))
+        {
+            _workspaceOptions.SeedRepositoryPath = repositoryPath;
+        }
+
         var branchId = await _branchService.CreateBranchAsync($"work-{Guid.NewGuid():N}", cancellationToken: cancellationToken)
             .ConfigureAwait(false);
 
@@ -98,7 +115,10 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             Owner: owner,
             AssignedAgent: null,
             SuccessCriteria: successCriteria,
-            Metadata: null);
+            Metadata: null,
+            ParentWorkUnitId: parentWorkUnitId,
+            DependsOn: dependsOn ?? [],
+            FileScope: fileScope ?? []);
 
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }
@@ -161,6 +181,24 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             knownGoodStates);
     }
 
+    public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken cancellationToken = default)
+    {
+        var children = _workUnits.Values
+            .Where(w => w.ParentWorkUnitId == parentId)
+            .OrderBy(w => w.CreatedAt)
+            .ToList();
+        return Task.FromResult<IReadOnlyList<WorkUnit>>(children);
+    }
+
+    public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken cancellationToken = default)
+    {
+        var dependents = _workUnits.Values
+            .Where(w => w.DependsOn.Contains(workUnitId))
+            .OrderBy(w => w.CreatedAt)
+            .ToList();
+        return Task.FromResult<IReadOnlyList<WorkUnit>>(dependents);
+    }
+
     private WorkUnit GetRequired(string workUnitId)
     {
         if (!_workUnits.TryGetValue(workUnitId, out var workUnit))
@@ -176,7 +214,13 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddStudioOrchestrator(this IServiceCollection services)
     {
-        services.AddSingleton<InMemoryWorkUnitService>();
+        services.AddSingleton<InMemoryWorkUnitService>(sp => new InMemoryWorkUnitService(
+            sp.GetRequiredService<IBranchService>(),
+            sp.GetRequiredService<IMergeService>(),
+            sp.GetRequiredService<IKnownGoodStateService>(),
+            sp.GetRequiredService<IAgentControlService>(),
+            sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions()));
         services.AddSingleton<IWorkUnitService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IOrchestratorService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IWorkspaceService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());

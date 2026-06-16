@@ -69,7 +69,12 @@ internal sealed class LlmClient(HttpClient http)
             JsonSerializer.Serialize(requestBody, SerOpts), Encoding.UTF8, "application/json");
 
         using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
-        resp.EnsureSuccessStatusCode();
+        if (!resp.IsSuccessStatusCode)
+        {
+            var errorBody = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new HttpRequestException(
+                $"Anthropic {(int)resp.StatusCode}: {errorBody}", null, resp.StatusCode);
+        }
 
         var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         var raw = JsonSerializer.Deserialize<AnthropicResponse>(json, DeserOpts)
@@ -145,7 +150,12 @@ internal sealed class LlmClient(HttpClient http)
             JsonSerializer.Serialize(requestBody, SerOpts), Encoding.UTF8, "application/json");
 
         using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
-        resp.EnsureSuccessStatusCode();
+        if (!resp.IsSuccessStatusCode)
+        {
+            var errorBody = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new HttpRequestException(
+                $"OpenAI-compat {(int)resp.StatusCode}: {errorBody}", null, resp.StatusCode);
+        }
 
         var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
         var raw = JsonSerializer.Deserialize<OpenAiResponse>(json, DeserOpts)

@@ -19,7 +19,12 @@ public sealed record MergeProposal(
     string? VerificationResults,
     string? RollbackPlan,
     double? Confidence,
-    MergeProposalStatus Status);
+    MergeProposalStatus Status,
+    string? WorkspaceChanges = null,
+    DateTimeOffset? DiffGeneratedAt = null,
+    string? AgentId = null,
+    string? Model = null,
+    string? Provider = null);
 
 public static class MergeProposalTransitions
 {

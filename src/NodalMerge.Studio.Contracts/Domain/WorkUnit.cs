@@ -20,7 +20,10 @@ public sealed record WorkUnit(
     string Owner,
     string? AssignedAgent,
     string? SuccessCriteria,
-    IReadOnlyDictionary<string, string>? Metadata);
+    IReadOnlyDictionary<string, string>? Metadata,
+    string? ParentWorkUnitId,
+    IReadOnlyList<string> DependsOn,
+    IReadOnlyList<string> FileScope);
 
 public static class WorkUnitTransitions
 {

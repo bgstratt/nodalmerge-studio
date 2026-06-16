@@ -25,6 +25,8 @@ public class ProjectionManagerTests
 
         public Task<WorkUnit> CreateAsync(WorkUnit w, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit> UpdateStatusAsync(string id, WorkUnitStatus s, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private sealed class FakeTaskService : ITaskService
@@ -81,6 +83,13 @@ public class ProjectionManagerTests
         public Task RecordActionAsync(string agentId, string workUnitId, string action, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
+    private sealed class FakeArtifactRefService : IArtifactRefService
+    {
+        public Task WriteAsync(ArtifactRef artifact, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<IReadOnlyList<ArtifactRef>> ListAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
+    }
+
     private static ProjectionManager BuildManager(
         FakeWorkUnitService? workUnits = null,
         FakeTaskService? tasks = null,
@@ -90,10 +99,11 @@ public class ProjectionManagerTests
             workUnits ?? new FakeWorkUnitService(),
             tasks ?? new FakeTaskService(),
             merges ?? new FakeMergeService(),
-            agentRuntime ?? new FakeAgentRuntimeService());
+            agentRuntime ?? new FakeAgentRuntimeService(),
+            new FakeArtifactRefService());
 
     private static WorkUnit MakeWorkUnit(string id, string goal, string branch = "main", WorkUnitStatus status = WorkUnitStatus.Active) =>
-        new(id, goal, branch, status, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "test", null, null, null);
+        new(id, goal, branch, status, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "test", null, null, null, null, [], []);
 
     private static StudioTask MakeTask(string id, string workUnitId, TaskStatus status = TaskStatus.Open) =>
         new(id, workUnitId, $"Task {id}", "desc", status, null, 1);

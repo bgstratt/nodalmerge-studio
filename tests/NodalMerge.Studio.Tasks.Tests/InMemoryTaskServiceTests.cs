@@ -16,7 +16,7 @@ public class InMemoryTaskServiceTests
 
         public void Seed(string workUnitId) =>
             _store[workUnitId] = new WorkUnit(workUnitId, "goal", "branch", WorkUnitStatus.Active,
-                DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "owner", null, null, null);
+                DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "owner", null, null, null, null, [], []);
 
         public Task<WorkUnit?> GetAsync(string id, CancellationToken ct = default) =>
             Task.FromResult(_store.GetValueOrDefault(id));
@@ -26,6 +26,8 @@ public class InMemoryTaskServiceTests
 
         public Task<WorkUnit> CreateAsync(WorkUnit w, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit> UpdateStatusAsync(string id, WorkUnitStatus s, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private static (InMemoryTaskService svc, FakeWorkUnitService workUnits) Build(params string[] seededWorkUnitIds)

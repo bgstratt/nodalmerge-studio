@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using NodalMerge.Studio.AgentRuntime;
 using NodalMerge.Studio.Merge;
@@ -26,6 +27,19 @@ public static class StudioServiceCollectionExtensions
                 // Studio Host binds to 127.0.0.1 only; permissive CORS is safe for local-only access.
                 policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod();
             });
+        });
+
+        // Bind WorkspaceOptions from "Workspace" config section; falls back to defaults if absent.
+        // Must be registered before AddNodalMergeStorage/AddInMemoryStorage so the factory picks it up.
+        services.AddSingleton<WorkspaceOptions>(sp =>
+        {
+            var config = sp.GetService<IConfiguration>();
+            var opts   = new WorkspaceOptions();
+            config?.GetSection("Workspace").Bind(opts);
+            // Config binding replaces C# defaults with empty strings for missing/blank values.
+            if (string.IsNullOrWhiteSpace(opts.RootPath))
+                opts.RootPath = Path.Combine(Path.GetTempPath(), "studio-workspace");
+            return opts;
         });
 
         services.AddNodalMergeStorage();

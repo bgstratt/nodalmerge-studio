@@ -15,17 +15,20 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly ITaskService _tasks;
     private readonly IMergeService _merges;
     private readonly IAgentRuntimeService _agentRuntime;
+    private readonly IArtifactRefService _artifactRefs;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
         ITaskService tasks,
         IMergeService merges,
-        IAgentRuntimeService agentRuntime)
+        IAgentRuntimeService agentRuntime,
+        IArtifactRefService artifactRefs)
     {
-        _workUnits = workUnits;
-        _tasks = tasks;
-        _merges = merges;
+        _workUnits    = workUnits;
+        _tasks        = tasks;
+        _merges       = merges;
         _agentRuntime = agentRuntime;
+        _artifactRefs = artifactRefs;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -37,6 +40,7 @@ public sealed class ProjectionManager : IProjectionManager
             ProjectionType.MergeProposal => await BuildMergeProposalAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.ExecutionSnapshot => await BuildExecutionSnapshotAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.AuthoritativeState => await BuildAuthoritativeStateAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.AgentWorkspace => await BuildAgentWorkspaceAsync(request, cancellationToken).ConfigureAwait(false),
             _ => throw new ArgumentOutOfRangeException(nameof(request), request.Type, "Unknown projection type.")
         };
 
@@ -196,6 +200,45 @@ public sealed class ProjectionManager : IProjectionManager
             ProjectionLevel.Compact => Serialize(new { branchId, mergedWorkUnits = mergedState.Keys.ToList() }),
             _ => Serialize(new AuthoritativeStateProjectionPayload(branchId, mergedState))
         };
+    }
+
+    private async Task<string> BuildAgentWorkspaceAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        var workUnitId = request.WorkUnitId;
+        if (workUnitId is null)
+            return Serialize(new { error = "AgentWorkspace projection requires workUnitId." });
+
+        var refs = await _artifactRefs.ListAsync(workUnitId, ct).ConfigureAwait(false);
+
+        // Enrich MergeProposal refs with current status from the merge service.
+        var enriched = new List<ArtifactRef>(refs.Count);
+        foreach (var r in refs)
+        {
+            if (r.Type == ArtifactType.MergeProposal)
+            {
+                var proposal = await _merges.GetAsync(r.ArtifactId, ct).ConfigureAwait(false);
+                if (proposal is not null)
+                {
+                    var status = proposal.Status switch
+                    {
+                        MergeProposalStatus.Approved => ArtifactStatus.Approved,
+                        MergeProposalStatus.Rejected => ArtifactStatus.Rejected,
+                        MergeProposalStatus.Merged   => ArtifactStatus.Applied,
+                        _                            => ArtifactStatus.Active,
+                    };
+                    enriched.Add(r with { Status = status });
+                    continue;
+                }
+            }
+            enriched.Add(r);
+        }
+
+        var payload = new AgentWorkspaceProjectionPayload(
+            request.AgentId,
+            workUnitId,
+            new ArtifactChain(enriched));
+
+        return Serialize(payload);
     }
 
     private static string Serialize(object data) => JsonSerializer.Serialize(data, JsonOptions);

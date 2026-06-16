@@ -10,7 +10,7 @@ public class McpToolNamesTests
     {
         Assert.All(McpToolNames.All, name =>
         {
-            Assert.StartsWith($"{McpContract.NamespacePrefix}.", name, StringComparison.Ordinal);
+            Assert.StartsWith($"{McpContract.NamespacePrefix}_", name, StringComparison.Ordinal);
         });
     }
 
@@ -35,7 +35,7 @@ public class ProjectionCatalogTests
     [Fact]
     public void Catalog_lists_all_projection_types()
     {
-        Assert.Equal(5, ProjectionCatalog.Types.Count);
+        Assert.Equal(Enum.GetValues<ProjectionType>().Length, ProjectionCatalog.Types.Count);
         Assert.Contains("WorkUnit", ProjectionCatalog.Types);
         Assert.Contains("ExecutionSnapshot", ProjectionCatalog.Types);
     }

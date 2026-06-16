@@ -33,8 +33,8 @@ export interface SpawnLlmConfig {
 }
 
 const DEFAULT_PROFILES: AgentProfile[] = [
-  { id: 'orchestrator', label: 'Orchestrator', domain: 'orchestration', model: '' },
-  { id: 'worker',       label: 'Worker',       domain: 'general',       model: '' },
+  { id: 'orchestrator', label: 'Orchestrator', domain: 'orchestration', provider: 'vscode-lm', model: '' },
+  { id: 'worker',       label: 'Worker',       domain: 'general',       provider: 'vscode-lm', model: '' },
 ];
 
 const DEFAULT_TEMPLATES: TopologyTemplate[] = [
@@ -116,7 +116,9 @@ export class AgentConfigService {
     }
 
     const apiKey = await this.resolveApiKey(p, secrets);
-    const baseUrl = p.baseUrl?.trim();
+    const baseUrl = p.provider === 'anthropic'
+      ? (p.baseUrl?.trim() || 'https://api.anthropic.com')
+      : p.baseUrl?.trim();
     if (!baseUrl || apiKey === undefined) { return undefined; }
 
     return {

@@ -113,7 +113,7 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
       const [summary, workUnits, agents, merges] = await Promise.all([
         this.get<WorkspaceSummary>('/studio/workspace-summary'),
         this.get<WorkUnit[]>('/studio/workunits'),
-        this.get<AgentInfo[]>('/studio/agents'),
+        this.get<AgentInfo[]>('/studio/agents?all=true'),
         this.get<MergeProposal[]>('/studio/merges'),
       ]);
       void this.panel.webview.postMessage({ type: 'data', summary, workUnits, agents, merges });
@@ -139,7 +139,8 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
             ignoreFocusOut: true,
           });
           if (!owner) { return; }
-          await this.post('/studio/workunits', { goal, owner });
+          const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+          await this.post('/studio/workunits', { goal, owner, ...(repositoryPath ? { repositoryPath } : {}) });
           void this.poll();
           break;
         }
@@ -399,8 +400,8 @@ const DASHBOARD_HTML = `
   <div id="work-units"><p class="empty">Loading…</p></div>
   <button class="add-btn" id="btn-new-wu">+ New Work Unit</button>
 
-  <h2>Active Agents</h2>
-  <div id="agents"><p class="empty">No active agents.</p></div>
+  <h2>Agents</h2>
+  <div id="agents"><p class="empty">No agents.</p></div>
   <button class="add-btn" id="btn-spawn">+ Spawn Agent</button>
 
   <h2>Pending Merges</h2>
@@ -469,7 +470,7 @@ const DASHBOARD_JS = `
   function renderAgents(agents, wus) {
     var el = document.getElementById('agents');
     if (!agents || !agents.length) {
-      el.innerHTML = '<p class="empty">No active agents.</p>';
+      el.innerHTML = '<p class="empty">No agents.</p>';
       return;
     }
     var wuMap = {};

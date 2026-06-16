@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 
@@ -10,10 +11,17 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     private readonly ConcurrentDictionary<(string AgentId, string WorkUnitId), ExecutionSnapshot> _snapshots = new();
     private readonly ConcurrentDictionary<string, AgentRecord> _agents = new();
     private readonly IServiceProvider _serviceProvider;
+    private readonly ILogger<InMemoryAgentRuntimeService> _logger;
+    private readonly IAgentProfileService _profileService;
 
-    public InMemoryAgentRuntimeService(IServiceProvider serviceProvider)
+    public InMemoryAgentRuntimeService(
+        IServiceProvider serviceProvider,
+        ILogger<InMemoryAgentRuntimeService> logger,
+        IAgentProfileService profileService)
     {
         _serviceProvider = serviceProvider;
+        _logger          = logger;
+        _profileService  = profileService;
     }
 
     private sealed record AgentRecord(
@@ -80,23 +88,34 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? baseUrl = null,
         string? apiKey = null,
         string? provider = null,
+        string? profileId = null,
         CancellationToken cancellationToken = default)
     {
         var agentId = $"{agentType}-{Guid.NewGuid():N}";
+
+        AgentProfile? profile = profileId is not null
+            ? _profileService.GetAsync(profileId, cancellationToken).GetAwaiter().GetResult()
+            : null;
 
         CancellationTokenSource? cts = null;
         var resolvedProvider = provider ?? "anthropic";
         var canStartLoop = !string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
             && (!string.IsNullOrWhiteSpace(model)
                 || resolvedProvider.Equals("openai", StringComparison.OrdinalIgnoreCase));
+        _logger.LogInformation(
+            "[Agent {AgentId}] Spawn — agentType={AgentType} provider={Provider} model={Model} baseUrl={BaseUrl} profileId={ProfileId} canStartLoop={CanStart}",
+            agentId, agentType, resolvedProvider, model ?? "(none)", baseUrl ?? "(none)", profileId ?? "(none)", canStartLoop);
+        if (!canStartLoop)
+            _logger.LogWarning("[Agent {AgentId}] Loop will NOT start — missing credentials or model. baseUrl={BaseUrl} model={Model} provider={Provider}",
+                agentId, baseUrl ?? "(none)", model ?? "(none)", resolvedProvider);
         if (canStartLoop)
         {
             cts = new CancellationTokenSource();
             var loopModel = model ?? string.Empty;
             if (agentType == "orchestrator")
-                StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, loopModel, baseUrl!, apiKey, cts);
+                StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
             else if (agentType == "worker" && taskId is not null)
-                StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl!, apiKey, cts);
+                StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
             else
                 cts.Dispose();
         }
@@ -112,8 +131,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string model,
         string baseUrl,
         string apiKey,
+        AgentProfile? profile,
         CancellationTokenSource cts)
     {
+        _logger.LogInformation("[Agent {AgentId}] Starting orchestrator loop — provider={Provider} model={Model} baseUrl={BaseUrl}",
+            agentId, provider, model, baseUrl);
         _ = Task.Run(async () =>
         {
             try
@@ -121,12 +143,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
                 var loop = new OrchestratorAgentLoop(
-                    agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm);
+                    agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm, profile);
                 await loop.RunAsync(cts.Token).ConfigureAwait(false);
+                _logger.LogInformation("[Agent {AgentId}] Orchestrator loop completed.", agentId);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
+                _logger.LogError(ex, "[Agent {AgentId}] Orchestrator loop failed.", agentId);
                 if (_agents.TryGetValue(agentId, out var r))
                 {
                     var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
@@ -150,8 +174,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string model,
         string baseUrl,
         string apiKey,
+        AgentProfile? profile,
         CancellationTokenSource cts)
     {
+        _logger.LogInformation("[Agent {AgentId}] Starting worker loop — provider={Provider} model={Model} taskId={TaskId}",
+            agentId, provider, model, taskId);
         _ = Task.Run(async () =>
         {
             try
@@ -159,12 +186,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
                 var loop = new WorkerAgentLoop(
-                    agentId, workUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm);
+                    agentId, workUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm, profile);
                 await loop.RunAsync(cts.Token).ConfigureAwait(false);
+                _logger.LogInformation("[Agent {AgentId}] Worker loop completed.", agentId);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
+                _logger.LogError(ex, "[Agent {AgentId}] Worker loop failed.", agentId);
                 if (_agents.TryGetValue(agentId, out var r))
                 {
                     var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
@@ -216,6 +245,15 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             .ToList();
 
         return Task.FromResult<IReadOnlyList<AgentInfo>>(active);
+    }
+
+    public Task<IReadOnlyList<AgentInfo>> ListAllAsync(CancellationToken cancellationToken = default)
+    {
+        var all = _agents.Values
+            .Select(a => new AgentInfo(a.AgentId, a.WorkUnitId, a.Status))
+            .ToList();
+
+        return Task.FromResult<IReadOnlyList<AgentInfo>>(all);
     }
 
     private AgentRecord GetRequired(string agentId)

@@ -44,14 +44,14 @@ internal sealed class ScriptedLlmHandler : HttpMessageHandler
         var wuId = ParseBetween(firstMsg, "Begin orchestrating work unit ", ". Your agent ID is");
         return step switch
         {
-            0 => ToolUse("tu-o-1", "nm.v1.workunit.get", new { workUnitId = wuId }),
-            1 => ToolUse("tu-o-2", "nm.v1.task.create", new
+            0 => ToolUse("tu-o-1", "nm_v1_workunit_get", new { workUnitId = wuId }),
+            1 => ToolUse("tu-o-2", "nm_v1_task_create", new
             {
                 workUnitId = wuId,
                 title = "Execute the goal",
                 description = "Complete all work required for this work unit"
             }),
-            2 => ToolUse("tu-o-3", "nm.v1.agent.spawn", new
+            2 => ToolUse("tu-o-3", "nm_v1_agent_spawn", new
             {
                 agentType = "worker",
                 workUnitId = wuId,
@@ -72,10 +72,10 @@ internal sealed class ScriptedLlmHandler : HttpMessageHandler
         var wuId   = ParseBetween(firstMsg, "for work unit ", ". Your agent ID is");
         return step switch
         {
-            0 => ToolUse("tu-w-1", "nm.v1.task.update", new { taskId, status = "InProgress" }),
-            1 => ToolUse("tu-w-2", "nm.v1.workunit.get", new { workUnitId = wuId }),
-            2 => ToolUse("tu-w-3", "nm.v1.task.update", new { taskId, status = "Completed" }),
-            3 => ToolUse("tu-w-4", "nm.v1.merge.propose", new
+            0 => ToolUse("tu-w-1", "nm_v1_task_update", new { taskId, status = "InProgress" }),
+            1 => ToolUse("tu-w-2", "nm_v1_workunit_get", new { workUnitId = wuId }),
+            2 => ToolUse("tu-w-3", "nm_v1_task_update", new { taskId, status = "Completed" }),
+            3 => ToolUse("tu-w-4", "nm_v1_merge_propose", new
             {
                 // WorkUnit serialises BranchId in PascalCase with default JsonSerializer options.
                 sourceBranch = ExtractFromToolResult(messages, "BranchId")
@@ -84,7 +84,7 @@ internal sealed class ScriptedLlmHandler : HttpMessageHandler
                 targetBranch = "main",
                 summary = "Completed the assigned task for the work unit"
             }),
-            4 => ToolUse("tu-w-5", "nm.v1.merge.validate", new
+            4 => ToolUse("tu-w-5", "nm_v1_merge_validate", new
             {
                 proposalId = ExtractFromToolResult(messages, "proposalId") ?? "unknown"
             }),

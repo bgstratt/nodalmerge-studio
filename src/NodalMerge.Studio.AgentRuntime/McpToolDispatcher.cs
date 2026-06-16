@@ -1,7 +1,9 @@
 using System.Text.Json;
 using NodalMerge.Studio.Contracts.Domain;
+using NodalMerge.Studio.Contracts.Projections;
 using NodalMerge.Studio.Contracts.Versioning;
 using NodalMerge.Studio.Core.Services;
+using StudioArtifactStatus = NodalMerge.Studio.Contracts.Domain.ArtifactStatus;
 using StudioTaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.AgentRuntime;
@@ -13,11 +15,21 @@ internal sealed class McpToolDispatcher(
     IBranchService branches,
     IMergeService merge,
     IWorkspaceService workspace,
+    IFileWorkspaceService fileWorkspace,
     ISnapshotService snapshots,
-    IAgentControlService agentControl)
+    IAgentControlService agentControl,
+    IArtifactRefService artifactRefs,
+    IProjectionManager projections)
 {
-    public async Task<string> DispatchAsync(string toolName, JsonElement input, CancellationToken ct)
+    public async Task<string> DispatchAsync(
+        string toolName,
+        JsonElement input,
+        IReadOnlyList<string>? allowedTools,
+        CancellationToken ct)
     {
+        if (allowedTools is { Count: > 0 } && !allowedTools.Contains(toolName))
+            return ToError($"Tool '{toolName}' is not permitted by this agent's profile.");
+
         try
         {
             return toolName switch
@@ -40,6 +52,14 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.MergeValidate    => await MergeValidateAsync(input, ct),
                 McpToolNames.WorkspaceSummary => await WorkspaceSummaryAsync(input, ct),
                 McpToolNames.SnapshotGet      => await SnapshotGetAsync(input, ct),
+                McpToolNames.ProjectionGet    => await ProjectionGetAsync(input, ct),
+                McpToolNames.MergeApply       => await MergeApplyAsync(input, ct),
+                McpToolNames.WorkspaceRead    => await WorkspaceReadAsync(input, ct),
+                McpToolNames.WorkspaceWrite   => await WorkspaceWriteAsync(input, ct),
+                McpToolNames.WorkspaceDelete  => await WorkspaceDeleteAsync(input, ct),
+                McpToolNames.WorkspaceList    => await WorkspaceListAsync(input, ct),
+                McpToolNames.WorkspaceDiff    => await WorkspaceDiffAsync(input, ct),
+                McpToolNames.WorkspaceExists  => await WorkspaceExistsAsync(input, ct),
                 _ => ToError($"Tool '{toolName}' is not dispatched by the agent runtime.")
             };
         }
@@ -59,7 +79,7 @@ internal sealed class McpToolDispatcher(
     {
         var wu = await orchestrator.CreateWorkUnitAsync(
             Str(input, "goal")!, Str(input, "owner") ?? "studio",
-            Str(input, "successCriteria"), ct).ConfigureAwait(false);
+            Str(input, "successCriteria"), cancellationToken: ct).ConfigureAwait(false);
         wu = wu with { BranchId = Str(input, "branchId") ?? wu.BranchId };
         await workUnits.CreateAsync(wu, ct).ConfigureAwait(false);
         return ToJson(new { workUnitId = wu.WorkUnitId, branchId = wu.BranchId });
@@ -86,15 +106,24 @@ internal sealed class McpToolDispatcher(
 
     private async Task<string> TaskCreateAsync(JsonElement input, CancellationToken ct)
     {
+        var workUnitId = Str(input, "workUnitId")!;
         var task = new StudioTask(
             Guid.NewGuid().ToString("N"),
-            Str(input, "workUnitId")!,
+            workUnitId,
             Str(input, "title")!,
             Str(input, "description")!,
             StudioTaskStatus.Open,
             null,
             Int(input, "priority") ?? 0);
         var created = await tasks.CreateAsync(task, ct).ConfigureAwait(false);
+        await artifactRefs.WriteAsync(new ArtifactRef(
+            created.TaskId,
+            ArtifactType.Task,
+            workUnitId,
+            StudioArtifactStatus.Active,
+            DateTimeOffset.UtcNow,
+            workUnitId,
+            null), ct).ConfigureAwait(false);
         return ToJson(new { taskId = created.TaskId });
     }
 
@@ -154,7 +183,7 @@ internal sealed class McpToolDispatcher(
         var agentId = await agentControl.SpawnAsync(
             Str(input, "agentType")!, Str(input, "workUnitId")!,
             Str(input, "taskId"), Str(input, "model"), Str(input, "baseUrl"), Str(input, "apiKey"),
-            Str(input, "provider"), ct).ConfigureAwait(false);
+            Str(input, "provider"), Str(input, "profileId"), ct).ConfigureAwait(false);
         return ToJson(new { agentId });
     }
 
@@ -174,18 +203,50 @@ internal sealed class McpToolDispatcher(
 
     private async Task<string> MergeProposeAsync(JsonElement input, CancellationToken ct)
     {
-        var proposalId = $"MP-{Guid.NewGuid():N}";
-        var summary = Str(input, "summary")!;
+        var proposalId   = $"MP-{Guid.NewGuid():N}";
+        var summary      = Str(input, "summary")!;
+        var sourceBranch = Str(input, "sourceBranch")!;
+        var targetBranch = Str(input, "targetBranch")!;
+        var workUnitId   = Str(input, "workUnitId");
+        var agentId      = Str(input, "agentId");
+
+        string? workspaceChanges = null;
+        DateTimeOffset? diffGeneratedAt = null;
+        try
+        {
+            workspaceChanges = await fileWorkspace.DiffAsync(sourceBranch, targetBranch, ct).ConfigureAwait(false);
+            diffGeneratedAt  = DateTimeOffset.UtcNow;
+        }
+        catch { /* branch dirs may not exist yet; diff is optional */ }
+
         var proposal = new MergeProposal(
             proposalId,
-            Str(input, "sourceBranch")!,
-            Str(input, "targetBranch")!,
+            sourceBranch,
+            targetBranch,
             Str(input, "goal") ?? summary,
             summary,
             Str(input, "changeDescription") ?? summary,
             null, null, null,
-            MergeProposalStatus.Draft);
+            MergeProposalStatus.Draft,
+            WorkspaceChanges: workspaceChanges,
+            DiffGeneratedAt:  diffGeneratedAt,
+            AgentId:          agentId,
+            Model:            Str(input, "model"),
+            Provider:         Str(input, "provider"));
         var created = await merge.ProposeAsync(proposal, ct).ConfigureAwait(false);
+
+        if (workUnitId is not null)
+        {
+            await artifactRefs.WriteAsync(new ArtifactRef(
+                created.ProposalId,
+                ArtifactType.MergeProposal,
+                workUnitId,
+                StudioArtifactStatus.Active,
+                DateTimeOffset.UtcNow,
+                workUnitId,
+                agentId), ct).ConfigureAwait(false);
+        }
+
         return ToJson(new { proposalId = created.ProposalId, status = created.Status.ToString() });
     }
 
@@ -201,11 +262,116 @@ internal sealed class McpToolDispatcher(
         return ToJson(summary);
     }
 
+    private async Task<string> WorkspaceReadAsync(JsonElement input, CancellationToken ct)
+    {
+        var branchId = Str(input, "branchId");
+        var path     = Str(input, "path");
+        if (branchId is null || path is null) return ToError("branchId and path are required.");
+        try
+        {
+            var content = await fileWorkspace.ReadAsync(branchId, path, ct).ConfigureAwait(false);
+            return content is null
+                ? ToError($"File '{path}' not found in branch '{branchId}'.")
+                : ToJson(new { content });
+        }
+        catch (Exception ex) { return ToError(ex.Message); }
+    }
+
+    private async Task<string> WorkspaceWriteAsync(JsonElement input, CancellationToken ct)
+    {
+        var branchId = Str(input, "branchId");
+        var path     = Str(input, "path");
+        var content  = Str(input, "content");
+        if (branchId is null || path is null || content is null) return ToError("branchId, path, and content are required.");
+        try
+        {
+            await fileWorkspace.WriteAsync(branchId, path, content, ct).ConfigureAwait(false);
+            return ToJson(new { written = true, path });
+        }
+        catch (Exception ex) { return ToError(ex.Message); }
+    }
+
+    private async Task<string> WorkspaceDeleteAsync(JsonElement input, CancellationToken ct)
+    {
+        var branchId = Str(input, "branchId");
+        var path     = Str(input, "path");
+        if (branchId is null || path is null) return ToError("branchId and path are required.");
+        try
+        {
+            await fileWorkspace.DeleteAsync(branchId, path, ct).ConfigureAwait(false);
+            return ToJson(new { deleted = true, path });
+        }
+        catch (Exception ex) { return ToError(ex.Message); }
+    }
+
+    private async Task<string> WorkspaceListAsync(JsonElement input, CancellationToken ct)
+    {
+        var branchId = Str(input, "branchId");
+        if (branchId is null) return ToError("branchId is required.");
+        try
+        {
+            var files = await fileWorkspace.ListAsync(branchId, Str(input, "path"), ct).ConfigureAwait(false);
+            return ToJson(new { files });
+        }
+        catch (Exception ex) { return ToError(ex.Message); }
+    }
+
+    private async Task<string> WorkspaceDiffAsync(JsonElement input, CancellationToken ct)
+    {
+        var sourceBranchId = Str(input, "branchId") ?? Str(input, "sourceBranchId");
+        var targetBranchId = Str(input, "targetBranchId");
+        if (sourceBranchId is null || targetBranchId is null) return ToError("branchId and targetBranchId are required.");
+        try
+        {
+            var diff = await fileWorkspace.DiffAsync(sourceBranchId, targetBranchId, ct).ConfigureAwait(false);
+            return ToJson(new { diff });
+        }
+        catch (Exception ex) { return ToError(ex.Message); }
+    }
+
+    private async Task<string> WorkspaceExistsAsync(JsonElement input, CancellationToken ct)
+    {
+        var branchId = Str(input, "branchId");
+        var path     = Str(input, "path");
+        if (branchId is null || path is null) return ToError("branchId and path are required.");
+        try
+        {
+            var exists = await fileWorkspace.ExistsAsync(branchId, path, ct).ConfigureAwait(false);
+            return ToJson(new { exists });
+        }
+        catch (Exception ex) { return ToError(ex.Message); }
+    }
+
     private async Task<string> SnapshotGetAsync(JsonElement input, CancellationToken ct)
     {
         var snap = await snapshots.GetAsync(
             Str(input, "agentId")!, Str(input, "workUnitId")!, ct).ConfigureAwait(false);
         return ToJson(snap);
+    }
+
+    private async Task<string> ProjectionGetAsync(JsonElement input, CancellationToken ct)
+    {
+        var typeStr  = Str(input, "projectionType") ?? Str(input, "type") ?? "WorkUnit";
+        var levelStr = Str(input, "projectionLevel") ?? Str(input, "level") ?? "Normal";
+        if (!Enum.TryParse<ProjectionType>(typeStr, ignoreCase: true, out var projType))
+            return ToError($"Unknown projectionType '{typeStr}'.");
+        if (!Enum.TryParse<ProjectionLevel>(levelStr, ignoreCase: true, out var projLevel))
+            return ToError($"Unknown projectionLevel '{levelStr}'.");
+        var result = await projections.GetAsync(
+            new ProjectionRequest(projType, projLevel, Str(input, "workUnitId"), Str(input, "branchId"), Str(input, "agentId")),
+            ct).ConfigureAwait(false);
+        return result.DataJson;
+    }
+
+    private async Task<string> MergeApplyAsync(JsonElement input, CancellationToken ct)
+    {
+        try
+        {
+            var result = await merge.ApplyAsync(Str(input, "proposalId")!, ct).ConfigureAwait(false);
+            return ToJson(new { proposalId = result.ProposalId, status = result.Status.ToString() });
+        }
+        catch (KeyNotFoundException ex) { return ToError(ex.Message); }
+        catch (InvalidOperationException ex) { return ToError(ex.Message); }
     }
 
     private static string? Str(JsonElement input, string key) =>

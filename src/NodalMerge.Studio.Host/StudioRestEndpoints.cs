@@ -12,7 +12,11 @@ public static class StudioRestEndpoints
     private sealed record CreateWorkUnitBody(
         string Goal,
         string Owner,
-        string? SuccessCriteria = null);
+        string? SuccessCriteria = null,
+        string? RepositoryPath = null,
+        string? ParentWorkUnitId = null,
+        IReadOnlyList<string>? DependsOn = null,
+        IReadOnlyList<string>? FileScope = null);
 
     private sealed record SpawnAgentBody(
         string AgentType,
@@ -21,7 +25,8 @@ public static class StudioRestEndpoints
         string? Model = null,
         string? BaseUrl = null,
         string? ApiKey = null,
-        string? Provider = null);
+        string? Provider = null,
+        string? ProfileId = null);
 
     private sealed record ProposeMergeBody(
         string SourceBranch,
@@ -35,6 +40,21 @@ public static class StudioRestEndpoints
     private sealed record CreateBranchBody(
         string Name,
         string? FromBranchId = null);
+
+    private sealed record CreateAgentProfileBody(
+        string AgentProfileId,
+        string Name,
+        PipelineStage Stage,
+        string SystemPrompt,
+        IReadOnlyList<string> AllowedTools,
+        int MaxIterations);
+
+    private sealed record UpdateAgentProfileBody(
+        string Name,
+        PipelineStage Stage,
+        string SystemPrompt,
+        IReadOnlyList<string> AllowedTools,
+        int MaxIterations);
 
     private sealed record MarkKnownGoodBody(
         string BranchId,
@@ -50,11 +70,13 @@ public static class StudioRestEndpoints
     {
         MapWorkspaceEndpoints(app);
         MapWorkUnitEndpoints(app);
+        MapTaskEndpoints(app);
         MapAgentEndpoints(app);
         MapMergeEndpoints(app);
         MapBranchEndpoints(app);
         MapStateEndpoints(app);
         MapNodeStoreEndpoints(app);
+        MapAgentProfileEndpoints(app);
         return app;
     }
 
@@ -96,6 +118,18 @@ public static class StudioRestEndpoints
                 : Results.Ok(wu);
         });
 
+        app.MapGet("/studio/workunits/{workUnitId}/children", async (
+            string workUnitId,
+            IWorkUnitService workUnits,
+            CancellationToken ct) =>
+        {
+            var parent = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (parent is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+            var children = await workUnits.GetChildrenAsync(workUnitId, ct).ConfigureAwait(false);
+            return Results.Ok(children);
+        });
+
         app.MapPost("/studio/workunits", async (
             CreateWorkUnitBody body,
             IOrchestratorService orchestrator,
@@ -107,9 +141,35 @@ public static class StudioRestEndpoints
                 return Results.BadRequest(new { error = "owner is required." });
 
             var wu = await orchestrator
-                .CreateWorkUnitAsync(body.Goal, body.Owner, body.SuccessCriteria, ct)
+                .CreateWorkUnitAsync(body.Goal, body.Owner, body.SuccessCriteria, body.RepositoryPath,
+                    body.ParentWorkUnitId, body.DependsOn, body.FileScope, ct)
                 .ConfigureAwait(false);
             return Results.Ok(wu);
+        });
+    }
+
+    // ── /studio/tasks ─────────────────────────────────────────────────────────
+
+    private static void MapTaskEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/tasks", async (
+            [FromQuery] string? workUnitId,
+            ITaskService tasks,
+            CancellationToken ct) =>
+        {
+            var list = await tasks.ListAsync(workUnitId, ct).ConfigureAwait(false);
+            return Results.Ok(list);
+        });
+
+        app.MapGet("/studio/tasks/{taskId}", async (
+            string taskId,
+            ITaskService tasks,
+            CancellationToken ct) =>
+        {
+            var task = await tasks.GetAsync(taskId, ct).ConfigureAwait(false);
+            return task is null
+                ? Results.NotFound(new { error = $"Task '{taskId}' not found." })
+                : Results.Ok(task);
         });
     }
 
@@ -118,11 +178,14 @@ public static class StudioRestEndpoints
     private static void MapAgentEndpoints(WebApplication app)
     {
         app.MapGet("/studio/agents", async (
+            [FromQuery] bool all,
             IAgentControlService agents,
             CancellationToken ct) =>
         {
-            var active = await agents.ListActiveAsync(ct).ConfigureAwait(false);
-            return Results.Ok(active);
+            var list = all
+                ? await agents.ListAllAsync(ct).ConfigureAwait(false)
+                : await agents.ListActiveAsync(ct).ConfigureAwait(false);
+            return Results.Ok(list);
         });
 
         app.MapPost("/studio/agents/spawn", async (
@@ -140,7 +203,7 @@ public static class StudioRestEndpoints
             if (wu is null)
                 return Results.NotFound(new { error = $"Work unit '{body.WorkUnitId}' not found." });
 
-            var agentId = await agents.SpawnAsync(body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey, body.Provider, ct).ConfigureAwait(false);
+            var agentId = await agents.SpawnAsync(body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey, body.Provider, body.ProfileId, ct).ConfigureAwait(false);
             return Results.Ok(new { agentId, agentType = body.AgentType, workUnitId = body.WorkUnitId, branchId = wu.BranchId });
         });
 
@@ -399,6 +462,77 @@ public static class StudioRestEndpoints
             return result is null
                 ? Results.NotFound(new { error = $"Known good state '{body.StateId}' not found." })
                 : Results.Ok(result);
+        });
+    }
+
+    // ── /studio/agent-profiles ────────────────────────────────────────────────
+
+    private static void MapAgentProfileEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/agent-profiles", async (
+            IAgentProfileService profiles,
+            CancellationToken ct) =>
+        {
+            var list = await profiles.ListAsync(ct).ConfigureAwait(false);
+            return Results.Ok(list);
+        });
+
+        app.MapGet("/studio/agent-profiles/{profileId}", async (
+            string profileId,
+            IAgentProfileService profiles,
+            CancellationToken ct) =>
+        {
+            var profile = await profiles.GetAsync(profileId, ct).ConfigureAwait(false);
+            return profile is null
+                ? Results.NotFound(new { error = $"Agent profile '{profileId}' not found." })
+                : Results.Ok(profile);
+        });
+
+        app.MapPost("/studio/agent-profiles", async (
+            CreateAgentProfileBody body,
+            IAgentProfileService profiles,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.AgentProfileId))
+                return Results.BadRequest(new { error = "agentProfileId is required." });
+            if (string.IsNullOrWhiteSpace(body.Name))
+                return Results.BadRequest(new { error = "name is required." });
+
+            var profile = new AgentProfile(
+                body.AgentProfileId,
+                body.Name,
+                body.Stage,
+                body.SystemPrompt ?? string.Empty,
+                body.AllowedTools ?? [],
+                body.MaxIterations > 0 ? body.MaxIterations : 20);
+            var created = await profiles.CreateAsync(profile, ct).ConfigureAwait(false);
+            return Results.Ok(created);
+        });
+
+        app.MapPut("/studio/agent-profiles/{profileId}", async (
+            string profileId,
+            UpdateAgentProfileBody body,
+            IAgentProfileService profiles,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.Name))
+                return Results.BadRequest(new { error = "name is required." });
+            try
+            {
+                var profile = new AgentProfile(
+                    profileId,
+                    body.Name,
+                    body.Stage,
+                    body.SystemPrompt ?? string.Empty,
+                    body.AllowedTools ?? [],
+                    body.MaxIterations > 0 ? body.MaxIterations : 20);
+                var updated = await profiles.UpdateAsync(profile, ct).ConfigureAwait(false);
+                return Results.Ok(updated);
+            }
+            catch (KeyNotFoundException)
+            {
+                return Results.NotFound(new { error = $"Agent profile '{profileId}' not found." });
+            }
         });
     }
 }

@@ -83,7 +83,8 @@ export class DagReplayPanel implements vscode.Disposable {
       });
       if (!goal) { return; }
       try {
-        const wu = await this.post<WorkUnit>('/studio/workunits', { goal, owner: 'user' });
+        const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+        const wu = await this.post<WorkUnit>('/studio/workunits', { goal, owner: 'user', ...(repositoryPath ? { repositoryPath } : {}) });
         // Tell the WebView to register the new branch from the cursor position
         void this.panel.webview.postMessage({
           type:        'branchCreated',

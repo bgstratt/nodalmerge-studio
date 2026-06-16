@@ -11,10 +11,17 @@ public sealed class InMemoryMergeService : IMergeService
 {
     private readonly ConcurrentDictionary<string, MergeProposal> _proposals = new();
     private readonly IStudioNodeStore _nodeStore;
+    private readonly IFileWorkspaceService _fileWorkspace;
+    private readonly WorkspaceOptions _workspaceOptions;
 
-    public InMemoryMergeService(IStudioNodeStore nodeStore)
+    public InMemoryMergeService(
+        IStudioNodeStore nodeStore,
+        IFileWorkspaceService fileWorkspace,
+        WorkspaceOptions workspaceOptions)
     {
-        _nodeStore = nodeStore;
+        _nodeStore        = nodeStore;
+        _fileWorkspace    = fileWorkspace;
+        _workspaceOptions = workspaceOptions;
     }
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
@@ -89,6 +96,16 @@ public sealed class InMemoryMergeService : IMergeService
                 $"Cannot apply proposal '{proposalId}': only Approved proposals can be merged (current: {proposal.Status}).");
         }
 
+        // Copy workspace files: source branch → target branch
+        await _fileWorkspace.ApplyBranchAsync(proposal.SourceBranch, proposal.TargetBranch, cancellationToken)
+            .ConfigureAwait(false);
+
+        // Write changed files back to disk whenever a repository path is configured
+        if (!string.IsNullOrWhiteSpace(_workspaceOptions.SeedRepositoryPath))
+        {
+            await WriteBackToRepositoryAsync(proposal.SourceBranch, cancellationToken).ConfigureAwait(false);
+        }
+
         var updated = proposal with { Status = MergeProposalStatus.Merged };
         _proposals[proposalId] = updated;
         await _nodeStore.WriteNodeAsync(
@@ -97,6 +114,22 @@ public sealed class InMemoryMergeService : IMergeService
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
         return updated;
+    }
+
+    private async Task WriteBackToRepositoryAsync(string sourceBranchId, CancellationToken ct)
+    {
+        var repoPath = _workspaceOptions.SeedRepositoryPath!;
+        var files = await _fileWorkspace.ListAsync(sourceBranchId, ct: ct).ConfigureAwait(false);
+        foreach (var relativePath in files)
+        {
+            var content = await _fileWorkspace.ReadAsync(sourceBranchId, relativePath, ct).ConfigureAwait(false);
+            if (content is null) continue;
+            var dest = Path.Combine(repoPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
+            var destDir = Path.GetDirectoryName(dest)!;
+            if (!Directory.Exists(destDir))
+                Directory.CreateDirectory(destDir);
+            await File.WriteAllTextAsync(dest, content, ct).ConfigureAwait(false);
+        }
     }
 
     public Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken cancellationToken = default)

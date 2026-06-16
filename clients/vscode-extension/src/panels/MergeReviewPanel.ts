@@ -11,6 +11,7 @@ export interface MergeProposal {
   changeDescription: string;
   verificationResults?: string | null;
   rollbackPlan?: string | null;
+  workspaceChanges?: string | null;
   confidence?: number | null;
   status: string;
 }
@@ -223,6 +224,17 @@ const REVIEW_CSS = `
   button.apply   { background: #7c4dff; color: #fff; }
   button.apply:hover:not(:disabled)   { filter: brightness(1.15); }
   #loading { opacity: 0.45; padding: 20px 0; }
+  .diff-pre {
+    font-family: var(--nm-mono);
+    font-size: 0.85em;
+    margin: 0;
+    overflow-x: auto;
+    line-height: 1.45;
+    white-space: pre;
+  }
+  .diff-add  { color: var(--nm-success); }
+  .diff-del  { color: var(--nm-error); }
+  .diff-meta { color: var(--nm-info); opacity: 0.7; }
 `;
 
 const REVIEW_HTML = `
@@ -246,6 +258,10 @@ const REVIEW_HTML = `
     <section id="section-change">
       <h2>Change description</h2>
       <p id="change-description"></p>
+    </section>
+    <section id="section-diff" class="hidden">
+      <h2>Diff</h2>
+      <pre id="diff-content" class="diff-pre"></pre>
     </section>
     <section id="section-verification" class="hidden">
       <h2>Verification results</h2>
@@ -277,6 +293,16 @@ const REVIEW_JS = `
 
   function esc(s) {
     return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function renderDiff(text) {
+    return String(text).split('\\n').map(function(line) {
+      var cls = line.startsWith('+') ? 'diff-add'
+              : line.startsWith('-') ? 'diff-del'
+              : line.startsWith('@@') ? 'diff-meta'
+              : '';
+      return cls ? '<span class="' + cls + '">' + esc(line) + '</span>' : esc(line);
+    }).join('\\n');
   }
 
   function setText(id, val) {
@@ -334,7 +360,9 @@ const REVIEW_JS = `
     setText('change-description', p.changeDescription);
     setText('verification-results', p.verificationResults);
     setText('rollback-plan', p.rollbackPlan);
+    if (p.workspaceChanges) { setHtml('diff-content', renderDiff(p.workspaceChanges)); }
 
+    showIf('section-diff', !!p.workspaceChanges);
     showIf('section-verification', !!p.verificationResults);
     showIf('section-rollback', !!p.rollbackPlan);
 

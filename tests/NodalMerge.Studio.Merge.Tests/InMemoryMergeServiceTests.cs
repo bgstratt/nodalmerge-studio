@@ -6,7 +6,21 @@ namespace NodalMerge.Studio.Merge.Tests;
 
 public class InMemoryMergeServiceTests
 {
-    private static InMemoryMergeService Build() => new(new InMemoryStudioNodeStore());
+    private static InMemoryMergeService Build() =>
+        new(new InMemoryStudioNodeStore(), new NoopFileWorkspaceService(), new WorkspaceOptions());
+
+    private sealed class NoopFileWorkspaceService : NodalMerge.Studio.Core.Services.IFileWorkspaceService
+    {
+        public Task InitBranchAsync(string b, string? s = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<string?> ReadAsync(string b, string p, CancellationToken ct = default) => Task.FromResult<string?>(null);
+        public Task WriteAsync(string b, string p, string c, CancellationToken ct = default) => Task.CompletedTask;
+        public Task DeleteAsync(string b, string p, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<bool> ExistsAsync(string b, string p, CancellationToken ct = default) => Task.FromResult(false);
+        public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<string> DiffAsync(string s, string t, CancellationToken ct = default) => Task.FromResult(string.Empty);
+        public Task ApplyBranchAsync(string s, string t, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<string?> GetWorkingDirectoryAsync(string b, CancellationToken ct = default) => Task.FromResult<string?>(null);
+    }
 
     private static MergeProposal MakeProposal(string id, string source = "feat/x", string target = "main") =>
         new(id, source, target, "goal", "summary", "desc", null, null, null, MergeProposalStatus.Draft);

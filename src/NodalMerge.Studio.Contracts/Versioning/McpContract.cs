@@ -6,6 +6,6 @@ namespace NodalMerge.Studio.Contracts.Versioning;
 public static class McpContract
 {
     public const string Version = "v1";
-    public const string NamespacePrefix = "nm.v1";
+    public const string NamespacePrefix = "nm_v1";
     public const string ProductPrefix = "nm";
 }

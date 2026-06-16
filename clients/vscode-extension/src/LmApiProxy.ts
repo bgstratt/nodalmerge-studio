@@ -37,6 +37,7 @@ interface OaiRequest {
 export class LmApiProxy implements vscode.Disposable {
   private server: http.Server | undefined;
   private _port = 0;
+  private readonly output = vscode.window.createOutputChannel('NodalMerge LM Proxy');
 
   get baseUrl(): string { return `http://127.0.0.1:${this._port}`; }
 
@@ -46,6 +47,7 @@ export class LmApiProxy implements vscode.Disposable {
       this.server!.listen(0, '127.0.0.1', () => {
         const addr = this.server!.address() as { port: number };
         this._port = addr.port;
+        this.output.appendLine(`[LmApiProxy] Listening on http://127.0.0.1:${this._port}`);
         resolve();
       });
       this.server!.on('error', reject);
@@ -64,6 +66,7 @@ export class LmApiProxy implements vscode.Disposable {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(oaiRes));
     } catch (err) {
+      this.output.appendLine(`[LmApiProxy] ERROR: ${String(err)}`);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: String(err), type: 'server_error' } }));
     }
@@ -71,7 +74,12 @@ export class LmApiProxy implements vscode.Disposable {
 
   private async dispatch(req: OaiRequest): Promise<unknown> {
     const modelHint = req.model ?? '';
-    const models = await vscode.lm.selectChatModels(modelHint ? { family: modelHint } : undefined);
+    this.output.appendLine(`[LmApiProxy] dispatch: modelHint="${modelHint}" messages=${(req.messages??[]).length} tools=${(req.tools??[]).length}`);
+    let models = await vscode.lm.selectChatModels(modelHint ? { family: modelHint } : undefined);
+    if (!models.length && modelHint) {
+      this.output.appendLine(`[LmApiProxy] WARN: No models match family="${modelHint}" — falling back to any available model.`);
+      models = await vscode.lm.selectChatModels(undefined);
+    }
     if (!models.length) {
       throw new Error(
         'No VS Code language models available. ' +
@@ -79,6 +87,7 @@ export class LmApiProxy implements vscode.Disposable {
       );
     }
     const model = models[0];
+    this.output.appendLine(`[LmApiProxy] using model: id=${model.id} family=${model.family}`);
 
     const { vsTools, origToSafe, safeToOrig } = toVsTools(req.tools ?? []);
     const vsMessages = toVsMessages(req.messages ?? [], origToSafe);
@@ -114,6 +123,15 @@ export class LmApiProxy implements vscode.Disposable {
       content:    textContent || null,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
     };
+
+    this.output.appendLine(`[LmApiProxy] response: model=${model.id} finish=${finishReason} tool_calls=${toolCalls.length}`);
+    if (toolCalls.length) {
+      this.output.appendLine(`[LmApiProxy] tool_calls: ${JSON.stringify(toolCalls, null, 2)}`);
+    }
+    if (textContent) {
+      const preview = textContent.length > 400 ? textContent.slice(0, 400) + '... (truncated)' : textContent;
+      this.output.appendLine(`[LmApiProxy] assistant content preview: ${preview.replace(/\r?\n/g, ' ')} `);
+    }
 
     return {
       id:      `chatcmpl-vscode-${Date.now()}`,
