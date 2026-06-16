@@ -246,6 +246,21 @@ public interface IWorkspaceService
     Task<WorkspaceSummary> GetSummaryAsync(string? branchId = null, CancellationToken cancellationToken = default);
 }
 
+public interface IAgentWorkspaceService
+{
+    Task<AgentWorkspace> CreateAsync(
+        string workUnitId, string baseBranch, string? sessionId = null, CancellationToken ct = default);
+
+    Task<AgentWorkspace?> GetAsync(string workspaceId, CancellationToken ct = default);
+
+    Task ArchiveAsync(string workspaceId, string? sessionId = null, CancellationToken ct = default);
+
+    Task DestroyAsync(string workspaceId, string? reason = null, string? sessionId = null, CancellationToken ct = default);
+
+    Task<bool> ValidateWriteAsync(
+        string workUnitId, string path, IReadOnlyList<string> fileScope, CancellationToken ct = default);
+}
+
 public interface IStateReconstructionService
 {
     Task<SessionStateSnapshot> GetStateAtAsync(

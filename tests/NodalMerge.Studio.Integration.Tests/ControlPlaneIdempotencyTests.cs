@@ -18,8 +18,24 @@ public class ControlPlaneIdempotencyTests
     {
         var store = new InMemoryStudioNodeStore();
         var events = new ExecutionEventStreamService(store);
-        var scheduler = new WorkSchedulerService(store, events);
+        var workspaces = new AgentWorkspaceService(store, new SingleServiceProvider(new NoopWorkUnitService()), new NoopFileWorkspaceService(), events);
+        var scheduler = new WorkSchedulerService(store, events, workspaces);
         return (scheduler, events);
+    }
+
+    private sealed class SingleServiceProvider(object service) : IServiceProvider
+    {
+        public object? GetService(Type serviceType) => serviceType.IsInstanceOfType(service) ? service : null;
+    }
+
+    private sealed class NoopWorkUnitService : IWorkUnitService
+    {
+        public Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> UpdateStatusAsync(string workUnitId, WorkUnitStatus status, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<WorkUnit?>(null);
+        public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
     }
 
     // ── IWorkScheduler.EnqueueAsync — key: SessionId + WorkUnitId ────────────

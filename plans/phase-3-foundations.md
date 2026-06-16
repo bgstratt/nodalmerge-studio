@@ -6,6 +6,23 @@ Phase 2.5 delivers a correct single-worker pipeline. Phase 3 adds the five found
 
 ---
 
+## Progress
+
+- [x] 10a — Work Unit DAG
+- [x] 10b — Scheduler / Work Queue
+- [x] 10b.1 — ExecutionSession Boundary
+- [x] 10b.2 — Unified Execution Event Stream
+- [x] 10b.3 — Control-Plane Idempotency
+- [x] 10b.4 — State Reconstruction API
+- [x] 10c — Workspace Isolation (see implementation note in that section — backed by the existing branch/file-copy isolation, not a real git worktree)
+- [ ] 10d — Artifact Lineage Store ← **next up**
+- [ ] 10e — Orchestration Decision Log
+- [ ] 10f — Proposal DAG & Artifact Branching
+- [ ] 10f.5 — Intent Graph & Conflict Resolver
+- [ ] 10g — Knowledge Artifacts
+
+---
+
 ## What Phase 3 adds (and why order matters)
 
 | Gap | System | Slice |
@@ -24,7 +41,7 @@ Without these nine, Phase 4 fan-out would be parallel workers stomping each othe
 
 ---
 
-## Slice 10a — Work Unit DAG
+## Slice 10a — Work Unit DAG ✅
 
 Work units gain parent/child relationships, dependency edges, and file scope boundaries. This is the core graph primitive everything else builds on.
 
@@ -70,7 +87,7 @@ public sealed record WorkUnit(
 
 ---
 
-## Slice 10b — Scheduler / Work Queue
+## Slice 10b — Scheduler / Work Queue ✅
 
 Orchestrator stops driving execution directly. A scheduler polls the work queue, assigns work to available agents, enforces concurrency limits, and expires stale leases.
 
@@ -128,7 +145,7 @@ public sealed record ScheduledItem(
 
 ---
 
-## Slice 10b.1 — ExecutionSession Boundary
+## Slice 10b.1 — ExecutionSession Boundary ✅
 
 A session is the outermost causal unit. Every scheduler event, orchestration decision, artifact, and workspace belongs to exactly one session. Sessions can be paused, resumed, branched (spawning a child session from any point in the causal history), and replayed in the UI. Without a session boundary every run is anonymous: there is no safe way to reconnect to in-progress work after a restart, resume a paused run, or let a user spin up a second independent session without the two colliding.
 
@@ -202,7 +219,7 @@ public interface IExecutionSessionService
 
 ---
 
-## Slice 10b.2 — Unified Execution Event Stream
+## Slice 10b.2 — Unified Execution Event Stream ✅
 
 Currently the scheduler, orchestrator, artifact store, and workspace service each write to separate node stores with no shared identity. Events from different subsystems cannot be ordered, correlated, or replayed relative to each other. The unified execution event stream gives every significant state change a single causal home: a session-scoped, append-only stream where events are ordered, attributed, and immutable.
 
@@ -411,7 +428,7 @@ Each existing subsystem appends to the stream **in addition to** its own store �
 
 ---
 
-## Slice 10b.3 — Control-Plane Idempotency
+## Slice 10b.3 — Control-Plane Idempotency ✅
 
 The scheduler's polling loop and retry logic will inevitably duplicate control-plane signals. Without idempotency, a retry that re-enqueues a work unit creates a second scheduler entry; a duplicate `merge.propose` creates two proposals; a re-spawned orchestrator fires two `LeaseAcquired` events. None of these are LLM correctness problems — they are distributed systems correctness problems.
 
@@ -450,7 +467,7 @@ MCP tool calls that trigger control-plane actions (`nm.v1.merge.propose`, future
 
 ---
 
-## Slice 10b.4 — State Reconstruction API
+## Slice 10b.4 — State Reconstruction API ✅
 
 Not deterministic replay of agent cognition. Just:
 
@@ -505,7 +522,11 @@ public sealed record SessionStateSnapshot(
 
 ---
 
-## Slice 10c — Workspace Isolation
+## Slice 10c — Workspace Isolation ✅
+
+> **As-built note:** v1 deliberately does **not** back workspaces with a real git worktree. There was no `IProcessService`/git shell-out in the codebase, and each work unit already gets an isolated branch directory via the existing `IBranchService` + `IFileWorkspaceService` (plain directory copy, created at work-unit-creation time). `AgentWorkspace` (`WorkspaceBackingModel.LogicalBranchWorkspace`) is a lifecycle/enforcement wrapper over that existing branch rather than a second, forked branch — `CreateAsync` resolves the work unit's own `BranchId`, it doesn't fork a new one from `baseBranch`. `DestroyAsync` marks the workspace finalized but does **not** delete the branch directory (it's shared with diff/inspection tooling, and a failed work unit can still be retried, reusing the same workspace). The service interface was named `IAgentWorkspaceService`, not `IWorkspaceService` as below, because `IWorkspaceService` already exists for an unrelated dashboard summary (`GetSummaryAsync`). Real git worktrees remain a future, pluggable backing model (`IWorkspaceBackingStore` with `DirectoryCopyWorkspace`/`GitWorktreeWorkspace` implementations) — not this slice. **This affects 10d** (no real git diff output to parse — `WorkspaceChanges` is still the existing plain-text diff format, not `+++ b/`-style unified diff) **and 10f** (branch-from-proposal has no real worktree to branch from yet).
+>
+> Implementation: [AgentWorkspace.cs](../src/NodalMerge.Studio.Contracts/Domain/AgentWorkspace.cs), [AgentWorkspaceService.cs](../src/NodalMerge.Studio.Storage/AgentWorkspaceService.cs), wired into `WorkSchedulerService` and `McpToolDispatcher`. Tests: `WorkspaceIsolationTests.cs`.
 
 Each work unit executes in an isolated **Workspace** — an independent filesystem view with its own branch and a disposable lifecycle. The initial implementation backs each workspace with a Git worktree. The domain model does not expose "worktree" directly; that is an implementation detail of the v1 provider.
 

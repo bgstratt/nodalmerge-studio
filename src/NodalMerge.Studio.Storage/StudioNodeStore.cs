@@ -14,6 +14,7 @@ public static class StudioNodeKind
     public const string ExecutionSessionV1 = "studio/execution-session/v1";
     public const string ExecutionEventV1    = "studio/execution-event/v1";
     public const string CommandResultV1     = "studio/command-result/v1";
+    public const string AgentWorkspaceV1    = "studio/agent-workspace/v1";
 }
 
 public interface IStudioNodeStore

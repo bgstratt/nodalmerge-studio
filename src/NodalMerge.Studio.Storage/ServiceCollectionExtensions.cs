@@ -17,6 +17,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IExecutionEventStream, ExecutionEventStreamService>();
         services.AddSingleton<IExecutionSessionService, ExecutionSessionService>();
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
+        services.AddSingleton<IAgentWorkspaceService, AgentWorkspaceService>();
         AddFileWorkspaceService(services);
         return services;
     }
@@ -33,6 +34,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IExecutionEventStream, ExecutionEventStreamService>();
         services.AddSingleton<IExecutionSessionService, ExecutionSessionService>();
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
+        services.AddSingleton<IAgentWorkspaceService, AgentWorkspaceService>();
         AddFileWorkspaceService(services);
         return services;
     }

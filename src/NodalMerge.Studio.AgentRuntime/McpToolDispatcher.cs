@@ -16,6 +16,7 @@ internal sealed class McpToolDispatcher(
     IMergeService merge,
     IWorkspaceService workspace,
     IFileWorkspaceService fileWorkspace,
+    IAgentWorkspaceService agentWorkspaces,
     ISnapshotService snapshots,
     IAgentControlService agentControl,
     IArtifactRefService artifactRefs,
@@ -300,6 +301,10 @@ internal sealed class McpToolDispatcher(
         var path     = Str(input, "path");
         var content  = Str(input, "content");
         if (branchId is null || path is null || content is null) return ToError("branchId, path, and content are required.");
+
+        var scopeError = await CheckFileScopeAsync(branchId, path, ct).ConfigureAwait(false);
+        if (scopeError is not null) return scopeError;
+
         try
         {
             await fileWorkspace.WriteAsync(branchId, path, content, ct).ConfigureAwait(false);
@@ -313,12 +318,30 @@ internal sealed class McpToolDispatcher(
         var branchId = Str(input, "branchId");
         var path     = Str(input, "path");
         if (branchId is null || path is null) return ToError("branchId and path are required.");
+
+        var scopeError = await CheckFileScopeAsync(branchId, path, ct).ConfigureAwait(false);
+        if (scopeError is not null) return scopeError;
+
         try
         {
             await fileWorkspace.DeleteAsync(branchId, path, ct).ConfigureAwait(false);
             return ToJson(new { deleted = true, path });
         }
         catch (Exception ex) { return ToError(ex.Message); }
+    }
+
+    private async Task<string?> CheckFileScopeAsync(string branchId, string path, CancellationToken ct)
+    {
+        var owners = await workUnits.ListAsync(branchId, ct).ConfigureAwait(false);
+        var owner = owners.FirstOrDefault();
+        if (owner is null || owner.FileScope.Count == 0)
+            return null;
+
+        var allowed = await agentWorkspaces
+            .ValidateWriteAsync(owner.WorkUnitId, path, owner.FileScope, ct)
+            .ConfigureAwait(false);
+
+        return allowed ? null : ToError($"File {path} is outside your declared scope {string.Join(", ", owner.FileScope)}.");
     }
 
     private async Task<string> WorkspaceListAsync(JsonElement input, CancellationToken ct)

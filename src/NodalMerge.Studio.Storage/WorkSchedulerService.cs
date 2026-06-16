@@ -12,11 +12,13 @@ public sealed class WorkSchedulerService : IWorkScheduler
     private readonly ConcurrentDictionary<string, ScheduledItem> _queue = new();
     private readonly IStudioNodeStore _nodeStore;
     private readonly IExecutionEventStream _events;
+    private readonly IAgentWorkspaceService _workspaces;
 
-    public WorkSchedulerService(IStudioNodeStore nodeStore, IExecutionEventStream events)
+    public WorkSchedulerService(IStudioNodeStore nodeStore, IExecutionEventStream events, IAgentWorkspaceService workspaces)
     {
-        _nodeStore = nodeStore;
-        _events    = events;
+        _nodeStore  = nodeStore;
+        _events     = events;
+        _workspaces = workspaces;
     }
 
     public async Task EnqueueAsync(
@@ -106,6 +108,8 @@ public sealed class WorkSchedulerService : IWorkScheduler
                     ct: ct).ConfigureAwait(false);
             }
 
+            await _workspaces.CreateAsync(acquired.WorkUnitId, "main", acquired.SessionId, ct).ConfigureAwait(false);
+
             return acquired;
         }
 
@@ -141,10 +145,14 @@ public sealed class WorkSchedulerService : IWorkScheduler
                     causedByEventId: completedEv.EventId,
                     ct: ct).ConfigureAwait(false);
             }
+
+            await _workspaces.ArchiveAsync($"ws-{workUnitId}", sessionId, ct).ConfigureAwait(false);
         }
         else
         {
-            // Reset lease so the next poll can retry.
+            // Reset lease so the next poll can retry. The workspace is intentionally left alone
+            // (not destroyed) here — it's keyed 1:1 to the work unit, not the attempt, and the
+            // next retry reuses it. DestroyAsync is for a work unit that is abandoned for good.
             if (_queue.TryGetValue(workUnitId, out var item))
             {
                 var sessionId = item.SessionId;
