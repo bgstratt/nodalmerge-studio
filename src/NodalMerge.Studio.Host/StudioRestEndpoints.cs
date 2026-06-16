@@ -64,6 +64,11 @@ public static class StudioRestEndpoints
 
     private sealed record CheckoutKnownGoodBody(string StateId);
 
+    private sealed record EnqueueBody(
+        string WorkUnitId,
+        string ProfileId,
+        string? TaskId = null);
+
     // ── Registration ───────────────────────────────────────────────────────
 
     public static WebApplication MapStudioRestEndpoints(this WebApplication app)
@@ -77,6 +82,7 @@ public static class StudioRestEndpoints
         MapStateEndpoints(app);
         MapNodeStoreEndpoints(app);
         MapAgentProfileEndpoints(app);
+        MapSchedulerEndpoints(app);
         return app;
     }
 
@@ -462,6 +468,34 @@ public static class StudioRestEndpoints
             return result is null
                 ? Results.NotFound(new { error = $"Known good state '{body.StateId}' not found." })
                 : Results.Ok(result);
+        });
+    }
+
+    // ── /studio/scheduler ─────────────────────────────────────────────────────
+
+    private static void MapSchedulerEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/scheduler/pending", async (
+            IWorkScheduler scheduler,
+            CancellationToken ct) =>
+        {
+            var items = await scheduler.ListPendingAsync(ct).ConfigureAwait(false);
+            return Results.Ok(items);
+        });
+
+        app.MapPost("/studio/scheduler/enqueue", async (
+            EnqueueBody body,
+            IWorkScheduler scheduler,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+            if (string.IsNullOrWhiteSpace(body.ProfileId))
+                return Results.BadRequest(new { error = "profileId is required." });
+
+            await scheduler.EnqueueAsync(body.WorkUnitId, body.ProfileId, body.TaskId, ct: ct)
+                .ConfigureAwait(false);
+            return Results.Ok(new { workUnitId = body.WorkUnitId, profileId = body.ProfileId, taskId = body.TaskId, status = "enqueued" });
         });
     }
 

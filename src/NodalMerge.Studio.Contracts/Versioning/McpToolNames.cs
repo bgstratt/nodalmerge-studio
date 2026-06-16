@@ -48,6 +48,9 @@ public static class McpToolNames
 
     public const string WorkspaceSummary = "nm_v1_workspace_summary";
 
+    public const string SchedulerEnqueue = "nm_v1_scheduler_enqueue";
+    public const string SchedulerPending = "nm_v1_scheduler_pending";
+
     public const string WorkspaceRead   = "nm_v1_workspace_read";
     public const string WorkspaceWrite  = "nm_v1_workspace_write";
     public const string WorkspaceDelete = "nm_v1_workspace_delete";
@@ -89,6 +92,8 @@ public static class McpToolNames
         AgentStatus,
         AgentStop,
         WorkspaceSummary,
+        SchedulerEnqueue,
+        SchedulerPending,
         WorkspaceRead,
         WorkspaceWrite,
         WorkspaceDelete,

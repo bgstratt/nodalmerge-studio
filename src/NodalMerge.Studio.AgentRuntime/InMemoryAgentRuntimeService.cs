@@ -1,27 +1,36 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.AgentRuntime;
 
-public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapshotService, IAgentControlService
+public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapshotService, IAgentControlService, IHostedService
 {
+    private const int MaxConcurrentWorkers = 3;
+    private const int PollIntervalMs = 2_000;
+
     private readonly ConcurrentDictionary<(string AgentId, string WorkUnitId), ExecutionSnapshot> _snapshots = new();
     private readonly ConcurrentDictionary<string, AgentRecord> _agents = new();
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<InMemoryAgentRuntimeService> _logger;
     private readonly IAgentProfileService _profileService;
+    private readonly IWorkScheduler _scheduler;
+    private int _activeWorkerCount;
+    private CancellationTokenSource? _pollCts;
 
     public InMemoryAgentRuntimeService(
         IServiceProvider serviceProvider,
         ILogger<InMemoryAgentRuntimeService> logger,
-        IAgentProfileService profileService)
+        IAgentProfileService profileService,
+        IWorkScheduler scheduler)
     {
         _serviceProvider = serviceProvider;
         _logger          = logger;
         _profileService  = profileService;
+        _scheduler       = scheduler;
     }
 
     private sealed record AgentRecord(
@@ -34,6 +43,121 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? ApiKey = null,
         string? Provider = null,
         CancellationTokenSource? Cts = null);
+
+    // ── IHostedService ─────────────────────────────────────────────────────
+
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        _pollCts = new CancellationTokenSource();
+        _ = Task.Run(() => PollSchedulerAsync(_pollCts.Token), CancellationToken.None);
+        return Task.CompletedTask;
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken)
+    {
+        _pollCts?.Cancel();
+        return Task.CompletedTask;
+    }
+
+    // ── Scheduler polling loop ─────────────────────────────────────────────
+
+    private async Task PollSchedulerAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                if (_activeWorkerCount < MaxConcurrentWorkers)
+                {
+                    var pollerId = $"poller-{Guid.NewGuid():N}";
+                    var item = await _scheduler.TryAcquireAsync(pollerId, ct).ConfigureAwait(false);
+                    if (item is not null)
+                    {
+                        _logger.LogInformation(
+                            "[Scheduler] Acquired workUnit={WorkUnitId} taskId={TaskId} profile={ProfileId}",
+                            item.WorkUnitId, item.TaskId ?? "(none)", item.ProfileId);
+
+                        _ = Task.Run(() => RunScheduledWorkerAsync(item, ct), CancellationToken.None);
+                    }
+                }
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Scheduler] Poll iteration failed.");
+            }
+
+            try { await Task.Delay(PollIntervalMs, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    private async Task RunScheduledWorkerAsync(ScheduledItem item, CancellationToken ct)
+    {
+        Interlocked.Increment(ref _activeWorkerCount);
+        var agentId = $"worker-{Guid.NewGuid():N}";
+        var cts = new CancellationTokenSource();
+        var success = false;
+
+        try
+        {
+            var profile = item.ProfileId is not null
+                ? await _profileService.GetAsync(item.ProfileId, ct).ConfigureAwait(false)
+                : null;
+
+            var provider = item.Provider ?? "anthropic";
+            var model    = item.Model    ?? string.Empty;
+            var baseUrl  = item.BaseUrl  ?? string.Empty;
+            var apiKey   = item.ApiKey   ?? string.Empty;
+            var taskId   = item.TaskId   ?? string.Empty;
+
+            _agents[agentId] = new AgentRecord(agentId, item.WorkUnitId, "active", taskId, model, baseUrl, apiKey, provider, cts);
+
+            var canRun = !string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
+                && (!string.IsNullOrWhiteSpace(model)
+                    || provider.Equals("openai", StringComparison.OrdinalIgnoreCase));
+
+            if (canRun)
+            {
+                var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
+                var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var loop = new WorkerAgentLoop(agentId, item.WorkUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm, profile);
+                await loop.RunAsync(cts.Token).ConfigureAwait(false);
+                success = true;
+            }
+            else
+            {
+                _logger.LogWarning("[Agent {AgentId}] Scheduled worker will NOT run — missing credentials.", agentId);
+            }
+
+            if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
+                _agents[agentId] = r with { Status = "stopped", Cts = null };
+        }
+        catch (OperationCanceledException)
+        {
+            if (_agents.TryGetValue(agentId, out var r))
+                _agents[agentId] = r with { Status = "stopped", Cts = null };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[Agent {AgentId}] Scheduled worker loop failed.", agentId);
+            if (_agents.TryGetValue(agentId, out var r))
+            {
+                var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
+                _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null };
+            }
+        }
+        finally
+        {
+            cts.Dispose();
+            Interlocked.Decrement(ref _activeWorkerCount);
+            await _scheduler.ReleaseAsync(item.WorkUnitId, success).ConfigureAwait(false);
+            _logger.LogInformation(
+                "[Scheduler] Released workUnit={WorkUnitId} success={Success}", item.WorkUnitId, success);
+        }
+    }
+
+    // ── IAgentRuntimeService ───────────────────────────────────────────────
 
     public Task<ExecutionSnapshot> GetSnapshotAsync(
         string agentId,
@@ -67,6 +191,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         return Task.CompletedTask;
     }
 
+    // ── ISnapshotService ───────────────────────────────────────────────────
+
     Task<ExecutionSnapshot> ISnapshotService.GetAsync(
         string agentId,
         string workUnitId,
@@ -79,6 +205,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string otherAgentId,
         CancellationToken cancellationToken = default) =>
         Task.FromResult("[]");
+
+    // ── IAgentControlService ───────────────────────────────────────────────
 
     public Task<string> SpawnAsync(
         string agentType,
@@ -272,6 +400,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IAgentRuntimeService>(sp => sp.GetRequiredService<InMemoryAgentRuntimeService>());
         services.AddSingleton<ISnapshotService>(sp => sp.GetRequiredService<InMemoryAgentRuntimeService>());
         services.AddSingleton<IAgentControlService>(sp => sp.GetRequiredService<InMemoryAgentRuntimeService>());
+        services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<InMemoryAgentRuntimeService>());
         services.AddSingleton<McpToolDispatcher>();
         services.AddSingleton<LlmClient>(_ => new LlmClient(llmHttpClient ?? new HttpClient()));
         return services;

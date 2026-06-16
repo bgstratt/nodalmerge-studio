@@ -13,6 +13,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IReplayService, StubReplayService>();
         services.AddSingleton<IAgentProfileService, AgentProfileService>();
         services.AddSingleton<IArtifactRefService, InMemoryArtifactRefService>();
+        services.AddSingleton<IWorkScheduler, WorkSchedulerService>();
         AddFileWorkspaceService(services);
         return services;
     }
@@ -25,6 +26,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IReplayService, StubReplayService>();
         services.AddSingleton<IAgentProfileService, AgentProfileService>();
         services.AddSingleton<IArtifactRefService, InMemoryArtifactRefService>();
+        services.AddSingleton<IWorkScheduler, WorkSchedulerService>();
         AddFileWorkspaceService(services);
         return services;
     }

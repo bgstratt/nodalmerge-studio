@@ -24,28 +24,27 @@ internal sealed class OrchestratorAgentLoop(
         Routing strategy — read artifact state before each decision:
         Call nm_v1_projection_get with projectionType="AgentWorkspace" and your workUnitId to see the current
         artifact chain. Then route based on what exists:
-        - No Task artifacts → create tasks with nm_v1_task_create, then spawn a worker.
-        - Task artifacts exist but no MergeProposal → spawn a worker for each open task.
+        - No Task artifacts → create tasks with nm_v1_task_create, then enqueue a worker for each task.
+        - Task artifacts exist but no MergeProposal → enqueue a worker for each open task.
         - MergeProposal artifact exists with status Active/ReadyForReview → wait for human review; stop.
         - MergeProposal artifact with status Approved → call nm_v1_merge_apply; done.
-        - MergeProposal artifact with status Rejected → create a new task to address the rejection, spawn another worker.
+        - MergeProposal artifact with status Rejected → create a new task to address the rejection, enqueue another worker.
 
         Workflow:
         1. Call nm_v1_workunit_get to understand the goal for your assigned work unit.
         2. Call nm_v1_projection_get (projectionType="AgentWorkspace", workUnitId=<id>) to see existing artifacts.
         3. Route based on artifact state (see above).
-        4. When spawning a worker: agentType="worker", profileId="worker", workUnitId=<your workUnitId>, taskId=<task id>.
+        4. When enqueuing a worker: call nm_v1_scheduler_enqueue with workUnitId=<your workUnitId>, profileId="worker", taskId=<task id>.
            LLM credentials are injected automatically — do not supply model, baseUrl, apiKey, or provider.
-        5. Monitor progress with nm_v1_task_list and nm_v1_agent_status.
-        6. After a worker completes, re-read the AgentWorkspace projection to see if a proposal now exists.
-        7. Stop after a proposal is validated — a human will review and approve it.
+        5. After enqueuing, stop — the scheduler picks up the work and runs the worker. Do not poll for worker completion.
+        6. The system will re-invoke you after the worker completes if further orchestration is needed.
 
         Rules:
         - Always re-read the AgentWorkspace projection before making a routing decision.
         - Do not approve or apply merges yourself — that requires human approval.
         - If you encounter an unrecoverable error, stop and report it clearly.
         - Be efficient: use each tool call purposefully, do not repeat calls unnecessarily.
-        - Do not spawn a second worker for a task that already has an active worker.
+        - Do not enqueue a second worker for a task that is already queued or active.
         """;
 
     private readonly int _maxIterations = profile?.MaxIterations ?? 25;
@@ -82,7 +81,7 @@ internal sealed class OrchestratorAgentLoop(
             {
                 if (block is not NmToolUse toolUse) continue;
 
-                var input = toolUse.Name == McpToolNames.AgentSpawn
+                var input = toolUse.Name is McpToolNames.AgentSpawn or McpToolNames.SchedulerEnqueue
                     ? InjectSpawnCredentials(toolUse.Input)
                     : toolUse.Input;
 
@@ -203,13 +202,21 @@ internal sealed class OrchestratorAgentLoop(
             new(McpToolNames.BranchStatus, "Get branch status.",
                 Schema(["branchId"], new() { ["branchId"] = Str("Branch ID") })),
 
-            new(McpToolNames.AgentSpawn, "Spawn a worker agent to execute a specific task. LLM credentials are injected automatically.",
+            new(McpToolNames.AgentSpawn, "Spawn a worker agent directly (legacy). Prefer nm_v1_scheduler_enqueue for queue-driven execution.",
                 Schema(["agentType", "workUnitId", "taskId"], new()
                 {
                     ["agentType"]  = Str("Agent type: worker"),
                     ["workUnitId"] = Str("Work unit ID (use your own workUnitId)"),
                     ["taskId"]     = Str("Task ID to assign to the worker"),
                     ["profileId"]  = Str("Pipeline profile ID to load for the worker (optional, e.g. 'worker')"),
+                })),
+
+            new(McpToolNames.SchedulerEnqueue, "Enqueue a worker for queue-driven execution. The scheduler picks it up respecting concurrency limits. LLM credentials are injected automatically.",
+                Schema(["workUnitId", "profileId"], new()
+                {
+                    ["workUnitId"] = Str("Work unit ID (use your own workUnitId)"),
+                    ["profileId"]  = Str("Pipeline profile ID for the worker (e.g. 'worker')"),
+                    ["taskId"]     = Str("Task ID to assign to the worker (optional)"),
                 })),
 
             new(McpToolNames.AgentStatus, "Get the status of an agent.",

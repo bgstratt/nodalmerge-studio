@@ -161,6 +161,37 @@ public interface IArtifactRefService
     Task<IReadOnlyList<ArtifactRef>> ListAsync(string workUnitId, CancellationToken cancellationToken = default);
 }
 
+public sealed record ScheduledItem(
+    string WorkUnitId,
+    string ProfileId,
+    string? TaskId,
+    string? LeasedBy,
+    DateTimeOffset? LeasedAt,
+    int AttemptCount,
+    string? Model,
+    string? BaseUrl,
+    string? ApiKey,
+    string? Provider);
+
+public interface IWorkScheduler
+{
+    Task EnqueueAsync(
+        string workUnitId,
+        string profileId,
+        string? taskId = null,
+        string? model = null,
+        string? baseUrl = null,
+        string? apiKey = null,
+        string? provider = null,
+        CancellationToken ct = default);
+
+    Task<ScheduledItem?> TryAcquireAsync(string agentId, CancellationToken ct = default);
+
+    Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default);
+
+    Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default);
+}
+
 public interface IAgentProfileService
 {
     Task<AgentProfile> CreateAsync(AgentProfile profile, CancellationToken cancellationToken = default);
