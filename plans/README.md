@@ -47,11 +47,11 @@ See [phase-2.5-agent-profiles.md](./phase-2.5-agent-profiles.md). Key shift: fro
 
 | Slice | Focus | Status |
 |-------|-------|--------|
-| 9a | Diff in Merge Review panel — render `workspaceChanges` with +/- coloring | Planned |
-| 9b | `AgentProfile` DAG entity with `PipelineStage` enum; default profiles; REST endpoints | Planned |
-| 9c | Profile-driven loop config — system prompt, maxIterations, tool filtering loaded from profile | Planned |
-| 9d | `AgentWorkspaceProjection` with artifact chain (plan → changes → proposals) | Planned |
-| 9e | Artifact-state-driven routing in orchestrator — routes by what artifacts exist, not by persona | Planned |
+| 9a | Diff in Merge Review panel — render `workspaceChanges` with +/- coloring | Complete |
+| 9b | `AgentProfile` DAG entity with `PipelineStage` enum; default profiles; REST endpoints | Complete |
+| 9c | Profile-driven loop config — system prompt, maxIterations, tool filtering loaded from profile | Complete |
+| 9d | `AgentWorkspaceProjection` with artifact chain (plan → changes → proposals) | Complete |
+| 9e | Artifact-state-driven routing in orchestrator — routes by what artifacts exist, not by persona | Complete |
 
 ## Phase 3 — Multi-agent foundations
 
@@ -59,13 +59,13 @@ See [phase-3-foundations.md](./phase-3-foundations.md). Five foundational system
 
 | Slice | Focus | Status |
 |-------|-------|--------|
-| 10a | Work Unit DAG — parent/child, dependency edges, file scope boundaries | Planned |
-| 10b | Scheduler / Work Queue — assignment queue, concurrency control, leasing | Planned |
-| 10c | Branch Isolation Model — per-WorkUnit execution branch, no cross-worker writes | Planned |
-| 10d | Artifact Ownership + Lineage — proposal attribution, `FilesTouched`, conflict pre-detection | Planned |
-| 10e | Orchestration Decision Log — every routing decision persisted with input projection + reason | Planned |
-| 10f | Proposal DAG & Artifact Branching — "checkout S0, apply A only"; branch/compare/replay from any proposal | Planned |
-| 10g | Knowledge Artifacts — `Research`, `Decision`, `Constraint` types; `artifact.record/query`; inherited constraints in projection | Planned |
+| 10a | Work Unit DAG — parent/child, dependency edges, file scope boundaries | Complete |
+| 10b | Scheduler / Work Queue — assignment queue, concurrency control, leasing | Complete |
+| 10c | Branch Isolation Model — per-WorkUnit execution branch, no cross-worker writes | Complete |
+| 10d | Artifact Ownership + Lineage — proposal attribution, `FilesTouched`, conflict pre-detection | Complete |
+| 10e | Orchestration Decision Log — every routing decision persisted with input projection + reason | Complete |
+| 10f | Proposal DAG & Artifact Branching — "checkout S0, apply A only"; branch/compare/replay from any proposal | Complete |
+| 10g | Knowledge Artifacts — `Research`, `Decision`, `Constraint` types; `artifact.record/query`; inherited constraints in projection | Complete |
 
 ## Phase 4 — Fan-out & merge reduction
 
@@ -74,10 +74,10 @@ See [phase-4-fanout-merger.md](./phase-4-fanout-merger.md). Built on Phase 3 fou
 | Slice | Focus | Status |
 |-------|-------|--------|
 | 11a | Artifact Lifecycle State Machine — formal states per WorkUnit and MergeProposal | Complete — see as-built note in phase-4-fanout-merger.md (built alongside the orchestrator re-invocation fix, see phase-3-foundations.md's Deferred Work Tracker) |
-| 11b | Fan-out — planner decomposes goal into N child work units; scheduler executes in parallel | Planned |
-| 11c | Merger/Reducer — N proposals reconciled into one candidate; conflict reporting | Planned |
-| 11d | Automated Reviewer agent (`Stage = Review`) as optional pre-gate before human | Planned |
-| 11e | Dead-letter & failure escalation — failed agents with retry from dashboard | Planned |
+| 11b | Fan-out — planner decomposes goal into N child work units; scheduler executes in parallel | Complete — see as-built note in phase-4-fanout-merger.md |
+| 11c | Merger/Reducer — N proposals reconciled into one candidate; conflict reporting | Complete — see as-built note in phase-4-fanout-merger.md |
+| 11d | Automated Reviewer agent (`Stage = Review`) as optional pre-gate before human | Complete — see as-built note in phase-4-fanout-merger.md |
+| 11e | Dead-letter & failure escalation — failed agents with retry from dashboard | Complete — see as-built note in phase-4-fanout-merger.md |
 
 ## Phase 5 — Control-plane UI
 

@@ -27,7 +27,8 @@ public static class StudioRestEndpoints
         string? BaseUrl = null,
         string? ApiKey = null,
         string? Provider = null,
-        string? ProfileId = null);
+        string? ProfileId = null,
+        string? AutoReviewProfileId = null);
 
     private sealed record ProposeMergeBody(
         string SourceBranch,
@@ -103,6 +104,7 @@ public static class StudioRestEndpoints
         MapEventStreamEndpoints(app);
         MapSessionStateEndpoints(app);
         MapArtifactEndpoints(app);
+        MapDeadLetterEndpoints(app);
         return app;
     }
 
@@ -233,7 +235,24 @@ public static class StudioRestEndpoints
                 })
                 .ToList();
 
-            return Results.Ok(new { workUnitId, proposals, branches });
+            object? mergeProposal = null;
+            foreach (var proposalRef in chain.Where(a => a.Type == ArtifactType.MergeProposal))
+            {
+                var proposal = await merge.GetAsync(proposalRef.ArtifactId, ct).ConfigureAwait(false);
+                if (proposal?.ReconciledFrom.Count > 0)
+                {
+                    mergeProposal = new
+                    {
+                        proposalId = proposal.ProposalId,
+                        status = proposalRef.Status.ToString(),
+                        reconciledFrom = proposal.ReconciledFrom,
+                        filesTouched = proposal.FilesTouched,
+                    };
+                    break;
+                }
+            }
+
+            return Results.Ok(new { workUnitId, proposals, branches, mergeProposal });
         });
 
         app.MapPost("/studio/workunits", async (
@@ -309,7 +328,9 @@ public static class StudioRestEndpoints
             if (wu is null)
                 return Results.NotFound(new { error = $"Work unit '{body.WorkUnitId}' not found." });
 
-            var agentId = await agents.SpawnAsync(body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey, body.Provider, body.ProfileId, ct).ConfigureAwait(false);
+            var agentId = await agents.SpawnAsync(
+                body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey,
+                body.Provider, body.ProfileId, body.AutoReviewProfileId, ct).ConfigureAwait(false);
             return Results.Ok(new { agentId, agentType = body.AgentType, workUnitId = body.WorkUnitId, branchId = wu.BranchId });
         });
 
@@ -384,6 +405,15 @@ public static class StudioRestEndpoints
             return proposal is null
                 ? Results.NotFound(new { error = $"Proposal '{proposalId}' not found." })
                 : Results.Ok(proposal);
+        });
+
+        app.MapGet("/studio/merges/{proposalId}/file-changes", async (
+            string proposalId,
+            IProposalReviewService review,
+            CancellationToken ct) =>
+        {
+            var changes = await review.GetFileChangesAsync(proposalId, ct).ConfigureAwait(false);
+            return Results.Ok(new { proposalId, fileChanges = changes });
         });
 
         app.MapPost("/studio/merges", async (
@@ -784,6 +814,46 @@ public static class StudioRestEndpoints
                 parentEventId: body.ParentEventId,
                 ct: ct).ConfigureAwait(false);
             return Results.Ok(child);
+        });
+    }
+
+    // ── /studio/dead-letter ───────────────────────────────────────────────────
+
+    private static void MapDeadLetterEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/dead-letter", async (
+            IDeadLetterService deadLetter,
+            CancellationToken ct) =>
+        {
+            var list = await deadLetter.ListAsync(ct).ConfigureAwait(false);
+            return Results.Ok(list);
+        });
+
+        app.MapGet("/studio/dead-letter/{entryId}", async (
+            string entryId,
+            IDeadLetterService deadLetter,
+            CancellationToken ct) =>
+        {
+            var entry = await deadLetter.GetAsync(entryId, ct).ConfigureAwait(false);
+            return entry is null
+                ? Results.NotFound(new { error = $"Dead-letter entry '{entryId}' not found." })
+                : Results.Ok(entry);
+        });
+
+        app.MapPost("/studio/dead-letter/{entryId}/retry", async (
+            string entryId,
+            IDeadLetterService deadLetter,
+            CancellationToken ct) =>
+        {
+            var result = await deadLetter.RetryAsync(entryId, ct).ConfigureAwait(false);
+            return result.Outcome switch
+            {
+                DeadLetterRetryOutcome.Retried => Results.Ok(result),
+                DeadLetterRetryOutcome.NotFound => Results.NotFound(new { error = result.Message }),
+                DeadLetterRetryOutcome.MaxAttemptsReached => Results.Conflict(new { error = result.Message }),
+                DeadLetterRetryOutcome.InvalidState => Results.BadRequest(new { error = result.Message }),
+                _ => Results.BadRequest(new { error = result.Message ?? "Retry failed." }),
+            };
         });
     }
 

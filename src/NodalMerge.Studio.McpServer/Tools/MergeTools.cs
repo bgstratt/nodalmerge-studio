@@ -71,10 +71,13 @@ public sealed class MergeTools(IMergeService merge, IStudioNodeStore nodeStore)
         }
     }
 
-    [McpServerTool(Name = McpToolNames.MergeReview), Description("Human review of a proposal (AP-4). Decision must be Approved or Rejected.")]
+    [McpServerTool(Name = McpToolNames.MergeReview), Description("Review a proposal. Set automated=true for pre-gate reviewer; otherwise human review.")]
     public async Task<string> ReviewAsync(
         string proposalId,
         string decision,
+        string? verificationResults = null,
+        bool automated = false,
+        string? reviewerAgentId = null,
         CancellationToken cancellationToken = default)
     {
         if (!Enum.TryParse<MergeProposalStatus>(decision, ignoreCase: true, out var status) ||
@@ -85,7 +88,11 @@ public sealed class MergeTools(IMergeService merge, IStudioNodeStore nodeStore)
 
         try
         {
-            var proposal = await merge.ReviewAsync(proposalId, status, cancellationToken).ConfigureAwait(false);
+            var proposal = automated
+                ? await merge.AutomatedReviewAsync(
+                    proposalId, status, verificationResults ?? string.Empty, reviewerAgentId, cancellationToken)
+                    .ConfigureAwait(false)
+                : await merge.ReviewAsync(proposalId, status, cancellationToken).ConfigureAwait(false);
             return McpJson.Ok(proposal);
         }
         catch (KeyNotFoundException)
@@ -93,6 +100,10 @@ public sealed class MergeTools(IMergeService merge, IStudioNodeStore nodeStore)
             return McpJson.Error(McpToolNames.MergeReview, $"Proposal '{proposalId}' was not found.");
         }
         catch (InvalidOperationException ex)
+        {
+            return McpJson.Error(McpToolNames.MergeReview, ex.Message);
+        }
+        catch (ArgumentException ex)
         {
             return McpJson.Error(McpToolNames.MergeReview, ex.Message);
         }

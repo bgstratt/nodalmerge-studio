@@ -128,6 +128,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IReadOnlyList<string>? fileScope = null,
         string? seedFromBranchId = null,
         string? branchedFromProposalId = null,
+        IReadOnlyDictionary<string, string>? metadata = null,
         CancellationToken cancellationToken = default)
     {
         // First work unit with a repositoryPath seeds the main branch for this session.
@@ -141,9 +142,19 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             .CreateBranchAsync($"work-{Guid.NewGuid():N}", seedFromBranchId, cancellationToken)
             .ConfigureAwait(false);
 
-        var metadata = branchedFromProposalId is not null
+        IReadOnlyDictionary<string, string>? workUnitMetadata = branchedFromProposalId is not null
             ? new Dictionary<string, string> { ["branchedFromProposalId"] = branchedFromProposalId }
             : null;
+
+        if (workUnitMetadata is Dictionary<string, string> dict && metadata is not null)
+        {
+            foreach (var (key, value) in metadata)
+                dict[key] = value;
+        }
+        else if (metadata is not null)
+        {
+            workUnitMetadata = new Dictionary<string, string>(metadata);
+        }
 
         var now = DateTimeOffset.UtcNow;
         var workUnit = new WorkUnit(
@@ -156,7 +167,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             Owner: owner,
             AssignedAgent: null,
             SuccessCriteria: successCriteria,
-            Metadata: metadata,
+            Metadata: workUnitMetadata,
             ParentWorkUnitId: parentWorkUnitId,
             DependsOn: dependsOn ?? [],
             FileScope: fileScope ?? []);
@@ -191,7 +202,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
 
         var failures = _workUnits.Values
             .Where(w => branchId is null || w.BranchId == branchId)
-            .Where(w => w.Status is WorkUnitStatus.Failed)
+            .Where(w => w.Status is WorkUnitStatus.Failed or WorkUnitStatus.DeadLettered)
             .Select(w => w.WorkUnitId)
             .ToList();
 
@@ -267,6 +278,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IWorkUnitService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IOrchestratorService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IWorkspaceService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
+        services.AddSingleton<IFanOutService, FanOutService>();
         return services;
     }
 }

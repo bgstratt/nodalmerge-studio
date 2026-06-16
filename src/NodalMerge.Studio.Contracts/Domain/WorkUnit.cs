@@ -60,7 +60,9 @@ public static class WorkUnitTransitions
             (WorkUnitStatus.DeadLettered, WorkUnitStatus.Retrying) => true,
             (WorkUnitStatus.Proposed, WorkUnitStatus.Reviewing) => true,
             (WorkUnitStatus.Proposed, WorkUnitStatus.Merged) => true,
+            (WorkUnitStatus.Proposed, WorkUnitStatus.Queued) => true,
             (WorkUnitStatus.Reviewing, WorkUnitStatus.Merged) => true,
+            (WorkUnitStatus.Reviewing, WorkUnitStatus.Executing) => true,
 
             (_, WorkUnitStatus.Cancelled) when from is not WorkUnitStatus.Completed and not WorkUnitStatus.Merged => true,
             _ => false

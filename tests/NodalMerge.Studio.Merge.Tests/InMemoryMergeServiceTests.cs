@@ -40,6 +40,7 @@ public class InMemoryMergeServiceTests
         public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
         public Task<string> DiffAsync(string s, string t, CancellationToken ct = default) => Task.FromResult(string.Empty);
         public Task ApplyBranchAsync(string s, string t, CancellationToken ct = default) => Task.CompletedTask;
+        public Task CopyFilesAsync(string s, string t, IReadOnlyList<string> paths, CancellationToken ct = default) => Task.CompletedTask;
         public Task<string?> GetWorkingDirectoryAsync(string b, CancellationToken ct = default) => Task.FromResult<string?>(null);
     }
 
@@ -302,6 +303,38 @@ public class InMemoryMergeServiceTests
     {
         await Assert.ThrowsAsync<KeyNotFoundException>(() =>
             Build().ReviewAsync("no-such", MergeProposalStatus.Approved));
+    }
+
+    [Fact]
+    public async Task AutomatedReviewAsync_approved_returns_to_ReadyForReview_with_notes()
+    {
+        var svc = Build();
+        await svc.ProposeAsync(MakeProposal("MP-auto"));
+        await svc.ValidateAsync("MP-auto");
+
+        var result = await svc.AutomatedReviewAsync(
+            "MP-auto",
+            MergeProposalStatus.Approved,
+            "Scope matches plan.");
+
+        Assert.Equal(MergeProposalStatus.ReadyForReview, result.Status);
+        Assert.Equal("Scope matches plan.", result.VerificationResults);
+    }
+
+    [Fact]
+    public async Task AutomatedReviewAsync_rejected_terminates_before_human_gate()
+    {
+        var svc = Build();
+        await svc.ProposeAsync(MakeProposal("MP-auto-rej"));
+        await svc.ValidateAsync("MP-auto-rej");
+
+        var result = await svc.AutomatedReviewAsync(
+            "MP-auto-rej",
+            MergeProposalStatus.Rejected,
+            "Missing required file.");
+
+        Assert.Equal(MergeProposalStatus.Rejected, result.Status);
+        Assert.Equal("Missing required file.", result.VerificationResults);
     }
 
     // ── ApplyAsync — human gate ──────────────────────────────────────────────

@@ -34,13 +34,11 @@ public sealed class AgentProfileService : IAgentProfileService
                 PipelineStage.Plan,
                 string.Empty,
                 [
-                    McpToolNames.TaskCreate,
-                    McpToolNames.TaskList,
                     McpToolNames.WorkUnitGet,
                     McpToolNames.WorkspaceSummary,
-                    McpToolNames.ArtifactRecord,
-                    McpToolNames.ArtifactQuery,
-                    McpToolNames.ArtifactList,
+                    McpToolNames.WorkspaceRead,
+                    McpToolNames.WorkspaceWrite,
+                    McpToolNames.WorkspaceList,
                 ],
                 15),
             new(
@@ -65,6 +63,33 @@ public sealed class AgentProfileService : IAgentProfileService
                     McpToolNames.ArtifactList,
                 ],
                 20),
+            new(
+                "merger",
+                "Merger",
+                PipelineStage.Merge,
+                string.Empty,
+                [
+                    McpToolNames.MergePropose,
+                    McpToolNames.MergeValidate,
+                    McpToolNames.WorkspaceRead,
+                    McpToolNames.WorkspaceWrite,
+                    McpToolNames.WorkspaceDiff,
+                    McpToolNames.ProjectionGet,
+                ],
+                15),
+            new(
+                "reviewer",
+                "Reviewer",
+                PipelineStage.Review,
+                string.Empty,
+                [
+                    McpToolNames.WorkUnitGet,
+                    McpToolNames.MergeValidate,
+                    McpToolNames.MergeReview,
+                    McpToolNames.ProjectionGet,
+                    McpToolNames.WorkspaceRead,
+                ],
+                10),
         };
 
         foreach (var profile in defaults)

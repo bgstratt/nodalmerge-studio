@@ -8,8 +8,7 @@ public enum MergeProposalStatus
     Rejected,
     Merged,
 
-    // Phase 4 slice 11a. UnderReview is defined but has no wired transitions yet — nothing
-    // produces it until 11d's automated-reviewer pre-gate exists.
+    // Phase 4 slice 11d — automated reviewer holds the proposal while evaluating.
     UnderReview,
     Superseded
 }
@@ -32,9 +31,12 @@ public sealed record MergeProposal(
     string? Provider = null,
     string? SessionId = null,
     string? WorkUnitId = null,
-    IReadOnlyList<string>? FilesTouched = null)
+    IReadOnlyList<string>? FilesTouched = null,
+    IReadOnlyList<string>? ReconciledFrom = null,
+    string? SupersededBy = null)
 {
     public IReadOnlyList<string> FilesTouched { get; init; } = FilesTouched ?? [];
+    public IReadOnlyList<string> ReconciledFrom { get; init; } = ReconciledFrom ?? [];
 }
 
 public static class MergeProposalTransitions
@@ -45,10 +47,11 @@ public static class MergeProposalTransitions
             (MergeProposalStatus.Draft, MergeProposalStatus.ReadyForReview) => true,
             (MergeProposalStatus.ReadyForReview, MergeProposalStatus.Approved) => true,
             (MergeProposalStatus.ReadyForReview, MergeProposalStatus.Rejected) => true,
+            (MergeProposalStatus.ReadyForReview, MergeProposalStatus.UnderReview) => true,
+            (MergeProposalStatus.UnderReview, MergeProposalStatus.ReadyForReview) => true,
+            (MergeProposalStatus.UnderReview, MergeProposalStatus.Rejected) => true,
             (MergeProposalStatus.Approved, MergeProposalStatus.Merged) => true,
 
-            // Phase 4 slice 11c (merger/reducer) will produce Superseded; the transition is
-            // defined now so 11c doesn't need to touch this file.
             (MergeProposalStatus.ReadyForReview, MergeProposalStatus.Superseded) => true,
             (MergeProposalStatus.Approved, MergeProposalStatus.Superseded) => true,
             _ => false

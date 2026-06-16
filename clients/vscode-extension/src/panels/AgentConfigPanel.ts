@@ -125,7 +125,11 @@ export class AgentConfigPanel implements vscode.Disposable {
       }
 
       case 'quickSpawn':
-        await this.handleQuickSpawn(msg.templateName as string, msg.goal as string);
+        await this.handleQuickSpawn(
+          msg.templateName as string,
+          msg.goal as string,
+          msg.autoReviewProfileId as string | undefined,
+        );
         break;
 
       case 'getModels': {
@@ -140,7 +144,7 @@ export class AgentConfigPanel implements vscode.Disposable {
     }
   }
 
-  private async handleQuickSpawn(templateName: string, goal: string): Promise<void> {
+  private async handleQuickSpawn(templateName: string, goal: string, autoReviewProfileId?: string): Promise<void> {
     const templates = this.configService.getTemplates();
     const template  = templates.find(t => t.name === templateName);
     if (!template) {
@@ -179,6 +183,7 @@ export class AgentConfigPanel implements vscode.Disposable {
         agentType:  'orchestrator',
         workUnitId: orchWu.workUnitId,
         ...orchCfg,
+        ...(autoReviewProfileId ? { autoReviewProfileId } : {}),
       });
 
       void this.panel.webview.postMessage({ type: 'spawnResult', success: true });
@@ -369,6 +374,7 @@ const AGENT_CONFIG_CSS = `
   .form-box h3 { margin: 0 0 12px; font-size: 0.9em; opacity: 0.7; }
   .field { margin-bottom: 10px; }
   .field label { display: block; font-size: 0.8em; opacity: 0.6; margin-bottom: 3px; }
+  .checkbox-label { display: flex; align-items: center; gap: 8px; opacity: 1; font-size: 0.9em; margin-bottom: 0; }
   input[type=text], textarea, select {
     width: 100%;
     background: var(--nm-input-bg); color: var(--nm-input-fg);
@@ -436,6 +442,12 @@ const AGENT_CONFIG_HTML = `
       <div class="field">
         <label>Goal</label>
         <input type="text" id="spawn-goal" placeholder="e.g. Refactor the auth module">
+      </div>
+      <div class="field">
+        <label class="checkbox-label">
+          <input type="checkbox" id="spawn-auto-review" checked>
+          Run automated review before human gate
+        </label>
       </div>
       <button id="btn-spawn">&#x25B6; Quick Spawn</button>
       <div id="spawn-result" class="spawn-result hidden"></div>
@@ -816,9 +828,15 @@ const AGENT_CONFIG_JS = `
     const templateName = document.getElementById('spawn-template').value;
     const goal = document.getElementById('spawn-goal').value.trim();
     if (!goal) { alert('Goal is required.'); return; }
+    const autoReview = document.getElementById('spawn-auto-review').checked;
     this.disabled    = true;
     this.textContent = 'Spawning…';
-    vscode.postMessage({ type: 'quickSpawn', templateName: templateName, goal: goal });
+    vscode.postMessage({
+      type: 'quickSpawn',
+      templateName: templateName,
+      goal: goal,
+      autoReviewProfileId: autoReview ? 'reviewer' : undefined
+    });
   });
 
   // ── Save ──────────────────────────────────────────────────────────────────

@@ -163,6 +163,93 @@ public sealed class InMemoryMergeService : IMergeService
         return updated;
     }
 
+    public async Task<MergeProposal> AutomatedReviewAsync(
+        string proposalId,
+        MergeProposalStatus decision,
+        string verificationResults,
+        string? reviewerAgentId = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (decision is not (MergeProposalStatus.Approved or MergeProposalStatus.Rejected))
+        {
+            throw new ArgumentException(
+                "Automated review decision must be Approved or Rejected.",
+                nameof(decision));
+        }
+
+        if (string.IsNullOrWhiteSpace(verificationResults))
+        {
+            throw new ArgumentException(
+                "verificationResults is required for automated review.",
+                nameof(verificationResults));
+        }
+
+        var proposal = GetRequired(proposalId);
+
+        if (proposal.Status == MergeProposalStatus.ReadyForReview)
+        {
+            if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.UnderReview))
+            {
+                throw new InvalidOperationException(
+                    $"Cannot begin automated review for proposal '{proposalId}' in status {proposal.Status}.");
+            }
+
+            proposal = proposal with { Status = MergeProposalStatus.UnderReview };
+            _proposals[proposalId] = proposal;
+        }
+        else if (proposal.Status != MergeProposalStatus.UnderReview)
+        {
+            throw new InvalidOperationException(
+                $"Cannot complete automated review for proposal '{proposalId}' in status {proposal.Status}. " +
+                "Proposal must be ReadyForReview or UnderReview.");
+        }
+
+        var nextStatus = decision == MergeProposalStatus.Approved
+            ? MergeProposalStatus.ReadyForReview
+            : MergeProposalStatus.Rejected;
+
+        if (!MergeProposalTransitions.CanTransition(proposal.Status, nextStatus))
+        {
+            throw new InvalidOperationException(
+                $"Cannot transition proposal '{proposalId}' from {proposal.Status} to {nextStatus}.");
+        }
+
+        var updated = proposal with
+        {
+            Status = nextStatus,
+            VerificationResults = verificationResults,
+            AgentId = reviewerAgentId ?? proposal.AgentId,
+        };
+        _proposals[proposalId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.MergeProposalV1,
+            proposalId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        if (proposal.SessionId is not null)
+        {
+            await _events.AppendAsync(
+                proposal.SessionId,
+                proposal.WorkUnitId,
+                ExecutionEventKind.MergeProposalStatusChanged,
+                new MergeProposalStatusChangedPayload(proposalId, proposal.Status, updated.Status),
+                ct: cancellationToken).ConfigureAwait(false);
+
+            if (decision == MergeProposalStatus.Rejected)
+            {
+                await _events.AppendAsync(
+                    proposal.SessionId,
+                    proposal.WorkUnitId,
+                    ExecutionEventKind.ProposalRejected,
+                    new ProposalRejectedPayload(proposalId, reviewerAgentId ?? "reviewer", verificationResults),
+                    ct: cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        return updated;
+    }
+
     public async Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default)
     {
         var proposal = GetRequired(proposalId);
@@ -266,6 +353,47 @@ public sealed class InMemoryMergeService : IMergeService
         return Task.FromResult<IReadOnlyList<MergeProposal>>(items);
     }
 
+    public async Task<MergeProposal> SupersedeAsync(
+        string proposalId,
+        string supersededByProposalId,
+        CancellationToken cancellationToken = default)
+    {
+        var proposal = GetRequired(proposalId);
+
+        if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.Superseded))
+        {
+            throw new InvalidOperationException(
+                $"Cannot supersede proposal '{proposalId}': status {proposal.Status} cannot transition to Superseded.");
+        }
+
+        var updated = proposal with
+        {
+            Status = MergeProposalStatus.Superseded,
+            SupersededBy = supersededByProposalId,
+        };
+        _proposals[proposalId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.MergeProposalV1,
+            proposalId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        if (proposal.WorkUnitId is not null)
+            await _artifacts.UpdateStatusAsync(proposalId, ArtifactStatus.Superseded, cancellationToken).ConfigureAwait(false);
+
+        if (proposal.SessionId is not null)
+        {
+            await _events.AppendAsync(
+                proposal.SessionId,
+                proposal.WorkUnitId,
+                ExecutionEventKind.MergeProposalStatusChanged,
+                new MergeProposalStatusChangedPayload(proposalId, proposal.Status, updated.Status),
+                ct: cancellationToken).ConfigureAwait(false);
+        }
+
+        return updated;
+    }
+
     private MergeProposal GetRequired(string proposalId)
     {
         if (!_proposals.TryGetValue(proposalId, out var proposal))
@@ -280,6 +408,9 @@ public static class ServiceCollectionExtensions
     {
         // IStudioNodeStore must be registered before this (AddStudioStorage)
         services.AddSingleton<IMergeService, InMemoryMergeService>();
+        services.AddSingleton<IProposalReviewService, ProposalReviewService>();
+        services.AddSingleton<IMergeReconciliationService, MergeReconciliationService>();
+        services.AddSingleton<IAutomatedReviewGateService, AutomatedReviewGateService>();
         return services;
     }
 }

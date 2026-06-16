@@ -33,10 +33,134 @@ public interface IMergeService
 
     Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus decision, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Automated pre-gate review (11d). Approved returns the proposal to ReadyForReview with
+    /// verificationResults populated; Rejected terminates before human review.
+    /// </summary>
+    Task<MergeProposal> AutomatedReviewAsync(
+        string proposalId,
+        MergeProposalStatus decision,
+        string verificationResults,
+        string? reviewerAgentId = null,
+        CancellationToken cancellationToken = default);
+
     Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken cancellationToken = default);
+
+    Task<MergeProposal> SupersedeAsync(
+        string proposalId,
+        string supersededByProposalId,
+        CancellationToken cancellationToken = default);
 }
+
+public interface IProposalReviewService
+{
+    Task<IReadOnlyList<ProposalFileChange>> GetFileChangesAsync(
+        string proposalId,
+        CancellationToken cancellationToken = default);
+}
+
+public interface IMergeReconciliationService
+{
+    Task<MergeReconciliationResult> TryReconcileAsync(
+        string parentWorkUnitId,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default);
+}
+
+public enum MergeReconciliationOutcome
+{
+    NotApplicable,
+    WaitingForChildren,
+    AlreadyReconciled,
+    Reconciled,
+    Conflict,
+}
+
+public sealed record MergeReconciliationResult(
+    MergeReconciliationOutcome Outcome,
+    string? ReconciledProposalId = null,
+    IReadOnlyList<string>? ConstituentProposalIds = null,
+    string? ConflictReportPath = null);
+
+public interface IAutomatedReviewGateService
+{
+    /// <summary>
+    /// When auto-review is enabled for a parent work unit, enqueues the reviewer profile
+    /// against a ReadyForReview proposal that has not yet been auto-reviewed.
+    /// </summary>
+    Task<AutomatedReviewGateResult> TryEnqueueReviewerAsync(
+        string parentWorkUnitId,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// After automated rejection, resets child work units for retry (11d rejection path).
+    /// </summary>
+    Task<AutomatedRejectionResult> HandleAutomatedRejectionAsync(
+        string parentWorkUnitId,
+        string proposalId,
+        string agentId,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default);
+}
+
+public enum AutomatedRejectionOutcome
+{
+    RetriedWorkers,
+    EscalatedToDeadLetter,
+}
+
+public sealed record AutomatedRejectionResult(AutomatedRejectionOutcome Outcome);
+
+public enum AutomatedReviewGateOutcome
+{
+    NotEnabled,
+    NotApplicable,
+    AlreadyEnqueued,
+    Enqueued,
+}
+
+public sealed record AutomatedReviewGateResult(
+    AutomatedReviewGateOutcome Outcome,
+    string? ProposalId = null);
+
+public interface IDeadLetterService
+{
+    Task<DeadLetterEntry> RecordFailureAsync(
+        string workUnitId,
+        string agentId,
+        PipelineStage stage,
+        string profileId,
+        string reason,
+        string? taskId = null,
+        string? lastProjectionSnapshot = null,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default);
+
+    Task<DeadLetterEntry?> GetAsync(string entryId, CancellationToken cancellationToken = default);
+
+    Task<DeadLetterEntry?> GetLatestForWorkUnitAsync(
+        string workUnitId,
+        CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<DeadLetterEntry>> ListAsync(CancellationToken cancellationToken = default);
+
+    Task<DeadLetterRetryResult> RetryAsync(string entryId, CancellationToken cancellationToken = default);
+}
+
+public enum DeadLetterRetryOutcome
+{
+    Retried,
+    NotFound,
+    MaxAttemptsReached,
+    InvalidState,
+}
+
+public sealed record DeadLetterRetryResult(
+    DeadLetterRetryOutcome Outcome,
+    string? Message = null);
 
 public interface IWorkUnitService
 {
@@ -69,6 +193,7 @@ public interface IOrchestratorService
         IReadOnlyList<string>? fileScope = null,
         string? seedFromBranchId = null,
         string? branchedFromProposalId = null,
+        IReadOnlyDictionary<string, string>? metadata = null,
         CancellationToken cancellationToken = default);
 
     Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default);
@@ -131,6 +256,13 @@ public interface ISnapshotService
 
 public sealed record AgentInfo(string AgentId, string WorkUnitId, string Status);
 
+public sealed record OrchestratorCredentials(
+    string Provider,
+    string Model,
+    string BaseUrl,
+    string ApiKey,
+    string? ProfileId);
+
 public interface IAgentControlService
 {
     Task<string> SpawnAsync(
@@ -142,12 +274,24 @@ public interface IAgentControlService
         string? apiKey = null,
         string? provider = null,
         string? profileId = null,
+        string? autoReviewProfileId = null,
         CancellationToken cancellationToken = default);
 
     // Re-enters the orchestrator loop for a work unit whose orchestrator was previously
     // SpawnAsync'd — a no-op if none was registered (e.g. a work unit whose worker was
     // enqueued directly via the scheduler debug endpoint, with no orchestrator behind it).
     Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Returns LLM credentials captured when an orchestrator was first spawned for a work unit.
+    /// Used by fan-out to enqueue child workers with the same credentials.
+    /// </summary>
+    OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId);
+
+    /// <summary>
+    /// Profile ID for the automated reviewer pre-gate, captured at orchestrator spawn time.
+    /// </summary>
+    string? GetAutoReviewProfileId(string workUnitId);
 
     Task PauseAsync(string agentId, CancellationToken cancellationToken = default);
 
@@ -173,7 +317,41 @@ public interface IArtifactLineageService
     Task<IReadOnlyList<ArtifactRef>> GetChildrenAsync(string parentArtifactId, CancellationToken ct = default);
 
     Task<ArtifactRef> UpdateStatusAsync(string artifactId, ArtifactStatus status, CancellationToken ct = default);
+
+    Task<ArtifactRef> ReparentAsync(string artifactId, string newParentArtifactId, CancellationToken ct = default);
 }
+
+public interface IFanOutService
+{
+    /// <summary>
+    /// Reads plan.json on the parent branch, records a Plan artifact, creates child work units,
+    /// and enqueues slices whose dependencies are satisfied.
+    /// </summary>
+    Task<FanOutResult> TryFanOutFromPlanAsync(
+        string parentWorkUnitId,
+        string? sessionId = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// After a child completes, enqueues any dependent siblings that are now unblocked.
+    /// </summary>
+    Task<FanOutResult> TryEnqueueReadyDependentsAsync(
+        string parentWorkUnitId,
+        string? sessionId = null,
+        CancellationToken ct = default);
+}
+
+public enum FanOutAction
+{
+    None,
+    PlanRecorded,
+    ChildrenCreated,
+    ChildEnqueued,
+}
+
+public sealed record FanOutResult(
+    IReadOnlyList<FanOutAction> Actions,
+    IReadOnlyList<string> EnqueuedWorkUnitIds);
 
 public sealed record ConflictWarning(
     IReadOnlyList<string> OverlappingFiles,
@@ -335,6 +513,11 @@ public interface IFileWorkspaceService
     Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, CancellationToken ct = default);
     Task<string> DiffAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default);
     Task ApplyBranchAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default);
+    Task CopyFilesAsync(
+        string sourceBranchId,
+        string targetBranchId,
+        IReadOnlyList<string> relativePaths,
+        CancellationToken ct = default);
     Task<string?> GetWorkingDirectoryAsync(string branchId, CancellationToken ct = default);
 }
 

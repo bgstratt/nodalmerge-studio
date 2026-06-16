@@ -20,6 +20,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IAgentWorkspaceService, AgentWorkspaceService>();
         services.AddSingleton<IOrchestrationDecisionLogService, OrchestrationDecisionLogService>();
         services.AddSingleton<IIntentGraphService, IntentGraphService>();
+        services.AddSingleton<IDeadLetterService, InMemoryDeadLetterService>();
         AddFileWorkspaceService(services);
         return services;
     }
@@ -39,6 +40,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IAgentWorkspaceService, AgentWorkspaceService>();
         services.AddSingleton<IOrchestrationDecisionLogService, OrchestrationDecisionLogService>();
         services.AddSingleton<IIntentGraphService, IntentGraphService>();
+        services.AddSingleton<IDeadLetterService, InMemoryDeadLetterService>();
         AddFileWorkspaceService(services);
         return services;
     }

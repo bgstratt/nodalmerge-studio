@@ -63,7 +63,9 @@ public class ProjectionManagerTests
         public Task<MergeProposal> ProposeAsync(MergeProposal p, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> ValidateAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> ReviewAsync(string id, MergeProposalStatus d, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> ApplyAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> SupersedeAsync(string proposalId, string supersededByProposalId, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private sealed class FakeAgentRuntimeService : IAgentRuntimeService
@@ -116,6 +118,9 @@ public class ProjectionManagerTests
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
 
         public Task<ArtifactRef> UpdateStatusAsync(string artifactId, ArtifactStatus status, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<ArtifactRef> ReparentAsync(string artifactId, string newParentArtifactId, CancellationToken ct = default) =>
             throw new NotSupportedException();
     }
 

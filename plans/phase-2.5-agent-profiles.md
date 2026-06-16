@@ -24,6 +24,14 @@ Key consequences:
 
 ✅ Pre-2.5 validation complete — end-to-end run produced `success.md` in the target repo via the merge apply write-back path.
 
+## Progress
+
+- [x] 9a — Diff in Merge Review panel
+- [x] 9b — AgentProfile with pipeline stage model
+- [x] 9c — Profile-driven loop configuration
+- [x] 9d — AgentWorkspaceProjection with artifact chain
+- [x] 9e — Artifact-state-driven orchestrator routing
+
 ---
 
 ## What 2.5 adds

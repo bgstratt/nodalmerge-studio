@@ -18,6 +18,7 @@ public static class StudioNodeKind
     public const string ArtifactRefV1       = "studio/artifact-ref/v1";
     public const string OrchestrationEventV1 = "studio/orchestration-event/v1";
     public const string ChangeIntentV1       = "studio/change-intent/v1";
+    public const string DeadLetterV1         = "studio/dead-letter/v1";
 }
 
 public interface IStudioNodeStore

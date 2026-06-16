@@ -55,6 +55,7 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.AgentStop        => await AgentStopAsync(input, ct),
                 McpToolNames.MergePropose     => await MergeProposeAsync(input, ct, sessionId),
                 McpToolNames.MergeValidate    => await MergeValidateAsync(input, ct),
+                McpToolNames.MergeReview      => await MergeReviewAsync(input, ct),
                 McpToolNames.WorkspaceSummary => await WorkspaceSummaryAsync(input, ct),
                 McpToolNames.SnapshotGet      => await SnapshotGetAsync(input, ct),
                 McpToolNames.ProjectionGet    => await ProjectionGetAsync(input, ct),
@@ -194,7 +195,7 @@ internal sealed class McpToolDispatcher(
         var agentId = await agentControl.SpawnAsync(
             Str(input, "agentType")!, Str(input, "workUnitId")!,
             Str(input, "taskId"), Str(input, "model"), Str(input, "baseUrl"), Str(input, "apiKey"),
-            Str(input, "provider"), Str(input, "profileId"), ct).ConfigureAwait(false);
+            Str(input, "provider"), Str(input, "profileId"), autoReviewProfileId: null, ct).ConfigureAwait(false);
         return ToJson(new { agentId });
     }
 
@@ -231,6 +232,14 @@ internal sealed class McpToolDispatcher(
         catch { /* branch dirs may not exist yet; diff is optional */ }
 
         var filesTouched = ParseFilesTouched(workspaceChanges);
+        if (filesTouched.Count == 0)
+        {
+            try
+            {
+                filesTouched = (await fileWorkspace.ListAsync(sourceBranch, ct: ct).ConfigureAwait(false)).ToList();
+            }
+            catch { /* best-effort */ }
+        }
 
         var proposal = new MergeProposal(
             proposalId,
@@ -253,10 +262,14 @@ internal sealed class McpToolDispatcher(
 
         if (workUnitId is not null)
         {
+            var chain = await artifactLineage.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
+            var taskRef = chain.LastOrDefault(a => a.Type == ArtifactType.Task);
+            var parentArtifactId = taskRef?.ArtifactId ?? workUnitId;
+
             await artifactLineage.RecordAsync(new ArtifactRef(
                 created.ProposalId,
                 ArtifactType.MergeProposal,
-                workUnitId,
+                parentArtifactId,
                 StudioArtifactStatus.Active,
                 DateTimeOffset.UtcNow,
                 workUnitId,
@@ -313,6 +326,49 @@ internal sealed class McpToolDispatcher(
     {
         var proposal = await merge.ValidateAsync(Str(input, "proposalId")!, ct).ConfigureAwait(false);
         return ToJson(proposal);
+    }
+
+    private async Task<string> MergeReviewAsync(JsonElement input, CancellationToken ct)
+    {
+        var proposalId = Str(input, "proposalId");
+        var decisionStr = Str(input, "decision");
+        if (proposalId is null || decisionStr is null)
+            return ToError("proposalId and decision are required.");
+
+        if (!Enum.TryParse<MergeProposalStatus>(decisionStr, ignoreCase: true, out var decision) ||
+            decision is not (MergeProposalStatus.Approved or MergeProposalStatus.Rejected))
+        {
+            return ToError("Decision must be 'Approved' or 'Rejected'.");
+        }
+
+        var automated = input.TryGetProperty("automated", out var autoEl) &&
+                        autoEl.ValueKind == JsonValueKind.True;
+
+        try
+        {
+            if (automated)
+            {
+                var verificationResults = Str(input, "verificationResults");
+                if (string.IsNullOrWhiteSpace(verificationResults))
+                    return ToError("verificationResults is required for automated review.");
+
+                var proposal = await merge
+                    .AutomatedReviewAsync(proposalId, decision, verificationResults, Str(input, "reviewerAgentId"), ct)
+                    .ConfigureAwait(false);
+                return ToJson(proposal);
+            }
+
+            var reviewed = await merge.ReviewAsync(proposalId, decision, ct).ConfigureAwait(false);
+            return ToJson(reviewed);
+        }
+        catch (KeyNotFoundException)
+        {
+            return ToError($"Proposal '{proposalId}' was not found.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            return ToError(ex.Message);
+        }
     }
 
     private async Task<string> WorkspaceSummaryAsync(JsonElement input, CancellationToken ct)

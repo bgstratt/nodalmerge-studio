@@ -30,6 +30,18 @@ interface WorkspaceSummary {
   knownGoodStates: string[];
 }
 
+interface DeadLetterEntry {
+  entryId: string;
+  workUnitId: string;
+  agentId: string;
+  stage: string;
+  profileId: string;
+  reason: string;
+  attemptCount: number;
+  occurredAt: string;
+  maxAttemptsReached: boolean;
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 export class WorkspaceDashboardPanel implements vscode.Disposable {
@@ -110,13 +122,14 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
 
   private async poll(): Promise<void> {
     try {
-      const [summary, workUnits, agents, merges] = await Promise.all([
+      const [summary, workUnits, agents, merges, deadLetters] = await Promise.all([
         this.get<WorkspaceSummary>('/studio/workspace-summary'),
         this.get<WorkUnit[]>('/studio/workunits'),
         this.get<AgentInfo[]>('/studio/agents?all=true'),
         this.get<MergeProposal[]>('/studio/merges'),
+        this.get<DeadLetterEntry[]>('/studio/dead-letter'),
       ]);
-      void this.panel.webview.postMessage({ type: 'data', summary, workUnits, agents, merges });
+      void this.panel.webview.postMessage({ type: 'data', summary, workUnits, agents, merges, deadLetters });
       this.notifications?.update(merges);
     } catch {
       // host not yet ready — suppress until healthy
@@ -198,6 +211,10 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
           break;
         case 'openMergeReview':
           void vscode.commands.executeCommand('nodalmerge.openMergeReview', msg.proposalId as string);
+          break;
+        case 'retryDeadLetter':
+          await this.post('/studio/dead-letter/' + String(msg.entryId) + '/retry', {});
+          void this.poll();
           break;
       }
     } catch (err) {
@@ -549,17 +566,45 @@ const DASHBOARD_JS = `
     });
   }
 
-  function renderFailures(failures) {
+  function renderFailures(deadLetters, workUnits) {
     var el = document.getElementById('failures');
-    if (!failures || !failures.length) {
+    if (!deadLetters || !deadLetters.length) {
       el.innerHTML = '<p class="empty">No failures.</p>';
       return;
     }
+    var wuMap = {};
+    for (var j = 0; j < (workUnits || []).length; j++) { wuMap[workUnits[j].workUnitId] = workUnits[j]; }
     var html = '';
-    for (var i = 0; i < failures.length; i++) {
-      html += '<div class="card"><div class="row"><span class="mono title">' + esc(failures[i]) + '</span></div></div>';
+    for (var i = 0; i < deadLetters.length; i++) {
+      var dl = deadLetters[i];
+      var wu = wuMap[dl.workUnitId];
+      var goal = wu ? wu.goal : dl.workUnitId;
+      var canRetry = !dl.maxAttemptsReached && dl.attemptCount < 3;
+      html += '<div class="card">';
+      html += '<div class="row">';
+      html += '<span class="title" title="' + esc(goal) + '">' + esc(goal) + '</span>';
+      html += badge('failed');
+      html += '<div class="actions">';
+      if (canRetry) {
+        html += '<button class="ghost" data-action="retryDeadLetter" data-id="' + esc(dl.entryId) + '">Retry</button>';
+      } else {
+        html += '<span class="mono" style="opacity:0.6">Max attempts reached</span>';
+      }
+      html += '</div></div>';
+      html += '<div class="row">';
+      html += '<span class="mono">stage: ' + esc(dl.stage) + '</span>';
+      html += '<span class="mono">profile: ' + esc(dl.profileId) + '</span>';
+      html += '<span class="mono">attempt ' + esc(String(dl.attemptCount)) + '/3</span>';
+      html += '</div>';
+      html += '<div class="row"><span class="mono">' + esc(dl.reason) + '</span></div>';
+      html += '</div>';
     }
     el.innerHTML = html;
+    el.querySelectorAll('[data-action="retryDeadLetter"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'retryDeadLetter', entryId: btn.getAttribute('data-id') });
+      });
+    });
   }
 
   window.addEventListener('message', function(event) {
@@ -568,7 +613,7 @@ const DASHBOARD_JS = `
     renderWorkUnits(msg.workUnits);
     renderAgents(msg.agents, msg.workUnits);
     renderMerges(msg.merges);
-    renderFailures(msg.summary.failures);
+    renderFailures(msg.deadLetters || [], msg.workUnits);
     var ts = document.getElementById('last-updated');
     if (ts) { ts.textContent = 'updated ' + new Date().toLocaleTimeString(); }
   });

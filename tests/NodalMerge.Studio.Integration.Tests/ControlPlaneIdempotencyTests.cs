@@ -157,16 +157,15 @@ public class ControlPlaneIdempotencyTests
     }
 
     [Fact]
-    public async Task ReleaseAsync_failure_also_reinvokes_the_registered_orchestrator_and_marks_Retrying()
+    public async Task ReleaseAsync_failure_does_not_auto_retry_or_reinvoke_orchestrator()
     {
-        var (scheduler, workUnits, agentControl) = BuildSchedulerWithLifecycle();
+        var (scheduler, _, agentControl) = BuildSchedulerWithLifecycle();
         await scheduler.EnqueueAsync("WU-1", "profile-a", sessionId: "SES-1");
         await scheduler.TryAcquireAsync("agent-X");
 
         await scheduler.ReleaseAsync("WU-1", success: false);
 
-        Assert.Single(agentControl.ReinvokeCalls);
-        Assert.Equal(WorkUnitStatus.Retrying, workUnits.Calls.Last().Status);
+        Assert.Empty(agentControl.ReinvokeCalls);
     }
 
     [Fact]
@@ -190,18 +189,22 @@ public class ControlPlaneIdempotencyTests
     private sealed class RecordingWorkUnitService : IWorkUnitService
     {
         public List<(string WorkUnitId, WorkUnitStatus Status, string? SessionId)> Calls { get; } = [];
+        private WorkUnitStatus _status = WorkUnitStatus.Created;
 
         public Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken ct = default) => throw new NotSupportedException();
 
         public Task<WorkUnit> UpdateStatusAsync(string workUnitId, WorkUnitStatus status, string? sessionId = null, CancellationToken ct = default)
         {
             Calls.Add((workUnitId, status, sessionId));
+            _status = status;
             var updated = new WorkUnit(workUnitId, "goal", "branch-1", status, DateTimeOffset.UtcNow,
                 DateTimeOffset.UtcNow, "owner", null, null, null, null, [], []);
             return Task.FromResult(updated);
         }
 
-        public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<WorkUnit?>(null);
+        public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.FromResult<WorkUnit?>(new WorkUnit(workUnitId, "goal", "branch-1", _status, DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow, "owner", null, null, null, null, [], []));
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
@@ -213,13 +216,16 @@ public class ControlPlaneIdempotencyTests
 
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
-            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+            string? autoReviewProfileId = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
 
         public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default)
         {
             ReinvokeCalls.Add((workUnitId, sessionId));
             return Task.CompletedTask;
         }
+
+        public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
+        public string? GetAutoReviewProfileId(string workUnitId) => null;
 
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task ResumeAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
@@ -330,6 +336,7 @@ public class ControlPlaneIdempotencyTests
         public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
         public Task<string> DiffAsync(string s, string t, CancellationToken ct = default) => Task.FromResult(string.Empty);
         public Task ApplyBranchAsync(string s, string t, CancellationToken ct = default) => Task.CompletedTask;
+        public Task CopyFilesAsync(string s, string t, IReadOnlyList<string> paths, CancellationToken ct = default) => Task.CompletedTask;
         public Task<string?> GetWorkingDirectoryAsync(string b, CancellationToken ct = default) => Task.FromResult<string?>(null);
     }
 }

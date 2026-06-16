@@ -161,6 +161,21 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         return sb.ToString();
     }
 
+    public async Task CopyFilesAsync(
+        string sourceBranchId,
+        string targetBranchId,
+        IReadOnlyList<string> relativePaths,
+        CancellationToken ct = default)
+    {
+        foreach (var path in relativePaths)
+        {
+            ct.ThrowIfCancellationRequested();
+            var content = await ReadAsync(sourceBranchId, path, ct).ConfigureAwait(false);
+            if (content is not null)
+                await WriteAsync(targetBranchId, path, content, ct).ConfigureAwait(false);
+        }
+    }
+
     public async Task ApplyBranchAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default)
     {
         var sourceDir = BranchDir(sourceBranchId);

@@ -14,7 +14,9 @@ public sealed record MergeReviewRequest(
     string ProposalId,
     string Decision,
     string? Reviewer = null,
-    string? Notes = null);
+    string? Notes = null,
+    string? VerificationResults = null,
+    bool Automated = false);
 
 public sealed record MergeApplyRequest(string ProposalId);
 

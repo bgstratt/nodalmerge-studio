@@ -73,7 +73,14 @@ public sealed class WorkSchedulerService : IWorkScheduler
         // Only emit events/transition status on the first enqueue, not on retries.
         if (isNew)
         {
-            await UpdateWorkUnitStatusAsync(workUnitId, WorkUnitStatus.Queued, sessionId, ct).ConfigureAwait(false);
+            var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+            var unit = workUnits is not null
+                ? await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false)
+                : null;
+            if (unit?.Status is WorkUnitStatus.Created or WorkUnitStatus.Queued)
+            {
+                await UpdateWorkUnitStatusAsync(workUnitId, WorkUnitStatus.Queued, sessionId, ct).ConfigureAwait(false);
+            }
 
             if (sessionId is not null)
             {
@@ -225,6 +232,10 @@ public sealed class WorkSchedulerService : IWorkScheduler
             _queue.TryRemove(workUnitId, out var removed);
             var sessionId  = removed?.SessionId;
             var agentId    = removed?.LeasedBy ?? string.Empty;
+            var profileId  = removed?.ProfileId;
+            var taskId     = removed?.TaskId;
+
+            await RecordBranchChangesetAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
 
             await _nodeStore.WriteNodeAsync(
                 StudioNodeKind.SchedulerV1, workUnitId,
@@ -250,45 +261,133 @@ public sealed class WorkSchedulerService : IWorkScheduler
 
             await _workspaces.ArchiveAsync($"ws-{workUnitId}", sessionId, ct).ConfigureAwait(false);
 
-            await ReinvokeOrchestratorAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+            var orchestratorTarget = await ResolveOrchestratorWorkUnitIdAsync(workUnitId, ct).ConfigureAwait(false);
+            if (orchestratorTarget != workUnitId)
+            {
+                var fanOut = _serviceProvider?.GetService(typeof(IFanOutService)) as IFanOutService;
+                if (fanOut is not null)
+                    await fanOut.TryEnqueueReadyDependentsAsync(orchestratorTarget, sessionId, ct).ConfigureAwait(false);
+
+                var mergeReconciliation = _serviceProvider?.GetService(typeof(IMergeReconciliationService)) as IMergeReconciliationService;
+                if (mergeReconciliation is not null)
+                    await mergeReconciliation.TryReconcileAsync(orchestratorTarget, sessionId, ct).ConfigureAwait(false);
+
+                var automatedReview = _serviceProvider?.GetService(typeof(IAutomatedReviewGateService)) as IAutomatedReviewGateService;
+                if (automatedReview is not null)
+                    await automatedReview.TryEnqueueReviewerAsync(orchestratorTarget, sessionId, ct).ConfigureAwait(false);
+            }
+            else if (string.Equals(profileId, "reviewer", StringComparison.OrdinalIgnoreCase) &&
+                     !string.IsNullOrWhiteSpace(taskId))
+            {
+                var automatedReview = _serviceProvider?.GetService(typeof(IAutomatedReviewGateService)) as IAutomatedReviewGateService;
+                var merge = _serviceProvider?.GetService(typeof(IMergeService)) as IMergeService;
+                if (automatedReview is not null && merge is not null)
+                {
+                    var proposal = await merge.GetAsync(taskId, ct).ConfigureAwait(false);
+                    if (proposal?.Status == MergeProposalStatus.Rejected)
+                    {
+                        var rejection = await automatedReview
+                            .HandleAutomatedRejectionAsync(workUnitId, taskId, agentId, sessionId, ct)
+                            .ConfigureAwait(false);
+                        if (rejection.Outcome == AutomatedRejectionOutcome.EscalatedToDeadLetter)
+                            return;
+                    }
+                }
+            }
+
+            await ReinvokeOrchestratorAsync(orchestratorTarget, sessionId, ct).ConfigureAwait(false);
         }
         else
         {
-            // Reset lease so the next poll can retry. The workspace is intentionally left alone
-            // (not destroyed) here — it's keyed 1:1 to the work unit, not the attempt, and the
-            // next retry reuses it. DestroyAsync is for a work unit that is abandoned for good.
-            if (_queue.TryGetValue(workUnitId, out var item))
+            _queue.TryRemove(workUnitId, out var removed);
+            var sessionId = removed?.SessionId;
+            var agentId   = removed?.LeasedBy ?? string.Empty;
+
+            if (sessionId is not null)
             {
-                var sessionId = item.SessionId;
-                var agentId   = item.LeasedBy ?? string.Empty;
-                var reset     = item with { LeasedBy = null, LeasedAt = null };
-                _queue.TryUpdate(workUnitId, reset, item);
-                await _nodeStore.WriteNodeAsync(
-                    StudioNodeKind.SchedulerV1, workUnitId,
-                    JsonSerializer.Serialize(reset), ct).ConfigureAwait(false);
+                var failedEv = await _events.AppendAsync(
+                    sessionId,
+                    workUnitId,
+                    ExecutionEventKind.WorkUnitFailed,
+                    new WorkUnitFailedPayload(workUnitId, agentId, "Agent loop exited without success"),
+                    ct: ct).ConfigureAwait(false);
 
-                if (sessionId is not null)
-                {
-                    var failedEv = await _events.AppendAsync(
-                        sessionId,
-                        workUnitId,
-                        ExecutionEventKind.WorkUnitFailed,
-                        new WorkUnitFailedPayload(workUnitId, agentId, "Agent loop exited without success"),
-                        ct: ct).ConfigureAwait(false);
-
-                    await _events.AppendAsync(
-                        sessionId,
-                        workUnitId,
-                        ExecutionEventKind.SchedulerLeaseReleased,
-                        new SchedulerLeaseReleasedPayload(workUnitId, agentId, false),
-                        causedByEventId: failedEv.EventId,
-                        ct: ct).ConfigureAwait(false);
-                }
-
-                await UpdateWorkUnitStatusAsync(workUnitId, WorkUnitStatus.Retrying, sessionId, ct).ConfigureAwait(false);
-                await ReinvokeOrchestratorAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+                await _events.AppendAsync(
+                    sessionId,
+                    workUnitId,
+                    ExecutionEventKind.SchedulerLeaseReleased,
+                    new SchedulerLeaseReleasedPayload(workUnitId, agentId, false),
+                    causedByEventId: failedEv.EventId,
+                    ct: ct).ConfigureAwait(false);
             }
+
+            await _nodeStore.WriteNodeAsync(
+                StudioNodeKind.SchedulerV1, workUnitId,
+                "{\"status\":\"failed\"}", ct).ConfigureAwait(false);
         }
+    }
+
+    private async Task<string> ResolveOrchestratorWorkUnitIdAsync(string workUnitId, CancellationToken ct)
+    {
+        var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+        if (workUnits is null)
+            return workUnitId;
+
+        var unit = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+        return unit?.ParentWorkUnitId ?? workUnitId;
+    }
+
+    private async Task RecordBranchChangesetAsync(string workUnitId, string? sessionId, CancellationToken ct)
+    {
+        if (_artifacts is null)
+            return;
+
+        var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+        var fileWorkspace = _serviceProvider?.GetService(typeof(IFileWorkspaceService)) as IFileWorkspaceService;
+        if (workUnits is null || fileWorkspace is null)
+            return;
+
+        var unit = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+        if (unit is null)
+            return;
+
+        var chain = await _artifacts.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
+        if (chain.Any(a => a.Type == ArtifactType.BranchChangeset))
+            return;
+
+        var seedBranch = unit.Metadata?.GetValueOrDefault(WorkUnitMetadataKeys.SeedFromBranchId) ?? "main";
+
+        string? diff;
+        try
+        {
+            diff = await fileWorkspace.DiffAsync(unit.BranchId, seedBranch, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(diff))
+            return;
+
+        var taskRef = chain.LastOrDefault(a => a.Type == ArtifactType.Task);
+        var parentArtifactId = taskRef?.ArtifactId ?? unit.WorkUnitId;
+
+        var changesetId = $"BC-{Guid.NewGuid():N}";
+        await _artifacts.RecordAsync(new ArtifactRef(
+            changesetId,
+            ArtifactType.BranchChangeset,
+            parentArtifactId,
+            ArtifactStatus.Active,
+            DateTimeOffset.UtcNow,
+            workUnitId,
+            null,
+            "Branch changeset",
+            diff), ct).ConfigureAwait(false);
+
+        var proposalRef = chain.LastOrDefault(a => a.Type == ArtifactType.MergeProposal);
+        if (proposalRef is not null)
+            await _artifacts.ReparentAsync(proposalRef.ArtifactId, changesetId, ct).ConfigureAwait(false);
     }
 
     public Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default)

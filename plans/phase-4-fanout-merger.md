@@ -17,16 +17,16 @@ Phase 3 delivers the five foundational systems: Work Unit DAG, Scheduler, Branch
 
 ---
 
-## Slice 11a — Artifact Lifecycle State Machine ✅ (scoped — fan-out itself, 11b-11e, is not built yet)
+## Slice 11a — Artifact Lifecycle State Machine ✅
 
 > **As-built note:** Built as part of a Phase 4 kickoff alongside the orchestrator re-invocation fix (see `plans/phase-3-foundations.md`'s Deferred Work Tracker), since fan-out (11b) assumes both exist. Several deviations from the literal spec below, each for a concrete reason:
 >
 > - **Enums expanded additively, not renamed.** `WorkUnitStatus` keeps its original six values (`Created, Active, Waiting, Completed, Failed, Cancelled`) — they're still live in the legacy direct-spawn path (`IAgentControlService.SpawnAsync("worker", ...)`, used by `FullAgentCycleTests`), which never touches the scheduler and so never reaches the new states. `Queued, Executing, Proposed, Reviewing, Merged, DeadLettered, Retrying` were added alongside, not in place of, the originals. `Planned` was **not** added — there's still no separate planner stage to produce it, the same gap that's kept `ArtifactType.Plan` defined-but-unrecorded since 10d. The spec's own diagram and prose enum list disagree on `Rejected` (diagram shows it, the addition list below doesn't); the prose list was followed, so `WorkUnitStatus.Rejected` does not exist.
-> - **`MergeProposalStatus` gained `UnderReview` and `Superseded`**, but only `Superseded` has wired transitions (`ReadyForReview/Approved → Superseded`) — defined now so 11c's merger won't need to touch `MergeProposalTransitions` later, exactly like `ArtifactStatus.Superseded` already existed with no producer before this slice. `UnderReview` is wired to nothing; nothing produces it until 11d's automated-reviewer pre-gate.
+> - **`MergeProposalStatus` gained `UnderReview` and `Superseded`.** `UnderReview` is wired by 11d's automated reviewer; `Superseded` by 11c's merger.
 > - **Throw-based internal pattern kept, not refactored to "structured error, not throws."** Every call site at every boundary — REST (`StudioRestEndpoints.cs` `/studio/merges/{id}/validate|review|apply`) and MCP tools (`MergeTools.cs`) — already wraps these calls in try/catch and converts `InvalidOperationException` to a structured error response. The literal spec's file reference (`src/NodalMerge.Studio.Storage/WorkUnitService.cs`) also doesn't exist — the real implementation is `InMemoryWorkUnitService.cs` in the `NodalMerge.Studio.Orchestrator` project (a Phase 3 as-built fact, not new to this slice).
 > - **Transitions are NOT logged through `OrchestrationEvent`/`OrchestrationAction`.** `OrchestrationAction` (`SpawnPlanner/SpawnWorker/Enqueue/AwaitReview/ApplyMerge/Escalate/NoOp`) represents orchestrator *routing decisions*, not state-pair transitions, and most new transitions (lease acquired, merge applied) have no orchestrator decision behind them at all. Instead, two new `ExecutionEventKind` values — `WorkUnitStatusChanged` and `MergeProposalStatusChanged`, with `*StatusChangedPayload(Id, PreviousStatus, NewStatus)` records — were added on the existing `IExecutionEventStream`, mirroring the shape of the already-defined-but-dormant `ArtifactStatusChanged`/`ProposalSuperseded` kinds from 10b.2. `InMemoryWorkUnitService.UpdateStatusAsync` emits `WorkUnitStatusChanged` centrally (gained a new optional `sessionId` parameter for this — threaded through `McpToolDispatcher.WorkUnitUpdateAsync`; the MCP-server tool surface `WorkUnitTools.cs` has no session concept and always passes `null`, consistent with the rest of that surface). `InMemoryMergeService` emits `MergeProposalStatusChanged` from `ValidateAsync`/`ReviewAsync`/`ApplyAsync` via its existing `IExecutionEventStream` dependency.
-> - **Where transitions actually get wired — the real value of this slice.** `WorkSchedulerService` never called `IWorkUnitService.UpdateStatusAsync` at all before this slice; `WorkUnit.Status` was inert in the queue-driven pipeline. Now: `EnqueueAsync` (`Created → Queued`, first enqueue only) and `TryAcquireAsync` (`Queued → Executing`, lease acquired) resolve `IWorkUnitService` lazily via the existing optional `_serviceProvider` (same pattern as `DetectConflictAsync`'s `IWorkUnitService` lookup — no new constructor parameter). `McpToolDispatcher.MergeProposeAsync` drives `Executing → Proposed` (best-effort, try/catch-swallowed on illegal transition — the legacy path never reaches `Executing`, so this silently no-ops there by design, not error). `InMemoryMergeService.ApplyAsync` drives `Proposed/Reviewing → Merged` the same way, via a **new** optional `IServiceProvider? serviceProvider = null` constructor parameter (no direct `IWorkUnitService` injection — `InMemoryWorkUnitService` already depends on `IMergeService`, so a direct dependency would cycle, same shape `WorkSchedulerService` already avoids). `WorkSchedulerService.ReleaseAsync`'s failure branch drives `Executing → Retrying`.
-> - **`Reviewing` and `DeadLettered` remain defined but unreachable** — same status as `SpawnPlanner`/`Escalate` in `OrchestrationAction` (10e) and `ArtifactType.Plan`/`BranchChangeset` (10d): there's no automated-reviewer pre-gate (11d) or dead-letter mechanism (11e) yet to produce them.
+> - **Where transitions actually get wired — the real value of this slice.** `WorkSchedulerService` never called `IWorkUnitService.UpdateStatusAsync` at all before this slice; `WorkUnit.Status` was inert in the queue-driven pipeline. Now: `EnqueueAsync` (`Created → Queued`, first enqueue only) and `TryAcquireAsync` (`Queued → Executing`, lease acquired) resolve `IWorkUnitService` lazily via the existing optional `_serviceProvider` (same pattern as `DetectConflictAsync`'s `IWorkUnitService` lookup — no new constructor parameter). `McpToolDispatcher.MergeProposeAsync` drives `Executing → Proposed` (best-effort, try/catch-swallowed on illegal transition — the legacy path never reaches `Executing`, so this silently no-ops there by design, not error). `InMemoryMergeService.ApplyAsync` drives `Proposed/Reviewing → Merged` the same way, via a **new** optional `IServiceProvider? serviceProvider = null` constructor parameter (no direct `IWorkUnitService` injection — `InMemoryWorkUnitService` already depends on `IMergeService`, so a direct dependency would cycle, same shape `WorkSchedulerService` already avoids). `WorkSchedulerService.ReleaseAsync`'s failure branch drives `Executing → Retrying` (superseded by 11e dead-letter — scheduler no longer auto-retries on agent failure).
+> - **`Reviewing` and `DeadLettered` are now reachable** via 11c (overlap conflicts → `Reviewing`), 11d (`UnderReview` on proposals), and 11e (agent failures → `DeadLettered`).
 >
 > Implementation: [WorkUnit.cs](../src/NodalMerge.Studio.Contracts/Domain/WorkUnit.cs), [MergeProposal.cs](../src/NodalMerge.Studio.Contracts/Domain/MergeProposal.cs), [ExecutionEvent.cs](../src/NodalMerge.Studio.Contracts/Domain/ExecutionEvent.cs)/[ExecutionEventPayloads.cs](../src/NodalMerge.Studio.Contracts/Domain/ExecutionEventPayloads.cs), [InMemoryWorkUnitService.cs](../src/NodalMerge.Studio.Orchestrator/InMemoryWorkUnitService.cs), [InMemoryMergeService.cs](../src/NodalMerge.Studio.Merge/InMemoryMergeService.cs), [WorkSchedulerService.cs](../src/NodalMerge.Studio.Storage/WorkSchedulerService.cs), [McpToolDispatcher.cs](../src/NodalMerge.Studio.AgentRuntime/McpToolDispatcher.cs). Tests: extended `DomainTests.cs`, `InMemoryMergeServiceTests.cs`, `ControlPlaneIdempotencyTests.cs`; new `WorkUnitLifecycleTests.cs`.
 
@@ -69,7 +69,11 @@ Every state transition writes an `OrchestrationEvent` (from 10e) with the transi
 
 ---
 
-## Slice 11b — Fan-out (Planner → N Workers)
+## Slice 11b — Fan-out (Planner → N Workers) ✅
+
+> **As-built note:** Fan-out is deterministic via `FanOutService` (not LLM-driven slice creation). The orchestrator LLM only enqueues `profileId="planner"` on the first pass; after `plan.json` exists, `OrchestratorAgentLoop` calls `IFanOutService.TryFanOutFromPlanAsync` at the end of every run to record the `Plan` artifact, create child work units, and enqueue ready slices. Child completion triggers `TryEnqueueReadyDependentsAsync` from `WorkSchedulerService.ReleaseAsync`, which also re-invokes the **parent** orchestrator (not the child's). `sliceId → WorkUnitId` mapping and `seedFromBranchId` live in work-unit `Metadata`. `BranchChangeset` is recorded in `ReleaseAsync(success: true)` before archive; `MergeProposal` artifacts are reparented under the changeset via `IArtifactLineageService.ReparentAsync`. `OrchestrationAction.SpawnPlanner` is emitted when `scheduler.enqueue` uses `profileId="planner"`. The 10f.5 advisory `ConflictWarning` path was exercised under real parallel fan-out with non-overlapping `fileScope` — no region locking (Option B/C) added; existing warning remains sufficient for non-overlapping slices.
+>
+> Implementation: [PlanDocument.cs](../src/NodalMerge.Studio.Contracts/Domain/PlanDocument.cs), [FanOutService.cs](../src/NodalMerge.Studio.Orchestrator/FanOutService.cs), [PlannerAgentLoop.cs](../src/NodalMerge.Studio.AgentRuntime/PlannerAgentLoop.cs), [OrchestratorAgentLoop.cs](../src/NodalMerge.Studio.AgentRuntime/OrchestratorAgentLoop.cs), [WorkSchedulerService.cs](../src/NodalMerge.Studio.Storage/WorkSchedulerService.cs), [ArtifactLineageService.cs](../src/NodalMerge.Studio.Storage/ArtifactLineageService.cs). Tests: `FanOutIntegrationTests`, `FanOutServiceTests`, `FanOutLlmHandler`.
 
 Planner produces a structured decomposition; orchestrator creates N child work units and enqueues them all. Scheduler executes them in parallel up to the concurrency limit.
 
@@ -129,7 +133,13 @@ These were deferred in `plans/phase-3-foundations.md`'s Deferred Work Tracker sp
 
 ---
 
-## Slice 11c — Merger/Reducer
+## Slice 11c — Merger/Reducer ✅
+
+> **As-built note:** Reconciliation is deterministic via `MergeReconciliationService` (same pattern as 11b's `FanOutService`), not an LLM-driven merger agent on the happy path. Triggered from `OrchestratorAgentLoop` end and `WorkSchedulerService.ReleaseAsync` when all child work units reach `Proposed`. Constituent proposals transition to `Superseded` with `SupersededBy` set. Overlapping `FilesTouched` writes `merge-conflict-report.md` on the parent branch and moves the parent to `Reviewing`. After an automated review rejection (11d), a previously reconciled proposal in `Rejected` status does not block a new reconciliation pass — workers are re-enqueued and a fresh reconciled candidate is produced.
+>
+> **Human review contract (addresses gap vs text-only review):** `GET /studio/merges/{id}/file-changes` returns structured `ProposalFileChange` records (`path`, `changeKind`, `beforeContent`, `afterContent`) computed from `base/{proposalId}` vs the proposal source branch. The Merge Review panel renders per-file before/after panes and an **Open Diff in Editor** button (VS Code `vscode.diff`). Summary/goal/description remain supplementary; the authoritative review surface is file content. `workspaceChanges` remains a combined text summary. 11d's automated reviewer will add a `verificationResults` badge on top of this same file-change view — not replace it.
+>
+> Implementation: [ProposalFileChange.cs](../src/NodalMerge.Studio.Contracts/Domain/ProposalFileChange.cs), [MergeReconciliationService.cs](../src/NodalMerge.Studio.Merge/MergeReconciliationService.cs), [ProposalReviewService.cs](../src/NodalMerge.Studio.Merge/ProposalReviewService.cs), [MergeReviewPanel.ts](../clients/vscode-extension/src/panels/MergeReviewPanel.ts). Tests: `MergeReconciliationServiceTests`, updated `FanOutIntegrationTests`.
 
 Takes all approved (or ready-for-review) proposals for a parent work unit and produces a single reconciled candidate. Human reviews the reconciled proposal, not N individual ones.
 
@@ -174,11 +184,23 @@ After all child work units reach `Proposed`:
 
 ---
 
-## Slice 11d — Automated Reviewer Agent (Optional Pre-gate)
+## Slice 11d — Automated Reviewer Agent (Optional Pre-gate) — **Complete**
 
 An automated review pass before the human gate. Catches obvious issues without involving a human.
 
-### New profile
+### As-built (11d)
+
+- **`reviewer` profile** seeded in `AgentProfileService` (`Stage = Review`, tools: workunit.get, merge.validate, merge.review, projection.get, workspace.read, max 10 iterations).
+- **`ReviewerAgentLoop`** runs on scheduler when `profile.Stage == Review`; `taskId` carries `proposalId`.
+- **`AutomatedReviewGateService`** enqueues reviewer after reconciliation when `autoReviewProfileId` was set at orchestrator spawn; uses orchestrator LLM credentials.
+- **`IMergeService.AutomatedReviewAsync`** — `ReadyForReview → UnderReview → ReadyForReview` (approved, with `verificationResults`) or `Rejected` (pre-gate fail). Human `ReviewAsync` unchanged.
+- **`nm.v1.merge.review`** accepts `automated=true` and `verificationResults` in dispatcher + MCP server.
+- **`SpawnAgentBody.autoReviewProfileId`** stored on `OrchestratorRegistration`; `IAgentControlService.GetAutoReviewProfileId`.
+- **Quick Spawn checkbox** in `AgentConfigPanel.ts` sends `autoReviewProfileId: "reviewer"` when enabled (default on).
+- **Merge Review panel** shows green “Automated Review: Approved” or red “Automated Review: Rejected: {reason}”.
+- **Rejection path**: first two rejections re-queue child work units (`Proposed → Queued`) and parent → `Executing`; orchestrator re-invoked. After `MaxFailureAttempts` (3) automated review rejections, parent escalates to dead-letter (`DeadLettered` + dashboard Failed entry) via `IDeadLetterService`; orchestrator re-invocation skipped.
+
+### New profile (spec reference)
 
 Seed a `reviewer` profile:
 - `Stage = Review`
@@ -206,11 +228,22 @@ When `verificationResults` is populated, show it in the review panel (field alre
 
 ---
 
-## Slice 11e — Dead-letter & Failure Escalation
+## Slice 11e — Dead-letter & Failure Escalation — **Complete**
 
 Failed agents (timeout, loop error, iteration limit) are captured as dead-letter entries with structured escalation. Human can retry from the dashboard.
 
-### Domain record
+### As-built (11e)
+
+- **`DeadLetterEntry`** domain record persisted at `studio/dead-letter/v1` via `InMemoryDeadLetterService`.
+- **`AgentLoopCompletion`** returned from all agent loops; `MaxIterationsExceeded` triggers dead-letter (no silent success).
+- **`InMemoryAgentRuntimeService`** records dead-letter on scheduled worker failure (exception, missing credentials, max iterations) and orchestrator loop failure.
+- **`WorkSchedulerService.ReleaseAsync(false)`** removes queue entry without auto-retry; human retry via dead-letter API only.
+- **`OrchestrationAction.Escalate`** recorded on parent orchestrator work unit when a child fails.
+- **REST**: `GET /studio/dead-letter`, `GET /studio/dead-letter/{id}`, `POST /studio/dead-letter/{id}/retry`.
+- **Workspace Dashboard** Failed section shows goal, stage, profile, reason, attempt count; Retry button (disabled at 3 attempts).
+- **Max 3 failure attempts** per work unit (`FailureAttemptCount` metadata); `MaxAttemptsReached` on entry.
+
+### Domain record (spec reference)
 
 **`src/NodalMerge.Studio.Contracts/Domain/DeadLetterEntry.cs`** (new)
 

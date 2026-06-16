@@ -55,13 +55,14 @@ internal sealed class WorkerAgentLoop(
         ? profile.AllowedTools
         : null;
 
-    public async Task RunAsync(CancellationToken ct)
+    public async Task<AgentLoopCompletion> RunAsync(CancellationToken ct)
     {
         var messages = new List<NmMessage>
         {
             new("user", [new NmText($"Execute task {taskId} for work unit {workUnitId}. Your agent ID is {agentId}.")])
         };
 
+        var completedNaturally = false;
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
             var response = await llm.SendAsync(provider, model, baseUrl, apiKey, messages, _tools, _systemPrompt, ct)
@@ -70,7 +71,10 @@ internal sealed class WorkerAgentLoop(
             messages.Add(new NmMessage("assistant", response.Content));
 
             if (response.StopReason == "end_turn")
+            {
+                completedNaturally = true;
                 break;
+            }
 
             if (response.StopReason != "tool_use")
                 break;
@@ -92,6 +96,13 @@ internal sealed class WorkerAgentLoop(
 
             messages.Add(new NmMessage("user", toolResults));
         }
+
+        if (ct.IsCancellationRequested)
+            return AgentLoopCompletion.Cancelled;
+
+        return completedNaturally
+            ? AgentLoopCompletion.Succeeded
+            : AgentLoopCompletion.MaxIterationsExceeded;
     }
 
     private static IReadOnlyList<LlmToolDef> FilterTools(IReadOnlyList<string>? allowedTools)

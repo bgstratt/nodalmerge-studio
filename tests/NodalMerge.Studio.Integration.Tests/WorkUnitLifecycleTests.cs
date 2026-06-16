@@ -124,8 +124,10 @@ public class WorkUnitLifecycleTests
         public Task<MergeProposal?> GetAsync(string proposalId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal> ValidateAsync(string proposalId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus decision, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<MergeProposal> SupersedeAsync(string proposalId, string supersededByProposalId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
     private sealed class NoopKnownGoodStateService : IKnownGoodStateService
@@ -139,8 +141,10 @@ public class WorkUnitLifecycleTests
     {
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
-            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+            string? autoReviewProfileId = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
+        public string? GetAutoReviewProfileId(string workUnitId) => null;
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task ResumeAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task StopAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();

@@ -14,6 +14,7 @@
     <ProjectReference Include="..\NodalMerge.Studio.Projections\NodalMerge.Studio.Projections.csproj" />
     <ProjectReference Include="..\NodalMerge.Studio.Tasks\NodalMerge.Studio.Tasks.csproj" />
     <ProjectReference Include="..\NodalMerge.Studio.Merge\NodalMerge.Studio.Merge.csproj" />
+    <ProjectReference Include="..\NodalMerge.Studio.Orchestrator\NodalMerge.Studio.Orchestrator.csproj" />
   </ItemGroup>
 
 </Project>

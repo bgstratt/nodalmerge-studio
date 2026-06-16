@@ -59,6 +59,17 @@ public class MergeProposalTransitionTests
     {
         Assert.Equal(expected, MergeProposalTransitions.CanTransition(from, to));
     }
+
+    [Theory]
+    [InlineData(MergeProposalStatus.ReadyForReview, MergeProposalStatus.UnderReview, true)]
+    [InlineData(MergeProposalStatus.UnderReview, MergeProposalStatus.ReadyForReview, true)]
+    [InlineData(MergeProposalStatus.UnderReview, MergeProposalStatus.Rejected, true)]
+    [InlineData(MergeProposalStatus.UnderReview, MergeProposalStatus.Approved, false)]
+    public void UnderReview_transitions_for_automated_pre_gate(
+        MergeProposalStatus from, MergeProposalStatus to, bool expected)
+    {
+        Assert.Equal(expected, MergeProposalTransitions.CanTransition(from, to));
+    }
 }
 
 public class StudioTaskTests

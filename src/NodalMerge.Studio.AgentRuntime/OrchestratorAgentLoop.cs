@@ -19,45 +19,42 @@ internal sealed class OrchestratorAgentLoop(
     IArtifactLineageService artifactLineage,
     IProjectionManager projections,
     IOrchestrationDecisionLogService decisionLog,
+    IFanOutService fanOut,
+    IMergeReconciliationService mergeReconciliation,
+    IAutomatedReviewGateService automatedReview,
     AgentProfile? profile = null,
     string? sessionId = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
         You are an OrchestratorAgent in NodalMerge Studio, a collaborative AI workspace.
-        Your job is to manage a work unit from planning through to a validated merge proposal.
+        Your job is to manage a work unit from planning through to validated merge proposals.
 
         Routing strategy — read artifact state before each decision:
         Call nm_v1_projection_get with projectionType="AgentWorkspace" and your workUnitId to see the current
         artifact chain. Then route based on what exists:
-        - No Task artifacts → create tasks with nm_v1_task_create, then enqueue a worker for each task.
-        - Task artifacts exist but no MergeProposal → enqueue a worker for each open task.
-        - MergeProposal artifact exists with status Active/ReadyForReview → wait for human review; stop.
-        - MergeProposal artifact with status Approved → call nm_v1_merge_apply; done.
-        - MergeProposal artifact with status Rejected → create a new task to address the rejection, enqueue another worker.
+        - No Plan artifact and no child work units → enqueue the planner:
+          nm_v1_scheduler_enqueue with workUnitId=<your workUnitId>, profileId="planner".
+        - Plan artifact exists OR child work units exist → stop. Fan-out and child enqueue are handled
+          automatically after your turn — do not create tasks or enqueue workers yourself for slices.
+        - All child work units are Proposed and a reconciled MergeProposal exists on this work unit → stop;
+          if automated review is enabled the reviewer runs first; otherwise a human reviews in the Merge Review panel.
+        - Reconciled MergeProposal with status Approved → call nm_v1_merge_apply; done.
 
         Workflow:
         1. Call nm_v1_workunit_get to understand the goal for your assigned work unit.
-        2. Call nm_v1_projection_get (projectionType="AgentWorkspace", workUnitId=<id>) to see existing artifacts —
-           this includes inherited Research/Decision/Constraint knowledge from ancestor work units, so check it
-           before re-deriving something a prior run already figured out.
-        3. Route based on artifact state (see above). (Optional) If you make a notable planning decision —
-           e.g. which approach to take, or a constraint future work must respect — call nm_v1_artifact_record
-           with type Decision or Constraint so descendant work units inherit it automatically.
-        4. (Optional) If you know which file(s) a task will touch, call nm_v1_intent_record with workUnitId and
-           targetPath before enqueuing its worker — the scheduler uses this to warn about overlaps with other
-           work units before either one writes anything. Skip this if you don't know the target yet.
-        5. When enqueuing a worker: call nm_v1_scheduler_enqueue with workUnitId=<your workUnitId>, profileId="worker", taskId=<task id>.
+        2. Call nm_v1_projection_get (projectionType="AgentWorkspace", workUnitId=<id>) to see existing artifacts.
+        3. Route based on artifact state (see above).
+        4. When enqueuing the planner: call nm_v1_scheduler_enqueue with profileId="planner".
            LLM credentials are injected automatically — do not supply model, baseUrl, apiKey, or provider.
-        6. After enqueuing, stop — the scheduler picks up the work and runs the worker. Do not poll for worker completion.
-        7. The system will re-invoke you after the worker completes if further orchestration is needed.
+        5. After enqueuing, stop — the scheduler picks up the work. Do not poll for completion.
+        6. The system will re-invoke you after the planner or workers complete if further orchestration is needed.
 
         Rules:
         - Always re-read the AgentWorkspace projection before making a routing decision.
         - Do not approve or apply merges yourself — that requires human approval.
-        - If you encounter an unrecoverable error, stop and report it clearly.
+        - Do not enqueue workers directly on the parent work unit — use planner fan-out instead.
         - Be efficient: use each tool call purposefully, do not repeat calls unnecessarily.
-        - Do not enqueue a second worker for a task that is already queued or active.
         """;
 
     private readonly int _maxIterations = profile?.MaxIterations ?? 25;
@@ -69,13 +66,14 @@ internal sealed class OrchestratorAgentLoop(
         ? profile.AllowedTools
         : null;
 
-    public async Task RunAsync(CancellationToken ct)
+    public async Task<AgentLoopCompletion> RunAsync(CancellationToken ct)
     {
         var messages = new List<NmMessage>
         {
             new("user", [new NmText($"Begin orchestrating work unit {workUnitId}. Your agent ID is {agentId}.")])
         };
 
+        var completedNaturally = false;
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
             var response = await llm.SendAsync(provider, model, baseUrl, apiKey, messages, _tools, _systemPrompt, ct)
@@ -90,6 +88,7 @@ internal sealed class OrchestratorAgentLoop(
                 var awaitingReview = chain.Any(a => a.Type == ArtifactType.MergeProposal && a.Status == ArtifactStatus.Active);
                 var action = awaitingReview ? OrchestrationAction.AwaitReview : OrchestrationAction.NoOp;
                 await RecordDecisionAsync(action, [], text, ct).ConfigureAwait(false);
+                completedNaturally = true;
                 break;
             }
 
@@ -111,7 +110,7 @@ internal sealed class OrchestratorAgentLoop(
 
                 toolResults.Add(new NmToolResult(toolUse.Id, result));
 
-                await RecordToolDecisionAsync(toolUse.Name, result, ct).ConfigureAwait(false);
+                await RecordToolDecisionAsync(toolUse.Name, toolUse.Input, result, ct).ConfigureAwait(false);
             }
 
             if (toolResults.Count == 0)
@@ -119,19 +118,41 @@ internal sealed class OrchestratorAgentLoop(
 
             messages.Add(new NmMessage("user", toolResults));
         }
+
+        if (ct.IsCancellationRequested)
+            return AgentLoopCompletion.Cancelled;
+
+        if (!completedNaturally)
+            return AgentLoopCompletion.MaxIterationsExceeded;
+
+        await fanOut.TryFanOutFromPlanAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+        await mergeReconciliation.TryReconcileAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+        await automatedReview.TryEnqueueReviewerAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+        return AgentLoopCompletion.Succeeded;
     }
 
     // Only tool calls that actually change execution routing become OrchestrationEvents —
     // investigative calls (workunit.get, projection.get, task.create) are not routing decisions.
-    private async Task RecordToolDecisionAsync(string toolName, string resultJson, CancellationToken ct)
+    private async Task RecordToolDecisionAsync(string toolName, JsonElement input, string resultJson, CancellationToken ct)
     {
-        var action = toolName switch
+        OrchestrationAction? action;
+        if (toolName == McpToolNames.SchedulerEnqueue)
         {
-            McpToolNames.SchedulerEnqueue => OrchestrationAction.Enqueue,
-            McpToolNames.AgentSpawn       => OrchestrationAction.SpawnWorker,
-            McpToolNames.MergeApply       => OrchestrationAction.ApplyMerge,
-            _                             => (OrchestrationAction?)null,
-        };
+            var profileId = input.TryGetProperty("profileId", out var p) ? p.GetString() : "worker";
+            action = string.Equals(profileId, "planner", StringComparison.OrdinalIgnoreCase)
+                ? OrchestrationAction.SpawnPlanner
+                : OrchestrationAction.Enqueue;
+        }
+        else
+        {
+            action = toolName switch
+            {
+                McpToolNames.AgentSpawn => OrchestrationAction.SpawnWorker,
+                McpToolNames.MergeApply => OrchestrationAction.ApplyMerge,
+                _                       => null,
+            };
+        }
+
         if (action is null)
             return;
 
@@ -170,9 +191,10 @@ internal sealed class OrchestratorAgentLoop(
     {
         var key = action switch
         {
-            OrchestrationAction.Enqueue     => "workUnitId",
-            OrchestrationAction.SpawnWorker => "agentId",
-            OrchestrationAction.ApplyMerge  => "proposalId",
+            OrchestrationAction.Enqueue      => "workUnitId",
+            OrchestrationAction.SpawnPlanner => "workUnitId",
+            OrchestrationAction.SpawnWorker  => "agentId",
+            OrchestrationAction.ApplyMerge   => "proposalId",
             _                                => null,
         };
         if (key is null)

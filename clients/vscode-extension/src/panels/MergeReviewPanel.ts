@@ -14,6 +14,15 @@ export interface MergeProposal {
   workspaceChanges?: string | null;
   confidence?: number | null;
   status: string;
+  reconciledFrom?: string[];
+  supersededBy?: string | null;
+}
+
+export interface ProposalFileChange {
+  path: string;
+  changeKind: 'Added' | 'Modified' | 'Deleted';
+  beforeContent?: string | null;
+  afterContent?: string | null;
 }
 
 // ── Panel ──────────────────────────────────────────────────────────────────
@@ -60,8 +69,14 @@ export class MergeReviewPanel implements vscode.Disposable {
   private async load(): Promise<void> {
     try {
       const proposal = await this.get<MergeProposal>('/studio/merges/' + this.proposalId);
+      const changesRes = await this.get<{ fileChanges: ProposalFileChange[] }>(
+        '/studio/merges/' + this.proposalId + '/file-changes');
       this.panel.title = 'Merge Review: ' + proposal.sourceBranch;
-      void this.panel.webview.postMessage({ type: 'proposal', proposal });
+      void this.panel.webview.postMessage({
+        type: 'proposal',
+        proposal,
+        fileChanges: changesRes.fileChanges ?? [],
+      });
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: failed to load proposal — ' + String(err));
     }
@@ -70,6 +85,17 @@ export class MergeReviewPanel implements vscode.Disposable {
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
     try {
       switch (msg.type as string) {
+        case 'openDiff': {
+          const path = String(msg.path ?? 'file');
+          const before = (msg.beforeContent as string | null | undefined) ?? '';
+          const after = (msg.afterContent as string | null | undefined) ?? '';
+          const lang = path.includes('.') ? path.split('.').pop() : 'plaintext';
+          const left = await vscode.workspace.openTextDocument({ language: lang, content: before });
+          const right = await vscode.workspace.openTextDocument({ language: lang, content: after });
+          const title = path + ' (base ↔ proposed)';
+          await vscode.commands.executeCommand('vscode.diff', left.uri, right.uri, title);
+          break;
+        }
         case 'validate':
           await this.post('/studio/merges/' + this.proposalId + '/validate', {});
           break;
@@ -235,6 +261,63 @@ const REVIEW_CSS = `
   .diff-add  { color: var(--nm-success); }
   .diff-del  { color: var(--nm-error); }
   .diff-meta { color: var(--nm-info); opacity: 0.7; }
+  .reconciled-banner {
+    border-left: 3px solid var(--nm-info);
+    padding: 8px 12px;
+    margin: 12px 0;
+    background: rgba(55, 148, 255, 0.08);
+    font-size: 0.9em;
+  }
+  .file-change {
+    border: 1px solid var(--nm-border);
+    border-radius: 4px;
+    margin: 8px 0;
+    overflow: hidden;
+  }
+  .file-change summary {
+    cursor: pointer;
+    padding: 8px 12px;
+    font-family: var(--nm-mono);
+    font-size: 0.9em;
+    background: rgba(128,128,128,0.08);
+  }
+  .file-change-body {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0;
+    border-top: 1px solid var(--nm-border);
+  }
+  .file-pane {
+    padding: 8px 10px;
+    min-width: 0;
+  }
+  .file-pane h3 {
+    font-size: 0.72em;
+    text-transform: uppercase;
+    opacity: 0.55;
+    margin: 0 0 6px;
+  }
+  .file-pane + .file-pane { border-left: 1px solid var(--nm-border); }
+  .file-pane.added-only { grid-column: 1 / -1; }
+  .verification-approved {
+    border-left: 3px solid var(--nm-success);
+    padding: 8px 12px;
+    background: rgba(35, 134, 54, 0.12);
+    color: var(--nm-success);
+    font-weight: 600;
+  }
+  .verification-rejected {
+    border-left: 3px solid var(--nm-error);
+    padding: 8px 12px;
+    background: rgba(241, 76, 76, 0.12);
+    color: var(--nm-error);
+    font-weight: 600;
+  }
+  button.ghost {
+    background: transparent;
+    border: 1px solid var(--nm-border);
+    margin: 8px 12px 12px;
+  }
 `;
 
 const REVIEW_HTML = `
@@ -247,6 +330,9 @@ const REVIEW_HTML = `
       <span class="meta-label">Target branch</span><span class="meta-value" id="target-branch"></span>
       <span class="meta-label">Confidence</span>  <span class="meta-value" id="confidence"></span>
     </div>
+    <section id="section-reconciled" class="hidden reconciled-banner">
+      <strong>Reconciled proposal</strong> — combined from <span id="reconciled-from"></span> child proposal(s).
+    </section>
     <section>
       <h2>Goal</h2>
       <p id="goal"></p>
@@ -259,13 +345,18 @@ const REVIEW_HTML = `
       <h2>Change description</h2>
       <p id="change-description"></p>
     </section>
+    <section id="section-files" class="hidden">
+      <h2>File changes</h2>
+      <p style="opacity:0.7;font-size:0.9em;margin:0 0 8px">Review concrete before/after content per file. Use Open Diff for the VS Code side-by-side editor.</p>
+      <div id="file-changes"></div>
+    </section>
     <section id="section-diff" class="hidden">
-      <h2>Diff</h2>
+      <h2>Combined diff summary</h2>
       <pre id="diff-content" class="diff-pre"></pre>
     </section>
     <section id="section-verification" class="hidden">
-      <h2>Verification results</h2>
-      <p id="verification-results"></p>
+      <h2>Automated review</h2>
+      <div id="verification-results"></div>
     </section>
     <section id="section-rollback" class="hidden">
       <h2>Rollback plan</h2>
@@ -338,10 +429,53 @@ const REVIEW_JS = `
     vscode.postMessage({ type: 'apply' });
   });
 
+  function renderFileChanges(changes) {
+    if (!changes || !changes.length) return '';
+    return changes.map(function(fc, idx) {
+      var kind = (fc.changeKind || '').toLowerCase();
+      var isAdded = kind === 'added';
+      var isDeleted = kind === 'deleted';
+      var bodyClass = isAdded ? 'file-change-body added-only' : 'file-change-body';
+      var before = isAdded ? '' : esc(fc.beforeContent || '(empty)');
+      var after = isDeleted ? '' : esc(fc.afterContent || '(empty)');
+      var html = '<details class="file-change" open>';
+      html += '<summary>' + esc(fc.path) + ' <span class="badge">' + esc(fc.changeKind) + '</span></summary>';
+      html += '<div class="' + bodyClass + '">';
+      if (!isAdded) {
+        html += '<div class="file-pane"><h3>Before (base)</h3><pre class="diff-pre">' + before + '</pre></div>';
+      }
+      if (!isDeleted) {
+        html += '<div class="file-pane"><h3>After (proposed)</h3><pre class="diff-pre">' + after + '</pre></div>';
+      }
+      html += '</div>';
+      if (!isDeleted) {
+        html += '<button class="ghost" data-open-diff="' + idx + '">Open Diff in Editor</button>';
+      }
+      html += '</details>';
+      return html;
+    }).join('');
+  }
+
+  document.addEventListener('click', function(ev) {
+    var btn = ev.target.closest('[data-open-diff]');
+    if (!btn) return;
+    var idx = parseInt(btn.getAttribute('data-open-diff'), 10);
+    var fc = window.__fileChanges && window.__fileChanges[idx];
+    if (!fc) return;
+    vscode.postMessage({
+      type: 'openDiff',
+      path: fc.path,
+      beforeContent: fc.beforeContent,
+      afterContent: fc.afterContent
+    });
+  });
+
   window.addEventListener('message', function(event) {
     var msg = event.data;
     if (msg.type !== 'proposal') { return; }
     var p = msg.proposal;
+    var fileChanges = msg.fileChanges || [];
+    window.__fileChanges = fileChanges;
     var status = (p.status || '').toLowerCase().replace(/\\s+/g, '');
 
     var loadingEl = document.getElementById('loading');
@@ -358,8 +492,31 @@ const REVIEW_JS = `
     setText('goal', p.goal);
     setText('summary', p.summary);
     setText('change-description', p.changeDescription);
-    setText('verification-results', p.verificationResults);
+
+    var verificationEl = document.getElementById('verification-results');
+    if (verificationEl && p.verificationResults) {
+      var isRejected = status === 'rejected';
+      var label = isRejected
+        ? 'Automated Review: Rejected: ' + esc(p.verificationResults)
+        : 'Automated Review: Approved — ' + esc(p.verificationResults);
+      verificationEl.className = isRejected ? 'verification-rejected' : 'verification-approved';
+      verificationEl.textContent = isRejected
+        ? 'Automated Review: Rejected: ' + (p.verificationResults || '')
+        : 'Automated Review: Approved — ' + (p.verificationResults || '');
+    } else if (verificationEl) {
+      verificationEl.className = '';
+      verificationEl.textContent = '';
+    }
+
     setText('rollback-plan', p.rollbackPlan);
+
+    var reconciled = p.reconciledFrom && p.reconciledFrom.length;
+    showIf('section-reconciled', !!reconciled);
+    if (reconciled) setText('reconciled-from', p.reconciledFrom.join(', '));
+
+    setHtml('file-changes', renderFileChanges(fileChanges));
+    showIf('section-files', fileChanges.length > 0);
+
     if (p.workspaceChanges) { setHtml('diff-content', renderDiff(p.workspaceChanges)); }
 
     showIf('section-diff', !!p.workspaceChanges);

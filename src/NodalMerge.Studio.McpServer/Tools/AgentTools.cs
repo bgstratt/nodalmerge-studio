@@ -26,7 +26,9 @@ public sealed class AgentTools(IAgentControlService agents, IWorkUnitService wor
             if (wu is null)
                 return McpJson.Error(McpToolNames.AgentSpawn, $"Work unit '{workUnitId}' not found.");
 
-            var agentId = await agents.SpawnAsync(agentType, workUnitId, taskId, model, baseUrl, apiKey, provider, profileId, cancellationToken).ConfigureAwait(false);
+            var agentId = await agents.SpawnAsync(
+                agentType, workUnitId, taskId, model, baseUrl, apiKey, provider, profileId,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
             return McpJson.Ok(new { agentId, agentType, workUnitId, branchId = wu.BranchId });
         }
         catch (InvalidOperationException ex)

@@ -84,6 +84,9 @@ public class WorkspaceIsolationTests
         public Task ApplyBranchAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default) =>
             Task.CompletedTask;
 
+        public Task CopyFilesAsync(string sourceBranchId, string targetBranchId, IReadOnlyList<string> relativePaths, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
         public Task<string?> GetWorkingDirectoryAsync(string branchId, CancellationToken ct = default) =>
             Task.FromResult<string?>(_branches.ContainsKey(branchId) ? $"/fake/{branchId}" : null);
     }

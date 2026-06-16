@@ -52,7 +52,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     // the loop with the same credentials/profile later, without the caller (WorkSchedulerService)
     // needing to remember or re-supply them.
     private sealed record OrchestratorRegistration(
-        string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId);
+        string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? AutoReviewProfileId);
 
     // ── IHostedService ─────────────────────────────────────────────────────
 
@@ -108,6 +108,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         var agentId = $"worker-{Guid.NewGuid():N}";
         var cts = new CancellationTokenSource();
         var success = false;
+        string? failureReason = null;
 
         try
         {
@@ -127,7 +128,12 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 && (!string.IsNullOrWhiteSpace(model)
                     || provider.Equals("openai", StringComparison.OrdinalIgnoreCase));
 
-            if (canRun)
+            if (!canRun)
+            {
+                _logger.LogWarning("[Agent {AgentId}] Scheduled worker will NOT run — missing credentials.", agentId);
+                failureReason = "Missing LLM credentials";
+            }
+            else
             {
                 if (item.SessionId is not null)
                 {
@@ -141,13 +147,35 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
-                var loop = new WorkerAgentLoop(agentId, item.WorkUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm, profile, item.SessionId);
-                await loop.RunAsync(cts.Token).ConfigureAwait(false);
-                success = true;
-            }
-            else
-            {
-                _logger.LogWarning("[Agent {AgentId}] Scheduled worker will NOT run — missing credentials.", agentId);
+
+                AgentLoopCompletion completion;
+                if (profile?.Stage == PipelineStage.Plan)
+                {
+                    var plannerLoop = new PlannerAgentLoop(
+                        agentId, item.WorkUnitId, provider, model, baseUrl, apiKey!,
+                        dispatcher, llm, profile, item.SessionId);
+                    completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
+                }
+                else if (profile?.Stage == PipelineStage.Review)
+                {
+                    var proposalId = string.IsNullOrWhiteSpace(taskId) ? string.Empty : taskId;
+                    var reviewerLoop = new ReviewerAgentLoop(
+                        agentId, item.WorkUnitId, proposalId, provider, model, baseUrl, apiKey!,
+                        dispatcher, llm, profile, item.SessionId);
+                    completion = await reviewerLoop.RunAsync(cts.Token).ConfigureAwait(false);
+                }
+                else
+                {
+                    var loop = new WorkerAgentLoop(
+                        agentId, item.WorkUnitId, taskId, provider, model, baseUrl, apiKey!,
+                        dispatcher, llm, profile, item.SessionId);
+                    completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
+                }
+
+                if (completion == AgentLoopCompletion.Succeeded)
+                    success = true;
+                else if (completion == AgentLoopCompletion.MaxIterationsExceeded)
+                    failureReason = "Max iterations reached";
             }
 
             if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
@@ -161,6 +189,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         catch (Exception ex)
         {
             _logger.LogError(ex, "[Agent {AgentId}] Scheduled worker loop failed.", agentId);
+            failureReason = ex.Message.Length > 200 ? ex.Message[..200] : ex.Message;
             if (_agents.TryGetValue(agentId, out var r))
             {
                 var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
@@ -169,12 +198,42 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         }
         finally
         {
+            if (failureReason is not null)
+            {
+                var profile = item.ProfileId is not null
+                    ? await _profileService.GetAsync(item.ProfileId, ct).ConfigureAwait(false)
+                    : null;
+                await RecordDeadLetterAsync(item, agentId, profile, failureReason, ct).ConfigureAwait(false);
+            }
+
             cts.Dispose();
             Interlocked.Decrement(ref _activeWorkerCount);
             await _scheduler.ReleaseAsync(item.WorkUnitId, success).ConfigureAwait(false);
             _logger.LogInformation(
                 "[Scheduler] Released workUnit={WorkUnitId} success={Success}", item.WorkUnitId, success);
         }
+    }
+
+    private async Task RecordDeadLetterAsync(
+        ScheduledItem item,
+        string agentId,
+        AgentProfile? profile,
+        string reason,
+        CancellationToken ct)
+    {
+        var deadLetter = _serviceProvider.GetService<IDeadLetterService>();
+        if (deadLetter is null)
+            return;
+
+        await deadLetter.RecordFailureAsync(
+            item.WorkUnitId,
+            agentId,
+            profile?.Stage ?? PipelineStage.Execute,
+            item.ProfileId,
+            reason,
+            string.IsNullOrWhiteSpace(item.TaskId) ? null : item.TaskId,
+            sessionId: item.SessionId,
+            cancellationToken: ct).ConfigureAwait(false);
     }
 
     // ── IAgentRuntimeService ───────────────────────────────────────────────
@@ -237,6 +296,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? apiKey = null,
         string? provider = null,
         string? profileId = null,
+        string? autoReviewProfileId = null,
         CancellationToken cancellationToken = default)
     {
         var agentId = $"{agentType}-{Guid.NewGuid():N}";
@@ -264,7 +324,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
                 _orchestratorRegistrations[workUnitId] = new OrchestratorRegistration(
-                    resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId);
+                    resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId, autoReviewProfileId);
             }
             else if (agentType == "worker" && taskId is not null)
                 StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
@@ -293,6 +353,22 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         return Task.CompletedTask;
     }
 
+    public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId)
+    {
+        if (!_orchestratorRegistrations.TryGetValue(workUnitId, out var reg))
+            return null;
+
+        return new OrchestratorCredentials(reg.Provider, reg.Model, reg.BaseUrl, reg.ApiKey, reg.ProfileId);
+    }
+
+    public string? GetAutoReviewProfileId(string workUnitId)
+    {
+        if (!_orchestratorRegistrations.TryGetValue(workUnitId, out var reg))
+            return null;
+
+        return reg.AutoReviewProfileId;
+    }
+
     private void StartOrchestratorLoop(
         string agentId,
         string workUnitId,
@@ -315,16 +391,46 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var artifactLineage = _serviceProvider.GetRequiredService<IArtifactLineageService>();
                 var projections = _serviceProvider.GetRequiredService<IProjectionManager>();
                 var decisionLog = _serviceProvider.GetRequiredService<IOrchestrationDecisionLogService>();
+                var fanOut = _serviceProvider.GetRequiredService<IFanOutService>();
+                var mergeReconciliation = _serviceProvider.GetRequiredService<IMergeReconciliationService>();
+                var automatedReview = _serviceProvider.GetRequiredService<IAutomatedReviewGateService>();
                 var loop = new OrchestratorAgentLoop(
                     agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm,
-                    artifactLineage, projections, decisionLog, profile, sessionId);
-                await loop.RunAsync(cts.Token).ConfigureAwait(false);
+                    artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, profile, sessionId);
+                var completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
+                if (completion == AgentLoopCompletion.MaxIterationsExceeded)
+                {
+                    var deadLetter = _serviceProvider.GetService<IDeadLetterService>();
+                    if (deadLetter is not null)
+                    {
+                        await deadLetter.RecordFailureAsync(
+                            workUnitId,
+                            agentId,
+                            profile?.Stage ?? PipelineStage.Orchestrate,
+                            profile?.AgentProfileId ?? "orchestrator",
+                            "Max iterations reached",
+                            sessionId: sessionId,
+                            cancellationToken: cts.Token).ConfigureAwait(false);
+                    }
+                }
                 _logger.LogInformation("[Agent {AgentId}] Orchestrator loop completed.", agentId);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[Agent {AgentId}] Orchestrator loop failed.", agentId);
+                var deadLetter = _serviceProvider.GetService<IDeadLetterService>();
+                if (deadLetter is not null)
+                {
+                    await deadLetter.RecordFailureAsync(
+                        workUnitId,
+                        agentId,
+                        profile?.Stage ?? PipelineStage.Orchestrate,
+                        profile?.AgentProfileId ?? "orchestrator",
+                        ex.Message.Length > 200 ? ex.Message[..200] : ex.Message,
+                        sessionId: sessionId,
+                        cancellationToken: CancellationToken.None).ConfigureAwait(false);
+                }
                 if (_agents.TryGetValue(agentId, out var r))
                 {
                     var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;

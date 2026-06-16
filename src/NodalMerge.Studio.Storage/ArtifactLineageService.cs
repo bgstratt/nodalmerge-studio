@@ -63,6 +63,37 @@ public sealed class ArtifactLineageService : IArtifactLineageService
         return updated;
     }
 
+    public async Task<ArtifactRef> ReparentAsync(string artifactId, string newParentArtifactId, CancellationToken ct = default)
+    {
+        if (!_byId.TryGetValue(artifactId, out var existing))
+            throw new KeyNotFoundException($"Artifact '{artifactId}' was not found.");
+
+        var updated = existing with { ParentArtifactId = newParentArtifactId };
+        _byId[artifactId] = updated;
+
+        lock (_indexLock)
+        {
+            if (existing.ParentArtifactId is { } oldParent)
+            {
+                if (_byParent.TryGetValue(oldParent, out var oldList))
+                    oldList.Remove(artifactId);
+            }
+
+            if (!_byParent.TryGetValue(newParentArtifactId, out var newList))
+                _byParent[newParentArtifactId] = newList = [];
+            if (!newList.Contains(artifactId))
+                newList.Add(artifactId);
+        }
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.ArtifactRefV1,
+            artifactId,
+            JsonSerializer.Serialize(updated),
+            ct).ConfigureAwait(false);
+
+        return updated;
+    }
+
     private IReadOnlyList<ArtifactRef> ResolveOrdered(ConcurrentDictionary<string, List<string>> index, string key)
     {
         List<string> ids;
