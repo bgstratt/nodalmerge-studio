@@ -14,6 +14,9 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IAgentProfileService, AgentProfileService>();
         services.AddSingleton<IArtifactRefService, InMemoryArtifactRefService>();
         services.AddSingleton<IWorkScheduler, WorkSchedulerService>();
+        services.AddSingleton<IExecutionEventStream, ExecutionEventStreamService>();
+        services.AddSingleton<IExecutionSessionService, ExecutionSessionService>();
+        services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
         AddFileWorkspaceService(services);
         return services;
     }
@@ -27,6 +30,9 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IAgentProfileService, AgentProfileService>();
         services.AddSingleton<IArtifactRefService, InMemoryArtifactRefService>();
         services.AddSingleton<IWorkScheduler, WorkSchedulerService>();
+        services.AddSingleton<IExecutionEventStream, ExecutionEventStreamService>();
+        services.AddSingleton<IExecutionSessionService, ExecutionSessionService>();
+        services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
         AddFileWorkspaceService(services);
         return services;
     }

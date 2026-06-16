@@ -13,15 +13,18 @@ public sealed class InMemoryMergeService : IMergeService
     private readonly IStudioNodeStore _nodeStore;
     private readonly IFileWorkspaceService _fileWorkspace;
     private readonly WorkspaceOptions _workspaceOptions;
+    private readonly IExecutionEventStream _events;
 
     public InMemoryMergeService(
         IStudioNodeStore nodeStore,
         IFileWorkspaceService fileWorkspace,
-        WorkspaceOptions workspaceOptions)
+        WorkspaceOptions workspaceOptions,
+        IExecutionEventStream events)
     {
         _nodeStore        = nodeStore;
         _fileWorkspace    = fileWorkspace;
         _workspaceOptions = workspaceOptions;
+        _events           = events;
     }
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
@@ -83,6 +86,37 @@ public sealed class InMemoryMergeService : IMergeService
             proposalId,
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
+
+        if (proposal.SessionId is not null)
+        {
+            if (decision == MergeProposalStatus.Approved)
+            {
+                var approvedEv = await _events.AppendAsync(
+                    proposal.SessionId,
+                    proposal.WorkUnitId,
+                    ExecutionEventKind.ProposalApproved,
+                    new ProposalApprovedPayload(proposalId, "user"),
+                    ct: cancellationToken).ConfigureAwait(false);
+
+                await _events.AppendAsync(
+                    proposal.SessionId,
+                    proposal.WorkUnitId,
+                    ExecutionEventKind.MergeApproved,
+                    new MergeApprovedPayload(proposalId, "user", DateTimeOffset.UtcNow),
+                    causedByEventId: approvedEv.EventId,
+                    ct: cancellationToken).ConfigureAwait(false);
+            }
+            else if (decision == MergeProposalStatus.Rejected)
+            {
+                await _events.AppendAsync(
+                    proposal.SessionId,
+                    proposal.WorkUnitId,
+                    ExecutionEventKind.ProposalRejected,
+                    new ProposalRejectedPayload(proposalId, "user", null),
+                    ct: cancellationToken).ConfigureAwait(false);
+            }
+        }
+
         return updated;
     }
 
@@ -113,6 +147,17 @@ public sealed class InMemoryMergeService : IMergeService
             proposalId,
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
+
+        if (proposal.SessionId is not null)
+        {
+            await _events.AppendAsync(
+                proposal.SessionId,
+                proposal.WorkUnitId,
+                ExecutionEventKind.MergeApplied,
+                new MergeAppliedPayload(proposalId, proposal.TargetBranch, string.Empty),
+                ct: cancellationToken).ConfigureAwait(false);
+        }
+
         return updated;
     }
 

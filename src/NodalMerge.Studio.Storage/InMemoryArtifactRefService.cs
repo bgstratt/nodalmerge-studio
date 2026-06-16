@@ -18,9 +18,9 @@ public sealed class InMemoryArtifactRefService : IArtifactRefService
             {
                 lock (list)
                 {
-                    var idx = list.FindIndex(r => r.ArtifactId == artifact.ArtifactId);
-                    if (idx >= 0) list[idx] = artifact;
-                    else list.Add(artifact);
+                    // Idempotent: no-op if ArtifactId already recorded.
+                    if (list.All(r => r.ArtifactId != artifact.ArtifactId))
+                        list.Add(artifact);
                 }
                 return list;
             });

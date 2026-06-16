@@ -24,7 +24,9 @@ public sealed record MergeProposal(
     DateTimeOffset? DiffGeneratedAt = null,
     string? AgentId = null,
     string? Model = null,
-    string? Provider = null);
+    string? Provider = null,
+    string? SessionId = null,
+    string? WorkUnitId = null);
 
 public static class MergeProposalTransitions
 {

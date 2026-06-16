@@ -171,7 +171,8 @@ public sealed record ScheduledItem(
     string? Model,
     string? BaseUrl,
     string? ApiKey,
-    string? Provider);
+    string? Provider,
+    string? SessionId = null);
 
 public interface IWorkScheduler
 {
@@ -183,6 +184,7 @@ public interface IWorkScheduler
         string? baseUrl = null,
         string? apiKey = null,
         string? provider = null,
+        string? sessionId = null,
         CancellationToken ct = default);
 
     Task<ScheduledItem?> TryAcquireAsync(string agentId, CancellationToken ct = default);
@@ -190,6 +192,23 @@ public interface IWorkScheduler
     Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default);
 
     Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default);
+}
+
+public interface IExecutionSessionService
+{
+    Task<ExecutionSession> CreateAsync(
+        string rootWorkUnitId,
+        string modelConfigJson,
+        IReadOnlyList<string> profileIds,
+        string? parentSessionId = null,
+        string? parentEventId = null,
+        CancellationToken ct = default);
+
+    Task<ExecutionSession?> GetAsync(string sessionId, CancellationToken ct = default);
+
+    Task<IReadOnlyList<ExecutionSession>> ListAsync(CancellationToken ct = default);
+
+    Task SetStatusAsync(string sessionId, ExecutionSessionStatus status, CancellationToken ct = default);
 }
 
 public interface IAgentProfileService
@@ -203,10 +222,47 @@ public interface IAgentProfileService
     Task<IReadOnlyList<AgentProfile>> ListAsync(CancellationToken cancellationToken = default);
 }
 
+public interface IExecutionEventStream
+{
+    Task<ExecutionEvent> AppendAsync<T>(
+        string sessionId,
+        string? workUnitId,
+        ExecutionEventKind kind,
+        T payload,
+        string? causedByEventId = null,
+        string? eventId = null,
+        CancellationToken ct = default);
+
+    Task<IReadOnlyList<ExecutionEvent>> GetSessionEventsAsync(
+        string sessionId,
+        DateTimeOffset? since = null,
+        CancellationToken ct = default);
+
+    Task<ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default);
+}
+
 public interface IWorkspaceService
 {
     Task<WorkspaceSummary> GetSummaryAsync(string? branchId = null, CancellationToken cancellationToken = default);
 }
+
+public interface IStateReconstructionService
+{
+    Task<SessionStateSnapshot> GetStateAtAsync(
+        string sessionId, string upToEventId, CancellationToken ct = default);
+
+    Task<SessionStateSnapshot> GetStateAtTimeAsync(
+        string sessionId, DateTimeOffset asOf, CancellationToken ct = default);
+}
+
+public sealed record SessionStateSnapshot(
+    string SessionId,
+    string BoundaryEventId,
+    DateTimeOffset BoundaryTime,
+    IReadOnlyList<string> ActiveWorkUnitIds,
+    IReadOnlyList<string> ActiveWorkspaceIds,
+    IReadOnlyList<string> ArtifactIds,
+    IReadOnlyList<string> CompletedEventIds);
 
 public interface IFileWorkspaceService
 {

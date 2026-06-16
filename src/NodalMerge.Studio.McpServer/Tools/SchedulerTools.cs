@@ -18,13 +18,14 @@ public sealed class SchedulerTools(IWorkScheduler scheduler)
         string? baseUrl = null,
         string? apiKey = null,
         string? provider = null,
+        string? sessionId = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
-            await scheduler.EnqueueAsync(workUnitId, profileId, taskId, model, baseUrl, apiKey, provider, cancellationToken)
+            await scheduler.EnqueueAsync(workUnitId, profileId, taskId, model, baseUrl, apiKey, provider, sessionId, cancellationToken)
                 .ConfigureAwait(false);
-            return McpJson.Ok(new { workUnitId, profileId, taskId, status = "enqueued" });
+            return McpJson.Ok(new { workUnitId, profileId, taskId, sessionId, status = "enqueued" });
         }
         catch (Exception ex)
         {

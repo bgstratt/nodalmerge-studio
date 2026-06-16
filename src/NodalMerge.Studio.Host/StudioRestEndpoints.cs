@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -67,7 +68,17 @@ public static class StudioRestEndpoints
     private sealed record EnqueueBody(
         string WorkUnitId,
         string ProfileId,
-        string? TaskId = null);
+        string? TaskId = null,
+        string? SessionId = null);
+
+    private sealed record CreateSessionBody(
+        string RootWorkUnitId,
+        IReadOnlyList<string> ProfileIds,
+        string? ModelConfigJson = null);
+
+    private sealed record BranchSessionBody(
+        string? ParentEventId = null,
+        string? Goal = null);
 
     // ── Registration ───────────────────────────────────────────────────────
 
@@ -83,6 +94,9 @@ public static class StudioRestEndpoints
         MapNodeStoreEndpoints(app);
         MapAgentProfileEndpoints(app);
         MapSchedulerEndpoints(app);
+        MapSessionEndpoints(app);
+        MapEventStreamEndpoints(app);
+        MapSessionStateEndpoints(app);
         return app;
     }
 
@@ -288,7 +302,9 @@ public static class StudioRestEndpoints
 
         app.MapPost("/studio/merges", async (
             ProposeMergeBody body,
+            HttpRequest request,
             IMergeService merge,
+            IStudioNodeStore nodeStore,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(body.SourceBranch))
@@ -297,6 +313,16 @@ public static class StudioRestEndpoints
                 return Results.BadRequest(new { error = "targetBranch is required." });
             if (string.IsNullOrWhiteSpace(body.Summary))
                 return Results.BadRequest(new { error = "summary is required." });
+
+            // Idempotent: return cached result for same X-Command-Id header.
+            var commandId = request.Headers["X-Command-Id"].FirstOrDefault();
+            if (commandId is not null)
+            {
+                var cached = await nodeStore.ReadNodeAsync(StudioNodeKind.CommandResultV1, commandId, ct)
+                    .ConfigureAwait(false);
+                if (cached is not null)
+                    return Results.Text(cached, "application/json");
+            }
 
             var proposal = new MergeProposal(
                 $"MP-{Guid.NewGuid():N}",
@@ -308,6 +334,11 @@ public static class StudioRestEndpoints
                 null, null, null,
                 MergeProposalStatus.Draft);
             var created = await merge.ProposeAsync(proposal, ct).ConfigureAwait(false);
+
+            if (commandId is not null)
+                await nodeStore.WriteNodeAsync(StudioNodeKind.CommandResultV1, commandId,
+                    JsonSerializer.Serialize(created), ct).ConfigureAwait(false);
+
             return Results.Ok(created);
         });
 
@@ -493,9 +524,108 @@ public static class StudioRestEndpoints
             if (string.IsNullOrWhiteSpace(body.ProfileId))
                 return Results.BadRequest(new { error = "profileId is required." });
 
-            await scheduler.EnqueueAsync(body.WorkUnitId, body.ProfileId, body.TaskId, ct: ct)
+            await scheduler.EnqueueAsync(body.WorkUnitId, body.ProfileId, body.TaskId, sessionId: body.SessionId, ct: ct)
                 .ConfigureAwait(false);
-            return Results.Ok(new { workUnitId = body.WorkUnitId, profileId = body.ProfileId, taskId = body.TaskId, status = "enqueued" });
+            return Results.Ok(new { workUnitId = body.WorkUnitId, profileId = body.ProfileId, taskId = body.TaskId, sessionId = body.SessionId, status = "enqueued" });
+        });
+    }
+
+    // ── /studio/sessions ──────────────────────────────────────────────────────
+
+    private static void MapSessionEndpoints(WebApplication app)
+    {
+        app.MapPost("/studio/sessions", async (
+            CreateSessionBody body,
+            IExecutionSessionService sessions,
+            IWorkUnitService workUnits,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.RootWorkUnitId))
+                return Results.BadRequest(new { error = "rootWorkUnitId is required." });
+            if (body.ProfileIds is null || body.ProfileIds.Count == 0)
+                return Results.BadRequest(new { error = "profileIds is required." });
+
+            var wu = await workUnits.GetAsync(body.RootWorkUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{body.RootWorkUnitId}' not found." });
+
+            var session = await sessions.CreateAsync(
+                body.RootWorkUnitId,
+                body.ModelConfigJson ?? "{}",
+                body.ProfileIds,
+                ct: ct).ConfigureAwait(false);
+            return Results.Ok(session);
+        });
+
+        app.MapGet("/studio/sessions", async (
+            IExecutionSessionService sessions,
+            CancellationToken ct) =>
+        {
+            var list = await sessions.ListAsync(ct).ConfigureAwait(false);
+            return Results.Ok(list);
+        });
+
+        app.MapGet("/studio/sessions/{sessionId}", async (
+            string sessionId,
+            IExecutionSessionService sessions,
+            CancellationToken ct) =>
+        {
+            var session = await sessions.GetAsync(sessionId, ct).ConfigureAwait(false);
+            return session is null
+                ? Results.NotFound(new { error = $"Session '{sessionId}' not found." })
+                : Results.Ok(session);
+        });
+
+        app.MapPost("/studio/sessions/{sessionId}/pause", async (
+            string sessionId,
+            IExecutionSessionService sessions,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                await sessions.SetStatusAsync(sessionId, ExecutionSessionStatus.Paused, ct).ConfigureAwait(false);
+                return Results.Ok(new { sessionId, status = "Paused" });
+            }
+            catch (KeyNotFoundException)
+            {
+                return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
+            }
+        });
+
+        app.MapPost("/studio/sessions/{sessionId}/resume", async (
+            string sessionId,
+            IExecutionSessionService sessions,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                await sessions.SetStatusAsync(sessionId, ExecutionSessionStatus.Active, ct).ConfigureAwait(false);
+                return Results.Ok(new { sessionId, status = "Active" });
+            }
+            catch (KeyNotFoundException)
+            {
+                return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
+            }
+        });
+
+        app.MapPost("/studio/sessions/{sessionId}/branch", async (
+            string sessionId,
+            BranchSessionBody body,
+            IExecutionSessionService sessions,
+            CancellationToken ct) =>
+        {
+            var parent = await sessions.GetAsync(sessionId, ct).ConfigureAwait(false);
+            if (parent is null)
+                return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
+
+            var child = await sessions.CreateAsync(
+                parent.RootWorkUnitId,
+                parent.ModelConfigSnapshotJson,
+                parent.ProfileIdSet,
+                parentSessionId: sessionId,
+                parentEventId: body.ParentEventId,
+                ct: ct).ConfigureAwait(false);
+            return Results.Ok(child);
         });
     }
 
@@ -566,6 +696,70 @@ public static class StudioRestEndpoints
             catch (KeyNotFoundException)
             {
                 return Results.NotFound(new { error = $"Agent profile '{profileId}' not found." });
+            }
+        });
+    }
+
+    // ── /studio/sessions/{id}/events + /studio/events ─────────────────────
+
+    private static void MapEventStreamEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/sessions/{sessionId}/events", async (
+            string sessionId,
+            IExecutionEventStream eventStream,
+            [FromQuery] string? since,
+            CancellationToken ct) =>
+        {
+            DateTimeOffset? sinceDto = null;
+            if (since is not null && DateTimeOffset.TryParse(since, out var parsed))
+                sinceDto = parsed;
+
+            var events = await eventStream.GetSessionEventsAsync(sessionId, sinceDto, ct).ConfigureAwait(false);
+            return Results.Ok(events);
+        });
+
+        app.MapGet("/studio/events/{eventId}", async (
+            string eventId,
+            IExecutionEventStream eventStream,
+            CancellationToken ct) =>
+        {
+            var ev = await eventStream.GetAsync(eventId, ct).ConfigureAwait(false);
+            return ev is null
+                ? Results.NotFound(new { error = $"Event '{eventId}' not found." })
+                : Results.Ok(ev);
+        });
+    }
+
+    // ── /studio/sessions/{id}/state ────────────────────────────────────────
+
+    private static void MapSessionStateEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/sessions/{sessionId}/state", async (
+            string sessionId,
+            [FromQuery] string? upToEvent,
+            [FromQuery] string? asOf,
+            IStateReconstructionService reconstruction,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                if (upToEvent is not null)
+                {
+                    var snapshot = await reconstruction.GetStateAtAsync(sessionId, upToEvent, ct).ConfigureAwait(false);
+                    return Results.Ok(snapshot);
+                }
+
+                if (asOf is not null && DateTimeOffset.TryParse(asOf, out var asOfDto))
+                {
+                    var snapshot = await reconstruction.GetStateAtTimeAsync(sessionId, asOfDto, ct).ConfigureAwait(false);
+                    return Results.Ok(snapshot);
+                }
+
+                return Results.BadRequest(new { error = "Either upToEvent or asOf (ISO 8601) is required." });
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
             }
         });
     }

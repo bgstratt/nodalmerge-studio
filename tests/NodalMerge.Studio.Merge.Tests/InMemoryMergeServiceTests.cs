@@ -7,7 +7,24 @@ namespace NodalMerge.Studio.Merge.Tests;
 public class InMemoryMergeServiceTests
 {
     private static InMemoryMergeService Build() =>
-        new(new InMemoryStudioNodeStore(), new NoopFileWorkspaceService(), new WorkspaceOptions());
+        new(new InMemoryStudioNodeStore(), new NoopFileWorkspaceService(), new WorkspaceOptions(), new NoopEventStream());
+
+    private sealed class NoopEventStream : NodalMerge.Studio.Core.Services.IExecutionEventStream
+    {
+        public Task<NodalMerge.Studio.Contracts.Domain.ExecutionEvent> AppendAsync<T>(
+            string sessionId, string? workUnitId,
+            NodalMerge.Studio.Contracts.Domain.ExecutionEventKind kind, T payload,
+            string? causedByEventId = null, string? eventId = null, CancellationToken ct = default) =>
+            Task.FromResult(new NodalMerge.Studio.Contracts.Domain.ExecutionEvent(
+                eventId ?? Guid.NewGuid().ToString("N"), sessionId, workUnitId, kind, "{}", causedByEventId, DateTimeOffset.UtcNow));
+
+        public Task<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>> GetSessionEventsAsync(
+            string sessionId, DateTimeOffset? since = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>>([]);
+
+        public Task<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default) =>
+            Task.FromResult<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?>(null);
+    }
 
     private sealed class NoopFileWorkspaceService : NodalMerge.Studio.Core.Services.IFileWorkspaceService
     {

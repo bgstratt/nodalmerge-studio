@@ -12,11 +12,15 @@ Phase 2.5 delivers a correct single-worker pipeline. Phase 3 adds the five found
 |-----|--------|-------|
 | Work is implicit state in a running loop | Work Unit DAG (parent/child, deps, scope) | 10a |
 | Orchestrator drives logic; no global queue | Scheduler / Work Queue | 10b |
+| No session boundary; runs are anonymous and not resumable | ExecutionSession boundary | 10b.1 |
+| Events from scheduler, orchestrator, and artifacts are unrelated streams | Unified Execution Event Stream | 10b.2 |
+| Scheduler retries can duplicate control-plane actions | Control-plane idempotency | 10b.3 |
+| No way to reconstruct system state at a point in time | State reconstruction API | 10b.4 |
 | Workers share file state; no ownership boundaries | Workspace Isolation | 10c |
 | Proposals are floating artifacts with no attribution | Artifact Ownership + Lineage | 10d |
 | Orchestration decisions are runtime heuristic; not replayable | Orchestration Decision Log | 10e |
 
-Without these five, Phase 4 fan-out would be parallel workers stomping each other's files, ambiguous merge attribution, and unreproducible orchestration behavior. Build the foundation first.
+Without these nine, Phase 4 fan-out would be parallel workers stomping each other's files, ambiguous merge attribution, and unreproducible orchestration behavior. The four control-plane backbone slices (10b.1–10b.4) are the missing connective tissue: they give every event a session identity, a causal home, and a safe retry story before branching and lineage are layered on top.
 
 ---
 
@@ -121,6 +125,383 @@ public sealed record ScheduledItem(
 - Three items queued; max-concurrent = 2; only two agents spawn at once.
 - Agent that exceeds lease timeout has its item re-acquired by the next poll.
 - Single-worker run still works: orchestrator enqueues one item; scheduler picks it up.
+
+---
+
+## Slice 10b.1 — ExecutionSession Boundary
+
+A session is the outermost causal unit. Every scheduler event, orchestration decision, artifact, and workspace belongs to exactly one session. Sessions can be paused, resumed, branched (spawning a child session from any point in the causal history), and replayed in the UI. Without a session boundary every run is anonymous: there is no safe way to reconnect to in-progress work after a restart, resume a paused run, or let a user spin up a second independent session without the two colliding.
+
+### Domain record
+
+**`src/NodalMerge.Studio.Contracts/Domain/ExecutionSession.cs`** (new)
+
+```csharp
+public sealed record ExecutionSession(
+    string SessionId,
+    string RootWorkUnitId,
+    ExecutionSessionStatus Status,        // Active | Paused | Completed | Abandoned
+    string? ParentSessionId,              // non-null when branched from another session
+    string? ParentEventId,                // the event in the parent session from which this was branched
+    DateTimeOffset StartedAt,
+    DateTimeOffset? PausedAt,
+    DateTimeOffset? CompletedAt,
+    string ModelConfigSnapshotJson,       // serialized model/provider config at session start
+    IReadOnlyList<string> ProfileIdSet);  // profile IDs active in this session
+
+public enum ExecutionSessionStatus { Active, Paused, Completed, Abandoned }
+```
+
+`ParentSessionId` + `ParentEventId` enable the "come back later and add on" workflow: branch a new session from any point in the parent's event history without touching the parent's state.
+
+### Session service
+
+**`src/NodalMerge.Studio.Core/Services/IExecutionSessionService.cs`** (new)
+
+```csharp
+public interface IExecutionSessionService
+{
+    Task<ExecutionSession> CreateAsync(string rootWorkUnitId, string modelConfigJson,
+        IReadOnlyList<string> profileIds, string? parentSessionId = null,
+        string? parentEventId = null, CancellationToken ct = default);
+    Task<ExecutionSession?> GetAsync(string sessionId, CancellationToken ct = default);
+    Task<IReadOnlyList<ExecutionSession>> ListAsync(CancellationToken ct = default);
+    Task SetStatusAsync(string sessionId, ExecutionSessionStatus status, CancellationToken ct = default);
+}
+```
+
+**`src/NodalMerge.Studio.Storage/ExecutionSessionService.cs`** (new)
+- Backed by `IStudioNodeStore` at `studio/execution-session/v1`.
+- `CreateAsync` persists the record immediately; no in-memory-only state.
+- `ListAsync` returns all sessions ordered by `StartedAt` descending.
+
+### Durability guarantee
+
+`ExecutionSession` is written to `IStudioNodeStore` before any scheduler, orchestrator, or workspace action is taken for that session. If the process crashes after session creation, the session record survives and the scheduler can resume from the last event in that session's stream (10b.2). On restart, `ListAsync` surfaces `Active` sessions; the UI or host can reconnect.
+
+### Propagation
+
+- `IWorkScheduler.EnqueueAsync` gains a `sessionId` parameter; the scheduler attaches it to every `ScheduledItem`.
+- `OrchestratorAgentLoop` receives the `sessionId` at construction; every decision it makes includes it.
+- REST API propagates `sessionId` in headers (or body) for all session-scoped requests.
+
+### REST endpoints
+
+- `POST /studio/sessions` — start a new session (`{ rootGoal, profileId, modelConfig? }`)
+- `GET /studio/sessions` — list all sessions
+- `GET /studio/sessions/{id}` — single session detail
+- `POST /studio/sessions/{id}/pause` — sets `Status = Paused`
+- `POST /studio/sessions/{id}/resume` — sets `Status = Active`, triggers scheduler to re-check pending items
+- `POST /studio/sessions/{id}/branch` — create a child session branching from `parentEventId`
+
+### Success criteria
+- Create a session; crash the process; restart; `GET /studio/sessions` returns the session with `Status = Active`.
+- Pause a session; no new work items are acquired by the scheduler for that session while paused; resume resumes acquisition.
+- Branch a session from a specific `parentEventId`; child session has `ParentSessionId` and `ParentEventId` set; child runs independently.
+- Two sessions exist simultaneously; their events, work units, and workspaces do not intermingle.
+
+---
+
+## Slice 10b.2 — Unified Execution Event Stream
+
+Currently the scheduler, orchestrator, artifact store, and workspace service each write to separate node stores with no shared identity. Events from different subsystems cannot be ordered, correlated, or replayed relative to each other. The unified execution event stream gives every significant state change a single causal home: a session-scoped, append-only stream where events are ordered, attributed, and immutable.
+
+This is the Temporal replacement. It is NOT full event sourcing — it does not need academic purity. It needs enough causal fidelity to: debug divergence, reconstruct state at a point in time (10b.4), and support branching (10f).
+
+### Domain record
+
+**`src/NodalMerge.Studio.Contracts/Domain/ExecutionEvent.cs`** (new)
+
+```csharp
+public sealed record ExecutionEvent(
+    string EventId,           // GUID, supplied by caller for idempotency (10b.3)
+    string SessionId,
+    string? WorkUnitId,       // null for session-level events
+    ExecutionEventKind Kind,
+    string PayloadJson,       // typed per Kind — see payload records below
+    string? CausedByEventId,  // parent event in causal chain (null = root)
+    DateTimeOffset OccurredAt);
+
+public enum ExecutionEventKind
+{
+    // Session lifecycle
+    SessionStarted,
+    SessionPaused,
+    SessionResumed,
+    SessionBranchCreated,
+
+    // Work unit lifecycle
+    WorkUnitCreated,
+    WorkUnitScheduled,        // accepted into scheduler queue
+    WorkUnitStarted,          // lease acquired; execution beginning
+    WorkUnitCompleted,        // released with success:true
+    WorkUnitFailed,           // released with success:false
+    WorkUnitAbandoned,        // explicitly cancelled
+
+    // Scheduler internals
+    SchedulerLeaseAcquired,
+    SchedulerLeaseReleased,
+    SchedulerLeaseExpired,    // lease timed out; item returned to queue
+
+    // Workspace
+    WorkspaceCreated,
+    WorkspaceBranchCreated,   // branched from an existing workspace state
+    WorkspaceArchived,
+    WorkspaceDestroyed,
+
+    // Artifact lifecycle
+    ArtifactRecorded,         // generic knowledge/research/decision artifact
+    ArtifactProposed,         // merge proposal specifically — carries FilesTouched
+    ArtifactStatusChanged,
+
+    // Proposal lifecycle (separate from MergeApplied — approval and application are distinct steps)
+    ProposalApproved,
+    ProposalRejected,
+    ProposalSuperseded,
+
+    // Merge lifecycle
+    MergeApproved,            // proposal passed human or agent review gate
+    MergeApplied,             // changes written to target branch; commit hash known
+
+    // Orchestration
+    OrchestrationDecision,
+    ConflictDetected,         // file/region overlap found at enqueue
+}
+```
+
+Each `Kind` has exactly one payload record. `PayloadJson` serializes that record. Reconstruction logic (10b.4) switches on `Kind` and deserializes to the correct type — no guessing.
+
+**`src/NodalMerge.Studio.Contracts/Domain/ExecutionEventPayloads.cs`** (new)
+
+```csharp
+// Session
+public sealed record SessionStartedPayload(
+    string SessionId, IReadOnlyList<string> ProfileIds, string ModelConfigSnapshotJson);
+
+public sealed record SessionBranchCreatedPayload(
+    string ChildSessionId, string ParentSessionId, string ParentEventId);
+
+// Work unit
+public sealed record WorkUnitScheduledPayload(
+    string WorkUnitId, string ProfileId, int AttemptCount);
+
+public sealed record WorkUnitStartedPayload(
+    string WorkUnitId, string AgentId);
+
+public sealed record WorkUnitCompletedPayload(
+    string WorkUnitId, string AgentId, string? ProducedProposalId);
+
+public sealed record WorkUnitFailedPayload(
+    string WorkUnitId, string AgentId, string FailureReason);
+
+// Scheduler
+public sealed record SchedulerLeaseAcquiredPayload(
+    string WorkUnitId, string AgentId, DateTimeOffset ExpiresAt);
+
+public sealed record SchedulerLeaseReleasedPayload(
+    string WorkUnitId, string AgentId, bool Success);
+
+public sealed record SchedulerLeaseExpiredPayload(
+    string WorkUnitId, string PriorAgentId);
+
+// Workspace
+public sealed record WorkspaceCreatedPayload(
+    string WorkspaceId, string WorkUnitId, string BranchName, string BaseBranch);
+
+public sealed record WorkspaceBranchCreatedPayload(
+    string NewWorkspaceId, string SourceWorkspaceId, string SourceEventId);
+
+public sealed record WorkspaceArchivedPayload(
+    string WorkspaceId, string ExecutionBranch);
+
+public sealed record WorkspaceDestroyedPayload(
+    string WorkspaceId, string Reason);
+
+// Artifacts
+public sealed record ArtifactProposedPayload(
+    string ArtifactId, string WorkUnitId, IReadOnlyList<string> FilesTouched);
+
+public sealed record ArtifactStatusChangedPayload(
+    string ArtifactId, ArtifactStatus PreviousStatus, ArtifactStatus NewStatus);
+
+// Proposal lifecycle
+public sealed record ProposalApprovedPayload(
+    string ProposalId, string ApprovedBy);   // agentId or "user:{email}"
+
+public sealed record ProposalRejectedPayload(
+    string ProposalId, string RejectedBy, string? Reason);
+
+// Merge
+public sealed record MergeApprovedPayload(
+    string ProposalId, string ApprovedBy, DateTimeOffset ApprovedAt);
+
+public sealed record MergeAppliedPayload(
+    string ProposalId, string TargetBranch, string ResultCommitHash);
+
+// Orchestration
+public sealed record OrchestrationDecisionPayload(
+    string OrchestratorAgentId, OrchestrationAction Action,
+    IReadOnlyList<string> SpawnedIds, string? Reason);
+
+public sealed record ConflictDetectedPayload(
+    string WorkUnitId, IReadOnlyList<string> OverlappingFiles,
+    IReadOnlyList<string> ConflictingWorkUnitIds);
+```
+
+`CausedByEventId` forms the causal chain: every event knows which prior event caused it. This is enough for lightweight replay (10b.4) and for UI timeline scrubbing without a full event-sourcing engine.
+
+### Event stream service
+
+**`src/NodalMerge.Studio.Core/Services/IExecutionEventStream.cs`** (new)
+
+```csharp
+public interface IExecutionEventStream
+{
+    Task<ExecutionEvent> AppendAsync<T>(string sessionId, string? workUnitId,
+        ExecutionEventKind kind, T payload, string? causedByEventId = null,
+        string? eventId = null,   // supply for idempotent re-drive; omit for new events
+        CancellationToken ct = default);
+    Task<IReadOnlyList<ExecutionEvent>> GetSessionEventsAsync(string sessionId,
+        DateTimeOffset? since = null, CancellationToken ct = default);
+    Task<ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default);
+}
+```
+
+The generic `T` constrains callers to pass the correct payload type per kind. The implementation serializes `payload` to `PayloadJson`. Callers never pass raw `object` or anonymous types.
+
+**`src/NodalMerge.Studio.Storage/ExecutionEventStreamService.cs`** (new)
+- Backed by `IStudioNodeStore` at `studio/execution-event/v1`.
+- Append-only: no update or delete operations. New entries only.
+- `AppendAsync` sets `OccurredAt = DateTimeOffset.UtcNow`; caller cannot override it (prevents clock skew from corrupting causal ordering).
+- If `eventId` is supplied and already exists in the store, the existing record is returned without a second write (idempotency, 10b.3).
+- `GetSessionEventsAsync` returns events ordered by `OccurredAt`.
+
+### Write path integration
+
+Each existing subsystem appends to the stream **in addition to** its own store — the stream does not replace local stores; it references them by ID:
+
+| Caller | Kind | Payload type |
+|--------|------|--------------|
+| `IExecutionSessionService.CreateAsync` | `SessionStarted` | `SessionStartedPayload` |
+| `IWorkScheduler.EnqueueAsync` | `WorkUnitScheduled` | `WorkUnitScheduledPayload` |
+| `IWorkScheduler.TryAcquireAsync` | `SchedulerLeaseAcquired` | `SchedulerLeaseAcquiredPayload` |
+| agent loop start | `WorkUnitStarted` | `WorkUnitStartedPayload` |
+| `IWorkScheduler.ReleaseAsync(success:true)` | `WorkUnitCompleted` + `SchedulerLeaseReleased` | respective payloads |
+| `IWorkScheduler.ReleaseAsync(success:false)` | `WorkUnitFailed` + `SchedulerLeaseReleased` | respective payloads |
+| lease timeout reaper | `SchedulerLeaseExpired` | `SchedulerLeaseExpiredPayload` |
+| `IWorkspaceService.CreateAsync` | `WorkspaceCreated` | `WorkspaceCreatedPayload` |
+| `IWorkspaceService.ArchiveAsync` | `WorkspaceArchived` | `WorkspaceArchivedPayload` |
+| `nm.v1.merge.propose` | `ArtifactProposed` | `ArtifactProposedPayload` |
+| reviewer approval | `ProposalApproved` → `MergeApproved` | `ProposalApprovedPayload`, `MergeApprovedPayload` |
+| merge write-back | `MergeApplied` | `MergeAppliedPayload` |
+| `OrchestratorAgentLoop` decision | `OrchestrationDecision` | `OrchestrationDecisionPayload` |
+| scheduler overlap check | `ConflictDetected` | `ConflictDetectedPayload` |
+
+### REST
+
+- `GET /studio/sessions/{id}/events` — full event stream for a session, ordered chronologically
+- `GET /studio/events/{eventId}` — single event detail with payload
+
+### Success criteria
+- Complete a Quick Spawn run; `GET /studio/sessions/{id}/events` returns events in causal order covering the full domain sequence: `SessionStarted → WorkUnitCreated → WorkUnitScheduled → SchedulerLeaseAcquired → WorkUnitStarted → WorkspaceCreated → ArtifactProposed → WorkspaceArchived → SchedulerLeaseReleased → WorkUnitCompleted`.
+- Each event deserializes to its typed payload record without error; no event has an `ArtifactRecorded` kind where `ArtifactProposed` is the correct kind.
+- Each event has a non-null `CausedByEventId` except the session root.
+- `AppendAsync` with a previously used `eventId` returns the existing record; `GetSessionEventsAsync` shows one entry for that ID.
+- Stream survives process restart; events are readable immediately after restart from `IStudioNodeStore`.
+
+---
+
+## Slice 10b.3 — Control-Plane Idempotency
+
+The scheduler's polling loop and retry logic will inevitably duplicate control-plane signals. Without idempotency, a retry that re-enqueues a work unit creates a second scheduler entry; a duplicate `merge.propose` creates two proposals; a re-spawned orchestrator fires two `LeaseAcquired` events. None of these are LLM correctness problems — they are distributed systems correctness problems.
+
+Idempotency is scoped to **control-plane actions only**. It does not apply to LLM outputs (which are intentionally non-deterministic), to artifact content (which is hash-addressed), or to workspace writes (which are branch-isolated).
+
+### Control actions requiring idempotency
+
+| Action | Idempotency key |
+|--------|-----------------|
+| `IWorkScheduler.EnqueueAsync` | `SessionId + WorkUnitId` |
+| `IWorkScheduler.TryAcquireAsync` | `WorkUnitId + AgentId` (re-acquire returns existing lease) |
+| `IWorkspaceService.CreateAsync` | `WorkUnitId` (second call returns existing workspace) |
+| `IArtifactLineageService.RecordAsync` | `ArtifactId` (second call is no-op if id matches) |
+| `IExecutionEventStream.AppendAsync` | `EventId` (supplied by caller for re-drive scenarios) |
+| `POST /studio/proposals` (MCP tool) | `CommandId` header (GUID per proposal intent) |
+
+### Implementation pattern
+
+Each idempotent service method:
+1. Derives or accepts an idempotency key.
+2. Checks `IStudioNodeStore` for an existing record at that key before writing.
+3. If found: returns the existing record unchanged (no error, no side effects).
+4. If not found: writes the record, then returns it.
+
+No global idempotency table is needed — each service owns its own key space. The key is always derivable from domain identity (work unit ID, artifact ID, etc.), not from a separate opaque token, so callers do not need to manage nonce storage.
+
+### CommandId for MCP tools
+
+MCP tool calls that trigger control-plane actions (`nm.v1.merge.propose`, future `nm.v1.work.spawn`) receive a `CommandId` (GUID) from the caller. The server stores `CommandId → result` in `IStudioNodeStore` at `studio/command-result/v1`. If the same `CommandId` arrives again, the stored result is returned immediately without re-executing. TTL: 24 hours (sufficient for any retry window).
+
+### Success criteria
+- `EnqueueAsync` called twice with the same `SessionId + WorkUnitId`: second call returns the existing `ScheduledItem`; `ListPendingAsync` shows one entry, not two.
+- Process crash during workspace creation; restart re-calls `CreateAsync(workUnitId)`; existing workspace is returned; no second worktree is created on disk.
+- `nm.v1.merge.propose` called twice with the same `CommandId`: second response is identical to the first; only one `MergeProposal` record exists.
+- `IExecutionEventStream.AppendAsync` called with a previously used `EventId`: second call is a no-op; stream has one entry for that ID.
+
+---
+
+## Slice 10b.4 — State Reconstruction API
+
+Not deterministic replay of agent cognition. Just:
+
+> "Given a session and an event, what was the system state immediately after that event?"
+
+This is used for: debugging multi-agent divergence, UI timeline scrubbing (the "back in time" slider), creating a workspace at an exact past state (foundation for 10f branching), and incident analysis after a failed run.
+
+The implementation is lightweight — it does not re-execute anything. It queries the event stream and resolves the referenced records at their stored state.
+
+### Service
+
+**`src/NodalMerge.Studio.Core/Services/IStateReconstructionService.cs`** (new)
+
+```csharp
+public interface IStateReconstructionService
+{
+    Task<SessionStateSnapshot> GetStateAtAsync(string sessionId, string upToEventId,
+        CancellationToken ct = default);
+    Task<SessionStateSnapshot> GetStateAtTimeAsync(string sessionId, DateTimeOffset asOf,
+        CancellationToken ct = default);
+}
+
+public sealed record SessionStateSnapshot(
+    string SessionId,
+    string BoundaryEventId,        // the last event included
+    DateTimeOffset BoundaryTime,
+    IReadOnlyList<string> ActiveWorkUnitIds,
+    IReadOnlyList<string> ActiveWorkspaceIds,
+    IReadOnlyList<string> ArtifactIds,
+    IReadOnlyList<string> CompletedEventIds);
+```
+
+**`src/NodalMerge.Studio.Storage/StateReconstructionService.cs`** (new)
+- `GetStateAtAsync`: loads all events for the session up to and including `upToEventId` via `IExecutionEventStream.GetSessionEventsAsync`.
+- Folds over the event sequence: `WorkUnitCreated` adds to `ActiveWorkUnitIds`; `LeaseReleased(success:false)` removes it; `WorkspaceCreated` adds to `ActiveWorkspaceIds`; etc.
+- Returns the accumulated snapshot. No re-execution of agents.
+
+### REST
+
+- `GET /studio/sessions/{id}/state?upToEvent={eventId}` — snapshot at event boundary
+- `GET /studio/sessions/{id}/state?asOf={iso8601}` — snapshot at timestamp
+
+### Usage in 10f (branching)
+
+`POST /studio/proposals/{id}/branch` (10f) calls `GetStateAtAsync` using the `ProposalCreated` event ID to pinpoint the exact workspace state to branch from. This replaces the approximate "archive and snapshot" approach with a causal-exact one.
+
+### Success criteria
+- Complete a run with 3 work units; `GET /studio/sessions/{id}/state?upToEvent={midRunEventId}` returns a snapshot showing only the work units and workspaces that existed at that point.
+- `asOf` query with a timestamp between enqueue and lease returns a snapshot with the work unit in `ActiveWorkUnitIds` but no workspace yet.
+- Snapshot at the final event matches the actual post-run state (all IDs present, no extras).
+- `GetStateAtAsync` does not call any agent, LLM, or external process.
 
 ---
 
@@ -530,10 +911,14 @@ This allows planners to record `Research` and `Decision` artifacts during the pl
 
 ## Slice ordering
 
-10a → 10b → 10c → 10d → 10e → 10f → 10g
+10a → 10b → 10b.1 → 10b.2 → 10b.3 → 10b.4 → 10c → 10d → 10e → 10f → 10g
 
 - **10a first**: the DAG is what scheduler, isolation, and lineage all reference.
-- **10b before 10c**: scheduler drives workspace creation on acquire and workspace teardown on release; isolation lifecycle is owned by the scheduler.
+- **10b before 10b.1**: the scheduler exists before sessions can attach to it. `EnqueueAsync` gains a `sessionId` parameter once 10b.1 is in place.
+- **10b.1 before 10b.2**: the unified event stream requires a `SessionId` on every event; sessions must exist first.
+- **10b.2 before 10b.3**: idempotency for `AppendAsync` is implemented inside the event stream service; the stream must exist first.
+- **10b.3 before 10b.4**: state reconstruction reads from the event stream; the idempotency guarantees in 10b.3 ensure the stream is free of duplicates before reconstruction reads it.
+- **10b.4 before 10c**: workspace creation (10c) becomes a causal event in the stream; `GetStateAtAsync` needs workspace events to produce accurate snapshots. More importantly, 10f's branch-from-proposal operation depends on `GetStateAtAsync` — that dependency must be resolved before branching is wired up.
 - **10c before 10d**: artifact lineage includes the `AgentWorkspace` record; the workspace must exist before it can be recorded in the lineage store.
 - **10d before 10e**: orchestration events record which spawned IDs were created; attribution requires 10d.
 - **10e before 10f**: branching needs the decision log to attribute the branch event.
@@ -556,7 +941,7 @@ This allows planners to record `Research` and `Decision` artifacts during the pl
 
 ## Phase 4 pointer
 
-After Phase 3, the system has a correct, isolated, attributable, replayable, branchable artifact platform with durable knowledge. The answer to "what can I do after a run?" is now: inspect, branch, replay, compare, and reuse prior knowledge. Phase 4 makes it genuinely parallel:
+After Phase 3, the system has a correct, isolated, attributable, replayable, branchable artifact platform with durable knowledge and session identity. The answer to "what can I do after a run?" is now: inspect, branch, replay, compare, resume, or start a parallel session — and reuse prior knowledge across all of them. Phase 4 makes it genuinely parallel:
 
 - Fan-out: planner decomposes goal → N child work units → N scheduler entries → N isolated workers in parallel
 - Artifact lifecycle state machine: formal states per artifact replacing the implicit status flags

@@ -8,7 +8,36 @@ namespace NodalMerge.Studio.AgentRuntime.Tests;
 public class InMemoryAgentRuntimeServiceTests
 {
     private static InMemoryAgentRuntimeService Build() =>
-        new(new NoopServiceProvider(), NullLogger<InMemoryAgentRuntimeService>.Instance, new NoopAgentProfileService());
+        new(new NoopServiceProvider(), NullLogger<InMemoryAgentRuntimeService>.Instance, new NoopAgentProfileService(), new NoopScheduler(), new NoopEventStream());
+
+    private sealed class NoopScheduler : IWorkScheduler
+    {
+        public Task EnqueueAsync(string workUnitId, string profileId, string? taskId = null, string? model = null,
+            string? baseUrl = null, string? apiKey = null, string? provider = null, string? sessionId = null,
+            CancellationToken ct = default) => Task.CompletedTask;
+        public Task<ScheduledItem?> TryAcquireAsync(string agentId, CancellationToken ct = default) =>
+            Task.FromResult<ScheduledItem?>(null);
+        public Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ScheduledItem>>([]);
+    }
+
+    private sealed class NoopEventStream : IExecutionEventStream
+    {
+        public Task<NodalMerge.Studio.Contracts.Domain.ExecutionEvent> AppendAsync<T>(
+            string sessionId, string? workUnitId,
+            NodalMerge.Studio.Contracts.Domain.ExecutionEventKind kind, T payload,
+            string? causedByEventId = null, string? eventId = null, CancellationToken ct = default) =>
+            Task.FromResult(new NodalMerge.Studio.Contracts.Domain.ExecutionEvent(
+                eventId ?? Guid.NewGuid().ToString("N"), sessionId, workUnitId, kind, "{}", causedByEventId, DateTimeOffset.UtcNow));
+
+        public Task<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>> GetSessionEventsAsync(
+            string sessionId, DateTimeOffset? since = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>>([]);
+
+        public Task<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default) =>
+            Task.FromResult<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?>(null);
+    }
 
     private sealed class NoopServiceProvider : IServiceProvider
     {

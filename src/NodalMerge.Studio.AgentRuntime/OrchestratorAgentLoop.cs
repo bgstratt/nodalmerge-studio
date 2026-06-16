@@ -14,7 +14,8 @@ internal sealed class OrchestratorAgentLoop(
     string apiKey,
     McpToolDispatcher dispatcher,
     LlmClient llm,
-    AgentProfile? profile = null)
+    AgentProfile? profile = null,
+    string? sessionId = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -86,7 +87,7 @@ internal sealed class OrchestratorAgentLoop(
                     : toolUse.Input;
 
                 var result = await dispatcher
-                    .DispatchAsync(toolUse.Name, input, _allowedTools, ct)
+                    .DispatchAsync(toolUse.Name, input, _allowedTools, ct, sessionId)
                     .ConfigureAwait(false);
 
                 toolResults.Add(new NmToolResult(toolUse.Id, result));

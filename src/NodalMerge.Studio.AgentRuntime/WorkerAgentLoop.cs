@@ -13,7 +13,8 @@ internal sealed class WorkerAgentLoop(
     string apiKey,
     McpToolDispatcher dispatcher,
     LlmClient llm,
-    AgentProfile? profile = null)
+    AgentProfile? profile = null,
+    string? sessionId = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -77,7 +78,7 @@ internal sealed class WorkerAgentLoop(
                 if (block is not NmToolUse toolUse) continue;
 
                 var result = await dispatcher
-                    .DispatchAsync(toolUse.Name, toolUse.Input, _allowedTools, ct)
+                    .DispatchAsync(toolUse.Name, toolUse.Input, _allowedTools, ct, sessionId)
                     .ConfigureAwait(false);
 
                 toolResults.Add(new NmToolResult(toolUse.Id, result));

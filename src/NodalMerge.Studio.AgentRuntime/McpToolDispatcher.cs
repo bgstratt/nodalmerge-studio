@@ -19,13 +19,16 @@ internal sealed class McpToolDispatcher(
     ISnapshotService snapshots,
     IAgentControlService agentControl,
     IArtifactRefService artifactRefs,
-    IProjectionManager projections)
+    IProjectionManager projections,
+    IWorkScheduler scheduler,
+    IExecutionEventStream events)
 {
     public async Task<string> DispatchAsync(
         string toolName,
         JsonElement input,
         IReadOnlyList<string>? allowedTools,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? sessionId = null)
     {
         if (allowedTools is { Count: > 0 } && !allowedTools.Contains(toolName))
             return ToError($"Tool '{toolName}' is not permitted by this agent's profile.");
@@ -48,18 +51,20 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.AgentSpawn       => await AgentSpawnAsync(input, ct),
                 McpToolNames.AgentStatus      => await AgentStatusAsync(input, ct),
                 McpToolNames.AgentStop        => await AgentStopAsync(input, ct),
-                McpToolNames.MergePropose     => await MergeProposeAsync(input, ct),
+                McpToolNames.MergePropose     => await MergeProposeAsync(input, ct, sessionId),
                 McpToolNames.MergeValidate    => await MergeValidateAsync(input, ct),
                 McpToolNames.WorkspaceSummary => await WorkspaceSummaryAsync(input, ct),
                 McpToolNames.SnapshotGet      => await SnapshotGetAsync(input, ct),
                 McpToolNames.ProjectionGet    => await ProjectionGetAsync(input, ct),
-                McpToolNames.MergeApply       => await MergeApplyAsync(input, ct),
+                McpToolNames.MergeApply       => await MergeApplyAsync(input, ct, sessionId),
                 McpToolNames.WorkspaceRead    => await WorkspaceReadAsync(input, ct),
                 McpToolNames.WorkspaceWrite   => await WorkspaceWriteAsync(input, ct),
                 McpToolNames.WorkspaceDelete  => await WorkspaceDeleteAsync(input, ct),
                 McpToolNames.WorkspaceList    => await WorkspaceListAsync(input, ct),
                 McpToolNames.WorkspaceDiff    => await WorkspaceDiffAsync(input, ct),
                 McpToolNames.WorkspaceExists  => await WorkspaceExistsAsync(input, ct),
+                McpToolNames.SchedulerEnqueue => await SchedulerEnqueueAsync(input, ct, sessionId),
+                McpToolNames.SchedulerPending => await SchedulerPendingAsync(ct),
                 _ => ToError($"Tool '{toolName}' is not dispatched by the agent runtime.")
             };
         }
@@ -201,7 +206,7 @@ internal sealed class McpToolDispatcher(
         return ToJson(new { agentId, status = "stopped" });
     }
 
-    private async Task<string> MergeProposeAsync(JsonElement input, CancellationToken ct)
+    private async Task<string> MergeProposeAsync(JsonElement input, CancellationToken ct, string? sessionId)
     {
         var proposalId   = $"MP-{Guid.NewGuid():N}";
         var summary      = Str(input, "summary")!;
@@ -232,7 +237,9 @@ internal sealed class McpToolDispatcher(
             DiffGeneratedAt:  diffGeneratedAt,
             AgentId:          agentId,
             Model:            Str(input, "model"),
-            Provider:         Str(input, "provider"));
+            Provider:         Str(input, "provider"),
+            SessionId:        sessionId,
+            WorkUnitId:       workUnitId);
         var created = await merge.ProposeAsync(proposal, ct).ConfigureAwait(false);
 
         if (workUnitId is not null)
@@ -245,6 +252,16 @@ internal sealed class McpToolDispatcher(
                 DateTimeOffset.UtcNow,
                 workUnitId,
                 agentId), ct).ConfigureAwait(false);
+
+            if (sessionId is not null)
+            {
+                await events.AppendAsync(
+                    sessionId,
+                    workUnitId,
+                    ExecutionEventKind.ArtifactProposed,
+                    new ArtifactProposedPayload(created.ProposalId, workUnitId, []),
+                    ct: ct).ConfigureAwait(false);
+            }
         }
 
         return ToJson(new { proposalId = created.ProposalId, status = created.Status.ToString() });
@@ -363,7 +380,7 @@ internal sealed class McpToolDispatcher(
         return result.DataJson;
     }
 
-    private async Task<string> MergeApplyAsync(JsonElement input, CancellationToken ct)
+    private async Task<string> MergeApplyAsync(JsonElement input, CancellationToken ct, string? sessionId)
     {
         try
         {
@@ -372,6 +389,33 @@ internal sealed class McpToolDispatcher(
         }
         catch (KeyNotFoundException ex) { return ToError(ex.Message); }
         catch (InvalidOperationException ex) { return ToError(ex.Message); }
+    }
+
+    private async Task<string> SchedulerEnqueueAsync(JsonElement input, CancellationToken ct, string? sessionId)
+    {
+        var workUnitId = Str(input, "workUnitId");
+        var profileId  = Str(input, "profileId");
+        if (workUnitId is null || profileId is null)
+            return ToError("workUnitId and profileId are required.");
+
+        await scheduler.EnqueueAsync(
+            workUnitId,
+            profileId,
+            taskId:    Str(input, "taskId"),
+            model:     Str(input, "model"),
+            baseUrl:   Str(input, "baseUrl"),
+            apiKey:    Str(input, "apiKey"),
+            provider:  Str(input, "provider"),
+            sessionId: sessionId,
+            ct:        ct).ConfigureAwait(false);
+
+        return ToJson(new { workUnitId, profileId, status = "enqueued" });
+    }
+
+    private async Task<string> SchedulerPendingAsync(CancellationToken ct)
+    {
+        var items = await scheduler.ListPendingAsync(ct).ConfigureAwait(false);
+        return ToJson(items);
     }
 
     private static string? Str(JsonElement input, string key) =>

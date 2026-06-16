@@ -18,6 +18,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     private readonly ILogger<InMemoryAgentRuntimeService> _logger;
     private readonly IAgentProfileService _profileService;
     private readonly IWorkScheduler _scheduler;
+    private readonly IExecutionEventStream _events;
     private int _activeWorkerCount;
     private CancellationTokenSource? _pollCts;
 
@@ -25,12 +26,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         IServiceProvider serviceProvider,
         ILogger<InMemoryAgentRuntimeService> logger,
         IAgentProfileService profileService,
-        IWorkScheduler scheduler)
+        IWorkScheduler scheduler,
+        IExecutionEventStream events)
     {
         _serviceProvider = serviceProvider;
         _logger          = logger;
         _profileService  = profileService;
         _scheduler       = scheduler;
+        _events          = events;
     }
 
     private sealed record AgentRecord(
@@ -119,9 +122,19 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
             if (canRun)
             {
+                if (item.SessionId is not null)
+                {
+                    await _events.AppendAsync(
+                        item.SessionId,
+                        item.WorkUnitId,
+                        ExecutionEventKind.WorkUnitStarted,
+                        new WorkUnitStartedPayload(item.WorkUnitId, agentId),
+                        ct: ct).ConfigureAwait(false);
+                }
+
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
-                var loop = new WorkerAgentLoop(agentId, item.WorkUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm, profile);
+                var loop = new WorkerAgentLoop(agentId, item.WorkUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm, profile, item.SessionId);
                 await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 success = true;
             }
@@ -260,7 +273,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string baseUrl,
         string apiKey,
         AgentProfile? profile,
-        CancellationTokenSource cts)
+        CancellationTokenSource cts,
+        string? sessionId = null)
     {
         _logger.LogInformation("[Agent {AgentId}] Starting orchestrator loop — provider={Provider} model={Model} baseUrl={BaseUrl}",
             agentId, provider, model, baseUrl);
@@ -271,7 +285,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
                 var loop = new OrchestratorAgentLoop(
-                    agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm, profile);
+                    agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm, profile, sessionId);
                 await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 _logger.LogInformation("[Agent {AgentId}] Orchestrator loop completed.", agentId);
             }
