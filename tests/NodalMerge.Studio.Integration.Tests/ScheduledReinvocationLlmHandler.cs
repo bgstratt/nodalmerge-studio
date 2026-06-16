@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -5,16 +6,25 @@ using System.Text.Json;
 namespace NodalMerge.Studio.Integration.Tests;
 
 /// <summary>
-/// Fake HttpMessageHandler that replays a deterministic tool-use script for the
-/// orchestrator and worker agent loops. Identifies each conversation by its initial
-/// user message and drives the full cycle without hitting a real LLM.
+/// Fake HttpMessageHandler for the scheduler-driven re-invocation test. Unlike
+/// <see cref="ScriptedLlmHandler"/>, the orchestrator here calls nm_v1_scheduler_enqueue
+/// (not the legacy nm_v1_agent_spawn) and is expected to be re-invoked by
+/// WorkSchedulerService.ReleaseAsync after the worker completes — a second, independent
+/// OrchestratorAgentLoop.RunAsync call with its own fresh conversation (step resets to 0).
 ///
-/// Orchestrator script: workunit.get → task.create → agent.spawn → end_turn
-/// Worker script: task.update(InProgress) → workunit.get → task.update(Completed)
-///                → artifact.record(Research) → merge.propose → merge.validate → end_turn
+/// Because each conversation looks identical from a pure step-count view, an external
+/// per-work-unit invocation counter distinguishes "first orchestration" from "re-invoked
+/// orchestration" so the two get different scripts:
+///   Invocation 1: workunit.get → task.create → scheduler.enqueue → end_turn
+///   Invocation 2+: projection.get → end_turn (simulating "the proposal already exists, stop")
+///
+/// Worker script is unchanged from ScriptedLlmHandler: task.update(InProgress) → workunit.get →
+/// task.update(Completed) → artifact.record(Research) → merge.propose → merge.validate → end_turn
 /// </summary>
-internal sealed class ScriptedLlmHandler : HttpMessageHandler
+internal sealed class ScheduledReinvocationLlmHandler : HttpMessageHandler
 {
+    private readonly ConcurrentDictionary<string, int> _orchestratorInvocations = new();
+
     protected override async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken)
     {
@@ -22,8 +32,6 @@ internal sealed class ScriptedLlmHandler : HttpMessageHandler
         using var doc = JsonDocument.Parse(body);
         var messages = doc.RootElement.GetProperty("messages");
 
-        // Step index: 0 on first call, +1 for each subsequent call within the same conversation.
-        // Pattern: [user] → step 0, [user,asst,user] → step 1, etc.
         var step = (messages.GetArrayLength() - 1) / 2;
         var firstMsg = messages[0].GetProperty("content").GetString() ?? "";
 
@@ -39,32 +47,46 @@ internal sealed class ScriptedLlmHandler : HttpMessageHandler
 
     // ── Orchestrator ──────────────────────────────────────────────────────────
 
-    private static string OrchestratorStep(int step, string firstMsg, JsonElement messages)
+    private string OrchestratorStep(int step, string firstMsg, JsonElement messages)
     {
         var wuId = ParseBetween(firstMsg, "Begin orchestrating work unit ", ". Your agent ID is");
-        return step switch
-        {
-            0 => ToolUse("tu-o-1", "nm_v1_workunit_get", new { workUnitId = wuId }),
-            1 => ToolUse("tu-o-2", "nm_v1_task_create", new
-            {
-                workUnitId = wuId,
-                title = "Execute the goal",
-                description = "Complete all work required for this work unit"
-            }),
-            2 => ToolUse("tu-o-3", "nm_v1_agent_spawn", new
-            {
-                agentType = "worker",
-                workUnitId = wuId,
-                taskId = ExtractFromToolResult(messages, "taskId") ?? "unknown",
-                model = "fake-model",
-                baseUrl = "http://fake-llm",
-                apiKey = "fake-key"
-            }),
-            _ => EndTurn()
-        };
+
+        // A new conversation (step == 0) means a fresh OrchestratorAgentLoop.RunAsync call —
+        // either the original spawn or a re-invocation. Bump the counter once per conversation.
+        var invocation = step == 0
+            ? _orchestratorInvocations.AddOrUpdate(wuId, 1, (_, n) => n + 1)
+            : _orchestratorInvocations.GetOrAdd(wuId, 1);
+
+        return invocation == 1
+            ? FirstInvocation(step, wuId, messages)
+            : ReinvokedInvocation(step, wuId);
     }
 
-    // ── Worker ────────────────────────────────────────────────────────────────
+    private static string FirstInvocation(int step, string wuId, JsonElement messages) => step switch
+    {
+        0 => ToolUse("tu-o-1", "nm_v1_workunit_get", new { workUnitId = wuId }),
+        1 => ToolUse("tu-o-2", "nm_v1_task_create", new
+        {
+            workUnitId = wuId,
+            title = "Execute the goal",
+            description = "Complete all work required for this work unit"
+        }),
+        2 => ToolUse("tu-o-3", "nm_v1_scheduler_enqueue", new
+        {
+            workUnitId = wuId,
+            profileId = "worker",
+            taskId = ExtractFromToolResult(messages, "taskId") ?? "unknown"
+        }),
+        _ => EndTurn(),
+    };
+
+    private static string ReinvokedInvocation(int step, string wuId) => step switch
+    {
+        0 => ToolUse("tu-o-r1", "nm_v1_projection_get", new { projectionType = "AgentWorkspace", workUnitId = wuId }),
+        _ => EndTurn(),
+    };
+
+    // ── Worker (identical script to ScriptedLlmHandler) ─────────────────────────
 
     private static string WorkerStep(int step, string firstMsg, JsonElement messages)
     {
@@ -85,13 +107,11 @@ internal sealed class ScriptedLlmHandler : HttpMessageHandler
             }),
             4 => ToolUse("tu-w-5", "nm_v1_merge_propose", new
             {
-                // WorkUnit serialises BranchId in PascalCase with default JsonSerializer options.
                 sourceBranch = ExtractFromToolResult(messages, "BranchId")
                             ?? ExtractFromToolResult(messages, "branchId")
                             ?? "unknown-branch",
                 targetBranch = "main",
                 summary = "Completed the assigned task for the work unit",
-                // The real worker prompt instructs including these for artifact tracking (10d).
                 workUnitId = wuId,
                 agentId
             }),
@@ -99,16 +119,12 @@ internal sealed class ScriptedLlmHandler : HttpMessageHandler
             {
                 proposalId = ExtractFromToolResult(messages, "proposalId") ?? "unknown"
             }),
-            _ => EndTurn()
+            _ => EndTurn(),
         };
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Helpers (same shape as ScriptedLlmHandler) ──────────────────────────────
 
-    /// <summary>
-    /// Searches all tool_result entries in the message history (newest first) for a JSON
-    /// property with the given key and returns its string value.
-    /// </summary>
     private static string? ExtractFromToolResult(JsonElement messages, string key)
     {
         for (var i = messages.GetArrayLength() - 1; i >= 0; i--)

@@ -11,6 +11,7 @@ public enum ArtifactType
     BranchChangeset,
     MergeProposal,
     MergeResult,
+    ChangeIntent,
 }
 
 public enum ArtifactStatus
@@ -29,4 +30,6 @@ public sealed record ArtifactRef(
     ArtifactStatus Status,
     DateTimeOffset CreatedAt,
     string? OwnedByWorkUnitId,
-    string? OwnedByAgentId);
+    string? OwnedByAgentId,
+    string? Title = null,
+    string? Body = null);

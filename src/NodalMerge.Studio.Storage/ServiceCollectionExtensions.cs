@@ -12,12 +12,14 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IKnownGoodStateService, InMemoryKnownGoodStateService>();
         services.AddSingleton<IReplayService, StubReplayService>();
         services.AddSingleton<IAgentProfileService, AgentProfileService>();
-        services.AddSingleton<IArtifactRefService, InMemoryArtifactRefService>();
+        services.AddSingleton<IArtifactLineageService, ArtifactLineageService>();
         services.AddSingleton<IWorkScheduler, WorkSchedulerService>();
         services.AddSingleton<IExecutionEventStream, ExecutionEventStreamService>();
         services.AddSingleton<IExecutionSessionService, ExecutionSessionService>();
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
         services.AddSingleton<IAgentWorkspaceService, AgentWorkspaceService>();
+        services.AddSingleton<IOrchestrationDecisionLogService, OrchestrationDecisionLogService>();
+        services.AddSingleton<IIntentGraphService, IntentGraphService>();
         AddFileWorkspaceService(services);
         return services;
     }
@@ -29,12 +31,14 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IKnownGoodStateService, InMemoryKnownGoodStateService>();
         services.AddSingleton<IReplayService, StubReplayService>();
         services.AddSingleton<IAgentProfileService, AgentProfileService>();
-        services.AddSingleton<IArtifactRefService, InMemoryArtifactRefService>();
+        services.AddSingleton<IArtifactLineageService, ArtifactLineageService>();
         services.AddSingleton<IWorkScheduler, WorkSchedulerService>();
         services.AddSingleton<IExecutionEventStream, ExecutionEventStreamService>();
         services.AddSingleton<IExecutionSessionService, ExecutionSessionService>();
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
         services.AddSingleton<IAgentWorkspaceService, AgentWorkspaceService>();
+        services.AddSingleton<IOrchestrationDecisionLogService, OrchestrationDecisionLogService>();
+        services.AddSingleton<IIntentGraphService, IntentGraphService>();
         AddFileWorkspaceService(services);
         return services;
     }

@@ -15,7 +15,9 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
     private readonly IKnownGoodStateService _knownGoodStateService;
     private readonly IAgentControlService _agentControl;
     private readonly IStudioNodeStore _nodeStore;
+    private readonly IArtifactLineageService _artifactLineage;
     private readonly WorkspaceOptions _workspaceOptions;
+    private readonly IExecutionEventStream _events;
 
     public InMemoryWorkUnitService(
         IBranchService branchService,
@@ -23,14 +25,18 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IKnownGoodStateService knownGoodStateService,
         IAgentControlService agentControl,
         IStudioNodeStore nodeStore,
-        WorkspaceOptions workspaceOptions)
+        IArtifactLineageService artifactLineage,
+        WorkspaceOptions workspaceOptions,
+        IExecutionEventStream events)
     {
         _branchService         = branchService;
         _mergeService          = mergeService;
         _knownGoodStateService = knownGoodStateService;
         _agentControl          = agentControl;
         _nodeStore             = nodeStore;
+        _artifactLineage       = artifactLineage;
         _workspaceOptions      = workspaceOptions;
+        _events                = events;
     }
 
     public async Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken cancellationToken = default)
@@ -44,12 +50,28 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             workUnit.WorkUnitId,
             JsonSerializer.Serialize(workUnit),
             cancellationToken).ConfigureAwait(false);
+
+        // The work unit's own ID doubles as its Goal artifact's ID — every other artifact in
+        // its chain (Task, MergeProposal, ...) traces back to this root. A child work unit's
+        // Goal is parented to the parent work unit's own Goal (same ID), so the artifact graph
+        // and the work-unit DAG agree — this is also how 10f's branch-from-proposal lineage
+        // becomes traversable via GetChildrenAsync without a separate artifact type.
+        await _artifactLineage.RecordAsync(new ArtifactRef(
+            workUnit.WorkUnitId,
+            ArtifactType.Goal,
+            workUnit.ParentWorkUnitId,
+            ArtifactStatus.Active,
+            workUnit.CreatedAt,
+            workUnit.WorkUnitId,
+            null), cancellationToken).ConfigureAwait(false);
+
         return workUnit;
     }
 
     public async Task<WorkUnit> UpdateStatusAsync(
         string workUnitId,
         WorkUnitStatus status,
+        string? sessionId = null,
         CancellationToken cancellationToken = default)
     {
         var workUnit = GetRequired(workUnitId);
@@ -58,6 +80,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             throw new InvalidOperationException($"Cannot transition work unit from {workUnit.Status} to {status}.");
         }
 
+        var previousStatus = workUnit.Status;
         var updated = workUnit with { Status = status, UpdatedAt = DateTimeOffset.UtcNow };
         _workUnits[workUnitId] = updated;
         await _nodeStore.WriteNodeAsync(
@@ -65,6 +88,17 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             workUnitId,
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
+
+        if (sessionId is not null)
+        {
+            await _events.AppendAsync(
+                sessionId,
+                workUnitId,
+                ExecutionEventKind.WorkUnitStatusChanged,
+                new WorkUnitStatusChangedPayload(workUnitId, previousStatus, status),
+                ct: cancellationToken).ConfigureAwait(false);
+        }
+
         return updated;
     }
 
@@ -92,6 +126,8 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         string? parentWorkUnitId = null,
         IReadOnlyList<string>? dependsOn = null,
         IReadOnlyList<string>? fileScope = null,
+        string? seedFromBranchId = null,
+        string? branchedFromProposalId = null,
         CancellationToken cancellationToken = default)
     {
         // First work unit with a repositoryPath seeds the main branch for this session.
@@ -101,8 +137,13 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             _workspaceOptions.SeedRepositoryPath = repositoryPath;
         }
 
-        var branchId = await _branchService.CreateBranchAsync($"work-{Guid.NewGuid():N}", cancellationToken: cancellationToken)
+        var branchId = await _branchService
+            .CreateBranchAsync($"work-{Guid.NewGuid():N}", seedFromBranchId, cancellationToken)
             .ConfigureAwait(false);
+
+        var metadata = branchedFromProposalId is not null
+            ? new Dictionary<string, string> { ["branchedFromProposalId"] = branchedFromProposalId }
+            : null;
 
         var now = DateTimeOffset.UtcNow;
         var workUnit = new WorkUnit(
@@ -115,7 +156,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             Owner: owner,
             AssignedAgent: null,
             SuccessCriteria: successCriteria,
-            Metadata: null,
+            Metadata: metadata,
             ParentWorkUnitId: parentWorkUnitId,
             DependsOn: dependsOn ?? [],
             FileScope: fileScope ?? []);
@@ -220,7 +261,9 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IKnownGoodStateService>(),
             sp.GetRequiredService<IAgentControlService>(),
             sp.GetRequiredService<IStudioNodeStore>(),
-            sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions()));
+            sp.GetRequiredService<IArtifactLineageService>(),
+            sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions(),
+            sp.GetRequiredService<IExecutionEventStream>()));
         services.AddSingleton<IWorkUnitService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IOrchestratorService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IWorkspaceService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());

@@ -14,17 +14,27 @@ public sealed class InMemoryMergeService : IMergeService
     private readonly IFileWorkspaceService _fileWorkspace;
     private readonly WorkspaceOptions _workspaceOptions;
     private readonly IExecutionEventStream _events;
+    private readonly IArtifactLineageService _artifacts;
+    private readonly IServiceProvider? _serviceProvider;
 
+    // IWorkUnitService is resolved lazily (via IServiceProvider) rather than constructor-injected:
+    // its production implementation (InMemoryWorkUnitService) already depends on IMergeService
+    // (this service), so a direct dependency here would be a circular constructor graph — same
+    // pattern used by WorkSchedulerService for the same interface.
     public InMemoryMergeService(
         IStudioNodeStore nodeStore,
         IFileWorkspaceService fileWorkspace,
         WorkspaceOptions workspaceOptions,
-        IExecutionEventStream events)
+        IExecutionEventStream events,
+        IArtifactLineageService artifacts,
+        IServiceProvider? serviceProvider = null)
     {
         _nodeStore        = nodeStore;
         _fileWorkspace    = fileWorkspace;
         _workspaceOptions = workspaceOptions;
         _events           = events;
+        _artifacts        = artifacts;
+        _serviceProvider  = serviceProvider;
     }
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
@@ -36,6 +46,13 @@ public sealed class InMemoryMergeService : IMergeService
             stored.ProposalId,
             JsonSerializer.Serialize(stored),
             cancellationToken).ConfigureAwait(false);
+
+        // Snapshot the target branch's current content as this proposal's base state (S0, 10f).
+        // Taken now rather than at apply time so it stays correct regardless of whether the
+        // proposal later gets approved, rejected, or applied — none of those touch this copy.
+        await _fileWorkspace.InitBranchAsync(
+            $"base/{proposal.ProposalId}", proposal.TargetBranch, cancellationToken).ConfigureAwait(false);
+
         return stored;
     }
 
@@ -62,6 +79,17 @@ public sealed class InMemoryMergeService : IMergeService
             proposalId,
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
+
+        if (proposal.SessionId is not null)
+        {
+            await _events.AppendAsync(
+                proposal.SessionId,
+                proposal.WorkUnitId,
+                ExecutionEventKind.MergeProposalStatusChanged,
+                new MergeProposalStatusChangedPayload(proposalId, proposal.Status, updated.Status),
+                ct: cancellationToken).ConfigureAwait(false);
+        }
+
         return updated;
     }
 
@@ -86,6 +114,14 @@ public sealed class InMemoryMergeService : IMergeService
             proposalId,
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
+
+        if (proposal.WorkUnitId is not null)
+        {
+            var artifactStatus = decision == MergeProposalStatus.Approved
+                ? ArtifactStatus.Approved
+                : ArtifactStatus.Rejected;
+            await _artifacts.UpdateStatusAsync(proposalId, artifactStatus, cancellationToken).ConfigureAwait(false);
+        }
 
         if (proposal.SessionId is not null)
         {
@@ -115,6 +151,13 @@ public sealed class InMemoryMergeService : IMergeService
                     new ProposalRejectedPayload(proposalId, "user", null),
                     ct: cancellationToken).ConfigureAwait(false);
             }
+
+            await _events.AppendAsync(
+                proposal.SessionId,
+                proposal.WorkUnitId,
+                ExecutionEventKind.MergeProposalStatusChanged,
+                new MergeProposalStatusChangedPayload(proposalId, proposal.Status, updated.Status),
+                ct: cancellationToken).ConfigureAwait(false);
         }
 
         return updated;
@@ -148,6 +191,19 @@ public sealed class InMemoryMergeService : IMergeService
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
 
+        if (proposal.WorkUnitId is not null)
+        {
+            await _artifacts.UpdateStatusAsync(proposalId, ArtifactStatus.Applied, cancellationToken).ConfigureAwait(false);
+            await _artifacts.RecordAsync(new ArtifactRef(
+                $"MR-{Guid.NewGuid():N}",
+                ArtifactType.MergeResult,
+                proposalId,
+                ArtifactStatus.Active,
+                DateTimeOffset.UtcNow,
+                proposal.WorkUnitId,
+                proposal.AgentId), cancellationToken).ConfigureAwait(false);
+        }
+
         if (proposal.SessionId is not null)
         {
             await _events.AppendAsync(
@@ -156,6 +212,31 @@ public sealed class InMemoryMergeService : IMergeService
                 ExecutionEventKind.MergeApplied,
                 new MergeAppliedPayload(proposalId, proposal.TargetBranch, string.Empty),
                 ct: cancellationToken).ConfigureAwait(false);
+
+            await _events.AppendAsync(
+                proposal.SessionId,
+                proposal.WorkUnitId,
+                ExecutionEventKind.MergeProposalStatusChanged,
+                new MergeProposalStatusChangedPayload(proposalId, proposal.Status, updated.Status),
+                ct: cancellationToken).ConfigureAwait(false);
+        }
+
+        if (proposal.WorkUnitId is not null)
+        {
+            // Best-effort — a proposal applying means the owning work unit's pipeline is done.
+            // Not worth failing the merge apply over an illegal transition (e.g. the legacy
+            // direct-spawn path never reaches WorkUnitStatus.Proposed).
+            var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+            if (workUnits is not null)
+            {
+                try
+                {
+                    await workUnits.UpdateStatusAsync(
+                        proposal.WorkUnitId, WorkUnitStatus.Merged, proposal.SessionId, cancellationToken).ConfigureAwait(false);
+                }
+                catch (InvalidOperationException) { }
+                catch (KeyNotFoundException) { }
+            }
         }
 
         return updated;

@@ -45,6 +45,7 @@ public interface IWorkUnitService
     Task<WorkUnit> UpdateStatusAsync(
         string workUnitId,
         WorkUnitStatus status,
+        string? sessionId = null,
         CancellationToken cancellationToken = default);
 
     Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default);
@@ -66,6 +67,8 @@ public interface IOrchestratorService
         string? parentWorkUnitId = null,
         IReadOnlyList<string>? dependsOn = null,
         IReadOnlyList<string>? fileScope = null,
+        string? seedFromBranchId = null,
+        string? branchedFromProposalId = null,
         CancellationToken cancellationToken = default);
 
     Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default);
@@ -141,6 +144,11 @@ public interface IAgentControlService
         string? profileId = null,
         CancellationToken cancellationToken = default);
 
+    // Re-enters the orchestrator loop for a work unit whose orchestrator was previously
+    // SpawnAsync'd — a no-op if none was registered (e.g. a work unit whose worker was
+    // enqueued directly via the scheduler debug endpoint, with no orchestrator behind it).
+    Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default);
+
     Task PauseAsync(string agentId, CancellationToken cancellationToken = default);
 
     Task ResumeAsync(string agentId, CancellationToken cancellationToken = default);
@@ -154,12 +162,22 @@ public interface IAgentControlService
     Task<IReadOnlyList<AgentInfo>> ListAllAsync(CancellationToken cancellationToken = default);
 }
 
-public interface IArtifactRefService
+public interface IArtifactLineageService
 {
-    Task WriteAsync(ArtifactRef artifact, CancellationToken cancellationToken = default);
+    Task<ArtifactRef> RecordAsync(ArtifactRef artifact, CancellationToken ct = default);
 
-    Task<IReadOnlyList<ArtifactRef>> ListAsync(string workUnitId, CancellationToken cancellationToken = default);
+    Task<ArtifactRef?> GetAsync(string artifactId, CancellationToken ct = default);
+
+    Task<IReadOnlyList<ArtifactRef>> GetChainAsync(string workUnitId, CancellationToken ct = default);
+
+    Task<IReadOnlyList<ArtifactRef>> GetChildrenAsync(string parentArtifactId, CancellationToken ct = default);
+
+    Task<ArtifactRef> UpdateStatusAsync(string artifactId, ArtifactStatus status, CancellationToken ct = default);
 }
+
+public sealed record ConflictWarning(
+    IReadOnlyList<string> OverlappingFiles,
+    IReadOnlyList<string> ConflictingWorkUnitIds);
 
 public sealed record ScheduledItem(
     string WorkUnitId,
@@ -172,7 +190,8 @@ public sealed record ScheduledItem(
     string? BaseUrl,
     string? ApiKey,
     string? Provider,
-    string? SessionId = null);
+    string? SessionId = null,
+    ConflictWarning? Conflict = null);
 
 public interface IWorkScheduler
 {
@@ -259,6 +278,33 @@ public interface IAgentWorkspaceService
 
     Task<bool> ValidateWriteAsync(
         string workUnitId, string path, IReadOnlyList<string> fileScope, CancellationToken ct = default);
+}
+
+public interface IOrchestrationDecisionLogService
+{
+    Task<OrchestrationEvent> RecordAsync(
+        string workUnitId,
+        string orchestratorAgentId,
+        PipelineStage inputStage,
+        string inputProjectionSnapshot,
+        OrchestrationAction action,
+        IReadOnlyList<string> spawnedIds,
+        string? reason,
+        string? sessionId = null,
+        CancellationToken ct = default);
+
+    Task<IReadOnlyList<OrchestrationEvent>> GetEventsAsync(string workUnitId, CancellationToken ct = default);
+}
+
+public interface IIntentGraphService
+{
+    Task RecordIntentAsync(ChangeIntent intent, CancellationToken ct = default);
+
+    Task<IReadOnlyList<ChangeIntent>> QueryIntentsAsync(string workUnitId, CancellationToken ct = default);
+
+    Task<IReadOnlyList<ChangeIntent>> QueryOverlappingAsync(ChangeIntent intent, CancellationToken ct = default);
+
+    Task RemoveIntentAsync(string intentId, CancellationToken ct = default);
 }
 
 public interface IStateReconstructionService

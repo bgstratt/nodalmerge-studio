@@ -24,7 +24,7 @@ public class ProjectionManagerTests
                 _store.Values.Where(w => branchId is null || w.BranchId == branchId).ToList());
 
         public Task<WorkUnit> CreateAsync(WorkUnit w, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<WorkUnit> UpdateStatusAsync(string id, WorkUnitStatus s, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> UpdateStatusAsync(string id, WorkUnitStatus s, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => throw new NotSupportedException();
     }
@@ -83,27 +83,62 @@ public class ProjectionManagerTests
         public Task RecordActionAsync(string agentId, string workUnitId, string action, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
-    private sealed class FakeArtifactRefService : IArtifactRefService
+    private sealed class FakeArtifactLineageService : IArtifactLineageService
     {
-        public Task WriteAsync(ArtifactRef artifact, CancellationToken ct = default) => Task.CompletedTask;
-        public Task<IReadOnlyList<ArtifactRef>> ListAsync(string workUnitId, CancellationToken ct = default) =>
+        private readonly Dictionary<string, ArtifactRef> _byId = new();
+        private readonly Dictionary<string, List<ArtifactRef>> _byWorkUnit = new();
+
+        public void Seed(ArtifactRef artifact)
+        {
+            _byId[artifact.ArtifactId] = artifact;
+            if (artifact.OwnedByWorkUnitId is { } workUnitId)
+            {
+                if (!_byWorkUnit.TryGetValue(workUnitId, out var list))
+                    _byWorkUnit[workUnitId] = list = [];
+                list.Add(artifact);
+            }
+        }
+
+        public Task<ArtifactRef> RecordAsync(ArtifactRef artifact, CancellationToken ct = default)
+        {
+            Seed(artifact);
+            return Task.FromResult(artifact);
+        }
+
+        public Task<ArtifactRef?> GetAsync(string artifactId, CancellationToken ct = default) =>
+            Task.FromResult(_byId.GetValueOrDefault(artifactId));
+
+        public Task<IReadOnlyList<ArtifactRef>> GetChainAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ArtifactRef>>(
+                _byWorkUnit.TryGetValue(workUnitId, out var list) ? [.. list.OrderBy(a => a.CreatedAt)] : []);
+
+        public Task<IReadOnlyList<ArtifactRef>> GetChildrenAsync(string parentArtifactId, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
+
+        public Task<ArtifactRef> UpdateStatusAsync(string artifactId, ArtifactStatus status, CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private static ProjectionManager BuildManager(
         FakeWorkUnitService? workUnits = null,
         FakeTaskService? tasks = null,
         FakeMergeService? merges = null,
-        FakeAgentRuntimeService? agentRuntime = null) =>
+        FakeAgentRuntimeService? agentRuntime = null,
+        FakeArtifactLineageService? artifacts = null) =>
         new(
             workUnits ?? new FakeWorkUnitService(),
             tasks ?? new FakeTaskService(),
             merges ?? new FakeMergeService(),
             agentRuntime ?? new FakeAgentRuntimeService(),
-            new FakeArtifactRefService());
+            artifacts ?? new FakeArtifactLineageService());
 
-    private static WorkUnit MakeWorkUnit(string id, string goal, string branch = "main", WorkUnitStatus status = WorkUnitStatus.Active) =>
-        new(id, goal, branch, status, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "test", null, null, null, null, [], []);
+    private static WorkUnit MakeWorkUnit(
+        string id, string goal, string branch = "main", WorkUnitStatus status = WorkUnitStatus.Active, string? parentWorkUnitId = null) =>
+        new(id, goal, branch, status, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "test", null, null, null, parentWorkUnitId, [], []);
+
+    private static ArtifactRef MakeArtifact(
+        string id, ArtifactType type, string ownedByWorkUnitId, string? title = null, string? body = null) =>
+        new(id, type, ownedByWorkUnitId, ArtifactStatus.Active, DateTimeOffset.UtcNow, ownedByWorkUnitId, null, title, body);
 
     private static StudioTask MakeTask(string id, string workUnitId, TaskStatus status = TaskStatus.Open) =>
         new(id, workUnitId, $"Task {id}", "desc", status, null, 1);
@@ -255,6 +290,72 @@ public class ProjectionManagerTests
         Assert.True(doc.TryGetProperty("error", out _));
     }
 
+    // ── AgentWorkspace projection — knowledge artifact inheritance (Slice 10g) ──
+
+    [Fact]
+    public async Task AgentWorkspace_includes_own_Research_artifact()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-1", "Goal"));
+        var artifacts = new FakeArtifactLineageService();
+        artifacts.Seed(MakeArtifact("KA-1", ArtifactType.Research, "WU-1", "Stack", ".NET 8, no Redis"));
+        var manager = BuildManager(workUnits, artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal, WorkUnitId: "WU-1"));
+
+        var payload = JsonSerializer.Deserialize<AgentWorkspaceProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        Assert.Contains(payload!.Artifacts.Artifacts, a => a.ArtifactId == "KA-1" && a.Type == ArtifactType.Research);
+    }
+
+    [Fact]
+    public async Task AgentWorkspace_inherits_parents_Research_artifact_into_the_chain()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-Parent", "Parent goal"));
+        workUnits.Seed(MakeWorkUnit("WU-Child", "Child goal", parentWorkUnitId: "WU-Parent"));
+        var artifacts = new FakeArtifactLineageService();
+        artifacts.Seed(MakeArtifact("KA-1", ArtifactType.Research, "WU-Parent", "Stack", ".NET 8, no Redis"));
+        var manager = BuildManager(workUnits, artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal, WorkUnitId: "WU-Child"));
+
+        var payload = JsonSerializer.Deserialize<AgentWorkspaceProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        Assert.Contains(payload!.Artifacts.Artifacts, a => a.ArtifactId == "KA-1");
+    }
+
+    [Fact]
+    public async Task AgentWorkspace_InheritedConstraints_walks_two_levels_to_a_grandchild()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-Grandparent", "Root goal"));
+        workUnits.Seed(MakeWorkUnit("WU-Parent", "Mid goal", parentWorkUnitId: "WU-Grandparent"));
+        workUnits.Seed(MakeWorkUnit("WU-Grandchild", "Leaf goal", parentWorkUnitId: "WU-Parent"));
+        var artifacts = new FakeArtifactLineageService();
+        artifacts.Seed(MakeArtifact("KA-1", ArtifactType.Constraint, "WU-Grandparent", "No tokens in cookies", "Auth middleware must not store session tokens."));
+        var manager = BuildManager(workUnits, artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal, WorkUnitId: "WU-Grandchild"));
+
+        var payload = JsonSerializer.Deserialize<AgentWorkspaceProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        Assert.Single(payload!.InheritedConstraints, a => a.ArtifactId == "KA-1");
+    }
+
+    [Fact]
+    public async Task AgentWorkspace_InheritedConstraints_excludes_the_work_units_own_constraints()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-1", "Goal"));
+        var artifacts = new FakeArtifactLineageService();
+        artifacts.Seed(MakeArtifact("KA-own", ArtifactType.Constraint, "WU-1", "Local rule", "Only applies here"));
+        var manager = BuildManager(workUnits, artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal, WorkUnitId: "WU-1"));
+
+        var payload = JsonSerializer.Deserialize<AgentWorkspaceProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        Assert.Empty(payload!.InheritedConstraints); // not inherited — it's the unit's own
+        Assert.Contains(payload.Artifacts.Artifacts, a => a.ArtifactId == "KA-own"); // still visible in the full chain
+    }
+
     // ── Routing ─────────────────────────────────────────────────────────────
 
     [Theory]
@@ -269,5 +370,13 @@ public class ProjectionManagerTests
         Assert.Equal(type, result.Type);
         Assert.Equal(level, result.Level);
         Assert.NotEmpty(result.DataJson);
+    }
+
+    [Fact]
+    public async Task AgentWorkspace_without_workUnitId_returns_error_without_throwing()
+    {
+        var result = await BuildManager().GetAsync(new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal));
+        var doc = JsonDocument.Parse(result.DataJson).RootElement;
+        Assert.True(doc.TryGetProperty("error", out _));
     }
 }

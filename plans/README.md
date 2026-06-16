@@ -73,7 +73,7 @@ See [phase-4-fanout-merger.md](./phase-4-fanout-merger.md). Built on Phase 3 fou
 
 | Slice | Focus | Status |
 |-------|-------|--------|
-| 11a | Artifact Lifecycle State Machine — formal states per WorkUnit and MergeProposal | Planned |
+| 11a | Artifact Lifecycle State Machine — formal states per WorkUnit and MergeProposal | Complete — see as-built note in phase-4-fanout-merger.md (built alongside the orchestrator re-invocation fix, see phase-3-foundations.md's Deferred Work Tracker) |
 | 11b | Fan-out — planner decomposes goal into N child work units; scheduler executes in parallel | Planned |
 | 11c | Merger/Reducer — N proposals reconciled into one candidate; conflict reporting | Planned |
 | 11d | Automated Reviewer agent (`Stage = Review`) as optional pre-gate before human | Planned |

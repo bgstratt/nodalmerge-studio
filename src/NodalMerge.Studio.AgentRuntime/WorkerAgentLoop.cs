@@ -30,10 +30,13 @@ internal sealed class WorkerAgentLoop(
            IMPORTANT: Write = full file replacement. Always write the complete file content, not just a diff.
            If modifying an existing file, read it first, then write the complete updated version.
         6. When work is complete, call nm_v1_task_update to set the task status to Completed.
-        7. Call nm_v1_workspace_diff to review your changes against the target branch (usually main).
-        8. Call nm_v1_merge_propose with an accurate summary listing the files changed. Include your agentId and workUnitId.
-        9. Call nm_v1_merge_validate to move the proposal to ReadyForReview.
-        10. Stop — a human will review and approve the merge.
+        7. (Optional) If you learned something future work units shouldn't have to rediscover — a fact about
+           the codebase, a decision you made, or a constraint that must hold — call nm_v1_artifact_record
+           with type Research, Decision, or Constraint. Check nm_v1_artifact_query first to avoid duplicates.
+        8. Call nm_v1_workspace_diff to review your changes against the target branch (usually main).
+        9. Call nm_v1_merge_propose with an accurate summary listing the files changed. Include your agentId and workUnitId.
+        10. Call nm_v1_merge_validate to move the proposal to ReadyForReview.
+        11. Stop — a human will review and approve the merge.
 
         Rules:
         - Always get your branchId from nm_v1_workunit_get before calling workspace tools.
@@ -181,6 +184,31 @@ internal sealed class WorkerAgentLoop(
 
             new(McpToolNames.WorkspaceSummary, "Get a summary of the current workspace state.",
                 Schema([], new() { ["branchId"] = Str("Branch ID filter (optional)") })),
+
+            new(McpToolNames.ArtifactRecord, "Record a durable knowledge note (Research, Decision, or Constraint) so future work units don't have to rediscover it.",
+                Schema(["workUnitId", "type", "title", "body"], new()
+                {
+                    ["workUnitId"]       = Str("Your work unit ID"),
+                    ["type"]             = Str("Research | Decision | Constraint"),
+                    ["title"]            = Str("Short title"),
+                    ["body"]             = Str("The note content (markdown)"),
+                    ["parentArtifactId"] = Str("Artifact to attach this under (optional, defaults to your work unit's Goal)"),
+                })),
+
+            new(McpToolNames.ArtifactQuery, "Search knowledge artifacts for this work unit and its ancestors by type and/or keyword.",
+                Schema(["workUnitId"], new()
+                {
+                    ["workUnitId"] = Str("Work unit ID to search from"),
+                    ["type"]       = Str("Filter by type: Research | Decision | Constraint (optional)"),
+                    ["keywords"]   = Str("Space-separated keywords to match against title and body (optional)"),
+                })),
+
+            new(McpToolNames.ArtifactList, "List the full artifact chain for a work unit, including ancestors' artifacts by default.",
+                Schema(["workUnitId"], new()
+                {
+                    ["workUnitId"]       = Str("Work unit ID"),
+                    ["includeAncestors"] = Str("true/false — include ancestor work units' artifacts (optional, default true)"),
+                })),
         ];
     }
 }

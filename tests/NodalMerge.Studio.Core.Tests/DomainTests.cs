@@ -10,6 +10,21 @@ public class WorkUnitTransitionTests
     [InlineData(WorkUnitStatus.Created, WorkUnitStatus.Active, true)]
     [InlineData(WorkUnitStatus.Active, WorkUnitStatus.Completed, true)]
     [InlineData(WorkUnitStatus.Completed, WorkUnitStatus.Active, false)]
+    // Phase 4 slice 11a — queue-driven pipeline states.
+    [InlineData(WorkUnitStatus.Created, WorkUnitStatus.Queued, true)]
+    [InlineData(WorkUnitStatus.Queued, WorkUnitStatus.Executing, true)]
+    [InlineData(WorkUnitStatus.Executing, WorkUnitStatus.Proposed, true)]
+    [InlineData(WorkUnitStatus.Executing, WorkUnitStatus.Retrying, true)]
+    [InlineData(WorkUnitStatus.Retrying, WorkUnitStatus.Executing, true)]
+    [InlineData(WorkUnitStatus.Executing, WorkUnitStatus.DeadLettered, true)]
+    [InlineData(WorkUnitStatus.Retrying, WorkUnitStatus.DeadLettered, true)]
+    [InlineData(WorkUnitStatus.DeadLettered, WorkUnitStatus.Retrying, true)]
+    [InlineData(WorkUnitStatus.Proposed, WorkUnitStatus.Reviewing, true)]
+    [InlineData(WorkUnitStatus.Proposed, WorkUnitStatus.Merged, true)]
+    [InlineData(WorkUnitStatus.Reviewing, WorkUnitStatus.Merged, true)]
+    [InlineData(WorkUnitStatus.Merged, WorkUnitStatus.Cancelled, false)]
+    [InlineData(WorkUnitStatus.Merged, WorkUnitStatus.Executing, false)]
+    [InlineData(WorkUnitStatus.Queued, WorkUnitStatus.Merged, false)]
     public void CanTransition_respects_lifecycle(WorkUnitStatus from, WorkUnitStatus to, bool expected)
     {
         Assert.Equal(expected, WorkUnitTransitions.CanTransition(from, to));
@@ -32,6 +47,17 @@ public class MergeProposalTransitionTests
         Assert.False(MergeProposalTransitions.CanTransition(
             MergeProposalStatus.Draft,
             MergeProposalStatus.Merged));
+    }
+
+    [Theory]
+    [InlineData(MergeProposalStatus.ReadyForReview, MergeProposalStatus.Superseded, true)]
+    [InlineData(MergeProposalStatus.Approved, MergeProposalStatus.Superseded, true)]
+    [InlineData(MergeProposalStatus.Draft, MergeProposalStatus.Superseded, false)]
+    [InlineData(MergeProposalStatus.Merged, MergeProposalStatus.Superseded, false)]
+    public void CanTransition_to_Superseded_only_from_ReadyForReview_or_Approved(
+        MergeProposalStatus from, MergeProposalStatus to, bool expected)
+    {
+        Assert.Equal(expected, MergeProposalTransitions.CanTransition(from, to));
     }
 }
 

@@ -15,5 +15,6 @@ public class StudioHostSmokeTests
         Assert.NotNull(app.Services.GetService(typeof(ITaskService)));
         Assert.NotNull(app.Services.GetService(typeof(IMergeService)));
         Assert.NotNull(app.Services.GetService(typeof(IWorkUnitService)));
+        Assert.NotNull(app.Services.GetService(typeof(IArtifactLineageService)));
     }
 }

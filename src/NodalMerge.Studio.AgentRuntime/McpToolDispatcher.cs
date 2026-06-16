@@ -19,10 +19,11 @@ internal sealed class McpToolDispatcher(
     IAgentWorkspaceService agentWorkspaces,
     ISnapshotService snapshots,
     IAgentControlService agentControl,
-    IArtifactRefService artifactRefs,
+    IArtifactLineageService artifactLineage,
     IProjectionManager projections,
     IWorkScheduler scheduler,
-    IExecutionEventStream events)
+    IExecutionEventStream events,
+    IIntentGraphService intentGraph)
 {
     public async Task<string> DispatchAsync(
         string toolName,
@@ -40,7 +41,7 @@ internal sealed class McpToolDispatcher(
             {
                 McpToolNames.WorkUnitGet      => await WorkUnitGetAsync(input, ct),
                 McpToolNames.WorkUnitCreate   => await WorkUnitCreateAsync(input, ct),
-                McpToolNames.WorkUnitUpdate   => await WorkUnitUpdateAsync(input, ct),
+                McpToolNames.WorkUnitUpdate   => await WorkUnitUpdateAsync(input, ct, sessionId),
                 McpToolNames.WorkUnitList     => await WorkUnitListAsync(input, ct),
                 McpToolNames.TaskCreate       => await TaskCreateAsync(input, ct),
                 McpToolNames.TaskList         => await TaskListAsync(input, ct),
@@ -66,6 +67,10 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.WorkspaceExists  => await WorkspaceExistsAsync(input, ct),
                 McpToolNames.SchedulerEnqueue => await SchedulerEnqueueAsync(input, ct, sessionId),
                 McpToolNames.SchedulerPending => await SchedulerPendingAsync(ct),
+                McpToolNames.IntentRecord     => await IntentRecordAsync(input, ct),
+                McpToolNames.ArtifactRecord   => await ArtifactRecordAsync(input, ct),
+                McpToolNames.ArtifactQuery    => await ArtifactQueryAsync(input, ct),
+                McpToolNames.ArtifactList     => await ArtifactListAsync(input, ct),
                 _ => ToError($"Tool '{toolName}' is not dispatched by the agent runtime.")
             };
         }
@@ -91,12 +96,12 @@ internal sealed class McpToolDispatcher(
         return ToJson(new { workUnitId = wu.WorkUnitId, branchId = wu.BranchId });
     }
 
-    private async Task<string> WorkUnitUpdateAsync(JsonElement input, CancellationToken ct)
+    private async Task<string> WorkUnitUpdateAsync(JsonElement input, CancellationToken ct, string? sessionId)
     {
         var workUnitId = Str(input, "workUnitId")!;
         var statusStr = Str(input, "status");
         if (statusStr is not null && Enum.TryParse<WorkUnitStatus>(statusStr, true, out var s))
-            await workUnits.UpdateStatusAsync(workUnitId, s, ct).ConfigureAwait(false);
+            await workUnits.UpdateStatusAsync(workUnitId, s, sessionId, ct).ConfigureAwait(false);
         var assignedAgent = Str(input, "assignedAgent");
         if (assignedAgent is not null)
             await orchestrator.AssignWorkAsync(workUnitId, assignedAgent, ct).ConfigureAwait(false);
@@ -122,7 +127,7 @@ internal sealed class McpToolDispatcher(
             null,
             Int(input, "priority") ?? 0);
         var created = await tasks.CreateAsync(task, ct).ConfigureAwait(false);
-        await artifactRefs.WriteAsync(new ArtifactRef(
+        await artifactLineage.RecordAsync(new ArtifactRef(
             created.TaskId,
             ArtifactType.Task,
             workUnitId,
@@ -225,6 +230,8 @@ internal sealed class McpToolDispatcher(
         }
         catch { /* branch dirs may not exist yet; diff is optional */ }
 
+        var filesTouched = ParseFilesTouched(workspaceChanges);
+
         var proposal = new MergeProposal(
             proposalId,
             sourceBranch,
@@ -240,12 +247,13 @@ internal sealed class McpToolDispatcher(
             Model:            Str(input, "model"),
             Provider:         Str(input, "provider"),
             SessionId:        sessionId,
-            WorkUnitId:       workUnitId);
+            WorkUnitId:       workUnitId,
+            FilesTouched:     filesTouched);
         var created = await merge.ProposeAsync(proposal, ct).ConfigureAwait(false);
 
         if (workUnitId is not null)
         {
-            await artifactRefs.WriteAsync(new ArtifactRef(
+            await artifactLineage.RecordAsync(new ArtifactRef(
                 created.ProposalId,
                 ArtifactType.MergeProposal,
                 workUnitId,
@@ -260,12 +268,45 @@ internal sealed class McpToolDispatcher(
                     sessionId,
                     workUnitId,
                     ExecutionEventKind.ArtifactProposed,
-                    new ArtifactProposedPayload(created.ProposalId, workUnitId, []),
+                    new ArtifactProposedPayload(created.ProposalId, workUnitId, filesTouched),
                     ct: ct).ConfigureAwait(false);
             }
+
+            // Best-effort lifecycle side effect — a proposal being raised means the work unit's
+            // execution stage is done. Not worth failing the propose call over an illegal transition
+            // (e.g. the legacy direct-spawn path never reaches WorkUnitStatus.Executing).
+            try
+            {
+                await workUnits.UpdateStatusAsync(workUnitId, WorkUnitStatus.Proposed, sessionId, ct).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException) { }
+            catch (KeyNotFoundException) { }
         }
 
         return ToJson(new { proposalId = created.ProposalId, status = created.Status.ToString() });
+    }
+
+    // The workspace diff is the plain-text format produced by FileSystemWorkspaceService.DiffAsync
+    // (10c as-built: not a real git worktree, so no "+++ b/"-style unified diff to parse).
+    private static IReadOnlyList<string> ParseFilesTouched(string? workspaceChanges)
+    {
+        if (string.IsNullOrEmpty(workspaceChanges))
+            return [];
+
+        var files = new List<string>();
+        foreach (var rawLine in workspaceChanges.Split('\n'))
+        {
+            var line = rawLine.TrimEnd('\r');
+            var file =
+                line.StartsWith("+++ ADDED: ", StringComparison.Ordinal)   ? line["+++ ADDED: ".Length..] :
+                line.StartsWith("~~~ MODIFIED: ", StringComparison.Ordinal) ? line["~~~ MODIFIED: ".Length..] :
+                line.StartsWith("--- DELETED: ", StringComparison.Ordinal) ? line["--- DELETED: ".Length..] :
+                null;
+            if (file is not null)
+                files.Add(file);
+        }
+
+        return files;
     }
 
     private async Task<string> MergeValidateAsync(JsonElement input, CancellationToken ct)
@@ -441,12 +482,136 @@ internal sealed class McpToolDispatcher(
         return ToJson(items);
     }
 
+    private async Task<string> IntentRecordAsync(JsonElement input, CancellationToken ct)
+    {
+        var workUnitId = Str(input, "workUnitId");
+        var targetPath = Str(input, "targetPath");
+        if (workUnitId is null || targetPath is null)
+            return ToError("workUnitId and targetPath are required.");
+
+        var intent = new ChangeIntent(
+            IntentId:          $"CI-{Guid.NewGuid():N}",
+            WorkUnitId:        workUnitId,
+            IntentType:        Str(input, "intentType") ?? "modify",
+            TargetPath:        targetPath,
+            RegionDescriptor:  Str(input, "regionDescriptor") ?? string.Empty,
+            BaseSnapshotHash:  Str(input, "baseSnapshotHash") ?? string.Empty,
+            FilesTouchedHint:  null,
+            CreatedAt:         DateTimeOffset.UtcNow);
+
+        await intentGraph.RecordIntentAsync(intent, ct).ConfigureAwait(false);
+
+        return ToJson(new { intentId = intent.IntentId });
+    }
+
+    private async Task<string> ArtifactRecordAsync(JsonElement input, CancellationToken ct)
+    {
+        var unitId = Str(input, "workUnitId");
+        var typeStr = Str(input, "type");
+        var title = Str(input, "title");
+        var body = Str(input, "body");
+        if (unitId is null || typeStr is null || title is null || body is null)
+            return ToError("workUnitId, type, title, and body are required.");
+
+        if (!Enum.TryParse<ArtifactType>(typeStr, ignoreCase: true, out var artifactType) ||
+            artifactType is not (ArtifactType.Research or ArtifactType.Decision or ArtifactType.Constraint))
+            return ToError("type must be one of: Research, Decision, Constraint.");
+
+        var artifact = new ArtifactRef(
+            $"KA-{Guid.NewGuid():N}",
+            artifactType,
+            Str(input, "parentArtifactId") ?? unitId,
+            StudioArtifactStatus.Active,
+            DateTimeOffset.UtcNow,
+            unitId,
+            null,
+            title,
+            body);
+
+        var recorded = await artifactLineage.RecordAsync(artifact, ct).ConfigureAwait(false);
+        return ToJson(new { artifactId = recorded.ArtifactId });
+    }
+
+    private async Task<string> ArtifactQueryAsync(JsonElement input, CancellationToken ct)
+    {
+        var unitId = Str(input, "workUnitId");
+        if (unitId is null)
+            return ToError("workUnitId is required.");
+
+        var typeStr = Str(input, "type");
+        ArtifactType? filterType = null;
+        if (typeStr is not null)
+        {
+            if (!Enum.TryParse<ArtifactType>(typeStr, ignoreCase: true, out var parsed))
+                return ToError($"Unknown artifact type '{typeStr}'.");
+            filterType = parsed;
+        }
+
+        var keywords = Str(input, "keywords");
+        var chain = await CollectChainWithAncestorsAsync(unitId, ct).ConfigureAwait(false);
+
+        var filtered = chain
+            .Where(a => filterType is null || a.Type == filterType)
+            .Where(a => keywords is null || MatchesKeywords(a, keywords))
+            .ToList();
+
+        return ToJson(filtered);
+    }
+
+    private async Task<string> ArtifactListAsync(JsonElement input, CancellationToken ct)
+    {
+        var unitId = Str(input, "workUnitId");
+        if (unitId is null)
+            return ToError("workUnitId is required.");
+
+        var includeAncestors = Bool(input, "includeAncestors") ?? true;
+        var list = includeAncestors
+            ? await CollectChainWithAncestorsAsync(unitId, ct).ConfigureAwait(false)
+            : await artifactLineage.GetChainAsync(unitId, ct).ConfigureAwait(false);
+
+        return ToJson(list);
+    }
+
+    // Walks ParentWorkUnitId root-first, folding in every ancestor's own chain ahead of this
+    // work unit's — same inheritance model as ProjectionManager.BuildAgentWorkspaceAsync (10g).
+    private async Task<IReadOnlyList<ArtifactRef>> CollectChainWithAncestorsAsync(string workUnitId, CancellationToken ct)
+    {
+        var ancestorIds = new List<string>();
+        var currentId = workUnitId;
+        while (currentId is not null)
+        {
+            ancestorIds.Add(currentId);
+            var unit = await workUnits.GetAsync(currentId, ct).ConfigureAwait(false);
+            currentId = unit?.ParentWorkUnitId;
+        }
+
+        var seen = new HashSet<string>();
+        var combined = new List<ArtifactRef>();
+        foreach (var id in Enumerable.Reverse(ancestorIds))
+        {
+            var chain = await artifactLineage.GetChainAsync(id, ct).ConfigureAwait(false);
+            foreach (var artifact in chain)
+                if (seen.Add(artifact.ArtifactId))
+                    combined.Add(artifact);
+        }
+
+        return combined;
+    }
+
+    private static bool MatchesKeywords(ArtifactRef artifact, string keywords) =>
+        keywords.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .All(k => $"{artifact.Title} {artifact.Body}".Contains(k, StringComparison.OrdinalIgnoreCase));
+
     private static string? Str(JsonElement input, string key) =>
         input.TryGetProperty(key, out var p) && p.ValueKind == JsonValueKind.String
             ? p.GetString() : null;
 
     private static int? Int(JsonElement input, string key) =>
         input.TryGetProperty(key, out var p) && p.TryGetInt32(out var v) ? v : null;
+
+    private static bool? Bool(JsonElement input, string key) =>
+        input.TryGetProperty(key, out var p) && (p.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            ? p.GetBoolean() : null;
 
     private static string ToJson(object? data) => JsonSerializer.Serialize(data);
     private static string ToError(string message) => JsonSerializer.Serialize(new { error = message });

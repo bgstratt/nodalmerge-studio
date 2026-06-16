@@ -1,7 +1,9 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using NodalMerge.Studio.Contracts.Domain;
+using NodalMerge.Studio.Contracts.Projections;
 using NodalMerge.Studio.Contracts.Versioning;
+using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.AgentRuntime;
 
@@ -14,6 +16,9 @@ internal sealed class OrchestratorAgentLoop(
     string apiKey,
     McpToolDispatcher dispatcher,
     LlmClient llm,
+    IArtifactLineageService artifactLineage,
+    IProjectionManager projections,
+    IOrchestrationDecisionLogService decisionLog,
     AgentProfile? profile = null,
     string? sessionId = null)
 {
@@ -33,12 +38,19 @@ internal sealed class OrchestratorAgentLoop(
 
         Workflow:
         1. Call nm_v1_workunit_get to understand the goal for your assigned work unit.
-        2. Call nm_v1_projection_get (projectionType="AgentWorkspace", workUnitId=<id>) to see existing artifacts.
-        3. Route based on artifact state (see above).
-        4. When enqueuing a worker: call nm_v1_scheduler_enqueue with workUnitId=<your workUnitId>, profileId="worker", taskId=<task id>.
+        2. Call nm_v1_projection_get (projectionType="AgentWorkspace", workUnitId=<id>) to see existing artifacts —
+           this includes inherited Research/Decision/Constraint knowledge from ancestor work units, so check it
+           before re-deriving something a prior run already figured out.
+        3. Route based on artifact state (see above). (Optional) If you make a notable planning decision —
+           e.g. which approach to take, or a constraint future work must respect — call nm_v1_artifact_record
+           with type Decision or Constraint so descendant work units inherit it automatically.
+        4. (Optional) If you know which file(s) a task will touch, call nm_v1_intent_record with workUnitId and
+           targetPath before enqueuing its worker — the scheduler uses this to warn about overlaps with other
+           work units before either one writes anything. Skip this if you don't know the target yet.
+        5. When enqueuing a worker: call nm_v1_scheduler_enqueue with workUnitId=<your workUnitId>, profileId="worker", taskId=<task id>.
            LLM credentials are injected automatically — do not supply model, baseUrl, apiKey, or provider.
-        5. After enqueuing, stop — the scheduler picks up the work and runs the worker. Do not poll for worker completion.
-        6. The system will re-invoke you after the worker completes if further orchestration is needed.
+        6. After enqueuing, stop — the scheduler picks up the work and runs the worker. Do not poll for worker completion.
+        7. The system will re-invoke you after the worker completes if further orchestration is needed.
 
         Rules:
         - Always re-read the AgentWorkspace projection before making a routing decision.
@@ -72,7 +84,14 @@ internal sealed class OrchestratorAgentLoop(
             messages.Add(new NmMessage("assistant", response.Content));
 
             if (response.StopReason == "end_turn")
+            {
+                var text = response.Content.OfType<NmText>().Select(t => t.Text).FirstOrDefault();
+                var chain = await artifactLineage.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
+                var awaitingReview = chain.Any(a => a.Type == ArtifactType.MergeProposal && a.Status == ArtifactStatus.Active);
+                var action = awaitingReview ? OrchestrationAction.AwaitReview : OrchestrationAction.NoOp;
+                await RecordDecisionAsync(action, [], text, ct).ConfigureAwait(false);
                 break;
+            }
 
             if (response.StopReason != "tool_use")
                 break;
@@ -91,12 +110,84 @@ internal sealed class OrchestratorAgentLoop(
                     .ConfigureAwait(false);
 
                 toolResults.Add(new NmToolResult(toolUse.Id, result));
+
+                await RecordToolDecisionAsync(toolUse.Name, result, ct).ConfigureAwait(false);
             }
 
             if (toolResults.Count == 0)
                 break;
 
             messages.Add(new NmMessage("user", toolResults));
+        }
+    }
+
+    // Only tool calls that actually change execution routing become OrchestrationEvents —
+    // investigative calls (workunit.get, projection.get, task.create) are not routing decisions.
+    private async Task RecordToolDecisionAsync(string toolName, string resultJson, CancellationToken ct)
+    {
+        var action = toolName switch
+        {
+            McpToolNames.SchedulerEnqueue => OrchestrationAction.Enqueue,
+            McpToolNames.AgentSpawn       => OrchestrationAction.SpawnWorker,
+            McpToolNames.MergeApply       => OrchestrationAction.ApplyMerge,
+            _                             => (OrchestrationAction?)null,
+        };
+        if (action is null)
+            return;
+
+        var spawnedId = ExtractSpawnedId(action.Value, resultJson);
+        await RecordDecisionAsync(action.Value, spawnedId is null ? [] : [spawnedId], toolName, ct).ConfigureAwait(false);
+    }
+
+    private async Task RecordDecisionAsync(
+        OrchestrationAction action, IReadOnlyList<string> spawnedIds, string? reason, CancellationToken ct)
+    {
+        var chain = await artifactLineage.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
+        var stage = InferStage(chain);
+
+        var projection = await projections.GetAsync(
+            new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal, WorkUnitId: workUnitId, AgentId: agentId),
+            ct).ConfigureAwait(false);
+
+        await decisionLog.RecordAsync(
+            workUnitId, agentId, stage, projection.DataJson, action, spawnedIds, reason, sessionId, ct).ConfigureAwait(false);
+    }
+
+    private static PipelineStage InferStage(IReadOnlyList<ArtifactRef> chain)
+    {
+        var proposal = chain.LastOrDefault(a => a.Type == ArtifactType.MergeProposal);
+        if (proposal is not null)
+        {
+            return proposal.Status is ArtifactStatus.Approved or ArtifactStatus.Applied
+                ? PipelineStage.Merge
+                : PipelineStage.Review;
+        }
+
+        return chain.Any(a => a.Type == ArtifactType.Task) ? PipelineStage.Execute : PipelineStage.Plan;
+    }
+
+    private static string? ExtractSpawnedId(OrchestrationAction action, string resultJson)
+    {
+        var key = action switch
+        {
+            OrchestrationAction.Enqueue     => "workUnitId",
+            OrchestrationAction.SpawnWorker => "agentId",
+            OrchestrationAction.ApplyMerge  => "proposalId",
+            _                                => null,
+        };
+        if (key is null)
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(resultJson);
+            return doc.RootElement.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String
+                ? v.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
         }
     }
 
@@ -220,6 +311,16 @@ internal sealed class OrchestratorAgentLoop(
                     ["taskId"]     = Str("Task ID to assign to the worker (optional)"),
                 })),
 
+            new(McpToolNames.IntentRecord, "Declare which file/region a task you are about to enqueue intends to change, so the scheduler can warn about overlaps with other work units before any worker writes anything. Optional — call once per task right before enqueuing its worker.",
+                Schema(["workUnitId", "targetPath"], new()
+                {
+                    ["workUnitId"]       = Str("Work unit ID (use your own workUnitId)"),
+                    ["targetPath"]       = Str("File path or logical target this task will touch"),
+                    ["intentType"]       = Str("modify | create | delete | rename (optional, default modify)"),
+                    ["regionDescriptor"] = Str("Narrower region within the file, e.g. 'method:CalculateTax' (optional — omit for whole-file)"),
+                    ["baseSnapshotHash"] = Str("Snapshot hash this intent is based on, for optimistic strategies (optional)"),
+                })),
+
             new(McpToolNames.AgentStatus, "Get the status of an agent.",
                 Schema(["agentId"], new() { ["agentId"] = Str("Agent ID") })),
 
@@ -260,6 +361,31 @@ internal sealed class OrchestratorAgentLoop(
 
             new(McpToolNames.MergeApply, "Apply an approved merge proposal, writing changes back to disk.",
                 Schema(["proposalId"], new() { ["proposalId"] = Str("Approved merge proposal ID") })),
+
+            new(McpToolNames.ArtifactRecord, "Record a durable knowledge note (Research, Decision, or Constraint) so descendant work units inherit it automatically.",
+                Schema(["workUnitId", "type", "title", "body"], new()
+                {
+                    ["workUnitId"]       = Str("Your work unit ID"),
+                    ["type"]             = Str("Research | Decision | Constraint"),
+                    ["title"]            = Str("Short title"),
+                    ["body"]             = Str("The note content (markdown)"),
+                    ["parentArtifactId"] = Str("Artifact to attach this under (optional, defaults to your work unit's Goal)"),
+                })),
+
+            new(McpToolNames.ArtifactQuery, "Search knowledge artifacts for this work unit and its ancestors by type and/or keyword.",
+                Schema(["workUnitId"], new()
+                {
+                    ["workUnitId"] = Str("Work unit ID to search from"),
+                    ["type"]       = Str("Filter by type: Research | Decision | Constraint (optional)"),
+                    ["keywords"]   = Str("Space-separated keywords to match against title and body (optional)"),
+                })),
+
+            new(McpToolNames.ArtifactList, "List the full artifact chain for a work unit, including ancestors' artifacts by default.",
+                Schema(["workUnitId"], new()
+                {
+                    ["workUnitId"]       = Str("Work unit ID"),
+                    ["includeAncestors"] = Str("true/false — include ancestor work units' artifacts (optional, default true)"),
+                })),
         ];
     }
 }

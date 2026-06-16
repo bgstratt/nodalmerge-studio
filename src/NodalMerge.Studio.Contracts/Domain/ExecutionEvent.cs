@@ -24,6 +24,7 @@ public enum ExecutionEventKind
     WorkUnitCompleted,
     WorkUnitFailed,
     WorkUnitAbandoned,
+    WorkUnitStatusChanged,
 
     // Scheduler internals
     SchedulerLeaseAcquired,
@@ -45,6 +46,7 @@ public enum ExecutionEventKind
     ProposalApproved,
     ProposalRejected,
     ProposalSuperseded,
+    MergeProposalStatusChanged,
 
     // Merge lifecycle
     MergeApproved,

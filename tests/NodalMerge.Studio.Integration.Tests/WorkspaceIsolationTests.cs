@@ -26,7 +26,7 @@ public class WorkspaceIsolationTests
             return Task.FromResult(workUnit);
         }
 
-        public Task<WorkUnit> UpdateStatusAsync(string workUnitId, WorkUnitStatus status, CancellationToken ct = default) =>
+        public Task<WorkUnit> UpdateStatusAsync(string workUnitId, WorkUnitStatus status, string? sessionId = null, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default)

@@ -51,6 +51,12 @@ public static class McpToolNames
     public const string SchedulerEnqueue = "nm_v1_scheduler_enqueue";
     public const string SchedulerPending = "nm_v1_scheduler_pending";
 
+    public const string IntentRecord = "nm_v1_intent_record";
+
+    public const string ArtifactRecord = "nm_v1_artifact_record";
+    public const string ArtifactQuery  = "nm_v1_artifact_query";
+    public const string ArtifactList   = "nm_v1_artifact_list";
+
     public const string WorkspaceRead   = "nm_v1_workspace_read";
     public const string WorkspaceWrite  = "nm_v1_workspace_write";
     public const string WorkspaceDelete = "nm_v1_workspace_delete";
@@ -94,6 +100,10 @@ public static class McpToolNames
         WorkspaceSummary,
         SchedulerEnqueue,
         SchedulerPending,
+        IntentRecord,
+        ArtifactRecord,
+        ArtifactQuery,
+        ArtifactList,
         WorkspaceRead,
         WorkspaceWrite,
         WorkspaceDelete,

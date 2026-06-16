@@ -36,6 +36,8 @@ public class FullAgentCycleTests
         var merge           = app.Services.GetRequiredService<IMergeService>();
         var tasks           = app.Services.GetRequiredService<ITaskService>();
         var nodeStore       = app.Services.GetRequiredService<IStudioNodeStore>();
+        var artifacts       = app.Services.GetRequiredService<IArtifactLineageService>();
+        var decisionLog     = app.Services.GetRequiredService<IOrchestrationDecisionLogService>();
 
         // Seed: create a work unit (which auto-creates a branch).
         var wu = await orchestratorSvc.CreateWorkUnitAsync(
@@ -86,5 +88,51 @@ public class FullAgentCycleTests
 
         var proposalNode = await nodeStore.ReadNodeAsync(StudioNodeKind.MergeProposalV1, merged.ProposalId);
         Assert.NotNull(proposalNode);
+
+        // ── Assert: artifact lineage chain (Slices 10d, 10g) ──────────────────
+        // As-built: Goal → Task → Research → MergeProposal → MergeResult (no separate
+        // Plan/BranchChangeset artifacts yet — see the 10d as-built note).
+        var chain = await artifacts.GetChainAsync(wu.WorkUnitId);
+        Assert.Equal(
+            [ArtifactType.Goal, ArtifactType.Task, ArtifactType.Research, ArtifactType.MergeProposal, ArtifactType.MergeResult],
+            chain.Select(a => a.Type));
+
+        var goalArtifact = chain.Single(a => a.Type == ArtifactType.Goal);
+        Assert.Equal(wu.WorkUnitId, goalArtifact.ArtifactId);
+        Assert.Null(goalArtifact.ParentArtifactId);
+
+        var taskArtifact = chain.Single(a => a.Type == ArtifactType.Task);
+        Assert.Equal(wu.WorkUnitId, taskArtifact.ParentArtifactId);
+
+        var researchArtifact = chain.Single(a => a.Type == ArtifactType.Research);
+        Assert.Equal("Stack", researchArtifact.Title);
+        Assert.Equal("Codebase uses .NET 8; no Redis present.", researchArtifact.Body);
+
+        var proposalArtifact = chain.Single(a => a.Type == ArtifactType.MergeProposal);
+        Assert.Equal(merged.ProposalId, proposalArtifact.ArtifactId);
+        Assert.Equal(ArtifactStatus.Applied, proposalArtifact.Status);
+
+        var resultArtifact = chain.Single(a => a.Type == ArtifactType.MergeResult);
+        Assert.Equal(merged.ProposalId, resultArtifact.ParentArtifactId);
+
+        // ── Assert: orchestration decision log (Slice 10e) ────────────────────
+        // The orchestrator's own loop runs fire-and-forget (StartOrchestratorLoop), so its final
+        // NoOp/end_turn decision may land slightly after the worker's merge proposal — poll briefly.
+        IReadOnlyList<OrchestrationEvent> orchestrationEvents = [];
+        var decisionDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < decisionDeadline)
+        {
+            orchestrationEvents = await decisionLog.GetEventsAsync(wu.WorkUnitId);
+            if (orchestrationEvents.Count >= 2) break;
+            await Task.Delay(50);
+        }
+
+        Assert.Contains(orchestrationEvents, e => e.Action == OrchestrationAction.SpawnWorker);
+        // Slice 11a: the final end_turn logs AwaitReview instead of NoOp if the worker's
+        // MergeProposal (status Active) already exists in the chain by the time the orchestrator's
+        // last LLM turn resolves — a genuine race against the worker's fire-and-forget loop, not a
+        // bug, so either outcome is accepted here.
+        Assert.Contains(orchestrationEvents, e => e.Action is OrchestrationAction.NoOp or OrchestrationAction.AwaitReview);
+        Assert.All(orchestrationEvents, e => Assert.False(string.IsNullOrEmpty(e.InputProjectionSnapshot)));
     }
 }

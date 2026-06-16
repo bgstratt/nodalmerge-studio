@@ -38,6 +38,11 @@ public static class StudioRestEndpoints
 
     private sealed record ReviewBody(string Decision);
 
+    private sealed record BranchProposalBody(
+        string Goal,
+        string ProfileId,
+        string? SessionId = null);
+
     private sealed record CreateBranchBody(
         string Name,
         string? FromBranchId = null);
@@ -97,6 +102,7 @@ public static class StudioRestEndpoints
         MapSessionEndpoints(app);
         MapEventStreamEndpoints(app);
         MapSessionStateEndpoints(app);
+        MapArtifactEndpoints(app);
         return app;
     }
 
@@ -150,6 +156,86 @@ public static class StudioRestEndpoints
             return Results.Ok(children);
         });
 
+        app.MapGet("/studio/workunits/{workUnitId}/artifacts", async (
+            string workUnitId,
+            IWorkUnitService workUnits,
+            IArtifactLineageService artifacts,
+            CancellationToken ct) =>
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+            var chain = await artifacts.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
+            return Results.Ok(chain);
+        });
+
+        app.MapGet("/studio/workunits/{workUnitId}/orchestration-events", async (
+            string workUnitId,
+            IWorkUnitService workUnits,
+            IOrchestrationDecisionLogService decisionLog,
+            CancellationToken ct) =>
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+            var events = await decisionLog.GetEventsAsync(workUnitId, ct).ConfigureAwait(false);
+            return Results.Ok(events);
+        });
+
+        app.MapGet("/studio/workunits/{workUnitId}/intents", async (
+            string workUnitId,
+            IWorkUnitService workUnits,
+            IIntentGraphService intents,
+            CancellationToken ct) =>
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+            var list = await intents.QueryIntentsAsync(workUnitId, ct).ConfigureAwait(false);
+            return Results.Ok(list);
+        });
+
+        app.MapGet("/studio/workunits/{workUnitId}/proposal-dag", async (
+            string workUnitId,
+            IWorkUnitService workUnits,
+            IArtifactLineageService artifacts,
+            IMergeService merge,
+            CancellationToken ct) =>
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+
+            var chain = await artifacts.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
+            var proposals = new List<object>();
+            foreach (var proposalRef in chain.Where(a => a.Type == ArtifactType.MergeProposal))
+            {
+                var proposal = await merge.GetAsync(proposalRef.ArtifactId, ct).ConfigureAwait(false);
+                proposals.Add(new
+                {
+                    proposalId = proposalRef.ArtifactId,
+                    status = proposalRef.Status.ToString(),
+                    baseState = $"base/{proposalRef.ArtifactId}",
+                    producedState = proposal?.SourceBranch,
+                    filesTouched = proposal?.FilesTouched ?? [],
+                });
+            }
+
+            var children = await workUnits.GetChildrenAsync(workUnitId, ct).ConfigureAwait(false);
+            var branches = children
+                .Where(c => c.Metadata?.ContainsKey("branchedFromProposalId") == true)
+                .Select(c => new
+                {
+                    workUnitId = c.WorkUnitId,
+                    goal = c.Goal,
+                    status = c.Status.ToString(),
+                    branchedFromProposalId = c.Metadata!["branchedFromProposalId"],
+                })
+                .ToList();
+
+            return Results.Ok(new { workUnitId, proposals, branches });
+        });
+
         app.MapPost("/studio/workunits", async (
             CreateWorkUnitBody body,
             IOrchestratorService orchestrator,
@@ -162,7 +248,7 @@ public static class StudioRestEndpoints
 
             var wu = await orchestrator
                 .CreateWorkUnitAsync(body.Goal, body.Owner, body.SuccessCriteria, body.RepositoryPath,
-                    body.ParentWorkUnitId, body.DependsOn, body.FileScope, ct)
+                    body.ParentWorkUnitId, body.DependsOn, body.FileScope, cancellationToken: ct)
                 .ConfigureAwait(false);
             return Results.Ok(wu);
         });
@@ -407,6 +493,67 @@ public static class StudioRestEndpoints
                 return Results.BadRequest(new { error = ex.Message });
             }
         });
+
+        app.MapGet("/studio/merges/compare", async (
+            [FromQuery] string? ids,
+            IMergeService merge,
+            CancellationToken ct) =>
+        {
+            var idList = (ids ?? string.Empty)
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (idList.Length != 2)
+                return Results.BadRequest(new { error = "ids must contain exactly two comma-separated proposal IDs." });
+
+            var a = await merge.GetAsync(idList[0], ct).ConfigureAwait(false);
+            if (a is null) return Results.NotFound(new { error = $"Proposal '{idList[0]}' not found." });
+            var b = await merge.GetAsync(idList[1], ct).ConfigureAwait(false);
+            if (b is null) return Results.NotFound(new { error = $"Proposal '{idList[1]}' not found." });
+
+            if (a.WorkUnitId is null || a.WorkUnitId != b.WorkUnitId)
+                return Results.BadRequest(new { error = "Proposals must share the same originating work unit (same base state) to compare." });
+
+            var overlapping = a.FilesTouched.Intersect(b.FilesTouched, StringComparer.OrdinalIgnoreCase).ToList();
+
+            return Results.Ok(new
+            {
+                proposalIdA = a.ProposalId,
+                proposalIdB = b.ProposalId,
+                overlappingFiles = overlapping,
+                diffA = a.WorkspaceChanges,
+                diffB = b.WorkspaceChanges,
+            });
+        });
+
+        app.MapPost("/studio/merges/{proposalId}/branch", async (
+            string proposalId,
+            BranchProposalBody body,
+            IMergeService merge,
+            IOrchestratorService orchestrator,
+            IWorkScheduler scheduler,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.Goal))
+                return Results.BadRequest(new { error = "goal is required." });
+            if (string.IsNullOrWhiteSpace(body.ProfileId))
+                return Results.BadRequest(new { error = "profileId is required." });
+
+            var proposal = await merge.GetAsync(proposalId, ct).ConfigureAwait(false);
+            if (proposal is null)
+                return Results.NotFound(new { error = $"Proposal '{proposalId}' not found." });
+
+            var newWorkUnit = await orchestrator.CreateWorkUnitAsync(
+                body.Goal,
+                owner: "user",
+                parentWorkUnitId: proposal.WorkUnitId,
+                seedFromBranchId: $"base/{proposalId}",
+                branchedFromProposalId: proposalId,
+                cancellationToken: ct).ConfigureAwait(false);
+
+            await scheduler.EnqueueAsync(
+                newWorkUnit.WorkUnitId, body.ProfileId, sessionId: body.SessionId, ct: ct).ConfigureAwait(false);
+
+            return Results.Ok(new { workUnitId = newWorkUnit.WorkUnitId });
+        });
     }
 
     // ── /studio/branches ──────────────────────────────────────────────────
@@ -507,11 +654,22 @@ public static class StudioRestEndpoints
     private static void MapSchedulerEndpoints(WebApplication app)
     {
         app.MapGet("/studio/scheduler/pending", async (
+            [FromQuery] int? includeIntentGraph,
             IWorkScheduler scheduler,
+            IIntentGraphService intents,
             CancellationToken ct) =>
         {
             var items = await scheduler.ListPendingAsync(ct).ConfigureAwait(false);
-            return Results.Ok(items);
+            if (includeIntentGraph != 1)
+                return Results.Ok(items);
+
+            var enriched = new List<object>();
+            foreach (var item in items)
+            {
+                var itemIntents = await intents.QueryIntentsAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                enriched.Add(new { item, intents = itemIntents });
+            }
+            return Results.Ok(enriched);
         });
 
         app.MapPost("/studio/scheduler/enqueue", async (
@@ -761,6 +919,31 @@ public static class StudioRestEndpoints
             {
                 return Results.NotFound(new { error = ex.Message });
             }
+        });
+    }
+
+    // ── /studio/artifacts ──────────────────────────────────────────────────
+
+    private static void MapArtifactEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/artifacts/{artifactId}", async (
+            string artifactId,
+            IArtifactLineageService artifacts,
+            CancellationToken ct) =>
+        {
+            var artifact = await artifacts.GetAsync(artifactId, ct).ConfigureAwait(false);
+            return artifact is null
+                ? Results.NotFound(new { error = $"Artifact '{artifactId}' not found." })
+                : Results.Ok(artifact);
+        });
+
+        app.MapGet("/studio/artifacts/{artifactId}/children", async (
+            string artifactId,
+            IArtifactLineageService artifacts,
+            CancellationToken ct) =>
+        {
+            var children = await artifacts.GetChildrenAsync(artifactId, ct).ConfigureAwait(false);
+            return Results.Ok(children);
         });
     }
 }

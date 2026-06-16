@@ -6,8 +6,12 @@ namespace NodalMerge.Studio.Merge.Tests;
 
 public class InMemoryMergeServiceTests
 {
-    private static InMemoryMergeService Build() =>
-        new(new InMemoryStudioNodeStore(), new NoopFileWorkspaceService(), new WorkspaceOptions(), new NoopEventStream());
+    private static InMemoryMergeService Build()
+    {
+        var store = new InMemoryStudioNodeStore();
+        return new(store, new NoopFileWorkspaceService(), new WorkspaceOptions(), new NoopEventStream(),
+            new ArtifactLineageService(store));
+    }
 
     private sealed class NoopEventStream : NodalMerge.Studio.Core.Services.IExecutionEventStream
     {
@@ -41,6 +45,156 @@ public class InMemoryMergeServiceTests
 
     private static MergeProposal MakeProposal(string id, string source = "feat/x", string target = "main") =>
         new(id, source, target, "goal", "summary", "desc", null, null, null, MergeProposalStatus.Draft);
+
+    // ── Phase 4 slice 11a — MergeProposalStatusChanged events + WorkUnit Merged transition ─
+
+    private sealed class RecordingEventStream : NodalMerge.Studio.Core.Services.IExecutionEventStream
+    {
+        public List<NodalMerge.Studio.Contracts.Domain.ExecutionEvent> Events { get; } = [];
+
+        public Task<NodalMerge.Studio.Contracts.Domain.ExecutionEvent> AppendAsync<T>(
+            string sessionId, string? workUnitId,
+            NodalMerge.Studio.Contracts.Domain.ExecutionEventKind kind, T payload,
+            string? causedByEventId = null, string? eventId = null, CancellationToken ct = default)
+        {
+            var ev = new NodalMerge.Studio.Contracts.Domain.ExecutionEvent(
+                eventId ?? Guid.NewGuid().ToString("N"), sessionId, workUnitId, kind,
+                System.Text.Json.JsonSerializer.Serialize(payload), causedByEventId, DateTimeOffset.UtcNow);
+            Events.Add(ev);
+            return Task.FromResult(ev);
+        }
+
+        public Task<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>> GetSessionEventsAsync(
+            string sessionId, DateTimeOffset? since = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>>(
+                [.. Events.Where(e => e.SessionId == sessionId)]);
+
+        public Task<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default) =>
+            Task.FromResult(Events.FirstOrDefault(e => e.EventId == eventId));
+    }
+
+    private sealed class RecordingWorkUnitService : NodalMerge.Studio.Core.Services.IWorkUnitService
+    {
+        public List<(string WorkUnitId, WorkUnitStatus Status, string? SessionId)> Calls { get; } = [];
+
+        public Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken ct = default) => throw new NotSupportedException();
+
+        public Task<WorkUnit> UpdateStatusAsync(string workUnitId, WorkUnitStatus status, string? sessionId = null, CancellationToken ct = default)
+        {
+            Calls.Add((workUnitId, status, sessionId));
+            return Task.FromResult(new WorkUnit(workUnitId, "goal", "branch-1", status, DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow, "owner", null, null, null, null, [], []));
+        }
+
+        public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<WorkUnit?>(null);
+        public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+    }
+
+    private sealed class SingleServiceProvider(object service) : IServiceProvider
+    {
+        public object? GetService(Type serviceType) => serviceType.IsInstanceOfType(service) ? service : null;
+    }
+
+    private static (InMemoryMergeService Svc, RecordingEventStream Events, RecordingWorkUnitService WorkUnits, ArtifactLineageService Artifacts) BuildWithLifecycle()
+    {
+        var store = new InMemoryStudioNodeStore();
+        var events = new RecordingEventStream();
+        var workUnits = new RecordingWorkUnitService();
+        var artifacts = new ArtifactLineageService(store);
+        var svc = new InMemoryMergeService(store, new NoopFileWorkspaceService(), new WorkspaceOptions(), events,
+            artifacts, new SingleServiceProvider(workUnits));
+        return (svc, events, workUnits, artifacts);
+    }
+
+    // ReviewAsync/ApplyAsync call IArtifactLineageService.UpdateStatusAsync when WorkUnitId is
+    // set — in production, McpToolDispatcher.MergeProposeAsync records this artifact before
+    // ReviewAsync ever runs; these tests call InMemoryMergeService directly, so it must be
+    // seeded explicitly.
+    private static Task SeedProposalArtifactAsync(ArtifactLineageService artifacts, string proposalId, string workUnitId) =>
+        artifacts.RecordAsync(new ArtifactRef(
+            proposalId, ArtifactType.MergeProposal, workUnitId, ArtifactStatus.Active, DateTimeOffset.UtcNow, workUnitId, null));
+
+    private static MergeProposal MakeProposalWithSession(string id, string workUnitId, string sessionId) =>
+        MakeProposal(id) with { WorkUnitId = workUnitId, SessionId = sessionId };
+
+    [Fact]
+    public async Task ValidateAsync_emits_MergeProposalStatusChanged_when_session_present()
+    {
+        var (svc, events, _, _) = BuildWithLifecycle();
+        await svc.ProposeAsync(MakeProposalWithSession("MP-1", "WU-1", "SES-1"));
+
+        await svc.ValidateAsync("MP-1");
+
+        var ev = Assert.Single(events.Events, e => e.Kind == ExecutionEventKind.MergeProposalStatusChanged);
+        var payload = System.Text.Json.JsonSerializer.Deserialize<MergeProposalStatusChangedPayload>(ev.PayloadJson)!;
+        Assert.Equal(MergeProposalStatus.Draft, payload.PreviousStatus);
+        Assert.Equal(MergeProposalStatus.ReadyForReview, payload.NewStatus);
+    }
+
+    [Fact]
+    public async Task ReviewAsync_emits_MergeProposalStatusChanged_alongside_ProposalApproved()
+    {
+        var (svc, events, _, artifacts) = BuildWithLifecycle();
+        await svc.ProposeAsync(MakeProposalWithSession("MP-1", "WU-1", "SES-1"));
+        await SeedProposalArtifactAsync(artifacts, "MP-1", "WU-1");
+        await svc.ValidateAsync("MP-1");
+
+        await svc.ReviewAsync("MP-1", MergeProposalStatus.Approved);
+
+        Assert.Contains(events.Events, e => e.Kind == ExecutionEventKind.ProposalApproved);
+        var statusChanges = events.Events
+            .Where(e => e.Kind == ExecutionEventKind.MergeProposalStatusChanged)
+            .Select(e => System.Text.Json.JsonSerializer.Deserialize<MergeProposalStatusChangedPayload>(e.PayloadJson)!)
+            .ToList();
+        Assert.Contains(statusChanges, p => p.NewStatus == MergeProposalStatus.Approved);
+    }
+
+    [Fact]
+    public async Task ApplyAsync_transitions_owning_WorkUnit_to_Merged()
+    {
+        var (svc, _, workUnits, artifacts) = BuildWithLifecycle();
+        await svc.ProposeAsync(MakeProposalWithSession("MP-1", "WU-1", "SES-1"));
+        await SeedProposalArtifactAsync(artifacts, "MP-1", "WU-1");
+        await svc.ValidateAsync("MP-1");
+        await svc.ReviewAsync("MP-1", MergeProposalStatus.Approved);
+
+        await svc.ApplyAsync("MP-1");
+
+        Assert.Contains(workUnits.Calls, c => c.WorkUnitId == "WU-1" && c.Status == WorkUnitStatus.Merged && c.SessionId == "SES-1");
+    }
+
+    [Fact]
+    public async Task ApplyAsync_emits_MergeProposalStatusChanged_to_Merged()
+    {
+        var (svc, events, _, artifacts) = BuildWithLifecycle();
+        await svc.ProposeAsync(MakeProposalWithSession("MP-1", "WU-1", "SES-1"));
+        await SeedProposalArtifactAsync(artifacts, "MP-1", "WU-1");
+        await svc.ValidateAsync("MP-1");
+        await svc.ReviewAsync("MP-1", MergeProposalStatus.Approved);
+
+        await svc.ApplyAsync("MP-1");
+
+        var statusChanges = events.Events
+            .Where(e => e.Kind == ExecutionEventKind.MergeProposalStatusChanged)
+            .Select(e => System.Text.Json.JsonSerializer.Deserialize<MergeProposalStatusChangedPayload>(e.PayloadJson)!)
+            .ToList();
+        Assert.Contains(statusChanges, p => p.NewStatus == MergeProposalStatus.Merged);
+    }
+
+    [Fact]
+    public async Task ApplyAsync_without_WorkUnitId_does_not_call_UpdateStatusAsync()
+    {
+        var (svc, _, workUnits, _) = BuildWithLifecycle();
+        await svc.ProposeAsync(MakeProposal("MP-1")); // no WorkUnitId/SessionId
+        await svc.ValidateAsync("MP-1");
+        await svc.ReviewAsync("MP-1", MergeProposalStatus.Approved);
+
+        await svc.ApplyAsync("MP-1");
+
+        Assert.Empty(workUnits.Calls);
+    }
 
     // ── ProposeAsync ────────────────────────────────────────────────────────
 

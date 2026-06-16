@@ -7,7 +7,19 @@ public enum WorkUnitStatus
     Waiting,
     Completed,
     Failed,
-    Cancelled
+    Cancelled,
+
+    // Phase 4 slice 11a — queue-driven pipeline states. Additive: Active/Waiting/Completed/Failed
+    // remain in use by the legacy direct-spawn path (IAgentControlService.SpawnAsync("worker",...)),
+    // which never goes through WorkSchedulerService and so never reaches these. Planned and Rejected
+    // are deliberately omitted — no planner stage or rejection path produces them yet.
+    Queued,
+    Executing,
+    Proposed,
+    Reviewing,
+    Merged,
+    DeadLettered,
+    Retrying
 }
 
 public sealed record WorkUnit(
@@ -36,7 +48,21 @@ public static class WorkUnitTransitions
             (WorkUnitStatus.Active, WorkUnitStatus.Completed) => true,
             (WorkUnitStatus.Active, WorkUnitStatus.Failed) => true,
             (WorkUnitStatus.Waiting, WorkUnitStatus.Failed) => true,
-            (_, WorkUnitStatus.Cancelled) when from is not WorkUnitStatus.Completed => true,
+
+            // Phase 4 slice 11a — queue-driven pipeline.
+            (WorkUnitStatus.Created, WorkUnitStatus.Queued) => true,
+            (WorkUnitStatus.Queued, WorkUnitStatus.Executing) => true,
+            (WorkUnitStatus.Executing, WorkUnitStatus.Proposed) => true,
+            (WorkUnitStatus.Executing, WorkUnitStatus.Retrying) => true,
+            (WorkUnitStatus.Retrying, WorkUnitStatus.Executing) => true,
+            (WorkUnitStatus.Executing, WorkUnitStatus.DeadLettered) => true,
+            (WorkUnitStatus.Retrying, WorkUnitStatus.DeadLettered) => true,
+            (WorkUnitStatus.DeadLettered, WorkUnitStatus.Retrying) => true,
+            (WorkUnitStatus.Proposed, WorkUnitStatus.Reviewing) => true,
+            (WorkUnitStatus.Proposed, WorkUnitStatus.Merged) => true,
+            (WorkUnitStatus.Reviewing, WorkUnitStatus.Merged) => true,
+
+            (_, WorkUnitStatus.Cancelled) when from is not WorkUnitStatus.Completed and not WorkUnitStatus.Merged => true,
             _ => false
         };
 }

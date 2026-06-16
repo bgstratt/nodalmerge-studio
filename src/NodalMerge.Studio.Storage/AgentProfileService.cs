@@ -38,6 +38,9 @@ public sealed class AgentProfileService : IAgentProfileService
                     McpToolNames.TaskList,
                     McpToolNames.WorkUnitGet,
                     McpToolNames.WorkspaceSummary,
+                    McpToolNames.ArtifactRecord,
+                    McpToolNames.ArtifactQuery,
+                    McpToolNames.ArtifactList,
                 ],
                 15),
             new(
@@ -57,6 +60,9 @@ public sealed class AgentProfileService : IAgentProfileService
                     McpToolNames.BranchCreate,
                     McpToolNames.BranchStatus,
                     McpToolNames.SnapshotGet,
+                    McpToolNames.ArtifactRecord,
+                    McpToolNames.ArtifactQuery,
+                    McpToolNames.ArtifactList,
                 ],
                 20),
         };

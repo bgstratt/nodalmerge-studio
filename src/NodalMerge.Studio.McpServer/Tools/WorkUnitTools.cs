@@ -46,7 +46,7 @@ public sealed class WorkUnitTools(IWorkUnitService workUnits, IOrchestratorServi
         if (status is not null &&
             Enum.TryParse<WorkUnitStatus>(status, ignoreCase: true, out var parsedStatus))
         {
-            var updated = await workUnits.UpdateStatusAsync(workUnitId, parsedStatus, cancellationToken)
+            var updated = await workUnits.UpdateStatusAsync(workUnitId, parsedStatus, cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
             if (assignedAgent is not null)
             {

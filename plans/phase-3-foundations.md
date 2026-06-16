@@ -1,6 +1,6 @@
 # Phase 3 — Multi-Agent Foundations
 
-Phase 2.5 delivers a correct single-worker pipeline. Phase 3 adds the five foundational systems that make parallelism safe and deterministic. Fan-out and multi-agent behavior arrive in Phase 4, but only because these primitives exist.
+Phase 2.5 delivers a correct single-worker pipeline. Phase 3 adds the foundational systems that make parallelism safe and deterministic — eleven slices in the end, not the five originally scoped, as control-plane backbone work (10b.1–10b.4) and conflict coordination (10f.5) grew the list. **All eleven are now complete** (see Progress below). Fan-out and multi-agent behavior arrive in Phase 4, but only because these primitives exist.
 
 > "You are not missing more agent types — you are missing control-plane infrastructure."
 
@@ -15,11 +15,23 @@ Phase 2.5 delivers a correct single-worker pipeline. Phase 3 adds the five found
 - [x] 10b.3 — Control-Plane Idempotency
 - [x] 10b.4 — State Reconstruction API
 - [x] 10c — Workspace Isolation (see implementation note in that section — backed by the existing branch/file-copy isolation, not a real git worktree)
-- [ ] 10d — Artifact Lineage Store ← **next up**
-- [ ] 10e — Orchestration Decision Log
-- [ ] 10f — Proposal DAG & Artifact Branching
-- [ ] 10f.5 — Intent Graph & Conflict Resolver
-- [ ] 10g — Knowledge Artifacts
+- [x] 10d — Artifact Lineage Store (see implementation note in that section — only Goal/Task/MergeProposal/MergeResult are wired; Plan/BranchChangeset have no producer yet)
+- [x] 10e — Orchestration Decision Log (see implementation note — also wires the dormant 10b.2 `OrchestrationDecision` event hook; UI panel deferred, see tracker below)
+- [x] 10f — Proposal DAG & Artifact Branching (see implementation note — base-state snapshot at propose time, branching via existing `seedFromBranchId`/`Metadata`, no new workspace service method needed)
+- [x] 10f.5 — Intent Graph & Conflict Resolver (see implementation note — only Option A strict-partitioning is built; region locking, optimistic execution, and the revalidation loop need real concurrent execution from Phase 4)
+- [x] 10g — Knowledge Artifacts (see implementation note — `Title`/`Body` added to `ArtifactRef`, `InheritedConstraints` and ancestor-walk are genuinely new, not pre-existing as the plan claimed)
+
+---
+
+## Deferred Work Tracker
+
+Every as-built note above documents a deviation from the original spec. Most are permanent (the spec was wrong or aspirational). Items that had a specific *future* trigger point have been moved directly into the plan for the slice that resolves them — see `plans/phase-4-fanout-merger.md`'s "Carried over from Phase 3" subsections in Slices 11b, 11c, and 11e — rather than living here as a second list to cross-check. Only items with **no fixed slice** (truly open-ended, or already actionable with nothing left to wait for) remain in this table.
+
+| Item | Introduced in | Currently | Status |
+|------|----------------|-----------|--------|
+| `OrchestrationAction.AwaitReview` | 10b.2 (defined) / 10e (still unreachable) | ✅ **Resolved** (Phase 4 kickoff) — emitted | `OrchestratorAgentLoop.RunAsync`'s `end_turn` branch now checks the artifact chain for a `MergeProposal` ref with `Status == ArtifactStatus.Active` (the only "not yet decided" status) and logs `AwaitReview` instead of `NoOp` when found — built alongside the re-invocation fix below since both touch the same `end_turn` decision point. |
+| Orchestrator re-invocation after worker completion | Implied by `OrchestratorAgentLoop`'s own system prompt ("The system will re-invoke you after the worker completes") | ✅ **Resolved** (Phase 4 kickoff) — see [phase-4-fanout-merger.md](./phase-4-fanout-merger.md)'s Slice 11a as-built note | `IAgentControlService.ReinvokeOrchestratorAsync` (new), called from `WorkSchedulerService.ReleaseAsync` on both success and failure via the existing lazy `_serviceProvider` lookup. `InMemoryAgentRuntimeService` registers each spawned orchestrator's credentials/profile keyed by `workUnitId` at `SpawnAsync` time; re-invocation is a no-op if none was registered (e.g. work enqueued directly via the debug endpoint). **Known accepted gap**: re-invoking on failure as well as success means a persistently-failing worker can cause unbounded re-invocation (no double-execution — `EnqueueAsync`/`TryAcquireAsync` are already idempotent/CAS-protected — but no backstop either). Deferred to 11e's dead-letter/attempt-count escalation, not fixed here. Tests: `InMemoryAgentRuntimeServiceTests.cs`, `ControlPlaneIdempotencyTests.cs`, `SchedulerReinvocationTests.cs` (new — proves convergence end-to-end via the real scheduler queue, not just the legacy direct-spawn path `FullAgentCycleTests.cs` exercises). |
+| "DAG replay panel" / "Orchestration Log" / "Merge Review panel" / intent conflict overlay / knowledge artifact browser UI work | 10e, 10f, 10f.5, 10g (and implicitly every slice since 10b.2 that added a debugger-relevant REST endpoint) | **Not implemented — and ready to start any time.** No fixed slice trigger — Phase 3's backend has been complete since before Phase 4 started, so this isn't waiting on anything else to land. | `clients/web-dashboard` is an empty placeholder; `clients/vscode-extension/src/panels/DagReplayPanel.ts` exists but predates Phase 3 — it visualizes the older NodalMerge DAG, not `ExecutionEvent`/`ArtifactRef`/`OrchestrationEvent`/`ChangeIntent`. Bundle the event stream (10b.2), state reconstruction (10b.4), workspace isolation (10c), artifact lineage + knowledge artifacts (10d/10g), orchestration log (10e), proposal branching/comparison (10f), and intent graph (10f.5) REST endpoints into one panel redesign rather than rebuilding the webview eight separate times. |
 
 ---
 
@@ -615,7 +627,17 @@ Failure: DestroyAsync          →  worktree + branch deleted
 
 ---
 
-## Slice 10d — Artifact Lineage Store
+## Slice 10d — Artifact Lineage Store ✅
+
+> **As-built note:** `IArtifactLineageService.RecordAsync`/`UpdateStatusAsync` return the persisted `ArtifactRef` (not `Task`) — matching the return-the-record convention already established by `IExecutionEventStream.AppendAsync` and `IAgentWorkspaceService.CreateAsync` in 10b.2/10c, rather than the plan's original `Task`-returning signature. This interface **replaces** the Phase 2.5/9d `IArtifactRefService`/`InMemoryArtifactRefService` (renamed, not added alongside) since the new service is the persistent superset.
+>
+> The real single-worker pipeline has no discrete planner stage or per-changeset event yet — fan-out and `ChangeIntent`-level granularity are Phase 4/10f.5. So only the artifact types with a real, distinct producer are wired: `Goal` (work unit creation, `ArtifactId = WorkUnitId`), `Task` (`nm.v1.task.create`, parent = the owning Goal), `MergeProposal` (`nm.v1.merge.propose`, parent = the owning Goal), and `MergeResult` (merge apply, parent = the `MergeProposal`). `Plan` and `BranchChangeset` remain defined in the `ArtifactType` enum for forward compatibility but have no write path yet — there is no separate planner output to record as `Plan`, and worker file writes are tracked via the workspace branch (10c), not as a discrete `BranchChangeset` artifact. The realistic chain today is `Goal → Task → MergeProposal → MergeResult`, not the five-stage chain in the original success criteria below.
+>
+> `FilesTouched` is parsed from the plain-text diff format `FileSystemWorkspaceService.DiffAsync` actually produces (`+++ ADDED: `, `~~~ MODIFIED: `, `--- DELETED: ` line prefixes) — not `+++ b/`-style unified diff, consistent with the 10c as-built note that there is no real git worktree/diff yet.
+>
+> Conflict pre-detection at enqueue resolves the *parent's other children* (siblings), not "the parent work unit" itself: `WorkSchedulerService.EnqueueAsync` looks up the enqueued unit's `ParentWorkUnitId`, calls `IWorkUnitService.GetChildrenAsync` (10a) to find siblings, and for each sibling walks `IArtifactLineageService.GetChainAsync` → `MergeProposal` refs → `IMergeService.GetAsync` to resolve `FilesTouched` (an `ArtifactRef` is a lightweight pointer; the actual `FilesTouched` lives on the `MergeProposal` record it points to). `IArtifactLineageService`/`IMergeService` are optional constructor parameters on `WorkSchedulerService` (default `null`). `IWorkUnitService` is **not** a direct constructor parameter — it's resolved lazily through an optional `IServiceProvider`, the same trick `AgentWorkspaceService` already uses, because `InMemoryWorkUnitService → IAgentControlService → InMemoryAgentRuntimeService → IWorkScheduler` closes a cycle back to this service. This was caught by a real test-host crash (circular dependency) before being fixed, not by inspection.
+>
+> Implementation: [ArtifactLineageService.cs](../src/NodalMerge.Studio.Storage/ArtifactLineageService.cs), wired into `InMemoryWorkUnitService` (Goal), `McpToolDispatcher` (Task, MergeProposal), `InMemoryMergeService` (status transitions, MergeResult), and `WorkSchedulerService` (conflict pre-detection). Tests: `ArtifactLineageTests.cs`.
 
 Phase 2.5 slice 9d defined `ArtifactRef` and `ArtifactChain` at the contract and write path level. This slice implements the persistent backing store so the full lineage graph survives across sessions and is queryable for branching, replay, and conflict detection.
 
@@ -680,7 +702,17 @@ Every service that produces an artifact calls `IArtifactLineageService.RecordAsy
 
 ---
 
-## Slice 10e — Orchestration Decision Log
+## Slice 10e — Orchestration Decision Log ✅
+
+> **As-built note:** `OrchestrationAction` was already defined in `ExecutionEventPayloads.cs` (10b.2, alongside the never-wired `OrchestrationDecisionPayload`/`ExecutionEventKind.OrchestrationDecision`) — `OrchestrationEvent.cs` reuses it rather than redefining it. This slice **also wires up that dormant 10b.2 hook**: `OrchestrationDecisionLogService.RecordAsync` writes to its own store (`studio/orchestration-event/v1`, queryable by `workUnitId`) and, when a `sessionId` is supplied, mirrors the same decision into the unified causal stream via `OrchestrationDecisionPayload` — matching 10b.2's stated pattern that "the stream does not replace local stores; it references them."
+>
+> The orchestrator has no separate LLM-routing stage (9e) to extract `Reason` from — all routing is the single orchestrator LLM's tool choice. `Reason` is the tool name for tool-driven decisions (e.g. `"nm_v1_scheduler_enqueue"`) and the LLM's own closing text for the final `end_turn`. Only tool calls that change execution routing become events: `nm_v1_scheduler_enqueue` → `Enqueue`, `nm_v1_agent_spawn` → `SpawnWorker`, `nm_v1_merge_apply` → `ApplyMerge`; investigative calls (`workunit.get`, `projection.get`) and `task.create` are not logged as routing decisions. A clean `end_turn` with no tool call always logs `NoOp` (not `AwaitReview` — distinguishing "stopped because waiting on a human" from "stopped because there was nothing left to do" needs semantic understanding of the projection that isn't reliably inferable from tool output, so it isn't guessed at; see the Deferred Work Tracker). `SpawnPlanner`, `AwaitReview`, and `Escalate` remain defined but unreachable today — same status as `Plan`/`BranchChangeset` from 10d, tracked below rather than silently dropped.
+>
+> `InputStage` is inferred from the 10d artifact chain (no `MergeProposal` → `Plan` if no `Task` yet, else `Execute`; `MergeProposal` present → `Review`, or `Merge` once `Approved`/`Applied`) — this is the first slice to actually *read* the lineage store 10d built, not just write to it.
+>
+> The "DAG replay panel" UI success criterion is **not implemented** — see the Deferred Work Tracker.
+>
+> Implementation: [OrchestrationEvent.cs](../src/NodalMerge.Studio.Contracts/Domain/OrchestrationEvent.cs), [OrchestrationDecisionLogService.cs](../src/NodalMerge.Studio.Storage/OrchestrationDecisionLogService.cs), wired into `OrchestratorAgentLoop.cs`. Tests: `OrchestrationDecisionLogTests.cs`, extended `FullAgentCycleTests.cs`.
 
 Every routing decision the orchestrator makes is persisted as an immutable log entry. This makes multi-agent orchestration replayable and debuggable without relying on runtime memory.
 
@@ -737,7 +769,17 @@ Add an "Orchestration Log" expandable section per work unit node: shows the even
 
 ---
 
-## Slice 10f — Proposal DAG & Artifact Branching
+## Slice 10f — Proposal DAG & Artifact Branching ✅
+
+> **As-built note:** No new `IWorkspaceService.CreateFromProposalBaseAsync` or `IAgentWorkspaceService` method was added — given 10c's wrapper model (a workspace *is* its work unit's branch, not a fork), the only thing "branching" actually needs is for the *new* work unit's branch to be seeded with the right content, which the existing `IFileWorkspaceService.InitBranchAsync(branchId, seedFromBranchId)` already does. So:
+> - `InMemoryMergeService.ProposeAsync` now snapshots the target branch's current content into a stable `base/{proposalId}` branch the moment a proposal is raised — *not* at apply time — so S0 stays correct regardless of whether the proposal later gets approved, rejected, or applied (none of those mutate this copy).
+> - `IOrchestratorService.CreateWorkUnitAsync` gained two optional parameters: `seedFromBranchId` (threaded into the same `IBranchService.CreateBranchAsync` call every work unit already makes) and `branchedFromProposalId` (stored in the already-existing but previously-unused `WorkUnit.Metadata` dictionary as `branchedFromProposalId`). No new domain fields, no new storage.
+> - The Goal artifact's `ParentArtifactId` — previously hardcoded `null` for every work unit — is now `workUnit.ParentWorkUnitId`. This was a latent gap from 10d (a child work unit's Goal had no parent in the artifact graph even when `ParentWorkUnitId` was set) that 10f's lineage needs anyway: a branched work unit's Goal is parented to the origin work unit's Goal, making `GetChildrenAsync`/`GetChainAsync` (10a/10d) sufficient to answer "what was branched from here" with zero new query surface.
+> - REST routes use the existing `/studio/merges/...` prefix (`POST /studio/merges/{proposalId}/branch`, `GET /studio/merges/compare`), not the plan's literal `/studio/proposals/...` — `MergeProposal` resources already live under `/studio/merges` (validate/review/apply); a second prefix for the same resource would be confusing, not just inconsistent.
+> - `proposal-dag`'s response shape is `{ workUnitId, proposals: [{ proposalId, status, baseState, producedState, filesTouched }], branches: [{ workUnitId, goal, status, branchedFromProposalId }] }` — simpler than the plan's illustrative JSON (no `reconciledFrom`/merger-proposal section, since N-proposal reconciliation is Phase 4's Merger/Reducer, not this slice).
+> - The "Merge Review panel" UI buttons are **not implemented** — folded into the same UI-tracker row as 10e's DAG replay panel; see the Deferred Work Tracker.
+>
+> Implementation: [InMemoryMergeService.cs](../src/NodalMerge.Studio.Merge/InMemoryMergeService.cs) (base snapshot), [InMemoryWorkUnitService.cs](../src/NodalMerge.Studio.Orchestrator/InMemoryWorkUnitService.cs) (`seedFromBranchId`/`branchedFromProposalId`), [StudioRestEndpoints.cs](../src/NodalMerge.Studio.Host/StudioRestEndpoints.cs) (`branch`, `compare`, `proposal-dag`). Tests: `ProposalBranchingTests.cs`.
 
 This is the strategic inflection point. After this slice, the answer to "what can I do after a run completes?" stops being "look at logs" and becomes: inspect, branch, replay, and compare every artifact.
 
@@ -803,7 +845,17 @@ This is the "checkout S0, try with a different model" operation. The new work un
 
 ---
 
-## Slice 10f.5 — Intent Graph & Conflict Resolver
+## Slice 10f.5 — Intent Graph & Conflict Resolver ✅ (scoped)
+
+> **As-built note:** Only **Option A — strict partitioning** is implemented: `IIntentGraphService` records intents and answers overlap queries; `WorkSchedulerService.EnqueueAsync` folds overlapping intents into the same advisory, non-blocking `ConflictWarning` that 10d's reactive (FilesTouched-based) detection already produces — it does not block, lock, or serialize anything. Region locking (Option B), optimistic execution with revalidation (Option C), and the planner/agent revalidation loop all assume real concurrent worker execution exists to coordinate, which it doesn't until Phase 4 fan-out — building them now would be locking/queuing logic with nothing to lock or queue against. See the Deferred Work Tracker.
+>
+> `QueryOverlappingAsync` is **global by `TargetPath`/`RegionDescriptor`**, not "per-work-unit" as the plan's wording suggests — intents from any two *different* work units touching the same path/region overlap, regardless of whether they're siblings under the same parent. This is deliberately broader than 10d's sibling-scoped `FilesTouched` check: declared intents are supposed to catch conflicts *before* any work starts, so there's no reason to narrow the search to a parent/child relationship that may not even exist yet (today, with no fan-out, every work unit is effectively a root). A whole-file region (`""`, `"*"`, or `"whole-file"`) overlaps with any region on the same path; otherwise two intents conflict only if they name the exact same region string — no AST awareness, matching the project's existing no-real-diff-parsing precedent from 10c/10d.
+>
+> There's no planner stage to "produce" intents from (same gap as 10d's `Plan` artifact) — `nm_v1_intent_record` is exposed to the **orchestrator** (today's de facto planner) as an explicitly optional tool, callable before `nm_v1_scheduler_enqueue`. The `ScriptedLlmHandler` used by `FullAgentCycleTests` doesn't call it (the orchestrator script predates this tool and isn't required to use it), so this slice's coverage comes from `IntentGraphTests.cs` exercising the service and scheduler integration directly, not a full agent-loop run — consistent with how 10d/10f were primarily tested.
+>
+> `IIntentGraphService` is constructor-injected directly into `WorkSchedulerService` (no `IServiceProvider` indirection needed) since, unlike `IWorkUnitService`, nothing in its dependency chain (`IStudioNodeStore`, `IArtifactLineageService`) loops back to `IWorkScheduler`.
+>
+> Implementation: [ChangeIntent.cs](../src/NodalMerge.Studio.Contracts/Domain/ChangeIntent.cs), [IntentGraphService.cs](../src/NodalMerge.Studio.Storage/IntentGraphService.cs), wired into `WorkSchedulerService.cs` (conflict detection) and `McpToolDispatcher.cs`/`OrchestratorAgentLoop.cs` (`nm_v1_intent_record`). Tests: `IntentGraphTests.cs`.
 
 This slice introduces a pre-execution coordination primitive that prevents uncontrolled concurrent edits to overlapping semantic regions. It shifts the model from "agents edit files" to "agents publish change intents" and the system decides safe parallelism before any workspace write occurs.
 
@@ -874,7 +926,21 @@ This slice completes the pre-execution conflict detection layer that Phase 3 has
 
 ---
 
-## Slice 10g — Knowledge Artifacts
+## Slice 10g — Knowledge Artifacts ✅
+
+> **As-built note:** `ArtifactRef` gained optional `Title`/`Body` fields — the plan's claim that knowledge artifacts need "no new storage schema" because "they are ArtifactRef records" only holds if `ArtifactRef` can actually carry note content, which it couldn't before this slice (it was a pure lineage pointer with no content fields at all). This was the minimal fix consistent with that intent, rather than inventing a parallel `KnowledgeArtifact` domain object with its own store.
+>
+> `InheritedConstraints` did **not** already exist on `AgentWorkspaceProjectionPayload` from 9d as the plan claimed — it didn't exist anywhere in the codebase. Both it and the ancestor-walk-into-`Artifacts` behavior (`AgentWorkspaceProjection includes the parent's Research artifact in the chain`) are new in this slice, added to `ProjectionManager.BuildAgentWorkspaceAsync`. `InheritedConstraints` is scoped to *ancestors only* — a work unit's own `Constraint` artifacts appear in the regular `Artifacts` chain but not in `InheritedConstraints`, since they weren't inherited from anywhere.
+>
+> Tool names are `nm_v1_artifact_record`/`query`/`list`, not the plan's literal dotted `nm.v1.artifact.*` — dots aren't valid under this project's own frozen tool-name constraint (`^[a-zA-Z0-9_-]{1,128}$`), so every other tool already uses underscores; the dotted spelling was shorthand, not a literal name.
+>
+> As with 10d/10e/10f.5, the same feature is wired twice: into `McpToolDispatcher` (used by the internal orchestrator/worker loops — this is what `FullAgentCycleTests` now exercises end-to-end) and into a new `ArtifactTools.cs` (used by external MCP clients via `WithToolsFromAssembly`), matching the existing `TaskTools`/`MergeTools` duplication pattern rather than introducing a new one.
+>
+> The ancestor-walk logic (`ParentWorkUnitId` chain, root-first, de-duped by `ArtifactId`) is duplicated three times in three different projects (`ProjectionManager`, `McpToolDispatcher`, `ArtifactTools`) rather than shared, because the services that need it don't share a common base across project boundaries and the loop is ~10 lines — same trade-off as `AgentWorkspaceService.MatchesGlob`/`WorkSchedulerService`'s glob duplication before it was consolidated. Worth revisiting only if a fourth caller shows up.
+>
+> Default `worker`/`planner` profile `AllowedTools` (in `AgentProfileService.SeedDefaults`) now include the three new tools, per spec — but note these seeded profiles aren't actually used by `FullAgentCycleTests` or any current call path that doesn't explicitly pass a `profileId`; see them as the intended-but-not-yet-default profile set.
+>
+> Implementation: [ArtifactRef.cs](../src/NodalMerge.Studio.Contracts/Domain/ArtifactRef.cs) (`Title`/`Body`), [ProjectionContracts.cs](../src/NodalMerge.Studio.Contracts/Projections/ProjectionContracts.cs) (`InheritedConstraints`), [ProjectionManager.cs](../src/NodalMerge.Studio.Projections/ProjectionManager.cs), [McpToolDispatcher.cs](../src/NodalMerge.Studio.AgentRuntime/McpToolDispatcher.cs), [ArtifactTools.cs](../src/NodalMerge.Studio.McpServer/Tools/ArtifactTools.cs). Tests: `StubProjectionManagerTests.cs` (ancestor inheritance, 2-level grandchild walk), extended `FullAgentCycleTests.cs` (real MCP-dispatch coverage for `artifact.record`).
 
 Agents currently rediscover context on every run. A `Research` artifact from run 1 that says "the codebase targets .NET 8 and has no Redis dependency" is thrown away — run 2 re-discovers it. A `Constraint` that says "auth middleware must not store session tokens" exists only in the LLM's context window, not in the workspace.
 

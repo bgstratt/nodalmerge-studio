@@ -35,6 +35,11 @@ public sealed record WorkUnitFailedPayload(
     string AgentId,
     string FailureReason);
 
+public sealed record WorkUnitStatusChangedPayload(
+    string WorkUnitId,
+    WorkUnitStatus PreviousStatus,
+    WorkUnitStatus NewStatus);
+
 // Scheduler
 public sealed record SchedulerLeaseAcquiredPayload(
     string WorkUnitId,
@@ -90,6 +95,11 @@ public sealed record ProposalRejectedPayload(
     string ProposalId,
     string RejectedBy,
     string? Reason);
+
+public sealed record MergeProposalStatusChangedPayload(
+    string ProposalId,
+    MergeProposalStatus PreviousStatus,
+    MergeProposalStatus NewStatus);
 
 // Merge
 public sealed record MergeApprovedPayload(

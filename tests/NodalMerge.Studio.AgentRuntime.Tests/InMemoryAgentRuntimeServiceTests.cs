@@ -206,4 +206,43 @@ public class InMemoryAgentRuntimeServiceTests
         Assert.Equal("wu-0", snapshot.WorkUnitId);
         Assert.Empty(snapshot.RecentActions);
     }
+
+    // ── ReinvokeOrchestratorAsync ────────────────────────────────────────────
+
+    [Fact]
+    public async Task ReinvokeOrchestratorAsync_noop_when_no_prior_orchestrator_registered()
+    {
+        var svc = Build();
+
+        await svc.ReinvokeOrchestratorAsync("wu-never-spawned");
+
+        Assert.Empty(await svc.ListAllAsync());
+    }
+
+    [Fact]
+    public async Task ReinvokeOrchestratorAsync_starts_a_new_agent_for_a_registered_work_unit()
+    {
+        var svc = Build();
+        await svc.SpawnAsync("orchestrator", "wu-1", model: "m", baseUrl: "http://fake-llm", apiKey: "k");
+
+        await svc.ReinvokeOrchestratorAsync("wu-1");
+
+        var all = await svc.ListAllAsync();
+        Assert.Equal(2, all.Count);
+        Assert.All(all, a => Assert.Equal("wu-1", a.WorkUnitId));
+        Assert.NotEqual(all[0].AgentId, all[1].AgentId);
+    }
+
+    [Fact]
+    public async Task ReinvokeOrchestratorAsync_does_not_register_when_credentials_are_missing()
+    {
+        var svc = Build();
+        // No baseUrl/apiKey — canStartLoop is false, so SpawnAsync never registers an orchestrator.
+        await svc.SpawnAsync("orchestrator", "wu-1");
+
+        await svc.ReinvokeOrchestratorAsync("wu-1");
+
+        // Only the original SpawnAsync's AgentRecord exists — reinvoke found nothing registered.
+        Assert.Single(await svc.ListAllAsync());
+    }
 }

@@ -31,7 +31,7 @@ public class ControlPlaneIdempotencyTests
     private sealed class NoopWorkUnitService : IWorkUnitService
     {
         public Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<WorkUnit> UpdateStatusAsync(string workUnitId, WorkUnitStatus status, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> UpdateStatusAsync(string workUnitId, WorkUnitStatus status, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<WorkUnit?>(null);
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
@@ -95,22 +95,156 @@ public class ControlPlaneIdempotencyTests
         Assert.Null(second); // no other items pending, lease held by agent-X
     }
 
+    // ── Phase 4 slice 11a — WorkUnitStatus wiring + orchestrator re-invocation ─
+
+    private static (WorkSchedulerService Scheduler, RecordingWorkUnitService WorkUnits, RecordingAgentControlService AgentControl)
+        BuildSchedulerWithLifecycle()
+    {
+        var store = new InMemoryStudioNodeStore();
+        var events = new ExecutionEventStreamService(store);
+        var workUnits = new RecordingWorkUnitService();
+        var agentControl = new RecordingAgentControlService();
+        var serviceProvider = new MultiServiceProvider(workUnits, agentControl);
+        var workspaces = new AgentWorkspaceService(store, serviceProvider, new NoopFileWorkspaceService(), events);
+        var scheduler = new WorkSchedulerService(store, events, workspaces, serviceProvider);
+        return (scheduler, workUnits, agentControl);
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_first_call_transitions_work_unit_to_Queued()
+    {
+        var (scheduler, workUnits, _) = BuildSchedulerWithLifecycle();
+
+        await scheduler.EnqueueAsync("WU-1", "profile-a", sessionId: "SES-1");
+
+        Assert.Equal(WorkUnitStatus.Queued, workUnits.Calls.Single().Status);
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_called_twice_does_not_double_transition()
+    {
+        var (scheduler, workUnits, _) = BuildSchedulerWithLifecycle();
+
+        await scheduler.EnqueueAsync("WU-1", "profile-a", sessionId: "SES-1");
+        await scheduler.EnqueueAsync("WU-1", "profile-a", sessionId: "SES-1");
+
+        Assert.Single(workUnits.Calls);
+    }
+
+    [Fact]
+    public async Task TryAcquireAsync_transitions_work_unit_to_Executing()
+    {
+        var (scheduler, workUnits, _) = BuildSchedulerWithLifecycle();
+        await scheduler.EnqueueAsync("WU-1", "profile-a", sessionId: "SES-1");
+
+        await scheduler.TryAcquireAsync("agent-X");
+
+        Assert.Equal(WorkUnitStatus.Executing, workUnits.Calls.Last().Status);
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_success_reinvokes_the_registered_orchestrator()
+    {
+        var (scheduler, _, agentControl) = BuildSchedulerWithLifecycle();
+        await scheduler.EnqueueAsync("WU-1", "profile-a", sessionId: "SES-1");
+        await scheduler.TryAcquireAsync("agent-X");
+
+        await scheduler.ReleaseAsync("WU-1", success: true);
+
+        var call = Assert.Single(agentControl.ReinvokeCalls);
+        Assert.Equal("WU-1", call.WorkUnitId);
+        Assert.Equal("SES-1", call.SessionId);
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_failure_also_reinvokes_the_registered_orchestrator_and_marks_Retrying()
+    {
+        var (scheduler, workUnits, agentControl) = BuildSchedulerWithLifecycle();
+        await scheduler.EnqueueAsync("WU-1", "profile-a", sessionId: "SES-1");
+        await scheduler.TryAcquireAsync("agent-X");
+
+        await scheduler.ReleaseAsync("WU-1", success: false);
+
+        Assert.Single(agentControl.ReinvokeCalls);
+        Assert.Equal(WorkUnitStatus.Retrying, workUnits.Calls.Last().Status);
+    }
+
+    [Fact]
+    public async Task ReleaseAsync_without_a_resolvable_IAgentControlService_does_not_throw()
+    {
+        // The existing BuildScheduler() helper passes no IServiceProvider at all — confirms
+        // backward compatibility with every other test in this file that already exercises
+        // ReleaseAsync's call sites indirectly via the scheduler's own queue lifecycle.
+        var (scheduler, _) = BuildScheduler();
+        await scheduler.EnqueueAsync("WU-1", "profile-a", sessionId: "SES-1");
+        await scheduler.TryAcquireAsync("agent-X");
+
+        await scheduler.ReleaseAsync("WU-1", success: true);
+    }
+
+    private sealed class MultiServiceProvider(params object[] services) : IServiceProvider
+    {
+        public object? GetService(Type serviceType) => services.FirstOrDefault(serviceType.IsInstanceOfType);
+    }
+
+    private sealed class RecordingWorkUnitService : IWorkUnitService
+    {
+        public List<(string WorkUnitId, WorkUnitStatus Status, string? SessionId)> Calls { get; } = [];
+
+        public Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken ct = default) => throw new NotSupportedException();
+
+        public Task<WorkUnit> UpdateStatusAsync(string workUnitId, WorkUnitStatus status, string? sessionId = null, CancellationToken ct = default)
+        {
+            Calls.Add((workUnitId, status, sessionId));
+            var updated = new WorkUnit(workUnitId, "goal", "branch-1", status, DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow, "owner", null, null, null, null, [], []);
+            return Task.FromResult(updated);
+        }
+
+        public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<WorkUnit?>(null);
+        public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+    }
+
+    private sealed class RecordingAgentControlService : IAgentControlService
+    {
+        public List<(string WorkUnitId, string? SessionId)> ReinvokeCalls { get; } = [];
+
+        public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
+            string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
+
+        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default)
+        {
+            ReinvokeCalls.Add((workUnitId, sessionId));
+            return Task.CompletedTask;
+        }
+
+        public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task ResumeAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task StopAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<string> GetStatusAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<AgentInfo>> ListActiveAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<AgentInfo>> ListAllAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
     // ── IArtifactLineageService.RecordAsync — key: ArtifactId ────────────────
 
     [Fact]
-    public async Task ArtifactRefWriteAsync_called_twice_with_same_ArtifactId_is_noop()
+    public async Task ArtifactLineageRecordAsync_called_twice_with_same_ArtifactId_is_noop()
     {
-        var svc = new InMemoryArtifactRefService();
+        var svc = new ArtifactLineageService(new InMemoryStudioNodeStore());
         var original = new ArtifactRef("ART-1", ArtifactType.BranchChangeset, null, ArtifactStatus.Active,
             DateTimeOffset.UtcNow, "WU-1", null);
         var duplicate = original with { Status = ArtifactStatus.Superseded };
 
-        await svc.WriteAsync(original);
-        await svc.WriteAsync(duplicate);
+        await svc.RecordAsync(original);
+        await svc.RecordAsync(duplicate);
 
-        var list = await svc.ListAsync("WU-1");
-        Assert.Single(list);
-        Assert.Equal(ArtifactStatus.Active, list[0].Status); // first write wins; second is a no-op
+        var chain = await svc.GetChainAsync("WU-1");
+        Assert.Single(chain);
+        Assert.Equal(ArtifactStatus.Active, chain[0].Status); // first write wins; second is a no-op
     }
 
     // ── IExecutionEventStream.AppendAsync — key: EventId ─────────────────────
@@ -138,7 +272,8 @@ public class ControlPlaneIdempotencyTests
     {
         var store = new InMemoryStudioNodeStore();
         var mergeService = new InMemoryMergeService(
-            store, new NoopFileWorkspaceService(), new WorkspaceOptions(), new NoopEventStream());
+            store, new NoopFileWorkspaceService(), new WorkspaceOptions(), new NoopEventStream(),
+            new ArtifactLineageService(store));
         var tools = new MergeTools(mergeService, store);
 
         var commandId = Guid.NewGuid().ToString("N");
@@ -156,7 +291,8 @@ public class ControlPlaneIdempotencyTests
     {
         var store = new InMemoryStudioNodeStore();
         var mergeService = new InMemoryMergeService(
-            store, new NoopFileWorkspaceService(), new WorkspaceOptions(), new NoopEventStream());
+            store, new NoopFileWorkspaceService(), new WorkspaceOptions(), new NoopEventStream(),
+            new ArtifactLineageService(store));
         var tools = new MergeTools(mergeService, store);
 
         await tools.ProposeAsync("feat/x", "main", "summary");

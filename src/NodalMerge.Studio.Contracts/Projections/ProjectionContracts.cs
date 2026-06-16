@@ -76,7 +76,8 @@ public sealed record ArtifactChain(
 public sealed record AgentWorkspaceProjectionPayload(
     string? AgentId,
     string? WorkUnitId,
-    ArtifactChain Artifacts);
+    ArtifactChain Artifacts,
+    IReadOnlyList<ArtifactRef> InheritedConstraints);
 
 public static class ProjectionCatalog
 {

@@ -15,6 +15,9 @@ public static class StudioNodeKind
     public const string ExecutionEventV1    = "studio/execution-event/v1";
     public const string CommandResultV1     = "studio/command-result/v1";
     public const string AgentWorkspaceV1    = "studio/agent-workspace/v1";
+    public const string ArtifactRefV1       = "studio/artifact-ref/v1";
+    public const string OrchestrationEventV1 = "studio/orchestration-event/v1";
+    public const string ChangeIntentV1       = "studio/change-intent/v1";
 }
 
 public interface IStudioNodeStore

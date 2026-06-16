@@ -14,6 +14,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
     private readonly ConcurrentDictionary<(string AgentId, string WorkUnitId), ExecutionSnapshot> _snapshots = new();
     private readonly ConcurrentDictionary<string, AgentRecord> _agents = new();
+    private readonly ConcurrentDictionary<string, OrchestratorRegistration> _orchestratorRegistrations = new();
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<InMemoryAgentRuntimeService> _logger;
     private readonly IAgentProfileService _profileService;
@@ -46,6 +47,12 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? ApiKey = null,
         string? Provider = null,
         CancellationTokenSource? Cts = null);
+
+    // Captured at SpawnAsync("orchestrator", ...) time so ReinvokeOrchestratorAsync can restart
+    // the loop with the same credentials/profile later, without the caller (WorkSchedulerService)
+    // needing to remember or re-supply them.
+    private sealed record OrchestratorRegistration(
+        string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId);
 
     // ── IHostedService ─────────────────────────────────────────────────────
 
@@ -254,7 +261,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             cts = new CancellationTokenSource();
             var loopModel = model ?? string.Empty;
             if (agentType == "orchestrator")
+            {
                 StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
+                _orchestratorRegistrations[workUnitId] = new OrchestratorRegistration(
+                    resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId);
+            }
             else if (agentType == "worker" && taskId is not null)
                 StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
             else
@@ -263,6 +274,23 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
         _agents[agentId] = new AgentRecord(agentId, workUnitId, "active", taskId, model, baseUrl, apiKey, provider, cts);
         return Task.FromResult(agentId);
+    }
+
+    public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default)
+    {
+        if (!_orchestratorRegistrations.TryGetValue(workUnitId, out var reg))
+            return Task.CompletedTask;
+
+        var agentId = $"orchestrator-{Guid.NewGuid():N}";
+        var cts = new CancellationTokenSource();
+        _agents[agentId] = new AgentRecord(agentId, workUnitId, "active", null, reg.Model, reg.BaseUrl, reg.ApiKey, reg.Provider, cts);
+
+        AgentProfile? profile = reg.ProfileId is not null
+            ? _profileService.GetAsync(reg.ProfileId, cancellationToken).GetAwaiter().GetResult()
+            : null;
+
+        StartOrchestratorLoop(agentId, workUnitId, reg.Provider, reg.Model, reg.BaseUrl, reg.ApiKey, profile, cts, sessionId);
+        return Task.CompletedTask;
     }
 
     private void StartOrchestratorLoop(
@@ -284,8 +312,12 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var artifactLineage = _serviceProvider.GetRequiredService<IArtifactLineageService>();
+                var projections = _serviceProvider.GetRequiredService<IProjectionManager>();
+                var decisionLog = _serviceProvider.GetRequiredService<IOrchestrationDecisionLogService>();
                 var loop = new OrchestratorAgentLoop(
-                    agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm, profile, sessionId);
+                    agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm,
+                    artifactLineage, projections, decisionLog, profile, sessionId);
                 await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 _logger.LogInformation("[Agent {AgentId}] Orchestrator loop completed.", agentId);
             }

@@ -15,20 +15,20 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly ITaskService _tasks;
     private readonly IMergeService _merges;
     private readonly IAgentRuntimeService _agentRuntime;
-    private readonly IArtifactRefService _artifactRefs;
+    private readonly IArtifactLineageService _artifactLineage;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
         ITaskService tasks,
         IMergeService merges,
         IAgentRuntimeService agentRuntime,
-        IArtifactRefService artifactRefs)
+        IArtifactLineageService artifactLineage)
     {
-        _workUnits    = workUnits;
-        _tasks        = tasks;
-        _merges       = merges;
-        _agentRuntime = agentRuntime;
-        _artifactRefs = artifactRefs;
+        _workUnits       = workUnits;
+        _tasks           = tasks;
+        _merges          = merges;
+        _agentRuntime    = agentRuntime;
+        _artifactLineage = artifactLineage;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -208,7 +208,7 @@ public sealed class ProjectionManager : IProjectionManager
         if (workUnitId is null)
             return Serialize(new { error = "AgentWorkspace projection requires workUnitId." });
 
-        var refs = await _artifactRefs.ListAsync(workUnitId, ct).ConfigureAwait(false);
+        var refs = await _artifactLineage.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
 
         // Enrich MergeProposal refs with current status from the merge service.
         var enriched = new List<ArtifactRef>(refs.Count);
@@ -233,12 +233,49 @@ public sealed class ProjectionManager : IProjectionManager
             enriched.Add(r);
         }
 
+        // Knowledge artifacts (10g) are inherited down the WorkUnit DAG: walk ParentWorkUnitId
+        // root-first and fold in every ancestor's own chain ahead of this work unit's, de-duping
+        // by ArtifactId (IDs are globally unique, so the only possible duplicates are across levels).
+        var ancestorChain = await CollectAncestorChainAsync(workUnitId, ct).ConfigureAwait(false);
+        var combined = new List<ArtifactRef>(ancestorChain.Count + enriched.Count);
+        combined.AddRange(ancestorChain);
+        combined.AddRange(enriched);
+
+        var inheritedConstraints = ancestorChain.Where(a => a.Type == ArtifactType.Constraint).ToList();
+
         var payload = new AgentWorkspaceProjectionPayload(
             request.AgentId,
             workUnitId,
-            new ArtifactChain(enriched));
+            new ArtifactChain(combined),
+            inheritedConstraints);
 
         return Serialize(payload);
+    }
+
+    private async Task<IReadOnlyList<ArtifactRef>> CollectAncestorChainAsync(string workUnitId, CancellationToken ct)
+    {
+        var ancestorWorkUnitIds = new List<string>();
+        var unit = await _workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+        var parentId = unit?.ParentWorkUnitId;
+        while (parentId is not null)
+        {
+            ancestorWorkUnitIds.Add(parentId);
+            var parent = await _workUnits.GetAsync(parentId, ct).ConfigureAwait(false);
+            parentId = parent?.ParentWorkUnitId;
+        }
+
+        var seen = new HashSet<string>();
+        var result = new List<ArtifactRef>();
+        // Walk root-first so the oldest ancestor's context appears first.
+        foreach (var ancestorId in Enumerable.Reverse(ancestorWorkUnitIds))
+        {
+            var chain = await _artifactLineage.GetChainAsync(ancestorId, ct).ConfigureAwait(false);
+            foreach (var artifact in chain)
+                if (seen.Add(artifact.ArtifactId))
+                    result.Add(artifact);
+        }
+
+        return result;
     }
 
     private static string Serialize(object data) => JsonSerializer.Serialize(data, JsonOptions);

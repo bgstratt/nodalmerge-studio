@@ -135,7 +135,8 @@ public sealed class AgentWorkspaceService : IAgentWorkspaceService
 
     private static string WorkspaceId(string workUnitId) => $"ws-{workUnitId}";
 
-    private static bool MatchesGlob(string pattern, string path)
+    // Shared with WorkSchedulerService's conflict pre-detection (10d) — same glob semantics as FileScope enforcement.
+    internal static bool MatchesGlob(string pattern, string path)
     {
         var regexPattern = "^" + Regex.Escape(pattern)
             .Replace(@"\*\*", ".*")
