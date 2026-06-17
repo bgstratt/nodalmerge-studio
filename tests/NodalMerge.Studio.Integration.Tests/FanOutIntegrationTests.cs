@@ -134,7 +134,7 @@ public class FanOutIntegrationTests
             while (DateTimeOffset.UtcNow < deadline)
             {
                 var children = await workUnits.GetChildrenAsync(parent.WorkUnitId);
-                var s2 = children.FirstOrDefault(c => c.Metadata?.GetValueOrDefault(WorkUnitMetadataKeys.SliceId) == "s2");
+                var s2 = children.FirstOrDefault(c => c.FanOutInfo?.SliceId == "s2");
                 var proposals = (await merge.ListAsync()).Count(p => p.Status == MergeProposalStatus.ReadyForReview);
                 if (children.Count >= 2 && s2?.Status == WorkUnitStatus.Proposed && proposals >= 2)
                     break;

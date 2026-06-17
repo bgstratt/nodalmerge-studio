@@ -5,7 +5,7 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
-public sealed class ExecutionSessionService : IExecutionSessionService
+public sealed class ExecutionSessionService : IExecutionSessionService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, ExecutionSession> _sessions = new();
     private readonly IStudioNodeStore _nodeStore;
@@ -92,6 +92,18 @@ public sealed class ExecutionSessionService : IExecutionSessionService
                 ? new SessionPausedPayload(sessionId)
                 : new SessionResumedPayload(sessionId);
             await _events.AppendAsync(sessionId, null, kind.Value, payload, ct: ct).ConfigureAwait(false);
+        }
+    }
+
+    public async Task RehydrateAsync(CancellationToken cancellationToken = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.ExecutionSessionV1, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var (entityId, payloadJson) in records)
+        {
+            var session = JsonSerializer.Deserialize<ExecutionSession>(payloadJson);
+            if (session is not null)
+                _sessions[entityId] = session;
         }
     }
 

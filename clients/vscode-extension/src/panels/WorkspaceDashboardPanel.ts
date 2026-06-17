@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import type { MergeProposal } from './MergeReviewPanel';
 import type { NotificationManager } from '../NotificationManager';
 import type { AgentConfigService } from '../AgentConfigService';
+import { scopeViewCss, wrapViewScript } from './sharedWebviewChrome';
 
 const POLL_INTERVAL_MS = 2_000;
 
@@ -45,8 +46,7 @@ interface DeadLetterEntry {
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 export class WorkspaceDashboardPanel implements vscode.Disposable {
-  static current: WorkspaceDashboardPanel | undefined;
-  private static readonly viewType = 'nodalmerge.dashboard';
+  static readonly containerId = 'shell-pane-workspace';
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
@@ -54,10 +54,9 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
   private readonly configService: AgentConfigService | undefined;
   private readonly secrets: vscode.SecretStorage | undefined;
   private readonly lmProxyBaseUrl: string | undefined;
-  private readonly disposables: vscode.Disposable[] = [];
   private pollTimer?: ReturnType<typeof setInterval>;
 
-  private constructor(
+  constructor(
     panel: vscode.WebviewPanel,
     baseUrl: string,
     notifications?: NotificationManager,
@@ -71,40 +70,21 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
     this.configService = configService;
     this.secrets       = secrets;
     this.lmProxyBaseUrl = lmProxyBaseUrl;
-    this.panel.webview.html = buildDashboardHtml();
-    this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
-    this.panel.onDidChangeViewState(e => {
-      if (e.webviewPanel.visible) { this.startPolling(); }
-      else { this.stopPolling(); }
-    }, null, this.disposables);
-    this.panel.webview.onDidReceiveMessage(
-      (msg: Record<string, unknown>) => { void this.handleMessage(msg); },
-      null,
-      this.disposables
-    );
-    this.startPolling();
   }
 
-  static createOrShow(
-    baseUrl: string,
-    notifications?: NotificationManager,
-    configService?: AgentConfigService,
-    secrets?: vscode.SecretStorage,
-    lmProxyBaseUrl?: string,
-  ): void {
-    if (WorkspaceDashboardPanel.current) {
-      WorkspaceDashboardPanel.current.panel.reveal(vscode.ViewColumn.Two);
-      return;
-    }
-    const panel = vscode.window.createWebviewPanel(
-      WorkspaceDashboardPanel.viewType,
-      'NodalMerge — Workspace',
-      vscode.ViewColumn.Two,
-      { enableScripts: true, retainContextWhenHidden: true }
-    );
-    WorkspaceDashboardPanel.current = new WorkspaceDashboardPanel(
-      panel, baseUrl, notifications, configService, secrets, lmProxyBaseUrl,
-    );
+  static getFragment(): { css: string; html: string; script: string } {
+    return {
+      css: scopeViewCss(DASHBOARD_CSS, WorkspaceDashboardPanel.containerId),
+      html: `<div id="${WorkspaceDashboardPanel.containerId}" class="nm-shell-pane">${DASHBOARD_HTML}</div>`,
+      script: wrapViewScript(DASHBOARD_JS, WorkspaceDashboardPanel.containerId),
+    };
+  }
+
+  /** Called once by the shell right after construction — was the tail of createOrShow(). Unlike
+   * before, polling now runs continuously regardless of which shell tab is visible (the shell
+   * has one always-open webview, not a panel that can itself be hidden/shown); see Slice 0 notes. */
+  activate(): void {
+    this.startPolling();
   }
 
   private startPolling(): void {
@@ -136,7 +116,7 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
     }
   }
 
-  private async handleMessage(msg: Record<string, unknown>): Promise<void> {
+  async handleMessage(msg: Record<string, unknown>): Promise<void> {
     try {
       switch (msg.type as string) {
         case 'createWorkUnit': {
@@ -212,6 +192,9 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
         case 'openMergeReview':
           void vscode.commands.executeCommand('nodalmerge.openMergeReview', msg.proposalId as string);
           break;
+        case 'openConflictReview':
+          void vscode.commands.executeCommand('nodalmerge.openMergeReviewConflict', msg.workUnitId as string);
+          break;
         case 'retryDeadLetter':
           await this.post('/studio/dead-letter/' + String(msg.entryId) + '/retry', {});
           void this.poll();
@@ -243,46 +226,10 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
 
   dispose(): void {
     this.stopPolling();
-    WorkspaceDashboardPanel.current = undefined;
-    this.panel.dispose();
-    for (const d of this.disposables) { d.dispose(); }
-    this.disposables.length = 0;
   }
 }
 
 // ── HTML builder ───────────────────────────────────────────────────────────
-
-function buildNonce(): string {
-  let text = '';
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  for (let i = 0; i < 32; i++) { text += chars[Math.floor(Math.random() * chars.length)]; }
-  return text;
-}
-
-function buildDashboardHtml(): string {
-  const n = buildNonce();
-  return [
-    '<!DOCTYPE html>',
-    '<html lang="en">',
-    '<head>',
-    '  <meta charset="UTF-8">',
-    '  <meta http-equiv="Content-Security-Policy"',
-    '        content="default-src \'none\'; style-src \'nonce-' + n + '\'; script-src \'nonce-' + n + '\';">',
-    '  <meta name="viewport" content="width=device-width, initial-scale=1.0">',
-    '  <title>NodalMerge Studio</title>',
-    '  <style nonce="' + n + '">',
-    DASHBOARD_CSS,
-    '  </style>',
-    '</head>',
-    '<body>',
-    DASHBOARD_HTML,
-    '<script nonce="' + n + '">',
-    DASHBOARD_JS,
-    '</script>',
-    '</body>',
-    '</html>',
-  ].join('\n');
-}
 
 const DASHBOARD_CSS = `
   :root {
@@ -461,11 +408,15 @@ const DASHBOARD_JS = `
     var html = '';
     for (var i = 0; i < wus.length; i++) {
       var wu = wus[i];
+      var isReviewing = (wu.status || '').toLowerCase() === 'reviewing';
       html += '<div class="card">';
       html += '<div class="row">';
       html += '<span class="title" title="' + esc(wu.goal) + '">' + esc(wu.goal) + '</span>';
       html += badge(wu.status);
       html += '<div class="actions">';
+      if (isReviewing) {
+        html += '<button class="ghost" data-action="openConflictReview" data-wu="' + esc(wu.workUnitId) + '">View Conflict →</button>';
+      }
       html += '<button class="ghost" data-action="spawnAgent" data-wu="' + esc(wu.workUnitId) + '">Spawn</button>';
       html += '</div>';
       html += '</div>';
@@ -480,6 +431,11 @@ const DASHBOARD_JS = `
     el.querySelectorAll('[data-action="spawnAgent"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: 'spawnAgent', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+    el.querySelectorAll('[data-action="openConflictReview"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'openConflictReview', workUnitId: btn.getAttribute('data-wu') });
       });
     });
   }

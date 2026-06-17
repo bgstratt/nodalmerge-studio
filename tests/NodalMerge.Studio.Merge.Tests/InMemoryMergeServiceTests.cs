@@ -87,6 +87,9 @@ public class InMemoryMergeServiceTests
                 DateTimeOffset.UtcNow, "owner", null, null, null, null, [], []));
         }
 
+        public Task<WorkUnit> SetCurrentStageAsync(string workUnitId, PipelineStage? stage, CancellationToken ct = default) =>
+            Task.FromResult(new WorkUnit(workUnitId, "goal", "branch-1", WorkUnitStatus.Merged, DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow, "owner", null, null, null, null, [], [], CurrentStage: stage));
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<WorkUnit?>(null);
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);

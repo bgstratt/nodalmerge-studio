@@ -198,7 +198,6 @@ Orchestrator asks an LLM which profile best fits a given task, replacing the det
 | File | Reason |
 |------|--------|
 | `InMemoryMergeService.cs` | Write-back complete since 2.5 |
-| `MergeReviewPanel.ts` | Artifact Explorer links to it; no changes needed |
 | `IWorkScheduler.cs` | Complete from Phase 3 |
 | `IFileWorkspaceService.cs` | Complete from Phase 3 |
 | Phase 2.5 profiles | Additive only |

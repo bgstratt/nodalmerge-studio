@@ -35,7 +35,20 @@ public sealed record WorkUnit(
     IReadOnlyDictionary<string, string>? Metadata,
     string? ParentWorkUnitId,
     IReadOnlyList<string> DependsOn,
-    IReadOnlyList<string> FileScope);
+    IReadOnlyList<string> FileScope,
+    // Phase 4 completion pass — typed state, promoted out of the Metadata grab-bag. Metadata
+    // remains for genuine ad-hoc/future use; these fields are for state with known shape and
+    // multiple call sites that previously round-tripped through string keys.
+    PipelineStage? CurrentStage = null,
+    WorkUnitExecutionInfo? ExecutionInfo = null,
+    WorkUnitFanOutInfo? FanOutInfo = null,
+    string? BranchedFromProposalId = null);
+
+/// <summary>Failure/rejection counters, previously stored as parsed strings in Metadata.</summary>
+public sealed record WorkUnitExecutionInfo(int FailureAttemptCount, int AutomatedReviewRejectionCount);
+
+/// <summary>Fan-out lineage: which plan slice this work unit fulfills and which branch it was seeded from.</summary>
+public sealed record WorkUnitFanOutInfo(string? SliceId, string? SeedFromBranchId);
 
 public static class WorkUnitTransitions
 {
@@ -59,6 +72,13 @@ public static class WorkUnitTransitions
             (WorkUnitStatus.Retrying, WorkUnitStatus.DeadLettered) => true,
             (WorkUnitStatus.DeadLettered, WorkUnitStatus.Retrying) => true,
             (WorkUnitStatus.Proposed, WorkUnitStatus.Reviewing) => true,
+            // A fan-out parent is the orchestrator's own work unit, spawned via the legacy
+            // direct-spawn path (IAgentControlService.SpawnAsync("orchestrator", ...)) — it never
+            // goes through Queued/Executing/Proposed itself, so it's still Created (or, if an agent
+            // ever called workunit.update with assignedAgent, Active) when the merger detects a
+            // conflict among its children and needs to flag it for human attention.
+            (WorkUnitStatus.Created, WorkUnitStatus.Reviewing) => true,
+            (WorkUnitStatus.Active, WorkUnitStatus.Reviewing) => true,
             (WorkUnitStatus.Proposed, WorkUnitStatus.Merged) => true,
             (WorkUnitStatus.Proposed, WorkUnitStatus.Queued) => true,
             (WorkUnitStatus.Reviewing, WorkUnitStatus.Merged) => true,

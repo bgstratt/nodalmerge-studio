@@ -26,6 +26,12 @@ public interface IStudioNodeStore
     Task WriteNodeAsync(string kind, string entityId, string payloadJson, CancellationToken cancellationToken = default);
 
     Task<string?> ReadNodeAsync(string kind, string entityId, CancellationToken cancellationToken = default);
+
+    // Slice 0a — rehydration. Returns the latest payload per entityId for every node of this
+    // kind, so a service can rebuild its in-memory dictionary on startup from what was already
+    // durably written via WriteNodeAsync.
+    Task<IReadOnlyList<(string EntityId, string PayloadJson)>> ReadAllNodesAsync(
+        string kind, CancellationToken cancellationToken = default);
 }
 
 public sealed class InMemoryStudioNodeStore : IStudioNodeStore
@@ -42,5 +48,15 @@ public sealed class InMemoryStudioNodeStore : IStudioNodeStore
     {
         _nodes.TryGetValue((kind, entityId), out var payload);
         return Task.FromResult(payload);
+    }
+
+    public Task<IReadOnlyList<(string EntityId, string PayloadJson)>> ReadAllNodesAsync(
+        string kind, CancellationToken cancellationToken = default)
+    {
+        IReadOnlyList<(string EntityId, string PayloadJson)> results = _nodes
+            .Where(n => n.Key.Kind == kind)
+            .Select(n => (n.Key.EntityId, n.Value))
+            .ToList();
+        return Task.FromResult(results);
     }
 }

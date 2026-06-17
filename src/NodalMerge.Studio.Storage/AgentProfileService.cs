@@ -6,7 +6,7 @@ using NodalMerge.Studio.Contracts.Versioning;
 
 namespace NodalMerge.Studio.Storage;
 
-public sealed class AgentProfileService : IAgentProfileService
+public sealed class AgentProfileService : IAgentProfileService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, AgentProfile> _profiles = new();
     private readonly IStudioNodeStore _nodeStore;
@@ -120,6 +120,20 @@ public sealed class AgentProfileService : IAgentProfileService
 
     public Task<IReadOnlyList<AgentProfile>> ListAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyList<AgentProfile>>(_profiles.Values.OrderBy(p => p.AgentProfileId).ToList());
+
+    // Runs after the constructor's SeedDefaults(), so any persisted, user-customized profile
+    // (e.g. an edited "worker" prompt) correctly overwrites the seeded default here.
+    public async Task RehydrateAsync(CancellationToken cancellationToken = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.AgentProfileV1, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var (entityId, payloadJson) in records)
+        {
+            var profile = JsonSerializer.Deserialize<AgentProfile>(payloadJson);
+            if (profile is not null)
+                _profiles[entityId] = profile;
+        }
+    }
 
     private Task Persist(AgentProfile profile, CancellationToken ct) =>
         _nodeStore.WriteNodeAsync(

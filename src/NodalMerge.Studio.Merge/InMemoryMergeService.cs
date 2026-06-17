@@ -7,7 +7,7 @@ using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Merge;
 
-public sealed class InMemoryMergeService : IMergeService
+public sealed class InMemoryMergeService : IMergeService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, MergeProposal> _proposals = new();
     private readonly IStudioNodeStore _nodeStore;
@@ -320,6 +320,7 @@ public sealed class InMemoryMergeService : IMergeService
                 {
                     await workUnits.UpdateStatusAsync(
                         proposal.WorkUnitId, WorkUnitStatus.Merged, proposal.SessionId, cancellationToken).ConfigureAwait(false);
+                    await workUnits.SetCurrentStageAsync(proposal.WorkUnitId, null, cancellationToken).ConfigureAwait(false);
                 }
                 catch (InvalidOperationException) { }
                 catch (KeyNotFoundException) { }
@@ -394,6 +395,18 @@ public sealed class InMemoryMergeService : IMergeService
         return updated;
     }
 
+    public async Task RehydrateAsync(CancellationToken cancellationToken = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.MergeProposalV1, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var (entityId, payloadJson) in records)
+        {
+            var proposal = JsonSerializer.Deserialize<MergeProposal>(payloadJson);
+            if (proposal is not null)
+                _proposals[entityId] = proposal;
+        }
+    }
+
     private MergeProposal GetRequired(string proposalId)
     {
         if (!_proposals.TryGetValue(proposalId, out var proposal))
@@ -407,7 +420,9 @@ public static class ServiceCollectionExtensions
     public static IServiceCollection AddStudioMerge(this IServiceCollection services)
     {
         // IStudioNodeStore must be registered before this (AddStudioStorage)
-        services.AddSingleton<IMergeService, InMemoryMergeService>();
+        services.AddSingleton<InMemoryMergeService>();
+        services.AddSingleton<IMergeService>(sp => sp.GetRequiredService<InMemoryMergeService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryMergeService>());
         services.AddSingleton<IProposalReviewService, ProposalReviewService>();
         services.AddSingleton<IMergeReconciliationService, MergeReconciliationService>();
         services.AddSingleton<IAutomatedReviewGateService, AutomatedReviewGateService>();

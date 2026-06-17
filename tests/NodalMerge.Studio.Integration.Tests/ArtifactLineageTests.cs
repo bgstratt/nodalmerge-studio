@@ -124,6 +124,12 @@ public class ArtifactLineageTests
             _units[id] = updated;
             return Task.FromResult(updated);
         }
+        public Task<WorkUnit> SetCurrentStageAsync(string id, PipelineStage? stage, CancellationToken ct = default)
+        {
+            var updated = _units[id] with { CurrentStage = stage };
+            _units[id] = updated;
+            return Task.FromResult(updated);
+        }
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) =>
             Task.FromResult(_units.GetValueOrDefault(workUnitId));
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) =>

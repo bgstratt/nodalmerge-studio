@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { scopeViewCss, wrapViewScript } from './sharedWebviewChrome';
 
 // ── Domain types ───────────────────────────────────────────────────────────
 
@@ -25,64 +26,98 @@ export interface ProposalFileChange {
   afterContent?: string | null;
 }
 
+export interface ConstituentProposal {
+  proposalId: string;
+  status: string;
+  goal?: string | null;
+  summary?: string | null;
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
-export class MergeReviewPanel implements vscode.Disposable {
-  static current: MergeReviewPanel | undefined;
-  private static readonly viewType = 'nodalmerge.mergeReview';
+export class MergeReviewPanel {
+  static readonly containerId = 'shell-pane-merge-review';
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
-  private readonly disposables: vscode.Disposable[] = [];
-  private proposalId: string;
+  private mode: 'proposal' | 'conflict' = 'proposal';
+  private proposalId?: string;
+  private workUnitId?: string;
 
-  private constructor(panel: vscode.WebviewPanel, baseUrl: string, proposalId: string) {
+  constructor(panel: vscode.WebviewPanel, baseUrl: string) {
     this.panel = panel;
     this.baseUrl = baseUrl;
+  }
+
+  /** Slice 0 — was createOrShow(); the Studio Shell now owns the one WebviewPanel, so this
+   * just points this view at a proposal and tells the already-open shell to show this tab. */
+  loadProposal(proposalId: string): void {
+    this.mode = 'proposal';
     this.proposalId = proposalId;
-    this.panel.webview.html = buildHtml();
-    this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
-    this.panel.webview.onDidReceiveMessage(
-      (msg: Record<string, unknown>) => { void this.handleMessage(msg); },
-      null,
-      this.disposables
-    );
+    this.workUnitId = undefined;
     void this.load();
   }
 
-  static createOrShow(baseUrl: string, proposalId: string): void {
-    if (MergeReviewPanel.current) {
-      MergeReviewPanel.current.proposalId = proposalId;
-      MergeReviewPanel.current.panel.reveal(vscode.ViewColumn.Two);
-      void MergeReviewPanel.current.load();
-      return;
-    }
-    const panel = vscode.window.createWebviewPanel(
-      MergeReviewPanel.viewType,
-      'Merge Review',
-      vscode.ViewColumn.Two,
-      { enableScripts: true, retainContextWhenHidden: true }
-    );
-    MergeReviewPanel.current = new MergeReviewPanel(panel, baseUrl, proposalId);
+  // Conflict mode: the merger found overlapping changes among child proposals and escalated
+  // the parent work unit to Reviewing without producing a proposal — there's nothing to
+  // approve/reject/apply yet, just the conflict report to surface (11c).
+  loadConflict(workUnitId: string): void {
+    this.mode = 'conflict';
+    this.workUnitId = workUnitId;
+    this.proposalId = undefined;
+    void this.load();
+  }
+
+  static getFragment(): { css: string; html: string; script: string } {
+    return {
+      css: scopeViewCss(REVIEW_CSS, MergeReviewPanel.containerId),
+      html: `<div id="${MergeReviewPanel.containerId}" class="nm-shell-pane">${REVIEW_HTML}</div>`,
+      script: wrapViewScript(REVIEW_JS, MergeReviewPanel.containerId),
+    };
   }
 
   private async load(): Promise<void> {
+    if (this.mode === 'conflict') {
+      try {
+        const report = await this.get<{ workUnitId: string; status: string; content: string }>(
+          '/studio/workunits/' + this.workUnitId + '/conflict-report');
+        void this.panel.webview.postMessage({
+          type: 'conflict',
+          workUnitId: report.workUnitId,
+          status: report.status,
+          content: report.content,
+        });
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: failed to load conflict report — ' + String(err));
+      }
+      return;
+    }
+
     try {
       const proposal = await this.get<MergeProposal>('/studio/merges/' + this.proposalId);
       const changesRes = await this.get<{ fileChanges: ProposalFileChange[] }>(
         '/studio/merges/' + this.proposalId + '/file-changes');
-      this.panel.title = 'Merge Review: ' + proposal.sourceBranch;
+      const constituents = (proposal.reconciledFrom && proposal.reconciledFrom.length)
+        ? await this.get<ConstituentProposal[]>('/studio/merges/' + this.proposalId + '/constituents')
+        : [];
       void this.panel.webview.postMessage({
         type: 'proposal',
         proposal,
         fileChanges: changesRes.fileChanges ?? [],
+        constituents,
       });
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: failed to load proposal — ' + String(err));
     }
   }
 
-  private async handleMessage(msg: Record<string, unknown>): Promise<void> {
+  // Slice 0 — the Studio Shell broadcasts every webview message to every view's handleMessage,
+  // since the 4 views' message-type vocabularies don't overlap (verified while planning). The
+  // `default: return` is load-bearing here specifically: unlike the other 3 views, this one
+  // unconditionally reloads after a matched case, so an unmatched (i.e. not-mine) message type
+  // must bail out before reaching that reload, or every other view's message would also
+  // trigger a needless (and, before a proposal/conflict is ever loaded, erroring) re-fetch here.
+  async handleMessage(msg: Record<string, unknown>): Promise<void> {
     try {
       switch (msg.type as string) {
         case 'openDiff': {
@@ -111,6 +146,8 @@ export class MergeReviewPanel implements vscode.Disposable {
           await this.post('/studio/merges/' + this.proposalId + '/apply', {});
           void vscode.window.showInformationMessage('Merge applied successfully.');
           break;
+        default:
+          return;
       }
       await this.load();
     } catch (err) {
@@ -140,39 +177,9 @@ export class MergeReviewPanel implements vscode.Disposable {
     return res.json();
   }
 
-  dispose(): void {
-    MergeReviewPanel.current = undefined;
-    this.panel.dispose();
-    for (const d of this.disposables) { d.dispose(); }
-    this.disposables.length = 0;
-  }
 }
 
 // ── HTML ───────────────────────────────────────────────────────────────────
-
-function buildNonce(): string {
-  let s = '';
-  const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  for (let i = 0; i < 32; i++) { s += c[Math.floor(Math.random() * c.length)]; }
-  return s;
-}
-
-function buildHtml(): string {
-  const n = buildNonce();
-  return [
-    '<!DOCTYPE html><html lang="en"><head>',
-    '<meta charset="UTF-8">',
-    '<meta http-equiv="Content-Security-Policy"',
-    '      content="default-src \'none\'; style-src \'nonce-' + n + '\'; script-src \'nonce-' + n + '\';">',
-    '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
-    '<title>Merge Review</title>',
-    '<style nonce="' + n + '">' + REVIEW_CSS + '</style>',
-    '</head><body>',
-    REVIEW_HTML,
-    '<script nonce="' + n + '">' + REVIEW_JS + '</script>',
-    '</body></html>',
-  ].join('\n');
-}
 
 const REVIEW_CSS = `
   :root {
@@ -268,6 +275,15 @@ const REVIEW_CSS = `
     background: rgba(55, 148, 255, 0.08);
     font-size: 0.9em;
   }
+  .constituent-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-top: 6px;
+    font-size: 0.92em;
+  }
+  .constituent-row .mono { font-family: var(--nm-mono); opacity: 0.7; }
+  .badge.superseded { background: #555; color: #ccc; }
   .file-change {
     border: 1px solid var(--nm-border);
     border-radius: 4px;
@@ -324,20 +340,29 @@ const REVIEW_HTML = `
   <div id="loading">Loading proposal…</div>
   <div id="content" class="hidden">
     <h1 id="title">Merge Review</h1>
-    <div class="meta-grid">
+    <div id="meta-grid" class="meta-grid">
       <span class="meta-label">Status</span>      <span id="status-badge"></span>
       <span class="meta-label">Source branch</span><span class="meta-value" id="source-branch"></span>
       <span class="meta-label">Target branch</span><span class="meta-value" id="target-branch"></span>
       <span class="meta-label">Confidence</span>  <span class="meta-value" id="confidence"></span>
     </div>
     <section id="section-reconciled" class="hidden reconciled-banner">
-      <strong>Reconciled proposal</strong> — combined from <span id="reconciled-from"></span> child proposal(s).
+      <strong>Reconciled proposal</strong> — combined from <span id="reconciled-count"></span> child proposal(s).
+      <div id="reconciled-from"></div>
     </section>
-    <section>
+    <section id="section-conflict-report" class="hidden">
+      <h2>Merge conflict</h2>
+      <pre id="conflict-report-content" class="diff-pre"></pre>
+      <p style="opacity:0.7;font-size:0.9em">
+        Resolve manually: edit the conflicting files on the affected branches outside this panel,
+        then re-run the merger for this work unit.
+      </p>
+    </section>
+    <section id="section-goal">
       <h2>Goal</h2>
       <p id="goal"></p>
     </section>
-    <section>
+    <section id="section-summary">
       <h2>Summary</h2>
       <p id="summary"></p>
     </section>
@@ -362,7 +387,7 @@ const REVIEW_HTML = `
       <h2>Rollback plan</h2>
       <p id="rollback-plan"></p>
     </section>
-    <div class="actions">
+    <div id="actions" class="actions">
       <button id="btn-validate">Validate</button>
       <button id="btn-approve" class="approve">Approve</button>
       <button id="btn-reject"  class="reject">Reject</button>
@@ -429,6 +454,23 @@ const REVIEW_JS = `
     vscode.postMessage({ type: 'apply' });
   });
 
+  function renderConstituents(constituents, fallbackIds) {
+    var byId = {};
+    (constituents || []).forEach(function(c) { byId[c.proposalId] = c; });
+    return (fallbackIds || []).map(function(id) {
+      var c = byId[id];
+      if (!c) {
+        return '<div class="constituent-row"><span class="mono">' + esc(id) + '</span></div>';
+      }
+      var statusKey = (c.status || '').toLowerCase().replace(/\\s+/g, '');
+      return '<div class="constituent-row">'
+        + '<span class="badge ' + statusKey + '">' + esc(c.status) + '</span>'
+        + '<span class="mono">' + esc(c.proposalId) + '</span>'
+        + (c.goal ? '<span>' + esc(c.goal) + '</span>' : '')
+        + '</div>';
+    }).join('');
+  }
+
   function renderFileChanges(changes) {
     if (!changes || !changes.length) return '';
     return changes.map(function(fc, idx) {
@@ -470,9 +512,38 @@ const REVIEW_JS = `
     });
   });
 
+  function showProposalSections(show) {
+    showIf('meta-grid', show);
+    showIf('section-goal', show);
+    showIf('section-summary', show);
+    showIf('section-change', show);
+    showIf('actions', show);
+  }
+
   window.addEventListener('message', function(event) {
     var msg = event.data;
+
+    if (msg.type === 'conflict') {
+      var loadingEl2 = document.getElementById('loading');
+      var contentEl2 = document.getElementById('content');
+      if (loadingEl2) loadingEl2.classList.add('hidden');
+      if (contentEl2) contentEl2.classList.remove('hidden');
+
+      setText('title', 'Merge Conflict: ' + (msg.workUnitId || ''));
+      showProposalSections(false);
+      showIf('section-reconciled', false);
+      showIf('section-files', false);
+      showIf('section-diff', false);
+      showIf('section-verification', false);
+      showIf('section-rollback', false);
+      showIf('section-conflict-report', true);
+      setText('conflict-report-content', msg.content || '');
+      return;
+    }
+
     if (msg.type !== 'proposal') { return; }
+    showProposalSections(true);
+    showIf('section-conflict-report', false);
     var p = msg.proposal;
     var fileChanges = msg.fileChanges || [];
     window.__fileChanges = fileChanges;
@@ -512,7 +583,10 @@ const REVIEW_JS = `
 
     var reconciled = p.reconciledFrom && p.reconciledFrom.length;
     showIf('section-reconciled', !!reconciled);
-    if (reconciled) setText('reconciled-from', p.reconciledFrom.join(', '));
+    if (reconciled) {
+      setText('reconciled-count', String(p.reconciledFrom.length));
+      setHtml('reconciled-from', renderConstituents(msg.constituents || [], p.reconciledFrom));
+    }
 
     setHtml('file-changes', renderFileChanges(fileChanges));
     showIf('section-files', fileChanges.length > 0);

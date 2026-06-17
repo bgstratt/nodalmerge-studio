@@ -1,5 +1,14 @@
 namespace NodalMerge.Studio.Core.Services;
 
+// Slice 0a — implemented by every in-memory storage service that owns a node-store-backed
+// dictionary. StudioStateRehydrationService calls RehydrateAsync on each registered instance
+// once at startup, before the host accepts traffic, to rebuild that dictionary from whatever
+// was already durably written via IStudioNodeStore.WriteNodeAsync.
+public interface IRehydratable
+{
+    Task RehydrateAsync(CancellationToken cancellationToken = default);
+}
+
 public interface IProjectionManager
 {
     Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default);
@@ -172,6 +181,13 @@ public interface IWorkUnitService
         string? sessionId = null,
         CancellationToken cancellationToken = default);
 
+    // Independent of WorkUnitStatus — there's no transition table for PipelineStage, it's an
+    // observational field (which stage is currently executing this work unit). Pass null to clear.
+    Task<WorkUnit> SetCurrentStageAsync(
+        string workUnitId,
+        PipelineStage? stage,
+        CancellationToken cancellationToken = default);
+
     Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken cancellationToken = default);
@@ -193,6 +209,7 @@ public interface IOrchestratorService
         IReadOnlyList<string>? fileScope = null,
         string? seedFromBranchId = null,
         string? branchedFromProposalId = null,
+        string? sliceId = null,
         IReadOnlyDictionary<string, string>? metadata = null,
         CancellationToken cancellationToken = default);
 

@@ -2,6 +2,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Merge;
 using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Host;
@@ -124,26 +125,57 @@ public static class StudioRestEndpoints
 
     // ── /studio/workunits ─────────────────────────────────────────────────
 
+    private static object ToWorkUnitResponse(WorkUnit wu, int proposalCount) => new
+    {
+        workUnitId = wu.WorkUnitId,
+        goal = wu.Goal,
+        branchId = wu.BranchId,
+        status = wu.Status,
+        createdAt = wu.CreatedAt,
+        updatedAt = wu.UpdatedAt,
+        owner = wu.Owner,
+        assignedAgent = wu.AssignedAgent,
+        successCriteria = wu.SuccessCriteria,
+        metadata = wu.Metadata,
+        parentWorkUnitId = wu.ParentWorkUnitId,
+        dependsOn = wu.DependsOn,
+        fileScope = wu.FileScope,
+        currentStage = wu.CurrentStage,
+        executionInfo = wu.ExecutionInfo,
+        fanOutInfo = wu.FanOutInfo,
+        branchedFromProposalId = wu.BranchedFromProposalId,
+        proposalCount,
+    };
+
     private static void MapWorkUnitEndpoints(WebApplication app)
     {
         app.MapGet("/studio/workunits", async (
             [FromQuery] string? branchId,
             IWorkUnitService workUnits,
+            IMergeService merge,
             CancellationToken ct) =>
         {
             var list = await workUnits.ListAsync(branchId, ct).ConfigureAwait(false);
-            return Results.Ok(list);
+            var allProposals = await merge.ListAsync(cancellationToken: ct).ConfigureAwait(false);
+            var counts = allProposals
+                .Where(p => p.WorkUnitId is not null)
+                .GroupBy(p => p.WorkUnitId!)
+                .ToDictionary(g => g.Key, g => g.Count());
+            return Results.Ok(list.Select(wu => ToWorkUnitResponse(wu, counts.GetValueOrDefault(wu.WorkUnitId))));
         });
 
         app.MapGet("/studio/workunits/{workUnitId}", async (
             string workUnitId,
             IWorkUnitService workUnits,
+            IMergeService merge,
             CancellationToken ct) =>
         {
             var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
-            return wu is null
-                ? Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." })
-                : Results.Ok(wu);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+            var proposals = await merge.ListAsync(cancellationToken: ct).ConfigureAwait(false);
+            var proposalCount = proposals.Count(p => p.WorkUnitId == workUnitId);
+            return Results.Ok(ToWorkUnitResponse(wu, proposalCount));
         });
 
         app.MapGet("/studio/workunits/{workUnitId}/children", async (
@@ -197,6 +229,27 @@ public static class StudioRestEndpoints
             return Results.Ok(list);
         });
 
+        // Surfaces the merger's conflict report (11c) — only ever written when WorkUnitStatus
+        // is Reviewing, since MergeReconciliationService.cs is the sole place that status is set.
+        app.MapGet("/studio/workunits/{workUnitId}/conflict-report", async (
+            string workUnitId,
+            IWorkUnitService workUnits,
+            IFileWorkspaceService fileWorkspace,
+            CancellationToken ct) =>
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+
+            var content = await fileWorkspace
+                .ReadAsync(wu.BranchId, MergeReconciliationService.ConflictReportFileName, ct)
+                .ConfigureAwait(false);
+            if (content is null)
+                return Results.NotFound(new { error = "No conflict report exists for this work unit." });
+
+            return Results.Ok(new { workUnitId, status = wu.Status.ToString(), content });
+        });
+
         app.MapGet("/studio/workunits/{workUnitId}/proposal-dag", async (
             string workUnitId,
             IWorkUnitService workUnits,
@@ -225,13 +278,13 @@ public static class StudioRestEndpoints
 
             var children = await workUnits.GetChildrenAsync(workUnitId, ct).ConfigureAwait(false);
             var branches = children
-                .Where(c => c.Metadata?.ContainsKey("branchedFromProposalId") == true)
+                .Where(c => c.BranchedFromProposalId is not null)
                 .Select(c => new
                 {
                     workUnitId = c.WorkUnitId,
                     goal = c.Goal,
                     status = c.Status.ToString(),
-                    branchedFromProposalId = c.Metadata!["branchedFromProposalId"],
+                    branchedFromProposalId = c.BranchedFromProposalId,
                 })
                 .ToList();
 
@@ -405,6 +458,35 @@ public static class StudioRestEndpoints
             return proposal is null
                 ? Results.NotFound(new { error = $"Proposal '{proposalId}' not found." })
                 : Results.Ok(proposal);
+        });
+
+        // Resolves a reconciled proposal's `reconciledFrom` IDs to full status/goal/summary —
+        // the Merge Review panel otherwise has nothing but bare IDs to show for Superseded constituents.
+        app.MapGet("/studio/merges/{proposalId}/constituents", async (
+            string proposalId,
+            IMergeService merge,
+            CancellationToken ct) =>
+        {
+            var proposal = await merge.GetAsync(proposalId, ct).ConfigureAwait(false);
+            if (proposal is null)
+                return Results.NotFound(new { error = $"Proposal '{proposalId}' not found." });
+
+            var constituents = new List<object>();
+            foreach (var id in proposal.ReconciledFrom)
+            {
+                var constituent = await merge.GetAsync(id, ct).ConfigureAwait(false);
+                constituents.Add(constituent is null
+                    ? new { proposalId = id, status = "Unknown", goal = (string?)null, summary = (string?)null }
+                    : new
+                    {
+                        proposalId = constituent.ProposalId,
+                        status = constituent.Status.ToString(),
+                        goal = constituent.Goal,
+                        summary = constituent.Summary,
+                    });
+            }
+
+            return Results.Ok(constituents);
         });
 
         app.MapGet("/studio/merges/{proposalId}/file-changes", async (
@@ -794,6 +876,62 @@ public static class StudioRestEndpoints
             {
                 return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
             }
+        });
+
+        app.MapPost("/studio/sessions/{sessionId}/abandon", async (
+            string sessionId,
+            IExecutionSessionService sessions,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                await sessions.SetStatusAsync(sessionId, ExecutionSessionStatus.Abandoned, ct).ConfigureAwait(false);
+                return Results.Ok(new { sessionId, status = "Abandoned" });
+            }
+            catch (KeyNotFoundException)
+            {
+                return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
+            }
+        });
+
+        // Slice 0a — the Studio Shell's session picker needs to scope the Artifact Explorer's
+        // DAG view to one session at a time. A session has no direct WorkUnitId membership
+        // list (only its RootWorkUnitId) — membership is the root plus its full descendant
+        // tree, walked here server-side so the extension doesn't do N+1 recursive calls.
+        app.MapGet("/studio/sessions/{sessionId}/workunits", async (
+            string sessionId,
+            IExecutionSessionService sessions,
+            IWorkUnitService workUnits,
+            IMergeService merge,
+            CancellationToken ct) =>
+        {
+            var session = await sessions.GetAsync(sessionId, ct).ConfigureAwait(false);
+            if (session is null)
+                return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
+
+            var root = await workUnits.GetAsync(session.RootWorkUnitId, ct).ConfigureAwait(false);
+            if (root is null)
+                return Results.NotFound(new { error = $"Root work unit '{session.RootWorkUnitId}' not found." });
+
+            var allProposals = await merge.ListAsync(cancellationToken: ct).ConfigureAwait(false);
+            var counts = allProposals
+                .Where(p => p.WorkUnitId is not null)
+                .GroupBy(p => p.WorkUnitId!)
+                .ToDictionary(g => g.Key, g => g.Count());
+
+            var tree = new List<WorkUnit> { root };
+            var frontier = new Queue<string>([root.WorkUnitId]);
+            while (frontier.Count > 0)
+            {
+                var children = await workUnits.GetChildrenAsync(frontier.Dequeue(), ct).ConfigureAwait(false);
+                foreach (var child in children)
+                {
+                    tree.Add(child);
+                    frontier.Enqueue(child.WorkUnitId);
+                }
+            }
+
+            return Results.Ok(tree.Select(wu => ToWorkUnitResponse(wu, counts.GetValueOrDefault(wu.WorkUnitId))));
         });
 
         app.MapPost("/studio/sessions/{sessionId}/branch", async (

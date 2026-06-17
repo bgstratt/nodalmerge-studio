@@ -5,10 +5,9 @@ export const HOST_HEALTH_POLL_INTERVAL_MS = 500;
 export const COMMANDS = {
   RESTART_HOST:       'nodalmerge.restartHost',
   SHOW_OUTPUT:        'nodalmerge.showOutput',
-  OPEN_DASHBOARD:     'nodalmerge.openDashboard',
+  OPEN_STUDIO:        'nodalmerge.openStudio',
   OPEN_MERGE_REVIEW:  'nodalmerge.openMergeReview',
-  OPEN_DAG_REPLAY:    'nodalmerge.openDagReplay',
-  OPEN_AGENT_CONFIG:  'nodalmerge.openAgentConfig',
+  OPEN_MERGE_REVIEW_CONFLICT: 'nodalmerge.openMergeReviewConflict',
 } as const;
 
 export const HOST_BINARY_NAME = {

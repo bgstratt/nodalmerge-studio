@@ -218,6 +218,7 @@ public sealed class WorkSchedulerService : IWorkScheduler
             await _workspaces.CreateAsync(acquired.WorkUnitId, "main", acquired.SessionId, ct).ConfigureAwait(false);
 
             await UpdateWorkUnitStatusAsync(acquired.WorkUnitId, WorkUnitStatus.Executing, acquired.SessionId, ct).ConfigureAwait(false);
+            await SetCurrentStageAsync(acquired.WorkUnitId, acquired.ProfileId, ct).ConfigureAwait(false);
 
             return acquired;
         }
@@ -355,7 +356,7 @@ public sealed class WorkSchedulerService : IWorkScheduler
         if (chain.Any(a => a.Type == ArtifactType.BranchChangeset))
             return;
 
-        var seedBranch = unit.Metadata?.GetValueOrDefault(WorkUnitMetadataKeys.SeedFromBranchId) ?? "main";
+        var seedBranch = unit.FanOutInfo?.SeedFromBranchId ?? "main";
 
         string? diff;
         try
@@ -427,6 +428,27 @@ public sealed class WorkSchedulerService : IWorkScheduler
         {
             // Work unit not found (e.g. test fakes, or a debug-enqueued item with no real WorkUnit
             // record) — same best-effort reasoning as above.
+        }
+    }
+
+    // CurrentStage on lease acquisition mirrors the spawned agent's own profile stage (planner →
+    // Plan, worker → Execute, reviewer → Review, ...) rather than re-deriving it from artifacts —
+    // see plans/phase-4-fanout-merger.md's completion-pass note on Stage Authority Cleanup.
+    private async Task SetCurrentStageAsync(string workUnitId, string profileId, CancellationToken ct)
+    {
+        var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+        var profiles = _serviceProvider?.GetService(typeof(IAgentProfileService)) as IAgentProfileService;
+        if (workUnits is null || profiles is null)
+            return;
+
+        try
+        {
+            var profile = await profiles.GetAsync(profileId, ct).ConfigureAwait(false);
+            await workUnits.SetCurrentStageAsync(workUnitId, profile?.Stage, ct).ConfigureAwait(false);
+        }
+        catch (KeyNotFoundException)
+        {
+            // Best-effort, same reasoning as UpdateWorkUnitStatusAsync above.
         }
     }
 }

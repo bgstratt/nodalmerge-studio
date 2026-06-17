@@ -75,14 +75,13 @@ public sealed class AutomatedReviewGateService(
         if (parent is null)
             return new AutomatedRejectionResult(AutomatedRejectionOutcome.RetriedWorkers);
 
-        var metadata = new Dictionary<string, string>(parent.Metadata ?? new Dictionary<string, string>());
-        var previousCount = metadata.TryGetValue(WorkUnitMetadataKeys.AutomatedReviewRejectionCount, out var rawCount) &&
-                            int.TryParse(rawCount, out var parsed)
-            ? parsed
-            : 0;
+        var previousCount = parent.ExecutionInfo?.AutomatedReviewRejectionCount ?? 0;
         var rejectionCount = previousCount + 1;
-        metadata[WorkUnitMetadataKeys.AutomatedReviewRejectionCount] = rejectionCount.ToString();
-        await workUnits.CreateAsync(parent with { Metadata = metadata }, cancellationToken).ConfigureAwait(false);
+        var executionInfo = (parent.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with
+        {
+            AutomatedReviewRejectionCount = rejectionCount,
+        };
+        await workUnits.CreateAsync(parent with { ExecutionInfo = executionInfo }, cancellationToken).ConfigureAwait(false);
 
         if (rejectionCount >= InMemoryDeadLetterService.MaxFailureAttempts)
         {
@@ -140,6 +139,8 @@ public sealed class AutomatedReviewGateService(
         {
             await workUnits
                 .UpdateStatusAsync(parentWorkUnitId, WorkUnitStatus.Executing, sessionId, cancellationToken)
+                .ConfigureAwait(false);
+            await workUnits.SetCurrentStageAsync(parentWorkUnitId, PipelineStage.Execute, cancellationToken)
                 .ConfigureAwait(false);
         }
         catch (InvalidOperationException) { }

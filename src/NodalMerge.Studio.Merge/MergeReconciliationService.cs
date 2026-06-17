@@ -68,6 +68,8 @@ public sealed class MergeReconciliationService(
             {
                 await workUnits.UpdateStatusAsync(parent.WorkUnitId, WorkUnitStatus.Reviewing, sessionId, cancellationToken)
                     .ConfigureAwait(false);
+                await workUnits.SetCurrentStageAsync(parent.WorkUnitId, PipelineStage.Review, cancellationToken)
+                    .ConfigureAwait(false);
             }
             catch (InvalidOperationException) { }
 
@@ -134,6 +136,9 @@ public sealed class MergeReconciliationService(
 
         foreach (var id in constituentIds)
             await merge.SupersedeAsync(id, reconciledId, cancellationToken).ConfigureAwait(false);
+
+        await workUnits.SetCurrentStageAsync(parent.WorkUnitId, PipelineStage.Merge, cancellationToken)
+            .ConfigureAwait(false);
 
         return new MergeReconciliationResult(
             MergeReconciliationOutcome.Reconciled,

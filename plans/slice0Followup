@@ -1,0 +1,9 @@
+Slice 0: manual F5 extension-host click-through (user-side, cannot be automated here)
+Slice 0 verification complete.
+
+npm run typecheck: 2 errors, both confirmed pre-existing on unmodified master (verified via git stash -u) — LmApiProxy.ts:166 unrelated type issue, dag-replay/main.ts unused colors var. Neither caused by this work.
+npm run compile: clean, both bundles built (extension.js 119kb, dag-replay.js 26kb).
+Mechanical checks: all 4 view containerIds are distinct; the only duplicate id="..." across the 4 panel source files is the already-known btn-spawn (handled correctly by the per-view scoped $() lookup, not document.getElementById); extension.ts/package.json/constants.ts commands are consistent (5 commands, OPEN_STUDIO plus the two merge-review variants now route through StudioShellPanel.createOrShow + showTab).
+I can't launch the actual extension host UI from here, so I haven't visually confirmed tab switching, polling, or the DAG Replay bundle loading correctly under the shared nonce — that needs an F5 manual pass on your end. Everything mechanically verifiable (types, bundling, ID collisions, command wiring) checks out.
+
+Slice 0 is otherwise done. Ready to move to Slice 12a (Artifact Explorer) next, or would you like to do the F5 manual pass first and report back before I continue?

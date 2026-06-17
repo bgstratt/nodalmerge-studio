@@ -5,7 +5,7 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
-public sealed class OrchestrationDecisionLogService : IOrchestrationDecisionLogService
+public sealed class OrchestrationDecisionLogService : IOrchestrationDecisionLogService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, OrchestrationEvent> _decisionsById = new();
     // workUnitId → ordered list of eventIds
@@ -69,6 +69,24 @@ public sealed class OrchestrationDecisionLogService : IOrchestrationDecisionLogS
         }
 
         return ev;
+    }
+
+    public async Task RehydrateAsync(CancellationToken ct = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.OrchestrationEventV1, ct).ConfigureAwait(false);
+        foreach (var (_, payloadJson) in records)
+        {
+            var ev = JsonSerializer.Deserialize<OrchestrationEvent>(payloadJson);
+            if (ev is null || !_decisionsById.TryAdd(ev.EventId, ev))
+                continue;
+
+            lock (_indexLock)
+            {
+                if (!_byWorkUnit.TryGetValue(ev.WorkUnitId, out var list))
+                    _byWorkUnit[ev.WorkUnitId] = list = [];
+                list.Add(ev.EventId);
+            }
+        }
     }
 
     public Task<IReadOnlyList<OrchestrationEvent>> GetEventsAsync(string workUnitId, CancellationToken ct = default)

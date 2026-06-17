@@ -5,7 +5,7 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
-public sealed class ArtifactLineageService : IArtifactLineageService
+public sealed class ArtifactLineageService : IArtifactLineageService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, ArtifactRef> _byId = new();
     // workUnitId / parentArtifactId → ordered list of artifactIds
@@ -92,6 +92,17 @@ public sealed class ArtifactLineageService : IArtifactLineageService
             ct).ConfigureAwait(false);
 
         return updated;
+    }
+
+    public async Task RehydrateAsync(CancellationToken ct = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.ArtifactRefV1, ct).ConfigureAwait(false);
+        foreach (var (_, payloadJson) in records)
+        {
+            var artifact = JsonSerializer.Deserialize<ArtifactRef>(payloadJson);
+            if (artifact is not null && _byId.TryAdd(artifact.ArtifactId, artifact))
+                Index(artifact);
+        }
     }
 
     private IReadOnlyList<ArtifactRef> ResolveOrdered(ConcurrentDictionary<string, List<string>> index, string key)

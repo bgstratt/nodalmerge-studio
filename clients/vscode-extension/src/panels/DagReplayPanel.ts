@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { scopeViewCss } from './sharedWebviewChrome';
 
 interface WorkUnit {
   workUnitId: string;
@@ -8,51 +9,35 @@ interface WorkUnit {
   status: string;
 }
 
-export class DagReplayPanel implements vscode.Disposable {
-  static current: DagReplayPanel | undefined;
-  private static readonly viewType = 'nodalmerge.dagReplay';
+export class DagReplayPanel {
+  static readonly containerId = 'shell-pane-dag-replay';
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
-  private readonly extensionUri: vscode.Uri;
-  private readonly disposables: vscode.Disposable[] = [];
 
-  private constructor(
-    panel: vscode.WebviewPanel,
-    baseUrl: string,
-    extensionUri: vscode.Uri,
-  ) {
+  constructor(panel: vscode.WebviewPanel, baseUrl: string) {
     this.panel = panel;
     this.baseUrl = baseUrl;
-    this.extensionUri = extensionUri;
+  }
 
-    this.panel.webview.html = this.buildHtml();
-    this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
-    this.panel.webview.onDidReceiveMessage(
-      (msg: Record<string, unknown>) => { void this.handleMessage(msg); },
-      null,
-      this.disposables,
-    );
+  /** Called once by the shell right after construction — was the tail of createOrShow(). */
+  activate(): void {
     void this.init();
   }
 
-  static createOrShow(baseUrl: string, extensionUri: vscode.Uri): void {
-    if (DagReplayPanel.current) {
-      DagReplayPanel.current.panel.reveal(vscode.ViewColumn.Two);
-      void DagReplayPanel.current.init();
-      return;
-    }
-    const panel = vscode.window.createWebviewPanel(
-      DagReplayPanel.viewType,
-      'NodalMerge — DAG',
-      vscode.ViewColumn.Two,
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-        localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'out')],
-      },
-    );
-    DagReplayPanel.current = new DagReplayPanel(panel, baseUrl, extensionUri);
+  /** Slice 0 — unlike the 3 inline-HTML views, this one's JS is an external esbuild bundle
+   * (out/dag-replay.js, kept as-is — see main.ts for the one acquireVsCodeApi() change that
+   * was needed) loaded via its own nonced <script src>, not an inline <script> block. Its DOM
+   * ids (dag-svg, scrubber, ...) don't collide with any other view's, so unlike the other 3
+   * views this fragment's script is not root-scoped. */
+  static getFragment(webview: vscode.Webview, extensionUri: vscode.Uri, nonce: string):
+    { css: string; html: string; scriptTag: string } {
+    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'out', 'dag-replay.js'));
+    return {
+      css: scopeViewCss(DAG_REPLAY_CSS, DagReplayPanel.containerId),
+      html: `<div id="${DagReplayPanel.containerId}" class="nm-shell-pane">${DAG_REPLAY_HTML}</div>`,
+      scriptTag: `<script nonce="${nonce}" src="${scriptUri}"></script>`,
+    };
   }
 
   private async init(): Promise<void> {
@@ -74,7 +59,7 @@ export class DagReplayPanel implements vscode.Disposable {
     }
   }
 
-  private async handleMessage(msg: Record<string, unknown>): Promise<void> {
+  async handleMessage(msg: Record<string, unknown>): Promise<void> {
     if (msg.type === 'branchFromCursor') {
       const goal = await vscode.window.showInputBox({
         prompt:         'Goal for branch from cursor',
@@ -145,22 +130,9 @@ export class DagReplayPanel implements vscode.Disposable {
     return res.json() as Promise<T>;
   }
 
-  private buildHtml(): string {
-    const webview   = this.panel.webview;
-    const scriptUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, 'out', 'dag-replay.js'),
-    );
-    const csp = webview.cspSource;
+}
 
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy"
-        content="default-src 'none'; script-src ${csp}; connect-src ws://127.0.0.1:*; style-src 'unsafe-inline';">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NodalMerge — DAG</title>
-  <style>
+const DAG_REPLAY_CSS = `
     :root {
       --nm-bg:     var(--vscode-editor-background);
       --nm-fg:     var(--vscode-editor-foreground);
@@ -184,7 +156,7 @@ export class DagReplayPanel implements vscode.Disposable {
       background: var(--nm-bg); color: var(--nm-fg);
       font-family: var(--nm-font); font-size: var(--nm-size);
       margin: 0; padding: 0;
-      display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+      display: flex; flex-direction: column; overflow: hidden;
     }
     #toolbar {
       display: flex; align-items: center; gap: 10px;
@@ -226,9 +198,9 @@ export class DagReplayPanel implements vscode.Disposable {
     #btn-branch:hover { filter: brightness(1.15); }
     #btn-kgs    { background: #4dac26; }
     #btn-kgs:hover    { filter: brightness(1.15); }
-  </style>
-</head>
-<body>
+`;
+
+const DAG_REPLAY_HTML = `
   <div id="toolbar">
     <span class="toolbar-title">DAG Replay</span>
     <span id="status-dot" class="status-dot"></span>
@@ -249,15 +221,4 @@ export class DagReplayPanel implements vscode.Disposable {
     <button id="btn-branch">⎇ Branch from here</button>
     <button id="btn-kgs">📌 Mark Known Good</button>
   </div>
-  <script src="${scriptUri}"></script>
-</body>
-</html>`;
-  }
-
-  dispose(): void {
-    DagReplayPanel.current = undefined;
-    this.panel.dispose();
-    for (const d of this.disposables) { d.dispose(); }
-    this.disposables.length = 0;
-  }
-}
+`;

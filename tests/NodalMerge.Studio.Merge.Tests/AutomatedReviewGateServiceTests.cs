@@ -27,7 +27,7 @@ public class AutomatedReviewGateServiceTests
         Assert.Equal(AutomatedRejectionOutcome.RetriedWorkers, result.Outcome);
         Assert.Contains((childId, WorkUnitStatus.Queued), workUnits.StatusCalls);
         Assert.Contains((parentId, WorkUnitStatus.Executing), workUnits.StatusCalls);
-        Assert.Equal("1", workUnits.Units[parentId].Metadata![WorkUnitMetadataKeys.AutomatedReviewRejectionCount]);
+        Assert.Equal(1, workUnits.Units[parentId].ExecutionInfo!.AutomatedReviewRejectionCount);
         Assert.Contains((childId, "worker"), scheduler.Enqueued);
     }
 
@@ -42,10 +42,7 @@ public class AutomatedReviewGateServiceTests
             MakeUnit(
                 parentId,
                 WorkUnitStatus.Proposed,
-                metadata: new Dictionary<string, string>
-                {
-                    [WorkUnitMetadataKeys.AutomatedReviewRejectionCount] = "2",
-                }),
+                executionInfo: new WorkUnitExecutionInfo(FailureAttemptCount: 0, AutomatedReviewRejectionCount: 2)),
             MakeUnit(childId, WorkUnitStatus.Proposed, parentId));
 
         var merge = new FakeMergeService(MakeRejectedProposal(proposalId, "Still broken."));
@@ -67,7 +64,7 @@ public class AutomatedReviewGateServiceTests
         string id,
         WorkUnitStatus status,
         string? parentId = null,
-        Dictionary<string, string>? metadata = null) =>
+        WorkUnitExecutionInfo? executionInfo = null) =>
         new(
             id,
             "goal",
@@ -78,10 +75,11 @@ public class AutomatedReviewGateServiceTests
             "owner",
             null,
             null,
-            metadata,
+            null,
             parentId,
             [],
-            []);
+            [],
+            ExecutionInfo: executionInfo);
 
     private static MergeProposal MakeRejectedProposal(string proposalId, string reason = "Missing required file.") =>
         new(
@@ -290,6 +288,15 @@ public class AutomatedReviewGateServiceTests
         {
             StatusCalls.Add((workUnitId, status));
             Units[workUnitId] = Units[workUnitId] with { Status = status };
+            return Task.FromResult(Units[workUnitId]);
+        }
+
+        public Task<WorkUnit> SetCurrentStageAsync(
+            string workUnitId,
+            PipelineStage? stage,
+            CancellationToken cancellationToken = default)
+        {
+            Units[workUnitId] = Units[workUnitId] with { CurrentStage = stage };
             return Task.FromResult(Units[workUnitId]);
         }
 

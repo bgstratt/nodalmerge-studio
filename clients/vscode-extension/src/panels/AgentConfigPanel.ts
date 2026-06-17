@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import type { AgentConfigService, AgentProfile, TopologyTemplate } from '../AgentConfigService';
+import { scopeViewCss, wrapViewScript } from './sharedWebviewChrome';
 
 export interface PipelineProfile {
   agentProfileId: string;
@@ -10,18 +11,16 @@ export interface PipelineProfile {
   maxIterations: number;
 }
 
-export class AgentConfigPanel implements vscode.Disposable {
-  static current: AgentConfigPanel | undefined;
-  private static readonly viewType = 'nodalmerge.agentConfig';
+export class AgentConfigPanel {
+  static readonly containerId = 'shell-pane-agent-config';
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
   private readonly configService: AgentConfigService;
   private readonly secrets: vscode.SecretStorage;
   private readonly lmProxyBaseUrl: string;
-  private readonly disposables: vscode.Disposable[] = [];
 
-  private constructor(
+  constructor(
     panel: vscode.WebviewPanel,
     baseUrl: string,
     configService: AgentConfigService,
@@ -33,35 +32,19 @@ export class AgentConfigPanel implements vscode.Disposable {
     this.configService  = configService;
     this.secrets        = secrets;
     this.lmProxyBaseUrl = lmProxyBaseUrl;
+  }
 
-    this.panel.webview.html = buildHtml();
-    this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
-    this.panel.webview.onDidReceiveMessage(
-      (msg: Record<string, unknown>) => { void this.handleMessage(msg); },
-      null,
-      this.disposables,
-    );
+  /** Called once by the shell right after construction — was the tail of createOrShow(). */
+  activate(): void {
     void this.sendConfig();
   }
 
-  static createOrShow(
-    baseUrl: string,
-    configService: AgentConfigService,
-    secrets: vscode.SecretStorage,
-    lmProxyBaseUrl: string,
-  ): void {
-    if (AgentConfigPanel.current) {
-      AgentConfigPanel.current.panel.reveal(vscode.ViewColumn.Two);
-      void AgentConfigPanel.current.sendConfig();
-      return;
-    }
-    const panel = vscode.window.createWebviewPanel(
-      AgentConfigPanel.viewType,
-      'NodalMerge — Agent Config',
-      vscode.ViewColumn.Two,
-      { enableScripts: true, retainContextWhenHidden: true },
-    );
-    AgentConfigPanel.current = new AgentConfigPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
+  static getFragment(): { css: string; html: string; script: string } {
+    return {
+      css: scopeViewCss(AGENT_CONFIG_CSS, AgentConfigPanel.containerId),
+      html: `<div id="${AgentConfigPanel.containerId}" class="nm-shell-pane">${AGENT_CONFIG_HTML}</div>`,
+      script: wrapViewScript(AGENT_CONFIG_JS, AgentConfigPanel.containerId),
+    };
   }
 
   private async sendConfig(): Promise<void> {
@@ -78,7 +61,7 @@ export class AgentConfigPanel implements vscode.Disposable {
     });
   }
 
-  private async handleMessage(msg: Record<string, unknown>): Promise<void> {
+  async handleMessage(msg: Record<string, unknown>): Promise<void> {
     switch (msg.type as string) {
       case 'saveProfiles':
         await this.configService.saveProfiles(msg.profiles as AgentProfile[]);
@@ -255,47 +238,9 @@ export class AgentConfigPanel implements vscode.Disposable {
     return res.json() as Promise<T>;
   }
 
-  dispose(): void {
-    AgentConfigPanel.current = undefined;
-    this.panel.dispose();
-    for (const d of this.disposables) { d.dispose(); }
-    this.disposables.length = 0;
-  }
 }
 
 // ── HTML builder ───────────────────────────────────────────────────────────
-
-function buildNonce(): string {
-  let text = '';
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  for (let i = 0; i < 32; i++) { text += chars[Math.floor(Math.random() * chars.length)]; }
-  return text;
-}
-
-function buildHtml(): string {
-  const n = buildNonce();
-  return [
-    '<!DOCTYPE html>',
-    '<html lang="en">',
-    '<head>',
-    '  <meta charset="UTF-8">',
-    '  <meta http-equiv="Content-Security-Policy"',
-    '        content="default-src \'none\'; style-src \'nonce-' + n + '\'; script-src \'nonce-' + n + '\';">',
-    '  <meta name="viewport" content="width=device-width, initial-scale=1.0">',
-    '  <title>Agent Config</title>',
-    '  <style nonce="' + n + '">',
-    AGENT_CONFIG_CSS,
-    '  </style>',
-    '</head>',
-    '<body>',
-    AGENT_CONFIG_HTML,
-    '<script nonce="' + n + '">',
-    AGENT_CONFIG_JS,
-    '</script>',
-    '</body>',
-    '</html>',
-  ].join('\n');
-}
 
 const AGENT_CONFIG_CSS = `
   :root {

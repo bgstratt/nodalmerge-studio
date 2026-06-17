@@ -5,7 +5,7 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
-public sealed class IntentGraphService : IIntentGraphService
+public sealed class IntentGraphService : IIntentGraphService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, ChangeIntent> _byId = new();
     private readonly ConcurrentDictionary<string, List<string>> _byWorkUnit = new();
@@ -85,6 +85,26 @@ public sealed class IntentGraphService : IIntentGraphService
             .ToList();
 
         return Task.FromResult<IReadOnlyList<ChangeIntent>>(overlapping);
+    }
+
+    public async Task RehydrateAsync(CancellationToken ct = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.ChangeIntentV1, ct).ConfigureAwait(false);
+        foreach (var (_, payloadJson) in records)
+        {
+            var intent = JsonSerializer.Deserialize<ChangeIntent>(payloadJson);
+            // RemoveIntentAsync overwrites a removed intent's node with a {"removed":true}
+            // tombstone — that deserializes to a ChangeIntent with null IntentId, which is how
+            // a removed intent is recognized and skipped here rather than resurrected.
+            if (intent?.IntentId is null || !_byId.TryAdd(intent.IntentId, intent))
+                continue;
+
+            lock (_indexLock)
+            {
+                Add(_byWorkUnit, intent.WorkUnitId, intent.IntentId);
+                Add(_byTargetPath, Normalize(intent.TargetPath), intent.IntentId);
+            }
+        }
     }
 
     public async Task RemoveIntentAsync(string intentId, CancellationToken ct = default)

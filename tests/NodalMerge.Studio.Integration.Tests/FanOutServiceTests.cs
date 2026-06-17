@@ -60,8 +60,8 @@ public class FanOutServiceTests
         Assert.Single(result.EnqueuedWorkUnitIds);
 
         var children = await workUnits.GetChildrenAsync(parent.WorkUnitId);
-        var s1 = children.Single(c => c.Metadata?[WorkUnitMetadataKeys.SliceId] == "s1");
-        var s2 = children.Single(c => c.Metadata?[WorkUnitMetadataKeys.SliceId] == "s2");
+        var s1 = children.Single(c => c.FanOutInfo?.SliceId == "s1");
+        var s2 = children.Single(c => c.FanOutInfo?.SliceId == "s2");
 
         Assert.Equal(WorkUnitStatus.Queued, s1.Status);
         Assert.Equal(WorkUnitStatus.Created, s2.Status);

@@ -22,6 +22,7 @@ internal sealed class OrchestratorAgentLoop(
     IFanOutService fanOut,
     IMergeReconciliationService mergeReconciliation,
     IAutomatedReviewGateService automatedReview,
+    IWorkUnitService workUnits,
     AgentProfile? profile = null,
     string? sessionId = null)
 {
@@ -163,8 +164,12 @@ internal sealed class OrchestratorAgentLoop(
     private async Task RecordDecisionAsync(
         OrchestrationAction action, IReadOnlyList<string> spawnedIds, string? reason, CancellationToken ct)
     {
-        var chain = await artifactLineage.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
-        var stage = InferStage(chain);
+        // CurrentStage is the orchestrator's own work unit's stage (authoritative, set by the
+        // scheduler/merge pipeline) — not derived from artifact presence. For a root orchestrator
+        // work unit that never goes through the scheduler itself, this is null, so the decision
+        // log correctly reads "Orchestrate" rather than guessing at a child's progress.
+        var unit = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+        var stage = unit?.CurrentStage ?? PipelineStage.Orchestrate;
 
         var projection = await projections.GetAsync(
             new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal, WorkUnitId: workUnitId, AgentId: agentId),
@@ -172,19 +177,6 @@ internal sealed class OrchestratorAgentLoop(
 
         await decisionLog.RecordAsync(
             workUnitId, agentId, stage, projection.DataJson, action, spawnedIds, reason, sessionId, ct).ConfigureAwait(false);
-    }
-
-    private static PipelineStage InferStage(IReadOnlyList<ArtifactRef> chain)
-    {
-        var proposal = chain.LastOrDefault(a => a.Type == ArtifactType.MergeProposal);
-        if (proposal is not null)
-        {
-            return proposal.Status is ArtifactStatus.Approved or ArtifactStatus.Applied
-                ? PipelineStage.Merge
-                : PipelineStage.Review;
-        }
-
-        return chain.Any(a => a.Type == ArtifactType.Task) ? PipelineStage.Execute : PipelineStage.Plan;
     }
 
     private static string? ExtractSpawnedId(OrchestrationAction action, string resultJson)

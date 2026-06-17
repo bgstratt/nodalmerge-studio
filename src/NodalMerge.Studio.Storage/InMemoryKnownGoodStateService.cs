@@ -5,7 +5,7 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
-internal sealed class InMemoryKnownGoodStateService : IKnownGoodStateService
+internal sealed class InMemoryKnownGoodStateService : IKnownGoodStateService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, KnownGoodState> _states = new();
     private readonly IStudioNodeStore _nodeStore;
@@ -39,5 +39,17 @@ internal sealed class InMemoryKnownGoodStateService : IKnownGoodStateService
     {
         _states.TryGetValue(stateId, out var state);
         return Task.FromResult(state);
+    }
+
+    public async Task RehydrateAsync(CancellationToken cancellationToken = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.KnownGoodStateV1, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var (entityId, payloadJson) in records)
+        {
+            var state = JsonSerializer.Deserialize<KnownGoodState>(payloadJson);
+            if (state is not null)
+                _states[entityId] = state;
+        }
     }
 }

@@ -20,6 +20,9 @@ appsettings.*.local.json
 # Local artifacts
 artifacts/
 
+# Studio Host runtime data — Sqlite node store + file blob store (Slice 0a persistence)
+src/NodalMerge.Studio.Host/data/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -85,7 +85,7 @@ public class ProposalBranchingTests
             branchedFromProposalId: "MP-1");
 
         Assert.Equal(origin.WorkUnitId, branched.ParentWorkUnitId);
-        Assert.Equal("MP-1", branched.Metadata?["branchedFromProposalId"]);
+        Assert.Equal("MP-1", branched.BranchedFromProposalId);
         // Branched work unit starts from main's pre-proposal state, not origin's in-progress branch.
         Assert.False(await fileWorkspace.ExistsAsync(branched.BranchId, "src/feature.cs"));
 
@@ -166,9 +166,9 @@ public class ProposalBranchingTests
         Assert.Equal(ArtifactStatus.Approved, proposalRef.Status);
 
         var children = await workUnits.GetChildrenAsync(origin.WorkUnitId);
-        var branches = children.Where(c => c.Metadata?.ContainsKey("branchedFromProposalId") == true).ToList();
+        var branches = children.Where(c => c.BranchedFromProposalId is not null).ToList();
         Assert.Single(branches);
         Assert.Equal(branched.WorkUnitId, branches[0].WorkUnitId);
-        Assert.Equal("MP-1", branches[0].Metadata!["branchedFromProposalId"]);
+        Assert.Equal("MP-1", branches[0].BranchedFromProposalId);
     }
 }

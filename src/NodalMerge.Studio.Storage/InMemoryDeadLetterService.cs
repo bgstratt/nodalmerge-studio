@@ -12,7 +12,7 @@ public sealed class InMemoryDeadLetterService(
     IWorkScheduler scheduler,
     IAgentControlService agentControl,
     IOrchestrationDecisionLogService decisionLog,
-    IProjectionManager projections) : IDeadLetterService
+    IProjectionManager projections) : IDeadLetterService, IRehydratable
 {
     public const int MaxFailureAttempts = 3;
 
@@ -32,15 +32,14 @@ public sealed class InMemoryDeadLetterService(
         var unit = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false)
             ?? throw new KeyNotFoundException($"Work unit '{workUnitId}' was not found.");
 
-        var metadata = new Dictionary<string, string>(unit.Metadata ?? new Dictionary<string, string>());
-        var previousCount = metadata.TryGetValue(WorkUnitMetadataKeys.FailureAttemptCount, out var rawCount) &&
-                            int.TryParse(rawCount, out var parsed)
-            ? parsed
-            : 0;
+        var previousCount = unit.ExecutionInfo?.FailureAttemptCount ?? 0;
         var attemptCount = previousCount + 1;
-        metadata[WorkUnitMetadataKeys.FailureAttemptCount] = attemptCount.ToString();
+        var executionInfo = (unit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with
+        {
+            FailureAttemptCount = attemptCount,
+        };
 
-        var updatedUnit = unit with { Metadata = metadata };
+        var updatedUnit = unit with { ExecutionInfo = executionInfo };
         await workUnits.CreateAsync(updatedUnit, cancellationToken).ConfigureAwait(false);
 
         var snapshot = lastProjectionSnapshot ?? await TryCaptureProjectionAsync(workUnitId, cancellationToken)
@@ -70,6 +69,7 @@ public sealed class InMemoryDeadLetterService(
         {
             await workUnits.UpdateStatusAsync(workUnitId, WorkUnitStatus.DeadLettered, sessionId, cancellationToken)
                 .ConfigureAwait(false);
+            await workUnits.SetCurrentStageAsync(workUnitId, stage, cancellationToken).ConfigureAwait(false);
         }
         catch (InvalidOperationException) { }
 
@@ -133,6 +133,7 @@ public sealed class InMemoryDeadLetterService(
             await workUnits
                 .UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Retrying, null, cancellationToken)
                 .ConfigureAwait(false);
+            await workUnits.SetCurrentStageAsync(entry.WorkUnitId, entry.Stage, cancellationToken).ConfigureAwait(false);
         }
         catch (InvalidOperationException) { }
 
@@ -148,6 +149,18 @@ public sealed class InMemoryDeadLetterService(
             ct: cancellationToken).ConfigureAwait(false);
 
         return new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried);
+    }
+
+    public async Task RehydrateAsync(CancellationToken cancellationToken = default)
+    {
+        var records = await nodeStore.ReadAllNodesAsync(StudioNodeKind.DeadLetterV1, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var (entityId, payloadJson) in records)
+        {
+            var entry = JsonSerializer.Deserialize<DeadLetterEntry>(payloadJson);
+            if (entry is not null)
+                _entries[entityId] = entry;
+        }
     }
 
     private async Task<string?> TryCaptureProjectionAsync(string workUnitId, CancellationToken ct)

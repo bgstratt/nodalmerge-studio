@@ -2,6 +2,7 @@ using Microsoft.Extensions.DependencyInjection;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Host;
+using NodalMerge.Studio.Merge;
 using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Integration.Tests;
@@ -69,5 +70,64 @@ public class MergeReconciliationServiceTests
         var fileChanges = await review.GetFileChangesAsync(reconciled.ProposalId);
         Assert.Equal(2, fileChanges.Count);
         Assert.All(fileChanges, fc => Assert.False(string.IsNullOrEmpty(fc.AfterContent)));
+    }
+
+    [Fact]
+    public async Task TryReconcile_writes_conflict_report_on_overlapping_files()
+    {
+        var app = StudioWebApplication.Build([], configureServices: s => s.AddInMemoryStorage());
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var workUnits    = app.Services.GetRequiredService<IWorkUnitService>();
+        var merge        = app.Services.GetRequiredService<IMergeService>();
+        var artifacts    = app.Services.GetRequiredService<IArtifactLineageService>();
+        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var reconciliation = app.Services.GetRequiredService<IMergeReconciliationService>();
+
+        var parent = await orchestrator.CreateWorkUnitAsync("parent goal", "test");
+        var child1 = await orchestrator.CreateWorkUnitAsync(
+            "slice one", "test", parentWorkUnitId: parent.WorkUnitId, fileScope: ["src/Shared.cs"]);
+        var child2 = await orchestrator.CreateWorkUnitAsync(
+            "slice two", "test", parentWorkUnitId: parent.WorkUnitId, fileScope: ["src/Shared.cs"]);
+
+        await fileWorkspace.WriteAsync(child1.BranchId, "src/Shared.cs", "class Shared { /* v1 */ }", CancellationToken.None);
+        await fileWorkspace.WriteAsync(child2.BranchId, "src/Shared.cs", "class Shared { /* v2 */ }", CancellationToken.None);
+
+        async Task<string> ProposeChildAsync(WorkUnit child, string file)
+        {
+            var id = $"MP-{Guid.NewGuid():N}";
+            var proposal = new MergeProposal(
+                id, child.BranchId, "main", child.Goal, $"add {file}", $"add {file}",
+                null, null, null, MergeProposalStatus.Draft,
+                FilesTouched: [file], WorkUnitId: child.WorkUnitId);
+            await merge.ProposeAsync(proposal);
+            await merge.ValidateAsync(id);
+            await artifacts.RecordAsync(new ArtifactRef(
+                id, ArtifactType.MergeProposal, child.WorkUnitId, ArtifactStatus.Active,
+                DateTimeOffset.UtcNow, child.WorkUnitId, null));
+            await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Queued);
+            await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Executing);
+            await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Proposed);
+            return id;
+        }
+
+        var p1 = await ProposeChildAsync(child1, "src/Shared.cs");
+        var p2 = await ProposeChildAsync(child2, "src/Shared.cs");
+
+        var result = await reconciliation.TryReconcileAsync(parent.WorkUnitId);
+
+        Assert.Equal(MergeReconciliationOutcome.Conflict, result.Outcome);
+        Assert.Null(result.ReconciledProposalId);
+        Assert.Equal(MergeReconciliationService.ConflictReportFileName, result.ConflictReportPath);
+
+        var parentAfter = await workUnits.GetAsync(parent.WorkUnitId);
+        Assert.Equal(WorkUnitStatus.Reviewing, parentAfter!.Status);
+        Assert.Equal(PipelineStage.Review, parentAfter.CurrentStage);
+
+        Assert.True(await fileWorkspace.ExistsAsync(parent.BranchId, MergeReconciliationService.ConflictReportFileName));
+        var report = await fileWorkspace.ReadAsync(parent.BranchId, MergeReconciliationService.ConflictReportFileName);
+        Assert.Contains("src/Shared.cs", report);
+        Assert.Contains(p1, report);
+        Assert.Contains(p2, report);
     }
 }

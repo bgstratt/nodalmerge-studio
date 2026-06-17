@@ -291,6 +291,7 @@ internal sealed class McpToolDispatcher(
             try
             {
                 await workUnits.UpdateStatusAsync(workUnitId, WorkUnitStatus.Proposed, sessionId, ct).ConfigureAwait(false);
+                await workUnits.SetCurrentStageAsync(workUnitId, PipelineStage.Review, ct).ConfigureAwait(false);
             }
             catch (InvalidOperationException) { }
             catch (KeyNotFoundException) { }

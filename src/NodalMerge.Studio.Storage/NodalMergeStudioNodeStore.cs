@@ -40,6 +40,27 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore
         return latest is null ? null : Encoding.UTF8.GetString(latest.Payload);
     }
 
+    public async Task<IReadOnlyList<(string EntityId, string PayloadJson)>> ReadAllNodesAsync(
+        string kind, CancellationToken cancellationToken = default)
+    {
+        var snapshot = await _nodeStore.LoadRoomSnapshotAsync(StudioRoomId, cancellationToken).ConfigureAwait(false);
+        if (snapshot is null || snapshot.Nodes.Count == 0)
+            return [];
+
+        var kindPrefix = $"studio:{kind}:";
+        return snapshot.Nodes
+            .Where(n => n.NodeIdHex.StartsWith(kindPrefix, StringComparison.Ordinal)
+                     && string.Equals(n.PayloadKind, StudioPayloadKind, StringComparison.Ordinal))
+            // Node IDs are "studio:{kind}:{entityId}:{ticksD20}" — the trailing ":" + 20 digits
+            // is always exactly 21 characters, so stripping it back off the suffix recovers
+            // entityId even though entityId itself may contain "/" (e.g. "base/MP-1").
+            .Select(n => (EntityId: n.NodeIdHex[kindPrefix.Length..^21], Node: n))
+            .GroupBy(x => x.EntityId)
+            .Select(g => g.OrderByDescending(x => x.Node.AcceptedAtUtc ?? DateTimeOffset.MinValue).First())
+            .Select(x => (x.EntityId, PayloadJson: Encoding.UTF8.GetString(x.Node.Payload)))
+            .ToList();
+    }
+
     internal static string BuildNodeIdPrefix(string kind, string entityId) =>
         $"studio:{kind}:{entityId}:";
 

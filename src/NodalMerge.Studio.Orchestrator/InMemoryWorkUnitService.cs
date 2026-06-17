@@ -7,7 +7,7 @@ using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Orchestrator;
 
-public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorService, IWorkspaceService
+public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorService, IWorkspaceService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, WorkUnit> _workUnits = new();
     private readonly IBranchService _branchService;
@@ -102,6 +102,23 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return updated;
     }
 
+    public async Task<WorkUnit> SetCurrentStageAsync(
+        string workUnitId,
+        PipelineStage? stage,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        var updated = workUnit with { CurrentStage = stage, UpdatedAt = DateTimeOffset.UtcNow };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
     public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default)
     {
         _workUnits.TryGetValue(workUnitId, out var workUnit);
@@ -128,6 +145,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IReadOnlyList<string>? fileScope = null,
         string? seedFromBranchId = null,
         string? branchedFromProposalId = null,
+        string? sliceId = null,
         IReadOnlyDictionary<string, string>? metadata = null,
         CancellationToken cancellationToken = default)
     {
@@ -142,19 +160,9 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             .CreateBranchAsync($"work-{Guid.NewGuid():N}", seedFromBranchId, cancellationToken)
             .ConfigureAwait(false);
 
-        IReadOnlyDictionary<string, string>? workUnitMetadata = branchedFromProposalId is not null
-            ? new Dictionary<string, string> { ["branchedFromProposalId"] = branchedFromProposalId }
+        var fanOutInfo = sliceId is not null || seedFromBranchId is not null
+            ? new WorkUnitFanOutInfo(sliceId, seedFromBranchId)
             : null;
-
-        if (workUnitMetadata is Dictionary<string, string> dict && metadata is not null)
-        {
-            foreach (var (key, value) in metadata)
-                dict[key] = value;
-        }
-        else if (metadata is not null)
-        {
-            workUnitMetadata = new Dictionary<string, string>(metadata);
-        }
 
         var now = DateTimeOffset.UtcNow;
         var workUnit = new WorkUnit(
@@ -167,10 +175,12 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             Owner: owner,
             AssignedAgent: null,
             SuccessCriteria: successCriteria,
-            Metadata: workUnitMetadata,
+            Metadata: metadata,
             ParentWorkUnitId: parentWorkUnitId,
             DependsOn: dependsOn ?? [],
-            FileScope: fileScope ?? []);
+            FileScope: fileScope ?? [],
+            FanOutInfo: fanOutInfo,
+            BranchedFromProposalId: branchedFromProposalId);
 
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }
@@ -251,6 +261,21 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return Task.FromResult<IReadOnlyList<WorkUnit>>(dependents);
     }
 
+    // Slice 0a — bypasses CreateAsync's parent-existence check (children can be loaded before
+    // their parents) and never re-emits artifacts/events; just repopulates the dictionary from
+    // what was already durably written.
+    public async Task RehydrateAsync(CancellationToken cancellationToken = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.WorkUnitV1, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var (entityId, payloadJson) in records)
+        {
+            var workUnit = JsonSerializer.Deserialize<WorkUnit>(payloadJson);
+            if (workUnit is not null)
+                _workUnits[entityId] = workUnit;
+        }
+    }
+
     private WorkUnit GetRequired(string workUnitId)
     {
         if (!_workUnits.TryGetValue(workUnitId, out var workUnit))
@@ -278,6 +303,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IWorkUnitService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IOrchestratorService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IWorkspaceService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IFanOutService, FanOutService>();
         return services;
     }

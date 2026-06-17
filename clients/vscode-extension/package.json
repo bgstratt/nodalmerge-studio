@@ -22,20 +22,16 @@
         "title": "NodalMerge: Show Output"
       },
       {
-        "command": "nodalmerge.openDashboard",
-        "title": "NodalMerge: Open Workspace Dashboard"
+        "command": "nodalmerge.openStudio",
+        "title": "NodalMerge: Open Studio"
       },
       {
         "command": "nodalmerge.openMergeReview",
         "title": "NodalMerge: Open Merge Review"
       },
       {
-        "command": "nodalmerge.openDagReplay",
-        "title": "NodalMerge: Open DAG Replay"
-      },
-      {
-        "command": "nodalmerge.openAgentConfig",
-        "title": "NodalMerge: Open Agent Config"
+        "command": "nodalmerge.openMergeReviewConflict",
+        "title": "NodalMerge: Open Merge Conflict"
       }
     ],
     "configuration": {

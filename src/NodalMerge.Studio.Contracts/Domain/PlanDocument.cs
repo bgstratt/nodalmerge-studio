@@ -19,11 +19,3 @@ public static class PlanDocumentPaths
 {
     public const string FileName = "plan.json";
 }
-
-public static class WorkUnitMetadataKeys
-{
-    public const string SliceId = "sliceId";
-    public const string SeedFromBranchId = "seedFromBranchId";
-    public const string FailureAttemptCount = "failureAttemptCount";
-    public const string AutomatedReviewRejectionCount = "automatedReviewRejectionCount";
-}

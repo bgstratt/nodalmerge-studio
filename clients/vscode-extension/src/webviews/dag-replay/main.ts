@@ -26,8 +26,10 @@ const btnKgs      = document.getElementById('btn-kgs')     as HTMLButtonElement;
 
 // ── vscode API (only available inside WebView) ─────────────────────────────
 
-declare function acquireVsCodeApi(): { postMessage(msg: unknown): void };
-const vscode = acquireVsCodeApi();
+// Slice 0 — the Studio Shell calls acquireVsCodeApi() exactly once (in its own bootstrap
+// script, which runs before this bundle's <script> tag in document order) and exposes the
+// result here, since calling acquireVsCodeApi() a second time in the same webview throws.
+const vscode = (window as unknown as { __nmVscode: { postMessage(msg: unknown): void } }).__nmVscode;
 
 // ── Dispatch + render ──────────────────────────────────────────────────────
 

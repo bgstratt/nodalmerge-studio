@@ -8,7 +8,7 @@ using TaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.Tasks;
 
-public sealed class InMemoryTaskService : ITaskService
+public sealed class InMemoryTaskService : ITaskService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, StudioTask> _tasks = new();
     private readonly IWorkUnitService _workUnits;
@@ -91,6 +91,18 @@ public sealed class InMemoryTaskService : ITaskService
         return updated;
     }
 
+    public async Task RehydrateAsync(CancellationToken cancellationToken = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.TaskV1, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var (entityId, payloadJson) in records)
+        {
+            var task = JsonSerializer.Deserialize<StudioTask>(payloadJson);
+            if (task is not null)
+                _tasks[entityId] = task;
+        }
+    }
+
     private StudioTask GetRequired(string taskId)
     {
         if (!_tasks.TryGetValue(taskId, out var task))
@@ -103,7 +115,9 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddStudioTasks(this IServiceCollection services)
     {
-        services.AddSingleton<ITaskService, InMemoryTaskService>();
+        services.AddSingleton<InMemoryTaskService>();
+        services.AddSingleton<ITaskService>(sp => sp.GetRequiredService<InMemoryTaskService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryTaskService>());
         return services;
     }
 }

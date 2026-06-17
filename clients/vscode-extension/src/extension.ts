@@ -1,9 +1,7 @@
 import * as vscode from 'vscode';
 import { HostManager } from './HostManager';
-import { WorkspaceDashboardPanel } from './panels/WorkspaceDashboardPanel';
+import { StudioShellPanel } from './panels/StudioShellPanel';
 import { MergeReviewPanel } from './panels/MergeReviewPanel';
-import { DagReplayPanel } from './panels/DagReplayPanel';
-import { AgentConfigPanel } from './panels/AgentConfigPanel';
 import { NotificationManager } from './NotificationManager';
 import { AgentConfigService } from './AgentConfigService';
 import { LmApiProxy } from './LmApiProxy';
@@ -41,22 +39,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       output.show();
     }),
 
-    vscode.commands.registerCommand(COMMANDS.OPEN_DASHBOARD, () => {
-      WorkspaceDashboardPanel.createOrShow(
-        manager.hostBaseUrl, notificationManager, agentConfig, context.secrets, lmProxy.baseUrl,
+    vscode.commands.registerCommand(COMMANDS.OPEN_STUDIO, () => {
+      StudioShellPanel.createOrShow(
+        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
       );
     }),
 
+    // Notification click-through and dead-letter "review" actions open the shell (creating it
+    // if needed) and switch it to the Merge Review tab, instead of a standalone panel.
     vscode.commands.registerCommand(COMMANDS.OPEN_MERGE_REVIEW, (proposalId: string) => {
-      MergeReviewPanel.createOrShow(manager.hostBaseUrl, proposalId);
+      const shell = StudioShellPanel.createOrShow(
+        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
+      );
+      shell.showTab(MergeReviewPanel.containerId);
+      shell.mergeReview.loadProposal(proposalId);
     }),
 
-    vscode.commands.registerCommand(COMMANDS.OPEN_DAG_REPLAY, () => {
-      DagReplayPanel.createOrShow(manager.hostBaseUrl, context.extensionUri);
-    }),
-
-    vscode.commands.registerCommand(COMMANDS.OPEN_AGENT_CONFIG, () => {
-      AgentConfigPanel.createOrShow(manager.hostBaseUrl, agentConfig, context.secrets, lmProxy.baseUrl);
+    vscode.commands.registerCommand(COMMANDS.OPEN_MERGE_REVIEW_CONFLICT, (workUnitId: string) => {
+      const shell = StudioShellPanel.createOrShow(
+        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
+      );
+      shell.showTab(MergeReviewPanel.containerId);
+      shell.mergeReview.loadConflict(workUnitId);
     }),
   );
 

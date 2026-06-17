@@ -137,8 +137,8 @@ public sealed class FanOutService : IFanOutService
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var child in children)
         {
-            if (child.Metadata?.TryGetValue(WorkUnitMetadataKeys.SliceId, out var sliceId) == true &&
-                !string.IsNullOrEmpty(sliceId))
+            var sliceId = child.FanOutInfo?.SliceId;
+            if (!string.IsNullOrEmpty(sliceId))
             {
                 map[sliceId] = child.WorkUnitId;
             }
@@ -175,12 +175,6 @@ public sealed class FanOutService : IFanOutService
                     .Select(dep => sliceIdToWorkUnitId[dep])
                     .ToList();
 
-                var metadata = new Dictionary<string, string>
-                {
-                    [WorkUnitMetadataKeys.SliceId] = slice.SliceId,
-                    [WorkUnitMetadataKeys.SeedFromBranchId] = parent.BranchId,
-                };
-
                 var child = await _orchestrator.CreateWorkUnitAsync(
                     slice.Goal,
                     parent.Owner,
@@ -188,7 +182,7 @@ public sealed class FanOutService : IFanOutService
                     dependsOn: resolvedDeps,
                     fileScope: slice.FileScope,
                     seedFromBranchId: parent.BranchId,
-                    metadata: metadata,
+                    sliceId: slice.SliceId,
                     cancellationToken: ct).ConfigureAwait(false);
 
                 sliceIdToWorkUnitId[slice.SliceId] = child.WorkUnitId;

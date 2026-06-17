@@ -394,9 +394,10 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var fanOut = _serviceProvider.GetRequiredService<IFanOutService>();
                 var mergeReconciliation = _serviceProvider.GetRequiredService<IMergeReconciliationService>();
                 var automatedReview = _serviceProvider.GetRequiredService<IAutomatedReviewGateService>();
+                var workUnits = _serviceProvider.GetRequiredService<IWorkUnitService>();
                 var loop = new OrchestratorAgentLoop(
                     agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm,
-                    artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, profile, sessionId);
+                    artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, workUnits, profile, sessionId);
                 var completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 if (completion == AgentLoopCompletion.MaxIterationsExceeded)
                 {
