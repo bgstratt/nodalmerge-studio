@@ -4,10 +4,9 @@ import { MergeReviewPanel } from './MergeReviewPanel';
 import { AgentConfigPanel } from './AgentConfigPanel';
 import { WorkspaceDashboardPanel } from './WorkspaceDashboardPanel';
 import { DagReplayPanel } from './DagReplayPanel';
+import { ArtifactExplorerPanel } from './ArtifactExplorerPanel';
 import type { NotificationManager } from '../NotificationManager';
 import type { AgentConfigService } from '../AgentConfigService';
-
-const HOME_TAB_ID = 'shell-pane-home';
 
 interface TabDef { id: string; label: string }
 
@@ -31,6 +30,7 @@ export class StudioShellPanel implements vscode.Disposable {
   readonly mergeReview: MergeReviewPanel;
   readonly agentConfig: AgentConfigPanel;
   readonly dagReplay: DagReplayPanel;
+  readonly home: ArtifactExplorerPanel;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -44,9 +44,10 @@ export class StudioShellPanel implements vscode.Disposable {
     this.panel = panel;
 
     this.workspace   = new WorkspaceDashboardPanel(panel, baseUrl, notifications, configService, secrets, lmProxyBaseUrl);
-    this.mergeReview = new MergeReviewPanel(panel, baseUrl);
+    this.mergeReview = new MergeReviewPanel(panel, baseUrl, configService);
     this.agentConfig = new AgentConfigPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
     this.dagReplay   = new DagReplayPanel(panel, baseUrl);
+    this.home        = new ArtifactExplorerPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
 
     this.panel.webview.html = this.buildHtml(extensionUri);
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
@@ -65,6 +66,7 @@ export class StudioShellPanel implements vscode.Disposable {
     this.workspace.activate();
     this.agentConfig.activate();
     this.dagReplay.activate();
+    this.home.activate();
   }
 
   static createOrShow(
@@ -109,6 +111,7 @@ export class StudioShellPanel implements vscode.Disposable {
       this.mergeReview.handleMessage(msg),
       this.agentConfig.handleMessage(msg),
       this.dagReplay.handleMessage(msg),
+      this.home.handleMessage(msg),
     ]);
   }
 
@@ -116,30 +119,22 @@ export class StudioShellPanel implements vscode.Disposable {
     const nonce  = buildNonce();
     const webview = this.panel.webview;
 
+    const homeFragment        = ArtifactExplorerPanel.getFragment();
     const workspaceFragment   = WorkspaceDashboardPanel.getFragment();
     const mergeReviewFragment = MergeReviewPanel.getFragment();
     const agentConfigFragment = AgentConfigPanel.getFragment();
     const dagFragment         = DagReplayPanel.getFragment(webview, extensionUri, nonce);
 
     const tabs: TabDef[] = [
-      { id: HOME_TAB_ID, label: 'Home' },
+      { id: ArtifactExplorerPanel.containerId, label: 'Home' },
       { id: AgentConfigPanel.containerId, label: 'Agent Config' },
       { id: WorkspaceDashboardPanel.containerId, label: 'Workspace' },
       { id: MergeReviewPanel.containerId, label: 'Merge Review' },
       { id: DagReplayPanel.containerId, label: 'DAG Replay' },
     ];
     const tabButtonsHtml = tabs
-      .map(t => `<button class="nm-shell-tab${t.id === HOME_TAB_ID ? ' active' : ''}" data-tab="${t.id}">${t.label}</button>`)
+      .map(t => `<button class="nm-shell-tab${t.id === ArtifactExplorerPanel.containerId ? ' active' : ''}" data-tab="${t.id}">${t.label}</button>`)
       .join('\n');
-
-    // Placeholder until Slice 12a builds the Artifact Explorer (goal input + live work-unit
-    // DAG + artifact timeline + inspector) here as the landing tab.
-    const homeHtml = `<div id="${HOME_TAB_ID}" class="nm-shell-pane active">
-      <div style="padding:24px;opacity:0.6;max-width:520px;">
-        The Artifact Explorer lands here in the next slice — paste a goal, watch it decompose
-        into a live work-unit DAG. For now, use the tabs above.
-      </div>
-    </div>`;
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -151,6 +146,7 @@ export class StudioShellPanel implements vscode.Disposable {
   <title>NodalMerge Studio</title>
   <style nonce="${nonce}">
 ${SHELL_CSS_VARS}
+${homeFragment.css}
 ${workspaceFragment.css}
 ${mergeReviewFragment.css}
 ${agentConfigFragment.css}
@@ -160,7 +156,7 @@ ${dagFragment.css}
 <body>
   <div id="nm-shell-tabbar">${tabButtonsHtml}</div>
   <div id="nm-shell-content">
-${homeHtml}
+${homeFragment.html}
 ${agentConfigFragment.html}
 ${workspaceFragment.html}
 ${mergeReviewFragment.html}
@@ -184,9 +180,18 @@ ${dagFragment.html}
       });
     })();
   </script>
+  <script nonce="${nonce}">
 ${agentConfigFragment.script}
+  </script>
+  <script nonce="${nonce}">
 ${workspaceFragment.script}
+  </script>
+  <script nonce="${nonce}">
 ${mergeReviewFragment.script}
+  </script>
+  <script nonce="${nonce}">
+${homeFragment.script}
+  </script>
 ${dagFragment.scriptTag}
 </body>
 </html>`;
@@ -195,6 +200,7 @@ ${dagFragment.scriptTag}
   dispose(): void {
     StudioShellPanel.current = undefined;
     this.workspace.dispose();
+    this.home.dispose();
     this.panel.dispose();
     for (const d of this.disposables) { d.dispose(); }
     this.disposables.length = 0;

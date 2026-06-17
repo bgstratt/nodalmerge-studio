@@ -87,6 +87,8 @@ public static class StudioRestEndpoints
         string? ParentEventId = null,
         string? Goal = null);
 
+    private sealed record UpdateOptionsBody(bool UseLlmProfileSelection);
+
     // ── Registration ───────────────────────────────────────────────────────
 
     public static WebApplication MapStudioRestEndpoints(this WebApplication app)
@@ -106,7 +108,27 @@ public static class StudioRestEndpoints
         MapSessionStateEndpoints(app);
         MapArtifactEndpoints(app);
         MapDeadLetterEndpoints(app);
+        MapOptionsEndpoints(app);
         return app;
+    }
+
+    // ── /studio/options — Slice 12d settings toggle ────────────────────────
+
+    private static void MapOptionsEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/options", (WorkspaceOptions options) =>
+            Results.Ok(new { useLlmProfileSelection = options.UseLlmProfileSelection }));
+
+        app.MapPost("/studio/options", async (
+            UpdateOptionsBody body,
+            WorkspaceOptions options,
+            RuntimeSettingsService runtimeSettings,
+            CancellationToken ct) =>
+        {
+            options.UseLlmProfileSelection = body.UseLlmProfileSelection;
+            await runtimeSettings.PersistAsync(ct).ConfigureAwait(false);
+            return Results.Ok(new { useLlmProfileSelection = options.UseLlmProfileSelection });
+        });
     }
 
     // ── /studio/workspace-summary ──────────────────────────────────────────
@@ -665,6 +687,30 @@ public static class StudioRestEndpoints
                 newWorkUnit.WorkUnitId, body.ProfileId, sessionId: body.SessionId, ct: ct).ConfigureAwait(false);
 
             return Results.Ok(new { workUnitId = newWorkUnit.WorkUnitId });
+        });
+
+        // Workspace replay (Slice 12a) — restores the workspace to a proposal's pre-change state
+        // without starting a new agent run. There is no agent-loop equivalent of "checkout"; the
+        // closest durable primitive is forking a fresh branch from the propose-time snapshot
+        // (`base/{proposalId}`, written by InMemoryMergeService at propose time) via
+        // IBranchService.CreateBranchAsync. The extension reads file content for display from the
+        // already-cached file-changes (IProposalReviewService), not by re-reading this branch.
+        app.MapPost("/studio/merges/{proposalId}/restore-workspace", async (
+            string proposalId,
+            IMergeService merge,
+            IBranchService branches,
+            CancellationToken ct) =>
+        {
+            var proposal = await merge.GetAsync(proposalId, ct).ConfigureAwait(false);
+            if (proposal is null)
+                return Results.NotFound(new { error = $"Proposal '{proposalId}' not found." });
+
+            var branchId = await branches.CreateBranchAsync(
+                $"restore/{proposalId}-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}",
+                fromBranchId: $"base/{proposalId}",
+                ct).ConfigureAwait(false);
+
+            return Results.Ok(new { branchId, proposalId });
         });
     }
 

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -12,6 +13,14 @@ public sealed class FanOutService : IFanOutService
         PropertyNameCaseInsensitive = true,
     };
 
+    // Slice 13g — two concurrent fan-out calls for the same parent (an explicit caller racing
+    // the orchestrator loop's own post-turn fan-out, see LlmProfileSelectionTests.cs's comment on
+    // the workaround this removes the need for) could each read the same pre-creation snapshot of
+    // existing children and independently decide a plan slice has no child yet, creating two. One
+    // semaphore per parent work unit serializes the read-children/create-children/enqueue section
+    // below so the second caller always sees the first caller's children once it gets its turn.
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _parentGates = new();
+
     private readonly IWorkUnitService _workUnits;
     private readonly IOrchestratorService _orchestrator;
     private readonly IArtifactLineageService _artifacts;
@@ -19,6 +28,8 @@ public sealed class FanOutService : IFanOutService
     private readonly IWorkScheduler _scheduler;
     private readonly ITaskService _tasks;
     private readonly IAgentControlService _agentControl;
+    private readonly IProfileSelectionService _profileSelection;
+    private readonly IOrchestrationDecisionLogService _decisionLog;
 
     public FanOutService(
         IWorkUnitService workUnits,
@@ -27,15 +38,19 @@ public sealed class FanOutService : IFanOutService
         IFileWorkspaceService fileWorkspace,
         IWorkScheduler scheduler,
         ITaskService tasks,
-        IAgentControlService agentControl)
+        IAgentControlService agentControl,
+        IProfileSelectionService profileSelection,
+        IOrchestrationDecisionLogService decisionLog)
     {
-        _workUnits     = workUnits;
-        _orchestrator  = orchestrator;
-        _artifacts     = artifacts;
-        _fileWorkspace = fileWorkspace;
-        _scheduler     = scheduler;
-        _tasks         = tasks;
-        _agentControl  = agentControl;
+        _workUnits         = workUnits;
+        _orchestrator      = orchestrator;
+        _artifacts         = artifacts;
+        _fileWorkspace     = fileWorkspace;
+        _scheduler         = scheduler;
+        _tasks             = tasks;
+        _agentControl      = agentControl;
+        _profileSelection  = profileSelection;
+        _decisionLog       = decisionLog;
     }
 
     public Task<FanOutResult> TryFanOutFromPlanAsync(
@@ -85,27 +100,38 @@ public sealed class FanOutService : IFanOutService
         if (await EnsurePlanArtifactAsync(parent, planContent, ct).ConfigureAwait(false))
             actions.Add(FanOutAction.PlanRecorded);
 
-        var sliceIdToWorkUnitId = await BuildSliceMapAsync(parent.WorkUnitId, ct).ConfigureAwait(false);
-
-        if (createChildren)
+        var gate = _parentGates.GetOrAdd(parentWorkUnitId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            var created = await EnsureChildWorkUnitsAsync(parent, plan, sliceIdToWorkUnitId, ct).ConfigureAwait(false);
-            if (created)
-                actions.Add(FanOutAction.ChildrenCreated);
-        }
+            // Built inside the gate so a caller that had to wait sees every child the previous
+            // holder just created, not a snapshot taken before either acquired it.
+            var sliceIdToWorkUnitId = await BuildSliceMapAsync(parent.WorkUnitId, ct).ConfigureAwait(false);
 
-        var creds = _agentControl.GetOrchestratorCredentials(parentWorkUnitId);
-        var children = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
-        foreach (var child in children)
-        {
-            if (!await IsReadyToEnqueueAsync(child, ct).ConfigureAwait(false))
-                continue;
-
-            if (await EnqueueChildWorkerAsync(child, creds, sessionId, ct).ConfigureAwait(false))
+            if (createChildren)
             {
-                actions.Add(FanOutAction.ChildEnqueued);
-                enqueued.Add(child.WorkUnitId);
+                var created = await EnsureChildWorkUnitsAsync(parent, plan, sliceIdToWorkUnitId, ct).ConfigureAwait(false);
+                if (created)
+                    actions.Add(FanOutAction.ChildrenCreated);
             }
+
+            var creds = _agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+            var children = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
+            foreach (var child in children)
+            {
+                if (!await IsReadyToEnqueueAsync(child, ct).ConfigureAwait(false))
+                    continue;
+
+                if (await EnqueueChildWorkerAsync(child, parentWorkUnitId, creds, sessionId, ct).ConfigureAwait(false))
+                {
+                    actions.Add(FanOutAction.ChildEnqueued);
+                    enqueued.Add(child.WorkUnitId);
+                }
+            }
+        }
+        finally
+        {
+            gate.Release();
         }
 
         return new FanOutResult(actions, enqueued);
@@ -218,6 +244,7 @@ public sealed class FanOutService : IFanOutService
 
     private async Task<bool> EnqueueChildWorkerAsync(
         WorkUnit child,
+        string parentWorkUnitId,
         OrchestratorCredentials? creds,
         string? sessionId,
         CancellationToken ct)
@@ -245,14 +272,38 @@ public sealed class FanOutService : IFanOutService
                 null), ct).ConfigureAwait(false);
         }
 
+        var selection = await _profileSelection.SelectProfileAsync(child, creds, ct).ConfigureAwait(false);
+
         await _scheduler.EnqueueAsync(
             child.WorkUnitId,
-            "worker",
+            selection.ProfileId,
             task.TaskId,
             creds?.Model,
             creds?.BaseUrl,
             creds?.ApiKey,
             creds?.Provider,
+            sessionId,
+            ct).ConfigureAwait(false);
+
+        // Slice 12d — fan-out child enqueue previously had no decision-log entry at all (it
+        // happens outside any LLM tool call, so OrchestratorAgentLoop's RecordToolDecisionAsync
+        // never saw it). Recording one here for every child, not just the LLM-selection path,
+        // makes the chosen profile (and why) auditable from the Artifact Explorer regardless of
+        // whether the toggle is on.
+        await _decisionLog.RecordAsync(
+            parentWorkUnitId,
+            "fanout",
+            PipelineStage.Plan,
+            JsonSerializer.Serialize(new
+            {
+                childWorkUnitId = child.WorkUnitId,
+                childGoal = child.Goal,
+                selectedProfileId = selection.ProfileId,
+                usedLlm = selection.UsedLlm,
+            }),
+            OrchestrationAction.Enqueue,
+            [child.WorkUnitId],
+            selection.Reason,
             sessionId,
             ct).ConfigureAwait(false);
 

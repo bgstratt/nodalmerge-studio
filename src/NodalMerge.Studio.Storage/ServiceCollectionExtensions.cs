@@ -10,9 +10,7 @@ public static class ServiceCollectionExtensions
     {
         services.AddSingleton<IStudioNodeStore, NodalMergeStudioNodeStore>();
         services.AddSingleton<IBranchService, NodalMergeBranchService>();
-        services.AddSingleton<IReplayService, StubReplayService>();
-        services.AddSingleton<IWorkScheduler, WorkSchedulerService>();
-        services.AddSingleton<IExecutionEventStream, ExecutionEventStreamService>();
+        services.AddSingleton<IReplayService, ReplayService>();
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
         services.AddSingleton<IAgentWorkspaceService, AgentWorkspaceService>();
         AddRehydratableServices(services);
@@ -24,9 +22,7 @@ public static class ServiceCollectionExtensions
     {
         services.AddSingleton<IStudioNodeStore, InMemoryStudioNodeStore>();
         services.AddSingleton<IBranchService, InMemoryBranchService>();
-        services.AddSingleton<IReplayService, StubReplayService>();
-        services.AddSingleton<IWorkScheduler, WorkSchedulerService>();
-        services.AddSingleton<IExecutionEventStream, ExecutionEventStreamService>();
+        services.AddSingleton<IReplayService, ReplayService>();
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
         services.AddSingleton<IAgentWorkspaceService, AgentWorkspaceService>();
         AddRehydratableServices(services);
@@ -69,6 +65,20 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IDeadLetterService>(sp => sp.GetRequiredService<InMemoryDeadLetterService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryDeadLetterService>());
 
+        services.AddSingleton<WorkSchedulerService>();
+        services.AddSingleton<IWorkScheduler>(sp => sp.GetRequiredService<WorkSchedulerService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<WorkSchedulerService>());
+
+        services.AddSingleton<ExecutionEventStreamService>();
+        services.AddSingleton<IExecutionEventStream>(sp => sp.GetRequiredService<ExecutionEventStreamService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<ExecutionEventStreamService>());
+
+        // No domain interface to forward — RuntimeSettingsService is only ever consumed
+        // directly (by /studio/options) for its PersistAsync side effect, not through an
+        // abstraction.
+        services.AddSingleton<RuntimeSettingsService>();
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<RuntimeSettingsService>());
+
         // Registered last and ahead of AddStudioAgentRuntime in AddStudioServices, so its
         // StartAsync (which awaits every IRehydratable above) completes before the scheduler
         // poll loop's StartAsync begins.
@@ -80,20 +90,4 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IFileWorkspaceService>(sp =>
             new FileSystemWorkspaceService(sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions()));
     }
-}
-
-internal sealed class StubReplayService : IReplayService
-{
-    public Task<string> RangeAsync(
-        string branchId,
-        string? fromNode = null,
-        string? toNode = null,
-        CancellationToken cancellationToken = default) =>
-        Task.FromResult($"{{\"branchId\":\"{branchId}\",\"note\":\"replay not yet wired to NodalMerge engine\"}}");
-
-    public Task<string> RollbackAsync(string branchId, string knownGoodStateId, CancellationToken cancellationToken = default) =>
-        Task.FromResult($"{{\"branchId\":\"{branchId}\",\"knownGoodStateId\":\"{knownGoodStateId}\",\"note\":\"rollback not yet wired to NodalMerge engine\"}}");
-
-    public Task<string> InspectAsync(string branchId, string? nodeId = null, CancellationToken cancellationToken = default) =>
-        Task.FromResult($"{{\"branchId\":\"{branchId}\",\"note\":\"inspect not yet wired to NodalMerge engine\"}}");
 }

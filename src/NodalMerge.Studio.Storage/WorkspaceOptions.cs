@@ -6,4 +6,6 @@ public sealed class WorkspaceOptions
     public string? SeedRepositoryPath { get; set; }
     public long MaxReadBytes  { get; set; } = 524_288;   // 512 KB
     public long MaxWriteBytes { get; set; } = 2_097_152; // 2 MB
+    public int StallDetectionCycles { get; set; } = 2;
+    public bool UseLlmProfileSelection { get; set; } = false;
 }

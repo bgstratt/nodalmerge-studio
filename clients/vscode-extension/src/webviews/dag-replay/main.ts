@@ -10,6 +10,16 @@ let replayState: ReplayState = createInitialReplayState('studio-main');
 let ws: WsClient | null = null;
 let goals: Record<string, string> = {};
 
+// Slice 13h — live stage badges, parity with ArtifactExplorerPanel's tree (12c). Nodes here are
+// organized per branchId, not per workUnitId (see ReplayNode/BranchStream in branchReplay.ts), so
+// stage is tracked per branchId too — workUnitIdToBranchId converts incoming
+// work-unit-stage-changed frames (which only know workUnitId) into that key. Seeded from the
+// WorkUnit.currentStage already present in the one-time 'init' payload (so a panel opened mid-run
+// shows the current stage immediately, not just stages that change after it opens), then kept
+// live by WsClient's onStageChange callback below.
+let stages: Record<string, string | null> = {};
+let workUnitIdToBranchId: Record<string, string> = {};
+
 // ── DOM refs ───────────────────────────────────────────────────────────────
 
 const svg         = document.getElementById('dag-svg')     as unknown as SVGSVGElement;
@@ -39,7 +49,7 @@ function dispatch(action: ReplayAction): void {
 }
 
 function render(): void {
-  renderDag(svg, replayState, goals);
+  renderDag(svg, replayState, goals, stages);
 
   const total = Object.keys(replayState.nodesById).length;
   if (nodeCount) { nodeCount.textContent = String(total) + ' node' + (total === 1 ? '' : 's'); }
@@ -145,9 +155,17 @@ if (btnKgs) {
 // ── Extension host messages ────────────────────────────────────────────────
 
 interface WorkUnitRef {
-  workUnitId: string;
-  branchId:   string;
-  goal:       string;
+  workUnitId:   string;
+  branchId:     string;
+  goal:         string;
+  currentStage?: string | null;
+}
+
+function applyStageChange(workUnitId: string, stage: string | null): void {
+  const branchId = workUnitIdToBranchId[workUnitId];
+  if (!branchId) { return; }
+  stages[branchId] = stage;
+  render();
 }
 
 window.addEventListener('message', (event: MessageEvent) => {
@@ -159,7 +177,13 @@ window.addEventListener('message', (event: MessageEvent) => {
     const wus    = (msg.workUnits as WorkUnitRef[]) ?? [];
 
     goals = {};
-    for (const wu of wus) { goals[wu.branchId] = wu.goal; }
+    stages = {};
+    workUnitIdToBranchId = {};
+    for (const wu of wus) {
+      goals[wu.branchId] = wu.goal;
+      stages[wu.branchId] = wu.currentStage ?? null;
+      workUnitIdToBranchId[wu.workUnitId] = wu.branchId;
+    }
 
     replayState = createInitialReplayState(roomId, roomId, goals[roomId] ?? roomId);
 
@@ -167,6 +191,7 @@ window.addEventListener('message', (event: MessageEvent) => {
     ws = new WsClient(port, roomId,
       (action) => { replayState = replayReducer(replayState, action); render(); },
       (status) => { setStatus(status); },
+      applyStageChange,
     );
     ws.connect();
     render();
@@ -175,7 +200,11 @@ window.addEventListener('message', (event: MessageEvent) => {
 
   if (msg.type === 'workUnits') {
     goals = {};
-    for (const wu of (msg.workUnits as WorkUnitRef[])) { goals[wu.branchId] = wu.goal; }
+    for (const wu of (msg.workUnits as WorkUnitRef[])) {
+      goals[wu.branchId] = wu.goal;
+      workUnitIdToBranchId[wu.workUnitId] = wu.branchId;
+      if (wu.currentStage !== undefined) { stages[wu.branchId] = wu.currentStage; }
+    }
     render();
     return;
   }
@@ -183,7 +212,9 @@ window.addEventListener('message', (event: MessageEvent) => {
   if (msg.type === 'branchCreated') {
     const newBranchId = msg.newBranchId as string;
     const goal        = msg.goal        as string;
+    const workUnitId  = msg.workUnitId  as string;
     goals[newBranchId] = goal;
+    workUnitIdToBranchId[workUnitId] = newBranchId;
     // Register branch in replay state and move cursor to it
     dispatch({
       type:             'create-branch-from-cursor',

@@ -5,7 +5,7 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
-public sealed class ExecutionEventStreamService : IExecutionEventStream
+public sealed class ExecutionEventStreamService : IExecutionEventStream, IRehydratable
 {
     private readonly ConcurrentDictionary<string, ExecutionEvent> _events = new();
     // sessionId → ordered list of eventIds
@@ -79,6 +79,27 @@ public sealed class ExecutionEventStreamService : IExecutionEventStream
     {
         _events.TryGetValue(eventId, out var ev);
         return Task.FromResult(ev);
+    }
+
+    public async Task RehydrateAsync(CancellationToken ct = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.ExecutionEventV1, ct).ConfigureAwait(false);
+
+        // Sort by OccurredAt before indexing so _sessionIndex's per-session lists come back in
+        // the same chronological order they'd have been appended in during the original run —
+        // ReadAllNodesAsync makes no ordering guarantee.
+        var events = records
+            .Select(r => JsonSerializer.Deserialize<ExecutionEvent>(r.PayloadJson))
+            .Where(ev => ev is not null)
+            .Cast<ExecutionEvent>()
+            .OrderBy(ev => ev.OccurredAt)
+            .ToList();
+
+        foreach (var ev in events)
+        {
+            if (_events.TryAdd(ev.EventId, ev))
+                IndexEvent(ev.SessionId, ev.EventId);
+        }
     }
 
     private void IndexEvent(string sessionId, string eventId)

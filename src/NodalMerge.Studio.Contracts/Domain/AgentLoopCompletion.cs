@@ -5,4 +5,5 @@ public enum AgentLoopCompletion
     Succeeded,
     MaxIterationsExceeded,
     Cancelled,
+    Stalled,
 }

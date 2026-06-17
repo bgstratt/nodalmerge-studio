@@ -24,16 +24,18 @@ internal sealed class OrchestratorAgentLoop(
     IAutomatedReviewGateService automatedReview,
     IWorkUnitService workUnits,
     AgentProfile? profile = null,
-    string? sessionId = null)
+    string? sessionId = null,
+    int stallDetectionCycles = 2)
 {
     private static readonly string DefaultSystemPrompt =
         """
         You are an OrchestratorAgent in NodalMerge Studio, a collaborative AI workspace.
         Your job is to manage a work unit from planning through to validated merge proposals.
 
-        Routing strategy — read artifact state before each decision:
-        Call nm_v1_projection_get with projectionType="AgentWorkspace" and your workUnitId to see the current
-        artifact chain. Then route based on what exists:
+        Routing strategy — a projection delta is appended to your context automatically every
+        cycle, showing what changed in the artifact chain since your last turn (added artifacts,
+        artifacts whose status changed, newly completed tasks). Route based on the current delta's
+        Current state:
         - No Plan artifact and no child work units → enqueue the planner:
           nm_v1_scheduler_enqueue with workUnitId=<your workUnitId>, profileId="planner".
         - Plan artifact exists OR child work units exist → stop. Fan-out and child enqueue are handled
@@ -41,10 +43,12 @@ internal sealed class OrchestratorAgentLoop(
         - All child work units are Proposed and a reconciled MergeProposal exists on this work unit → stop;
           if automated review is enabled the reviewer runs first; otherwise a human reviews in the Merge Review panel.
         - Reconciled MergeProposal with status Approved → call nm_v1_merge_apply; done.
+        If you need the full artifact chain rather than just what changed, call
+        nm_v1_projection_get with projectionType="AgentWorkspace" and your workUnitId.
 
         Workflow:
         1. Call nm_v1_workunit_get to understand the goal for your assigned work unit.
-        2. Call nm_v1_projection_get (projectionType="AgentWorkspace", workUnitId=<id>) to see existing artifacts.
+        2. Read the projection delta in your context (or call nm_v1_projection_get for the full chain).
         3. Route based on artifact state (see above).
         4. When enqueuing the planner: call nm_v1_scheduler_enqueue with profileId="planner".
            LLM credentials are injected automatically — do not supply model, baseUrl, apiKey, or provider.
@@ -52,13 +56,13 @@ internal sealed class OrchestratorAgentLoop(
         6. The system will re-invoke you after the planner or workers complete if further orchestration is needed.
 
         Rules:
-        - Always re-read the AgentWorkspace projection before making a routing decision.
         - Do not approve or apply merges yourself — that requires human approval.
         - Do not enqueue workers directly on the parent work unit — use planner fan-out instead.
         - Be efficient: use each tool call purposefully, do not repeat calls unnecessarily.
         """;
 
     private readonly int _maxIterations = profile?.MaxIterations ?? 25;
+    private readonly int _stallDetectionCycles = stallDetectionCycles;
     private readonly string _systemPrompt = !string.IsNullOrEmpty(profile?.SystemPrompt)
         ? profile.SystemPrompt
         : DefaultSystemPrompt;
@@ -75,8 +79,20 @@ internal sealed class OrchestratorAgentLoop(
         };
 
         var completedNaturally = false;
+        var lastProjection = new AgentWorkspaceProjectionPayload(agentId, workUnitId, new ArtifactChain([]), []);
+        var stallStreak = 0;
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
+            var currentProjection = await FetchAgentWorkspaceProjectionAsync(ct).ConfigureAwait(false);
+            var delta = ProjectionDelta.Compute(workUnitId, lastProjection, currentProjection);
+            stallStreak = delta.AnyChange ? 0 : stallStreak + 1;
+            lastProjection = currentProjection;
+
+            if (stallStreak >= _stallDetectionCycles)
+                return AgentLoopCompletion.Stalled;
+
+            AppendDeltaToOutgoingMessage(messages, delta);
+
             var response = await llm.SendAsync(provider, model, baseUrl, apiKey, messages, _tools, _systemPrompt, ct)
                 .ConfigureAwait(false);
 
@@ -159,6 +175,31 @@ internal sealed class OrchestratorAgentLoop(
 
         var spawnedId = ExtractSpawnedId(action.Value, resultJson);
         await RecordDecisionAsync(action.Value, spawnedId is null ? [] : [spawnedId], toolName, ct).ConfigureAwait(false);
+    }
+
+    private async Task<AgentWorkspaceProjectionPayload> FetchAgentWorkspaceProjectionAsync(CancellationToken ct)
+    {
+        var result = await projections.GetAsync(
+            new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal, WorkUnitId: workUnitId, AgentId: agentId),
+            ct).ConfigureAwait(false);
+        return JsonSerializer.Deserialize<AgentWorkspaceProjectionPayload>(result.DataJson, JsonSerializerOptions.Web)!;
+    }
+
+    // Appended to the message about to be sent (the kickoff message on cycle 0, or the
+    // tool-results message from the previous cycle) rather than a new standalone message, so the
+    // conversation keeps strict user/assistant alternation. When the outgoing message is a
+    // single NmText (the kickoff message on cycle 0), the delta is folded into that same NmText
+    // rather than added as a second block — LlmClient serializes single-text messages as a plain
+    // string (Anthropic shorthand), and turning that into a multi-block array would break any
+    // code (fakes included) that expects to read the kickoff message's content as one string.
+    private static void AppendDeltaToOutgoingMessage(List<NmMessage> messages, ProjectionDelta delta)
+    {
+        var deltaText = $"[Projection delta — what changed since last cycle]\n{JsonSerializer.Serialize(delta, JsonOpts)}";
+        var last = messages[^1];
+        IReadOnlyList<NmContent> newContent = last.Content is [NmText only]
+            ? [new NmText($"{only.Text}\n\n{deltaText}")]
+            : [.. last.Content, new NmText(deltaText)];
+        messages[^1] = last with { Content = newContent };
     }
 
     private async Task RecordDecisionAsync(

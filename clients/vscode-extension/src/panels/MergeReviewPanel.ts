@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { scopeViewCss, wrapViewScript } from './sharedWebviewChrome';
+import type { AgentConfigService } from '../AgentConfigService';
 
 // ── Domain types ───────────────────────────────────────────────────────────
 
@@ -40,13 +41,15 @@ export class MergeReviewPanel {
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
+  private readonly configService: AgentConfigService | undefined;
   private mode: 'proposal' | 'conflict' = 'proposal';
   private proposalId?: string;
   private workUnitId?: string;
 
-  constructor(panel: vscode.WebviewPanel, baseUrl: string) {
+  constructor(panel: vscode.WebviewPanel, baseUrl: string, configService?: AgentConfigService) {
     this.panel = panel;
     this.baseUrl = baseUrl;
+    this.configService = configService;
   }
 
   /** Slice 0 — was createOrShow(); the Studio Shell now owns the one WebviewPanel, so this
@@ -146,6 +149,45 @@ export class MergeReviewPanel {
           await this.post('/studio/merges/' + this.proposalId + '/apply', {});
           void vscode.window.showInformationMessage('Merge applied successfully.');
           break;
+        case 'branchFromHere': {
+          const goal = await vscode.window.showInputBox({
+            prompt: 'Goal for the new branch',
+            placeHolder: 'e.g. Retry with a different model',
+            ignoreFocusOut: true,
+          });
+          if (!goal) { return; }
+          let profileId: string | undefined;
+          if (this.configService) {
+            const profile = await this.configService.pickProfile('Select profile to run the new branch');
+            profileId = profile?.id;
+          } else {
+            profileId = await vscode.window.showInputBox({ prompt: 'Profile ID', ignoreFocusOut: true });
+          }
+          if (!profileId) { return; }
+          const result = await this.post<{ workUnitId: string }>(
+            '/studio/merges/' + this.proposalId + '/branch', { goal, profileId });
+          void vscode.window.showInformationMessage(
+            'NodalMerge: Branched new work unit ' + result.workUnitId + '.');
+          break;
+        }
+        case 'restoreWorkspace': {
+          const result = await this.post<{ branchId: string }>(
+            '/studio/merges/' + this.proposalId + '/restore-workspace', {});
+          const changesRes = await this.get<{ fileChanges: ProposalFileChange[] }>(
+            '/studio/merges/' + this.proposalId + '/file-changes');
+          let opened = 0;
+          for (const fc of changesRes.fileChanges ?? []) {
+            if (fc.beforeContent == null) { continue; }
+            const lang = fc.path.includes('.') ? fc.path.split('.').pop() : 'plaintext';
+            const doc = await vscode.workspace.openTextDocument({ language: lang, content: fc.beforeContent });
+            await vscode.window.showTextDocument(doc, { preview: false });
+            opened++;
+          }
+          void vscode.window.showInformationMessage(
+            'NodalMerge: Restored workspace to branch ' + result.branchId
+            + ' (' + opened + ' file(s) opened read-only).');
+          break;
+        }
         default:
           return;
       }
@@ -164,7 +206,7 @@ export class MergeReviewPanel {
     return res.json() as Promise<T>;
   }
 
-  private async post(path: string, body: unknown): Promise<unknown> {
+  private async post<T = unknown>(path: string, body: unknown): Promise<T> {
     const res = await fetch(this.baseUrl + path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -174,7 +216,7 @@ export class MergeReviewPanel {
       const text = await res.text();
       throw new Error('POST ' + path + ' → ' + String(res.status) + ': ' + text);
     }
-    return res.json();
+    return res.json() as Promise<T>;
   }
 
 }
@@ -392,6 +434,8 @@ const REVIEW_HTML = `
       <button id="btn-approve" class="approve">Approve</button>
       <button id="btn-reject"  class="reject">Reject</button>
       <button id="btn-apply"   class="apply">Apply</button>
+      <button id="btn-branch"  class="ghost">Branch from here</button>
+      <button id="btn-restore" class="ghost">Restore workspace</button>
     </div>
   </div>
 `;
@@ -452,6 +496,12 @@ const REVIEW_JS = `
   });
   document.getElementById('btn-apply').addEventListener('click', function() {
     vscode.postMessage({ type: 'apply' });
+  });
+  document.getElementById('btn-branch').addEventListener('click', function() {
+    vscode.postMessage({ type: 'branchFromHere' });
+  });
+  document.getElementById('btn-restore').addEventListener('click', function() {
+    vscode.postMessage({ type: 'restoreWorkspace' });
   });
 
   function renderConstituents(constituents, fallbackIds) {

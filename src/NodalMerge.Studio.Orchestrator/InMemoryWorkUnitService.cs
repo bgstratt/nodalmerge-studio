@@ -18,6 +18,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
     private readonly IArtifactLineageService _artifactLineage;
     private readonly WorkspaceOptions _workspaceOptions;
     private readonly IExecutionEventStream _events;
+    private readonly IRuntimeEventBroadcaster? _broadcaster;
 
     public InMemoryWorkUnitService(
         IBranchService branchService,
@@ -27,7 +28,8 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IStudioNodeStore nodeStore,
         IArtifactLineageService artifactLineage,
         WorkspaceOptions workspaceOptions,
-        IExecutionEventStream events)
+        IExecutionEventStream events,
+        IRuntimeEventBroadcaster? broadcaster = null)
     {
         _branchService         = branchService;
         _mergeService          = mergeService;
@@ -37,6 +39,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         _artifactLineage       = artifactLineage;
         _workspaceOptions      = workspaceOptions;
         _events                = events;
+        _broadcaster           = broadcaster;
     }
 
     public async Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken cancellationToken = default)
@@ -115,6 +118,12 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             workUnitId,
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
+
+        if (_broadcaster is not null)
+        {
+            await _broadcaster.BroadcastWorkUnitStageChangedAsync(workUnitId, stage, cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         return updated;
     }
@@ -299,7 +308,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IStudioNodeStore>(),
             sp.GetRequiredService<IArtifactLineageService>(),
             sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions(),
-            sp.GetRequiredService<IExecutionEventStream>()));
+            sp.GetRequiredService<IExecutionEventStream>(),
+            sp.GetService<IRuntimeEventBroadcaster>()));
         services.AddSingleton<IWorkUnitService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IOrchestratorService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IWorkspaceService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());

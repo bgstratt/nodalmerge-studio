@@ -13,7 +13,8 @@ namespace NodalMerge.Studio.Integration.Tests;
 [Trait("Category", "Integration")]
 public class WorkUnitLifecycleTests
 {
-    private static (InMemoryWorkUnitService Svc, ExecutionEventStreamService Events) Build()
+    private static (InMemoryWorkUnitService Svc, ExecutionEventStreamService Events) Build(
+        IRuntimeEventBroadcaster? broadcaster = null)
     {
         var store = new InMemoryStudioNodeStore();
         var events = new ExecutionEventStreamService(store);
@@ -25,7 +26,8 @@ public class WorkUnitLifecycleTests
             store,
             new ArtifactLineageService(store),
             new WorkspaceOptions(),
-            events);
+            events,
+            broadcaster);
         return (svc, events);
     }
 
@@ -107,6 +109,57 @@ public class WorkUnitLifecycleTests
         var recovered = await svc.UpdateStatusAsync("WU-1", WorkUnitStatus.Executing);
 
         Assert.Equal(WorkUnitStatus.Executing, recovered.Status);
+    }
+
+    [Fact]
+    public async Task SetCurrentStageAsync_broadcasts_when_broadcaster_present()
+    {
+        var broadcaster = new RecordingRuntimeEventBroadcaster();
+        var (svc, _) = Build(broadcaster);
+        await svc.CreateAsync(MakeWorkUnit("WU-1"));
+
+        await svc.SetCurrentStageAsync("WU-1", PipelineStage.Execute);
+
+        var call = Assert.Single(broadcaster.Calls);
+        Assert.Equal("WU-1", call.WorkUnitId);
+        Assert.Equal(PipelineStage.Execute, call.Stage);
+    }
+
+    [Fact]
+    public async Task SetCurrentStageAsync_broadcasts_null_when_stage_cleared()
+    {
+        var broadcaster = new RecordingRuntimeEventBroadcaster();
+        var (svc, _) = Build(broadcaster);
+        await svc.CreateAsync(MakeWorkUnit("WU-1"));
+        await svc.SetCurrentStageAsync("WU-1", PipelineStage.Merge);
+
+        await svc.SetCurrentStageAsync("WU-1", null);
+
+        Assert.Equal(2, broadcaster.Calls.Count);
+        Assert.Null(broadcaster.Calls[^1].Stage);
+    }
+
+    [Fact]
+    public async Task SetCurrentStageAsync_does_not_throw_when_no_broadcaster_configured()
+    {
+        var (svc, _) = Build();
+        await svc.CreateAsync(MakeWorkUnit("WU-1"));
+
+        var updated = await svc.SetCurrentStageAsync("WU-1", PipelineStage.Plan);
+
+        Assert.Equal(PipelineStage.Plan, updated.CurrentStage);
+    }
+
+    private sealed class RecordingRuntimeEventBroadcaster : IRuntimeEventBroadcaster
+    {
+        public List<(string WorkUnitId, PipelineStage? Stage)> Calls { get; } = [];
+
+        public Task BroadcastWorkUnitStageChangedAsync(
+            string workUnitId, PipelineStage? stage, CancellationToken cancellationToken = default)
+        {
+            Calls.Add((workUnitId, stage));
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class NoopBranchService : IBranchService

@@ -1,6 +1,9 @@
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Configuration;
 using NodalMerge.DotNetHost;
+using NodalMerge.DotNetHost.Runtime;
 using NodalMerge.Studio.Core;
+using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Host;
 
@@ -10,14 +13,17 @@ public static class StudioWebApplication
         string[] args,
         Action<IWebHostBuilder>? configureWebHost = null,
         HttpClient? llmHttpClient = null,
-        Action<IServiceCollection>? configureServices = null)
+        Action<IServiceCollection>? configureServices = null,
+        Action<ConfigurationManager>? configureConfiguration = null)
     {
         var app = HostApplication.Build(
             args,
             configureWebHost: configureWebHost,
+            configureConfiguration: configureConfiguration,
             configureServices: services =>
             {
                 services.AddStudioServices(llmHttpClient);
+                services.AddSingleton<IRuntimeEventBroadcaster, RuntimeRoomEventBroadcaster>();
                 configureServices?.Invoke(services);
             });
 

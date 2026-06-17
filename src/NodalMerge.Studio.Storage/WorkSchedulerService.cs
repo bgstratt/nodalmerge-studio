@@ -5,7 +5,7 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
-public sealed class WorkSchedulerService : IWorkScheduler
+public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
 {
     private static readonly TimeSpan LeaseTimeout = TimeSpan.FromMinutes(5);
 
@@ -395,6 +395,29 @@ public sealed class WorkSchedulerService : IWorkScheduler
     {
         IReadOnlyList<ScheduledItem> items = _queue.Values.OrderBy(i => i.AttemptCount).ToList();
         return Task.FromResult(items);
+    }
+
+    public async Task RehydrateAsync(CancellationToken ct = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.SchedulerV1, ct).ConfigureAwait(false);
+        foreach (var (entityId, payloadJson) in records)
+        {
+            var item = JsonSerializer.Deserialize<ScheduledItem>(payloadJson);
+
+            // ReleaseAsync's terminal writes ({"status":"completed"/"failed"}) aren't ScheduledItem
+            // payloads; they deserialize with a null WorkUnitId and mean this item is no longer
+            // queued, so skip them rather than re-adding a dead entry.
+            if (item is null || item.WorkUnitId is null)
+                continue;
+
+            // The agent process that held this lease is gone now that the host restarted — clear
+            // the lease so the item becomes acquirable again. AttemptCount is real retry history,
+            // not lease state, so it's preserved as-is.
+            if (item.LeasedBy is not null || item.LeasedAt is not null)
+                item = item with { LeasedBy = null, LeasedAt = null };
+
+            _queue.TryAdd(entityId, item);
+        }
     }
 
     // Lazily resolved — IAgentControlService's production impl (InMemoryAgentRuntimeService)

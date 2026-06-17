@@ -9,21 +9,33 @@ internal sealed class InMemoryKnownGoodStateService : IKnownGoodStateService, IR
 {
     private readonly ConcurrentDictionary<string, KnownGoodState> _states = new();
     private readonly IStudioNodeStore _nodeStore;
+    private readonly IBranchService _branches;
+    private readonly IFileWorkspaceService _fileWorkspace;
 
-    public InMemoryKnownGoodStateService(IStudioNodeStore nodeStore)
+    public InMemoryKnownGoodStateService(IStudioNodeStore nodeStore, IBranchService branches, IFileWorkspaceService fileWorkspace)
     {
         _nodeStore = nodeStore;
+        _branches = branches;
+        _fileWorkspace = fileWorkspace;
     }
 
     public async Task<KnownGoodState> MarkKnownGoodAsync(KnownGoodState state, CancellationToken cancellationToken = default)
     {
-        _states[state.StateId] = state;
+        // Real point-in-time copy: a snapshot branch seeded from state.BranchId's current files
+        // (CreateBranchAsync calls IFileWorkspaceService.InitBranchAsync internally), so a later
+        // edit to state.BranchId can't retroactively change what "known good" looked like.
+        var snapshotBranchId = await _branches
+            .CreateBranchAsync($"knowngood/{state.StateId}", state.BranchId, cancellationToken)
+            .ConfigureAwait(false);
+        var snapshotted = state with { SnapshotBranchId = snapshotBranchId };
+
+        _states[snapshotted.StateId] = snapshotted;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.KnownGoodStateV1,
-            state.StateId,
-            JsonSerializer.Serialize(state),
+            snapshotted.StateId,
+            JsonSerializer.Serialize(snapshotted),
             cancellationToken).ConfigureAwait(false);
-        return state;
+        return snapshotted;
     }
 
     public Task<IReadOnlyList<KnownGoodState>> FindKnownGoodAsync(string branchId, CancellationToken cancellationToken = default)
@@ -35,10 +47,17 @@ internal sealed class InMemoryKnownGoodStateService : IKnownGoodStateService, IR
         return Task.FromResult<IReadOnlyList<KnownGoodState>>(results);
     }
 
-    public Task<KnownGoodState?> CheckoutKnownGoodAsync(string stateId, CancellationToken cancellationToken = default)
+    public async Task<KnownGoodState?> CheckoutKnownGoodAsync(string stateId, CancellationToken cancellationToken = default)
     {
-        _states.TryGetValue(stateId, out var state);
-        return Task.FromResult(state);
+        if (!_states.TryGetValue(stateId, out var state))
+            return null;
+
+        // Null only for states persisted before 13e — nothing to restore from in that case.
+        if (state.SnapshotBranchId is not null)
+            await _fileWorkspace.ApplyBranchAsync(state.SnapshotBranchId, state.BranchId, cancellationToken)
+                .ConfigureAwait(false);
+
+        return state;
     }
 
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)

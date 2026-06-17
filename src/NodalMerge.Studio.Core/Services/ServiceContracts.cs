@@ -197,6 +197,19 @@ public interface IWorkUnitService
     Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken cancellationToken = default);
 }
 
+// Slice 12c — pushes live pipeline-stage updates to connected extension clients over the
+// embedded NodalMerge runtime WebSocket room, so the Artifact Explorer doesn't have to poll to
+// see stage badges move. Optional collaborator (resolved via IServiceProvider.GetService, never
+// constructor-required) because the room broker only exists in the Studio Host process — unit
+// and integration tests that build services directly never register an implementation.
+public interface IRuntimeEventBroadcaster
+{
+    Task BroadcastWorkUnitStageChangedAsync(
+        string workUnitId,
+        PipelineStage? stage,
+        CancellationToken cancellationToken = default);
+}
+
 public interface IOrchestratorService
 {
     Task<WorkUnit> CreateWorkUnitAsync(
@@ -434,6 +447,25 @@ public interface IAgentProfileService
     Task<AgentProfile> UpdateAsync(AgentProfile profile, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<AgentProfile>> ListAsync(CancellationToken cancellationToken = default);
+}
+
+// Slice 12d — LLM-driven profile selection. FanOutService (Orchestrator project) needs this to
+// pick a profile for each child work unit it enqueues; the LLM-calling implementation lives in
+// AgentRuntime (where LlmClient lives), so this interface is the seam that lets Orchestrator
+// depend on the capability without depending on AgentRuntime directly.
+public sealed record ProfileSelectionResult(string ProfileId, string Reason, bool UsedLlm);
+
+public interface IProfileSelectionService
+{
+    /// <summary>
+    /// Picks the agent profile for a child work unit. Returns the heuristic default ("worker")
+    /// immediately when LLM selection is disabled, credentials are unavailable, or the LLM call
+    /// fails/times out/returns an unknown profile id.
+    /// </summary>
+    Task<ProfileSelectionResult> SelectProfileAsync(
+        WorkUnit childUnit,
+        OrchestratorCredentials? credentials,
+        CancellationToken ct = default);
 }
 
 public interface IExecutionEventStream

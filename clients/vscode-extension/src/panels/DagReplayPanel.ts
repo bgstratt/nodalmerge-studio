@@ -7,6 +7,7 @@ interface WorkUnit {
   goal: string;
   owner: string;
   status: string;
+  currentStage?: string | null;
 }
 
 export class DagReplayPanel {
@@ -49,9 +50,10 @@ export class DagReplayPanel {
         port,
         roomId:    'studio-main',
         workUnits: workUnits.map(wu => ({
-          workUnitId: wu.workUnitId,
-          branchId:   wu.branchId,
-          goal:       wu.goal,
+          workUnitId:   wu.workUnitId,
+          branchId:     wu.branchId,
+          goal:         wu.goal,
+          currentStage: wu.currentStage ?? null,
         })),
       });
     } catch {

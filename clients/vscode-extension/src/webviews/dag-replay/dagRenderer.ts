@@ -54,12 +54,25 @@ const C = {
   label_main:   '#bbb',
 };
 
+// Slice 13h — same palette as ArtifactExplorerPanel's .badge.stage.* CSS, so a work unit reads
+// as the same stage color in both views.
+const STAGE_COLORS: Record<string, { fill: string; text: string }> = {
+  plan:    { fill: '#3794ff', text: '#fff' },
+  execute: { fill: '#cca700', text: '#000' },
+  review:  { fill: '#b180d7', text: '#fff' },
+  merge:   { fill: '#2da198', text: '#fff' },
+};
+
+const STAGE_BADGE_W = 13;
+const STAGE_BADGE_H = 13;
+
 // ── Main render ────────────────────────────────────────────────────────────
 
 export function renderDag(
   svg: SVGSVGElement,
   state: ReplayState,
   goals: Record<string, string>,
+  stages: Record<string, string | null> = {},
 ): void {
   while (svg.firstChild) { svg.removeChild(svg.firstChild); }
 
@@ -204,6 +217,34 @@ export function renderDag(
         node.opSummary + '\n' + nodeId.slice(0, 16) + '\n' + node.atIso.slice(0, 19),
       ));
       root.appendChild(circle);
+
+      // Slice 13h — live stage badge on the branch's head node (its "current commit"), parity
+      // with ArtifactExplorerPanel's tree. Only the head, not every node, since the stage tracks
+      // the work unit as a whole, not any one historical node.
+      if (isHead) {
+        const stage = stages[branchId];
+        const colors = stage ? STAGE_COLORS[stage.toLowerCase()] : undefined;
+        if (colors) {
+          const bx = pos.x + r;
+          const by = pos.y - r - STAGE_BADGE_H;
+          const badge = el('rect', {
+            x: bx, y: by,
+            width: STAGE_BADGE_W, height: STAGE_BADGE_H,
+            rx: 3, ry: 3,
+            fill: colors.fill,
+          });
+          badge.appendChild(svgTitle('Stage: ' + stage));
+          root.appendChild(badge);
+          root.appendChild(text(stage!.charAt(0).toUpperCase(), {
+            x: bx + STAGE_BADGE_W / 2, y: by + STAGE_BADGE_H - 3,
+            'text-anchor': 'middle',
+            fill: colors.text,
+            'font-size': '9',
+            'font-weight': '700',
+            'font-family': 'var(--nm-font, sans-serif)',
+          }));
+        }
+      }
     });
   }
 

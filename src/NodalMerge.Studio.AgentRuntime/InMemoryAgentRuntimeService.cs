@@ -4,6 +4,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.AgentRuntime;
 
@@ -395,21 +396,26 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var mergeReconciliation = _serviceProvider.GetRequiredService<IMergeReconciliationService>();
                 var automatedReview = _serviceProvider.GetRequiredService<IAutomatedReviewGateService>();
                 var workUnits = _serviceProvider.GetRequiredService<IWorkUnitService>();
+                var workspaceOptions = _serviceProvider.GetRequiredService<WorkspaceOptions>();
                 var loop = new OrchestratorAgentLoop(
                     agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm,
-                    artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, workUnits, profile, sessionId);
+                    artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, workUnits,
+                    profile, sessionId, workspaceOptions.StallDetectionCycles);
                 var completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
-                if (completion == AgentLoopCompletion.MaxIterationsExceeded)
+                if (completion is AgentLoopCompletion.MaxIterationsExceeded or AgentLoopCompletion.Stalled)
                 {
                     var deadLetter = _serviceProvider.GetService<IDeadLetterService>();
                     if (deadLetter is not null)
                     {
+                        var reason = completion == AgentLoopCompletion.Stalled
+                            ? $"Stall: no artifact change after {workspaceOptions.StallDetectionCycles} cycles."
+                            : "Max iterations reached";
                         await deadLetter.RecordFailureAsync(
                             workUnitId,
                             agentId,
                             profile?.Stage ?? PipelineStage.Orchestrate,
                             profile?.AgentProfileId ?? "orchestrator",
-                            "Max iterations reached",
+                            reason,
                             sessionId: sessionId,
                             cancellationToken: cts.Token).ConfigureAwait(false);
                     }
@@ -556,6 +562,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<InMemoryAgentRuntimeService>());
         services.AddSingleton<McpToolDispatcher>();
         services.AddSingleton<LlmClient>(_ => new LlmClient(llmHttpClient ?? new HttpClient()));
+        services.AddSingleton<IProfileSelectionService, LlmProfileSelectionService>();
         return services;
     }
 }

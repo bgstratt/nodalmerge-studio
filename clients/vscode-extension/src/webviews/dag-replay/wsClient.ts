@@ -20,6 +20,12 @@ export class WsClient {
     private readonly roomId: string,
     private readonly onAction: (action: ReplayAction) => void,
     private readonly onStatus: (status: WsStatus) => void,
+    // Slice 13h — same /ws/runtime room broker ArtifactExplorerPanel's inline script already
+    // subscribes to for live stage badges (clients/vscode-extension/src/panels/
+    // ArtifactExplorerPanel.ts's connectStageSocket). Routed separately from onAction: a
+    // work-unit-stage-changed frame isn't a DAG op and must never fall through to the "else"
+    // branch below, which would otherwise append it as a fake graph node.
+    private readonly onStageChange?: (workUnitId: string, stage: string | null) => void,
   ) {}
 
   connect(): void {
@@ -41,7 +47,12 @@ export class WsClient {
       try {
         const msg = JSON.parse(e.data as string) as Record<string, unknown>;
 
-        if (msg.type === 'pack' && Array.isArray(msg.nodes)) {
+        if (msg.type === 'work-unit-stage-changed') {
+          const workUnitId = typeof msg.workUnitId === 'string' ? msg.workUnitId : null;
+          if (workUnitId) {
+            this.onStageChange?.(workUnitId, typeof msg.stage === 'string' ? msg.stage : null);
+          }
+        } else if (msg.type === 'pack' && Array.isArray(msg.nodes)) {
           // Bulk historical nodes from request-server-pack
           for (const raw of msg.nodes as PackNode[]) {
             if (typeof raw.nodeId !== 'string' || typeof raw.branchId !== 'string') { continue; }

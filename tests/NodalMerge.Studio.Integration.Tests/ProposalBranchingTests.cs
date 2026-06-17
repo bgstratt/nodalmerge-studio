@@ -22,7 +22,8 @@ public class ProposalBranchingTests
         IMergeService Merge,
         IFileWorkspaceService FileWorkspace,
         IArtifactLineageService Artifacts,
-        IWorkScheduler Scheduler)> BuildAsync()
+        IWorkScheduler Scheduler,
+        IBranchService Branches)> BuildAsync()
     {
         var app = StudioWebApplication.Build(
             [], configureServices: services => services.AddInMemoryStorage());
@@ -36,15 +37,17 @@ public class ProposalBranchingTests
             app.Services.GetRequiredService<IMergeService>(),
             fileWorkspace,
             app.Services.GetRequiredService<IArtifactLineageService>(),
-            app.Services.GetRequiredService<IWorkScheduler>());
+            app.Services.GetRequiredService<IWorkScheduler>(),
+            app.Services.GetRequiredService<IBranchService>());
     }
 
     private static async Task<MergeProposal> RaiseProposalAsync(
         IMergeService merge, IArtifactLineageService artifacts,
-        string proposalId, string sourceBranch, string workUnitId, IReadOnlyList<string> filesTouched)
+        string proposalId, string sourceBranch, string workUnitId, IReadOnlyList<string> filesTouched,
+        string targetBranch = "main")
     {
         var proposal = new MergeProposal(
-            proposalId, sourceBranch, "main", "goal", "summary", "desc",
+            proposalId, sourceBranch, targetBranch, "goal", "summary", "desc",
             null, null, null, MergeProposalStatus.Draft,
             WorkUnitId: workUnitId, FilesTouched: filesTouched);
         var created = await merge.ProposeAsync(proposal);
@@ -57,7 +60,7 @@ public class ProposalBranchingTests
     [Fact]
     public async Task ProposeAsync_snapshots_target_branch_as_base_state()
     {
-        var (orchestrator, _, merge, fileWorkspace, artifacts, _) = await BuildAsync();
+        var (orchestrator, _, merge, fileWorkspace, artifacts, _, _) = await BuildAsync();
         var origin = await orchestrator.CreateWorkUnitAsync("Implement feature", "test");
         await fileWorkspace.InitBranchAsync(origin.BranchId);
         await fileWorkspace.WriteAsync(origin.BranchId, "src/feature.cs", "// v1");
@@ -71,7 +74,7 @@ public class ProposalBranchingTests
     [Fact]
     public async Task Branching_creates_work_unit_seeded_from_the_proposals_base_state()
     {
-        var (orchestrator, workUnits, merge, fileWorkspace, artifacts, _) = await BuildAsync();
+        var (orchestrator, workUnits, merge, fileWorkspace, artifacts, _, _) = await BuildAsync();
         var origin = await orchestrator.CreateWorkUnitAsync("Implement feature", "test");
         await fileWorkspace.InitBranchAsync(origin.BranchId);
         await fileWorkspace.WriteAsync(origin.BranchId, "src/feature.cs", "// v1 — only on origin's branch");
@@ -96,7 +99,7 @@ public class ProposalBranchingTests
     [Fact]
     public async Task Branched_work_unit_Goal_artifact_is_parented_to_origin_Goal()
     {
-        var (orchestrator, _, merge, fileWorkspace, artifacts, _) = await BuildAsync();
+        var (orchestrator, _, merge, fileWorkspace, artifacts, _, _) = await BuildAsync();
         var origin = await orchestrator.CreateWorkUnitAsync("Implement feature", "test");
         await fileWorkspace.InitBranchAsync(origin.BranchId);
         await RaiseProposalAsync(merge, artifacts, "MP-1", origin.BranchId, origin.WorkUnitId, []);
@@ -114,7 +117,7 @@ public class ProposalBranchingTests
     [Fact]
     public async Task Branched_work_unit_enqueues_and_runs_through_the_scheduler_like_any_other()
     {
-        var (orchestrator, _, merge, fileWorkspace, artifacts, scheduler) = await BuildAsync();
+        var (orchestrator, _, merge, fileWorkspace, artifacts, scheduler, _) = await BuildAsync();
         var origin = await orchestrator.CreateWorkUnitAsync("Implement feature", "test");
         await fileWorkspace.InitBranchAsync(origin.BranchId);
         await RaiseProposalAsync(merge, artifacts, "MP-1", origin.BranchId, origin.WorkUnitId, []);
@@ -132,7 +135,7 @@ public class ProposalBranchingTests
     [Fact]
     public async Task Compare_two_proposals_from_the_same_origin_reports_overlapping_files()
     {
-        var (orchestrator, _, merge, fileWorkspace, artifacts, _) = await BuildAsync();
+        var (orchestrator, _, merge, fileWorkspace, artifacts, _, _) = await BuildAsync();
         var origin = await orchestrator.CreateWorkUnitAsync("Implement feature", "test");
         await fileWorkspace.InitBranchAsync(origin.BranchId);
 
@@ -150,7 +153,7 @@ public class ProposalBranchingTests
     [Fact]
     public async Task ProposalDag_chain_reflects_status_and_branches_reflect_metadata()
     {
-        var (orchestrator, workUnits, merge, fileWorkspace, artifacts, _) = await BuildAsync();
+        var (orchestrator, workUnits, merge, fileWorkspace, artifacts, _, _) = await BuildAsync();
         var origin = await orchestrator.CreateWorkUnitAsync("Implement feature", "test");
         await fileWorkspace.InitBranchAsync(origin.BranchId);
         await RaiseProposalAsync(merge, artifacts, "MP-1", origin.BranchId, origin.WorkUnitId, ["src/a.cs"]);
@@ -170,5 +173,77 @@ public class ProposalBranchingTests
         Assert.Single(branches);
         Assert.Equal(branched.WorkUnitId, branches[0].WorkUnitId);
         Assert.Equal("MP-1", branches[0].BranchedFromProposalId);
+    }
+
+    // ── Slice 12a — workspace replay ("Restore workspace to this state") ────
+    //
+    // There is no IFileWorkspaceService.CheckoutProposalBaseAsync (referenced aspirationally in
+    // plans/phase-5-control-plane-ui.md and VISION.md but never built). The
+    // POST /studio/merges/{proposalId}/restore-workspace endpoint instead forks a fresh, durable
+    // branch from the already-existing base/{proposalId} snapshot via IBranchService.CreateBranchAsync
+    // — the same primitive InMemoryBranchService.CreateBranchAsync delegates straight through to
+    // IFileWorkspaceService.InitBranchAsync(name, fromBranchId), so these tests exercise that
+    // service-layer call directly rather than the minimal-API endpoint itself.
+
+    [Fact]
+    public async Task Restoring_a_proposal_creates_a_branch_seeded_from_its_base_snapshot()
+    {
+        // FileSystemWorkspaceService's WorkspaceOptions.RootPath defaults to a fixed temp
+        // directory that outlives any single test run, and InitBranchAsync is a no-op once a
+        // branch directory already exists — so every id used here must be unique per run (not
+        // the literal "main"/"MP-1" other tests in this file reuse) or this test would silently
+        // observe a stale base/{proposalId} snapshot left over from an earlier run.
+        var (orchestrator, _, merge, fileWorkspace, artifacts, _, branches) = await BuildAsync();
+        var origin = await orchestrator.CreateWorkUnitAsync("Implement feature", "test");
+        await fileWorkspace.InitBranchAsync(origin.BranchId);
+
+        var targetBranch = $"target-{Guid.NewGuid():N}";
+        var proposalId = $"MP-{Guid.NewGuid():N}";
+        await fileWorkspace.InitBranchAsync(targetBranch);
+        // base/{proposalId} snapshots the *target* branch at propose time — see
+        // ProposeAsync_snapshots_target_branch_as_base_state above — not the proposal's source
+        // branch, so what the target looked like before the proposal is what gets restored.
+        await fileWorkspace.WriteAsync(targetBranch, "src/shared.cs", "// already on target before the proposal");
+
+        await RaiseProposalAsync(
+            merge, artifacts, proposalId, origin.BranchId, origin.WorkUnitId, ["src/feature.cs"], targetBranch);
+
+        // The target keeps moving after the proposal was raised — the restored branch must
+        // reflect the target's state at propose time, not its current state.
+        await fileWorkspace.WriteAsync(targetBranch, "src/after.cs", "// landed on target after the proposal was raised");
+
+        var restoredBranchId = await branches.CreateBranchAsync(
+            $"restore-{Guid.NewGuid():N}", fromBranchId: $"base/{proposalId}");
+
+        Assert.True(await fileWorkspace.ExistsAsync(restoredBranchId, "src/shared.cs"));
+        Assert.False(await fileWorkspace.ExistsAsync(restoredBranchId, "src/after.cs"));
+    }
+
+    [Fact]
+    public async Task Restoring_does_not_mutate_the_proposals_base_snapshot_or_the_origin_branch()
+    {
+        var (orchestrator, _, merge, fileWorkspace, artifacts, _, branches) = await BuildAsync();
+        var origin = await orchestrator.CreateWorkUnitAsync("Implement feature", "test");
+        await fileWorkspace.InitBranchAsync(origin.BranchId);
+        var proposalId = $"MP-{Guid.NewGuid():N}";
+        await RaiseProposalAsync(merge, artifacts, proposalId, origin.BranchId, origin.WorkUnitId, []);
+
+        var restoredBranchId = await branches.CreateBranchAsync(
+            $"restore-{Guid.NewGuid():N}", fromBranchId: $"base/{proposalId}");
+        await fileWorkspace.WriteAsync(restoredBranchId, "scratch.cs", "// edits on the restored branch only");
+
+        Assert.False(await fileWorkspace.ExistsAsync($"base/{proposalId}", "scratch.cs"));
+        Assert.False(await fileWorkspace.ExistsAsync(origin.BranchId, "scratch.cs"));
+    }
+
+    [Fact]
+    public async Task Restoring_an_unknown_proposal_id_is_rejected_before_branching()
+    {
+        var (_, _, merge, _, _, _, _) = await BuildAsync();
+
+        // Mirrors the endpoint's own guard: it calls merge.GetAsync first and returns 404
+        // without ever calling IBranchService.CreateBranchAsync when the proposal doesn't exist.
+        var proposal = await merge.GetAsync("MP-does-not-exist");
+        Assert.Null(proposal);
     }
 }

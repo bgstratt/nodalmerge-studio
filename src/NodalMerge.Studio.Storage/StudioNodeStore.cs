@@ -19,6 +19,7 @@ public static class StudioNodeKind
     public const string OrchestrationEventV1 = "studio/orchestration-event/v1";
     public const string ChangeIntentV1       = "studio/change-intent/v1";
     public const string DeadLetterV1         = "studio/dead-letter/v1";
+    public const string RuntimeSettingsV1    = "studio/runtime-settings/v1";
 }
 
 public interface IStudioNodeStore

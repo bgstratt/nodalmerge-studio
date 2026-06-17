@@ -6,4 +6,7 @@ public sealed record KnownGoodState(
     string Description,
     string? VerificationResults,
     DateTimeOffset CreatedAt,
-    string CreatedBy);
+    string CreatedBy,
+    // The branch holding a point-in-time copy of BranchId's files as of MarkKnownGoodAsync —
+    // what CheckoutKnownGoodAsync restores from. Null for states persisted before 13e.
+    string? SnapshotBranchId = null);
