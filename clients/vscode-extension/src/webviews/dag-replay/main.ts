@@ -120,6 +120,92 @@ if (scrubber) {
   });
 }
 
+// ── Replay mode selector (Slice 18d) ───────────────────────────────────────
+
+const replayModeSelect = document.getElementById('replay-mode') as HTMLSelectElement | null;
+let currentReplayMode = 'linear';
+
+if (replayModeSelect) {
+  replayModeSelect.addEventListener('change', () => {
+    const newMode = replayModeSelect.value;
+    currentReplayMode = newMode;
+    vscode.postMessage({ type: 'replayModeChanged', mode: newMode });
+
+    // Show/hide main DAG vs alternate view
+    const svg = document.getElementById('dag-svg');
+    const altView = document.getElementById('alternate-view');
+    const scrubberRow = document.getElementById('scrubber-row');
+    const playbackBarEl = document.getElementById('playback-bar');
+    if (newMode === 'linear') {
+      if (svg) svg.style.display = 'block';
+      if (altView) altView.style.display = 'none';
+      if (scrubberRow) scrubberRow.style.display = 'flex';
+      if (playbackBarEl) playbackBarEl.style.display = 'none';
+    } else {
+      if (svg) svg.style.display = 'none';
+      if (altView) altView.style.display = 'block';
+      if (scrubberRow) scrubberRow.style.display = 'none';
+      if (playbackBarEl) playbackBarEl.style.display = 'none';
+      if (altView) altView.innerHTML = '<p style="opacity:0.45;font-style:italic">Loading…</p>';
+    }
+  });
+}
+
+// ── Alternate view renderers ──────────────────────────────────────────────
+
+function escHtml(s: string): string {
+  return String(s || '').replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>');
+}
+
+function badgeHtml(status: string): string {
+  return '<span style="display:inline-block;border-radius:9px;padding:1px 8px;font-size:0.78em;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground)">' + escHtml(status) + '</span>';
+}
+
+function renderBranchExplorer(data: any): string {
+  const branches: any[] = data?.branches ?? [];
+  if (!branches.length) { return '<p style="opacity:0.45;font-style:italic">No branches found.</p>'; }
+  let html = '<h2 style="font-size:0.82em;text-transform:uppercase;letter-spacing:0.07em;opacity:0.5;margin:0 0 8px">Branch Explorer</h2>';
+  branches.forEach((br: any) => {
+    html += '<details style="margin-bottom:8px;border:1px solid var(--nm-border);border-radius:4px;padding:8px" open>';
+    html += '<summary style="cursor:pointer;font-weight:600;font-size:0.9em"><span class="mono" style="font-family:var(--vscode-editor-font-family,monospace);opacity:0.7">' + escHtml(br.branchId) + '</span> <span style="opacity:0.5">(' + br.workUnitCount + ' work units)</span></summary>';
+    html += '<div style="margin-top:6px">';
+    (br.goals ?? []).forEach((g: any) => {
+      html += '<div style="padding:4px 8px;margin:2px 0;border-left:2px solid var(--vscode-textLink-foreground,#3794ff);font-size:0.85em">';
+      html += '<span style="font-weight:600">' + escHtml(g.goal ?? '') + '</span> ';
+      html += badgeHtml(g.status);
+      if (g.phase) { html += ' <span style="font-size:0.85em;opacity:0.6">' + escHtml(g.phase) + '</span>'; }
+      html += '</div>';
+    });
+    html += '</div></details>';
+  });
+  return html;
+}
+
+function renderCounterfactual(data: any): string {
+  const alternatives: any[] = data?.alternatives ?? [];
+  const targetWorkUnitId = data?.targetWorkUnitId ?? '';
+  const targetGoal = data?.targetGoal ?? '';
+  let html = '<h2 style="font-size:0.82em;text-transform:uppercase;letter-spacing:0.07em;opacity:0.5;margin:0 0 8px">Counterfactual</h2>';
+  if (targetWorkUnitId) {
+    html += '<p style="font-size:0.85em;opacity:0.6">Target: <span class="mono" style="font-family:var(--vscode-editor-font-family,monospace)">' + escHtml(targetWorkUnitId) + '</span>' + (targetGoal ? ' — ' + escHtml(targetGoal) : '') + '</p>';
+  }
+  if (!alternatives.length) {
+    html += '<p style="opacity:0.45;font-style:italic">No alternative timelines found for this work unit.</p>';
+  } else {
+    html += '<p style="font-size:0.85em;opacity:0.6">' + alternatives.length + ' alternative timeline(s)</p>';
+    alternatives.forEach((alt: any) => {
+      html += '<div style="padding:8px;margin:4px 0;border:1px solid var(--nm-border);border-radius:4px">';
+      html += '<div style="font-weight:600;font-size:0.9em">' + escHtml(alt.goal ?? '') + '</div>';
+      html += '<div style="font-size:0.8em;margin-top:4px;display:flex;gap:6px;flex-wrap:wrap">';
+      html += badgeHtml(alt.status);
+      if (alt.forkType) { html += '<span style="font-size:0.78em;opacity:0.7;border:1px solid var(--nm-border);border-radius:9px;padding:1px 8px">' + escHtml(alt.forkType) + '</span>'; }
+      if (alt.relationship) { html += '<span style="font-size:0.78em;opacity:0.5">' + escHtml(alt.relationship) + '</span>'; }
+      html += '</div></div>';
+    });
+  }
+  return html;
+}
+
 // ── Playback bar buttons ───────────────────────────────────────────────────
 
 if (btnLive) {
@@ -157,11 +243,62 @@ interface WorkUnitRef {
   currentStage?: string | null;
 }
 
+interface TimelineEntry {
+  kind: string;
+  nodeId: string;
+  description: string;
+  occurredAt: string;
+}
+
+interface TimelineData {
+  branchId: string;
+  entries: TimelineEntry[];
+}
+
+interface TimelineResponse {
+  branches: string[];
+  timelines: TimelineData[];
+}
+
 function applyStageChange(workUnitId: string, stage: string | null): void {
   const branchId = workUnitIdToBranchId[workUnitId];
   if (!branchId) { return; }
   stages[branchId] = stage;
   render();
+}
+
+// Slice 13h — registers branches and nodes from the /studio/replay/timeline REST
+// response. Called from both init and workUnits message handlers so new artifacts and
+// orchestration events appear without waiting for a full re-init.
+function registerTimeline(timeline: TimelineResponse): void {
+  for (const branchId of timeline.branches) {
+    if (!replayState.branches[branchId]) {
+      const label = goals[branchId] ?? branchId;
+      dispatch({
+        type: 'register-branch',
+        branchId,
+        roomId: branchId,
+        label,
+        basedOnBranchId: null,
+        basedOnNodeId: null,
+      });
+    }
+  }
+
+  for (const td of timeline.timelines) {
+    const branchId = td.branchId;
+    for (const entry of td.entries) {
+      dispatch({
+        type: 'append-branch-node',
+        branchId,
+        roomId: branchId,
+        opSummary: `${entry.kind}: ${entry.description}`,
+        payloadJson: JSON.stringify(entry),
+        replayOpId: entry.nodeId,
+        atIso: entry.occurredAt,
+      });
+    }
+  }
 }
 
 window.addEventListener('message', (event: MessageEvent) => {
@@ -183,6 +320,39 @@ window.addEventListener('message', (event: MessageEvent) => {
 
     replayState = createInitialReplayState(roomId, roomId, goals[roomId] ?? roomId);
 
+    // Slice 13h — register timeline branches/nodes from REST before connecting
+    // the WebSocket (which now only handles live stage-change events).
+    if (msg.timeline) {
+      // Dispatch each timeline entry through the reducer so branches get auto-registered
+      const tl = msg.timeline as TimelineResponse;
+      for (const branchId of tl.branches) {
+        if (!replayState.branches[branchId]) {
+          const label = goals[branchId] ?? branchId;
+          replayState = replayReducer(replayState, {
+            type: 'register-branch',
+            branchId,
+            roomId: branchId,
+            label,
+            basedOnBranchId: null,
+            basedOnNodeId: null,
+          });
+        }
+      }
+      for (const td of tl.timelines) {
+        for (const entry of td.entries) {
+          replayState = replayReducer(replayState, {
+            type: 'append-branch-node',
+            branchId: td.branchId,
+            roomId: td.branchId,
+            opSummary: `${entry.kind}: ${entry.description}`,
+            payloadJson: JSON.stringify(entry),
+            replayOpId: entry.nodeId,
+            atIso: entry.occurredAt,
+          });
+        }
+      }
+    }
+
     ws?.close();
     ws = new WsClient(port, roomId,
       (action) => { replayState = replayReducer(replayState, action); render(); },
@@ -201,7 +371,32 @@ window.addEventListener('message', (event: MessageEvent) => {
       workUnitIdToBranchId[wu.workUnitId] = wu.branchId;
       if (wu.currentStage !== undefined) { stages[wu.branchId] = wu.currentStage; }
     }
+    // Slice 13h — merge updated timeline into existing replay state
+    if (msg.timeline) {
+      const tl = msg.timeline as TimelineResponse;
+      registerTimeline(tl);
+    }
     render();
+    return;
+  }
+
+  // Slice 18d — render alternate view data from trajectory/replay endpoint
+  if (msg.type === 'replayModeData') {
+    const mode = msg.mode as string;
+    const data = msg.data as any;
+    const altView = document.getElementById('alternate-view');
+    if (altView) {
+      if (mode === 'branchexplorer') {
+        altView.innerHTML = renderBranchExplorer(data);
+      } else if (mode === 'counterfactual') {
+        altView.innerHTML = renderCounterfactual(data);
+      } else {
+        // Linear — show the DAG
+        const svg = document.getElementById('dag-svg');
+        if (svg) svg.style.display = 'block';
+        altView.style.display = 'none';
+      }
+    }
     return;
   }
 

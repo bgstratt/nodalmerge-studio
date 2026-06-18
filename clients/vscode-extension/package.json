@@ -23,15 +23,15 @@
       },
       {
         "command": "nodalmerge.openStudio",
-        "title": "NodalMerge: Open Studio"
+        "title": "NodalMerge: Open Decision Workspace"
       },
       {
         "command": "nodalmerge.openMergeReview",
-        "title": "NodalMerge: Open Merge Review"
+        "title": "NodalMerge: Open Decision Convergence"
       },
       {
         "command": "nodalmerge.openMergeReviewConflict",
-        "title": "NodalMerge: Open Merge Conflict"
+        "title": "NodalMerge: Open Decision Conflict"
       }
     ],
     "configuration": {
@@ -90,6 +90,32 @@
           "type": "string",
           "default": "",
           "description": "Name of the topology template to use when spawning a new workspace."
+        },
+        "nodalmerge.requireBuildBeforeProposal": {
+          "type": "boolean",
+          "default": false,
+          "description": "Require passing build before proposal submission."
+        },
+        "nodalmerge.requireTestBeforeProposal": {
+          "type": "boolean",
+          "default": false,
+          "description": "Require passing tests before proposal submission."
+        },
+        "nodalmerge.buildCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Global build command (empty = auto-detect per branch)."
+        },
+        "nodalmerge.testCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Global test command (empty = auto-detect per branch)."
+        },
+        "nodalmerge.postMergeExecutionMode": {
+          "type": "string",
+          "default": "Disabled",
+          "enum": ["Disabled", "Async", "Blocking"],
+          "description": "Post-merge execution mode: Disabled (no execution), Async (background fire-and-forget), Blocking (synchronous with rollback on failure)."
         }
       }
     }

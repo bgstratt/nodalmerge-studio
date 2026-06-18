@@ -6,7 +6,7 @@ using NodalMerge.Studio.Core.Services;
 namespace NodalMerge.Studio.McpServer.Tools;
 
 [McpServerToolType]
-public sealed class SchedulerTools(IWorkScheduler scheduler)
+public sealed class SchedulerTools(ISchedulerCommandService scheduler)
 {
     [McpServerTool(Name = McpToolNames.SchedulerEnqueue)]
     [Description("Enqueue a work unit for a worker agent to pick up. Use this instead of nm_v1_agent_spawn when the orchestrator wants to delegate worker execution to the scheduler.")]
@@ -23,9 +23,9 @@ public sealed class SchedulerTools(IWorkScheduler scheduler)
     {
         try
         {
-            await scheduler.EnqueueAsync(workUnitId, profileId, taskId, model, baseUrl, apiKey, provider, sessionId, cancellationToken)
+            var item = await scheduler.EnqueueAsync(workUnitId, profileId, taskId, model, baseUrl, apiKey, provider, sessionId, cancellationToken)
                 .ConfigureAwait(false);
-            return McpJson.Ok(new { workUnitId, profileId, taskId, sessionId, status = "enqueued" });
+            return McpJson.Ok(new { workUnitId = item.WorkUnitId, profileId = item.ProfileId, taskId = item.TaskId, sessionId = item.SessionId, status = "enqueued" });
         }
         catch (Exception ex)
         {

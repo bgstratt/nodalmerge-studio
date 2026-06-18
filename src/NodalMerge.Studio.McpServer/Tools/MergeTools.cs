@@ -3,14 +3,13 @@ using ModelContextProtocol.Server;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Versioning;
 using NodalMerge.Studio.Core.Services;
-using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
 [McpServerToolType]
-public sealed class MergeTools(IMergeService merge, IStudioNodeStore nodeStore)
+public sealed class MergeTools(IMergeCommandService mergeCommands)
 {
-    [McpServerTool(Name = McpToolNames.MergePropose), Description("Submit a merge proposal from a work branch.")]
+    [McpServerTool(Name = McpToolNames.MergePropose), Description("Submit a merge proposal with full diff, artifact lineage, execution event, and work-unit status transition.")]
     public async Task<string> ProposeAsync(
         string sourceBranch,
         string targetBranch,
@@ -21,36 +20,11 @@ public sealed class MergeTools(IMergeService merge, IStudioNodeStore nodeStore)
         string? commandId = null,
         CancellationToken cancellationToken = default)
     {
-        // Idempotent: return cached result for same commandId.
-        if (commandId is not null)
-        {
-            var cached = await nodeStore.ReadNodeAsync(StudioNodeKind.CommandResultV1, commandId, cancellationToken)
-                .ConfigureAwait(false);
-            if (cached is not null)
-                return cached;
-        }
+        var created = await mergeCommands.ProposeAsync(
+            sourceBranch, targetBranch, summary, goal, changeDescription,
+            commandId: commandId, cancellationToken: cancellationToken).ConfigureAwait(false);
 
-        var proposalId = $"MP-{Guid.NewGuid():N}";
-        var proposal = new MergeProposal(
-            proposalId,
-            sourceBranch,
-            targetBranch,
-            goal ?? summary,
-            summary,
-            changeDescription ?? summary,
-            null,
-            null,
-            null,
-            MergeProposalStatus.Draft);
-
-        var created = await merge.ProposeAsync(proposal, cancellationToken).ConfigureAwait(false);
-        var result = McpJson.Ok(new { proposalId = created.ProposalId, status = created.Status.ToString() });
-
-        if (commandId is not null)
-            await nodeStore.WriteNodeAsync(StudioNodeKind.CommandResultV1, commandId, result, cancellationToken)
-                .ConfigureAwait(false);
-
-        return result;
+        return McpJson.Ok(new { proposalId = created.ProposalId, status = created.Status.ToString() });
     }
 
     [McpServerTool(Name = McpToolNames.MergeValidate), Description("Validate a draft proposal, moving it to ReadyForReview.")]
@@ -58,7 +32,7 @@ public sealed class MergeTools(IMergeService merge, IStudioNodeStore nodeStore)
     {
         try
         {
-            var proposal = await merge.ValidateAsync(proposalId, cancellationToken).ConfigureAwait(false);
+            var proposal = await mergeCommands.ValidateAsync(proposalId, cancellationToken).ConfigureAwait(false);
             return McpJson.Ok(proposal);
         }
         catch (KeyNotFoundException)
@@ -80,19 +54,10 @@ public sealed class MergeTools(IMergeService merge, IStudioNodeStore nodeStore)
         string? reviewerAgentId = null,
         CancellationToken cancellationToken = default)
     {
-        if (!Enum.TryParse<MergeProposalStatus>(decision, ignoreCase: true, out var status) ||
-            status is not (MergeProposalStatus.Approved or MergeProposalStatus.Rejected))
-        {
-            return McpJson.Error(McpToolNames.MergeReview, "Decision must be 'Approved' or 'Rejected'.");
-        }
-
         try
         {
-            var proposal = automated
-                ? await merge.AutomatedReviewAsync(
-                    proposalId, status, verificationResults ?? string.Empty, reviewerAgentId, cancellationToken)
-                    .ConfigureAwait(false)
-                : await merge.ReviewAsync(proposalId, status, cancellationToken).ConfigureAwait(false);
+            var proposal = await mergeCommands.ReviewAsync(
+                proposalId, decision, verificationResults, automated, reviewerAgentId, cancellationToken).ConfigureAwait(false);
             return McpJson.Ok(proposal);
         }
         catch (KeyNotFoundException)
@@ -114,7 +79,7 @@ public sealed class MergeTools(IMergeService merge, IStudioNodeStore nodeStore)
     {
         try
         {
-            var proposal = await merge.ApplyAsync(proposalId, cancellationToken).ConfigureAwait(false);
+            var proposal = await mergeCommands.ApplyAsync(proposalId, cancellationToken).ConfigureAwait(false);
             return McpJson.Ok(proposal);
         }
         catch (KeyNotFoundException)

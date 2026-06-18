@@ -12,8 +12,26 @@ interface WorkUnit {
   currentStage?: string | null;
 }
 
-export class DagReplayPanel {
-  static readonly containerId = 'shell-pane-dag-replay';
+// Slice 13h — timeline entries returned by /studio/replay/timeline
+interface TimelineEntry {
+  kind: string;
+  nodeId: string;
+  description: string;
+  occurredAt: string;
+}
+
+interface TimelineData {
+  branchId: string;
+  entries: TimelineEntry[];
+}
+
+interface TimelineResponse {
+  branches: string[];
+  timelines: TimelineData[];
+}
+
+export class TrajectoryReplayPanel {
+  static readonly containerId = 'shell-pane-trajectory-replay';
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
@@ -43,15 +61,18 @@ export class DagReplayPanel {
     { css: string; html: string; scriptTag: string } {
     const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'out', 'dag-replay.js'));
     return {
-      css: scopeViewCss(DAG_REPLAY_CSS, DagReplayPanel.containerId),
-      html: `<div id="${DagReplayPanel.containerId}" class="nm-shell-pane">${DAG_REPLAY_HTML}</div>`,
+      css: scopeViewCss(DAG_REPLAY_CSS, TrajectoryReplayPanel.containerId),
+      html: `<div id="${TrajectoryReplayPanel.containerId}" class="nm-shell-pane">${DAG_REPLAY_HTML}</div>`,
       scriptTag: `<script nonce="${nonce}" src="${scriptUri}"></script>`,
     };
   }
 
   private async init(): Promise<void> {
     try {
-      const workUnits = await this.get<WorkUnit[]>('/studio/workunits');
+      const [workUnits, timeline] = await Promise.all([
+        this.get<WorkUnit[]>('/studio/workunits'),
+        this.get<TimelineResponse>('/studio/replay/timeline'),
+      ]);
       const port = this.extractPort();
       void this.panel.webview.postMessage({
         type:      'init',
@@ -63,20 +84,25 @@ export class DagReplayPanel {
           goal:         wu.goal,
           currentStage: wu.currentStage ?? null,
         })),
+        // Slice 13h — include timeline data in the init payload so the DAG
+        // renders branches/nodes immediately without waiting for a poll cycle.
+        timeline,
       });
     } catch {
-      // host not running or WU list empty — WebView shows idle state
+      // host not running or no data yet — WebView shows idle state
     }
   }
 
   /** Polled every POLL_INTERVAL_MS so work units fanned out after the panel was opened (no
    * goal/stage entry in the webview's workUnitIdToBranchId map otherwise) become visible without
-   * requiring the panel to be closed and reopened. Sends 'workUnits', not 'init' — main.ts merges
-   * that into goals/stages/workUnitIdToBranchId without resetting replay state or reconnecting
-   * the websocket. */
+   * requiring the panel to be closed and reopened. Also refreshes timeline data so new artifacts
+   * and orchestration events appear without a full re-init. */
   private async refreshWorkUnits(): Promise<void> {
     try {
-      const workUnits = await this.get<WorkUnit[]>('/studio/workunits');
+      const [workUnits, timeline] = await Promise.all([
+        this.get<WorkUnit[]>('/studio/workunits'),
+        this.get<TimelineResponse>('/studio/replay/timeline'),
+      ]);
       void this.panel.webview.postMessage({
         type: 'workUnits',
         workUnits: workUnits.map(wu => ({
@@ -85,6 +111,7 @@ export class DagReplayPanel {
           goal:         wu.goal,
           currentStage: wu.currentStage ?? null,
         })),
+        timeline,
       });
     } catch {
       // host not running — same suppress-and-poll-later convention as init()
@@ -92,6 +119,22 @@ export class DagReplayPanel {
   }
 
   async handleMessage(msg: Record<string, unknown>): Promise<void> {
+    // Slice 18d — trajectory replay mode switch: fetch data from the appropriate
+    // /studio/trajectory/replay?mode= endpoint and send to the webview.
+    if (msg.type === 'replayModeChanged') {
+      const mode = (msg.mode as string) || 'linear';
+      const workUnitId = (msg.workUnitId as string) || undefined;
+      try {
+        let url = '/studio/trajectory/replay?mode=' + encodeURIComponent(mode);
+        if (workUnitId) { url += '&workUnitId=' + encodeURIComponent(workUnitId); }
+        const data = await this.get<unknown>(url);
+        void this.panel.webview.postMessage({ type: 'replayModeData', mode, data });
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: failed to load replay mode — ' + String(err));
+      }
+      return;
+    }
+
     if (msg.type === 'branchFromCursor') {
       const goal = await vscode.window.showInputBox({
         prompt:         'Goal for branch from cursor',
@@ -234,13 +277,22 @@ const DAG_REPLAY_CSS = `
 
 const DAG_REPLAY_HTML = `
   <div id="toolbar">
-    <span class="toolbar-title">DAG Replay</span>
+    <span class="toolbar-title">Trajectory Replay</span>
     <span id="status-dot" class="status-dot"></span>
     <span id="status-text">idle</span>
     <span id="node-count"></span>
   </div>
+  <div style="padding: 4px 14px; font-size: 0.8em; opacity: 0.55; border-bottom: 1px solid var(--nm-border); flex-shrink: 0; display: flex; justify-content: space-between; align-items: center;">
+    <span>Replay the evolution of decisions through the goal → decomposition → execution → convergence lifecycle.</span>
+    <select id="replay-mode" style="font-size:0.8em;padding:2px 6px;border:1px solid var(--nm-border);border-radius:3px;background:var(--vscode-input-background,#3c3c3c);color:var(--vscode-input-foreground,#ccc);">
+      <option value="linear">Linear</option>
+      <option value="branchexplorer">Branch Explorer</option>
+      <option value="counterfactual">Counterfactual</option>
+    </select>
+  </div>
   <div id="dag-scroll">
     <svg id="dag-svg"></svg>
+    <div id="alternate-view" style="display:none;padding:12px;overflow-y:auto;"></div>
   </div>
   <div id="scrubber-row">
     <span id="scrub-branch"></span>

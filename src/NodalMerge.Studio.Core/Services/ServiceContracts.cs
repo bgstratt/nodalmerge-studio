@@ -30,9 +30,35 @@ public interface ITaskService
     Task<IReadOnlyList<StudioTask>> ListAsync(string? workUnitId = null, CancellationToken cancellationToken = default);
 
     Task<StudioTask> AssignAsync(string taskId, string agentId, CancellationToken cancellationToken = default);
-}
+    }
 
-public interface IMergeService
+    // Slice 15c — shared create-task entry point for MCP/REST/the agent-loop dispatcher.
+    // The artifact-lineage record that only McpToolDispatcher previously wrote on task creation
+    // now fires once, inside TaskCommandService.CreateAsync, regardless of transport.
+    public sealed record TaskCreateCommand(
+        string WorkUnitId,
+        string Title,
+        string Description,
+        int Priority = 0);
+
+    public interface ITaskCommandService
+    {
+        Task<StudioTask> CreateAsync(TaskCreateCommand command, CancellationToken cancellationToken = default);
+
+        Task<StudioTask> UpdateAsync(
+            string taskId,
+            string? title = null,
+            string? description = null,
+            string? status = null,
+            int? priority = null,
+            CancellationToken cancellationToken = default);
+
+        Task<StudioTask> AssignAsync(string taskId, string agentId, CancellationToken cancellationToken = default);
+
+        Task<IReadOnlyList<StudioTask>> ListAsync(string? workUnitId = null, CancellationToken cancellationToken = default);
+    }
+
+    public interface IMergeService
 {
     Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default);
 
@@ -58,12 +84,46 @@ public interface IMergeService
     Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken cancellationToken = default);
 
     Task<MergeProposal> SupersedeAsync(
-        string proposalId,
-        string supersededByProposalId,
-        CancellationToken cancellationToken = default);
-}
+            string proposalId,
+            string supersededByProposalId,
+            CancellationToken cancellationToken = default);
+    }
 
-public interface IProposalReviewService
+    // Slice 15d — merge command consolidation. ProposeAsync is the heavyweight one: it runs the diff,
+    // records artifact lineage, appends execution events, and best-efforts the owning work unit's
+    // status transition to Proposed — all of which were previously only executed by the agent-loop
+    // dispatcher path. Validate/Review/Apply are near-identical across transports, so wrapping them
+    // here keeps every adapter thin.
+    public interface IMergeCommandService
+    {
+        Task<MergeProposal> ProposeAsync(
+            string sourceBranch,
+            string targetBranch,
+            string summary,
+            string? goal = null,
+            string? changeDescription = null,
+            string? workUnitId = null,
+            string? agentId = null,
+            string? model = null,
+            string? provider = null,
+            string? sessionId = null,
+            string? commandId = null,
+            CancellationToken cancellationToken = default);
+
+        Task<MergeProposal> ValidateAsync(string proposalId, CancellationToken cancellationToken = default);
+
+        Task<MergeProposal> ReviewAsync(
+            string proposalId,
+            string decision,
+            string? verificationResults = null,
+            bool automated = false,
+            string? reviewerAgentId = null,
+            CancellationToken cancellationToken = default);
+
+        Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default);
+    }
+
+    public interface IProposalReviewService
 {
     Task<IReadOnlyList<ProposalFileChange>> GetFileChangesAsync(
         string proposalId,
@@ -234,6 +294,7 @@ public interface IOrchestratorService
         string? branchedFromProposalId = null,
         string? sliceId = null,
         IReadOnlyDictionary<string, string>? metadata = null,
+        HypothesisForkType? forkType = null,
         CancellationToken cancellationToken = default);
 
     Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default);
@@ -250,7 +311,8 @@ public sealed record WorkUnitCreateCommand(
     string? RepositoryPath = null,
     string? ParentWorkUnitId = null,
     IReadOnlyList<string>? DependsOn = null,
-    IReadOnlyList<string>? FileScope = null);
+    IReadOnlyList<string>? FileScope = null,
+    HypothesisForkType? ForkType = null);
 
 public interface IWorkUnitCommandService
 {
@@ -447,6 +509,49 @@ public interface IWorkScheduler
     Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default);
 
     Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default);
+}
+
+// Slice 15f — shared enqueue entry point for MCP/REST/the agent-loop dispatcher, so the
+// three transports can't drift on which params (model/baseUrl/apiKey/provider) they support.
+public interface ISchedulerCommandService
+{
+    Task<ScheduledItem> EnqueueAsync(
+        string workUnitId,
+        string profileId,
+        string? taskId = null,
+        string? model = null,
+        string? baseUrl = null,
+        string? apiKey = null,
+        string? provider = null,
+        string? sessionId = null,
+        CancellationToken ct = default);
+
+    Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default);
+}
+
+// Slice 15f — shared artifact command entry point for MCP/REST/the agent-loop dispatcher.
+// Moves the CollectChainWithAncestorsAsync walk (copy-pasted verbatim between ArtifactTools.cs
+// and McpToolDispatcher.cs) into a single implementation.
+public interface IArtifactCommandService
+{
+    Task<ArtifactRef> RecordAsync(
+        string workUnitId,
+        string type,
+        string title,
+        string body,
+        string? parentArtifactId = null,
+        CancellationToken ct = default);
+
+    Task<IReadOnlyList<ArtifactRef>> QueryAsync(
+        string workUnitId,
+        string? type = null,
+        string? keywords = null,
+        CancellationToken ct = default);
+
+    Task<IReadOnlyList<ArtifactRef>> ListAsync(
+        string workUnitId,
+        bool includeAncestors = true,
+        CancellationToken ct = default);
 }
 
 public interface IExecutionSessionService
@@ -647,3 +752,71 @@ public sealed record WorkspaceSummary(
     IReadOnlyList<string> PendingMerges,
     IReadOnlyList<string> Failures,
     IReadOnlyList<string> KnownGoodStates);
+
+// Slice 16b — executes build, test, and lint commands inside a branch's working directory.
+// Language-agnostic — runs whatever command string it receives via Process.Start.
+public interface IWorkspaceExecutionService
+{
+    /// <summary>
+    /// Execute build/test/lint on a single branch.
+    /// </summary>
+    Task<BranchExecutionResult> ExecuteAsync(
+        string branchId,
+        WorkspaceExecutionRequest request,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Merge files from multiple source branches into a temporary composite branch,
+    /// then execute build/test/lint on the composite. Cleans up the temp branch afterward.
+    /// </summary>
+    Task<BranchExecutionResult> ExecuteCompositeAsync(
+        IReadOnlyList<string> sourceBranchIds,
+        WorkspaceExecutionRequest request,
+        CancellationToken ct = default);
+}
+
+// Slice 16c — shared entry point for workspace execution commands — called by both MCP tools
+// (WorkspaceTools) and REST endpoints (StudioRestEndpoints) so they cannot drift.
+public interface IWorkspaceExecutionCommandService
+{
+    Task<BranchExecutionResult> BuildAsync(
+        string branchId,
+        string? buildCommand = null,
+        int timeoutSeconds = 300,
+        CancellationToken ct = default);
+
+    Task<BranchExecutionResult> TestAsync(
+        string branchId,
+        string? testCommand = null,
+        int timeoutSeconds = 300,
+        CancellationToken ct = default);
+
+    Task<BranchExecutionResult> ExecAsync(
+        string branchId,
+        WorkspaceExecutionRequest request,
+        CancellationToken ct = default);
+
+    Task<BranchExecutionResult?> GetLatestAsync(
+        string branchId,
+        CancellationToken ct = default);
+
+    Task<BuildResult> RunAsync(
+        string branchId,
+        string? runCommand = null,
+        int timeoutSeconds = 120,
+        Dictionary<string, string>? environmentVariables = null,
+        CancellationToken ct = default);
+
+    Task<string?> GetBranchPathAsync(
+        string branchId,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns the cached (truncated) stdout+stderr for a previously persisted execution result.
+    /// The resultId is the ExecutionResultV1 node entity ID (e.g. "exec/{branchId}/20260618120000").
+    /// </summary>
+    Task<ExecutionOutput?> GetOutputAsync(
+        string branchId,
+        string resultId,
+        CancellationToken ct = default);
+}

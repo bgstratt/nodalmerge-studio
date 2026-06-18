@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { HostManager } from './HostManager';
 import { StudioShellPanel } from './panels/StudioShellPanel';
-import { MergeReviewPanel } from './panels/MergeReviewPanel';
+import { DecisionConvergencePanel } from './panels/MergeReviewPanel';
 import { NotificationManager } from './NotificationManager';
 import { AgentConfigService } from './AgentConfigService';
 import { LmApiProxy } from './LmApiProxy';
@@ -51,16 +51,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const shell = StudioShellPanel.createOrShow(
         manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
       );
-      shell.showTab(MergeReviewPanel.containerId);
-      shell.mergeReview.loadProposal(proposalId);
+      shell.showTab(DecisionConvergencePanel.containerId);
+      shell.decisionConvergence.loadProposal(proposalId);
     }),
 
     vscode.commands.registerCommand(COMMANDS.OPEN_MERGE_REVIEW_CONFLICT, (workUnitId: string) => {
       const shell = StudioShellPanel.createOrShow(
         manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
       );
-      shell.showTab(MergeReviewPanel.containerId);
-      shell.mergeReview.loadConflict(workUnitId);
+      shell.showTab(DecisionConvergencePanel.containerId);
+      shell.decisionConvergence.loadConflict(workUnitId);
     }),
   );
 

@@ -13,6 +13,11 @@ public enum ProjectionType
     MergeProposal,
     ExecutionSnapshot,
     AgentWorkspace,
+    GoalGraph,
+    EvidenceLedger,
+    TrajectoryTimeline,
+    ModelDivergenceView,
+    ReasoningCommitGraph,
 }
 
 public enum ProjectionLevel
@@ -77,7 +82,8 @@ public sealed record AgentWorkspaceProjectionPayload(
     string? AgentId,
     string? WorkUnitId,
     ArtifactChain Artifacts,
-    IReadOnlyList<ArtifactRef> InheritedConstraints);
+    IReadOnlyList<ArtifactRef> InheritedConstraints,
+    WorkspaceExecutionSummary? Execution = null);
 
 /// <summary>
 /// What changed in a work unit's artifact chain since the last cycle. Lets an orchestrator
@@ -118,6 +124,87 @@ public sealed record ProjectionDelta(
             AnyChange: added.Count > 0 || removed.Count > 0 || statusChanged.Count > 0);
     }
 }
+
+/// <summary>
+/// GoalGraph projection — DAG of goal nodes for the decision tree.
+/// </summary>
+public sealed record GoalGraphProjectionPayload(
+    IReadOnlyList<GoalGraphNode> Nodes);
+
+public sealed record GoalGraphNode(
+    string GoalId,
+    string Goal,
+    string WorkUnitId,
+    string BranchId,
+    string Status,
+    string? ParentGoalId,
+    IReadOnlyList<string> ChildGoalIds,
+    string Owner,
+    string? AssignedAgent,
+    int ProposalCount,
+    DateTimeOffset CreatedAt);
+
+/// <summary>
+/// EvidenceLedger projection — evidentiary basis for a work unit or proposal.
+/// </summary>
+public sealed record EvidenceLedgerProjectionPayload(
+    string WorkUnitId,
+    IReadOnlyList<EvidenceEntry> Entries);
+
+public sealed record EvidenceEntry(
+    string EvidenceId,
+    EvidenceKind Kind,
+    string Summary,
+    string? DetailJson,
+    DateTimeOffset AttachedAt);
+
+/// <summary>
+/// ModelDivergenceView projection — side-by-side diff of outputs from two models.
+/// </summary>
+public sealed record ModelDivergenceProjectionPayload(
+    string ModelA,
+    string ModelB,
+    IReadOnlyList<ModelDivergenceFile> DivergedFiles,
+    DateTimeOffset ComparedAt);
+
+public sealed record ModelDivergenceFile(
+    string Path,
+    string DiffAText,
+    string DiffBText,
+    IReadOnlyList<string> OverlappingLines);
+
+/// <summary>
+/// ReasoningCommitGraph projection — reasoning→model→execution→convergence graph
+/// built from orchestration decision log events, decision records, and execution evidence.
+/// </summary>
+public sealed record ReasoningCommitGraphProjectionPayload(
+    string RootWorkUnitId,
+    IReadOnlyList<ReasoningCommitGraphNode> Nodes,
+    IReadOnlyList<ReasoningCommitGraphEdge> Edges);
+
+/// <summary>
+/// A single commit in the reasoning graph. Each node corresponds to either an
+/// orchestration decision log event (reasoning step) or a convergence decision record.
+/// </summary>
+public sealed record ReasoningCommitGraphNode(
+    string CommitId,
+    string WorkUnitId,
+    string? AgentId,
+    string Stage,
+    string Action,
+    string? Reasoning,
+    string? AgentModel,
+    string? AgentProvider,
+    DateTimeOffset OccurredAt);
+
+/// <summary>
+/// Typed edge connecting two reasoning commits.
+/// EdgeType values: Refine, Fork, Replace, Merge, Invalidate, EvidenceAttached, Decided.
+/// </summary>
+public sealed record ReasoningCommitGraphEdge(
+    string FromCommitId,
+    string ToCommitId,
+    string EdgeType);
 
 public static class ProjectionCatalog
 {

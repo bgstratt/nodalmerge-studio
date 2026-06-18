@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Projections;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 using TaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.Projections;
@@ -16,19 +17,31 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly IMergeService _merges;
     private readonly IAgentRuntimeService _agentRuntime;
     private readonly IArtifactLineageService _artifactLineage;
+    private readonly IWorkspaceExecutionCommandService? _executionCommands;
+    private readonly IOrchestrationDecisionLogService? _decisionLog;
+    private readonly IDecisionNodeService? _decisionNodes;
+    private readonly IEvidenceNodeService? _evidenceNodes;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
         ITaskService tasks,
         IMergeService merges,
         IAgentRuntimeService agentRuntime,
-        IArtifactLineageService artifactLineage)
+        IArtifactLineageService artifactLineage,
+        IWorkspaceExecutionCommandService? executionCommands = null,
+        IOrchestrationDecisionLogService? decisionLog = null,
+        IDecisionNodeService? decisionNodes = null,
+        IEvidenceNodeService? evidenceNodes = null)
     {
-        _workUnits       = workUnits;
-        _tasks           = tasks;
-        _merges          = merges;
-        _agentRuntime    = agentRuntime;
-        _artifactLineage = artifactLineage;
+        _workUnits          = workUnits;
+        _tasks              = tasks;
+        _merges             = merges;
+        _agentRuntime       = agentRuntime;
+        _artifactLineage    = artifactLineage;
+        _executionCommands  = executionCommands;
+        _decisionLog        = decisionLog;
+        _decisionNodes      = decisionNodes;
+        _evidenceNodes      = evidenceNodes;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -41,6 +54,11 @@ public sealed class ProjectionManager : IProjectionManager
             ProjectionType.ExecutionSnapshot => await BuildExecutionSnapshotAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.AuthoritativeState => await BuildAuthoritativeStateAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.AgentWorkspace => await BuildAgentWorkspaceAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.GoalGraph => await BuildGoalGraphAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.EvidenceLedger => await BuildEvidenceLedgerAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.TrajectoryTimeline => await BuildTrajectoryTimelineAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.ModelDivergenceView => await BuildModelDivergenceViewAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.ReasoningCommitGraph => await BuildReasoningCommitGraphAsync(request, cancellationToken).ConfigureAwait(false),
             _ => throw new ArgumentOutOfRangeException(nameof(request), request.Type, "Unknown projection type.")
         };
 
@@ -243,11 +261,44 @@ public sealed class ProjectionManager : IProjectionManager
 
         var inheritedConstraints = ancestorChain.Where(a => a.Type == ArtifactType.Constraint).ToList();
 
+        // ── Slice 16l — attach latest execution result ───────────────────────
+        WorkspaceExecutionSummary? execution = null;
+        if (_executionCommands is not null)
+        {
+            try
+            {
+                var wu = await _workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+                if (wu is not null)
+                {
+                    var execResult = await _executionCommands.GetLatestAsync(wu.BranchId, ct).ConfigureAwait(false);
+                    if (execResult is not null)
+                    {
+                        var buildSystems = execResult.Builds
+                            .Select(b => b.BuildSystem)
+                            .Concat(execResult.Tests.Select(t => t.BuildSystem))
+                            .Where(bs => bs is not null)
+                            .Distinct()
+                            .ToList()!;
+                        var testSummary = execResult.Tests.Count > 0
+                            ? $"{execResult.Tests.Sum(t => t.Passed)} passed / {execResult.Tests.Sum(t => t.Failed)} failed"
+                            : null;
+                        execution = new WorkspaceExecutionSummary(
+                            execResult.AllSucceeded,
+                            buildSystems,
+                            testSummary,
+                            execResult.ExecutedAt);
+                    }
+                }
+            }
+            catch { /* best-effort — never fail a projection for execution data */ }
+        }
+
         var payload = new AgentWorkspaceProjectionPayload(
             request.AgentId,
             workUnitId,
             new ArtifactChain(combined),
-            inheritedConstraints);
+            inheritedConstraints,
+            execution);
 
         return Serialize(payload);
     }
@@ -276,6 +327,286 @@ public sealed class ProjectionManager : IProjectionManager
         }
 
         return result;
+    }
+
+    private async Task<string> BuildGoalGraphAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        var allWorkUnits = await _workUnits.ListAsync(request.BranchId, ct).ConfigureAwait(false);
+        var nodes = allWorkUnits.Select(wu => new GoalGraphNode(
+            GoalId: wu.WorkUnitId,
+            Goal: wu.Goal,
+            WorkUnitId: wu.WorkUnitId,
+            BranchId: wu.BranchId,
+            Status: wu.Status.ToString(),
+            ParentGoalId: wu.ParentWorkUnitId,
+            ChildGoalIds: allWorkUnits.Where(c => c.ParentWorkUnitId == wu.WorkUnitId).Select(c => c.WorkUnitId).ToList(),
+            Owner: wu.Owner,
+            AssignedAgent: wu.AssignedAgent,
+            ProposalCount: 0,
+            CreatedAt: wu.CreatedAt
+        )).ToList();
+
+        return Serialize(new GoalGraphProjectionPayload(nodes));
+    }
+
+    private async Task<string> BuildEvidenceLedgerAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new EvidenceLedgerProjectionPayload(string.Empty, []));
+
+        var entries = new List<EvidenceEntry>();
+
+        // Pull build/test evidence from workspace execution results.
+        if (_executionCommands is not null)
+        {
+            try
+            {
+                var wu = await _workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+                if (wu is not null)
+                {
+                    var execResult = await _executionCommands.GetLatestAsync(wu.BranchId, ct).ConfigureAwait(false);
+                    if (execResult is not null)
+                    {
+                        foreach (var build in execResult.Builds)
+                        {
+                            var summary = build.Success
+                                ? $"{build.BuildSystem ?? "build"}: passed (exit {build.ExitCode})"
+                                : $"{build.BuildSystem ?? "build"}: failed (exit {build.ExitCode})";
+                            entries.Add(new EvidenceEntry(
+                                $"ev-bld-{Guid.NewGuid():N}",
+                                EvidenceKind.Build,
+                                summary,
+                                null,
+                                execResult.ExecutedAt));
+                        }
+                        foreach (var test in execResult.Tests)
+                        {
+                            var summary = test.Success
+                                ? $"{test.BuildSystem ?? "test"}: passed ({test.Passed}/{test.TotalTests})"
+                                : $"{test.BuildSystem ?? "test"}: failed ({test.Passed}/{test.TotalTests})";
+                            entries.Add(new EvidenceEntry(
+                                $"ev-tst-{Guid.NewGuid():N}",
+                                EvidenceKind.Test,
+                                summary,
+                                null,
+                                execResult.ExecutedAt));
+                        }
+                    }
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        return Serialize(new EvidenceLedgerProjectionPayload(request.WorkUnitId, entries));
+    }
+
+    private async Task<string> BuildTrajectoryTimelineAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        var allWorkUnits = await _workUnits.ListAsync(request.BranchId, ct).ConfigureAwait(false);
+
+        var nodes = allWorkUnits.Select(wu =>
+        {
+            var phase = wu.CurrentStage switch
+            {
+                PipelineStage.Orchestrate => "GoalDefined",
+                PipelineStage.Plan        => "Decomposed",
+                PipelineStage.Execute     => "Executing",
+                PipelineStage.Review      => "Proposed",
+                PipelineStage.Merge       => wu.Status is WorkUnitStatus.Completed or WorkUnitStatus.Merged ? "Converged" : "Converging",
+                _ => wu.Status.ToString()
+            };
+
+            var children = allWorkUnits.Where(c => c.ParentWorkUnitId == wu.WorkUnitId).ToList();
+
+            return new
+            {
+                trajectoryId = wu.WorkUnitId,
+                workUnitId = wu.WorkUnitId,
+                branchId = wu.BranchId,
+                goal = wu.Goal,
+                phase,
+                parentTrajectoryId = wu.ParentWorkUnitId,
+                childTrajectoryIds = children.Select(c => c.WorkUnitId).ToList(),
+                agentId = wu.AssignedAgent,
+                startedAt = wu.CreatedAt,
+                completedAt = wu.Status is WorkUnitStatus.Completed or WorkUnitStatus.Merged ? (DateTimeOffset?)wu.UpdatedAt : null
+            };
+        }).ToList();
+
+        return Serialize(new { nodes, count = nodes.Count });
+    }
+
+    private async Task<string> BuildModelDivergenceViewAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new { error = "ModelDivergenceView requires workUnitId to find associated proposals." });
+
+        var wu = await _workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+        if (wu is null)
+            return Serialize(new { error = $"WorkUnit '{request.WorkUnitId}' not found." });
+
+        // Find proposals for this work unit, grouped by model
+        var allProposals = await _merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+        var relevantProposals = allProposals.Where(p => p.WorkUnitId == request.WorkUnitId).ToList();
+
+        var byModel = relevantProposals
+            .GroupBy(p => p.Model ?? p.AgentId ?? "unknown")
+            .ToList();
+
+        var models = byModel.Select(g => new
+        {
+            model = g.Key,
+            provider = g.First().Provider,
+            proposalIds = g.Select(p => p.ProposalId).ToList(),
+            proposalCount = g.Count(),
+            latestStatus = g.OrderByDescending(p => p.Status).First().Status.ToString()
+        }).ToList();
+
+        return Serialize(new
+        {
+            workUnitId = request.WorkUnitId,
+            goal = wu.Goal,
+            models,
+            comparedAt = DateTimeOffset.UtcNow
+        });
+    }
+
+    private async Task<string> BuildReasoningCommitGraphAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new ReasoningCommitGraphProjectionPayload(string.Empty, [], []));
+
+        var rootWu = await _workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+        if (rootWu is null)
+            return Serialize(new { error = $"WorkUnit '{request.WorkUnitId}' not found." });
+
+        // 1. Collect the entire work unit tree rooted at WorkUnitId.
+        var allWuIds = new HashSet<string> { request.WorkUnitId };
+        await CollectDescendantWorkUnitIdsAsync(request.WorkUnitId, allWuIds, ct).ConfigureAwait(false);
+
+        var nodes = new List<ReasoningCommitGraphNode>();
+        var edges = new List<ReasoningCommitGraphEdge>();
+
+        // Map workUnitId → last event's CommitId for chaining Refine/Decided edges.
+        var lastEventIdByWu = new Dictionary<string, string>();
+
+        // Map workUnitId → first event's CommitId for Fork edges from parent spawns to child roots.
+        var firstEventIdByWu = new Dictionary<string, string>();
+
+        // 2. Query orchestration events for every work unit in the tree.
+        foreach (var wuId in allWuIds)
+        {
+            if (_decisionLog is null) continue;
+            var events = await _decisionLog.GetEventsAsync(wuId, ct).ConfigureAwait(false);
+            var ordered = events.OrderBy(e => e.OccurredAt).ToList();
+
+            string? prevEventId = null;
+            foreach (var evt in ordered)
+            {
+                var node = new ReasoningCommitGraphNode(
+                    CommitId: evt.EventId,
+                    WorkUnitId: evt.WorkUnitId,
+                    AgentId: evt.OrchestratorAgentId,
+                    Stage: evt.InputStage.ToString(),
+                    Action: evt.Action.ToString(),
+                    Reasoning: evt.Reason,
+                    AgentModel: null,
+                    AgentProvider: null,
+                    OccurredAt: evt.OccurredAt);
+                nodes.Add(node);
+
+                // Track first event per work unit for Fork edge resolution.
+                if (!firstEventIdByWu.ContainsKey(wuId))
+                    firstEventIdByWu[wuId] = evt.EventId;
+
+                // Refine edge: sequential events within the same work unit.
+                if (prevEventId is not null)
+                    edges.Add(new ReasoningCommitGraphEdge(prevEventId, evt.EventId, "Refine"));
+
+                prevEventId = evt.EventId;
+
+                // Fork edges: connect this spawn event to the first event of each spawned child.
+                // SpawnedIds contains work unit IDs of children created by SpawnPlanner/SpawnWorker/Enqueue.
+                foreach (var spawnedId in evt.SpawnedIds)
+                {
+                    if (allWuIds.Contains(spawnedId))
+                    {
+                        // The child's first event may not have been processed yet (if ordered by
+                        // creation time but child created after parent). Record a deferred edge
+                        // that will be resolved after all events are collected.
+                        edges.Add(new ReasoningCommitGraphEdge(evt.EventId, spawnedId, "Fork"));
+                    }
+                }
+            }
+
+            if (prevEventId is not null)
+                lastEventIdByWu[wuId] = prevEventId;
+        }
+
+        // 3. Query decision nodes for every work unit — add as decision commit nodes.
+        if (_decisionNodes is not null)
+        {
+            foreach (var wuId in allWuIds)
+            {
+                var decisions = await _decisionNodes.ListByWorkUnitAsync(wuId, ct).ConfigureAwait(false);
+                foreach (var dec in decisions)
+                {
+                    var decisionNode = new ReasoningCommitGraphNode(
+                        CommitId: dec.DecisionId,
+                        WorkUnitId: dec.WorkUnitId,
+                        AgentId: dec.ReviewerAgentId,
+                        Stage: "Review",
+                        Action: dec.Outcome.ToString(),
+                        Reasoning: dec.Rationale,
+                        AgentModel: dec.ReviewerModel,
+                        AgentProvider: dec.ReviewerProvider,
+                        OccurredAt: dec.DecidedAt);
+                    nodes.Add(decisionNode);
+
+                    // Decided edge: last orchestration event → this decision.
+                    if (lastEventIdByWu.TryGetValue(wuId, out var lastEventId))
+                        edges.Add(new ReasoningCommitGraphEdge(lastEventId, dec.DecisionId, "Decided"));
+                }
+            }
+        }
+
+        // 4. Query evidence nodes and add EvidenceAttached edges to their associated decisions.
+        if (_evidenceNodes is not null)
+        {
+            foreach (var wuId in allWuIds)
+            {
+                var evidenceList = await _evidenceNodes.ListByWorkUnitAsync(wuId, ct).ConfigureAwait(false);
+                foreach (var ev in evidenceList)
+                {
+                    if (ev.ProposalId is not null)
+                    {
+                        // Find the decision node that references this proposal.
+                        var matchingDecision = nodes.FirstOrDefault(n =>
+                            n.Stage == "Review" &&
+                            n.WorkUnitId == wuId);
+                        if (matchingDecision is not null)
+                            edges.Add(new ReasoningCommitGraphEdge(matchingDecision.CommitId, ev.EvidenceId, "EvidenceAttached"));
+                    }
+                }
+            }
+        }
+
+        return Serialize(new ReasoningCommitGraphProjectionPayload(request.WorkUnitId, nodes, edges));
+    }
+
+    /// <summary>
+    /// Recursively collects all descendant work unit IDs starting from <paramref name="parentId"/>.
+    /// Guards against cycles with the <paramref name="collected"/> set.
+    /// </summary>
+    private async Task CollectDescendantWorkUnitIdsAsync(
+        string parentId, HashSet<string> collected, CancellationToken ct)
+    {
+        var children = await _workUnits.GetChildrenAsync(parentId, ct).ConfigureAwait(false);
+        foreach (var child in children)
+        {
+            if (collected.Add(child.WorkUnitId))
+                await CollectDescendantWorkUnitIdsAsync(child.WorkUnitId, collected, ct).ConfigureAwait(false);
+        }
     }
 
     private static string Serialize(object data) => JsonSerializer.Serialize(data, JsonOptions);

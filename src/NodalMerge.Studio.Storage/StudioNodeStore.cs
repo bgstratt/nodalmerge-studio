@@ -20,6 +20,13 @@ public static class StudioNodeKind
     public const string ChangeIntentV1       = "studio/change-intent/v1";
     public const string DeadLetterV1         = "studio/dead-letter/v1";
     public const string RuntimeSettingsV1    = "studio/runtime-settings/v1";
+    public const string ExecutionResultV1    = "studio/execution-result/v1";
+    public const string GoalV1               = "studio/goal/v1";
+    public const string DecisionV1           = "studio/decision/v1";
+    public const string EvidenceV1           = "studio/evidence/v1";
+    public const string TrajectoryV1         = "studio/trajectory/v1";
+    public const string HypothesisV1         = "studio/hypothesis/v1";
+    public const string ReasoningCommitV1    = "studio/reasoning-commit/v1";
 }
 
 public interface IStudioNodeStore

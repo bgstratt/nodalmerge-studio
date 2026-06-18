@@ -42,7 +42,8 @@ public sealed record WorkUnit(
     PipelineStage? CurrentStage = null,
     WorkUnitExecutionInfo? ExecutionInfo = null,
     WorkUnitFanOutInfo? FanOutInfo = null,
-    string? BranchedFromProposalId = null);
+    string? BranchedFromProposalId = null,
+    HypothesisForkType? ForkType = null);
 
 /// <summary>Failure/rejection counters, previously stored as parsed strings in Metadata.</summary>
 public sealed record WorkUnitExecutionInfo(int FailureAttemptCount, int AutomatedReviewRejectionCount);

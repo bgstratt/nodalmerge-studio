@@ -64,6 +64,33 @@ public static class McpToolNames
     public const string WorkspaceDiff   = "nm_v1_workspace_diff";
     public const string WorkspaceExists = "nm_v1_workspace_exists";
 
+    public const string WorkspaceBuild  = "nm_v1_workspace_build";
+    public const string WorkspaceTest   = "nm_v1_workspace_test";
+    public const string WorkspaceExec   = "nm_v1_workspace_exec";
+    public const string WorkspaceRun    = "nm_v1_workspace_run";
+    public const string WorkspaceExecStatus = "nm_v1_workspace_exec_status";
+    public const string WorkspacePath   = "nm_v1_workspace_path";
+
+    public const string GoalCreate = "nm_v1_goal_create";
+    public const string GoalList   = "nm_v1_goal_list";
+
+    public const string DecisionRecord = "nm_v1_decision_record";
+    public const string DecisionList   = "nm_v1_decision_list";
+
+    public const string EvidenceAttach = "nm_v1_evidence_attach";
+    public const string EvidenceList   = "nm_v1_evidence_list";
+
+    public const string TrajectoryCreate = "nm_v1_trajectory_create";
+    public const string TrajectoryReplay = "nm_v1_trajectory_replay";
+
+    public const string HypothesisFork = "nm_v1_hypothesis_fork";
+    public const string HypothesisList = "nm_v1_hypothesis_list";
+
+    public const string ReasoningRecord = "nm_v1_reasoning_record";
+
+    public const string ModelCompare = "nm_v1_model_compare";
+    public const string ModelReplay  = "nm_v1_model_replay";
+
     public static IReadOnlyList<string> All { get; } =
     [
         ProjectionGet,
@@ -109,6 +136,25 @@ public static class McpToolNames
         WorkspaceDelete,
         WorkspaceList,
         WorkspaceDiff,
-        WorkspaceExists
+        WorkspaceExists,
+        WorkspaceBuild,
+        WorkspaceTest,
+        WorkspaceExec,
+        WorkspaceRun,
+        WorkspaceExecStatus,
+        WorkspacePath,
+        GoalCreate,
+        GoalList,
+        DecisionRecord,
+        DecisionList,
+        EvidenceAttach,
+        EvidenceList,
+        TrajectoryCreate,
+        TrajectoryReplay,
+        HypothesisFork,
+        HypothesisList,
+        ReasoningRecord,
+        ModelCompare,
+        ModelReplay
     ];
 }

@@ -45,8 +45,8 @@ interface DeadLetterEntry {
 
 // ── Panel ──────────────────────────────────────────────────────────────────
 
-export class WorkspaceDashboardPanel implements vscode.Disposable {
-  static readonly containerId = 'shell-pane-workspace';
+export class ExecutionTimelinePanel implements vscode.Disposable {
+  static readonly containerId = 'shell-pane-execution-timeline';
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
@@ -74,15 +74,12 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
 
   static getFragment(): { css: string; html: string; script: string } {
     return {
-      css: scopeViewCss(DASHBOARD_CSS, WorkspaceDashboardPanel.containerId),
-      html: `<div id="${WorkspaceDashboardPanel.containerId}" class="nm-shell-pane">${DASHBOARD_HTML}</div>`,
-      script: wrapViewScript(DASHBOARD_JS, WorkspaceDashboardPanel.containerId),
+      css: scopeViewCss(ET_CSS, ExecutionTimelinePanel.containerId),
+      html: `<div id="${ExecutionTimelinePanel.containerId}" class="nm-shell-pane">${ET_HTML}</div>`,
+      script: wrapViewScript(ET_JS, ExecutionTimelinePanel.containerId),
     };
   }
 
-  /** Called once by the shell right after construction — was the tail of createOrShow(). Unlike
-   * before, polling now runs continuously regardless of which shell tab is visible (the shell
-   * has one always-open webview, not a panel that can itself be hidden/shown); see Slice 0 notes. */
   activate(): void {
     this.startPolling();
   }
@@ -121,7 +118,7 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
       switch (msg.type as string) {
         case 'createWorkUnit': {
           const goal = await vscode.window.showInputBox({
-            prompt: 'Work unit goal',
+            prompt: 'Goal for the new work unit',
             placeHolder: 'e.g. Build the NodalMerge docs site',
             ignoreFocusOut: true,
           });
@@ -163,14 +160,14 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
             );
             if (!llm) {
               void vscode.window.showErrorMessage(
-                `NodalMerge: Profile "${agentType}" has no LLM credentials — set VS Code LM or an API key in Agent Config.`,
+                `NodalMerge: Profile "${agentType}" has no LLM credentials — set VS Code LM or an API key in Model & Agent Studio.`,
               );
               return;
             }
             spawnBody = { ...spawnBody, ...llm };
           } else {
             void vscode.window.showWarningMessage(
-              'NodalMerge: Spawning without LLM credentials — the agent loop will not start. Use Agent Config → Quick Spawn instead.',
+              'NodalMerge: Spawning without LLM credentials — the agent loop will not start. Use Model & Agent Studio → Quick Explore instead.',
             );
           }
           await this.post('/studio/agents/spawn', spawnBody);
@@ -231,7 +228,7 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
 
 // ── HTML builder ───────────────────────────────────────────────────────────
 
-const DASHBOARD_CSS = `
+const ET_CSS = `
   :root {
     --nm-bg:         var(--vscode-editor-background);
     --nm-fg:         var(--vscode-editor-foreground);
@@ -354,43 +351,43 @@ const DASHBOARD_CSS = `
   .add-btn:hover { opacity: 1; }
 `;
 
-const DASHBOARD_HTML = `
+const ET_HTML = `
   <div class="header">
-    <span class="header-title">NodalMerge Studio<span class="pulse"></span></span>
+    <span class="header-title">Execution Timeline<span class="pulse"></span></span>
     <span id="last-updated"></span>
   </div>
 
-  <h2>Work Units</h2>
-  <div id="work-units"><p class="empty">Loading…</p></div>
-  <button class="add-btn" id="btn-new-wu">+ New Work Unit</button>
+  <h2>Active Goals</h2>
+  <div id="active-goals"><p class="empty">Loading…</p></div>
+  <button class="add-btn" id="btn-new-goal">+ New Goal</button>
 
-  <h2>Agents</h2>
-  <div id="agents"><p class="empty">No agents.</p></div>
-  <button class="add-btn" id="btn-spawn">+ Spawn Agent</button>
+  <h2>Running Agents</h2>
+  <div id="agents"><p class="empty">No running agents.</p></div>
+  <button class="add-btn" id="btn-start-agent">+ Start Agent</button>
 
-  <h2>Pending Merges</h2>
-  <div id="merges"><p class="empty">No pending merges.</p></div>
+  <h2>Pending Decisions</h2>
+  <div id="decisions"><p class="empty">No pending decisions.</p></div>
 
-  <h2>Failures</h2>
-  <div id="failures"><p class="empty">No failures.</p></div>
+  <h2>Blocked Explorations</h2>
+  <div id="blocked"><p class="empty">No blocked explorations.</p></div>
 `;
 
-const DASHBOARD_JS = `
+const ET_JS = `
   const vscode = acquireVsCodeApi();
 
-  document.getElementById('btn-new-wu').addEventListener('click', function() {
+  document.getElementById('btn-new-goal').addEventListener('click', function() {
     vscode.postMessage({ type: 'createWorkUnit' });
   });
-  document.getElementById('btn-spawn').addEventListener('click', function() {
+  document.getElementById('btn-start-agent').addEventListener('click', function() {
     vscode.postMessage({ type: 'spawnAgent' });
   });
 
   function esc(str) {
     return String(str || '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
+      .replace(/&/g, '&')
+      .replace(/</g, '<')
+      .replace(/>/g, '>')
+      .replace(/"/g, '"')
       .replace(/'/g, '&#39;');
   }
 
@@ -399,15 +396,15 @@ const DASHBOARD_JS = `
     return '<span class="badge ' + s + '">' + esc(status || '—') + '</span>';
   }
 
-  function renderWorkUnits(wus) {
-    var el = document.getElementById('work-units');
-    if (!wus || !wus.length) {
-      el.innerHTML = '<p class="empty">No work units yet.</p>';
+  function renderActiveGoals(goals) {
+    var el = document.getElementById('active-goals');
+    if (!goals || !goals.length) {
+      el.innerHTML = '<p class="empty">No active goals.</p>';
       return;
     }
     var html = '';
-    for (var i = 0; i < wus.length; i++) {
-      var wu = wus[i];
+    for (var i = 0; i < goals.length; i++) {
+      var wu = goals[i];
       var isReviewing = (wu.status || '').toLowerCase() === 'reviewing';
       html += '<div class="card">';
       html += '<div class="row">';
@@ -422,7 +419,7 @@ const DASHBOARD_JS = `
       html += '</div>';
       html += '<div class="row">';
       html += '<span class="mono">' + esc(wu.workUnitId) + '</span>';
-      html += '<span class="mono">branch: ' + esc(wu.branchId) + '</span>';
+      html += '<span class="mono">fork: ' + esc(wu.branchId) + '</span>';
       html += '<span class="mono">owner: ' + esc(wu.owner) + '</span>';
       html += '</div>';
       html += '</div>';
@@ -440,18 +437,18 @@ const DASHBOARD_JS = `
     });
   }
 
-  function renderAgents(agents, wus) {
+  function renderAgents(agents, goals) {
     var el = document.getElementById('agents');
     if (!agents || !agents.length) {
-      el.innerHTML = '<p class="empty">No agents.</p>';
+      el.innerHTML = '<p class="empty">No running agents.</p>';
       return;
     }
-    var wuMap = {};
-    for (var j = 0; j < (wus || []).length; j++) { wuMap[wus[j].workUnitId] = wus[j]; }
+    var goalMap = {};
+    for (var j = 0; j < (goals || []).length; j++) { goalMap[goals[j].workUnitId] = goals[j]; }
     var html = '';
     for (var i = 0; i < agents.length; i++) {
       var a = agents[i];
-      var wu = wuMap[a.workUnitId];
+      var wu = goalMap[a.workUnitId];
       var isPaused = (a.status || '').toLowerCase() === 'paused';
       html += '<div class="card">';
       html += '<div class="row">';
@@ -479,7 +476,7 @@ const DASHBOARD_JS = `
     });
   }
 
-  var MERGE_STATUS_COLOR = {
+  var DECISION_STATUS_COLOR = {
     draft:          '',
     readyforreview: 'active',
     approved:       'active',
@@ -487,17 +484,17 @@ const DASHBOARD_JS = `
     merged:         'stopped',
   };
 
-  function renderMerges(merges) {
-    var el = document.getElementById('merges');
+  function renderPendingDecisions(merges) {
+    var el = document.getElementById('decisions');
     if (!merges || !merges.length) {
-      el.innerHTML = '<p class="empty">No merge proposals.</p>';
+      el.innerHTML = '<p class="empty">No pending decisions.</p>';
       return;
     }
     var html = '';
     for (var i = 0; i < merges.length; i++) {
       var m = merges[i];
       var statusKey = (m.status || '').toLowerCase().replace(/\\s+/g, '');
-      var badgeClass = 'badge ' + (MERGE_STATUS_COLOR[statusKey] || '');
+      var badgeClass = 'badge ' + (DECISION_STATUS_COLOR[statusKey] || '');
       var canReview = statusKey === 'readyforreview' || statusKey === 'approved' || statusKey === 'draft';
       html += '<div class="card">';
       html += '<div class="row">';
@@ -505,7 +502,7 @@ const DASHBOARD_JS = `
       html += '<span class="' + badgeClass + '">' + esc(m.status) + '</span>';
       if (canReview) {
         html += '<div class="actions">';
-        html += '<button class="ghost" data-action="openMergeReview" data-pid="' + esc(m.proposalId) + '">Review →</button>';
+        html += '<button class="ghost" data-action="openMergeReview" data-pid="' + esc(m.proposalId) + '">Review Decision →</button>';
         html += '</div>';
       }
       html += '</div>';
@@ -522,18 +519,18 @@ const DASHBOARD_JS = `
     });
   }
 
-  function renderFailures(deadLetters, workUnits) {
-    var el = document.getElementById('failures');
+  function renderBlockedExplorations(deadLetters, goals) {
+    var el = document.getElementById('blocked');
     if (!deadLetters || !deadLetters.length) {
-      el.innerHTML = '<p class="empty">No failures.</p>';
+      el.innerHTML = '<p class="empty">No blocked explorations.</p>';
       return;
     }
-    var wuMap = {};
-    for (var j = 0; j < (workUnits || []).length; j++) { wuMap[workUnits[j].workUnitId] = workUnits[j]; }
+    var goalMap = {};
+    for (var j = 0; j < (goals || []).length; j++) { goalMap[goals[j].workUnitId] = goals[j]; }
     var html = '';
     for (var i = 0; i < deadLetters.length; i++) {
       var dl = deadLetters[i];
-      var wu = wuMap[dl.workUnitId];
+      var wu = goalMap[dl.workUnitId];
       var goal = wu ? wu.goal : dl.workUnitId;
       var canRetry = !dl.maxAttemptsReached && dl.attemptCount < 3;
       html += '<div class="card">';
@@ -548,8 +545,8 @@ const DASHBOARD_JS = `
       }
       html += '</div></div>';
       html += '<div class="row">';
-      html += '<span class="mono">stage: ' + esc(dl.stage) + '</span>';
-      html += '<span class="mono">profile: ' + esc(dl.profileId) + '</span>';
+      html += '<span class="mono">phase: ' + esc(dl.stage) + '</span>';
+      html += '<span class="mono">model: ' + esc(dl.profileId) + '</span>';
       html += '<span class="mono">attempt ' + esc(String(dl.attemptCount)) + '/3</span>';
       html += '</div>';
       html += '<div class="row"><span class="mono">' + esc(dl.reason) + '</span></div>';
@@ -566,10 +563,10 @@ const DASHBOARD_JS = `
   window.addEventListener('message', function(event) {
     var msg = event.data;
     if (msg.type !== 'data') { return; }
-    renderWorkUnits(msg.workUnits);
+    renderActiveGoals(msg.workUnits);
     renderAgents(msg.agents, msg.workUnits);
-    renderMerges(msg.merges);
-    renderFailures(msg.deadLetters || [], msg.workUnits);
+    renderPendingDecisions(msg.merges);
+    renderBlockedExplorations(msg.deadLetters || [], msg.workUnits);
     var ts = document.getElementById('last-updated');
     if (ts) { ts.textContent = 'updated ' + new Date().toLocaleTimeString(); }
   });

@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Merge;
+using NodalMerge.Studio.Contracts.Projections;
 using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Host;
@@ -79,6 +80,10 @@ public static class StudioRestEndpoints
         string WorkUnitId,
         string ProfileId,
         string? TaskId = null,
+        string? Model = null,
+        string? BaseUrl = null,
+        string? ApiKey = null,
+        string? Provider = null,
         string? SessionId = null);
 
     private sealed record CreateSessionBody(
@@ -95,6 +100,57 @@ public static class StudioRestEndpoints
         bool BlockOverlappingFileScope = false,
         int MaxConcurrentWorkers = 3,
         int SchedulerPollIntervalMs = 2_000);
+
+    private sealed record BuildRequestBody(
+        string? BuildCommand = null,
+        int TimeoutSeconds = 300);
+
+    private sealed record TestRequestBody(
+        string? TestCommand = null,
+        int TimeoutSeconds = 300);
+
+    private sealed record RunRequestBody(
+        string? RunCommand = null,
+        int TimeoutSeconds = 120);
+
+    private sealed record RollbackRequestBody(string KnownGoodStateId);
+
+    private sealed record CreateGoalBody(
+        string Goal,
+        string? WorkUnitId = null);
+
+    private sealed record RecordDecisionBody(
+        string ProposalId,
+        string Outcome,
+        string? Rationale = null,
+        string? ReviewerAgentId = null,
+        string? ReviewerModel = null,
+        string? ReviewerProvider = null,
+        double? Confidence = null);
+
+    private sealed record CreateTrajectoryBody(
+        string WorkUnitId,
+        string Phase,
+        string? AgentId = null,
+        string? Model = null,
+        string? Provider = null);
+
+    private sealed record CreateHypothesisBody(
+        string Goal,
+        string ForkType,
+        string? ParentWorkUnitId = null,
+        string? BranchedFromProposalId = null,
+        string? Rationale = null);
+
+    private sealed record RecordReasoningBody(
+        string WorkUnitId,
+        string AgentId,
+        string InputStage,
+        string Action,
+        string? Reasoning = null,
+        string? ProjectionSnapshotJson = null,
+        string? AgentModel = null,
+        string? AgentProvider = null);
 
     // ── Registration ───────────────────────────────────────────────────────
 
@@ -117,6 +173,16 @@ public static class StudioRestEndpoints
         MapDeadLetterEndpoints(app);
         MapOptionsEndpoints(app);
         MapPolicyEndpoints(app);
+        MapProjectionEndpoints(app);
+        MapSnapshotEndpoints(app);
+        MapReplayEndpoints(app);
+        MapGoalEndpoints(app);
+        MapDecisionEndpoints(app);
+        MapEvidenceEndpoints(app);
+        MapTrajectoryEndpoints(app);
+        MapHypothesisEndpoints(app);
+        MapReasoningEndpoints(app);
+        MapModelEndpoints(app);
         return app;
     }
 
@@ -144,6 +210,12 @@ public static class StudioRestEndpoints
                 blockOverlappingFileScope = options.BlockOverlappingFileScope,
                 maxConcurrentWorkers = options.MaxConcurrentWorkers,
                 schedulerPollIntervalMs = options.SchedulerPollIntervalMs,
+                requireBuildBeforeProposal = options.RequireBuildBeforeProposal,
+                requireTestBeforeProposal = options.RequireTestBeforeProposal,
+                buildCommand = options.BuildCommand,
+                testCommand = options.TestCommand,
+                executionTimeoutSeconds = options.ExecutionTimeoutSeconds,
+                postMergeExecutionMode = options.PostMergeExecutionMode,
             }));
 
         app.MapPost("/studio/options", async (
@@ -172,6 +244,12 @@ public static class StudioRestEndpoints
                 blockOverlappingFileScope = options.BlockOverlappingFileScope,
                 maxConcurrentWorkers = options.MaxConcurrentWorkers,
                 schedulerPollIntervalMs = options.SchedulerPollIntervalMs,
+                requireBuildBeforeProposal = options.RequireBuildBeforeProposal,
+                requireTestBeforeProposal = options.RequireTestBeforeProposal,
+                buildCommand = options.BuildCommand,
+                testCommand = options.TestCommand,
+                executionTimeoutSeconds = options.ExecutionTimeoutSeconds,
+                postMergeExecutionMode = options.PostMergeExecutionMode,
             });
         });
     }
@@ -187,6 +265,81 @@ public static class StudioRestEndpoints
         {
             var summary = await workspace.GetSummaryAsync(branchId, ct).ConfigureAwait(false);
             return Results.Ok(summary);
+        });
+
+        // ── Slice 16d — workspace execution REST endpoints (MCP parity) ────
+
+        app.MapPost("/studio/workspace/{branchId}/build", async (
+            string branchId,
+            BuildRequestBody body,
+            IWorkspaceExecutionCommandService cmd,
+            CancellationToken ct) =>
+        {
+            var result = await cmd.BuildAsync(branchId, body.BuildCommand, body.TimeoutSeconds, ct).ConfigureAwait(false);
+            return Results.Ok(result);
+        });
+
+        app.MapPost("/studio/workspace/{branchId}/test", async (
+            string branchId,
+            TestRequestBody body,
+            IWorkspaceExecutionCommandService cmd,
+            CancellationToken ct) =>
+        {
+            var result = await cmd.TestAsync(branchId, body.TestCommand, body.TimeoutSeconds, ct).ConfigureAwait(false);
+            return Results.Ok(result);
+        });
+
+        app.MapPost("/studio/workspace/{branchId}/exec", async (
+            string branchId,
+            WorkspaceExecutionRequest body,
+            IWorkspaceExecutionCommandService cmd,
+            CancellationToken ct) =>
+        {
+            var result = await cmd.ExecAsync(branchId, body, ct).ConfigureAwait(false);
+            return Results.Ok(result);
+        });
+
+        app.MapPost("/studio/workspace/{branchId}/run", async (
+            string branchId,
+            RunRequestBody body,
+            IWorkspaceExecutionCommandService cmd,
+            CancellationToken ct) =>
+        {
+            var result = await cmd.RunAsync(branchId, body.RunCommand, body.TimeoutSeconds, environmentVariables: null, ct: ct).ConfigureAwait(false);
+            return Results.Ok(result);
+        });
+
+        app.MapGet("/studio/workspace/{branchId}/exec/latest", async (
+            string branchId,
+            IWorkspaceExecutionCommandService cmd,
+            CancellationToken ct) =>
+        {
+            var result = await cmd.GetLatestAsync(branchId, ct).ConfigureAwait(false);
+            return result is not null ? Results.Ok(result) : Results.NotFound();
+        });
+
+        app.MapGet("/studio/workspace/{branchId}/path", async (
+            string branchId,
+            IWorkspaceExecutionCommandService cmd,
+            CancellationToken ct) =>
+        {
+            var path = await cmd.GetBranchPathAsync(branchId, ct).ConfigureAwait(false);
+            return path is not null
+                ? Results.Ok(new { branchId, workingDirectory = path, exists = true })
+                : Results.Ok(new { branchId, workingDirectory = (string?)null, exists = false });
+        });
+
+        // Slice 16m — output download endpoint. Returns cached (truncated) stdout/stderr from a
+        // persisted execution result node. resultId is the ExecutionResultV1 entity ID (form:
+        // "exec/{branchId}/20260618120000").
+        app.MapGet("/studio/workspace/{branchId}/exec/{resultId}/output", async (
+            string branchId,
+            string resultId,
+            IWorkspaceExecutionCommandService cmd,
+            CancellationToken ct) =>
+        {
+            var output = await cmd.GetOutputAsync(branchId, resultId, ct).ConfigureAwait(false);
+            return output is not null ? Results.Ok(output) : Results.NotFound();
         });
     }
 
@@ -211,6 +364,7 @@ public static class StudioRestEndpoints
         executionInfo = wu.ExecutionInfo,
         fanOutInfo = wu.FanOutInfo,
         branchedFromProposalId = wu.BranchedFromProposalId,
+        forkType = wu.ForkType?.ToString(),
         proposalCount,
     };
 
@@ -393,16 +547,30 @@ public static class StudioRestEndpoints
         });
     }
 
-    // ── /studio/tasks ─────────────────────────────────────────────────────────
+        // ── /studio/tasks ─────────────────────────────────────────────────────────
+
+    private sealed record CreateTaskBody(
+        string WorkUnitId,
+        string Title,
+        string Description,
+        int Priority = 0);
+
+    private sealed record UpdateTaskBody(
+        string? Title = null,
+        string? Description = null,
+        string? Status = null,
+        int? Priority = null);
+
+    private sealed record AssignTaskBody(string AgentId);
 
     private static void MapTaskEndpoints(WebApplication app)
     {
         app.MapGet("/studio/tasks", async (
             [FromQuery] string? workUnitId,
-            ITaskService tasks,
+            ITaskCommandService taskCommands,
             CancellationToken ct) =>
         {
-            var list = await tasks.ListAsync(workUnitId, ct).ConfigureAwait(false);
+            var list = await taskCommands.ListAsync(workUnitId, ct).ConfigureAwait(false);
             return Results.Ok(list);
         });
 
@@ -415,6 +583,70 @@ public static class StudioRestEndpoints
             return task is null
                 ? Results.NotFound(new { error = $"Task '{taskId}' not found." })
                 : Results.Ok(task);
+        });
+
+        app.MapPost("/studio/tasks", async (
+            CreateTaskBody body,
+            ITaskCommandService taskCommands,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+            if (string.IsNullOrWhiteSpace(body.Title))
+                return Results.BadRequest(new { error = "title is required." });
+            if (string.IsNullOrWhiteSpace(body.Description))
+                return Results.BadRequest(new { error = "description is required." });
+
+            var task = await taskCommands.CreateAsync(
+                new TaskCreateCommand(body.WorkUnitId, body.Title, body.Description, body.Priority),
+                ct).ConfigureAwait(false);
+            return Results.Ok(task);
+        });
+
+        app.MapPut("/studio/tasks/{taskId}", async (
+            string taskId,
+            UpdateTaskBody body,
+            ITaskCommandService taskCommands,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var updated = await taskCommands.UpdateAsync(
+                    taskId, body.Title, body.Description, body.Status, body.Priority, ct).ConfigureAwait(false);
+                return Results.Ok(updated);
+            }
+            catch (KeyNotFoundException)
+            {
+                return Results.NotFound(new { error = $"Task '{taskId}' not found." });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        app.MapPost("/studio/tasks/{taskId}/assign", async (
+            string taskId,
+            AssignTaskBody body,
+            ITaskCommandService taskCommands,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.AgentId))
+                return Results.BadRequest(new { error = "agentId is required." });
+
+            try
+            {
+                var assigned = await taskCommands.AssignAsync(taskId, body.AgentId, ct).ConfigureAwait(false);
+                return Results.Ok(assigned);
+            }
+            catch (KeyNotFoundException)
+            {
+                return Results.NotFound(new { error = $"Task '{taskId}' not found." });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
         });
     }
 
@@ -452,6 +684,17 @@ public static class StudioRestEndpoints
                 body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey,
                 body.Provider, body.ProfileId, body.AutoReviewProfileId, ct).ConfigureAwait(false);
             return Results.Ok(new { agentId, agentType = body.AgentType, workUnitId = body.WorkUnitId, branchId = wu.BranchId });
+        });
+
+        // Slice 15e — single-agent status read (list/spawn/pause/resume/stop already existed; this
+        // fills the gap matching MCP's nm_v1_agent_status and the agent-loop dispatcher equivalent).
+        app.MapGet("/studio/agents/{agentId}/status", async (
+            string agentId,
+            IAgentControlService agents,
+            CancellationToken ct) =>
+        {
+            var status = await agents.GetStatusAsync(agentId, ct).ConfigureAwait(false);
+            return Results.Ok(new { agentId, status });
         });
 
         app.MapPost("/studio/agents/{agentId}/pause", async (
@@ -543,13 +786,19 @@ public static class StudioRestEndpoints
             {
                 var constituent = await merge.GetAsync(id, ct).ConfigureAwait(false);
                 constituents.Add(constituent is null
-                    ? new { proposalId = id, status = "Unknown", goal = (string?)null, summary = (string?)null }
+                    ? new { proposalId = id, status = "Unknown", goal = (string?)null, summary = (string?)null, model = (string?)null, confidence = (double?)null, rationale = (string?)null }
                     : new
                     {
                         proposalId = constituent.ProposalId,
                         status = constituent.Status.ToString(),
                         goal = (string?)constituent.Goal,
                         summary = (string?)constituent.Summary,
+                        model = (string?)constituent.Model,
+                        provider = (string?)constituent.Provider,
+                        confidence = constituent.Confidence,
+                        rationale = (string?)constituent.ChangeDescription,
+                        agentId = (string?)constituent.AgentId,
+                        workspaceChanges = (string?)constituent.WorkspaceChanges,
                     });
             }
 
@@ -568,8 +817,7 @@ public static class StudioRestEndpoints
         app.MapPost("/studio/merges", async (
             ProposeMergeBody body,
             HttpRequest request,
-            IMergeService merge,
-            IStudioNodeStore nodeStore,
+            IMergeCommandService mergeCommands,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(body.SourceBranch))
@@ -579,30 +827,12 @@ public static class StudioRestEndpoints
             if (string.IsNullOrWhiteSpace(body.Summary))
                 return Results.BadRequest(new { error = "summary is required." });
 
-            // Idempotent: return cached result for same X-Command-Id header.
             var commandId = request.Headers["X-Command-Id"].FirstOrDefault();
-            if (commandId is not null)
-            {
-                var cached = await nodeStore.ReadNodeAsync(StudioNodeKind.CommandResultV1, commandId, ct)
-                    .ConfigureAwait(false);
-                if (cached is not null)
-                    return Results.Text(cached, "application/json");
-            }
 
-            var proposal = new MergeProposal(
-                $"MP-{Guid.NewGuid():N}",
-                body.SourceBranch,
-                body.TargetBranch,
-                body.Goal ?? body.Summary,
-                body.Summary,
-                body.ChangeDescription ?? body.Summary,
-                null, null, null,
-                MergeProposalStatus.Draft);
-            var created = await merge.ProposeAsync(proposal, ct).ConfigureAwait(false);
-
-            if (commandId is not null)
-                await nodeStore.WriteNodeAsync(StudioNodeKind.CommandResultV1, commandId,
-                    JsonSerializer.Serialize(created), ct).ConfigureAwait(false);
+            var created = await mergeCommands.ProposeAsync(
+                body.SourceBranch, body.TargetBranch, body.Summary,
+                body.Goal, body.ChangeDescription,
+                commandId: commandId, cancellationToken: ct).ConfigureAwait(false);
 
             return Results.Ok(created);
         });
@@ -896,7 +1126,7 @@ public static class StudioRestEndpoints
 
         app.MapPost("/studio/scheduler/enqueue", async (
             EnqueueBody body,
-            IWorkScheduler scheduler,
+            ISchedulerCommandService scheduler,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(body.WorkUnitId))
@@ -904,9 +1134,10 @@ public static class StudioRestEndpoints
             if (string.IsNullOrWhiteSpace(body.ProfileId))
                 return Results.BadRequest(new { error = "profileId is required." });
 
-            await scheduler.EnqueueAsync(body.WorkUnitId, body.ProfileId, body.TaskId, sessionId: body.SessionId, ct: ct)
+            var item = await scheduler.EnqueueAsync(
+                body.WorkUnitId, body.ProfileId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey, body.Provider, body.SessionId, ct)
                 .ConfigureAwait(false);
-            return Results.Ok(new { workUnitId = body.WorkUnitId, profileId = body.ProfileId, taskId = body.TaskId, sessionId = body.SessionId, status = "enqueued" });
+            return Results.Ok(new { workUnitId = item.WorkUnitId, profileId = item.ProfileId, taskId = item.TaskId, sessionId = item.SessionId, status = "enqueued" });
         });
     }
 
@@ -1244,6 +1475,13 @@ public static class StudioRestEndpoints
 
     // ── /studio/artifacts ──────────────────────────────────────────────────
 
+    private sealed record CreateArtifactBody(
+        string WorkUnitId,
+        string Type,
+        string Title,
+        string Body,
+        string? ParentArtifactId = null);
+
     private static void MapArtifactEndpoints(WebApplication app)
     {
         app.MapGet("/studio/artifacts/{artifactId}", async (
@@ -1264,6 +1502,882 @@ public static class StudioRestEndpoints
         {
             var children = await artifacts.GetChildrenAsync(artifactId, ct).ConfigureAwait(false);
             return Results.Ok(children);
+        });
+
+        // Slice 15f — knowledge artifact Record/Query/List via REST (previously only MCP).
+        app.MapPost("/studio/artifacts", async (
+            CreateArtifactBody body,
+            IArtifactCommandService artifactCommands,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+            if (string.IsNullOrWhiteSpace(body.Type))
+                return Results.BadRequest(new { error = "type is required." });
+            if (string.IsNullOrWhiteSpace(body.Title))
+                return Results.BadRequest(new { error = "title is required." });
+            if (string.IsNullOrWhiteSpace(body.Body))
+                return Results.BadRequest(new { error = "body is required." });
+
+            try
+            {
+                var recorded = await artifactCommands.RecordAsync(
+                    body.WorkUnitId, body.Type, body.Title, body.Body, body.ParentArtifactId, ct).ConfigureAwait(false);
+                return Results.Ok(recorded);
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        app.MapGet("/studio/artifacts", async (
+            [FromQuery] string workUnitId,
+            [FromQuery] string? type,
+            [FromQuery] string? keywords,
+            [FromQuery] bool? includeAncestors,
+            IArtifactCommandService artifactCommands,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(workUnitId))
+                return Results.BadRequest(new { error = "workUnitId query parameter is required." });
+
+            try
+            {
+                // If keywords or type are given, it's a query; otherwise a list.
+                if (keywords is not null || type is not null)
+                {
+                    var results = await artifactCommands.QueryAsync(
+                        workUnitId, type, keywords, ct).ConfigureAwait(false);
+                    return Results.Ok(results);
+                }
+
+                var list = await artifactCommands.ListAsync(
+                    workUnitId, includeAncestors ?? true, ct).ConfigureAwait(false);
+                return Results.Ok(list);
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+    }
+
+    // ── /studio/projections — Slice 6.5 deferred: projection REST parity ───
+
+    private static void MapProjectionEndpoints(WebApplication app)
+    {
+        // List available projection types and levels (mirrors nm_v1_projection_list)
+        app.MapGet("/studio/projections", () =>
+            Results.Ok(new
+            {
+                types = ProjectionCatalog.Types,
+                levels = ProjectionCatalog.Levels
+            }));
+
+        // Get a projection by type (mirrors nm_v1_projection_get)
+        app.MapGet("/studio/projections/{projectionType}", async (
+            string projectionType,
+            [FromQuery] string? level,
+            [FromQuery] string? workUnitId,
+            [FromQuery] string? branchId,
+            [FromQuery] string? agentId,
+            IProjectionManager projections,
+            CancellationToken ct) =>
+        {
+            if (!Enum.TryParse<ProjectionType>(projectionType, ignoreCase: true, out var type) ||
+                !Enum.TryParse<ProjectionLevel>(level ?? "Normal", ignoreCase: true, out var projectionLevel))
+            {
+                return Results.BadRequest(new { error = "Invalid projectionType or projectionLevel." });
+            }
+
+            try
+            {
+                var result = await projections.GetAsync(
+                    new ProjectionRequest(type, projectionLevel, workUnitId, branchId, agentId),
+                    ct).ConfigureAwait(false);
+
+                return Results.Ok(new
+                {
+                    contractVersion = "v1",
+                    projectionType = result.Type.ToString(),
+                    level = result.Level.ToString(),
+                    data = JsonSerializer.Deserialize<object>(result.DataJson)
+                });
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+    }
+
+    // ── /studio/snapshots — Slice 6.5 deferred: snapshot REST parity ────────
+
+    private static void MapSnapshotEndpoints(WebApplication app)
+    {
+        // Get an execution snapshot for an agent (mirrors nm_v1_snapshot_get)
+        app.MapGet("/studio/snapshots/{agentId}", async (
+            string agentId,
+            [FromQuery] string? workUnitId,
+            ISnapshotService snapshots,
+            CancellationToken ct) =>
+        {
+            if (workUnitId is null)
+                return Results.BadRequest(new { error = "workUnitId is required." });
+
+            try
+            {
+                var snapshot = await snapshots.GetAsync(agentId, workUnitId, ct).ConfigureAwait(false);
+                return Results.Ok(new
+                {
+                    agentId,
+                    workUnitId,
+                    currentGoal = snapshot.CurrentGoal,
+                    currentTask = snapshot.CurrentTask,
+                    failureCount = snapshot.FailureCount,
+                    rollbackCount = snapshot.RollbackCount,
+                    nextSuggestedAction = snapshot.NextSuggestedAction
+                });
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        // Compare execution snapshots between agents (mirrors nm_v1_snapshot_compare)
+        app.MapGet("/studio/snapshots/{agentId}/compare/{otherAgentId}", async (
+            string agentId,
+            string otherAgentId,
+            [FromQuery] string? workUnitId,
+            ISnapshotService snapshots,
+            CancellationToken ct) =>
+        {
+            if (workUnitId is null)
+                return Results.BadRequest(new { error = "workUnitId is required." });
+
+            try
+            {
+                var comparison = await snapshots.CompareAsync(agentId, workUnitId, otherAgentId, ct).ConfigureAwait(false);
+                return Results.Ok(JsonSerializer.Deserialize<object>(comparison)!);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+    }
+
+    // ── /studio/replay ─────────────────────────────────────────────────────
+
+    private static void MapReplayEndpoints(WebApplication app)
+    {
+        // Slice 13h — DAG Replay frontend connects here instead of the engine's /ws/runtime
+        // WebSocket for timeline node data. Returns timeline entries (artifacts + orchestration
+        // events) grouped by branch, plus the set of known branches so the frontend can render
+        // them as DAG lanes without a separate init payload.
+        app.MapGet("/studio/replay/timeline", async (
+            [FromQuery] string? branchId,
+            IBranchService branches,
+            IReplayService replay,
+            CancellationToken ct) =>
+        {
+            var branchIds = await branches.ListBranchesAsync(ct).ConfigureAwait(false);
+            var targetBranches = branchId is { Length: > 0 }
+                ? new[] { branchId }
+                : branchIds.ToArray();
+
+            var timelines = new List<object>();
+            foreach (var b in targetBranches)
+            {
+                var json = await replay.RangeAsync(b, cancellationToken: ct).ConfigureAwait(false);
+                timelines.Add(JsonSerializer.Deserialize<object>(json)!);
+            }
+
+            return Results.Ok(new { branches = targetBranches, timelines });
+        });
+
+        app.MapGet("/studio/replay/timeline/{branchId}", async (
+            string branchId,
+            IReplayService replay,
+            CancellationToken ct) =>
+        {
+            var json = await replay.RangeAsync(branchId, cancellationToken: ct).ConfigureAwait(false);
+            return Results.Ok(JsonSerializer.Deserialize<object>(json)!);
+        });
+
+        // ── Slice 6.5 deferred: replay REST parity ──────────────────────────
+
+        // Range replay with optional from/to node (mirrors nm_v1_replay_range)
+        app.MapGet("/studio/replay/range/{branchId}", async (
+            string branchId,
+            [FromQuery] string? fromNode,
+            [FromQuery] string? toNode,
+            IReplayService replay,
+            CancellationToken ct) =>
+        {
+            var json = await replay.RangeAsync(branchId, fromNode, toNode, ct).ConfigureAwait(false);
+            return Results.Ok(JsonSerializer.Deserialize<object>(json)!);
+        });
+
+        // Rollback to a known good state (mirrors nm_v1_replay_rollback)
+        app.MapPost("/studio/replay/rollback/{branchId}", async (
+            string branchId,
+            RollbackRequestBody body,
+            IReplayService replay,
+            CancellationToken ct) =>
+        {
+            var json = await replay.RollbackAsync(branchId, body.KnownGoodStateId, ct).ConfigureAwait(false);
+            return Results.Ok(JsonSerializer.Deserialize<object>(json)!);
+        });
+
+        // Inspect replay history (mirrors nm_v1_replay_inspect)
+        app.MapGet("/studio/replay/inspect/{branchId}", async (
+            string branchId,
+            [FromQuery] string? nodeId,
+            IReplayService replay,
+            CancellationToken ct) =>
+        {
+            var json = await replay.InspectAsync(branchId, nodeId, ct).ConfigureAwait(false);
+            return Results.Ok(JsonSerializer.Deserialize<object>(json)!);
+        });
+    }
+
+    // ── /studio/goals — 6.5 deferred: goal REST parity ─────────────────────
+
+    private static void MapGoalEndpoints(WebApplication app)
+    {
+        // Create a goal (mirrors nm_v1_goal_create)
+        app.MapPost("/studio/goals", async (
+            CreateGoalBody body,
+            IWorkUnitService workUnits,
+            IWorkUnitCommandService workUnitCommands,
+            IGoalNodeService goalNodes,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.Goal))
+                return Results.BadRequest(new { error = "goal is required." });
+
+            WorkUnit workUnit;
+            if (body.WorkUnitId is not null)
+            {
+                var wu = await workUnits.GetAsync(body.WorkUnitId, ct).ConfigureAwait(false);
+                if (wu is null)
+                    return Results.NotFound(new { error = $"Work unit '{body.WorkUnitId}' not found." });
+                workUnit = wu;
+            }
+            else
+            {
+                workUnit = await workUnitCommands.CreateAsync(
+                    new WorkUnitCreateCommand(body.Goal, "studio"), ct).ConfigureAwait(false);
+            }
+
+            var goalNode = new GoalNode(
+                GoalId: workUnit.WorkUnitId,
+                Goal: workUnit.Goal,
+                WorkUnitId: workUnit.WorkUnitId,
+                BranchId: workUnit.BranchId,
+                Status: GoalStatus.Exploring,
+                CreatedAt: workUnit.CreatedAt,
+                UpdatedAt: workUnit.UpdatedAt,
+                Owner: workUnit.Owner,
+                ParentGoalId: workUnit.ParentWorkUnitId);
+            await goalNodes.RecordAsync(goalNode, ct).ConfigureAwait(false);
+
+            return Results.Ok(new
+            {
+                goalId = workUnit.WorkUnitId,
+                goal = workUnit.Goal,
+                workUnitId = workUnit.WorkUnitId,
+                branchId = workUnit.BranchId,
+                status = goalNode.Status.ToString(),
+                createdAt = workUnit.CreatedAt
+            });
+        });
+
+        // List goals (mirrors nm_v1_goal_list)
+        app.MapGet("/studio/goals", async (
+            IGoalNodeService goalNodes,
+            IWorkUnitService workUnits,
+            CancellationToken ct) =>
+        {
+            var storedGoals = await goalNodes.ListAsync(ct).ConfigureAwait(false);
+            if (storedGoals.Count > 0)
+            {
+                var goals = storedGoals.Select(g => new
+                {
+                    goalId = g.GoalId,
+                    goal = g.Goal,
+                    workUnitId = g.WorkUnitId,
+                    branchId = g.BranchId,
+                    status = g.Status.ToString(),
+                    parentGoalId = g.ParentGoalId,
+                    createdAt = g.CreatedAt
+                }).ToList();
+                return Results.Ok(new { goals, source = "goal-store" });
+            }
+
+            var items = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+            var fallback = items.Select(wu => new
+            {
+                goalId = wu.WorkUnitId,
+                goal = wu.Goal,
+                workUnitId = wu.WorkUnitId,
+                branchId = wu.BranchId,
+                status = wu.Status.ToString(),
+                parentWorkUnitId = wu.ParentWorkUnitId,
+                createdAt = wu.CreatedAt
+            }).ToList();
+            return Results.Ok(new { goals = fallback, source = "work-units" });
+        });
+    }
+
+    // ── /studio/decisions — 6.5 deferred: decision REST parity ──────────────
+
+    private static void MapDecisionEndpoints(WebApplication app)
+    {
+        // Record a decision (mirrors nm_v1_decision_record)
+        app.MapPost("/studio/decisions", async (
+            RecordDecisionBody body,
+            IMergeService merges,
+            IDecisionNodeService decisionNodes,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.ProposalId))
+                return Results.BadRequest(new { error = "proposalId is required." });
+            if (string.IsNullOrWhiteSpace(body.Outcome))
+                return Results.BadRequest(new { error = "outcome is required." });
+
+            var proposal = await merges.GetAsync(body.ProposalId, ct).ConfigureAwait(false);
+            if (proposal is null)
+                return Results.NotFound(new { error = $"Proposal '{body.ProposalId}' not found." });
+
+            if (!Enum.TryParse<DecisionOutcome>(body.Outcome, ignoreCase: true, out var decision))
+                return Results.BadRequest(new { error = "Invalid outcome. Use Accepted, Rejected, Deferred, or Superseded." });
+
+            var mergeStatus = decision switch
+            {
+                DecisionOutcome.Accepted => MergeProposalStatus.Approved,
+                DecisionOutcome.Rejected => MergeProposalStatus.Rejected,
+                DecisionOutcome.Superseded => MergeProposalStatus.Superseded,
+                _ => proposal.Status
+            };
+
+            if (mergeStatus != proposal.Status)
+                proposal = await merges.ReviewAsync(body.ProposalId, mergeStatus, ct).ConfigureAwait(false);
+
+            var decisionNode = new DecisionNode(
+                DecisionId: $"dec-{Guid.NewGuid():N}",
+                WorkUnitId: proposal.WorkUnitId ?? string.Empty,
+                ProposalId: body.ProposalId,
+                Outcome: decision,
+                ReviewerAgentId: body.ReviewerAgentId,
+                ReviewerModel: body.ReviewerModel,
+                ReviewerProvider: body.ReviewerProvider,
+                Confidence: body.Confidence,
+                Rationale: body.Rationale,
+                DecidedAt: DateTimeOffset.UtcNow);
+            await decisionNodes.RecordAsync(decisionNode, ct).ConfigureAwait(false);
+
+            return Results.Ok(new
+            {
+                decisionId = decisionNode.DecisionId,
+                proposalId = body.ProposalId,
+                outcome = decision.ToString(),
+                status = proposal.Status.ToString(),
+                confidence = body.Confidence,
+                rationale = body.Rationale,
+                decidedAt = decisionNode.DecidedAt
+            });
+        });
+
+        // List decisions (mirrors nm_v1_decision_list)
+        app.MapGet("/studio/decisions", async (
+            [FromQuery] string? workUnitId,
+            IMergeService merges,
+            IDecisionNodeService decisionNodes,
+            CancellationToken ct) =>
+        {
+            if (workUnitId is not null)
+            {
+                var storedDecisions = await decisionNodes.ListByWorkUnitAsync(workUnitId, ct).ConfigureAwait(false);
+                if (storedDecisions.Count > 0)
+                {
+                    var decisions = storedDecisions.Select(d => new
+                    {
+                        decisionId = d.DecisionId,
+                        proposalId = d.ProposalId,
+                        workUnitId = d.WorkUnitId,
+                        outcome = d.Outcome.ToString(),
+                        confidence = d.Confidence,
+                        decidedAt = d.DecidedAt
+                    }).ToList();
+                    return Results.Ok(new { decisions, source = "decision-store" });
+                }
+            }
+
+            var proposals = await merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+            var fallback = proposals.Select(p => new
+            {
+                decisionId = $"dec-{p.ProposalId}",
+                proposalId = p.ProposalId,
+                workUnitId = p.WorkUnitId,
+                sourceBranch = p.SourceBranch,
+                status = p.Status.ToString(),
+                confidence = p.Confidence,
+                agentId = p.AgentId,
+                model = p.Model,
+                provider = p.Provider
+            }).ToList();
+            return Results.Ok(new { decisions = fallback, source = "proposals" });
+        });
+    }
+
+    // ── /studio/evidence — 6.5 deferred: evidence REST parity ───────────────
+
+    private static void MapEvidenceEndpoints(WebApplication app)
+    {
+        // Attach build/test evidence (mirrors nm_v1_evidence_attach)
+        app.MapPost("/studio/evidence/attach", async (
+            [FromQuery] string workUnitId,
+            IWorkUnitService workUnits,
+            IWorkspaceExecutionCommandService execCommands,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(workUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+
+            var execResult = await execCommands.GetLatestAsync(wu.BranchId, ct).ConfigureAwait(false);
+            if (execResult is null)
+                return Results.Ok(new { evidence = Array.Empty<object>(), message = "No execution results available." });
+
+            var evidence = new List<object>();
+            foreach (var build in execResult.Builds)
+            {
+                evidence.Add(new
+                {
+                    evidenceId = $"ev-bld-{Guid.NewGuid():N}",
+                    kind = "Build",
+                    summary = build.Success
+                        ? $"{build.BuildSystem ?? "build"}: passed"
+                        : $"{build.BuildSystem ?? "build"}: failed (exit {build.ExitCode})",
+                    attachedAt = DateTimeOffset.UtcNow
+                });
+            }
+            foreach (var test in execResult.Tests)
+            {
+                evidence.Add(new
+                {
+                    evidenceId = $"ev-tst-{Guid.NewGuid():N}",
+                    kind = "Test",
+                    summary = test.Success
+                        ? $"{test.BuildSystem ?? "test"}: passed ({test.Passed}/{test.TotalTests})"
+                        : $"{test.BuildSystem ?? "test"}: failed ({test.Passed}/{test.TotalTests})",
+                    attachedAt = DateTimeOffset.UtcNow
+                });
+            }
+
+            return Results.Ok(new { evidence, allSucceeded = execResult.AllSucceeded });
+        });
+
+        // List evidence (mirrors nm_v1_evidence_list)
+        app.MapGet("/studio/evidence", async (
+            [FromQuery] string workUnitId,
+            IWorkUnitService workUnits,
+            IWorkspaceExecutionCommandService execCommands,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(workUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+
+            var execResult = await execCommands.GetLatestAsync(wu.BranchId, ct).ConfigureAwait(false);
+            if (execResult is null)
+                return Results.Ok(new { evidence = Array.Empty<object>() });
+
+            var evidence = new List<object>();
+            foreach (var build in execResult.Builds)
+            {
+                evidence.Add(new
+                {
+                    evidenceId = $"ev-bld-{Guid.NewGuid():N}",
+                    kind = "Build",
+                    buildSystem = build.BuildSystem,
+                    command = build.Command,
+                    success = build.Success,
+                    exitCode = build.ExitCode,
+                    attachedAt = execResult.ExecutedAt
+                });
+            }
+            foreach (var test in execResult.Tests)
+            {
+                evidence.Add(new
+                {
+                    evidenceId = $"ev-tst-{Guid.NewGuid():N}",
+                    kind = "Test",
+                    buildSystem = test.BuildSystem,
+                    command = test.Command,
+                    success = test.Success,
+                    totalTests = test.TotalTests,
+                    passed = test.Passed,
+                    failed = test.Failed,
+                    skipped = test.Skipped,
+                    attachedAt = execResult.ExecutedAt
+                });
+            }
+
+            return Results.Ok(new { evidence });
+        });
+    }
+
+    // ── /studio/trajectory — 6.5 deferred: trajectory REST parity ───────────
+
+    private static void MapTrajectoryEndpoints(WebApplication app)
+    {
+        // Create trajectory (mirrors nm_v1_trajectory_create)
+        app.MapPost("/studio/trajectory", async (
+            CreateTrajectoryBody body,
+            IWorkUnitService workUnits,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+            if (string.IsNullOrWhiteSpace(body.Phase))
+                return Results.BadRequest(new { error = "phase is required." });
+
+            var wu = await workUnits.GetAsync(body.WorkUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{body.WorkUnitId}' not found." });
+
+            if (!Enum.TryParse<TrajectoryPhase>(body.Phase, ignoreCase: true, out var trajectoryPhase))
+                return Results.BadRequest(new { error = "Invalid phase. Use GoalDefined, Decomposed, Executing, Proposed, Converging, Converged, Forked, or Abandoned." });
+
+            return Results.Ok(new
+            {
+                trajectoryId = wu.WorkUnitId,
+                workUnitId = body.WorkUnitId,
+                branchId = wu.BranchId,
+                goal = wu.Goal,
+                phase = trajectoryPhase.ToString(),
+                agentId = body.AgentId,
+                model = body.Model,
+                provider = body.Provider,
+                startedAt = wu.CreatedAt
+            });
+        });
+
+        // Replay trajectory (mirrors nm_v1_trajectory_replay)
+        app.MapGet("/studio/trajectory/replay", async (
+            [FromQuery] string? workUnitId,
+            [FromQuery] string? branchId,
+            [FromQuery] string? mode,
+            IWorkUnitService workUnits,
+            IReplayService replay,
+            CancellationToken ct) =>
+        {
+            var normalizedMode = mode?.Trim().ToLowerInvariant() ?? "linear";
+
+            if (normalizedMode == "branchexplorer")
+            {
+                var allUnits = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+                var byBranch = allUnits.GroupBy(wu => wu.BranchId).Select(g => new
+                {
+                    branchId = g.Key,
+                    workUnitCount = g.Count(),
+                    goals = g.Select(wu => new
+                    {
+                        workUnitId = wu.WorkUnitId,
+                        goal = wu.Goal,
+                        status = wu.Status.ToString(),
+                        phase = wu.CurrentStage?.ToString(),
+                        hasChildren = allUnits.Any(c => c.ParentWorkUnitId == wu.WorkUnitId),
+                        createdAt = wu.CreatedAt
+                    }).OrderBy(w => w.createdAt).ToList()
+                }).OrderByDescending(b => b.workUnitCount).ToList();
+                return Results.Ok(new { mode = "BranchExplorer", branches = byBranch });
+            }
+
+            if (normalizedMode == "counterfactual")
+            {
+                var allUnits = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+                WorkUnit? target = null;
+                if (workUnitId is not null)
+                    target = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+
+                var counterfactuals = new List<object>();
+                if (target?.ParentWorkUnitId is not null)
+                {
+                    var siblings = allUnits.Where(wu => wu.ParentWorkUnitId == target.ParentWorkUnitId && wu.WorkUnitId != target.WorkUnitId).ToList();
+                    counterfactuals.AddRange(siblings.Select(s => new
+                    {
+                        workUnitId = s.WorkUnitId,
+                        goal = s.Goal,
+                        status = s.Status.ToString(),
+                        relationship = "sibling",
+                        forkType = s.ForkType?.ToString(),
+                        branchedFromProposalId = s.BranchedFromProposalId,
+                        createdAt = s.CreatedAt
+                    }));
+                }
+                var forkedFromProposals = allUnits.Where(wu => wu.BranchedFromProposalId is not null && wu.WorkUnitId != workUnitId).ToList();
+                counterfactuals.AddRange(forkedFromProposals.Select(f => new
+                {
+                    workUnitId = f.WorkUnitId,
+                    goal = f.Goal,
+                    status = f.Status.ToString(),
+                    relationship = "forked-from-proposal",
+                    forkType = f.ForkType?.ToString(),
+                    branchedFromProposalId = f.BranchedFromProposalId,
+                    createdAt = f.CreatedAt
+                }));
+
+                return Results.Ok(new
+                {
+                    mode = "Counterfactual",
+                    targetWorkUnitId = workUnitId,
+                    targetGoal = target?.Goal,
+                    alternatives = counterfactuals
+                });
+            }
+
+            // Linear mode
+            var targetBranchId = branchId;
+            if (targetBranchId is null && workUnitId is not null)
+            {
+                var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+                targetBranchId = wu?.BranchId;
+            }
+
+            if (targetBranchId is not null)
+            {
+                var replayJson = await replay.RangeAsync(targetBranchId, cancellationToken: ct).ConfigureAwait(false);
+                return Results.Ok(new { mode = "Linear", replayJson });
+            }
+
+            var allUnits2 = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+            var nodes = allUnits2.Select(wu => new
+            {
+                workUnitId = wu.WorkUnitId,
+                branchId = wu.BranchId,
+                goal = wu.Goal,
+                phase = wu.CurrentStage?.ToString() ?? wu.Status.ToString(),
+                startedAt = wu.CreatedAt,
+                completedAt = wu.Status is WorkUnitStatus.Completed or WorkUnitStatus.Merged ? (DateTimeOffset?)wu.UpdatedAt : null
+            }).ToList();
+            return Results.Ok(new { mode = "Linear", nodes });
+        });
+    }
+
+    // ── /studio/hypotheses — 6.5 deferred: hypothesis REST parity ───────────
+
+    private static void MapHypothesisEndpoints(WebApplication app)
+    {
+        // Fork hypothesis (mirrors nm_v1_hypothesis_fork)
+        app.MapPost("/studio/hypotheses/fork", async (
+            CreateHypothesisBody body,
+            IWorkUnitCommandService workUnitCommands,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.Goal))
+                return Results.BadRequest(new { error = "goal is required." });
+            if (string.IsNullOrWhiteSpace(body.ForkType))
+                return Results.BadRequest(new { error = "forkType is required." });
+
+            if (!Enum.TryParse<HypothesisForkType>(body.ForkType, ignoreCase: true, out var hypothesisType))
+                return Results.BadRequest(new { error = "Invalid forkType. Use Code, Reasoning, Model, Research, Architecture, or Product." });
+
+            var workUnit = await workUnitCommands.CreateAsync(
+                new WorkUnitCreateCommand(body.Goal, "studio", ParentWorkUnitId: body.ParentWorkUnitId, ForkType: hypothesisType),
+                ct).ConfigureAwait(false);
+
+            return Results.Ok(new
+            {
+                hypothesisId = workUnit.WorkUnitId,
+                workUnitId = workUnit.WorkUnitId,
+                goal = workUnit.Goal,
+                forkType = hypothesisType.ToString(),
+                parentWorkUnitId = body.ParentWorkUnitId,
+                branchedFromProposalId = body.BranchedFromProposalId,
+                rationale = body.Rationale,
+                status = "Active",
+                createdAt = workUnit.CreatedAt
+            });
+        });
+
+        // List hypotheses (mirrors nm_v1_hypothesis_list)
+        app.MapGet("/studio/hypotheses", async (
+            [FromQuery] string? parentWorkUnitId,
+            IWorkUnitService workUnits,
+            CancellationToken ct) =>
+        {
+            IReadOnlyList<WorkUnit> items;
+            if (parentWorkUnitId is not null)
+                items = await workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
+            else
+                items = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+
+            var hypotheses = items.Select(wu => new
+            {
+                hypothesisId = wu.WorkUnitId,
+                workUnitId = wu.WorkUnitId,
+                goal = wu.Goal,
+                forkType = wu.ForkType?.ToString() ?? "Unknown",
+                status = wu.Status.ToString(),
+                parentWorkUnitId = wu.ParentWorkUnitId,
+                branchedFromProposalId = wu.BranchedFromProposalId,
+                createdAt = wu.CreatedAt
+            }).ToList();
+
+            return Results.Ok(new { hypotheses });
+        });
+    }
+
+    // ── /studio/reasoning — 6.5 deferred: reasoning REST parity ─────────────
+
+    private static void MapReasoningEndpoints(WebApplication app)
+    {
+        // Record reasoning commit (mirrors nm_v1_reasoning_record)
+        app.MapPost("/studio/reasoning", async (
+            RecordReasoningBody body,
+            IOrchestrationDecisionLogService decisionLog,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+            if (string.IsNullOrWhiteSpace(body.AgentId))
+                return Results.BadRequest(new { error = "agentId is required." });
+            if (string.IsNullOrWhiteSpace(body.InputStage))
+                return Results.BadRequest(new { error = "inputStage is required." });
+            if (string.IsNullOrWhiteSpace(body.Action))
+                return Results.BadRequest(new { error = "action is required." });
+
+            if (!Enum.TryParse<PipelineStage>(body.InputStage, ignoreCase: true, out var stage))
+                return Results.BadRequest(new { error = "Invalid inputStage." });
+
+            if (!Enum.TryParse<OrchestrationAction>(body.Action, ignoreCase: true, out var orchestrationAction))
+                return Results.BadRequest(new { error = "Invalid action." });
+
+            var ev = await decisionLog.RecordAsync(
+                body.WorkUnitId, body.AgentId, stage,
+                body.ProjectionSnapshotJson ?? "{}", orchestrationAction,
+                [], body.Reasoning, ct: ct).ConfigureAwait(false);
+
+            return Results.Ok(new
+            {
+                commitId = ev.EventId,
+                workUnitId = body.WorkUnitId,
+                agentId = body.AgentId,
+                agentModel = body.AgentModel,
+                agentProvider = body.AgentProvider,
+                inputStage = stage.ToString(),
+                action = orchestrationAction.ToString(),
+                reasoning = body.Reasoning,
+                committedAt = ev.OccurredAt
+            });
+        });
+    }
+
+    // ── /studio/models — 6.5 deferred: model comparison REST parity ─────────
+
+    private static void MapModelEndpoints(WebApplication app)
+    {
+        // Compare model outputs (mirrors nm_v1_model_compare)
+        app.MapGet("/studio/models/compare", async (
+            [FromQuery] string proposalIdA,
+            [FromQuery] string proposalIdB,
+            IMergeService merges,
+            IProposalReviewService proposalReview,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(proposalIdA) || string.IsNullOrWhiteSpace(proposalIdB))
+                return Results.BadRequest(new { error = "proposalIdA and proposalIdB are required." });
+
+            var proposalA = await merges.GetAsync(proposalIdA, ct).ConfigureAwait(false);
+            if (proposalA is null)
+                return Results.NotFound(new { error = $"Proposal '{proposalIdA}' not found." });
+
+            var proposalB = await merges.GetAsync(proposalIdB, ct).ConfigureAwait(false);
+            if (proposalB is null)
+                return Results.NotFound(new { error = $"Proposal '{proposalIdB}' not found." });
+
+            var results = await Task.WhenAll(
+                proposalReview.GetFileChangesAsync(proposalIdA, ct),
+                proposalReview.GetFileChangesAsync(proposalIdB, ct)
+            ).ConfigureAwait(false);
+            var changesA = results[0];
+            var changesB = results[1];
+
+            var filesByPathA = changesA.ToDictionary(fc => fc.Path);
+            var filesByPathB = changesB.ToDictionary(fc => fc.Path);
+            var allPaths = filesByPathA.Keys.Union(filesByPathB.Keys).Distinct().ToList();
+
+            var divergedFiles = allPaths.Select(path =>
+            {
+                filesByPathA.TryGetValue(path, out var fcA);
+                filesByPathB.TryGetValue(path, out var fcB);
+                var hunksA = fcA?.Hunks.SelectMany(h => h.Lines.Select(l => l.Text)).ToList() ?? [];
+                var hunksB = fcB?.Hunks.SelectMany(h => h.Lines.Select(l => l.Text)).ToList() ?? [];
+                var overlapping = hunksA.Intersect(hunksB).ToList();
+                return new
+                {
+                    path,
+                    diffA = fcA?.AfterContent ?? fcA?.BeforeContent ?? "(no output)",
+                    diffB = fcB?.AfterContent ?? fcB?.BeforeContent ?? "(no output)",
+                    overlappingLines = overlapping
+                };
+            }).ToList();
+
+            return Results.Ok(new
+            {
+                modelA = proposalA.Model ?? proposalA.AgentId ?? "unknown",
+                modelB = proposalB.Model ?? proposalB.AgentId ?? "unknown",
+                divergedFiles,
+                comparedAt = DateTimeOffset.UtcNow
+            });
+        });
+
+        // Model replay (mirrors nm_v1_model_replay)
+        app.MapGet("/studio/models/replay/{workUnitId}", async (
+            string workUnitId,
+            [FromQuery] string? compareModel,
+            IWorkUnitService workUnits,
+            IMergeService merges,
+            CancellationToken ct) =>
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+
+            var allProposals = await merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+            var relevantProposals = allProposals
+                .Where(p => p.WorkUnitId == workUnitId)
+                .Select(p => new
+                {
+                    proposalId = p.ProposalId,
+                    model = p.Model,
+                    provider = p.Provider,
+                    agentId = p.AgentId,
+                    status = p.Status.ToString(),
+                    confidence = p.Confidence
+                })
+                .ToList();
+
+            return Results.Ok(new
+            {
+                workUnitId,
+                goal = wu.Goal,
+                model = compareModel,
+                proposals = relevantProposals,
+                replayMode = "ModelComparison"
+            });
         });
     }
 }

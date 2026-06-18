@@ -18,5 +18,6 @@ public sealed class WorkUnitCommandService(IOrchestratorService orchestrator) : 
             command.ParentWorkUnitId,
             command.DependsOn,
             command.FileScope,
+            forkType: command.ForkType,
             cancellationToken: cancellationToken);
 }

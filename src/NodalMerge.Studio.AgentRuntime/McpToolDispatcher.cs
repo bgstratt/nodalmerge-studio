@@ -3,8 +3,6 @@ using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Projections;
 using NodalMerge.Studio.Contracts.Versioning;
 using NodalMerge.Studio.Core.Services;
-using StudioArtifactStatus = NodalMerge.Studio.Contracts.Domain.ArtifactStatus;
-using StudioTaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.AgentRuntime;
 
@@ -12,19 +10,21 @@ internal sealed class McpToolDispatcher(
     IWorkUnitService workUnits,
     IOrchestratorService orchestrator,
     IWorkUnitCommandService workUnitCommands,
-    ITaskService tasks,
+    ITaskCommandService taskCommands,
     IBranchService branches,
     IMergeService merge,
+    IMergeCommandService mergeCommands,
     IWorkspaceService workspace,
     IFileWorkspaceService fileWorkspace,
     IAgentWorkspaceService agentWorkspaces,
     ISnapshotService snapshots,
     IAgentControlService agentControl,
-    IArtifactLineageService artifactLineage,
+    IArtifactCommandService artifactCommands,
     IProjectionManager projections,
-    IWorkScheduler scheduler,
+    ISchedulerCommandService scheduler,
     IExecutionEventStream events,
-    IIntentGraphService intentGraph)
+    IIntentGraphService intentGraph,
+    IWorkspaceExecutionCommandService executionCommands)
 {
     public async Task<string> DispatchAsync(
         string toolName,
@@ -73,6 +73,12 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.ArtifactRecord   => await ArtifactRecordAsync(input, ct),
                 McpToolNames.ArtifactQuery    => await ArtifactQueryAsync(input, ct),
                 McpToolNames.ArtifactList     => await ArtifactListAsync(input, ct),
+                McpToolNames.WorkspaceBuild   => await WorkspaceBuildAsync(input, ct),
+                McpToolNames.WorkspaceTest    => await WorkspaceTestAsync(input, ct),
+                McpToolNames.WorkspaceExec    => await WorkspaceExecAsync(input, ct),
+                McpToolNames.WorkspaceRun     => await WorkspaceRunAsync(input, ct),
+                McpToolNames.WorkspaceExecStatus => await WorkspaceExecStatusAsync(input, ct),
+                McpToolNames.WorkspacePath    => await WorkspacePathAsync(input, ct),
                 _ => ToError($"Tool '{toolName}' is not dispatched by the agent runtime.")
             };
         }
@@ -123,59 +129,48 @@ internal sealed class McpToolDispatcher(
         return ToJson(list.Select(w => w.WorkUnitId));
     }
 
-    private async Task<string> TaskCreateAsync(JsonElement input, CancellationToken ct)
+        private async Task<string> TaskCreateAsync(JsonElement input, CancellationToken ct)
     {
-        var workUnitId = Str(input, "workUnitId")!;
-        var task = new StudioTask(
-            Guid.NewGuid().ToString("N"),
-            workUnitId,
-            Str(input, "title")!,
-            Str(input, "description")!,
-            StudioTaskStatus.Open,
-            null,
-            Int(input, "priority") ?? 0);
-        var created = await tasks.CreateAsync(task, ct).ConfigureAwait(false);
-        await artifactLineage.RecordAsync(new ArtifactRef(
-            created.TaskId,
-            ArtifactType.Task,
-            workUnitId,
-            StudioArtifactStatus.Active,
-            DateTimeOffset.UtcNow,
-            workUnitId,
-            null), ct).ConfigureAwait(false);
-        return ToJson(new { taskId = created.TaskId });
+        var task = await taskCommands.CreateAsync(
+            new TaskCreateCommand(
+                Str(input, "workUnitId")!,
+                Str(input, "title")!,
+                Str(input, "description")!,
+                Int(input, "priority") ?? 0),
+            ct).ConfigureAwait(false);
+        return ToJson(new { taskId = task.TaskId });
     }
 
     private async Task<string> TaskListAsync(JsonElement input, CancellationToken ct)
     {
-        var list = await tasks.ListAsync(Str(input, "workUnitId"), ct).ConfigureAwait(false);
+        var list = await taskCommands.ListAsync(Str(input, "workUnitId"), ct).ConfigureAwait(false);
         return ToJson(list);
     }
 
     private async Task<string> TaskUpdateAsync(JsonElement input, CancellationToken ct)
     {
         var taskId = Str(input, "taskId")!;
-        var existing = await tasks.GetAsync(taskId, ct).ConfigureAwait(false);
-        if (existing is null) return ToError($"Task '{taskId}' not found.");
-        var statusStr = Str(input, "status");
-        var status = statusStr is not null && Enum.TryParse<StudioTaskStatus>(statusStr, true, out var s)
-            ? s : existing.Status;
-        var updated = existing with
+        try
         {
-            Title = Str(input, "title") ?? existing.Title,
-            Description = Str(input, "description") ?? existing.Description,
-            Status = status,
-            Priority = Int(input, "priority") ?? existing.Priority
-        };
-        var result = await tasks.UpdateAsync(updated, ct).ConfigureAwait(false);
-        return ToJson(result);
+            var result = await taskCommands.UpdateAsync(
+                taskId, Str(input, "title"), Str(input, "description"),
+                Str(input, "status"), Int(input, "priority"), ct).ConfigureAwait(false);
+            return ToJson(result);
+        }
+        catch (KeyNotFoundException) { return ToError($"Task '{taskId}' not found."); }
+        catch (InvalidOperationException ex) { return ToError(ex.Message); }
     }
 
     private async Task<string> TaskAssignAsync(JsonElement input, CancellationToken ct)
     {
-        var assigned = await tasks.AssignAsync(
-            Str(input, "taskId")!, Str(input, "agentId")!, ct).ConfigureAwait(false);
-        return ToJson(assigned);
+        try
+        {
+            var assigned = await taskCommands.AssignAsync(
+                Str(input, "taskId")!, Str(input, "agentId")!, ct).ConfigureAwait(false);
+            return ToJson(assigned);
+        }
+        catch (KeyNotFoundException) { return ToError($"Task '{Str(input, "taskId")}' not found."); }
+        catch (InvalidOperationException ex) { return ToError(ex.Message); }
     }
 
     private async Task<string> BranchCreateAsync(JsonElement input, CancellationToken ct)
@@ -202,7 +197,7 @@ internal sealed class McpToolDispatcher(
         var agentId = await agentControl.SpawnAsync(
             Str(input, "agentType")!, Str(input, "workUnitId")!,
             Str(input, "taskId"), Str(input, "model"), Str(input, "baseUrl"), Str(input, "apiKey"),
-            Str(input, "provider"), Str(input, "profileId"), autoReviewProfileId: null, ct).ConfigureAwait(false);
+            Str(input, "provider"), Str(input, "profileId"), Str(input, "autoReviewProfileId"), ct).ConfigureAwait(false);
         return ToJson(new { agentId });
     }
 
@@ -222,112 +217,20 @@ internal sealed class McpToolDispatcher(
 
     private async Task<string> MergeProposeAsync(JsonElement input, CancellationToken ct, string? sessionId)
     {
-        var proposalId   = $"MP-{Guid.NewGuid():N}";
-        var summary      = Str(input, "summary")!;
-        var sourceBranch = Str(input, "sourceBranch")!;
-        var targetBranch = Str(input, "targetBranch")!;
-        var workUnitId   = Str(input, "workUnitId");
-        var agentId      = Str(input, "agentId");
-
-        string? workspaceChanges = null;
-        DateTimeOffset? diffGeneratedAt = null;
-        try
-        {
-            workspaceChanges = await fileWorkspace.DiffAsync(sourceBranch, targetBranch, ct).ConfigureAwait(false);
-            diffGeneratedAt  = DateTimeOffset.UtcNow;
-        }
-        catch { /* branch dirs may not exist yet; diff is optional */ }
-
-        var filesTouched = ParseFilesTouched(workspaceChanges);
-        if (filesTouched.Count == 0)
-        {
-            try
-            {
-                filesTouched = (await fileWorkspace.ListAsync(sourceBranch, ct: ct).ConfigureAwait(false)).ToList();
-            }
-            catch { /* best-effort */ }
-        }
-
-        var proposal = new MergeProposal(
-            proposalId,
-            sourceBranch,
-            targetBranch,
-            Str(input, "goal") ?? summary,
-            summary,
-            Str(input, "changeDescription") ?? summary,
-            null, null, null,
-            MergeProposalStatus.Draft,
-            WorkspaceChanges: workspaceChanges,
-            DiffGeneratedAt:  diffGeneratedAt,
-            AgentId:          agentId,
-            Model:            Str(input, "model"),
-            Provider:         Str(input, "provider"),
-            SessionId:        sessionId,
-            WorkUnitId:       workUnitId,
-            FilesTouched:     filesTouched);
-        var created = await merge.ProposeAsync(proposal, ct).ConfigureAwait(false);
-
-        if (workUnitId is not null)
-        {
-            var chain = await artifactLineage.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
-            var taskRef = chain.LastOrDefault(a => a.Type == ArtifactType.Task);
-            var parentArtifactId = taskRef?.ArtifactId ?? workUnitId;
-
-            await artifactLineage.RecordAsync(new ArtifactRef(
-                created.ProposalId,
-                ArtifactType.MergeProposal,
-                parentArtifactId,
-                StudioArtifactStatus.Active,
-                DateTimeOffset.UtcNow,
-                workUnitId,
-                agentId), ct).ConfigureAwait(false);
-
-            if (sessionId is not null)
-            {
-                await events.AppendAsync(
-                    sessionId,
-                    workUnitId,
-                    ExecutionEventKind.ArtifactProposed,
-                    new ArtifactProposedPayload(created.ProposalId, workUnitId, filesTouched),
-                    ct: ct).ConfigureAwait(false);
-            }
-
-            // Best-effort lifecycle side effect — a proposal being raised means the work unit's
-            // execution stage is done. Not worth failing the propose call over an illegal transition
-            // (e.g. the legacy direct-spawn path never reaches WorkUnitStatus.Executing).
-            try
-            {
-                await workUnits.UpdateStatusAsync(workUnitId, WorkUnitStatus.Proposed, sessionId, ct).ConfigureAwait(false);
-                await workUnits.SetCurrentStageAsync(workUnitId, PipelineStage.Review, ct).ConfigureAwait(false);
-            }
-            catch (InvalidOperationException) { }
-            catch (KeyNotFoundException) { }
-        }
+        var created = await mergeCommands.ProposeAsync(
+            Str(input, "sourceBranch")!,
+            Str(input, "targetBranch")!,
+            Str(input, "summary")!,
+            Str(input, "goal"),
+            Str(input, "changeDescription"),
+            workUnitId: Str(input, "workUnitId"),
+            agentId:    Str(input, "agentId"),
+            model:      Str(input, "model"),
+            provider:   Str(input, "provider"),
+            sessionId:  sessionId,
+            cancellationToken: ct).ConfigureAwait(false);
 
         return ToJson(new { proposalId = created.ProposalId, status = created.Status.ToString() });
-    }
-
-    // The workspace diff is the plain-text format produced by FileSystemWorkspaceService.DiffAsync
-    // (10c as-built: not a real git worktree, so no "+++ b/"-style unified diff to parse).
-    private static IReadOnlyList<string> ParseFilesTouched(string? workspaceChanges)
-    {
-        if (string.IsNullOrEmpty(workspaceChanges))
-            return [];
-
-        var files = new List<string>();
-        foreach (var rawLine in workspaceChanges.Split('\n'))
-        {
-            var line = rawLine.TrimEnd('\r');
-            var file =
-                line.StartsWith("+++ ADDED: ", StringComparison.Ordinal)   ? line["+++ ADDED: ".Length..] :
-                line.StartsWith("~~~ MODIFIED: ", StringComparison.Ordinal) ? line["~~~ MODIFIED: ".Length..] :
-                line.StartsWith("--- DELETED: ", StringComparison.Ordinal) ? line["--- DELETED: ".Length..] :
-                null;
-            if (file is not null)
-                files.Add(file);
-        }
-
-        return files;
     }
 
     private async Task<string> MergeValidateAsync(JsonElement input, CancellationToken ct)
@@ -577,23 +480,16 @@ internal sealed class McpToolDispatcher(
         if (unitId is null || typeStr is null || title is null || body is null)
             return ToError("workUnitId, type, title, and body are required.");
 
-        if (!Enum.TryParse<ArtifactType>(typeStr, ignoreCase: true, out var artifactType) ||
-            artifactType is not (ArtifactType.Research or ArtifactType.Decision or ArtifactType.Constraint))
-            return ToError("type must be one of: Research, Decision, Constraint.");
-
-        var artifact = new ArtifactRef(
-            $"KA-{Guid.NewGuid():N}",
-            artifactType,
-            Str(input, "parentArtifactId") ?? unitId,
-            StudioArtifactStatus.Active,
-            DateTimeOffset.UtcNow,
-            unitId,
-            null,
-            title,
-            body);
-
-        var recorded = await artifactLineage.RecordAsync(artifact, ct).ConfigureAwait(false);
-        return ToJson(new { artifactId = recorded.ArtifactId });
+        try
+        {
+            var recorded = await artifactCommands.RecordAsync(
+                unitId, typeStr, title, body, Str(input, "parentArtifactId"), ct).ConfigureAwait(false);
+            return ToJson(new { artifactId = recorded.ArtifactId });
+        }
+        catch (ArgumentException ex)
+        {
+            return ToError(ex.Message);
+        }
     }
 
     private async Task<string> ArtifactQueryAsync(JsonElement input, CancellationToken ct)
@@ -602,24 +498,16 @@ internal sealed class McpToolDispatcher(
         if (unitId is null)
             return ToError("workUnitId is required.");
 
-        var typeStr = Str(input, "type");
-        ArtifactType? filterType = null;
-        if (typeStr is not null)
+        try
         {
-            if (!Enum.TryParse<ArtifactType>(typeStr, ignoreCase: true, out var parsed))
-                return ToError($"Unknown artifact type '{typeStr}'.");
-            filterType = parsed;
+            var filtered = await artifactCommands.QueryAsync(
+                unitId, Str(input, "type"), Str(input, "keywords"), ct).ConfigureAwait(false);
+            return ToJson(filtered);
         }
-
-        var keywords = Str(input, "keywords");
-        var chain = await CollectChainWithAncestorsAsync(unitId, ct).ConfigureAwait(false);
-
-        var filtered = chain
-            .Where(a => filterType is null || a.Type == filterType)
-            .Where(a => keywords is null || MatchesKeywords(a, keywords))
-            .ToList();
-
-        return ToJson(filtered);
+        catch (ArgumentException ex)
+        {
+            return ToError(ex.Message);
+        }
     }
 
     private async Task<string> ArtifactListAsync(JsonElement input, CancellationToken ct)
@@ -629,42 +517,68 @@ internal sealed class McpToolDispatcher(
             return ToError("workUnitId is required.");
 
         var includeAncestors = Bool(input, "includeAncestors") ?? true;
-        var list = includeAncestors
-            ? await CollectChainWithAncestorsAsync(unitId, ct).ConfigureAwait(false)
-            : await artifactLineage.GetChainAsync(unitId, ct).ConfigureAwait(false);
-
+        var list = await artifactCommands.ListAsync(unitId, includeAncestors, ct).ConfigureAwait(false);
         return ToJson(list);
     }
 
-    // Walks ParentWorkUnitId root-first, folding in every ancestor's own chain ahead of this
-    // work unit's — same inheritance model as ProjectionManager.BuildAgentWorkspaceAsync (10g).
-    private async Task<IReadOnlyList<ArtifactRef>> CollectChainWithAncestorsAsync(string workUnitId, CancellationToken ct)
+    // ── Slice 16d — workspace execution tool handlers ─────────────────────
+
+    private async Task<string> WorkspaceBuildAsync(JsonElement input, CancellationToken ct)
     {
-        var ancestorIds = new List<string>();
-        var currentId = workUnitId;
-        while (currentId is not null)
-        {
-            ancestorIds.Add(currentId);
-            var unit = await workUnits.GetAsync(currentId, ct).ConfigureAwait(false);
-            currentId = unit?.ParentWorkUnitId;
-        }
-
-        var seen = new HashSet<string>();
-        var combined = new List<ArtifactRef>();
-        foreach (var id in Enumerable.Reverse(ancestorIds))
-        {
-            var chain = await artifactLineage.GetChainAsync(id, ct).ConfigureAwait(false);
-            foreach (var artifact in chain)
-                if (seen.Add(artifact.ArtifactId))
-                    combined.Add(artifact);
-        }
-
-        return combined;
+        var result = await executionCommands.BuildAsync(
+            Str(input, "branchId")!,
+            Str(input, "buildCommand"),
+            Int(input, "timeoutSeconds") ?? 300,
+            ct).ConfigureAwait(false);
+        return ToJson(result);
     }
 
-    private static bool MatchesKeywords(ArtifactRef artifact, string keywords) =>
-        keywords.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .All(k => $"{artifact.Title} {artifact.Body}".Contains(k, StringComparison.OrdinalIgnoreCase));
+    private async Task<string> WorkspaceTestAsync(JsonElement input, CancellationToken ct)
+    {
+        var result = await executionCommands.TestAsync(
+            Str(input, "branchId")!,
+            Str(input, "testCommand"),
+            Int(input, "timeoutSeconds") ?? 300,
+            ct).ConfigureAwait(false);
+        return ToJson(result);
+    }
+
+    private async Task<string> WorkspaceExecAsync(JsonElement input, CancellationToken ct)
+    {
+        var request = new WorkspaceExecutionRequest(
+            Build: Bool(input, "build") ?? true,
+            Test: Bool(input, "test") ?? true,
+            Lint: Bool(input, "lint") ?? false,
+            BuildCommand: Str(input, "buildCommand"),
+            TestCommand: Str(input, "testCommand"),
+            LintCommand: Str(input, "lintCommand"),
+            TimeoutSeconds: Int(input, "timeoutSeconds") ?? 300);
+        var result = await executionCommands.ExecAsync(Str(input, "branchId")!, request, ct).ConfigureAwait(false);
+        return ToJson(result);
+    }
+
+    private async Task<string> WorkspaceRunAsync(JsonElement input, CancellationToken ct)
+    {
+        var result = await executionCommands.RunAsync(
+            Str(input, "branchId")!,
+            Str(input, "runCommand"),
+            Int(input, "timeoutSeconds") ?? 120,
+            environmentVariables: null,
+            ct: ct).ConfigureAwait(false);
+        return ToJson(result);
+    }
+
+    private async Task<string> WorkspaceExecStatusAsync(JsonElement input, CancellationToken ct)
+    {
+        var result = await executionCommands.GetLatestAsync(Str(input, "branchId")!, ct).ConfigureAwait(false);
+        return result is not null ? ToJson(result) : ToError("No execution result found for this branch.");
+    }
+
+    private async Task<string> WorkspacePathAsync(JsonElement input, CancellationToken ct)
+    {
+        var path = await executionCommands.GetBranchPathAsync(Str(input, "branchId")!, ct).ConfigureAwait(false);
+        return ToJson(new { branchId = Str(input, "branchId"), workingDirectory = path, exists = path is not null });
+    }
 
     private static string? Str(JsonElement input, string key) =>
         input.TryGetProperty(key, out var p) && p.ValueKind == JsonValueKind.String

@@ -1,6 +1,8 @@
 using System.Text;
+using System.Text.Json;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Merge;
 
@@ -8,7 +10,9 @@ public sealed class MergeReconciliationService(
     IWorkUnitService workUnits,
     IMergeService merge,
     IArtifactLineageService artifacts,
-    IFileWorkspaceService fileWorkspace) : IMergeReconciliationService
+    IFileWorkspaceService fileWorkspace,
+    IWorkspaceExecutionService? execution = null,
+    WorkspaceOptions? options = null) : IMergeReconciliationService
 {
     public const string ConflictReportFileName = "merge-conflict-report.md";
 
@@ -97,6 +101,28 @@ public sealed class MergeReconciliationService(
             }
         }
 
+        // Slice 16h — composite execution on the merged branch (opt-in)
+        string? executionVerification = null;
+        if (execution is not null && options is not null &&
+            (options.RequireBuildBeforeProposal || options.RequireTestBeforeProposal))
+        {
+            try
+            {
+                var sourceBranchIds = ordered.Select(cp => cp.Proposal.SourceBranch).ToList();
+                var execResult = await execution.ExecuteCompositeAsync(
+                    sourceBranchIds,
+                    new WorkspaceExecutionRequest(
+                        Build: options.RequireBuildBeforeProposal,
+                        Test: options.RequireTestBeforeProposal,
+                        BuildCommand: options.BuildCommand,
+                        TestCommand: options.TestCommand,
+                        TimeoutSeconds: options.ExecutionTimeoutSeconds),
+                    cancellationToken).ConfigureAwait(false);
+                executionVerification = JsonSerializer.Serialize(execResult);
+            }
+            catch { /* best-effort — execution failure doesn't block reconciliation */ }
+        }
+
         var constituentIds = ordered.Select(cp => cp.Proposal.ProposalId).ToList();
         var workspaceChanges = await fileWorkspace
             .DiffAsync(mergeBranch, "main", cancellationToken)
@@ -115,7 +141,7 @@ public sealed class MergeReconciliationService(
             parent.Goal,
             $"Reconciled merge from {constituentIds.Count} child proposals",
             $"Combined changes from proposals: {string.Join(", ", constituentIds)}",
-            null, null, null,
+            executionVerification, null, null,
             MergeProposalStatus.Draft,
             WorkspaceChanges: workspaceChanges,
             DiffGeneratedAt: DateTimeOffset.UtcNow,

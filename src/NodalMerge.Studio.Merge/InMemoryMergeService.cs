@@ -291,6 +291,89 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 proposal.AgentId), cancellationToken).ConfigureAwait(false);
         }
 
+        // ── Post-merge execution ("system truth" validation) ────────────────
+        var execMode = _workspaceOptions.PostMergeExecutionMode;
+        if (execMode is "Async" or "Blocking")
+        {
+            var execution = _serviceProvider?.GetService(typeof(IWorkspaceExecutionService))
+                as IWorkspaceExecutionService;
+            if (execution is not null)
+            {
+                var execRequest = new WorkspaceExecutionRequest(
+                    Build: true,
+                    Test: true,
+                    BuildCommand: _workspaceOptions.BuildCommand,
+                    TestCommand: _workspaceOptions.TestCommand,
+                    TimeoutSeconds: _workspaceOptions.ExecutionTimeoutSeconds);
+
+                if (execMode == "Async")
+                {
+                    // Fire-and-forget: apply returns immediately, results logged in background.
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var result = await execution.ExecuteAsync(
+                                proposal.TargetBranch, execRequest, CancellationToken.None)
+                                .ConfigureAwait(false);
+                            await _nodeStore.WriteNodeAsync(
+                                StudioNodeKind.ExecutionResultV1,
+                                $"postmerge/{proposalId}",
+                                JsonSerializer.Serialize(result)).ConfigureAwait(false);
+
+                            if (!result.AllSucceeded && proposal.SessionId is not null)
+                            {
+                                await _events.AppendAsync(
+                                    proposal.SessionId,
+                                    proposal.WorkUnitId,
+                                    ExecutionEventKind.MergeProposalStatusChanged,
+                                    new MergeProposalStatusChangedPayload(
+                                        proposalId, MergeProposalStatus.Merged, MergeProposalStatus.Merged),
+                                    ct: CancellationToken.None).ConfigureAwait(false);
+                            }
+                        }
+                        catch { /* best-effort background task */ }
+                    });
+                }
+                else // Blocking
+                {
+                    try
+                    {
+                        var execResult = await execution.ExecuteAsync(
+                            proposal.TargetBranch, execRequest, cancellationToken)
+                            .ConfigureAwait(false);
+
+                        await _nodeStore.WriteNodeAsync(
+                            StudioNodeKind.ExecutionResultV1,
+                            $"postmerge/{proposalId}",
+                            JsonSerializer.Serialize(execResult),
+                            cancellationToken).ConfigureAwait(false);
+
+                        // Blocking mode: failure rolls back the apply.
+                        if (!execResult.AllSucceeded)
+                        {
+                            await _fileWorkspace.ApplyBranchAsync(
+                                $"base/{proposalId}", proposal.TargetBranch, CancellationToken.None)
+                                .ConfigureAwait(false);
+
+                            var rolledBack = updated with { Status = MergeProposalStatus.Rejected };
+                            _proposals[proposalId] = rolledBack;
+                            await _nodeStore.WriteNodeAsync(
+                                StudioNodeKind.MergeProposalV1, proposalId,
+                                JsonSerializer.Serialize(rolledBack),
+                                CancellationToken.None).ConfigureAwait(false);
+
+                            throw new InvalidOperationException(
+                                $"Post-merge execution failed on target branch '{proposal.TargetBranch}'. " +
+                                $"Apply rolled back. Builds: {execResult.Builds.Count(b => !b.Success)} failed. " +
+                                $"Tests: {execResult.Tests.Sum(t => t.Failed)} of {execResult.Tests.Sum(t => t.TotalTests)} failed.");
+                        }
+                    }
+                    catch when (execMode != "Blocking") { /* unreachable */ }
+                }
+            }
+        }
+
         if (proposal.SessionId is not null)
         {
             await _events.AppendAsync(
@@ -423,6 +506,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<InMemoryMergeService>();
         services.AddSingleton<IMergeService>(sp => sp.GetRequiredService<InMemoryMergeService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryMergeService>());
+        services.AddSingleton<IMergeCommandService, MergeCommandService>();
         services.AddSingleton<IProposalReviewService, ProposalReviewService>();
         services.AddSingleton<IMergeReconciliationService, MergeReconciliationService>();
         services.AddSingleton<IAutomatedReviewGateService, AutomatedReviewGateService>();

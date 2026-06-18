@@ -19,4 +19,17 @@ public sealed class WorkspaceOptions
     // is registered but evaluates to Allowed regardless of overlap. True rejects the second of two
     // overlapping siblings at BeforeEnqueue instead of just warning after the fact.
     public bool BlockOverlappingFileScope { get; set; } = false;
+
+    // ── Slice 16e/16f/16m — workspace execution ───────────────────────────────
+
+    public bool RequireBuildBeforeProposal { get; set; }   // default false
+    public bool RequireTestBeforeProposal  { get; set; }   // default false
+    public string? BuildCommand { get; set; }               // null = auto-detect
+    public string? TestCommand  { get; set; }               // null = auto-detect
+    public int ExecutionTimeoutSeconds { get; set; } = 300;
+
+    public int MaxOutputBytes  { get; set; } = 64 * 1024;
+    public string TruncationMode { get; set; } = "Tail";   // "Head", "Tail", "HeadTail"
+
+    public string PostMergeExecutionMode { get; set; } = "Disabled"; // "Disabled", "Async", "Blocking"
 }

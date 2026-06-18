@@ -14,8 +14,8 @@ export interface PipelineProfile {
   fileScopePatterns: string[];
 }
 
-export class AgentConfigPanel {
-  static readonly containerId = 'shell-pane-agent-config';
+export class ModelAgentStudioPanel {
+  static readonly containerId = 'shell-pane-model-agent-studio';
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
@@ -44,9 +44,9 @@ export class AgentConfigPanel {
 
   static getFragment(): { css: string; html: string; script: string } {
     return {
-      css: scopeViewCss(AGENT_CONFIG_CSS, AgentConfigPanel.containerId),
-      html: `<div id="${AgentConfigPanel.containerId}" class="nm-shell-pane">${AGENT_CONFIG_HTML}</div>`,
-      script: wrapViewScript(AGENT_CONFIG_JS, AgentConfigPanel.containerId),
+      css: scopeViewCss(MAS_CSS, ModelAgentStudioPanel.containerId),
+      html: `<div id="${ModelAgentStudioPanel.containerId}" class="nm-shell-pane">${MAS_HTML}</div>`,
+      script: wrapViewScript(MAS_JS, ModelAgentStudioPanel.containerId),
     };
   }
 
@@ -110,8 +110,8 @@ export class AgentConfigPanel {
         break;
       }
 
-      case 'quickSpawn':
-        await this.handleQuickSpawn(
+      case 'quickExplore':
+        await this.handleQuickExplore(
           msg.templateName as string,
           msg.goal as string,
           msg.autoReviewProfileId as string | undefined,
@@ -130,12 +130,12 @@ export class AgentConfigPanel {
     }
   }
 
-  private async handleQuickSpawn(templateName: string, goal: string, autoReviewProfileId?: string): Promise<void> {
+  private async handleQuickExplore(templateName: string, goal: string, autoReviewProfileId?: string): Promise<void> {
     const templates = this.configService.getTemplates();
     const template  = templates.find(t => t.name === templateName);
     if (!template) {
-      void vscode.window.showErrorMessage(`NodalMerge: Template "${templateName}" not found.`);
-      void this.panel.webview.postMessage({ type: 'spawnResult', success: false, message: 'Template not found.' });
+      void vscode.window.showErrorMessage(`NodalMerge: Exploration strategy "${templateName}" not found.`);
+      void this.panel.webview.postMessage({ type: 'spawnResult', success: false, message: 'Exploration strategy not found.' });
       return;
     }
 
@@ -162,9 +162,6 @@ export class AgentConfigPanel {
         owner: template.orchestrator,
         ...(repositoryPath ? { repositoryPath } : {}),
       });
-      // Always use 'orchestrator' as the agentType so the server starts the correct loop,
-      // regardless of what the user named their LLM profile.  Workers are spawned by
-      // the orchestrator via nm.v1.agent.spawn once it has created tasks with taskIds.
       await this.post('/studio/agents/spawn', {
         agentType:  'orchestrator',
         workUnitId: orchWu.workUnitId,
@@ -174,13 +171,13 @@ export class AgentConfigPanel {
 
       void this.panel.webview.postMessage({ type: 'spawnResult', success: true });
       void vscode.window.showInformationMessage(
-        `NodalMerge: Spawned orchestrator for "${templateName}": ${goal}`,
+        `NodalMerge: Started exploration for "${templateName}": ${goal}`,
       );
     } catch (err) {
       void this.panel.webview.postMessage({
         type: 'spawnResult', success: false, message: String(err),
       });
-      void vscode.window.showErrorMessage('NodalMerge: Quick spawn failed — ' + String(err));
+      void vscode.window.showErrorMessage('NodalMerge: Quick explore failed — ' + String(err));
     }
   }
 
@@ -245,7 +242,7 @@ export class AgentConfigPanel {
 
 // ── HTML builder ───────────────────────────────────────────────────────────
 
-const AGENT_CONFIG_CSS = `
+const MAS_CSS = `
   :root {
     --nm-bg:         var(--vscode-editor-background);
     --nm-fg:         var(--vscode-editor-foreground);
@@ -271,6 +268,7 @@ const AGENT_CONFIG_CSS = `
     padding: 13px 16px 8px; border-bottom: 1px solid var(--nm-border); flex-shrink: 0;
   }
   .header h1 { font-size: 1.1em; font-weight: 700; margin: 0; }
+  .header .sub { font-size: 0.82em; opacity: 0.6; margin: 2px 0 0; }
   .tabs {
     display: flex; border-bottom: 1px solid var(--nm-border); flex-shrink: 0;
   }
@@ -341,25 +339,28 @@ const AGENT_CONFIG_CSS = `
   .muted { font-size:0.82em; opacity:0.6; padding:6px 0; }
   .grow { flex: 1; }
   .save-bar .status { font-size: 0.8em; opacity: 0.5; flex: 1; }
-  .spawn-form { max-width: 440px; }
-  .spawn-form .field { margin-bottom: 12px; }
-  .spawn-result {
+  .explore-form { max-width: 440px; }
+  .explore-form .field { margin-bottom: 12px; }
+  .explore-result {
     margin-top: 14px; font-size: 0.88em; padding: 8px 12px; border-radius: 4px;
   }
-  .spawn-result.ok  { background: #1e3a1e; color: #7ec87e; }
-  .spawn-result.err { background: #3a1e1e; color: #f07070; }
+  .explore-result.ok  { background: #1e3a1e; color: #7ec87e; }
+  .explore-result.err { background: #3a1e1e; color: #f07070; }
   .default-badge {
     background: #2d5016; color: #8fc96a;
     border-radius: 10px; font-size: 0.74em; padding: 1px 7px; margin-left: 5px;
   }
 `;
 
-const AGENT_CONFIG_HTML = `
-  <div class="header"><h1>Agent Config</h1></div>
+const MAS_HTML = `
+  <div class="header">
+    <h1>Model & Agent Studio</h1>
+    <p class="sub">Configure models, agent profiles, and exploration strategies.</p>
+  </div>
   <div class="tabs">
     <button class="tab-btn active" data-tab="profiles">Profiles</button>
-    <button class="tab-btn" data-tab="templates">Topology Templates</button>
-    <button class="tab-btn" data-tab="spawn">Quick Spawn</button>
+    <button class="tab-btn" data-tab="strategies">Exploration Strategies</button>
+    <button class="tab-btn" data-tab="explore">Quick Explore</button>
     <button class="tab-btn" data-tab="pipeline-profiles">Pipeline Profiles</button>
   </div>
 
@@ -372,33 +373,33 @@ const AGENT_CONFIG_HTML = `
     <button class="add-btn" id="btn-add-profile">+ Add Profile</button>
   </div>
 
-  <div id="pane-templates" class="tab-pane">
+  <div id="pane-strategies" class="tab-pane">
     <div id="template-form-area"></div>
     <table>
-      <thead><tr><th>Name</th><th>Orchestrator</th><th>Workers</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Planner Profile</th><th>Executor Profiles</th><th></th></tr></thead>
       <tbody id="template-tbody"></tbody>
     </table>
-    <button class="add-btn" id="btn-add-template">+ Add Template</button>
+    <button class="add-btn" id="btn-add-template">+ Add Exploration Strategy</button>
   </div>
 
-  <div id="pane-spawn" class="tab-pane">
-    <div class="spawn-form">
+  <div id="pane-explore" class="tab-pane">
+    <div class="explore-form">
       <div class="field">
-        <label>Topology Template</label>
-        <select id="spawn-template"></select>
+        <label>Exploration Strategy</label>
+        <select id="explore-strategy"></select>
       </div>
       <div class="field">
         <label>Goal</label>
-        <input type="text" id="spawn-goal" placeholder="e.g. Refactor the auth module">
+        <input type="text" id="explore-goal" placeholder="e.g. Refactor the auth module">
       </div>
       <div class="field">
         <label class="checkbox-label">
-          <input type="checkbox" id="spawn-auto-review" checked>
+          <input type="checkbox" id="explore-auto-review" checked>
           Run automated review before human gate
         </label>
       </div>
-      <button id="btn-spawn">&#x25B6; Quick Spawn</button>
-      <div id="spawn-result" class="spawn-result hidden"></div>
+      <button id="btn-explore">&#x25B6; Quick Explore</button>
+      <div id="explore-result" class="explore-result hidden"></div>
     </div>
   </div>
 
@@ -414,11 +415,11 @@ const AGENT_CONFIG_HTML = `
   <div class="save-bar">
     <span class="status" id="save-status"></span>
     <button id="btn-save-profiles">Save Profiles</button>
-    <button id="btn-save-templates">Save Templates</button>
+    <button id="btn-save-strategies">Save Strategies</button>
   </div>
 `;
 
-const AGENT_CONFIG_JS = `
+const MAS_JS = `
   const vscode = acquireVsCodeApi();
 
   let profiles = [];
@@ -441,8 +442,8 @@ const AGENT_CONFIG_JS = `
   // ── Escape helper ──────────────────────────────────────────────────────────
   function esc(str) {
     return String(str || '')
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      .replace(/&/g, '&').replace(/</g, '<')
+      .replace(/>/g, '>').replace(/"/g, '"').replace(/'/g, '&#39;');
   }
 
   // ── Status flash ──────────────────────────────────────────────────────────
@@ -473,7 +474,7 @@ const AGENT_CONFIG_JS = `
         '</div></td>';
       tbody.appendChild(tr);
     });
-    updateSpawnTemplates();
+    updateExploreStrategySelector();
   }
 
   document.getElementById('profile-tbody').addEventListener('click', function(e) {
@@ -499,7 +500,6 @@ const AGENT_CONFIG_JS = `
     const curProvider = p.provider || 'anthropic';
     const isVsLm = curProvider === 'vscode-lm';
     const area = document.getElementById('profile-form-area');
-    // Always show the model field so users can supply a model hint for vscode-lm.
     const modelRowClass = 'field';
     const baseUrlRowClass = isVsLm ? 'field hidden' : 'field';
     const apiKeyRowClass = isVsLm ? 'field hidden' : 'field';
@@ -629,15 +629,12 @@ const AGENT_CONFIG_JS = `
       const label    = document.getElementById('pf-label').value.trim();
       const domain   = document.getElementById('pf-domain').value.trim();
       const provider = document.getElementById('pf-provider').value;
-      // Always capture the model field; an empty value will mean "use active VS Code model".
       const model    = getModelValue();
       const baseUrl  = provider === 'vscode-lm' ? '' : document.getElementById('pf-baseurl').value.trim();
       const prompt   = document.getElementById('pf-prompt').value.trim();
       if (!id || !label || !domain) { alert('ID, Label, and Domain are required.'); return; }
-      // If a key was typed in the password field, store it when saving — no need for a separate "Store Key" click.
       const keyEl     = document.getElementById('pf-apikey');
       const pendingKey = (keyEl && provider !== 'vscode-lm') ? keyEl.value.trim() : '';
-      // Determine apiKeyRef: use the pending key's deterministic ref, OR carry forward the existing ref from the live profiles array.
       const liveProfile = isNew ? null : profiles.find(function(pr) { return pr.id === p.id; });
       const existingRef = liveProfile ? liveProfile.apiKeyRef : (isNew ? undefined : p.apiKeyRef);
       const apiKeyRef   = provider === 'vscode-lm' ? undefined
@@ -655,7 +652,6 @@ const AGENT_CONFIG_JS = `
       document.getElementById('profile-form-area').innerHTML = '';
       renderProfiles();
       vscode.postMessage({ type: 'saveProfiles', profiles: profiles });
-      // Store the key AFTER saving the profile so the ref is already in place.
       if (pendingKey) {
         vscode.postMessage({ type: 'setApiKey', profileId: id, key: pendingKey });
       }
@@ -671,19 +667,19 @@ const AGENT_CONFIG_JS = `
     showProfileForm(-1);
   });
 
-  // ── Templates ─────────────────────────────────────────────────────────────
+  // ── Exploration Strategies ─────────────────────────────────────────────────
   function renderTemplates() {
     const tbody = document.getElementById('template-tbody');
     if (!tbody) { return; }
     tbody.innerHTML = '';
     templates.forEach(function(t, i) {
-      const workers   = (t.workers || []).map(function(w) { return w.profile; }).join(', ') || '—';
+      const executors = (t.workers || []).map(function(w) { return w.profile; }).join(', ') || '—';
       const isDefault = t.name === defaultTopology;
       const tr = document.createElement('tr');
       tr.innerHTML =
         '<td>' + esc(t.name) + (isDefault ? '<span class="default-badge">default</span>' : '') + '</td>' +
         '<td class="mono">' + esc(t.orchestrator) + '</td>' +
-        '<td class="mono">' + esc(workers) + '</td>' +
+        '<td class="mono">' + esc(executors) + '</td>' +
         '<td><div class="act-cell">' +
           (isDefault ? '' : '<button class="ghost" data-action="setDefault" data-idx="' + i + '">Set Default</button>') +
           '<button class="ghost" data-action="edit" data-idx="' + i + '">Edit</button>' +
@@ -691,7 +687,7 @@ const AGENT_CONFIG_JS = `
         '</div></td>';
       tbody.appendChild(tr);
     });
-    updateSpawnTemplates();
+    updateExploreStrategySelector();
   }
 
   document.getElementById('template-tbody').addEventListener('click', function(e) {
@@ -721,12 +717,12 @@ const AGENT_CONFIG_JS = `
     const area = document.getElementById('template-form-area');
     area.innerHTML =
       '<div class="form-box">' +
-      '<h3>' + (isNew ? 'Add Template' : 'Edit Template') + '</h3>' +
+      '<h3>' + (isNew ? 'Add Exploration Strategy' : 'Edit Exploration Strategy') + '</h3>' +
       '<div class="field"><label>Name</label>' +
         '<input type="text" id="tmpl-name" value="' + esc(t.name) + '" placeholder="e.g. Default"></div>' +
-      '<div class="field"><label>Orchestrator Profile ID</label>' +
+      '<div class="field"><label>Planner Profile ID</label>' +
         '<input type="text" id="tmpl-orch" value="' + esc(t.orchestrator) + '" placeholder="e.g. orchestrator"></div>' +
-      '<div class="field"><label>Worker Profile IDs (comma-separated)</label>' +
+      '<div class="field"><label>Executor Profile IDs (comma-separated)</label>' +
         '<input type="text" id="tmpl-workers" value="' + esc(workersStr) + '" placeholder="e.g. worker, docs-agent"></div>' +
       '<div class="form-actions">' +
         '<button id="tmpl-save">Save</button>' +
@@ -737,7 +733,7 @@ const AGENT_CONFIG_JS = `
       const name  = document.getElementById('tmpl-name').value.trim();
       const orch  = document.getElementById('tmpl-orch').value.trim();
       const wStr  = document.getElementById('tmpl-workers').value.trim();
-      if (!name || !orch) { alert('Name and Orchestrator are required.'); return; }
+      if (!name || !orch) { alert('Name and Planner Profile are required.'); return; }
       const workers = wStr
         ? wStr.split(',').map(function(s) { return { profile: s.trim() }; }).filter(function(w) { return w.profile; })
         : [];
@@ -756,9 +752,9 @@ const AGENT_CONFIG_JS = `
     showTemplateForm(-1);
   });
 
-  // ── Spawn template selector ────────────────────────────────────────────────
-  function updateSpawnTemplates() {
-    const sel = document.getElementById('spawn-template');
+  // ── Quick Explore strategy selector ────────────────────────────────────────
+  function updateExploreStrategySelector() {
+    const sel = document.getElementById('explore-strategy');
     if (!sel) { return; }
     const current = sel.value;
     sel.innerHTML = templates.map(function(t) {
@@ -771,16 +767,16 @@ const AGENT_CONFIG_JS = `
     }
   }
 
-  // ── Quick Spawn ────────────────────────────────────────────────────────────
-  document.getElementById('btn-spawn').addEventListener('click', function() {
-    const templateName = document.getElementById('spawn-template').value;
-    const goal = document.getElementById('spawn-goal').value.trim();
+  // ── Quick Explore ──────────────────────────────────────────────────────────
+  document.getElementById('btn-explore').addEventListener('click', function() {
+    const templateName = document.getElementById('explore-strategy').value;
+    const goal = document.getElementById('explore-goal').value.trim();
     if (!goal) { alert('Goal is required.'); return; }
-    const autoReview = document.getElementById('spawn-auto-review').checked;
+    const autoReview = document.getElementById('explore-auto-review').checked;
     this.disabled    = true;
-    this.textContent = 'Spawning…';
+    this.textContent = 'Exploring…';
     vscode.postMessage({
-      type: 'quickSpawn',
+      type: 'quickExplore',
       templateName: templateName,
       goal: goal,
       autoReviewProfileId: autoReview ? 'reviewer' : undefined
@@ -792,9 +788,9 @@ const AGENT_CONFIG_JS = `
     vscode.postMessage({ type: 'saveProfiles', profiles: profiles });
     setStatus('Profiles saved.');
   });
-  document.getElementById('btn-save-templates').addEventListener('click', function() {
+  document.getElementById('btn-save-strategies').addEventListener('click', function() {
     vscode.postMessage({ type: 'saveTemplates', templates: templates });
-    setStatus('Templates saved.');
+    setStatus('Strategies saved.');
   });
 
   // ── Pipeline Profiles ─────────────────────────────────────────────────────
@@ -901,14 +897,13 @@ const AGENT_CONFIG_JS = `
       pipelineProfiles = msg.pipelineProfiles || [];
       renderProfiles();
       renderTemplates();
-      updateSpawnTemplates();
+      updateExploreStrategySelector();
       renderPipelineProfiles();
       return;
     }
     if (msg.type === 'apiKeySaved') {
       const statusEl = document.getElementById('pf-key-status');
       if (statusEl) { statusEl.textContent = 'Key stored (' + esc(msg.apiKeyRef || msg.profileId) + ')'; }
-      // Update the in-memory profiles array so a subsequent Save preserves the apiKeyRef.
       if (msg.apiKeyRef) {
         const pi = profiles.findIndex(function(pr) { return pr.id === msg.profileId; });
         if (pi >= 0) { profiles[pi] = Object.assign({}, profiles[pi], { apiKeyRef: msg.apiKeyRef }); }
@@ -916,17 +911,17 @@ const AGENT_CONFIG_JS = `
       return;
     }
     if (msg.type === 'spawnResult') {
-      const btn = document.getElementById('btn-spawn');
+      const btn = document.getElementById('btn-explore');
       btn.disabled    = false;
-      btn.textContent = '\\u25B6 Quick Spawn';
-      const result = document.getElementById('spawn-result');
+      btn.textContent = '\\u25B6 Quick Explore';
+      const result = document.getElementById('explore-result');
       if (result) {
         result.classList.remove('hidden');
-        result.className     = 'spawn-result ' + (msg.success ? 'ok' : 'err');
-        result.textContent   = msg.success ? 'Spawned successfully!' : ('Error: ' + (msg.message || 'unknown'));
+        result.className     = 'explore-result ' + (msg.success ? 'ok' : 'err');
+        result.textContent   = msg.success ? 'Exploration started successfully!' : ('Error: ' + (msg.message || 'unknown'));
       }
       if (msg.success) {
-        const g = document.getElementById('spawn-goal');
+        const g = document.getElementById('explore-goal');
         if (g && 'value' in g) { g.value = ''; }
         setTimeout(function() { if (result) result.classList.add('hidden'); }, 5000);
       }

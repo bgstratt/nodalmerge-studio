@@ -178,6 +178,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         string? branchedFromProposalId = null,
         string? sliceId = null,
         IReadOnlyDictionary<string, string>? metadata = null,
+        HypothesisForkType? forkType = null,
         CancellationToken cancellationToken = default)
     {
         // First work unit with a repositoryPath seeds the main branch for this session.
@@ -187,12 +188,6 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             _workspaceOptions.SeedRepositoryPath = repositoryPath;
         }
 
-        // Slice 15b — branchId used to be patched onto the WorkUnit record *after* this method
-        // returned (by the MCP tool and the agent-loop dispatcher, independently), which left the
-        // real generated "work-{guid}" branch (and any seedFromBranchId content copied into it)
-        // orphaned, and the caller-chosen name never registered with IBranchService at all
-        // (nm_v1_branch_status on it would report "unknown" even though the work unit was "on"
-        // it). Resolving it here means it actually gets created/seeded like any other branch.
         var resolvedBranchId = await _branchService
             .CreateBranchAsync(branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, cancellationToken)
             .ConfigureAwait(false);
@@ -217,7 +212,8 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             DependsOn: dependsOn ?? [],
             FileScope: fileScope ?? [],
             FanOutInfo: fanOutInfo,
-            BranchedFromProposalId: branchedFromProposalId);
+            BranchedFromProposalId: branchedFromProposalId,
+            ForkType: forkType);
 
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }

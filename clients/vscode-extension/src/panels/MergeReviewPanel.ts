@@ -48,12 +48,18 @@ export interface ConstituentProposal {
   status: string;
   goal?: string | null;
   summary?: string | null;
+  model?: string | null;
+  provider?: string | null;
+  confidence?: number | null;
+  rationale?: string | null;
+  agentId?: string | null;
+  workspaceChanges?: string | null;
 }
 
 // ── Panel ──────────────────────────────────────────────────────────────────
 
-export class MergeReviewPanel {
-  static readonly containerId = 'shell-pane-merge-review';
+export class DecisionConvergencePanel {
+  static readonly containerId = 'shell-pane-decision-convergence';
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
@@ -68,8 +74,6 @@ export class MergeReviewPanel {
     this.configService = configService;
   }
 
-  /** Slice 0 — was createOrShow(); the Studio Shell now owns the one WebviewPanel, so this
-   * just points this view at a proposal and tells the already-open shell to show this tab. */
   loadProposal(proposalId: string): void {
     this.mode = 'proposal';
     this.proposalId = proposalId;
@@ -77,9 +81,6 @@ export class MergeReviewPanel {
     void this.load();
   }
 
-  // Conflict mode: the merger found overlapping changes among child proposals and escalated
-  // the parent work unit to Reviewing without producing a proposal — there's nothing to
-  // approve/reject/apply yet, just the conflict report to surface (11c).
   loadConflict(workUnitId: string): void {
     this.mode = 'conflict';
     this.workUnitId = workUnitId;
@@ -89,9 +90,9 @@ export class MergeReviewPanel {
 
   static getFragment(): { css: string; html: string; script: string } {
     return {
-      css: scopeViewCss(REVIEW_CSS, MergeReviewPanel.containerId),
-      html: `<div id="${MergeReviewPanel.containerId}" class="nm-shell-pane">${REVIEW_HTML}</div>`,
-      script: wrapViewScript(REVIEW_JS, MergeReviewPanel.containerId),
+      css: scopeViewCss(DC_CSS, DecisionConvergencePanel.containerId),
+      html: `<div id="${DecisionConvergencePanel.containerId}" class="nm-shell-pane">${DC_HTML}</div>`,
+      script: wrapViewScript(DC_JS, DecisionConvergencePanel.containerId),
     };
   }
 
@@ -130,9 +131,6 @@ export class MergeReviewPanel {
     }
   }
 
-  // Mirrors the "canReview"/"isReviewing" filters the Workspace tab's task list uses to decide
-  // when to show its own "Review →" / "View Conflict →" buttons — same data, just picking the
-  // first match instead of rendering every one, since this pane can only show one at a time.
   private async loadLatestPending(): Promise<void> {
     try {
       const proposals = await this.get<MergeProposal[]>('/studio/merges');
@@ -151,27 +149,15 @@ export class MergeReviewPanel {
         this.loadConflict(reviewing.workUnitId);
       }
     } catch (err) {
-      void vscode.window.showWarningMessage('NodalMerge: failed to check for a pending merge review — ' + String(err));
+      void vscode.window.showWarningMessage('NodalMerge: failed to check for a pending decision — ' + String(err));
     }
   }
 
-  // Slice 0 — the Studio Shell broadcasts every webview message to every view's handleMessage,
-  // since the 4 views' message-type vocabularies don't overlap (verified while planning). The
-  // `default: return` is load-bearing here specifically: unlike the other 3 views, this one
-  // unconditionally reloads after a matched case, so an unmatched (i.e. not-mine) message type
-  // must bail out before reaching that reload, or every other view's message would also
-  // trigger a needless (and, before a proposal/conflict is ever loaded, erroring) re-fetch here.
   async handleMessage(msg: Record<string, unknown>): Promise<void> {
     try {
       switch (msg.type as string) {
-        // The shell broadcasts this on every tab switch (including the initial click into
-        // Merge Review). Before this, switching to the tab directly — rather than via a
-        // notification or the Workspace tab's "Review →" button, both of which call
-        // loadProposal/loadConflict explicitly — left the pane blank even when a proposal or
-        // conflict was already waiting. Only auto-load if nothing has been explicitly requested
-        // yet, so this never overrides what the user is currently looking at.
         case 'studio.tabActivated':
-          if (msg.tab === MergeReviewPanel.containerId
+          if (msg.tab === DecisionConvergencePanel.containerId
             && this.proposalId === undefined && this.workUnitId === undefined) {
             await this.loadLatestPending();
           }
@@ -187,31 +173,31 @@ export class MergeReviewPanel {
           await vscode.commands.executeCommand('vscode.diff', left.uri, right.uri, title);
           break;
         }
-        case 'validate':
+        case 'validateEvidence':
           await this.post('/studio/merges/' + this.proposalId + '/validate', {});
           break;
-        case 'approve':
+        case 'acceptDecision':
           await this.post('/studio/merges/' + this.proposalId + '/review', { decision: 'Approved' });
-          void vscode.window.showInformationMessage('Merge proposal approved.');
+          void vscode.window.showInformationMessage('Decision accepted.');
           break;
-        case 'reject':
+        case 'rejectDecision':
           await this.post('/studio/merges/' + this.proposalId + '/review', { decision: 'Rejected' });
-          void vscode.window.showWarningMessage('Merge proposal rejected.');
+          void vscode.window.showWarningMessage('Decision rejected.');
           break;
-        case 'apply':
+        case 'applyDecision':
           await this.post('/studio/merges/' + this.proposalId + '/apply', {});
-          void vscode.window.showInformationMessage('Merge applied successfully.');
+          void vscode.window.showInformationMessage('Decision applied successfully.');
           break;
-        case 'branchFromHere': {
+        case 'forkHypothesis': {
           const goal = await vscode.window.showInputBox({
-            prompt: 'Goal for the new branch',
+            prompt: 'Goal for the new hypothesis fork',
             placeHolder: 'e.g. Retry with a different model',
             ignoreFocusOut: true,
           });
           if (!goal) { return; }
           let profileId: string | undefined;
           if (this.configService) {
-            const profile = await this.configService.pickProfile('Select profile to run the new branch');
+            const profile = await this.configService.pickProfile('Select profile to run the new fork');
             profileId = profile?.id;
           } else {
             profileId = await vscode.window.showInputBox({ prompt: 'Profile ID', ignoreFocusOut: true });
@@ -220,7 +206,7 @@ export class MergeReviewPanel {
           const result = await this.post<{ workUnitId: string }>(
             '/studio/merges/' + this.proposalId + '/branch', { goal, profileId });
           void vscode.window.showInformationMessage(
-            'NodalMerge: Branched new work unit ' + result.workUnitId + '.');
+            'NodalMerge: Forked new work unit ' + result.workUnitId + '.');
           break;
         }
         case 'restoreWorkspace': {
@@ -239,6 +225,44 @@ export class MergeReviewPanel {
           void vscode.window.showInformationMessage(
             'NodalMerge: Restored workspace to branch ' + result.branchId
             + ' (' + opened + ' file(s) opened read-only).');
+          break;
+        }
+        case 'downloadExecOutput': {
+          const payload = String(msg.payload ?? '');
+          const slashIdx = payload.indexOf('/');
+          if (slashIdx < 0) { break; }
+          const branchId = payload.substring(0, slashIdx);
+          const resultId = payload.substring(slashIdx + 1);
+          try {
+            const output = await this.get<{
+              branchId: string;
+              resultId: string;
+              entries: {
+                kind: string;
+                buildSystem?: string;
+                command: string;
+                stdOut: string;
+                stdErr: string;
+                truncated: boolean;
+              }[];
+            }>('/studio/workspace/' + branchId + '/exec/' + resultId + '/output');
+            const lines: string[] = [];
+            for (const entry of output.entries) {
+              lines.push(`# ${entry.kind}: ${entry.command || ''} (${entry.buildSystem || 'cmd'}) ${entry.truncated ? '[truncated]' : ''}`);
+              if (entry.stdErr) { lines.push('## stderr'); lines.push(entry.stdErr); }
+              if (entry.stdOut) { lines.push('## stdout'); lines.push(entry.stdOut); }
+              lines.push('');
+            }
+            const doc = await vscode.workspace.openTextDocument({
+              language: 'plaintext',
+              content: lines.join('\n'),
+            });
+            await vscode.window.showTextDocument(doc, { preview: false });
+            void vscode.window.showInformationMessage(
+              'NodalMerge: Downloaded execution output for ' + resultId);
+          } catch (err) {
+            void vscode.window.showErrorMessage('NodalMerge: failed to download execution output — ' + String(err));
+          }
           break;
         }
         default:
@@ -276,7 +300,7 @@ export class MergeReviewPanel {
 
 // ── HTML ───────────────────────────────────────────────────────────────────
 
-const REVIEW_CSS = `
+const DC_CSS = `
   :root {
     --nm-bg:      var(--vscode-editor-background);
     --nm-fg:      var(--vscode-editor-foreground);
@@ -315,11 +339,11 @@ const REVIEW_CSS = `
     background: var(--vscode-badge-background);
     color: var(--vscode-badge-foreground);
   }
-  .badge.draft           { background: #555; color: #ccc; }
-  .badge.readyforreview  { background: var(--nm-info); color: #fff; }
-  .badge.approved        { background: var(--nm-success); color: #fff; }
+  .badge.draft, .badge.exploring { background: #555; color: #ccc; }
+  .badge.readyforreview, .badge.proposed { background: var(--nm-info); color: #fff; }
+  .badge.approved, .badge.accepted { background: var(--nm-success); color: #fff; }
   .badge.rejected        { background: var(--nm-error); color: #fff; }
-  .badge.merged          { background: #7c4dff; color: #fff; }
+  .badge.merged, .badge.converged { background: #7c4dff; color: #fff; }
   section {
     border: 1px solid var(--nm-border);
     border-radius: 4px;
@@ -345,8 +369,8 @@ const REVIEW_CSS = `
   }
   button:hover:not(:disabled) { background: var(--nm-btn-h); }
   button:disabled { opacity: 0.35; cursor: not-allowed; }
-  button.approve { background: var(--nm-success); color: #fff; }
-  button.approve:hover:not(:disabled) { filter: brightness(1.15); }
+  button.accept { background: var(--nm-success); color: #fff; }
+  button.accept:hover:not(:disabled) { filter: brightness(1.15); }
   button.reject  { background: var(--nm-error);   color: #fff; }
   button.reject:hover:not(:disabled)  { filter: brightness(1.15); }
   button.apply   { background: #7c4dff; color: #fff; }
@@ -399,7 +423,7 @@ const REVIEW_CSS = `
   .diff-split-cell.right { border-left: 1px solid var(--nm-border); }
   .diff-split-meta { grid-column: 1 / -1; }
   .diff-empty { opacity: 0.6; padding: 8px 12px; font-size: 0.9em; }
-  .reconciled-banner {
+  .converged-banner {
     border-left: 3px solid var(--nm-info);
     padding: 8px 12px;
     margin: 12px 0;
@@ -415,6 +439,51 @@ const REVIEW_CSS = `
   }
   .constituent-row .mono { font-family: var(--nm-mono); opacity: 0.7; }
   .badge.superseded { background: #555; color: #ccc; }
+  /* ── Slice 16m — workspace execution results ──────────────────────── */
+  .exec-section { margin: 8px 0; }
+  .exec-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    font-family: var(--nm-mono);
+    font-size: 0.85em;
+  }
+  .exec-row .badge { font-family: var(--nm-font); }
+  .exec-row .cmd { opacity: 0.7; margin-left: 4px; }
+  .exec-output-toggle {
+    background: transparent;
+    border: 1px solid var(--nm-border);
+    border-radius: 3px;
+    color: var(--nm-fg);
+    cursor: pointer;
+    font-size: 0.78em;
+    padding: 2px 8px;
+    margin: 2px 0 4px 20px;
+    font-family: var(--nm-font);
+  }
+  .exec-output-pre {
+    font-family: var(--nm-mono);
+    font-size: 0.8em;
+    background: rgba(128,128,128,0.06);
+    border: 1px solid var(--nm-border);
+    border-radius: 3px;
+    padding: 6px 10px;
+    margin: 2px 0 8px 20px;
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .exec-download-link {
+    font-size: 0.78em;
+    margin: 0 0 4px 20px;
+    color: var(--nm-info);
+    cursor: pointer;
+    text-decoration: none;
+    font-family: var(--nm-font);
+  }
+  .exec-download-link:hover { text-decoration: underline; }
   .file-change {
     border: 1px solid var(--nm-border);
     border-radius: 4px;
@@ -431,14 +500,14 @@ const REVIEW_CSS = `
   .file-change-body {
     border-top: 1px solid var(--nm-border);
   }
-  .verification-approved {
+  .evidence-accepted {
     border-left: 3px solid var(--nm-success);
     padding: 8px 12px;
     background: rgba(35, 134, 54, 0.12);
     color: var(--nm-success);
     font-weight: 600;
   }
-  .verification-rejected {
+  .evidence-rejected {
     border-left: 3px solid var(--nm-error);
     padding: 8px 12px;
     background: rgba(241, 76, 76, 0.12);
@@ -452,25 +521,25 @@ const REVIEW_CSS = `
   }
 `;
 
-const REVIEW_HTML = `
-  <div id="loading">Loading proposal…</div>
+const DC_HTML = `
+  <div id="loading">Loading decision candidate…</div>
   <div id="content" class="hidden">
-    <h1 id="title">Merge Review</h1>
+    <h1 id="title">Decision Convergence</h1>
     <div id="meta-grid" class="meta-grid">
-      <span class="meta-label">Status</span>      <span id="status-badge"></span>
-      <span class="meta-label">Source branch</span><span class="meta-value" id="source-branch"></span>
-      <span class="meta-label">Target branch</span><span class="meta-value" id="target-branch"></span>
-      <span class="meta-label">Confidence</span>  <span class="meta-value" id="confidence"></span>
+      <span class="meta-label">Decision Status</span> <span id="status-badge"></span>
+      <span class="meta-label">Hypothesis Fork</span><span class="meta-value" id="source-branch"></span>
+      <span class="meta-label">Target</span>         <span class="meta-value" id="target-branch"></span>
+      <span class="meta-label">Confidence</span>     <span class="meta-value" id="confidence"></span>
     </div>
-    <section id="section-reconciled" class="hidden reconciled-banner">
-      <strong>Reconciled proposal</strong> — combined from <span id="reconciled-count"></span> child proposal(s).
-      <div id="reconciled-from"></div>
+    <section id="section-converged" class="hidden converged-banner">
+      <strong>Converged decision</strong> — synthesized from <span id="converged-count"></span> candidate(s).
+      <div id="converged-from"></div>
     </section>
     <section id="section-conflict-report" class="hidden">
-      <h2>Merge conflict</h2>
+      <h2>Decision Conflict</h2>
       <pre id="conflict-report-content" class="diff-pre"></pre>
       <p style="opacity:0.7;font-size:0.9em">
-        Resolve manually: edit the conflicting files on the affected branches outside this panel,
+        Resolve conflicting hypotheses manually — edit the conflicting files on the affected branches outside this panel,
         then re-run the merger for this work unit.
       </p>
     </section>
@@ -483,49 +552,50 @@ const REVIEW_HTML = `
       <p id="summary"></p>
     </section>
     <section id="section-change">
-      <h2>Change description</h2>
+      <h2>Rationale</h2>
       <p id="change-description"></p>
     </section>
     <section id="section-files" class="hidden">
-      <h2>File changes</h2>
+      <h2>Code Changes</h2>
       <div class="diff-mode-toggle">
         <button id="btn-mode-inline">Inline</button>
         <button id="btn-mode-split">Split</button>
       </div>
       <div id="file-changes"></div>
     </section>
-    <section id="section-verification" class="hidden">
-      <h2>Automated review</h2>
-      <div id="verification-results"></div>
+  <section id="section-evidence" class="hidden">
+      <h2>Evidence</h2>
+      <div id="evidence-results"></div>
+      <div id="execution-results" class="hidden"></div>
     </section>
     <section id="section-rollback" class="hidden">
       <h2>Rollback plan</h2>
       <p id="rollback-plan"></p>
     </section>
     <div id="actions" class="actions">
-      <button id="btn-validate">Validate</button>
-      <button id="btn-approve" class="approve">Approve</button>
-      <button id="btn-reject"  class="reject">Reject</button>
-      <button id="btn-apply"   class="apply">Apply</button>
-      <button id="btn-branch"  class="ghost">Branch from here</button>
+      <button id="btn-validate">Validate Evidence</button>
+      <button id="btn-accept" class="accept">Accept Decision</button>
+      <button id="btn-reject" class="reject">Reject Decision</button>
+      <button id="btn-apply"  class="apply">Apply Decision</button>
+      <button id="btn-fork"   class="ghost">Fork Hypothesis</button>
       <button id="btn-restore" class="ghost">Restore workspace</button>
     </div>
   </div>
 `;
 
-const REVIEW_JS = `
+const DC_JS = `
   var vscode = acquireVsCodeApi();
 
   var STATUS_BUTTONS = {
-    draft:          { validate: true,  approve: false, reject: false, apply: false },
-    readyforreview: { validate: false, approve: true,  reject: true,  apply: false },
-    approved:       { validate: false, approve: false, reject: false, apply: true  },
-    merged:         { validate: false, approve: false, reject: false, apply: false },
-    rejected:       { validate: false, approve: false, reject: false, apply: false },
+    draft:          { validate: true,  accept: false, reject: false, apply: false },
+    readyforreview: { validate: false, accept: true,  reject: true,  apply: false },
+    approved:       { validate: false, accept: false, reject: false, apply: true  },
+    merged:         { validate: false, accept: false, reject: false, apply: false },
+    rejected:       { validate: false, accept: false, reject: false, apply: false },
   };
 
   function esc(s) {
-    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return String(s || '').replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>');
   }
 
   function setText(id, val) {
@@ -549,38 +619,67 @@ const REVIEW_JS = `
   }
 
   document.getElementById('btn-validate').addEventListener('click', function() {
-    vscode.postMessage({ type: 'validate' });
+    vscode.postMessage({ type: 'validateEvidence' });
   });
-  document.getElementById('btn-approve').addEventListener('click', function() {
-    vscode.postMessage({ type: 'approve' });
+  document.getElementById('btn-accept').addEventListener('click', function() {
+    vscode.postMessage({ type: 'acceptDecision' });
   });
   document.getElementById('btn-reject').addEventListener('click', function() {
-    vscode.postMessage({ type: 'reject' });
+    vscode.postMessage({ type: 'rejectDecision' });
   });
   document.getElementById('btn-apply').addEventListener('click', function() {
-    vscode.postMessage({ type: 'apply' });
+    vscode.postMessage({ type: 'applyDecision' });
   });
-  document.getElementById('btn-branch').addEventListener('click', function() {
-    vscode.postMessage({ type: 'branchFromHere' });
+  document.getElementById('btn-fork').addEventListener('click', function() {
+    vscode.postMessage({ type: 'forkHypothesis' });
   });
   document.getElementById('btn-restore').addEventListener('click', function() {
     vscode.postMessage({ type: 'restoreWorkspace' });
   });
 
+  // Slice 18g — card-based constituent rendering with model, confidence, rationale
   function renderConstituents(constituents, fallbackIds) {
     var byId = {};
     (constituents || []).forEach(function(c) { byId[c.proposalId] = c; });
     return (fallbackIds || []).map(function(id) {
       var c = byId[id];
       if (!c) {
-        return '<div class="constituent-row"><span class="mono">' + esc(id) + '</span></div>';
+        return '<div class="constituent-card" style="border:1px solid var(--nm-border);border-radius:4px;padding:8px;margin:6px 0">'
+          + '<div class="constituent-row"><span class="mono">' + esc(id) + '</span></div>'
+          + '</div>';
       }
       var statusKey = (c.status || '').toLowerCase().replace(/\\s+/g, '');
-      return '<div class="constituent-row">'
-        + '<span class="badge ' + statusKey + '">' + esc(c.status) + '</span>'
-        + '<span class="mono">' + esc(c.proposalId) + '</span>'
-        + (c.goal ? '<span>' + esc(c.goal) + '</span>' : '')
-        + '</div>';
+      var html = '<div class="constituent-card" style="border:1px solid var(--nm-border);border-radius:4px;padding:10px;margin:6px 0">';
+      // Header row
+      html += '<div class="constituent-row" style="margin-bottom:4px">';
+      html += '<span class="badge ' + statusKey + '">' + esc(c.status) + '</span>';
+      html += '<span class="mono">' + esc(c.proposalId) + '</span>';
+      if (c.goal) { html += '<span style="font-size:0.88em">' + esc(c.goal) + '</span>'; }
+      html += '</div>';
+      // Model & confidence row
+      html += '<div style="display:flex;gap:8px;flex-wrap:wrap;font-size:0.82em;margin-top:4px">';
+      if (c.model) {
+        html += '<span style="opacity:0.6">Model:</span><span>' + esc(c.model);
+        if (c.provider) { html += ' (' + esc(c.provider) + ')'; }
+        html += '</span>';
+      }
+      if (c.confidence != null) {
+        html += '<span style="opacity:0.6">Confidence:</span><span>' + Math.round(c.confidence * 100) + '%</span>';
+      }
+      if (c.agentId) {
+        html += '<span style="opacity:0.6">Agent:</span><span class="mono">' + esc(c.agentId) + '</span>';
+      }
+      html += '</div>';
+      // Rationale excerpt
+      if (c.rationale) {
+        html += '<div style="font-size:0.82em;opacity:0.7;margin-top:6px;padding-left:6px;border-left:2px solid var(--nm-border)">' + esc(c.rationale.substring(0, 200)) + (c.rationale.length > 200 ? '…' : '') + '</div>';
+      }
+      // Summary
+      if (c.summary) {
+        html += '<div style="font-size:0.82em;opacity:0.7;margin-top:4px">' + esc(c.summary) + '</div>';
+      }
+      html += '</div>';
+      return html;
     }).join('');
   }
 
@@ -599,7 +698,6 @@ const REVIEW_JS = `
     return '@@ -' + h.beforeStart + ',' + h.beforeCount + ' +' + h.afterStart + ',' + h.afterCount + ' @@';
   }
 
-  // One pane, git-diff-style: every line gets a +/-/space prefix and its own row, in order.
   function renderInlineHunks(hunks) {
     if (!hunks || !hunks.length) return '<div class="diff-empty">No textual changes.</div>';
     return hunks.map(function(h) {
@@ -612,9 +710,6 @@ const REVIEW_JS = `
     }).join('');
   }
 
-  // Two columns from the same hunk data: Context lines appear on both sides, Added only on the
-  // right, Removed only on the left — no smart pairing of adjacent add/remove lines (yet), just
-  // an honest per-line layout.
   function renderSplitHunks(hunks) {
     if (!hunks || !hunks.length) return '<div class="diff-empty">No textual changes.</div>';
     return hunks.map(function(h) {
@@ -666,19 +761,40 @@ const REVIEW_JS = `
 
   document.addEventListener('click', function(ev) {
     var btn = ev.target.closest('[data-open-diff]');
-    if (!btn) return;
-    var idx = parseInt(btn.getAttribute('data-open-diff'), 10);
-    var fc = window.__fileChanges && window.__fileChanges[idx];
-    if (!fc) return;
-    vscode.postMessage({
-      type: 'openDiff',
-      path: fc.path,
-      beforeContent: fc.beforeContent,
-      afterContent: fc.afterContent
-    });
+    if (btn) {
+      var idx = parseInt(btn.getAttribute('data-open-diff'), 10);
+      var fc = window.__fileChanges && window.__fileChanges[idx];
+      if (!fc) return;
+      vscode.postMessage({
+        type: 'openDiff',
+        path: fc.path,
+        beforeContent: fc.beforeContent,
+        afterContent: fc.afterContent
+      });
+      return;
+    }
+
+    var toggle = ev.target.closest('[data-target]');
+    if (toggle) {
+      var targetId = toggle.getAttribute('data-target');
+      var pre = document.getElementById(targetId);
+      if (pre) {
+        var isVisible = pre.style.display !== 'none';
+        pre.style.display = isVisible ? 'none' : 'block';
+        toggle.textContent = isVisible ? '▼ Output' : '▲ Output';
+      }
+      return;
+    }
+
+    var download = ev.target.closest('[data-download]');
+    if (download) {
+      var payload = download.getAttribute('data-download');
+      vscode.postMessage({ type: 'downloadExecOutput', payload: payload });
+      return;
+    }
   });
 
-  function showProposalSections(show) {
+  function showDecisionSections(show) {
     showIf('meta-grid', show);
     showIf('section-goal', show);
     showIf('section-summary', show);
@@ -695,11 +811,11 @@ const REVIEW_JS = `
       if (loadingEl2) loadingEl2.classList.add('hidden');
       if (contentEl2) contentEl2.classList.remove('hidden');
 
-      setText('title', 'Merge Conflict: ' + (msg.workUnitId || ''));
-      showProposalSections(false);
-      showIf('section-reconciled', false);
+      setText('title', 'Decision Conflict: ' + (msg.workUnitId || ''));
+      showDecisionSections(false);
+      showIf('section-converged', false);
       showIf('section-files', false);
-      showIf('section-verification', false);
+      showIf('section-evidence', false);
       showIf('section-rollback', false);
       showIf('section-conflict-report', true);
       setText('conflict-report-content', msg.content || '');
@@ -707,7 +823,7 @@ const REVIEW_JS = `
     }
 
     if (msg.type !== 'proposal') { return; }
-    showProposalSections(true);
+    showDecisionSections(true);
     showIf('section-conflict-report', false);
     var p = msg.proposal;
     var fileChanges = msg.fileChanges || [];
@@ -719,7 +835,7 @@ const REVIEW_JS = `
     if (loadingEl) loadingEl.classList.add('hidden');
     if (contentEl) contentEl.classList.remove('hidden');
 
-    setText('title', 'Merge Review: ' + (p.sourceBranch || ''));
+    setText('title', 'Decision Convergence: ' + (p.goal || p.sourceBranch || ''));
     var badgeClass = 'badge ' + status;
     setHtml('status-badge', '<span class="' + badgeClass + '">' + esc(p.status) + '</span>');
     setText('source-branch', p.sourceBranch);
@@ -729,40 +845,145 @@ const REVIEW_JS = `
     setText('summary', p.summary);
     setText('change-description', p.changeDescription);
 
-    var verificationEl = document.getElementById('verification-results');
-    if (verificationEl && p.verificationResults) {
-      var isRejected = status === 'rejected';
-      var label = isRejected
-        ? 'Automated Review: Rejected: ' + esc(p.verificationResults)
-        : 'Automated Review: Approved — ' + esc(p.verificationResults);
-      verificationEl.className = isRejected ? 'verification-rejected' : 'verification-approved';
-      verificationEl.textContent = isRejected
-        ? 'Automated Review: Rejected: ' + (p.verificationResults || '')
-        : 'Automated Review: Approved — ' + (p.verificationResults || '');
-    } else if (verificationEl) {
-      verificationEl.className = '';
-      verificationEl.textContent = '';
+    // ── Parse evidence for execution data or plain review text ──
+    var evidenceEl = document.getElementById('evidence-results');
+    var execResultsEl = document.getElementById('execution-results');
+    var parsedExec = null;
+    var blockedInfo = null;
+    var plainReview = null;
+
+    if (p.verificationResults) {
+      try {
+        var parsed = JSON.parse(p.verificationResults);
+        if (parsed.blocked) {
+          blockedInfo = parsed;
+          if (blockedInfo.execution) parsedExec = blockedInfo.execution;
+        } else if (parsed.branchId && parsed.builds) {
+          parsedExec = parsed;
+        } else {
+          plainReview = p.verificationResults;
+        }
+      } catch (_) {
+        plainReview = p.verificationResults;
+      }
     }
+
+    if (evidenceEl && plainReview) {
+      var isRejected = status === 'rejected';
+      evidenceEl.className = isRejected ? 'evidence-rejected' : 'evidence-accepted';
+      evidenceEl.textContent = plainReview;
+    } else if (evidenceEl && blockedInfo) {
+      evidenceEl.className = 'evidence-rejected';
+      evidenceEl.textContent = 'Policy blocked: ' + (blockedInfo.violations || []).join('; ');
+      showIf('section-evidence', true);
+    } else if (evidenceEl) {
+      evidenceEl.className = '';
+      evidenceEl.textContent = '';
+    }
+
+    if (parsedExec && execResultsEl) {
+      execResultsEl.classList.remove('hidden');
+      showIf('section-evidence', true);
+      var html = '<div class="exec-section">';
+
+      if (parsedExec.builds && parsedExec.builds.length) {
+        html += '<strong>Build</strong>';
+        parsedExec.builds.forEach(function(b) {
+          var icon = b.success ? '✅' : '❌';
+          var sys = b.buildSystem || 'cmd';
+          var dur = b.startedAt && b.completedAt
+            ? ((new Date(b.completedAt) - new Date(b.startedAt)) / 1000).toFixed(1) + 's'
+            : '';
+          html += '<div class="exec-row">' + icon + ' <span class="badge">' + esc(sys) + '</span>'
+            + ' <span class="cmd">' + esc(b.command || '') + '</span>'
+            + (dur ? ' <span style="opacity:0.6">(' + dur + ')</span>' : '')
+            + (b.exitCode !== 0 ? ' <span style="color:var(--nm-error)">exit ' + b.exitCode + '</span>' : '')
+            + '</div>';
+
+          var hasStdout = b.stdOut && b.stdOut.length > 0;
+          var hasStderr = b.stdErr && b.stdErr.length > 0;
+          if (hasStdout || hasStderr) {
+            var outId = 'exec-stdout-' + Math.random().toString(36).slice(2,8);
+            html += '<button class="exec-output-toggle" data-target="' + outId + '">▼ Output</button>';
+            html += '<pre class="exec-output-pre" id="' + outId + '" style="display:none">';
+            if (hasStderr) html += esc(b.stdErr) + '\n';
+            if (hasStdout) html += esc(b.stdOut);
+            html += '</pre>';
+          }
+
+          if (b.truncated && parsedExec.nodeId) {
+            html += '<a class="exec-download-link" data-download="'
+              + esc(parsedExec.branchId) + '/' + esc(parsedExec.nodeId) + '">'
+              + 'Download full output (truncated)</a>';
+          }
+        });
+      }
+
+      if (parsedExec.tests && parsedExec.tests.length) {
+        html += '<strong style="margin-top:8px;display:block">Tests</strong>';
+        parsedExec.tests.forEach(function(t) {
+          var icon = t.success ? '✅' : '⚠';
+          var sys = t.buildSystem || 'cmd';
+          if (t.failed === 0 && t.totalTests === 0) icon = t.success ? '✅' : '❌';
+          var summary = t.totalTests > 0
+            ? t.passed + ' passed / ' + t.failed + ' failed' + (t.skipped ? ' / ' + t.skipped + ' skipped' : '')
+            : '';
+          var dur = t.startedAt && t.completedAt
+            ? ((new Date(t.completedAt) - new Date(t.startedAt)) / 1000).toFixed(1) + 's'
+            : '';
+          html += '<div class="exec-row">' + icon + ' <span class="badge">' + esc(sys) + '</span>'
+            + ' <span class="cmd">' + esc(t.command || '') + '</span>'
+            + ' <span>' + summary + '</span>'
+            + (dur ? ' <span style="opacity:0.6">(' + dur + ')</span>' : '')
+            + '</div>';
+
+          var hasStdout = t.stdOut && t.stdOut.length > 0;
+          if (hasStdout) {
+            var tid = 'exec-testout-' + Math.random().toString(36).slice(2,8);
+            html += '<button class="exec-output-toggle" data-target="' + tid + '">▼ Output</button>';
+            html += '<pre class="exec-output-pre" id="' + tid + '" style="display:none">' + esc(t.stdOut) + '</pre>';
+          }
+
+          if (t.truncated && parsedExec.nodeId) {
+            html += '<a class="exec-download-link" data-download="'
+              + esc(parsedExec.branchId) + '/' + esc(parsedExec.nodeId) + '">'
+              + 'Download full output (truncated)</a>';
+          }
+        });
+      }
+
+      if (!parsedExec.builds || !parsedExec.builds.length && (!parsedExec.tests || !parsedExec.tests.length)) {
+        html += '<span style="opacity:0.6;font-size:0.85em">No build/test results.</span>';
+      }
+
+      html += '</div>';
+      execResultsEl.innerHTML = html;
+    } else if (execResultsEl) {
+      execResultsEl.classList.add('hidden');
+      execResultsEl.innerHTML = '';
+    }
+
+    showIf('section-evidence', !!(p.verificationResults || parsedExec));
 
     setText('rollback-plan', p.rollbackPlan);
 
-    var reconciled = p.reconciledFrom && p.reconciledFrom.length;
-    showIf('section-reconciled', !!reconciled);
-    if (reconciled) {
-      setText('reconciled-count', String(p.reconciledFrom.length));
-      setHtml('reconciled-from', renderConstituents(msg.constituents || [], p.reconciledFrom));
+    var converged = p.reconciledFrom && p.reconciledFrom.length;
+    showIf('section-converged', !!converged);
+    if (converged) {
+      setText('converged-count', String(p.reconciledFrom.length));
+      setHtml('converged-from', renderConstituents(msg.constituents || [], p.reconciledFrom));
     }
 
     rerenderFileChanges();
     showIf('section-files', fileChanges.length > 0);
 
-    showIf('section-verification', !!p.verificationResults);
+    showIf('section-evidence', !!p.verificationResults);
     showIf('section-rollback', !!p.rollbackPlan);
 
-    var btns = STATUS_BUTTONS[status] || { validate: false, approve: false, reject: false, apply: false };
+    var btns = STATUS_BUTTONS[status] || { validate: false, accept: false, reject: false, apply: false };
     setDisabled('btn-validate', !btns.validate);
-    setDisabled('btn-approve',  !btns.approve);
-    setDisabled('btn-reject',   !btns.reject);
-    setDisabled('btn-apply',    !btns.apply);
+    setDisabled('btn-accept',  !btns.accept);
+    setDisabled('btn-reject',  !btns.reject);
+    setDisabled('btn-apply',   !btns.apply);
   });
 `;

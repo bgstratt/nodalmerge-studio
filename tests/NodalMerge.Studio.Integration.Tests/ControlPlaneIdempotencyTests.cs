@@ -188,6 +188,11 @@ public class ControlPlaneIdempotencyTests
         public object? GetService(Type serviceType) => services.FirstOrDefault(serviceType.IsInstanceOfType);
     }
 
+    private sealed class NoopServiceProvider : IServiceProvider
+    {
+        public object? GetService(Type serviceType) => null;
+    }
+
     private sealed class RecordingWorkUnitService : IWorkUnitService
     {
         public List<(string WorkUnitId, WorkUnitStatus Status, string? SessionId)> Calls { get; } = [];
@@ -283,10 +288,12 @@ public class ControlPlaneIdempotencyTests
     public async Task MergeProposeAsync_called_twice_with_same_CommandId_creates_one_proposal()
     {
         var store = new InMemoryStudioNodeStore();
-        var mergeService = new InMemoryMergeService(
-            store, new NoopFileWorkspaceService(), new WorkspaceOptions(), new NoopEventStream(),
-            new ArtifactLineageService(store));
-        var tools = new MergeTools(mergeService, store);
+        var events = new NoopEventStream();
+        var fileWorkspace = new NoopFileWorkspaceService();
+        var artifacts = new ArtifactLineageService(store);
+        var mergeService = new InMemoryMergeService(store, fileWorkspace, new WorkspaceOptions(), events, artifacts);
+        var mergeCommands = new MergeCommandService(mergeService, fileWorkspace, artifacts, events, store, new NoopServiceProvider());
+        var tools = new MergeTools(mergeCommands);
 
         var commandId = Guid.NewGuid().ToString("N");
         var first = await tools.ProposeAsync("feat/x", "main", "summary", commandId: commandId);
@@ -302,10 +309,12 @@ public class ControlPlaneIdempotencyTests
     public async Task MergeProposeAsync_without_CommandId_creates_separate_proposals()
     {
         var store = new InMemoryStudioNodeStore();
-        var mergeService = new InMemoryMergeService(
-            store, new NoopFileWorkspaceService(), new WorkspaceOptions(), new NoopEventStream(),
-            new ArtifactLineageService(store));
-        var tools = new MergeTools(mergeService, store);
+        var events = new NoopEventStream();
+        var fileWorkspace = new NoopFileWorkspaceService();
+        var artifacts = new ArtifactLineageService(store);
+        var mergeService = new InMemoryMergeService(store, fileWorkspace, new WorkspaceOptions(), events, artifacts);
+        var mergeCommands = new MergeCommandService(mergeService, fileWorkspace, artifacts, events, store, new NoopServiceProvider());
+        var tools = new MergeTools(mergeCommands);
 
         await tools.ProposeAsync("feat/x", "main", "summary");
         await tools.ProposeAsync("feat/x", "main", "summary");

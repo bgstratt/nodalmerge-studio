@@ -71,6 +71,27 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IWorkScheduler>(sp => sp.GetRequiredService<WorkSchedulerService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<WorkSchedulerService>());
 
+        // Slice 15f — shared command services that every transport (MCP/REST/dispatcher) calls.
+        services.AddSingleton<ISchedulerCommandService, SchedulerCommandService>();
+        services.AddSingleton<IArtifactCommandService, ArtifactCommandService>();
+
+        // Slice 16b/16c — workspace execution services
+        services.AddSingleton<IWorkspaceExecutionService, WorkspaceExecutionService>();
+        services.AddSingleton<IWorkspaceExecutionCommandService, WorkspaceExecutionCommandService>();
+
+        // Phase 6.7b — decision-centric persistent node services
+        services.AddSingleton<GoalNodeService>();
+        services.AddSingleton<IGoalNodeService>(sp => sp.GetRequiredService<GoalNodeService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<GoalNodeService>());
+
+        services.AddSingleton<DecisionNodeService>();
+        services.AddSingleton<IDecisionNodeService>(sp => sp.GetRequiredService<DecisionNodeService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<DecisionNodeService>());
+
+        services.AddSingleton<EvidenceNodeService>();
+        services.AddSingleton<IEvidenceNodeService>(sp => sp.GetRequiredService<EvidenceNodeService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<EvidenceNodeService>());
+
         services.AddSingleton<ExecutionEventStreamService>();
         services.AddSingleton<IExecutionEventStream>(sp => sp.GetRequiredService<ExecutionEventStreamService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<ExecutionEventStreamService>());
@@ -98,6 +119,9 @@ public static class ServiceCollectionExtensions
         // Slice 14b — the first real rule. Always registered; gated by
         // WorkspaceOptions.BlockOverlappingFileScope (default false) inside the rule itself.
         services.AddSingleton<IPolicyRule, NonOverlappingFileScopeRule>();
+
+        // Slice 16f — opt-in execution rule; gated by RequireBuildBeforeProposal/RequireTestBeforeProposal.
+        services.AddSingleton<IPolicyRule, WorkspaceExecutionRule>();
     }
 
     private static void AddFileWorkspaceService(IServiceCollection services)

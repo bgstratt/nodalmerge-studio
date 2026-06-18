@@ -1,23 +1,19 @@
 import * as vscode from 'vscode';
 import { buildNonce, SHELL_CSS_VARS } from './sharedWebviewChrome';
-import { MergeReviewPanel } from './MergeReviewPanel';
-import { AgentConfigPanel } from './AgentConfigPanel';
-import { WorkspaceDashboardPanel } from './WorkspaceDashboardPanel';
-import { DagReplayPanel } from './DagReplayPanel';
-import { ArtifactExplorerPanel } from './ArtifactExplorerPanel';
+import { DecisionConvergencePanel } from './MergeReviewPanel';
+import { ModelAgentStudioPanel } from './AgentConfigPanel';
+import { ExecutionTimelinePanel } from './WorkspaceDashboardPanel';
+import { TrajectoryReplayPanel } from './DagReplayPanel';
+import { GoalWorkspacePanel } from './ArtifactExplorerPanel';
 import type { NotificationManager } from '../NotificationManager';
 import type { AgentConfigService } from '../AgentConfigService';
 
 interface TabDef { id: string; label: string }
 
 /**
- * Slice 0 — the consolidated "NodalMerge Studio" window. Previously each feature
- * (Workspace Dashboard, Merge Review, DAG Replay, Agent Config) was its own
- * vscode.WebviewPanel, opened by its own command, appearing as its own editor tab. This is
- * now the only WebviewPanel the extension creates; the 4 panel classes no longer create their
- * own panel/html/message-listener — they're constructed with this shell's shared panel and
- * become "views" whose HTML fragment gets embedded here and whose handleMessage gets called
- * here. See sharedWebviewChrome.ts for how their CSS/JS avoid colliding once combined.
+ * NodalMerge Studio — Decision Workspace shell.
+ * Consolidates Goal Workspace, Model & Agent Studio, Execution Timeline,
+ * Decision Convergence, and Trajectory Replay into a single webview panel.
  */
 export class StudioShellPanel implements vscode.Disposable {
   static current: StudioShellPanel | undefined;
@@ -26,11 +22,11 @@ export class StudioShellPanel implements vscode.Disposable {
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
 
-  readonly workspace: WorkspaceDashboardPanel;
-  readonly mergeReview: MergeReviewPanel;
-  readonly agentConfig: AgentConfigPanel;
-  readonly dagReplay: DagReplayPanel;
-  readonly home: ArtifactExplorerPanel;
+  readonly executionTimeline: ExecutionTimelinePanel;
+  readonly decisionConvergence: DecisionConvergencePanel;
+  readonly modelAgentStudio: ModelAgentStudioPanel;
+  readonly trajectoryReplay: TrajectoryReplayPanel;
+  readonly goalWorkspace: GoalWorkspacePanel;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -43,11 +39,11 @@ export class StudioShellPanel implements vscode.Disposable {
   ) {
     this.panel = panel;
 
-    this.workspace   = new WorkspaceDashboardPanel(panel, baseUrl, notifications, configService, secrets, lmProxyBaseUrl);
-    this.mergeReview = new MergeReviewPanel(panel, baseUrl, configService);
-    this.agentConfig = new AgentConfigPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
-    this.dagReplay   = new DagReplayPanel(panel, baseUrl);
-    this.home        = new ArtifactExplorerPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
+    this.executionTimeline   = new ExecutionTimelinePanel(panel, baseUrl, notifications, configService, secrets, lmProxyBaseUrl);
+    this.decisionConvergence = new DecisionConvergencePanel(panel, baseUrl, configService);
+    this.modelAgentStudio    = new ModelAgentStudioPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
+    this.trajectoryReplay    = new TrajectoryReplayPanel(panel, baseUrl);
+    this.goalWorkspace       = new GoalWorkspacePanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
 
     this.panel.webview.html = this.buildHtml(extensionUri);
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
@@ -57,16 +53,10 @@ export class StudioShellPanel implements vscode.Disposable {
       this.disposables,
     );
 
-    // Slice 0 simplification: all views start polling/loading as soon as the shell opens,
-    // regardless of which tab is visible — there's one always-open webview now, not 4
-    // independently hidden/shown panels, so there's no per-tab "became visible" signal to
-    // gate this on. Tab-aware pause/resume of polling is a reasonable later refinement, not
-    // required for this slice. Merge Review stays idle on purpose — there's no proposal to
-    // show until loadProposal()/loadConflict() is called.
-    this.workspace.activate();
-    this.agentConfig.activate();
-    this.dagReplay.activate();
-    this.home.activate();
+    this.executionTimeline.activate();
+    this.modelAgentStudio.activate();
+    this.trajectoryReplay.activate();
+    this.goalWorkspace.activate();
   }
 
   static createOrShow(
@@ -83,7 +73,7 @@ export class StudioShellPanel implements vscode.Disposable {
     }
     const panel = vscode.window.createWebviewPanel(
       StudioShellPanel.viewType,
-      'NodalMerge Studio',
+      'NodalMerge Studio — Decision Workspace',
       vscode.ViewColumn.Two,
       {
         enableScripts: true,
@@ -98,20 +88,18 @@ export class StudioShellPanel implements vscode.Disposable {
   }
 
   /** Switches the already-open shell to a given tab — used when a notification or dead-letter
-   * action needs to bring a specific view to the front (e.g. Merge Review for a proposal). */
+   * action needs to bring a specific view to the front (e.g. Decision Convergence for a proposal). */
   showTab(tabId: string): void {
     void this.panel.webview.postMessage({ type: 'studio.showTab', tab: tabId });
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
-    // Broadcast — verified while planning that the 4 views' message-type vocabularies don't
-    // overlap, so each view's own handleMessage safely ignores types it doesn't recognize.
     await Promise.all([
-      this.workspace.handleMessage(msg),
-      this.mergeReview.handleMessage(msg),
-      this.agentConfig.handleMessage(msg),
-      this.dagReplay.handleMessage(msg),
-      this.home.handleMessage(msg),
+      this.executionTimeline.handleMessage(msg),
+      this.decisionConvergence.handleMessage(msg),
+      this.modelAgentStudio.handleMessage(msg),
+      this.trajectoryReplay.handleMessage(msg),
+      this.goalWorkspace.handleMessage(msg),
     ]);
   }
 
@@ -119,21 +107,21 @@ export class StudioShellPanel implements vscode.Disposable {
     const nonce  = buildNonce();
     const webview = this.panel.webview;
 
-    const homeFragment        = ArtifactExplorerPanel.getFragment();
-    const workspaceFragment   = WorkspaceDashboardPanel.getFragment();
-    const mergeReviewFragment = MergeReviewPanel.getFragment();
-    const agentConfigFragment = AgentConfigPanel.getFragment();
-    const dagFragment         = DagReplayPanel.getFragment(webview, extensionUri, nonce);
+    const goalWorkspaceFragment        = GoalWorkspacePanel.getFragment();
+    const modelAgentStudioFragment     = ModelAgentStudioPanel.getFragment();
+    const executionTimelineFragment    = ExecutionTimelinePanel.getFragment();
+    const decisionConvergenceFragment  = DecisionConvergencePanel.getFragment();
+    const trajectoryFragment           = TrajectoryReplayPanel.getFragment(webview, extensionUri, nonce);
 
     const tabs: TabDef[] = [
-      { id: ArtifactExplorerPanel.containerId, label: 'Home' },
-      { id: AgentConfigPanel.containerId, label: 'Agent Config' },
-      { id: WorkspaceDashboardPanel.containerId, label: 'Workspace' },
-      { id: MergeReviewPanel.containerId, label: 'Merge Review' },
-      { id: DagReplayPanel.containerId, label: 'DAG Replay' },
+      { id: GoalWorkspacePanel.containerId, label: 'Goal Workspace' },
+      { id: ModelAgentStudioPanel.containerId, label: 'Model & Agent Studio' },
+      { id: ExecutionTimelinePanel.containerId, label: 'Execution Timeline' },
+      { id: DecisionConvergencePanel.containerId, label: 'Decision Convergence' },
+      { id: TrajectoryReplayPanel.containerId, label: 'Trajectory Replay' },
     ];
     const tabButtonsHtml = tabs
-      .map(t => `<button class="nm-shell-tab${t.id === ArtifactExplorerPanel.containerId ? ' active' : ''}" data-tab="${t.id}">${t.label}</button>`)
+      .map(t => `<button class="nm-shell-tab${t.id === GoalWorkspacePanel.containerId ? ' active' : ''}" data-tab="${t.id}">${t.label}</button>`)
       .join('\n');
 
     return `<!DOCTYPE html>
@@ -143,24 +131,24 @@ export class StudioShellPanel implements vscode.Disposable {
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; connect-src ws://127.0.0.1:*;">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NodalMerge Studio</title>
+  <title>NodalMerge Studio — Decision Workspace</title>
   <style nonce="${nonce}">
 ${SHELL_CSS_VARS}
-${homeFragment.css}
-${workspaceFragment.css}
-${mergeReviewFragment.css}
-${agentConfigFragment.css}
-${dagFragment.css}
+${goalWorkspaceFragment.css}
+${modelAgentStudioFragment.css}
+${executionTimelineFragment.css}
+${decisionConvergenceFragment.css}
+${trajectoryFragment.css}
   </style>
 </head>
 <body>
   <div id="nm-shell-tabbar">${tabButtonsHtml}</div>
   <div id="nm-shell-content">
-${homeFragment.html}
-${agentConfigFragment.html}
-${workspaceFragment.html}
-${mergeReviewFragment.html}
-${dagFragment.html}
+${goalWorkspaceFragment.html}
+${modelAgentStudioFragment.html}
+${executionTimelineFragment.html}
+${decisionConvergenceFragment.html}
+${trajectoryFragment.html}
   </div>
   <script nonce="${nonce}">
     (function() {
@@ -182,27 +170,27 @@ ${dagFragment.html}
     })();
   </script>
   <script nonce="${nonce}">
-${agentConfigFragment.script}
+${modelAgentStudioFragment.script}
   </script>
   <script nonce="${nonce}">
-${workspaceFragment.script}
+${executionTimelineFragment.script}
   </script>
   <script nonce="${nonce}">
-${mergeReviewFragment.script}
+${decisionConvergenceFragment.script}
   </script>
   <script nonce="${nonce}">
-${homeFragment.script}
+${goalWorkspaceFragment.script}
   </script>
-${dagFragment.scriptTag}
+${trajectoryFragment.scriptTag}
 </body>
 </html>`;
   }
 
   dispose(): void {
     StudioShellPanel.current = undefined;
-    this.workspace.dispose();
-    this.home.dispose();
-    this.dagReplay.dispose();
+    this.executionTimeline.dispose();
+    this.goalWorkspace.dispose();
+    this.trajectoryReplay.dispose();
     this.panel.dispose();
     for (const d of this.disposables) { d.dispose(); }
     this.disposables.length = 0;
