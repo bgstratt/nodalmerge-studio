@@ -10,9 +10,6 @@ namespace NodalMerge.Studio.AgentRuntime;
 
 public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapshotService, IAgentControlService, IHostedService
 {
-    private const int MaxConcurrentWorkers = 3;
-    private const int PollIntervalMs = 2_000;
-
     private readonly ConcurrentDictionary<(string AgentId, string WorkUnitId), ExecutionSnapshot> _snapshots = new();
     private readonly ConcurrentDictionary<string, AgentRecord> _agents = new();
     private readonly ConcurrentDictionary<string, OrchestratorRegistration> _orchestratorRegistrations = new();
@@ -21,6 +18,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     private readonly IAgentProfileService _profileService;
     private readonly IWorkScheduler _scheduler;
     private readonly IExecutionEventStream _events;
+    private readonly WorkspaceOptions _options;
     private int _activeWorkerCount;
     private CancellationTokenSource? _pollCts;
 
@@ -29,13 +27,15 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         ILogger<InMemoryAgentRuntimeService> logger,
         IAgentProfileService profileService,
         IWorkScheduler scheduler,
-        IExecutionEventStream events)
+        IExecutionEventStream events,
+        WorkspaceOptions options)
     {
         _serviceProvider = serviceProvider;
         _logger          = logger;
         _profileService  = profileService;
         _scheduler       = scheduler;
         _events          = events;
+        _options         = options;
     }
 
     private sealed record AgentRecord(
@@ -78,7 +78,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         {
             try
             {
-                if (_activeWorkerCount < MaxConcurrentWorkers)
+                if (_activeWorkerCount < _options.MaxConcurrentWorkers)
                 {
                     var pollerId = $"poller-{Guid.NewGuid():N}";
                     var item = await _scheduler.TryAcquireAsync(pollerId, ct).ConfigureAwait(false);
@@ -98,7 +98,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 _logger.LogError(ex, "[Scheduler] Poll iteration failed.");
             }
 
-            try { await Task.Delay(PollIntervalMs, ct).ConfigureAwait(false); }
+            try { await Task.Delay(_options.SchedulerPollIntervalMs, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { break; }
         }
     }

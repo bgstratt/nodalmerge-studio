@@ -376,8 +376,16 @@ That is the durable artifact platform. Everything before this was infrastructure
 
 ## Phase 6 pointer (future)
 
-- **Policy / Validator layer**: cross-cutting gate between stages enforcing schema, invariants, repo rules — not an agent, a pipeline primitive.
-- **Cross-repo work units**: `SeedRepositoryPath` arrays for work spanning multiple repositories.
-- **Persistent branch history**: branches survive server restart (real blob store, not `WsOnly`).
-- **AST-level conflict detection**: syntax-aware diff in the merger stage (11c), not line-level.
-- **Collaborative steering**: multiple humans editing the work unit DAG simultaneously (CRDT / OT).
+Superseded by [phase-6-policy-routing-conflicts.md](./phase-6-policy-routing-conflicts.md), written
+after Phase 5.5 closed the durability gaps below it. Quick map from this pointer to where each item
+landed:
+
+- **Policy / Validator layer** → phase-6's Slices 14a/14b (the gate primitive, then the first real
+  rule built on it).
+- **Persistent branch history** → already resolved by Phase 5.5 (slice 13a) before Phase 6 was
+  written; see that doc's "Already resolved" section.
+- **AST-level conflict detection** → phase-6's Slice 14d, scoped down to line-range-aware diffing
+  after checking that no line-level diff primitive exists yet anywhere in the codebase; true
+  syntax-aware diffing pushed to that doc's Phase 7 pointer.
+- **Cross-repo work units**, **Collaborative steering** → carried forward unchanged to phase-6's own
+  Phase 7 pointer — neither was researched deeply enough this round to commit to a design yet.

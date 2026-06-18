@@ -121,6 +121,9 @@ public enum OrchestrationAction
     AwaitReview,
     ApplyMerge,
     Escalate,
+    // Slice 14a — a registered IPolicyRule rejected the checkpoint. Distinct from Escalate, which
+    // is the 11e dead-letter path for a different kind of "something stopped this."
+    PolicyBlocked,
     NoOp,
 }
 

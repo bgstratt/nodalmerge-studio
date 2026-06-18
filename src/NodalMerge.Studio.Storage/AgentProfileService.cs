@@ -27,7 +27,8 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 PipelineStage.Orchestrate,
                 string.Empty,
                 [],
-                25),
+                25,
+                []),
             new(
                 "planner",
                 "Planner",
@@ -40,7 +41,8 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                     McpToolNames.WorkspaceWrite,
                     McpToolNames.WorkspaceList,
                 ],
-                15),
+                15,
+                []),
             new(
                 "worker",
                 "Worker",
@@ -62,7 +64,8 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                     McpToolNames.ArtifactQuery,
                     McpToolNames.ArtifactList,
                 ],
-                20),
+                20,
+                []),
             new(
                 "merger",
                 "Merger",
@@ -76,7 +79,8 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                     McpToolNames.WorkspaceDiff,
                     McpToolNames.ProjectionGet,
                 ],
-                15),
+                15,
+                []),
             new(
                 "reviewer",
                 "Reviewer",
@@ -89,7 +93,8 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                     McpToolNames.ProjectionGet,
                     McpToolNames.WorkspaceRead,
                 ],
-                10),
+                10,
+                []),
         };
 
         foreach (var profile in defaults)

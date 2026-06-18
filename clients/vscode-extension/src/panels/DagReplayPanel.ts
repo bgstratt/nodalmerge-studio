@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { scopeViewCss } from './sharedWebviewChrome';
 
+const POLL_INTERVAL_MS = 2_000;
+
 interface WorkUnit {
   workUnitId: string;
   branchId: string;
@@ -15,6 +17,7 @@ export class DagReplayPanel {
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
+  private pollTimer?: ReturnType<typeof setInterval>;
 
   constructor(panel: vscode.WebviewPanel, baseUrl: string) {
     this.panel = panel;
@@ -24,6 +27,11 @@ export class DagReplayPanel {
   /** Called once by the shell right after construction — was the tail of createOrShow(). */
   activate(): void {
     void this.init();
+    this.pollTimer = setInterval(() => { void this.refreshWorkUnits(); }, POLL_INTERVAL_MS);
+  }
+
+  dispose(): void {
+    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = undefined; }
   }
 
   /** Slice 0 — unlike the 3 inline-HTML views, this one's JS is an external esbuild bundle
@@ -58,6 +66,28 @@ export class DagReplayPanel {
       });
     } catch {
       // host not running or WU list empty — WebView shows idle state
+    }
+  }
+
+  /** Polled every POLL_INTERVAL_MS so work units fanned out after the panel was opened (no
+   * goal/stage entry in the webview's workUnitIdToBranchId map otherwise) become visible without
+   * requiring the panel to be closed and reopened. Sends 'workUnits', not 'init' — main.ts merges
+   * that into goals/stages/workUnitIdToBranchId without resetting replay state or reconnecting
+   * the websocket. */
+  private async refreshWorkUnits(): Promise<void> {
+    try {
+      const workUnits = await this.get<WorkUnit[]>('/studio/workunits');
+      void this.panel.webview.postMessage({
+        type: 'workUnits',
+        workUnits: workUnits.map(wu => ({
+          workUnitId:   wu.workUnitId,
+          branchId:     wu.branchId,
+          goal:         wu.goal,
+          currentStage: wu.currentStage ?? null,
+        })),
+      });
+    } catch {
+      // host not running — same suppress-and-poll-later convention as init()
     }
   }
 

@@ -170,6 +170,7 @@ ${dagFragment.html}
       function showTab(tabId) {
         tabButtons.forEach(function(b) { b.classList.toggle('active', b.getAttribute('data-tab') === tabId); });
         panes.forEach(function(p) { p.classList.toggle('active', p.id === tabId); });
+        window.__nmVscode.postMessage({ type: 'studio.tabActivated', tab: tabId });
       }
       tabButtons.forEach(function(b) {
         b.addEventListener('click', function() { showTab(b.getAttribute('data-tab')); });
@@ -201,6 +202,7 @@ ${dagFragment.scriptTag}
     StudioShellPanel.current = undefined;
     this.workspace.dispose();
     this.home.dispose();
+    this.dagReplay.dispose();
     this.panel.dispose();
     for (const d of this.disposables) { d.dispose(); }
     this.disposables.length = 0;

@@ -15,6 +15,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IAgentWorkspaceService, AgentWorkspaceService>();
         AddRehydratableServices(services);
         AddFileWorkspaceService(services);
+        AddPolicyGate(services);
         return services;
     }
 
@@ -27,6 +28,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IAgentWorkspaceService, AgentWorkspaceService>();
         AddRehydratableServices(services);
         AddFileWorkspaceService(services);
+        AddPolicyGate(services);
         return services;
     }
 
@@ -83,6 +85,19 @@ public static class ServiceCollectionExtensions
         // StartAsync (which awaits every IRehydratable above) completes before the scheduler
         // poll loop's StartAsync begins.
         services.AddSingleton<IHostedService, StudioStateRehydrationService>();
+    }
+
+    // Slice 14a — no state to rehydrate (rules are resolved fresh from DI each time), so this
+    // doesn't go through AddRehydratableServices. Ships with zero IPolicyRule registrations;
+    // EvaluateAsync is a no-op (Allowed = true) against every checkpoint until a slice like 14b
+    // registers one.
+    private static void AddPolicyGate(IServiceCollection services)
+    {
+        services.AddSingleton<IPolicyGateService, PolicyGateService>();
+
+        // Slice 14b — the first real rule. Always registered; gated by
+        // WorkspaceOptions.BlockOverlappingFileScope (default false) inside the rule itself.
+        services.AddSingleton<IPolicyRule, NonOverlappingFileScopeRule>();
     }
 
     private static void AddFileWorkspaceService(IServiceCollection services)

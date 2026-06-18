@@ -9,6 +9,9 @@ export interface PipelineProfile {
   systemPrompt: string;
   allowedTools: string[];
   maxIterations: number;
+  // Slice 14c — glob patterns (e.g. "src/**/*.tsx") declaring this profile's file-scope
+  // specialty. Empty = no declared specialty, routing falls through to heuristic/LLM selection.
+  fileScopePatterns: string[];
 }
 
 export class AgentConfigPanel {
@@ -97,8 +100,8 @@ export class AgentConfigPanel {
         const endpoint = '/studio/agent-profiles' + (exists ? '/' + p.agentProfileId : '');
         const method   = exists ? 'PUT' : 'POST';
         const body = exists
-          ? { name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations }
-          : { agentProfileId: p.agentProfileId, name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations };
+          ? { name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns }
+          : { agentProfileId: p.agentProfileId, name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns };
         await (method === 'PUT'
           ? fetch(this.baseUrl + endpoint, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
           : this.post(endpoint, body));
@@ -402,7 +405,7 @@ const AGENT_CONFIG_HTML = `
   <div id="pane-pipeline-profiles" class="tab-pane">
     <div id="pipeline-profile-form-area"></div>
     <table>
-      <thead><tr><th>ID</th><th>Name</th><th>Stage</th><th>Tools</th><th>Max Iter</th><th></th></tr></thead>
+      <thead><tr><th>ID</th><th>Name</th><th>Stage</th><th>Tools</th><th>File Scope</th><th>Max Iter</th><th></th></tr></thead>
       <tbody id="pipeline-profile-tbody"></tbody>
     </table>
     <button class="add-btn" id="btn-add-pipeline-profile">+ Add Pipeline Profile</button>
@@ -804,12 +807,14 @@ const AGENT_CONFIG_JS = `
     tbody.innerHTML = '';
     pipelineProfiles.forEach(function(p, i) {
       const toolCount = p.allowedTools && p.allowedTools.length > 0 ? p.allowedTools.length + ' tools' : 'all tools';
+      const fileScope = p.fileScopePatterns && p.fileScopePatterns.length > 0 ? p.fileScopePatterns.join(', ') : '—';
       const tr = document.createElement('tr');
       tr.innerHTML =
         '<td class="mono">' + esc(p.agentProfileId) + '</td>' +
         '<td>' + esc(p.name) + '</td>' +
         '<td class="mono">' + esc(p.stage) + '</td>' +
         '<td class="mono">' + esc(toolCount) + '</td>' +
+        '<td class="mono">' + esc(fileScope) + '</td>' +
         '<td class="mono">' + esc(String(p.maxIterations)) + '</td>' +
         '<td><div class="act-cell">' +
           '<button class="ghost" data-action="edit" data-idx="' + i + '">Edit</button>' +
@@ -828,7 +833,7 @@ const AGENT_CONFIG_JS = `
   function showPipelineProfileForm(idx) {
     const isNew = idx === -1;
     const p = isNew
-      ? { agentProfileId: '', name: '', stage: 'Execute', systemPrompt: '', allowedTools: [], maxIterations: 20 }
+      ? { agentProfileId: '', name: '', stage: 'Execute', systemPrompt: '', allowedTools: [], maxIterations: 20, fileScopePatterns: [] }
       : pipelineProfiles[idx];
     const stageOptions = PIPELINE_STAGES.map(function(s) {
       return '<option value="' + s + '"' + (p.stage === s ? ' selected' : '') + '>' + s + '</option>';
@@ -847,6 +852,8 @@ const AGENT_CONFIG_JS = `
         '<select id="pp-stage">' + stageOptions + '</select></div>' +
       '<div class="field"><label>Allowed Tools (comma-separated, empty = all tools)</label>' +
         '<input type="text" id="pp-tools" value="' + esc((p.allowedTools || []).join(', ')) + '" placeholder="e.g. nm_v1_task_create, nm_v1_task_list"></div>' +
+      '<div class="field"><label>File Scope Patterns (comma-separated globs, empty = no declared specialty)</label>' +
+        '<input type="text" id="pp-filescope" value="' + esc((p.fileScopePatterns || []).join(', ')) + '" placeholder="e.g. src/**/*.tsx, src/**/*.css"></div>' +
       '<div class="field"><label>Max Iterations</label>' +
         '<input type="text" id="pp-maxiter" value="' + esc(String(p.maxIterations)) + '" placeholder="20"></div>' +
       '<div class="field"><label>System Prompt (optional)</label>' +
@@ -861,11 +868,13 @@ const AGENT_CONFIG_JS = `
       const name     = document.getElementById('pp-name').value.trim();
       const stage    = document.getElementById('pp-stage').value;
       const toolsRaw = document.getElementById('pp-tools').value.trim();
+      const fileScopeRaw = document.getElementById('pp-filescope').value.trim();
       const maxIter  = parseInt(document.getElementById('pp-maxiter').value.trim(), 10) || 20;
       const prompt   = document.getElementById('pp-prompt').value.trim();
       if (!id || !name) { alert('Profile ID and Name are required.'); return; }
       const allowedTools = toolsRaw ? toolsRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
-      const profile = { agentProfileId: id, name: name, stage: stage, systemPrompt: prompt, allowedTools: allowedTools, maxIterations: maxIter };
+      const fileScopePatterns = fileScopeRaw ? fileScopeRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+      const profile = { agentProfileId: id, name: name, stage: stage, systemPrompt: prompt, allowedTools: allowedTools, maxIterations: maxIter, fileScopePatterns: fileScopePatterns };
       vscode.postMessage({ type: 'savePipelineProfile', profile: profile });
       document.getElementById('pipeline-profile-form-area').innerHTML = '';
     });

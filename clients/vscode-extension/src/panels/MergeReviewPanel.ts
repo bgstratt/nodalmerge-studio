@@ -20,11 +20,27 @@ export interface MergeProposal {
   supersededBy?: string | null;
 }
 
+export interface DiffLine {
+  kind: 'Context' | 'Added' | 'Removed';
+  beforeLineNumber?: number | null;
+  afterLineNumber?: number | null;
+  text: string;
+}
+
+export interface DiffHunk {
+  beforeStart: number;
+  beforeCount: number;
+  afterStart: number;
+  afterCount: number;
+  lines: DiffLine[];
+}
+
 export interface ProposalFileChange {
   path: string;
   changeKind: 'Added' | 'Modified' | 'Deleted';
   beforeContent?: string | null;
   afterContent?: string | null;
+  hunks: DiffHunk[];
 }
 
 export interface ConstituentProposal {
@@ -114,6 +130,31 @@ export class MergeReviewPanel {
     }
   }
 
+  // Mirrors the "canReview"/"isReviewing" filters the Workspace tab's task list uses to decide
+  // when to show its own "Review →" / "View Conflict →" buttons — same data, just picking the
+  // first match instead of rendering every one, since this pane can only show one at a time.
+  private async loadLatestPending(): Promise<void> {
+    try {
+      const proposals = await this.get<MergeProposal[]>('/studio/merges');
+      const pending = proposals.find(p => {
+        const status = (p.status || '').toLowerCase();
+        return status === 'readyforreview' || status === 'approved' || status === 'draft';
+      });
+      if (pending) {
+        this.loadProposal(pending.proposalId);
+        return;
+      }
+
+      const workUnits = await this.get<{ workUnitId: string; status: string }[]>('/studio/workunits');
+      const reviewing = workUnits.find(wu => (wu.status || '').toLowerCase() === 'reviewing');
+      if (reviewing) {
+        this.loadConflict(reviewing.workUnitId);
+      }
+    } catch (err) {
+      void vscode.window.showWarningMessage('NodalMerge: failed to check for a pending merge review — ' + String(err));
+    }
+  }
+
   // Slice 0 — the Studio Shell broadcasts every webview message to every view's handleMessage,
   // since the 4 views' message-type vocabularies don't overlap (verified while planning). The
   // `default: return` is load-bearing here specifically: unlike the other 3 views, this one
@@ -123,6 +164,18 @@ export class MergeReviewPanel {
   async handleMessage(msg: Record<string, unknown>): Promise<void> {
     try {
       switch (msg.type as string) {
+        // The shell broadcasts this on every tab switch (including the initial click into
+        // Merge Review). Before this, switching to the tab directly — rather than via a
+        // notification or the Workspace tab's "Review →" button, both of which call
+        // loadProposal/loadConflict explicitly — left the pane blank even when a proposal or
+        // conflict was already waiting. Only auto-load if nothing has been explicitly requested
+        // yet, so this never overrides what the user is currently looking at.
+        case 'studio.tabActivated':
+          if (msg.tab === MergeReviewPanel.containerId
+            && this.proposalId === undefined && this.workUnitId === undefined) {
+            await this.loadLatestPending();
+          }
+          return;
         case 'openDiff': {
           const path = String(msg.path ?? 'file');
           const before = (msg.beforeContent as string | null | undefined) ?? '';
@@ -307,9 +360,45 @@ const REVIEW_CSS = `
     line-height: 1.45;
     white-space: pre;
   }
-  .diff-add  { color: var(--nm-success); }
-  .diff-del  { color: var(--nm-error); }
-  .diff-meta { color: var(--nm-info); opacity: 0.7; }
+  .diff-line {
+    font-family: var(--nm-mono);
+    font-size: 0.85em;
+    white-space: pre;
+    overflow-x: auto;
+    padding: 0 8px;
+  }
+  .diff-add  { color: var(--nm-success); background: rgba(35, 134, 54, 0.12); }
+  .diff-del  { color: var(--nm-error);   background: rgba(241, 76, 76, 0.12); }
+  .diff-meta {
+    color: var(--nm-info); opacity: 0.7;
+    font-family: var(--nm-mono); font-size: 0.85em;
+    padding: 2px 8px;
+  }
+  .diff-mode-toggle {
+    display: flex; gap: 0; margin: 0 0 8px;
+  }
+  .diff-mode-toggle button {
+    border-radius: 0; opacity: 0.6;
+    background: transparent; border: 1px solid var(--nm-border);
+  }
+  .diff-mode-toggle button.active { opacity: 1; background: var(--nm-btn); color: var(--nm-btn-fg); }
+  .diff-mode-toggle button:first-child { border-radius: 3px 0 0 3px; }
+  .diff-mode-toggle button:last-child  { border-radius: 0 3px 3px 0; border-left: none; }
+  .diff-split {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+  .diff-split-cell {
+    font-family: var(--nm-mono);
+    font-size: 0.85em;
+    white-space: pre;
+    overflow-x: auto;
+    padding: 0 8px;
+    min-width: 0;
+  }
+  .diff-split-cell.right { border-left: 1px solid var(--nm-border); }
+  .diff-split-meta { grid-column: 1 / -1; }
+  .diff-empty { opacity: 0.6; padding: 8px 12px; font-size: 0.9em; }
   .reconciled-banner {
     border-left: 3px solid var(--nm-info);
     padding: 8px 12px;
@@ -340,23 +429,8 @@ const REVIEW_CSS = `
     background: rgba(128,128,128,0.08);
   }
   .file-change-body {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0;
     border-top: 1px solid var(--nm-border);
   }
-  .file-pane {
-    padding: 8px 10px;
-    min-width: 0;
-  }
-  .file-pane h3 {
-    font-size: 0.72em;
-    text-transform: uppercase;
-    opacity: 0.55;
-    margin: 0 0 6px;
-  }
-  .file-pane + .file-pane { border-left: 1px solid var(--nm-border); }
-  .file-pane.added-only { grid-column: 1 / -1; }
   .verification-approved {
     border-left: 3px solid var(--nm-success);
     padding: 8px 12px;
@@ -414,12 +488,11 @@ const REVIEW_HTML = `
     </section>
     <section id="section-files" class="hidden">
       <h2>File changes</h2>
-      <p style="opacity:0.7;font-size:0.9em;margin:0 0 8px">Review concrete before/after content per file. Use Open Diff for the VS Code side-by-side editor.</p>
+      <div class="diff-mode-toggle">
+        <button id="btn-mode-inline">Inline</button>
+        <button id="btn-mode-split">Split</button>
+      </div>
       <div id="file-changes"></div>
-    </section>
-    <section id="section-diff" class="hidden">
-      <h2>Combined diff summary</h2>
-      <pre id="diff-content" class="diff-pre"></pre>
     </section>
     <section id="section-verification" class="hidden">
       <h2>Automated review</h2>
@@ -453,16 +526,6 @@ const REVIEW_JS = `
 
   function esc(s) {
     return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  }
-
-  function renderDiff(text) {
-    return String(text).split('\\n').map(function(line) {
-      var cls = line.startsWith('+') ? 'diff-add'
-              : line.startsWith('-') ? 'diff-del'
-              : line.startsWith('@@') ? 'diff-meta'
-              : '';
-      return cls ? '<span class="' + cls + '">' + esc(line) + '</span>' : esc(line);
-    }).join('\\n');
   }
 
   function setText(id, val) {
@@ -521,25 +584,60 @@ const REVIEW_JS = `
     }).join('');
   }
 
-  function renderFileChanges(changes) {
+  function getDiffMode() {
+    var state = vscode.getState() || {};
+    return state.diffMode === 'split' ? 'split' : 'inline';
+  }
+
+  function setDiffMode(mode) {
+    var state = vscode.getState() || {};
+    state.diffMode = mode;
+    vscode.setState(state);
+  }
+
+  function hunkHeader(h) {
+    return '@@ -' + h.beforeStart + ',' + h.beforeCount + ' +' + h.afterStart + ',' + h.afterCount + ' @@';
+  }
+
+  // One pane, git-diff-style: every line gets a +/-/space prefix and its own row, in order.
+  function renderInlineHunks(hunks) {
+    if (!hunks || !hunks.length) return '<div class="diff-empty">No textual changes.</div>';
+    return hunks.map(function(h) {
+      var rows = h.lines.map(function(l) {
+        var prefix = l.kind === 'Added' ? '+' : l.kind === 'Removed' ? '-' : ' ';
+        var cls = l.kind === 'Added' ? 'diff-add' : l.kind === 'Removed' ? 'diff-del' : '';
+        return '<div class="diff-line ' + cls + '">' + prefix + esc(l.text) + '</div>';
+      }).join('');
+      return '<div class="diff-meta">' + esc(hunkHeader(h)) + '</div>' + rows;
+    }).join('');
+  }
+
+  // Two columns from the same hunk data: Context lines appear on both sides, Added only on the
+  // right, Removed only on the left — no smart pairing of adjacent add/remove lines (yet), just
+  // an honest per-line layout.
+  function renderSplitHunks(hunks) {
+    if (!hunks || !hunks.length) return '<div class="diff-empty">No textual changes.</div>';
+    return hunks.map(function(h) {
+      var rows = h.lines.map(function(l) {
+        var left = l.kind === 'Added' ? '' : esc(l.text);
+        var right = l.kind === 'Removed' ? '' : esc(l.text);
+        var leftCls = l.kind === 'Removed' ? 'diff-del' : '';
+        var rightCls = l.kind === 'Added' ? 'diff-add' : '';
+        return '<div class="diff-split-cell ' + leftCls + '">' + left + '</div>'
+          + '<div class="diff-split-cell right ' + rightCls + '">' + right + '</div>';
+      }).join('');
+      return '<div class="diff-split"><div class="diff-split-meta">' + esc(hunkHeader(h)) + '</div>' + rows + '</div>';
+    }).join('');
+  }
+
+  function renderFileChanges(changes, mode) {
     if (!changes || !changes.length) return '';
     return changes.map(function(fc, idx) {
-      var kind = (fc.changeKind || '').toLowerCase();
-      var isAdded = kind === 'added';
-      var isDeleted = kind === 'deleted';
-      var bodyClass = isAdded ? 'file-change-body added-only' : 'file-change-body';
-      var before = isAdded ? '' : esc(fc.beforeContent || '(empty)');
-      var after = isDeleted ? '' : esc(fc.afterContent || '(empty)');
+      var isDeleted = (fc.changeKind || '').toLowerCase() === 'deleted';
+      var body = mode === 'split' ? renderSplitHunks(fc.hunks) : renderInlineHunks(fc.hunks);
       var html = '<details class="file-change" open>';
       html += '<summary>' + esc(fc.path) + ' <span class="badge">' + esc(fc.changeKind) + '</span></summary>';
-      html += '<div class="' + bodyClass + '">';
-      if (!isAdded) {
-        html += '<div class="file-pane"><h3>Before (base)</h3><pre class="diff-pre">' + before + '</pre></div>';
-      }
-      if (!isDeleted) {
-        html += '<div class="file-pane"><h3>After (proposed)</h3><pre class="diff-pre">' + after + '</pre></div>';
-      }
-      html += '</div>';
+      html += '<div class="file-change-body">' + body + '</div>';
       if (!isDeleted) {
         html += '<button class="ghost" data-open-diff="' + idx + '">Open Diff in Editor</button>';
       }
@@ -547,6 +645,24 @@ const REVIEW_JS = `
       return html;
     }).join('');
   }
+
+  function rerenderFileChanges() {
+    var mode = getDiffMode();
+    var inlineBtn = document.getElementById('btn-mode-inline');
+    var splitBtn = document.getElementById('btn-mode-split');
+    if (inlineBtn) inlineBtn.classList.toggle('active', mode === 'inline');
+    if (splitBtn) splitBtn.classList.toggle('active', mode === 'split');
+    setHtml('file-changes', renderFileChanges(window.__fileChanges || [], mode));
+  }
+
+  document.getElementById('btn-mode-inline').addEventListener('click', function() {
+    setDiffMode('inline');
+    rerenderFileChanges();
+  });
+  document.getElementById('btn-mode-split').addEventListener('click', function() {
+    setDiffMode('split');
+    rerenderFileChanges();
+  });
 
   document.addEventListener('click', function(ev) {
     var btn = ev.target.closest('[data-open-diff]');
@@ -583,7 +699,6 @@ const REVIEW_JS = `
       showProposalSections(false);
       showIf('section-reconciled', false);
       showIf('section-files', false);
-      showIf('section-diff', false);
       showIf('section-verification', false);
       showIf('section-rollback', false);
       showIf('section-conflict-report', true);
@@ -638,12 +753,9 @@ const REVIEW_JS = `
       setHtml('reconciled-from', renderConstituents(msg.constituents || [], p.reconciledFrom));
     }
 
-    setHtml('file-changes', renderFileChanges(fileChanges));
+    rerenderFileChanges();
     showIf('section-files', fileChanges.length > 0);
 
-    if (p.workspaceChanges) { setHtml('diff-content', renderDiff(p.workspaceChanges)); }
-
-    showIf('section-diff', !!p.workspaceChanges);
     showIf('section-verification', !!p.verificationResults);
     showIf('section-rollback', !!p.rollbackPlan);
 

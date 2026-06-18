@@ -4,26 +4,28 @@ using ModelContextProtocol.Server;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Versioning;
 using NodalMerge.Studio.Core.Services;
-using NodalMerge.Studio.Storage;
 using StudioTaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
 [McpServerToolType]
-public sealed class WorkUnitTools(IWorkUnitService workUnits, IOrchestratorService orchestrator, WorkspaceOptions workspaceOptions)
+public sealed class WorkUnitTools(IWorkUnitService workUnits, IOrchestratorService orchestrator, IWorkUnitCommandService workUnitCommands)
 {
     [McpServerTool(Name = McpToolNames.WorkUnitCreate), Description("Create a work unit from goal and branch.")]
     public async Task<string> CreateAsync(
         string goal,
-        string branchId,
+        string? branchId = null,
         string? owner = "studio",
         string? successCriteria = null,
+        string? repositoryPath = null,
+        string? parentWorkUnitId = null,
+        IReadOnlyList<string>? dependsOn = null,
+        IReadOnlyList<string>? fileScope = null,
         CancellationToken cancellationToken = default)
     {
-        var workUnit = await orchestrator.CreateWorkUnitAsync(goal, owner!, successCriteria, workspaceOptions.SeedRepositoryPath, cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
-        workUnit = workUnit with { BranchId = branchId };
-        await workUnits.CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
+        var workUnit = await workUnitCommands.CreateAsync(
+            new WorkUnitCreateCommand(goal, owner ?? "studio", branchId, successCriteria, repositoryPath, parentWorkUnitId, dependsOn, fileScope),
+            cancellationToken).ConfigureAwait(false);
         return McpJson.Ok(new { workUnitId = workUnit.WorkUnitId, branchId = workUnit.BranchId });
     }
 
@@ -60,7 +62,9 @@ public sealed class WorkUnitTools(IWorkUnitService workUnits, IOrchestratorServi
         {
             await orchestrator.AssignWorkAsync(workUnitId, assignedAgent, cancellationToken).ConfigureAwait(false);
             var workUnit = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false);
-            return McpJson.Ok(workUnit);
+            return workUnit is null
+                ? McpJson.Error(McpToolNames.WorkUnitUpdate, $"Work unit '{workUnitId}' was not found.")
+                : McpJson.Ok(workUnit);
         }
 
         return McpJson.Error(McpToolNames.WorkUnitUpdate, "Provide status and/or assignedAgent.");

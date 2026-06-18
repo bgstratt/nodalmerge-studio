@@ -130,6 +130,16 @@ public class ArtifactLineageTests
             _units[id] = updated;
             return Task.FromResult(updated);
         }
+        public Task<WorkUnit> SetFanOutBlockedReasonAsync(string id, string? blockedReason, CancellationToken ct = default)
+        {
+            var existing = _units[id];
+            var fanOutInfo = existing.FanOutInfo is null
+                ? (blockedReason is null ? null : new WorkUnitFanOutInfo(null, null, blockedReason))
+                : existing.FanOutInfo with { BlockedReason = blockedReason };
+            var updated = existing with { FanOutInfo = fanOutInfo };
+            _units[id] = updated;
+            return Task.FromResult(updated);
+        }
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) =>
             Task.FromResult(_units.GetValueOrDefault(workUnitId));
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) =>

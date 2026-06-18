@@ -73,4 +73,30 @@ public class RuntimeSettingsRehydrationTests : IDisposable
         var options2 = app2.Services.GetRequiredService<WorkspaceOptions>();
         Assert.True(options2.UseLlmProfileSelection);
     }
+
+    [Fact]
+    public async Task SchedulerConcurrencySettings_survive_a_restart()
+    {
+        // Slice 14e — MaxConcurrentWorkers/SchedulerPollIntervalMs join the same runtime-mutable
+        // subset UseLlmProfileSelection already covers above.
+        var app1 = BuildApp();
+        var options1 = app1.Services.GetRequiredService<WorkspaceOptions>();
+        var runtimeSettings1 = app1.Services.GetRequiredService<RuntimeSettingsService>();
+
+        Assert.Equal(3, options1.MaxConcurrentWorkers);
+        Assert.Equal(2_000, options1.SchedulerPollIntervalMs);
+
+        options1.MaxConcurrentWorkers = 7;
+        options1.SchedulerPollIntervalMs = 500;
+        await runtimeSettings1.PersistAsync();
+
+        await app1.DisposeAsync();
+
+        var app2 = BuildApp();
+        await RehydrateAsync(app2);
+
+        var options2 = app2.Services.GetRequiredService<WorkspaceOptions>();
+        Assert.Equal(7, options2.MaxConcurrentWorkers);
+        Assert.Equal(500, options2.SchedulerPollIntervalMs);
+    }
 }

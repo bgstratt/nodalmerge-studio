@@ -90,6 +90,24 @@ See [phase-5-control-plane-ui.md](./phase-5-control-plane-ui.md). Makes the pipe
 | 12c | Pipeline Stage Streaming — real-time stage badges on work unit nodes | Planned |
 | 12d | LLM-driven profile selection — orchestrator asks LLM which profile fits a task | Planned |
 
+## Phase 6.5 — Command Surface Hardening
+
+See [phase-6.5-command-surface-hardening.md](./phase-6.5-command-surface-hardening.md). MCP is
+disabled by enterprise policy on at least one active dev machine; this phase converges MCP/REST/the
+agent-loop-internal dispatcher onto one shared implementation per command so REST is a true,
+full-parity fallback. Surfaced along the way: the agent-internal dispatcher's `merge.propose` is
+materially richer (diff/lineage/event/status transition) than what external MCP/REST callers get
+today — fixed as part of 15d.
+
+| Slice | Focus | Status |
+|-------|-------|--------|
+| 15a | Branch & State parity (template slice, no new abstraction) | Complete |
+| 15b | Work unit command consolidation | Planned |
+| 15c | Task command consolidation | Planned |
+| 15d | Merge command consolidation (diff/lineage/event parity fix) | Planned |
+| 15e | Agent command consolidation | Planned |
+| 15f | Scheduler & Artifact command consolidation | Planned |
+
 ## Slice document template
 
 Each slice file should include:

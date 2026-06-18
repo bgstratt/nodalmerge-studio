@@ -2,13 +2,14 @@ using Microsoft.Extensions.Logging.Abstractions;
 using NodalMerge.Studio.AgentRuntime;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.AgentRuntime.Tests;
 
 public class InMemoryAgentRuntimeServiceTests
 {
     private static InMemoryAgentRuntimeService Build() =>
-        new(new NoopServiceProvider(), NullLogger<InMemoryAgentRuntimeService>.Instance, new NoopAgentProfileService(), new NoopScheduler(), new NoopEventStream());
+        new(new NoopServiceProvider(), NullLogger<InMemoryAgentRuntimeService>.Instance, new NoopAgentProfileService(), new NoopScheduler(), new NoopEventStream(), new WorkspaceOptions());
 
     private sealed class NoopScheduler : IWorkScheduler
     {

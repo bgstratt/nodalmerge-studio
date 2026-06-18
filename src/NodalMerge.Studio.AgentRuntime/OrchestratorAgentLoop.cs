@@ -25,7 +25,7 @@ internal sealed class OrchestratorAgentLoop(
     IWorkUnitService workUnits,
     AgentProfile? profile = null,
     string? sessionId = null,
-    int stallDetectionCycles = 2)
+    int stallDetectionCycles = 4)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -81,11 +81,19 @@ internal sealed class OrchestratorAgentLoop(
         var completedNaturally = false;
         var lastProjection = new AgentWorkspaceProjectionPayload(agentId, workUnitId, new ArtifactChain([]), []);
         var stallStreak = 0;
+        // A routing tool call that actually advanced the work unit (enqueue planner/worker, apply
+        // merge) is real progress even when its effect lands on the artifact chain a cycle later
+        // (or never directly at all — enqueueing only flips WorkUnit.Status, which ProjectionDelta
+        // doesn't track). Without this, the orchestrator's own recommended first-time flow — a
+        // read-only workunit_get, then enqueue the planner, then stop — trips the stall detector
+        // on the very next fetch, since neither of those two tool calls touches the artifact chain.
+        var madeRoutingDecisionLastCycle = false;
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
             var currentProjection = await FetchAgentWorkspaceProjectionAsync(ct).ConfigureAwait(false);
             var delta = ProjectionDelta.Compute(workUnitId, lastProjection, currentProjection);
-            stallStreak = delta.AnyChange ? 0 : stallStreak + 1;
+            stallStreak = delta.AnyChange || madeRoutingDecisionLastCycle ? 0 : stallStreak + 1;
+            madeRoutingDecisionLastCycle = false;
             lastProjection = currentProjection;
 
             if (stallStreak >= _stallDetectionCycles)
@@ -127,7 +135,8 @@ internal sealed class OrchestratorAgentLoop(
 
                 toolResults.Add(new NmToolResult(toolUse.Id, result));
 
-                await RecordToolDecisionAsync(toolUse.Name, toolUse.Input, result, ct).ConfigureAwait(false);
+                if (await RecordToolDecisionAsync(toolUse.Name, toolUse.Input, result, ct).ConfigureAwait(false))
+                    madeRoutingDecisionLastCycle = true;
             }
 
             if (toolResults.Count == 0)
@@ -150,7 +159,9 @@ internal sealed class OrchestratorAgentLoop(
 
     // Only tool calls that actually change execution routing become OrchestrationEvents —
     // investigative calls (workunit.get, projection.get, task.create) are not routing decisions.
-    private async Task RecordToolDecisionAsync(string toolName, JsonElement input, string resultJson, CancellationToken ct)
+    // Returns whether a decision was recorded, so the caller can count it as loop progress even
+    // when (as with enqueueing) it doesn't itself touch the artifact chain.
+    private async Task<bool> RecordToolDecisionAsync(string toolName, JsonElement input, string resultJson, CancellationToken ct)
     {
         OrchestrationAction? action;
         if (toolName == McpToolNames.SchedulerEnqueue)
@@ -171,10 +182,11 @@ internal sealed class OrchestratorAgentLoop(
         }
 
         if (action is null)
-            return;
+            return false;
 
         var spawnedId = ExtractSpawnedId(action.Value, resultJson);
         await RecordDecisionAsync(action.Value, spawnedId is null ? [] : [spawnedId], toolName, ct).ConfigureAwait(false);
+        return true;
     }
 
     private async Task<AgentWorkspaceProjectionPayload> FetchAgentWorkspaceProjectionAsync(CancellationToken ct)

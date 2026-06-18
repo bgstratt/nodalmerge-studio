@@ -120,4 +120,63 @@ public class ProjectionDiffingIntegrationTests
             await agentRuntime.StopAsync(CancellationToken.None);
         }
     }
+
+    [Theory]
+    // 1 read-only call (workunit_get) before enqueueing the planner — the minimal documented
+    // flow. Tripped the original 2-cycle stall threshold before either fix.
+    [InlineData(1)]
+    // 2 read-only calls (workunit_get, then projection_get — both offered by the system prompt
+    // as valid ways to understand state) before enqueueing. Still tripped the stall detector
+    // even after the "routing decision counts as progress" fix, because the budget was already
+    // spent on two consecutive read-only cycles before any routing decision happened — this is
+    // the exact path the user hit live after that first fix shipped.
+    [InlineData(2)]
+    public async Task Orchestrator_enqueueing_planner_after_readonly_calls_is_not_stall_dead_lettered(
+        int readOnlyCalls)
+    {
+        var app = StudioWebApplication.Build(
+            [],
+            llmHttpClient: new HttpClient(new PlannerEnqueueOnlyLlmHandler(readOnlyCalls)),
+            configureServices: services => services.AddInMemoryStorage());
+
+        var orchestratorSvc = app.Services.GetRequiredService<IOrchestratorService>();
+        var agentControl    = app.Services.GetRequiredService<IAgentControlService>();
+        var agentRuntime    = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
+        var deadLetter      = app.Services.GetRequiredService<IDeadLetterService>();
+        var decisionLog     = app.Services.GetRequiredService<IOrchestrationDecisionLogService>();
+
+        await agentRuntime.StartAsync(CancellationToken.None);
+        try
+        {
+            var wu = await orchestratorSvc.CreateWorkUnitAsync(
+                goal: "Goal that should route through the planner",
+                owner: "integration-test");
+
+            await agentControl.SpawnAsync(
+                agentType: "orchestrator",
+                workUnitId: wu.WorkUnitId,
+                model: "fake-model",
+                baseUrl: "http://fake-llm",
+                apiKey: "fake-key");
+
+            OrchestrationEvent? spawnPlanner = null;
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                var events = await decisionLog.GetEventsAsync(wu.WorkUnitId);
+                spawnPlanner = events.FirstOrDefault(e => e.Action == OrchestrationAction.SpawnPlanner);
+                if (spawnPlanner is not null) break;
+                await Task.Delay(100);
+            }
+
+            Assert.NotNull(spawnPlanner);
+
+            var entry = await deadLetter.GetLatestForWorkUnitAsync(wu.WorkUnitId);
+            Assert.Null(entry);
+        }
+        finally
+        {
+            await agentRuntime.StopAsync(CancellationToken.None);
+        }
+    }
 }

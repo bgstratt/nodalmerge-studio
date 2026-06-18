@@ -48,7 +48,12 @@ public sealed record WorkUnit(
 public sealed record WorkUnitExecutionInfo(int FailureAttemptCount, int AutomatedReviewRejectionCount);
 
 /// <summary>Fan-out lineage: which plan slice this work unit fulfills and which branch it was seeded from.</summary>
-public sealed record WorkUnitFanOutInfo(string? SliceId, string? SeedFromBranchId);
+// Slice 14b — BlockedReason is set when a BeforeEnqueue policy rule rejects this slice (e.g.
+// NonOverlappingFileScopeRule) and cleared the next time it enqueues successfully. The work unit
+// stays Created while blocked, so a later fan-out call retries it automatically once the
+// conflicting sibling finishes — this field is purely the human-readable "why," not authoritative
+// state.
+public sealed record WorkUnitFanOutInfo(string? SliceId, string? SeedFromBranchId, string? BlockedReason = null);
 
 public static class WorkUnitTransitions
 {

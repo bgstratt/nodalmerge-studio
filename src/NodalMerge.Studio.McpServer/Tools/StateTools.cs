@@ -34,6 +34,11 @@ public sealed class StateTools(IKnownGoodStateService states)
         McpJson.Ok(await states.FindKnownGoodAsync(branchId, cancellationToken).ConfigureAwait(false));
 
     [McpServerTool(Name = McpToolNames.StateCheckoutKnownGood), Description("Check out a known good state.")]
-    public async Task<string> CheckoutKnownGoodAsync(string knownGoodStateId, CancellationToken cancellationToken = default) =>
-        McpJson.Ok(await states.CheckoutKnownGoodAsync(knownGoodStateId, cancellationToken).ConfigureAwait(false));
+    public async Task<string> CheckoutKnownGoodAsync(string knownGoodStateId, CancellationToken cancellationToken = default)
+    {
+        var state = await states.CheckoutKnownGoodAsync(knownGoodStateId, cancellationToken).ConfigureAwait(false);
+        return state is null
+            ? McpJson.Error(McpToolNames.StateCheckoutKnownGood, $"Known good state '{knownGoodStateId}' was not found.")
+            : McpJson.Ok(state);
+    }
 }

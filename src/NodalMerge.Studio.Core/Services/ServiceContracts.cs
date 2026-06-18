@@ -188,6 +188,13 @@ public interface IWorkUnitService
         PipelineStage? stage,
         CancellationToken cancellationToken = default);
 
+    // Slice 14b — observational field, independent of WorkUnitStatus, same reasoning as
+    // SetCurrentStageAsync above. Pass null to clear once a previously blocked slice enqueues.
+    Task<WorkUnit> SetFanOutBlockedReasonAsync(
+        string workUnitId,
+        string? blockedReason,
+        CancellationToken cancellationToken = default);
+
     Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken cancellationToken = default);
@@ -215,6 +222,9 @@ public interface IOrchestratorService
     Task<WorkUnit> CreateWorkUnitAsync(
         string goal,
         string owner,
+        // Slice 15b — caller-chosen branch name (e.g. "feature/payment-validation" per the MCP
+        // contract doc's example). Null keeps today's behavior: a fresh "work-{guid}" branch.
+        string? branchId = null,
         string? successCriteria = null,
         string? repositoryPath = null,
         string? parentWorkUnitId = null,
@@ -227,6 +237,24 @@ public interface IOrchestratorService
         CancellationToken cancellationToken = default);
 
     Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default);
+}
+
+// Slice 15b — shared create-work-unit entry point for MCP/REST/the agent-loop dispatcher, so the
+// three transports can't drift on which optional params (branchId/parentWorkUnitId/dependsOn/
+// fileScope) they happen to support. See phase-6.5-command-surface-hardening.md.
+public sealed record WorkUnitCreateCommand(
+    string Goal,
+    string Owner,
+    string? BranchId = null,
+    string? SuccessCriteria = null,
+    string? RepositoryPath = null,
+    string? ParentWorkUnitId = null,
+    IReadOnlyList<string>? DependsOn = null,
+    IReadOnlyList<string>? FileScope = null);
+
+public interface IWorkUnitCommandService
+{
+    Task<WorkUnit> CreateAsync(WorkUnitCreateCommand command, CancellationToken cancellationToken = default);
 }
 
 public interface IAgentRuntimeService
@@ -522,6 +550,49 @@ public interface IOrchestrationDecisionLogService
 
     Task<IReadOnlyList<OrchestrationEvent>> GetEventsAsync(string workUnitId, CancellationToken ct = default);
 }
+
+// Slice 14a — pluggable validation seam checked at defined pipeline checkpoints. Ships with zero
+// registered IPolicyRule implementations; PolicyGateService aggregates whatever rules DI resolves
+// for the requested checkpoint, so adding a new rule later is "register one more class," not
+// "edit the gate." context is a loose bag rather than a typed-per-checkpoint payload because
+// different checkpoints have genuinely different available data.
+public enum PolicyCheckpoint
+{
+    BeforeEnqueue,
+    ProposalCreated,
+    BeforeMerge,
+}
+
+public sealed record PolicyViolation(string RuleId, string Message);
+
+public sealed record PolicyResult(bool Allowed, IReadOnlyList<PolicyViolation> Violations);
+
+public interface IPolicyRule
+{
+    string RuleId { get; }
+
+    PolicyCheckpoint Checkpoint { get; }
+
+    Task<PolicyResult> EvaluateAsync(IReadOnlyDictionary<string, object?> context, CancellationToken ct = default);
+}
+
+public interface IPolicyGateService
+{
+    Task<PolicyResult> EvaluateAsync(PolicyCheckpoint checkpoint, IReadOnlyDictionary<string, object?> context, CancellationToken ct = default);
+
+    Task<IReadOnlyList<string>> ListRuleIdsAsync(CancellationToken ct = default);
+}
+
+// Slice 14b — shape of the "activeSiblings" key FanOutService populates in BeforeEnqueue's
+// context bag. Built by FanOutService (it already depends on IWorkUnitService) so IPolicyRule
+// implementations living in Storage don't need their own IWorkUnitService dependency — that
+// would risk the same circular constructor graph IWorkScheduler's lazy IWorkUnitService
+// resolution (see WorkSchedulerService) already exists to avoid.
+public sealed record FileScopeSibling(
+    string WorkUnitId,
+    string? SliceId,
+    WorkUnitStatus Status,
+    IReadOnlyList<string> FileScope);
 
 public interface IIntentGraphService
 {

@@ -35,7 +35,8 @@ public class DeadLetterIntegrationTests
             PipelineStage.Execute,
             string.Empty,
             [McpToolNames.WorkUnitGet],
-            MaxIterations: 2));
+            MaxIterations: 2,
+            FileScopePatterns: []));
 
         await agentRuntime.StartAsync(CancellationToken.None);
         try
@@ -95,7 +96,8 @@ public class DeadLetterIntegrationTests
             PipelineStage.Execute,
             string.Empty,
             [McpToolNames.WorkUnitGet],
-            MaxIterations: 2));
+            MaxIterations: 2,
+            FileScopePatterns: []));
 
         await agentRuntime.StartAsync(CancellationToken.None);
         try

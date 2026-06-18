@@ -38,7 +38,10 @@ public sealed class ProposalReviewService(
             };
 
             if (kind is not null)
-                changes.Add(new ProposalFileChange(path, kind.Value, before, after));
+            {
+                var hunks = LineDiffer.Diff(before, after);
+                changes.Add(new ProposalFileChange(path, kind.Value, before, after, hunks));
+            }
         }
 
         return changes;

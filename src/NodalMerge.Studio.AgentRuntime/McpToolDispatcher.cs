@@ -11,6 +11,7 @@ namespace NodalMerge.Studio.AgentRuntime;
 internal sealed class McpToolDispatcher(
     IWorkUnitService workUnits,
     IOrchestratorService orchestrator,
+    IWorkUnitCommandService workUnitCommands,
     ITaskService tasks,
     IBranchService branches,
     IMergeService merge,
@@ -89,11 +90,17 @@ internal sealed class McpToolDispatcher(
 
     private async Task<string> WorkUnitCreateAsync(JsonElement input, CancellationToken ct)
     {
-        var wu = await orchestrator.CreateWorkUnitAsync(
-            Str(input, "goal")!, Str(input, "owner") ?? "studio",
-            Str(input, "successCriteria"), cancellationToken: ct).ConfigureAwait(false);
-        wu = wu with { BranchId = Str(input, "branchId") ?? wu.BranchId };
-        await workUnits.CreateAsync(wu, ct).ConfigureAwait(false);
+        var wu = await workUnitCommands.CreateAsync(
+            new WorkUnitCreateCommand(
+                Str(input, "goal")!,
+                Str(input, "owner") ?? "studio",
+                Str(input, "branchId"),
+                Str(input, "successCriteria"),
+                RepositoryPath: Str(input, "repositoryPath"),
+                ParentWorkUnitId: Str(input, "parentWorkUnitId"),
+                DependsOn: StrArray(input, "dependsOn"),
+                FileScope: StrArray(input, "fileScope")),
+            ct).ConfigureAwait(false);
         return ToJson(new { workUnitId = wu.WorkUnitId, branchId = wu.BranchId });
     }
 
@@ -662,6 +669,11 @@ internal sealed class McpToolDispatcher(
     private static string? Str(JsonElement input, string key) =>
         input.TryGetProperty(key, out var p) && p.ValueKind == JsonValueKind.String
             ? p.GetString() : null;
+
+    private static IReadOnlyList<string>? StrArray(JsonElement input, string key) =>
+        input.TryGetProperty(key, out var p) && p.ValueKind == JsonValueKind.Array
+            ? p.EnumerateArray().Select(e => e.GetString() ?? string.Empty).ToList()
+            : null;
 
     private static int? Int(JsonElement input, string key) =>
         input.TryGetProperty(key, out var p) && p.TryGetInt32(out var v) ? v : null;

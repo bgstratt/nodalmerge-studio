@@ -8,6 +8,14 @@ const POLL_INTERVAL_MS = 2_000;
 
 // ── Domain types matching Studio Host REST responses ───────────────────────
 
+interface WorkUnitFanOutInfo {
+  sliceId?: string | null;
+  seedFromBranchId?: string | null;
+  // Slice 14b — set when a BeforeEnqueue policy rule (e.g. non-overlapping fileScope) rejected
+  // this slice. Only meaningful while status is still "Created"; stale once it later enqueues.
+  blockedReason?: string | null;
+}
+
 interface WorkUnit {
   workUnitId: string;
   goal: string;
@@ -22,6 +30,14 @@ interface WorkUnit {
   successCriteria?: string | null;
   branchedFromProposalId?: string | null;
   proposalCount: number;
+  fanOutInfo?: WorkUnitFanOutInfo | null;
+}
+
+interface StudioOptions {
+  useLlmProfileSelection: boolean;
+  blockOverlappingFileScope: boolean;
+  maxConcurrentWorkers: number;
+  schedulerPollIntervalMs: number;
 }
 
 interface ExecutionSession {
@@ -135,13 +151,21 @@ export class ArtifactExplorerPanel {
 
   private async sendSettings(): Promise<void> {
     try {
-      const opts = await this.get<{ useLlmProfileSelection: boolean }>('/studio/options');
-      void this.panel.webview.postMessage({
-        type: 'explorerSettings', useLlmProfileSelection: opts.useLlmProfileSelection,
-      });
+      const opts = await this.get<StudioOptions>('/studio/options');
+      void this.panel.webview.postMessage({ type: 'explorerSettings', ...opts });
     } catch {
       // host not ready yet — same suppress-and-poll-later convention as refreshSessions
     }
+  }
+
+  // Slice 14e — UpdateOptionsBody on the host side has defaults for every field but
+  // useLlmProfileSelection, so a partial POST silently resets whatever's omitted back to that
+  // default instead of leaving it alone. Fetch-merge-post avoids that regardless of which single
+  // setting the gear panel just changed.
+  private async updateOptions(patch: Partial<StudioOptions>): Promise<void> {
+    const current = await this.get<StudioOptions>('/studio/options');
+    const updated = await this.post<StudioOptions>('/studio/options', { ...current, ...patch });
+    void this.panel.webview.postMessage({ type: 'explorerSettings', ...updated });
   }
 
   private async refreshSessions(): Promise<void> {
@@ -214,7 +238,13 @@ export class ArtifactExplorerPanel {
           );
           break;
         case 'explorerSetUseLlmProfileSelection':
-          await this.post('/studio/options', { useLlmProfileSelection: msg.value as boolean });
+          await this.updateOptions({ useLlmProfileSelection: msg.value as boolean });
+          break;
+        case 'explorerSetMaxConcurrentWorkers':
+          await this.updateOptions({ maxConcurrentWorkers: msg.value as number });
+          break;
+        case 'explorerSetSchedulerPollIntervalMs':
+          await this.updateOptions({ schedulerPollIntervalMs: msg.value as number });
           break;
         default:
           return;
@@ -481,6 +511,7 @@ const EXPLORER_CSS = `
   .badge.failed, .badge.deadlettered, .badge.cancelled { background: var(--nm-error); color: #fff; }
   .badge.reviewing, .badge.proposed { background: var(--nm-info); color: #fff; }
   .badge.executing, .badge.queued, .badge.retrying { background: var(--nm-warn); color: #000; }
+  .badge.blocked { background: var(--nm-error); color: #fff; }
   .badge.stage { background: transparent; border: 1px solid var(--nm-border); color: var(--nm-fg); opacity: 0.8; }
   .badge.stage.plan { background: var(--nm-info); color: #fff; border-color: transparent; opacity: 1; }
   .badge.stage.execute { background: var(--nm-warn); color: #000; border-color: transparent; opacity: 1; }
@@ -524,6 +555,14 @@ const EXPLORER_HTML = `
       <input type="checkbox" id="ex-llm-profile-checkbox"/>
       Use LLM profile selection (orchestrator asks the LLM which profile fits each child work unit)
     </label>
+    <label class="ex-settings-row">
+      Max concurrent workers
+      <input type="number" id="ex-max-concurrent-workers" min="1" step="1" style="width:60px"/>
+    </label>
+    <label class="ex-settings-row">
+      Scheduler poll interval (ms)
+      <input type="number" id="ex-scheduler-poll-interval" min="100" step="100" style="width:80px"/>
+    </label>
   </div>
   <div class="ex-body">
     <div class="ex-col ex-col-tree">
@@ -552,6 +591,12 @@ const EXPLORER_JS = `
   function badge(status) {
     var s = (status || '').toLowerCase().replace(/\\s+/g, '');
     return '<span class="badge ' + s + '">' + esc(status || '—') + '</span>';
+  }
+
+  // Slice 14b — blockedReason is stale once the slice has moved past Created (it enqueued, so
+  // the block was resolved), so only show it while still Created.
+  function isBlocked(wu) {
+    return !!(wu && wu.fanOutInfo && wu.fanOutInfo.blockedReason && (wu.status || '').toLowerCase() === 'created');
   }
 
   function stageBadge(stage) {
@@ -590,6 +635,18 @@ const EXPLORER_JS = `
 
   document.getElementById('ex-llm-profile-checkbox').addEventListener('change', function(ev) {
     vscode.postMessage({ type: 'explorerSetUseLlmProfileSelection', value: ev.target.checked });
+  });
+
+  document.getElementById('ex-max-concurrent-workers').addEventListener('change', function(ev) {
+    var value = parseInt(ev.target.value, 10);
+    if (!value || value < 1) { return; }
+    vscode.postMessage({ type: 'explorerSetMaxConcurrentWorkers', value: value });
+  });
+
+  document.getElementById('ex-scheduler-poll-interval').addEventListener('change', function(ev) {
+    var value = parseInt(ev.target.value, 10);
+    if (!value || value < 100) { return; }
+    vscode.postMessage({ type: 'explorerSetSchedulerPollIntervalMs', value: value });
   });
 
   // ── Live stage updates (Slice 12c) ──────────────────────────────────────
@@ -650,6 +707,7 @@ const EXPLORER_JS = `
       html += '<div class="wu-node' + sel + '" style="margin-left:' + (depth * 14) + 'px" data-wu="' + esc(wu.workUnitId) + '">';
       html += '<div class="wu-title" title="' + esc(wu.goal) + '">' + esc(wu.goal) + '</div>';
       html += '<div class="wu-meta">' + badge(wu.status);
+      if (isBlocked(wu)) { html += '<span class="badge blocked" title="' + esc(wu.fanOutInfo.blockedReason) + '">blocked</span>'; }
       if (wu.currentStage) { html += stageBadge(wu.currentStage); }
       if (wu.proposalCount) { html += '<span class="mono">' + wu.proposalCount + ' proposal(s)</span>'; }
       html += '</div></div>';
@@ -713,6 +771,9 @@ const EXPLORER_JS = `
     html += '<span class="meta-label">Branch</span><span class="mono">' + esc(wu.branchId) + '</span>';
     html += '<span class="meta-label">File scope</span><span class="mono">' + esc((wu.fileScope || []).join(', ') || '—') + '</span>';
     html += '<span class="meta-label">Depends on</span><span class="mono">' + esc((wu.dependsOn || []).join(', ') || '—') + '</span>';
+    if (isBlocked(wu)) {
+      html += '<span class="meta-label">Blocked</span><span>' + esc(wu.fanOutInfo.blockedReason) + '</span>';
+    }
     html += '</div>';
     html += '<p>' + esc(wu.goal) + '</p>';
     if (wu.successCriteria) { html += '<p style="opacity:0.75"><em>' + esc(wu.successCriteria) + '</em></p>'; }
@@ -897,6 +958,8 @@ const EXPLORER_JS = `
     }
     if (msg.type === 'explorerSettings') {
       document.getElementById('ex-llm-profile-checkbox').checked = !!msg.useLlmProfileSelection;
+      document.getElementById('ex-max-concurrent-workers').value = msg.maxConcurrentWorkers;
+      document.getElementById('ex-scheduler-poll-interval').value = msg.schedulerPollIntervalMs;
       return;
     }
     if (msg.type === 'runResult') {

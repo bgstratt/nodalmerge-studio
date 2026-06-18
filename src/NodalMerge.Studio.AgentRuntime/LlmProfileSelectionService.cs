@@ -31,9 +31,15 @@ internal sealed class LlmProfileSelectionService(
         if (credentials is null)
             return Heuristic("No LLM credentials available for profile selection; using heuristic default.");
 
-        var available = await profiles.ListAsync(ct).ConfigureAwait(false);
+        // Only Execute-stage profiles are valid candidates for a fanned-out child worker —
+        // without this filter the LLM would see (and could select) Orchestrate/Plan/Merge/Review
+        // profiles too, which would hand a child work unit a profile whose AllowedTools likely
+        // doesn't even include workspace.write.
+        var available = (await profiles.ListAsync(ct).ConfigureAwait(false))
+            .Where(p => p.Stage == PipelineStage.Execute)
+            .ToList();
         if (available.Count == 0)
-            return Heuristic("No agent profiles registered; using heuristic default.");
+            return Heuristic("No Execute-stage agent profiles registered; using heuristic default.");
 
         string? text;
         try

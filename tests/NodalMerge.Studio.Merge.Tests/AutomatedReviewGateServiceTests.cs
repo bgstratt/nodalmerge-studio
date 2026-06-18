@@ -300,6 +300,12 @@ public class AutomatedReviewGateServiceTests
             return Task.FromResult(Units[workUnitId]);
         }
 
+        public Task<WorkUnit> SetFanOutBlockedReasonAsync(
+            string workUnitId,
+            string? blockedReason,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             Task.FromResult(Units.TryGetValue(workUnitId, out var unit) ? unit : null);
 

@@ -52,7 +52,10 @@ export class WsClient {
           if (workUnitId) {
             this.onStageChange?.(workUnitId, typeof msg.stage === 'string' ? msg.stage : null);
           }
-        } else if (msg.type === 'pack' && Array.isArray(msg.nodes)) {
+          return;
+        }
+
+        if (msg.type === 'pack' && Array.isArray(msg.nodes)) {
           // Bulk historical nodes from request-server-pack
           for (const raw of msg.nodes as PackNode[]) {
             if (typeof raw.nodeId !== 'string' || typeof raw.branchId !== 'string') { continue; }
@@ -68,15 +71,19 @@ export class WsClient {
               atIso:       typeof raw.atIso   === 'string' ? raw.atIso   : undefined,
             });
           }
-        } else {
-          // Live runtime event
-          this.onAction({
-            type:           'append-runtime-event',
-            roomId:         this.roomId,
-            payload:        msg,
-            receivedAtIso:  new Date().toISOString(),
-          });
+          return;
         }
+
+        // Everything else here — room-ensured, session-opened, welcome, the *real*
+        // nodalmerge-host wire shape of 'pack' (where `nodes` is an opaque base64 blob, not
+        // the PackNode[] handled above), pack-ack, peer-joined, peer-left, presence,
+        // projection.*, etc. — is /ws/runtime control-plane traffic, not a DAG op: none of it
+        // carries a stable nodeId. This used to fall through to 'append-runtime-event' below,
+        // which synthesized a brand-new fake graph node (id `${branchId}-${sequence}`) for
+        // every single one of these frames — on every connect, and on every scrub/click since
+        // those also trigger a requestPack() round trip. That's what was producing nodes that
+        // multiplied every time you moved the scrubber. Intentionally dropped until a real,
+        // structured op/timeline feed is wired up (see ReplayService pivot).
       } catch {
         // ignore malformed frames
       }

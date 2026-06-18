@@ -128,6 +128,27 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return updated;
     }
 
+    public async Task<WorkUnit> SetFanOutBlockedReasonAsync(
+        string workUnitId,
+        string? blockedReason,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        var fanOutInfo = workUnit.FanOutInfo is null
+            ? (blockedReason is null ? null : new WorkUnitFanOutInfo(null, null, blockedReason))
+            : workUnit.FanOutInfo with { BlockedReason = blockedReason };
+
+        var updated = workUnit with { FanOutInfo = fanOutInfo, UpdatedAt = DateTimeOffset.UtcNow };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
     public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default)
     {
         _workUnits.TryGetValue(workUnitId, out var workUnit);
@@ -147,6 +168,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
     public async Task<WorkUnit> CreateWorkUnitAsync(
         string goal,
         string owner,
+        string? branchId = null,
         string? successCriteria = null,
         string? repositoryPath = null,
         string? parentWorkUnitId = null,
@@ -165,8 +187,14 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             _workspaceOptions.SeedRepositoryPath = repositoryPath;
         }
 
-        var branchId = await _branchService
-            .CreateBranchAsync($"work-{Guid.NewGuid():N}", seedFromBranchId, cancellationToken)
+        // Slice 15b — branchId used to be patched onto the WorkUnit record *after* this method
+        // returned (by the MCP tool and the agent-loop dispatcher, independently), which left the
+        // real generated "work-{guid}" branch (and any seedFromBranchId content copied into it)
+        // orphaned, and the caller-chosen name never registered with IBranchService at all
+        // (nm_v1_branch_status on it would report "unknown" even though the work unit was "on"
+        // it). Resolving it here means it actually gets created/seeded like any other branch.
+        var resolvedBranchId = await _branchService
+            .CreateBranchAsync(branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, cancellationToken)
             .ConfigureAwait(false);
 
         var fanOutInfo = sliceId is not null || seedFromBranchId is not null
@@ -177,7 +205,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         var workUnit = new WorkUnit(
             WorkUnitId: Guid.NewGuid().ToString("N"),
             Goal: goal,
-            BranchId: branchId,
+            BranchId: resolvedBranchId,
             Status: WorkUnitStatus.Created,
             CreatedAt: now,
             UpdatedAt: now,
@@ -315,6 +343,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IWorkspaceService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IFanOutService, FanOutService>();
+        services.AddSingleton<IWorkUnitCommandService, WorkUnitCommandService>();
         return services;
     }
 }

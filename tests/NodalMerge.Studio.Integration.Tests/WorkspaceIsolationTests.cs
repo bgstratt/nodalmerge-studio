@@ -32,6 +32,9 @@ public class WorkspaceIsolationTests
         public Task<WorkUnit> SetCurrentStageAsync(string workUnitId, PipelineStage? stage, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
+        public Task<WorkUnit> SetFanOutBlockedReasonAsync(string workUnitId, string? blockedReason, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default)
         {
             _units.TryGetValue(workUnitId, out var wu);

@@ -51,15 +51,6 @@ export type ReplayState = {
   sequence: number;
 };
 
-type RuntimeEventPayload = {
-  type?: unknown;
-  lamport?: unknown;
-  author?: unknown;
-  pubkey?: unknown;
-  nodeId?: unknown;
-  node_id?: unknown;
-};
-
 export type ReplayAction =
   | { type: "reset"; roomId: string; branchId?: string; branchLabel?: string }
   | { type: "set-mode"; mode: ReplayMode }
@@ -74,7 +65,6 @@ export type ReplayAction =
       basedOnNodeId: string | null;
       isMain?: boolean;
     }
-  | { type: "append-runtime-event"; roomId: string; branchId?: string; payload: Record<string, unknown>; receivedAtIso: string }
   | { type: "create-branch-from-cursor"; newBranchId: string; newRoomId: string; newLabel: string; reason: "manual" | "playback-edit" }
   | {
       type: "append-branch-node";
@@ -114,39 +104,6 @@ export function createInitialReplayState(roomId: string, branchId = "main", bran
     activeBranchId: branchId,
     sequence: 0
   };
-}
-
-function parseLamport(payload: RuntimeEventPayload): number | null {
-  if (typeof payload.lamport === "number" && Number.isFinite(payload.lamport)) {
-    return payload.lamport;
-  }
-  return null;
-}
-
-function parseAuthor(payload: RuntimeEventPayload): string | null {
-  if (typeof payload.author === "string" && payload.author.length > 0) {
-    return payload.author;
-  }
-  if (typeof payload.pubkey === "string" && payload.pubkey.length > 0) {
-    return payload.pubkey;
-  }
-  return null;
-}
-
-function parseNodeId(payload: RuntimeEventPayload, fallback: string): string {
-  if (typeof payload.nodeId === "string" && payload.nodeId.length > 0) {
-    return payload.nodeId;
-  }
-  if (typeof payload.node_id === "string" && payload.node_id.length > 0) {
-    return payload.node_id;
-  }
-  return fallback;
-}
-
-function summarizePayload(payload: RuntimeEventPayload): string {
-  const kind = typeof payload.type === "string" ? payload.type : "runtime";
-  const lamport = typeof payload.lamport === "number" ? ` lamport=${payload.lamport}` : "";
-  return `${kind}${lamport}`;
 }
 
 function compareNodeIds(a: ReplayNode, b: ReplayNode): number {
@@ -228,6 +185,22 @@ export function replayReducer(state: ReplayState, action: ReplayAction): ReplayS
   }
 
   if (action.type === "set-mode") {
+    if (action.mode === "live") {
+      // Switching to live should jump the cursor back to the active branch's current head,
+      // not just flip the mode flag — otherwise "Live" only re-enables auto-follow for the
+      // *next* incoming node and leaves the view stuck wherever playback left it.
+      const branchIds = state.branchNodeIds[state.cursor.branchId] ?? [];
+      const headIndex = clampIndex(branchIds.length - 1, branchIds.length);
+      return {
+        ...state,
+        cursor: {
+          ...state.cursor,
+          mode: "live",
+          nodeIndex: headIndex,
+          nodeId: getCursorNodeId(branchIds, headIndex)
+        }
+      };
+    }
     return {
       ...state,
       cursor: {
@@ -292,39 +265,6 @@ export function replayReducer(state: ReplayState, action: ReplayAction): ReplayS
         [action.branchId]: []
       }
     };
-  }
-
-  if (action.type === "append-runtime-event") {
-    const branchId = action.branchId ?? state.activeBranchId;
-    const branch = state.branches[branchId];
-    if (!branch) {
-      return state;
-    }
-
-    const payload = action.payload as RuntimeEventPayload;
-    const sequence = state.sequence + 1;
-    const fallbackId = `${branchId}-${sequence.toString(36)}`;
-    const nextNodeId = parseNodeId(payload, fallbackId);
-    if (state.nodesById[nextNodeId]) {
-      return { ...state, sequence };
-    }
-
-    const previousBranchIds = state.branchNodeIds[branchId] ?? [];
-    const previousHeadNodeId = previousBranchIds.length > 0 ? previousBranchIds[previousBranchIds.length - 1] : null;
-    const nextNode: ReplayNode = {
-      nodeId: nextNodeId,
-      roomId: action.roomId,
-      branchId,
-      parentIds: previousHeadNodeId ? [previousHeadNodeId] : [],
-      lamport: parseLamport(payload),
-      author: parseAuthor(payload),
-      atIso: action.receivedAtIso,
-      opSummary: summarizePayload(payload),
-      payloadJson: JSON.stringify(payload),
-      payloadRef: typeof payload.type === "string" ? payload.type : undefined
-    };
-    const appended = appendNodeToBranch({ ...state, sequence }, branchId, nextNode);
-    return appended;
   }
 
   if (action.type === "create-branch-from-cursor") {

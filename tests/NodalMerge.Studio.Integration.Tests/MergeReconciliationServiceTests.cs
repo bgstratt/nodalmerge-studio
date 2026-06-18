@@ -130,4 +130,64 @@ public class MergeReconciliationServiceTests
         Assert.Contains(p1, report);
         Assert.Contains(p2, report);
     }
+
+    [Fact]
+    public async Task TryReconcile_combines_non_overlapping_line_ranges_in_same_file()
+    {
+        // Slice 14d: two proposals touching the same file no longer conflict purely because they
+        // both appear in FilesTouched — only an actual changed-line-range overlap escalates.
+        var app = StudioWebApplication.Build([], configureServices: s => s.AddInMemoryStorage());
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var workUnits    = app.Services.GetRequiredService<IWorkUnitService>();
+        var merge        = app.Services.GetRequiredService<IMergeService>();
+        var artifacts    = app.Services.GetRequiredService<IArtifactLineageService>();
+        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var reconciliation = app.Services.GetRequiredService<IMergeReconciliationService>();
+
+        var baseContent = string.Join("\n", Enumerable.Range(1, 20).Select(i => $"line{i}")) + "\n";
+        await fileWorkspace.WriteAsync("main", "src/Shared.cs", baseContent, CancellationToken.None);
+
+        var parent = await orchestrator.CreateWorkUnitAsync("parent goal", "test");
+        var child1 = await orchestrator.CreateWorkUnitAsync(
+            "slice one", "test", parentWorkUnitId: parent.WorkUnitId,
+            fileScope: ["src/Shared.cs"], seedFromBranchId: "main");
+        var child2 = await orchestrator.CreateWorkUnitAsync(
+            "slice two", "test", parentWorkUnitId: parent.WorkUnitId,
+            fileScope: ["src/Shared.cs"], seedFromBranchId: "main");
+
+        // child1 prepends a function, child2 appends a different one — distinct, non-overlapping
+        // line ranges relative to the shared base.
+        await fileWorkspace.WriteAsync(
+            child1.BranchId, "src/Shared.cs", "newFunctionA();\n" + baseContent, CancellationToken.None);
+        await fileWorkspace.WriteAsync(
+            child2.BranchId, "src/Shared.cs", baseContent + "newFunctionB();\n", CancellationToken.None);
+
+        async Task<string> ProposeChildAsync(WorkUnit child, string file)
+        {
+            var id = $"MP-{Guid.NewGuid():N}";
+            var proposal = new MergeProposal(
+                id, child.BranchId, "main", child.Goal, $"add {file}", $"add {file}",
+                null, null, null, MergeProposalStatus.Draft,
+                FilesTouched: [file], WorkUnitId: child.WorkUnitId);
+            await merge.ProposeAsync(proposal);
+            await merge.ValidateAsync(id);
+            await artifacts.RecordAsync(new ArtifactRef(
+                id, ArtifactType.MergeProposal, child.WorkUnitId, ArtifactStatus.Active,
+                DateTimeOffset.UtcNow, child.WorkUnitId, null));
+            await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Queued);
+            await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Executing);
+            await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Proposed);
+            return id;
+        }
+
+        await ProposeChildAsync(child1, "src/Shared.cs");
+        await ProposeChildAsync(child2, "src/Shared.cs");
+
+        var result = await reconciliation.TryReconcileAsync(parent.WorkUnitId);
+
+        Assert.Equal(MergeReconciliationOutcome.Reconciled, result.Outcome);
+        Assert.Null(result.ConflictReportPath);
+        Assert.False(await fileWorkspace.ExistsAsync(parent.BranchId, MergeReconciliationService.ConflictReportFileName));
+    }
 }

@@ -56,7 +56,8 @@ public sealed class MergeReconciliationService(
             childProposals.Add((child, proposal));
         }
 
-        var conflicts = DetectOverlappingFiles(childProposals.Select(cp => cp.Proposal).ToList());
+        var conflicts = await DetectOverlappingFilesAsync(
+            childProposals.Select(cp => cp.Proposal).ToList(), cancellationToken).ConfigureAwait(false);
         if (conflicts.Count > 0)
         {
             var report = BuildConflictReport(conflicts, childProposals);
@@ -175,7 +176,73 @@ public sealed class MergeReconciliationService(
         return ordered;
     }
 
-    private static Dictionary<string, List<string>> DetectOverlappingFiles(IReadOnlyList<MergeProposal> proposals)
+    // Two passes: the original whole-file FilesTouched intersection as a cheap filter (no
+    // workspace reads for the common case of disjoint file sets), then a line-range-aware
+    // refinement for whatever it flags. A file only stays flagged if two proposals' actually
+    // *changed* line ranges (vs. their own base/{proposalId} snapshot) intersect — two proposals
+    // appending distinct, non-overlapping functions to the same file no longer conflict.
+    private async Task<Dictionary<string, List<string>>> DetectOverlappingFilesAsync(
+        IReadOnlyList<MergeProposal> proposals, CancellationToken cancellationToken)
+    {
+        var candidates = DetectTouchedFileOverlap(proposals);
+        if (candidates.Count == 0)
+            return candidates;
+
+        var byId = proposals.ToDictionary(p => p.ProposalId);
+        var refined = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (file, proposalIds) in candidates)
+        {
+            var ranges = new List<(string ProposalId, List<(int Start, int End)> Ranges)>();
+            foreach (var proposalId in proposalIds)
+            {
+                var proposal = byId[proposalId];
+                var before = await fileWorkspace
+                    .ReadAsync($"base/{proposalId}", file, cancellationToken).ConfigureAwait(false);
+                var after = await fileWorkspace
+                    .ReadAsync(proposal.SourceBranch, file, cancellationToken).ConfigureAwait(false);
+
+                var hunks = LineDiffer.Diff(before, after, contextLines: 0);
+                var fileRanges = hunks
+                    .Select(h => (h.BeforeStart, h.BeforeStart + Math.Max(h.BeforeCount, 1) - 1))
+                    .ToList();
+                ranges.Add((proposalId, fileRanges));
+            }
+
+            var overlapping = new HashSet<string>();
+            for (var i = 0; i < ranges.Count; i++)
+            {
+                for (var j = i + 1; j < ranges.Count; j++)
+                {
+                    if (!RangesOverlap(ranges[i].Ranges, ranges[j].Ranges))
+                        continue;
+                    overlapping.Add(ranges[i].ProposalId);
+                    overlapping.Add(ranges[j].ProposalId);
+                }
+            }
+
+            if (overlapping.Count > 1)
+                refined[file] = overlapping.ToList();
+        }
+
+        return refined;
+    }
+
+    private static bool RangesOverlap(List<(int Start, int End)> a, List<(int Start, int End)> b)
+    {
+        foreach (var ra in a)
+        {
+            foreach (var rb in b)
+            {
+                if (ra.Start <= rb.End && rb.Start <= ra.End)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static Dictionary<string, List<string>> DetectTouchedFileOverlap(IReadOnlyList<MergeProposal> proposals)
     {
         var fileToProposals = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         foreach (var proposal in proposals)

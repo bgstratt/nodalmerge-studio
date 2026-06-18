@@ -14,6 +14,7 @@ public static class StudioRestEndpoints
     private sealed record CreateWorkUnitBody(
         string Goal,
         string Owner,
+        string? BranchId = null,
         string? SuccessCriteria = null,
         string? RepositoryPath = null,
         string? ParentWorkUnitId = null,
@@ -55,14 +56,16 @@ public static class StudioRestEndpoints
         PipelineStage Stage,
         string SystemPrompt,
         IReadOnlyList<string> AllowedTools,
-        int MaxIterations);
+        int MaxIterations,
+        IReadOnlyList<string>? FileScopePatterns = null);
 
     private sealed record UpdateAgentProfileBody(
         string Name,
         PipelineStage Stage,
         string SystemPrompt,
         IReadOnlyList<string> AllowedTools,
-        int MaxIterations);
+        int MaxIterations,
+        IReadOnlyList<string>? FileScopePatterns = null);
 
     private sealed record MarkKnownGoodBody(
         string BranchId,
@@ -87,7 +90,11 @@ public static class StudioRestEndpoints
         string? ParentEventId = null,
         string? Goal = null);
 
-    private sealed record UpdateOptionsBody(bool UseLlmProfileSelection);
+    private sealed record UpdateOptionsBody(
+        bool UseLlmProfileSelection,
+        bool BlockOverlappingFileScope = false,
+        int MaxConcurrentWorkers = 3,
+        int SchedulerPollIntervalMs = 2_000);
 
     // ── Registration ───────────────────────────────────────────────────────
 
@@ -109,7 +116,21 @@ public static class StudioRestEndpoints
         MapArtifactEndpoints(app);
         MapDeadLetterEndpoints(app);
         MapOptionsEndpoints(app);
+        MapPolicyEndpoints(app);
         return app;
+    }
+
+    // ── /studio/policies — Slice 14a, visibility only (no per-rule toggle yet) ─────────────
+
+    private static void MapPolicyEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/policies", async (
+            IPolicyGateService policyGate,
+            CancellationToken ct) =>
+        {
+            var ruleIds = await policyGate.ListRuleIdsAsync(ct).ConfigureAwait(false);
+            return Results.Ok(new { ruleIds });
+        });
     }
 
     // ── /studio/options — Slice 12d settings toggle ────────────────────────
@@ -117,7 +138,13 @@ public static class StudioRestEndpoints
     private static void MapOptionsEndpoints(WebApplication app)
     {
         app.MapGet("/studio/options", (WorkspaceOptions options) =>
-            Results.Ok(new { useLlmProfileSelection = options.UseLlmProfileSelection }));
+            Results.Ok(new
+            {
+                useLlmProfileSelection = options.UseLlmProfileSelection,
+                blockOverlappingFileScope = options.BlockOverlappingFileScope,
+                maxConcurrentWorkers = options.MaxConcurrentWorkers,
+                schedulerPollIntervalMs = options.SchedulerPollIntervalMs,
+            }));
 
         app.MapPost("/studio/options", async (
             UpdateOptionsBody body,
@@ -125,9 +152,27 @@ public static class StudioRestEndpoints
             RuntimeSettingsService runtimeSettings,
             CancellationToken ct) =>
         {
+            // Slice 14e — the scheduler poll loop reads these straight off this same
+            // WorkspaceOptions singleton every iteration (InMemoryAgentRuntimeService), so a
+            // bad value here doesn't just get rejected, it wedges the scheduler (0 workers =
+            // nothing ever gets picked up; a 0/negative delay = a busy-loop).
+            if (body.MaxConcurrentWorkers < 1)
+                return Results.BadRequest(new { error = "maxConcurrentWorkers must be at least 1." });
+            if (body.SchedulerPollIntervalMs < 100)
+                return Results.BadRequest(new { error = "schedulerPollIntervalMs must be at least 100." });
+
             options.UseLlmProfileSelection = body.UseLlmProfileSelection;
+            options.BlockOverlappingFileScope = body.BlockOverlappingFileScope;
+            options.MaxConcurrentWorkers = body.MaxConcurrentWorkers;
+            options.SchedulerPollIntervalMs = body.SchedulerPollIntervalMs;
             await runtimeSettings.PersistAsync(ct).ConfigureAwait(false);
-            return Results.Ok(new { useLlmProfileSelection = options.UseLlmProfileSelection });
+            return Results.Ok(new
+            {
+                useLlmProfileSelection = options.UseLlmProfileSelection,
+                blockOverlappingFileScope = options.BlockOverlappingFileScope,
+                maxConcurrentWorkers = options.MaxConcurrentWorkers,
+                schedulerPollIntervalMs = options.SchedulerPollIntervalMs,
+            });
         });
     }
 
@@ -332,7 +377,7 @@ public static class StudioRestEndpoints
 
         app.MapPost("/studio/workunits", async (
             CreateWorkUnitBody body,
-            IOrchestratorService orchestrator,
+            IWorkUnitCommandService workUnitCommands,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(body.Goal))
@@ -340,10 +385,10 @@ public static class StudioRestEndpoints
             if (string.IsNullOrWhiteSpace(body.Owner))
                 return Results.BadRequest(new { error = "owner is required." });
 
-            var wu = await orchestrator
-                .CreateWorkUnitAsync(body.Goal, body.Owner, body.SuccessCriteria, body.RepositoryPath,
-                    body.ParentWorkUnitId, body.DependsOn, body.FileScope, cancellationToken: ct)
-                .ConfigureAwait(false);
+            var wu = await workUnitCommands.CreateAsync(
+                new WorkUnitCreateCommand(body.Goal, body.Owner, body.BranchId, body.SuccessCriteria,
+                    body.RepositoryPath, body.ParentWorkUnitId, body.DependsOn, body.FileScope),
+                ct).ConfigureAwait(false);
             return Results.Ok(wu);
         });
     }
@@ -503,8 +548,8 @@ public static class StudioRestEndpoints
                     {
                         proposalId = constituent.ProposalId,
                         status = constituent.Status.ToString(),
-                        goal = constituent.Goal,
-                        summary = constituent.Summary,
+                        goal = (string?)constituent.Goal,
+                        summary = (string?)constituent.Summary,
                     });
             }
 
@@ -737,6 +782,25 @@ public static class StudioRestEndpoints
             var branchId = await branches.CreateBranchAsync(body.Name, body.FromBranchId, ct)
                 .ConfigureAwait(false);
             return Results.Ok(new { branchId, name = body.Name, fromBranchId = body.FromBranchId });
+        });
+
+        // Slice 15a — REST/MCP parity (nm_v1_branch_checkout / nm_v1_branch_status had no REST route).
+        app.MapPost("/studio/branches/{branchId}/checkout", async (
+            string branchId,
+            IBranchService branches,
+            CancellationToken ct) =>
+        {
+            await branches.CheckoutBranchAsync(branchId, ct).ConfigureAwait(false);
+            return Results.Ok(new { branchId, status = "checked_out" });
+        });
+
+        app.MapGet("/studio/branches/{branchId}/status", async (
+            string branchId,
+            IBranchService branches,
+            CancellationToken ct) =>
+        {
+            var status = await branches.GetStatusAsync(branchId, ct).ConfigureAwait(false);
+            return Results.Ok(status);
         });
     }
 
@@ -1080,7 +1144,8 @@ public static class StudioRestEndpoints
                 body.Stage,
                 body.SystemPrompt ?? string.Empty,
                 body.AllowedTools ?? [],
-                body.MaxIterations > 0 ? body.MaxIterations : 20);
+                body.MaxIterations > 0 ? body.MaxIterations : 20,
+                body.FileScopePatterns ?? []);
             var created = await profiles.CreateAsync(profile, ct).ConfigureAwait(false);
             return Results.Ok(created);
         });
@@ -1101,7 +1166,8 @@ public static class StudioRestEndpoints
                     body.Stage,
                     body.SystemPrompt ?? string.Empty,
                     body.AllowedTools ?? [],
-                    body.MaxIterations > 0 ? body.MaxIterations : 20);
+                    body.MaxIterations > 0 ? body.MaxIterations : 20,
+                    body.FileScopePatterns ?? []);
                 var updated = await profiles.UpdateAsync(profile, ct).ConfigureAwait(false);
                 return Results.Ok(updated);
             }

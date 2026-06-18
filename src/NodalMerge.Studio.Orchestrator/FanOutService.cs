@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text.Json;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 using StudioTaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.Orchestrator;
@@ -30,6 +31,8 @@ public sealed class FanOutService : IFanOutService
     private readonly IAgentControlService _agentControl;
     private readonly IProfileSelectionService _profileSelection;
     private readonly IOrchestrationDecisionLogService _decisionLog;
+    private readonly IPolicyGateService _policyGate;
+    private readonly IAgentProfileService _agentProfiles;
 
     public FanOutService(
         IWorkUnitService workUnits,
@@ -40,7 +43,9 @@ public sealed class FanOutService : IFanOutService
         ITaskService tasks,
         IAgentControlService agentControl,
         IProfileSelectionService profileSelection,
-        IOrchestrationDecisionLogService decisionLog)
+        IOrchestrationDecisionLogService decisionLog,
+        IPolicyGateService policyGate,
+        IAgentProfileService agentProfiles)
     {
         _workUnits         = workUnits;
         _orchestrator      = orchestrator;
@@ -51,6 +56,8 @@ public sealed class FanOutService : IFanOutService
         _agentControl      = agentControl;
         _profileSelection  = profileSelection;
         _decisionLog       = decisionLog;
+        _agentProfiles     = agentProfiles;
+        _policyGate        = policyGate;
     }
 
     public Task<FanOutResult> TryFanOutFromPlanAsync(
@@ -272,7 +279,66 @@ public sealed class FanOutService : IFanOutService
                 null), ct).ConfigureAwait(false);
         }
 
-        var selection = await _profileSelection.SelectProfileAsync(child, creds, ct).ConfigureAwait(false);
+        // Slice 14c — deterministic, free, instant routing tier checked before the
+        // LLM/heuristic IProfileSelectionService path. Falls through completely unchanged
+        // (same heuristic-or-LLM behavior as today) on zero or multiple matches.
+        var matchedProfile = await TryMatchFileScopeProfileAsync(child, ct).ConfigureAwait(false);
+        var matchedPattern = matchedProfile is not null;
+        var selection = matchedProfile is not null
+            ? new ProfileSelectionResult(
+                matchedProfile.AgentProfileId,
+                $"fileScope matched profile '{matchedProfile.AgentProfileId}' declared FileScopePatterns",
+                UsedLlm: false)
+            : await _profileSelection.SelectProfileAsync(child, creds, ct).ConfigureAwait(false);
+
+        // Slice 14b — built here (rather than inside a rule) so IPolicyRule implementations like
+        // NonOverlappingFileScopeRule don't need their own IWorkUnitService dependency.
+        var siblings = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
+        var activeSiblings = siblings
+            .Where(s => s.WorkUnitId != child.WorkUnitId)
+            .Select(s => new FileScopeSibling(s.WorkUnitId, s.FanOutInfo?.SliceId, s.Status, s.FileScope))
+            .ToList();
+
+        var policyContext = new Dictionary<string, object?>
+        {
+            ["workUnitId"] = child.WorkUnitId,
+            ["parentWorkUnitId"] = parentWorkUnitId,
+            ["goal"] = child.Goal,
+            ["fileScope"] = child.FileScope,
+            ["activeSiblings"] = activeSiblings,
+        };
+        var policyResult = await _policyGate
+            .EvaluateAsync(PolicyCheckpoint.BeforeEnqueue, policyContext, ct)
+            .ConfigureAwait(false);
+        if (!policyResult.Allowed)
+        {
+            var reason = string.Join("; ", policyResult.Violations.Select(v => $"{v.RuleId}: {v.Message}"));
+
+            await _decisionLog.RecordAsync(
+                parentWorkUnitId,
+                "fanout",
+                PipelineStage.Plan,
+                JsonSerializer.Serialize(new
+                {
+                    childWorkUnitId = child.WorkUnitId,
+                    childGoal = child.Goal,
+                }),
+                OrchestrationAction.PolicyBlocked,
+                [child.WorkUnitId],
+                reason,
+                sessionId,
+                ct).ConfigureAwait(false);
+
+            await _workUnits.SetFanOutBlockedReasonAsync(child.WorkUnitId, $"blocked — {reason}", ct)
+                .ConfigureAwait(false);
+
+            return false;
+        }
+
+        if (child.FanOutInfo?.BlockedReason is not null)
+        {
+            await _workUnits.SetFanOutBlockedReasonAsync(child.WorkUnitId, null, ct).ConfigureAwait(false);
+        }
 
         await _scheduler.EnqueueAsync(
             child.WorkUnitId,
@@ -300,6 +366,7 @@ public sealed class FanOutService : IFanOutService
                 childGoal = child.Goal,
                 selectedProfileId = selection.ProfileId,
                 usedLlm = selection.UsedLlm,
+                matchedPattern,
             }),
             OrchestrationAction.Enqueue,
             [child.WorkUnitId],
@@ -308,5 +375,23 @@ public sealed class FanOutService : IFanOutService
             ct).ConfigureAwait(false);
 
         return true;
+    }
+
+    // Slice 14c — "matches every path" means every entry in the child's fileScope is covered by
+    // at least one of the profile's declared patterns; exactly one such profile routes
+    // deterministically, zero or multiple fall through to IProfileSelectionService unchanged.
+    private async Task<AgentProfile?> TryMatchFileScopeProfileAsync(WorkUnit child, CancellationToken ct)
+    {
+        if (child.FileScope.Count == 0)
+            return null;
+
+        var profiles = await _agentProfiles.ListAsync(ct).ConfigureAwait(false);
+        var matches = profiles
+            .Where(p => p.Stage == PipelineStage.Execute && p.FileScopePatterns.Count > 0)
+            .Where(p => child.FileScope.All(path => p.FileScopePatterns.Any(pattern =>
+                AgentWorkspaceService.MatchesGlob(pattern.Replace('\\', '/'), path.Replace('\\', '/')))))
+            .ToList();
+
+        return matches.Count == 1 ? matches[0] : null;
     }
 }

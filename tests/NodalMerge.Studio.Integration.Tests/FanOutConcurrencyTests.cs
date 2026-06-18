@@ -38,6 +38,9 @@ public class FanOutConcurrencyTests
         public Task<WorkUnit> SetCurrentStageAsync(string workUnitId, PipelineStage? stage, CancellationToken cancellationToken = default) =>
             inner.SetCurrentStageAsync(workUnitId, stage, cancellationToken);
 
+        public Task<WorkUnit> SetFanOutBlockedReasonAsync(string workUnitId, string? blockedReason, CancellationToken cancellationToken = default) =>
+            inner.SetFanOutBlockedReasonAsync(workUnitId, blockedReason, cancellationToken);
+
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             inner.GetAsync(workUnitId, cancellationToken);
 
