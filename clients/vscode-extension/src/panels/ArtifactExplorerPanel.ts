@@ -39,6 +39,10 @@ interface StudioOptions {
   blockOverlappingFileScope: boolean;
   maxConcurrentWorkers: number;
   schedulerPollIntervalMs: number;
+  requireBuildBeforeProposal: boolean;
+  requireTestBeforeProposal: boolean;
+  buildCommand: string;
+  testCommand: string;
 }
 
 interface ExecutionSession {
@@ -132,8 +136,9 @@ export class GoalWorkspacePanel {
   private readonly configService: AgentConfigService | undefined;
   private readonly secrets: vscode.SecretStorage | undefined;
   private readonly lmProxyBaseUrl: string | undefined;
+  private readonly onSessionChanged?: (sessionId: string | undefined) => void;
   private pollTimer?: ReturnType<typeof setInterval>;
-  private selectedSessionId?: string;
+  selectedSessionId?: string;
 
   constructor(
     panel: vscode.WebviewPanel,
@@ -141,12 +146,14 @@ export class GoalWorkspacePanel {
     configService?: AgentConfigService,
     secrets?: vscode.SecretStorage,
     lmProxyBaseUrl?: string,
+    onSessionChanged?: (sessionId: string | undefined) => void,
   ) {
     this.panel          = panel;
     this.baseUrl         = baseUrl;
     this.configService   = configService;
     this.secrets         = secrets;
     this.lmProxyBaseUrl  = lmProxyBaseUrl;
+    this.onSessionChanged = onSessionChanged;
   }
 
   static getFragment(): { css: string; html: string; script: string } {
@@ -280,6 +287,7 @@ export class GoalWorkspacePanel {
       switch (msg.type as string) {
         case 'explorerSelectSession':
           this.selectedSessionId = (msg.sessionId as string) || undefined;
+          this.onSessionChanged?.(this.selectedSessionId);
           if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
           break;
         case 'explorerRun':
@@ -401,6 +409,7 @@ export class GoalWorkspacePanel {
         ]);
 
         this.selectedSessionId = session.sessionId;
+        this.onSessionChanged?.(this.selectedSessionId);
         void this.panel.webview.postMessage({ type: 'runResult', success: true, sessionId: session.sessionId });
         await this.refreshSessions();
         await this.refreshDecisionTree(session.sessionId);
@@ -458,6 +467,7 @@ export class GoalWorkspacePanel {
       });
 
       this.selectedSessionId = session.sessionId;
+      this.onSessionChanged?.(this.selectedSessionId);
       void this.panel.webview.postMessage({ type: 'runResult', success: true, sessionId: session.sessionId });
       await this.refreshSessions();
       await this.refreshDecisionTree(session.sessionId);
@@ -766,6 +776,17 @@ const GW_HTML = `
     <label class="gw-settings-row">
       Scheduler poll interval (ms)
       <input type="number" id="gw-scheduler-poll-interval" min="100" step="100" style="width:80px"/>
+    </label>
+    <label class="gw-settings-row" style="margin-top:8px;border-top:1px solid var(--nm-border);padding-top:8px">
+      Pipeline Gates
+    </label>
+    <label class="gw-settings-row">
+      <input type="checkbox" id="gw-require-build-checkbox"/>
+      Require build before proposal
+    </label>
+    <label class="gw-settings-row">
+      <input type="checkbox" id="gw-require-test-checkbox"/>
+      Require tests before proposal
     </label>
   </div>
   <div class="gw-body">
@@ -1116,7 +1137,7 @@ const GW_JS = `
     window.__nmProposalId = proposal.proposalId;
 
     html += '<div class="inspector-actions">';
-    html += '<button data-p-action="openReview">Open in Decision Convergence &rarr;</button>';
+    html += '<button data-p-action="openReview">Open in Review &rarr;</button>';
     html += '<button class="ghost" data-p-action="forkHypothesis">Fork Hypothesis from here</button>';
     html += '<button class="ghost" data-p-action="restore">Restore workspace</button>';
     html += '<button class="ghost" data-p-action="compare">Compare with…</button>';

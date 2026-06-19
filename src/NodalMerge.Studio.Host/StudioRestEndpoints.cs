@@ -372,11 +372,22 @@ public static class StudioRestEndpoints
     {
         app.MapGet("/studio/workunits", async (
             [FromQuery] string? branchId,
+            [FromQuery] string? sessionId,
             IWorkUnitService workUnits,
             IMergeService merge,
+            IExecutionSessionService sessions,
             CancellationToken ct) =>
         {
             var list = await workUnits.ListAsync(branchId, ct).ConfigureAwait(false);
+            // Filter to session descendants if sessionId is provided
+            if (sessionId is not null)
+            {
+                var session = await sessions.GetAsync(sessionId, ct).ConfigureAwait(false);
+                if (session is null)
+                    return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
+                var sessionWuIds = await GetSessionDescendantIdsAsync(sessions, workUnits, session.RootWorkUnitId, ct).ConfigureAwait(false);
+                list = list.Where(wu => sessionWuIds.Contains(wu.WorkUnitId)).ToList();
+            }
             var allProposals = await merge.ListAsync(cancellationToken: ct).ConfigureAwait(false);
             var counts = allProposals
                 .Where(p => p.WorkUnitId is not null)
@@ -752,10 +763,22 @@ public static class StudioRestEndpoints
     {
         app.MapGet("/studio/merges", async (
             [FromQuery] string? sourceBranch,
+            [FromQuery] string? sessionId,
             IMergeService merge,
+            IExecutionSessionService sessions,
+            IWorkUnitService workUnits,
             CancellationToken ct) =>
         {
             var list = await merge.ListAsync(sourceBranch, ct).ConfigureAwait(false);
+            // Filter to session descendants if sessionId is provided
+            if (sessionId is not null)
+            {
+                var session = await sessions.GetAsync(sessionId, ct).ConfigureAwait(false);
+                if (session is null)
+                    return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
+                var sessionWuIds = await GetSessionDescendantIdsAsync(sessions, workUnits, session.RootWorkUnitId, ct).ConfigureAwait(false);
+                list = list.Where(p => p.WorkUnitId is not null && sessionWuIds.Contains(p.WorkUnitId)).ToList();
+            }
             return Results.Ok(list);
         });
 
@@ -1667,6 +1690,32 @@ public static class StudioRestEndpoints
                 return Results.NotFound(new { error = ex.Message });
             }
         });
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    /// Walks the descendant tree from a root work unit to collect all work unit IDs
+    /// belonging to a session.
+    private static async Task<HashSet<string>> GetSessionDescendantIdsAsync(
+        IExecutionSessionService sessions,
+        IWorkUnitService workUnits,
+        string rootWorkUnitId,
+        CancellationToken ct)
+    {
+        var ids = new HashSet<string> { rootWorkUnitId };
+        var frontier = new Queue<string>([rootWorkUnitId]);
+        while (frontier.Count > 0)
+        {
+            var children = await workUnits.GetChildrenAsync(frontier.Dequeue(), ct).ConfigureAwait(false);
+            foreach (var child in children)
+            {
+                if (ids.Add(child.WorkUnitId))
+                {
+                    frontier.Enqueue(child.WorkUnitId);
+                }
+            }
+        }
+        return ids;
     }
 
     // ── /studio/replay ─────────────────────────────────────────────────────

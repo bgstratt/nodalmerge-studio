@@ -23,11 +23,11 @@
       },
       {
         "command": "nodalmerge.openStudio",
-        "title": "NodalMerge: Open Decision Workspace"
+        "title": "NodalMerge: Open Studio"
       },
       {
         "command": "nodalmerge.openMergeReview",
-        "title": "NodalMerge: Open Decision Convergence"
+        "title": "NodalMerge: Open Review"
       },
       {
         "command": "nodalmerge.openMergeReviewConflict",

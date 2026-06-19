@@ -64,14 +64,21 @@ export class DecisionConvergencePanel {
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
   private readonly configService: AgentConfigService | undefined;
+  private readonly getSelectedSessionId?: () => string | undefined;
   private mode: 'proposal' | 'conflict' = 'proposal';
   private proposalId?: string;
   private workUnitId?: string;
 
-  constructor(panel: vscode.WebviewPanel, baseUrl: string, configService?: AgentConfigService) {
+  constructor(
+    panel: vscode.WebviewPanel,
+    baseUrl: string,
+    configService?: AgentConfigService,
+    getSelectedSessionId?: () => string | undefined,
+  ) {
     this.panel = panel;
     this.baseUrl = baseUrl;
     this.configService = configService;
+    this.getSelectedSessionId = getSelectedSessionId;
   }
 
   loadProposal(proposalId: string): void {
@@ -86,6 +93,17 @@ export class DecisionConvergencePanel {
     this.workUnitId = workUnitId;
     this.proposalId = undefined;
     void this.load();
+  }
+
+  /** Reloads the currently loaded proposal/conflict, or loads latest pending — used by the shell when the selected session changes. */
+  async triggerReload(): Promise<void> {
+    if (this.proposalId) {
+      void this.load();
+    } else if (this.workUnitId) {
+      void this.load();
+    } else {
+      await this.loadLatestPending();
+    }
   }
 
   static getFragment(): { css: string; html: string; script: string } {
@@ -127,27 +145,35 @@ export class DecisionConvergencePanel {
         constituents,
       });
     } catch (err) {
-      void vscode.window.showErrorMessage('NodalMerge: failed to load proposal — ' + String(err));
+      const msg = 'NodalMerge: failed to load proposal — ' + String(err);
+      void vscode.window.showErrorMessage(msg);
+      void this.panel.webview.postMessage({ type: 'loadError', error: msg });
     }
   }
 
   private async loadLatestPending(): Promise<void> {
     try {
-      const proposals = await this.get<MergeProposal[]>('/studio/merges');
+      const sessionId = this.getSelectedSessionId?.();
+      const proposals = await this.get<MergeProposal[]>('/studio/merges' + (sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : ''));
       const pending = proposals.find(p => {
         const status = (p.status || '').toLowerCase();
-        return status === 'readyforreview' || status === 'approved' || status === 'draft';
+        return status === 'readyforreview' || status === 'approved' || status === 'draft' || status === 'proposed' || status === 'executing' || status === 'merge';
       });
       if (pending) {
         this.loadProposal(pending.proposalId);
         return;
       }
 
-      const workUnits = await this.get<{ workUnitId: string; status: string }[]>('/studio/workunits');
+      const sessionParams = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
+      const workUnits = await this.get<{ workUnitId: string; status: string }[]>('/studio/workunits' + sessionParams);
       const reviewing = workUnits.find(wu => (wu.status || '').toLowerCase() === 'reviewing');
       if (reviewing) {
         this.loadConflict(reviewing.workUnitId);
+        return;
       }
+
+      // No pending proposals or conflicts — tell the webview
+      void this.panel.webview.postMessage({ type: 'noPending' });
     } catch (err) {
       void vscode.window.showWarningMessage('NodalMerge: failed to check for a pending decision — ' + String(err));
     }
@@ -589,6 +615,9 @@ const DC_JS = `
   var STATUS_BUTTONS = {
     draft:          { validate: true,  accept: false, reject: false, apply: false },
     readyforreview: { validate: false, accept: true,  reject: true,  apply: false },
+    proposed:       { validate: false, accept: true,  reject: true,  apply: false },
+    executing:      { validate: true,  accept: false, reject: false, apply: false },
+    merge:          { validate: false, accept: false, reject: false, apply: false },
     approved:       { validate: false, accept: false, reject: false, apply: true  },
     merged:         { validate: false, accept: false, reject: false, apply: false },
     rejected:       { validate: false, accept: false, reject: false, apply: false },
@@ -805,11 +834,32 @@ const DC_JS = `
   window.addEventListener('message', function(event) {
     var msg = event.data;
 
-    if (msg.type === 'conflict') {
+    if (msg.type === 'noPending') {
       var loadingEl2 = document.getElementById('loading');
       var contentEl2 = document.getElementById('content');
-      if (loadingEl2) loadingEl2.classList.add('hidden');
-      if (contentEl2) contentEl2.classList.remove('hidden');
+      if (loadingEl2) {
+        loadingEl2.textContent = 'No pending decisions to review.';
+        loadingEl2.style.opacity = '0.55';
+      }
+      if (contentEl2) { contentEl2.classList.add('hidden'); }
+      return;
+    }
+
+    if (msg.type === 'loadError') {
+      var loadingEl2 = document.getElementById('loading');
+      if (loadingEl2) {
+        loadingEl2.textContent = 'Failed to load: ' + (msg.error || 'Unknown error');
+        loadingEl2.style.opacity = '0.7';
+        loadingEl2.style.color = 'var(--nm-error, #f14c4c)';
+      }
+      return;
+    }
+
+    if (msg.type === 'conflict') {
+      var loadingEl3 = document.getElementById('loading');
+      var contentEl3 = document.getElementById('content');
+      if (loadingEl3) loadingEl3.classList.add('hidden');
+      if (contentEl3) contentEl3.classList.remove('hidden');
 
       setText('title', 'Decision Conflict: ' + (msg.workUnitId || ''));
       showDecisionSections(false);

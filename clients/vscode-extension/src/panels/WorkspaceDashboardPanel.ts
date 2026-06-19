@@ -54,6 +54,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
   private readonly configService: AgentConfigService | undefined;
   private readonly secrets: vscode.SecretStorage | undefined;
   private readonly lmProxyBaseUrl: string | undefined;
+  private readonly getSelectedSessionId?: () => string | undefined;
   private pollTimer?: ReturnType<typeof setInterval>;
 
   constructor(
@@ -63,6 +64,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
     configService?: AgentConfigService,
     secrets?: vscode.SecretStorage,
     lmProxyBaseUrl?: string,
+    getSelectedSessionId?: () => string | undefined,
   ) {
     this.panel         = panel;
     this.baseUrl       = baseUrl;
@@ -70,6 +72,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
     this.configService = configService;
     this.secrets       = secrets;
     this.lmProxyBaseUrl = lmProxyBaseUrl;
+    this.getSelectedSessionId = getSelectedSessionId;
   }
 
   static getFragment(): { css: string; html: string; script: string } {
@@ -82,6 +85,11 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
 
   activate(): void {
     this.startPolling();
+  }
+
+  /** Immediately re-polls — used by the shell when the selected session changes. */
+  async triggerPoll(): Promise<void> {
+    await this.poll();
   }
 
   private startPolling(): void {
@@ -99,12 +107,14 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
 
   private async poll(): Promise<void> {
     try {
+      const sessionId = this.getSelectedSessionId?.();
+      const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
       const [summary, workUnits, agents, merges, deadLetters] = await Promise.all([
-        this.get<WorkspaceSummary>('/studio/workspace-summary'),
-        this.get<WorkUnit[]>('/studio/workunits'),
-        this.get<AgentInfo[]>('/studio/agents?all=true'),
-        this.get<MergeProposal[]>('/studio/merges'),
-        this.get<DeadLetterEntry[]>('/studio/dead-letter'),
+        this.get<WorkspaceSummary>('/studio/workspace-summary' + params),
+        this.get<WorkUnit[]>('/studio/workunits' + params),
+        this.get<AgentInfo[]>('/studio/agents?all=true' + (sessionId ? '&sessionId=' + encodeURIComponent(sessionId) : '')),
+        this.get<MergeProposal[]>('/studio/merges' + params),
+        this.get<DeadLetterEntry[]>('/studio/dead-letter' + params),
       ]);
       void this.panel.webview.postMessage({ type: 'data', summary, workUnits, agents, merges, deadLetters });
       this.notifications?.update(merges);
@@ -353,7 +363,7 @@ const ET_CSS = `
 
 const ET_HTML = `
   <div class="header">
-    <span class="header-title">Execution Timeline<span class="pulse"></span></span>
+     <span class="header-title">Activity Center<span class="pulse"></span></span>
     <span id="last-updated"></span>
   </div>
 
@@ -495,7 +505,7 @@ const ET_JS = `
       var m = merges[i];
       var statusKey = (m.status || '').toLowerCase().replace(/\\s+/g, '');
       var badgeClass = 'badge ' + (DECISION_STATUS_COLOR[statusKey] || '');
-      var canReview = statusKey === 'readyforreview' || statusKey === 'approved' || statusKey === 'draft';
+      var canReview = statusKey === 'readyforreview' || statusKey === 'approved' || statusKey === 'draft' || statusKey === 'proposed' || statusKey === 'executing' || statusKey === 'merge';
       html += '<div class="card">';
       html += '<div class="row">';
       html += '<span class="title" title="' + esc(m.goal) + '">' + esc(m.goal) + '</span>';

@@ -46,13 +46,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
 
     // Notification click-through and dead-letter "review" actions open the shell (creating it
-    // if needed) and switch it to the Merge Review tab, instead of a standalone panel.
+    // if needed) and switch it to the Review tab, instead of a standalone panel.
     vscode.commands.registerCommand(COMMANDS.OPEN_MERGE_REVIEW, (proposalId: string) => {
       const shell = StudioShellPanel.createOrShow(
         manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
       );
       shell.showTab(DecisionConvergencePanel.containerId);
-      shell.decisionConvergence.loadProposal(proposalId);
+      shell.reviewPanel.loadProposal(proposalId);
     }),
 
     vscode.commands.registerCommand(COMMANDS.OPEN_MERGE_REVIEW_CONFLICT, (workUnitId: string) => {
@@ -60,7 +60,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
       );
       shell.showTab(DecisionConvergencePanel.containerId);
-      shell.decisionConvergence.loadConflict(workUnitId);
+      shell.reviewPanel.loadConflict(workUnitId);
     }),
   );
 

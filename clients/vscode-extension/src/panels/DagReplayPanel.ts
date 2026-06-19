@@ -35,17 +35,24 @@ export class TrajectoryReplayPanel {
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
+  private readonly getSelectedSessionId?: () => string | undefined;
   private pollTimer?: ReturnType<typeof setInterval>;
 
-  constructor(panel: vscode.WebviewPanel, baseUrl: string) {
+  constructor(panel: vscode.WebviewPanel, baseUrl: string, getSelectedSessionId?: () => string | undefined) {
     this.panel = panel;
     this.baseUrl = baseUrl;
+    this.getSelectedSessionId = getSelectedSessionId;
   }
 
   /** Called once by the shell right after construction — was the tail of createOrShow(). */
   activate(): void {
     void this.init();
     this.pollTimer = setInterval(() => { void this.refreshWorkUnits(); }, POLL_INTERVAL_MS);
+  }
+
+  /** Immediately re-polls — used by the shell when the selected session changes. */
+  async triggerPoll(): Promise<void> {
+    await this.refreshWorkUnits();
   }
 
   dispose(): void {
@@ -69,9 +76,11 @@ export class TrajectoryReplayPanel {
 
   private async init(): Promise<void> {
     try {
+      const sessionId = this.getSelectedSessionId?.();
+      const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
       const [workUnits, timeline] = await Promise.all([
-        this.get<WorkUnit[]>('/studio/workunits'),
-        this.get<TimelineResponse>('/studio/replay/timeline'),
+        this.get<WorkUnit[]>('/studio/workunits' + params),
+        this.get<TimelineResponse>('/studio/replay/timeline' + params),
       ]);
       const port = this.extractPort();
       void this.panel.webview.postMessage({
@@ -99,9 +108,11 @@ export class TrajectoryReplayPanel {
    * and orchestration events appear without a full re-init. */
   private async refreshWorkUnits(): Promise<void> {
     try {
+      const sessionId = this.getSelectedSessionId?.();
+      const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
       const [workUnits, timeline] = await Promise.all([
-        this.get<WorkUnit[]>('/studio/workunits'),
-        this.get<TimelineResponse>('/studio/replay/timeline'),
+        this.get<WorkUnit[]>('/studio/workunits' + params),
+        this.get<TimelineResponse>('/studio/replay/timeline' + params),
       ]);
       void this.panel.webview.postMessage({
         type: 'workUnits',
@@ -277,13 +288,13 @@ const DAG_REPLAY_CSS = `
 
 const DAG_REPLAY_HTML = `
   <div id="toolbar">
-    <span class="toolbar-title">Trajectory Replay</span>
+    <span class="toolbar-title">Pathways</span>
     <span id="status-dot" class="status-dot"></span>
     <span id="status-text">idle</span>
     <span id="node-count"></span>
   </div>
   <div style="padding: 4px 14px; font-size: 0.8em; opacity: 0.55; border-bottom: 1px solid var(--nm-border); flex-shrink: 0; display: flex; justify-content: space-between; align-items: center;">
-    <span>Replay the evolution of decisions through the goal → decomposition → execution → convergence lifecycle.</span>
+    <span>Trace the evolution of decisions through the goal → decomposition → execution → convergence lifecycle.</span>
     <select id="replay-mode" style="font-size:0.8em;padding:2px 6px;border:1px solid var(--nm-border);border-radius:3px;background:var(--vscode-input-background,#3c3c3c);color:var(--vscode-input-foreground,#ccc);">
       <option value="linear">Linear</option>
       <option value="branchexplorer">Branch Explorer</option>

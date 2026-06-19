@@ -11,9 +11,9 @@ import type { AgentConfigService } from '../AgentConfigService';
 interface TabDef { id: string; label: string }
 
 /**
- * NodalMerge Studio — Decision Workspace shell.
- * Consolidates Goal Workspace, Model & Agent Studio, Execution Timeline,
- * Decision Convergence, and Trajectory Replay into a single webview panel.
+ * NodalMerge Studio shell.
+ * Consolidates Goal Workspace, Model & Agent Studio, Activity Center,
+ * Review, and Pathways into a single webview panel.
  */
 export class StudioShellPanel implements vscode.Disposable {
   static current: StudioShellPanel | undefined;
@@ -22,10 +22,10 @@ export class StudioShellPanel implements vscode.Disposable {
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
 
-  readonly executionTimeline: ExecutionTimelinePanel;
-  readonly decisionConvergence: DecisionConvergencePanel;
+  readonly activityCenter: ExecutionTimelinePanel;
+  readonly reviewPanel: DecisionConvergencePanel;
   readonly modelAgentStudio: ModelAgentStudioPanel;
-  readonly trajectoryReplay: TrajectoryReplayPanel;
+  readonly pathways: TrajectoryReplayPanel;
   readonly goalWorkspace: GoalWorkspacePanel;
 
   private constructor(
@@ -39,11 +39,11 @@ export class StudioShellPanel implements vscode.Disposable {
   ) {
     this.panel = panel;
 
-    this.executionTimeline   = new ExecutionTimelinePanel(panel, baseUrl, notifications, configService, secrets, lmProxyBaseUrl);
-    this.decisionConvergence = new DecisionConvergencePanel(panel, baseUrl, configService);
+    this.activityCenter   = new ExecutionTimelinePanel(panel, baseUrl, notifications, configService, secrets, lmProxyBaseUrl, this.getSelectedSessionId);
+    this.reviewPanel = new DecisionConvergencePanel(panel, baseUrl, configService, this.getSelectedSessionId);
     this.modelAgentStudio    = new ModelAgentStudioPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
-    this.trajectoryReplay    = new TrajectoryReplayPanel(panel, baseUrl);
-    this.goalWorkspace       = new GoalWorkspacePanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
+    this.pathways    = new TrajectoryReplayPanel(panel, baseUrl, this.getSelectedSessionId);
+    this.goalWorkspace       = new GoalWorkspacePanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl, this.onSessionChanged);
 
     this.panel.webview.html = this.buildHtml(extensionUri);
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
@@ -53,11 +53,26 @@ export class StudioShellPanel implements vscode.Disposable {
       this.disposables,
     );
 
-    this.executionTimeline.activate();
+    this.activityCenter.activate();
     this.modelAgentStudio.activate();
-    this.trajectoryReplay.activate();
+    this.pathways.activate();
     this.goalWorkspace.activate();
   }
+
+  /** Returns the currently-selected session ID from the Goal Workspace. */
+  private getSelectedSessionId = (): string | undefined => {
+    return this.goalWorkspace?.selectedSessionId;
+  };
+
+  /** Called by GoalWorkspacePanel when the user selects a session.
+   *  Triggers repolling for Activity Center and Pathways so they filter to the session. */
+  private onSessionChanged = (sessionId: string | undefined): void => {
+    void this.panel.webview.postMessage({ type: 'sessionSelected', sessionId: sessionId ?? '' });
+    // Re-poll filtered panels immediately
+    void this.activityCenter.triggerPoll();
+    void this.pathways.triggerPoll();
+    void this.reviewPanel.triggerReload();
+  };
 
   static createOrShow(
     baseUrl: string,
@@ -73,7 +88,7 @@ export class StudioShellPanel implements vscode.Disposable {
     }
     const panel = vscode.window.createWebviewPanel(
       StudioShellPanel.viewType,
-      'NodalMerge Studio — Decision Workspace',
+      'NodalMerge Studio',
       vscode.ViewColumn.Two,
       {
         enableScripts: true,
@@ -95,10 +110,10 @@ export class StudioShellPanel implements vscode.Disposable {
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
     await Promise.all([
-      this.executionTimeline.handleMessage(msg),
-      this.decisionConvergence.handleMessage(msg),
+      this.activityCenter.handleMessage(msg),
+      this.reviewPanel.handleMessage(msg),
       this.modelAgentStudio.handleMessage(msg),
-      this.trajectoryReplay.handleMessage(msg),
+      this.pathways.handleMessage(msg),
       this.goalWorkspace.handleMessage(msg),
     ]);
   }
@@ -116,9 +131,9 @@ export class StudioShellPanel implements vscode.Disposable {
     const tabs: TabDef[] = [
       { id: GoalWorkspacePanel.containerId, label: 'Goal Workspace' },
       { id: ModelAgentStudioPanel.containerId, label: 'Model & Agent Studio' },
-      { id: ExecutionTimelinePanel.containerId, label: 'Execution Timeline' },
-      { id: DecisionConvergencePanel.containerId, label: 'Decision Convergence' },
-      { id: TrajectoryReplayPanel.containerId, label: 'Trajectory Replay' },
+      { id: ExecutionTimelinePanel.containerId, label: 'Activity Center' },
+      { id: DecisionConvergencePanel.containerId, label: 'Review' },
+      { id: TrajectoryReplayPanel.containerId, label: 'Pathways' },
     ];
     const tabButtonsHtml = tabs
       .map(t => `<button class="nm-shell-tab${t.id === GoalWorkspacePanel.containerId ? ' active' : ''}" data-tab="${t.id}">${t.label}</button>`)
@@ -131,7 +146,7 @@ export class StudioShellPanel implements vscode.Disposable {
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; connect-src ws://127.0.0.1:*;">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NodalMerge Studio — Decision Workspace</title>
+   <title>NodalMerge Studio</title>
   <style nonce="${nonce}">
 ${SHELL_CSS_VARS}
 ${goalWorkspaceFragment.css}
@@ -188,9 +203,9 @@ ${trajectoryFragment.scriptTag}
 
   dispose(): void {
     StudioShellPanel.current = undefined;
-    this.executionTimeline.dispose();
+    this.activityCenter.dispose();
     this.goalWorkspace.dispose();
-    this.trajectoryReplay.dispose();
+    this.pathways.dispose();
     this.panel.dispose();
     for (const d of this.disposables) { d.dispose(); }
     this.disposables.length = 0;
