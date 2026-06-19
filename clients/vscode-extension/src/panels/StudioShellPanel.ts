@@ -118,6 +118,12 @@ export class StudioShellPanel implements vscode.Disposable {
     ]);
   }
 
+  // style-src below intentionally omits a nonce: VS Code's webview host injects the current
+  // theme's CSS custom properties via inline style attributes on load, and pairing 'unsafe-inline'
+  // with a nonce/hash on the same directive makes browsers disregard 'unsafe-inline' entirely
+  // (CSP3 backwards-compat rule) — that blocked the injection and a host-side fallback path threw
+  // a document.write() SyntaxError that aborted parsing the rest of the page, silently preventing
+  // every script tag after the failure point (including Decision Convergence's) from ever running.
   private buildHtml(extensionUri: vscode.Uri): string {
     const nonce  = buildNonce();
     const webview = this.panel.webview;
@@ -144,7 +150,7 @@ export class StudioShellPanel implements vscode.Disposable {
 <head>
   <meta charset="UTF-8">
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; connect-src ws://127.0.0.1:*;">
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src ws://127.0.0.1:*;">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
    <title>NodalMerge Studio</title>
   <style nonce="${nonce}">

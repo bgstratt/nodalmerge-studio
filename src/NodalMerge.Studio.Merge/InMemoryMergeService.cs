@@ -39,7 +39,10 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
     {
-        var stored = proposal with { Status = MergeProposalStatus.Draft };
+        // Status is the caller's to set — normally Draft (MergeCommandService, MergeReconciliationService),
+        // but the policy-gate-blocked path deliberately proposes straight into Rejected. Forcing Draft
+        // here unconditionally used to silently clobber that back to Draft.
+        var stored = proposal;
         _proposals[proposal.ProposalId] = stored;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.MergeProposalV1,

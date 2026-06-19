@@ -138,7 +138,7 @@ export class DecisionConvergencePanel {
       const constituents = (proposal.reconciledFrom && proposal.reconciledFrom.length)
         ? await this.get<ConstituentProposal[]>('/studio/merges/' + this.proposalId + '/constituents')
         : [];
-      void this.panel.webview.postMessage({
+      await this.panel.webview.postMessage({
         type: 'proposal',
         proposal,
         fileChanges: changesRes.fileChanges ?? [],
@@ -301,25 +301,42 @@ export class DecisionConvergencePanel {
   }
 
   private async get<T>(path: string): Promise<T> {
-    const res = await fetch(this.baseUrl + path);
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error('GET ' + path + ' → ' + String(res.status) + ': ' + text);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error('timed out after 8000ms')), 8000);
+    try {
+      const res = await fetch(this.baseUrl + path, { signal: controller.signal });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error('GET ' + path + ' → ' + String(res.status) + ': ' + text);
+      }
+      return res.json() as Promise<T>;
+    } catch (err) {
+      throw new Error('GET ' + path + ' failed — ' + String(err));
+    } finally {
+      clearTimeout(timeout);
     }
-    return res.json() as Promise<T>;
   }
 
   private async post<T = unknown>(path: string, body: unknown): Promise<T> {
-    const res = await fetch(this.baseUrl + path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error('POST ' + path + ' → ' + String(res.status) + ': ' + text);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error('timed out after 8000ms')), 8000);
+    try {
+      const res = await fetch(this.baseUrl + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error('POST ' + path + ' → ' + String(res.status) + ': ' + text);
+      }
+      return res.json() as Promise<T>;
+    } catch (err) {
+      throw new Error('POST ' + path + ' failed — ' + String(err));
+    } finally {
+      clearTimeout(timeout);
     }
-    return res.json() as Promise<T>;
   }
 
 }
@@ -624,7 +641,7 @@ const DC_JS = `
   };
 
   function esc(s) {
-    return String(s || '').replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>');
+    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   }
 
   function setText(id, val) {
@@ -956,7 +973,7 @@ const DC_JS = `
             var outId = 'exec-stdout-' + Math.random().toString(36).slice(2,8);
             html += '<button class="exec-output-toggle" data-target="' + outId + '">▼ Output</button>';
             html += '<pre class="exec-output-pre" id="' + outId + '" style="display:none">';
-            if (hasStderr) html += esc(b.stdErr) + '\n';
+            if (hasStderr) html += esc(b.stdErr) + '\\n';
             if (hasStdout) html += esc(b.stdOut);
             html += '</pre>';
           }
@@ -1027,7 +1044,6 @@ const DC_JS = `
     rerenderFileChanges();
     showIf('section-files', fileChanges.length > 0);
 
-    showIf('section-evidence', !!p.verificationResults);
     showIf('section-rollback', !!p.rollbackPlan);
 
     var btns = STATUS_BUTTONS[status] || { validate: false, accept: false, reject: false, apply: false };
@@ -1037,3 +1053,4 @@ const DC_JS = `
     setDisabled('btn-apply',   !btns.apply);
   });
 `;
+

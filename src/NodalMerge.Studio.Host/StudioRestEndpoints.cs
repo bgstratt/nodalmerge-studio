@@ -38,7 +38,12 @@ public static class StudioRestEndpoints
         string TargetBranch,
         string Summary,
         string? Goal = null,
-        string? ChangeDescription = null);
+        string? ChangeDescription = null,
+        string? WorkUnitId = null,
+        string? AgentId = null,
+        string? Model = null,
+        string? Provider = null,
+        string? SessionId = null);
 
     private sealed record ReviewBody(string Decision);
 
@@ -855,6 +860,8 @@ public static class StudioRestEndpoints
             var created = await mergeCommands.ProposeAsync(
                 body.SourceBranch, body.TargetBranch, body.Summary,
                 body.Goal, body.ChangeDescription,
+                workUnitId: body.WorkUnitId, agentId: body.AgentId, model: body.Model,
+                provider: body.Provider, sessionId: body.SessionId,
                 commandId: commandId, cancellationToken: ct).ConfigureAwait(false);
 
             return Results.Ok(created);

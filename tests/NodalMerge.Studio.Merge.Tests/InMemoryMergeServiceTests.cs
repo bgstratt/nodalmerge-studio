@@ -205,14 +205,18 @@ public class InMemoryMergeServiceTests
     // ── ProposeAsync ────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task ProposeAsync_always_stores_as_Draft()
+    public async Task ProposeAsync_stores_the_caller_supplied_status()
     {
+        // ProposeAsync no longer forces Draft — the policy-gate-blocked path in
+        // MergeCommandService relies on proposing straight into Rejected, and normal
+        // callers (MergeCommandService, MergeReconciliationService) already pass Draft
+        // themselves.
         var svc = Build();
-        var proposal = MakeProposal("MP-1") with { Status = MergeProposalStatus.Approved };
+        var proposal = MakeProposal("MP-1") with { Status = MergeProposalStatus.Rejected };
 
         var result = await svc.ProposeAsync(proposal);
 
-        Assert.Equal(MergeProposalStatus.Draft, result.Status);
+        Assert.Equal(MergeProposalStatus.Rejected, result.Status);
     }
 
     // ── GetAsync ────────────────────────────────────────────────────────────

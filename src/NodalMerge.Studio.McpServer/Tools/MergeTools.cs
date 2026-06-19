@@ -16,12 +16,20 @@ public sealed class MergeTools(IMergeCommandService mergeCommands)
         string summary,
         string? goal = null,
         string? changeDescription = null,
+        [Description("Your work unit ID — required for artifact lineage, the work-unit status transition, and for the proposal to be discoverable when the Review pane is scoped to a session.")]
+        string? workUnitId = null,
+        [Description("Your agent ID for attribution (optional).")]
+        string? agentId = null,
+        string? model = null,
+        string? provider = null,
+        string? sessionId = null,
         [Description("Idempotency key (GUID). Same commandId returns the cached result without creating a second proposal.")]
         string? commandId = null,
         CancellationToken cancellationToken = default)
     {
         var created = await mergeCommands.ProposeAsync(
             sourceBranch, targetBranch, summary, goal, changeDescription,
+            workUnitId: workUnitId, agentId: agentId, model: model, provider: provider, sessionId: sessionId,
             commandId: commandId, cancellationToken: cancellationToken).ConfigureAwait(false);
 
         return McpJson.Ok(new { proposalId = created.ProposalId, status = created.Status.ToString() });
