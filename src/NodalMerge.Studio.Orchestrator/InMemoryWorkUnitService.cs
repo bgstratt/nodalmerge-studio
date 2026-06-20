@@ -179,6 +179,8 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         string? sliceId = null,
         IReadOnlyDictionary<string, string>? metadata = null,
         HypothesisForkType? forkType = null,
+        ReviewPolicy? reviewPolicy = null,
+        bool bypassPromotionBranch = false,
         CancellationToken cancellationToken = default)
     {
         // First work unit with a repositoryPath seeds the main branch for this session.
@@ -213,7 +215,9 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             FileScope: fileScope ?? [],
             FanOutInfo: fanOutInfo,
             BranchedFromProposalId: branchedFromProposalId,
-            ForkType: forkType);
+            ForkType: forkType,
+            ReviewPolicy: reviewPolicy ?? ReviewPolicy.HumanRequired,
+            BypassPromotionBranch: bypassPromotionBranch);
 
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }
@@ -340,6 +344,8 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IFanOutService, FanOutService>();
         services.AddSingleton<IWorkUnitCommandService, WorkUnitCommandService>();
+        services.AddSingleton<IExperimentService, ExperimentService>();
+        services.AddSingleton<ISteeringService, SteeringService>();
         return services;
     }
 }

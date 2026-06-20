@@ -188,6 +188,7 @@ public class WorkUnitLifecycleTests
         public Task<KnownGoodState> MarkKnownGoodAsync(KnownGoodState state, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<KnownGoodState>> FindKnownGoodAsync(string branchId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<KnownGoodState?> CheckoutKnownGoodAsync(string stateId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<KnownGoodState?> GetAsync(string stateId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
     private sealed class NoopAgentControlService : IAgentControlService

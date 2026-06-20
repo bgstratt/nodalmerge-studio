@@ -23,6 +23,7 @@ public enum HypothesisForkType
     Model,
     Research,
     Architecture,
+    Library,
     Product
 }
 

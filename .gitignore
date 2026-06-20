@@ -19,6 +19,7 @@ appsettings.*.local.json
 
 # Local artifacts
 artifacts/
+CoverageReport/
 
 # Studio Host runtime data — Sqlite node store + file blob store (Slice 0a persistence)
 src/NodalMerge.Studio.Host/data/

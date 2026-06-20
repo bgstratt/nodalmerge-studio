@@ -2,6 +2,7 @@ using System.Text.Json.Serialization;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using NodalMerge.Studio.AgentRuntime;
+using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Merge;
 using NodalMerge.Studio.McpServer;
 using NodalMerge.Studio.Orchestrator;
@@ -48,6 +49,7 @@ public static class StudioServiceCollectionExtensions
         services.AddStudioMerge();
         services.AddStudioAgentRuntime(llmHttpClient);
         services.AddStudioOrchestrator();
+        services.AddSingleton<ICounterfactualService, NodalMerge.Studio.Orchestrator.CounterfactualService>();
         services.AddStudioMcpServer();
         return services;
     }

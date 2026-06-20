@@ -30,7 +30,7 @@ Approved State     ← committed, traceable back to the goal
 2. **An orchestrator agent plans it.** The orchestrator breaks the goal into work units and tasks.
 3. **Worker agents execute tasks.** Each worker operates on its own branch, producing changes.
 4. **Merge proposals are generated.** Workers submit structured proposals with full lineage.
-5. **You review and approve.** Human approval is mandatory for all merges in v1.
+5. **A proposal is reviewed and approved.** By default a human approves it; a goal can opt into `Agent Approval` or `Hybrid` review policy so a reviewer agent (and a timeout) handles it instead — see [Trust, Autonomy & Exploration](#trust-autonomy--exploration) below.
 6. **State converges.** Approved changes land in the authoritative branch.
 
 ### Key Concepts
@@ -43,6 +43,11 @@ Approved State     ← committed, traceable back to the goal
 | **Merge Proposal** | Structured intent to reconcile branch changes into the authoritative branch. Includes diff, artifact lineage, execution event, and verification results. |
 | **Known Good State** | A verified branch checkpoint used for rollback and recovery. |
 | **Room** | Sync boundary for multi-peer NodalMerge replication. |
+| **Review Policy** | Per-work-unit setting (`Human Required` / `Agent Approval` / `Hybrid`) controlling who approves a proposal before it applies. |
+| **Candidate Branch** | Optional safety layer: when promotion branches are enabled, applies land here instead of `main` until a human explicitly promotes. |
+| **Experiment** | A parent work unit fanned out into 2+ sibling forks (different model, architecture, library, or product framing) that run in parallel for comparison. |
+| **Steering** | Pausing a running work unit and injecting a constraint, which forks a sibling that resumes with it — the original's decision log is never rewritten. |
+| **Counterfactual** | A sibling work unit branched from a completed proposal's base state and re-run under a different model/profile for comparison. |
 
 ### Agent Execution Loop
 
@@ -58,7 +63,66 @@ Verify  → Validate outcome
 Propose → Submit merge proposal
 ```
 
-The loop ends at proposal submission. Merge authority remains external — agents propose, humans approve.
+The loop ends at proposal submission. Merge authority remains external — agents propose, by default humans approve.
+
+---
+
+## Trust, Autonomy & Exploration
+
+Beyond the core pipeline above, NodalMerge Studio lets you configure *how much* human attention each goal actually needs, *where* speculative work is allowed to land, and *how many* alternatives get explored before you commit to one. These are independent, composable settings — each goal can use a different combination.
+
+### Review Policy — who approves a proposal
+
+Set per goal in the Goal Workspace (or as a session default in Model & Agent Studio):
+
+| Policy | Behavior |
+|---|---|
+| `Human Required` (default) | Every proposal waits at the merge-review gate for manual Accept/Reject. No behavior change from v1. |
+| `Agent Approval` | A reviewer agent evaluates the proposal (build/test evidence, goal satisfaction) and auto-applies on approval, or rejects with notes for a human to see. |
+| `Hybrid` | The reviewer agent approves immediately, then a countdown (default 5 minutes) starts. A human can override (reject) during the window; otherwise it auto-applies at expiry. |
+
+### Optional execution gates — verify before proposing
+
+Independent of review policy, a work unit's branch can be required to **build** and/or **test** clean before it's even allowed to submit a proposal (toggled in Exploration Settings). Failing evidence is attached to the proposal either way, so reviewers (human or agent) always see it.
+
+### Promotion Branches — a safety layer above "main"
+
+When enabled (session-wide, with a per-goal override), proposals never apply directly to `main`. They land on a shared `candidate` branch instead:
+
+```
+Agent Work Branches  →  Candidate Branch  →  Main
+ (per work unit,         (auto-applies         (explicit human
+  fully sandboxed)        land here)            "Promote to Main")
+```
+
+A goal can opt out of the candidate layer with the **Direct** target override, bypassing promotion even when it's on session-wide.
+
+### Experiments — explore several approaches in parallel
+
+A goal can fan out into 2+ sibling work units that run concurrently and converge into a side-by-side comparison:
+
+| Strategy | What differs between forks |
+|---|---|
+| **Multi-Model Comparison** | Same goal, different LLM/profile per fork |
+| **Architecture Fork** | Same goal, a different structural constraint injected per fork (e.g. "use CQRS" vs. "use a simple service layer") |
+| **Library Comparison** | Same goal, a different dependency constraint per fork |
+| **Product Strategy Fork** | Same goal, a different product-framing constraint per fork |
+
+Each fork runs to its own proposal; the Decision Tree shows a fork-count badge and a **Compare Results** view. **Pick Winner** accepts the chosen fork's proposal and rejects the others — all recorded in the decision log.
+
+### Steering — redirect a running agent without losing its history
+
+Instead of stopping and re-prompting an agent from scratch, you can **pause** a running work unit, inject a constraint or correction ("use Redis instead of SQLite"), and the system forks a sibling work unit that resumes with that constraint in its plan context. The original work unit's decision log is untouched — steering never rewrites history, it branches from it. You can also fork from any specific node in Trajectory Replay, not just the live edge.
+
+### Counterfactual Replay — "what would a different model do here?"
+
+From any completed work unit, **Run with different model** branches from that proposal's base state and re-runs the same goal under a different profile. The result is a new sibling work unit; selecting it shows a **Compare with Original** view (proposals, confidence, file coverage side by side) without disturbing the original.
+
+### Putting it together
+
+A typical autonomous run: you describe a goal, pick `Agent Approval` (or `Hybrid`) so it doesn't need you at the merge gate, turn on the candidate branch so nothing touches `main` directly, optionally require build+test evidence before any proposal is even accepted, and — if you're unsure which approach is best — launch it as a Multi-Model or Architecture experiment instead of a single run. You can walk away; when you come back, either a completed merge is waiting on `candidate` for you to promote, or a decision (a rejected proposal, a paused agent awaiting your steering input, or a set of forks awaiting **Pick Winner**) is waiting in the Decision Tree.
+
+See [docs/reference/ui-reference.md](docs/reference/ui-reference.md) for every control these features expose in the extension, and [docs/reference/api-reference.md](docs/reference/api-reference.md) for the full MCP/REST surface behind them.
 
 ---
 
@@ -100,14 +164,15 @@ Full MCP v1 tool surface with 30+ frozen tool names under `nm.v1.*` namespaces. 
 The following are explicitly deferred from v1:
 
 - Autonomous self-directed agents (agents cannot set their own goals)
-- Agent-to-agent approval chains
-- Agent-controlled merges without human review
 - Long-term memory databases or vector stores
 - "Dreaming" / distillation pipelines
 - Cross-workspace reasoning
 - Autonomous goal generation
 - Enterprise RBAC systems
 - Multi-tenant SaaS architecture
+- Per-work-unit cross-repo execution (single shared repository path per workspace today)
+
+**No longer fully deferred (Phase 7):** Agent-controlled merges without a human in the loop are now possible, but only when a goal explicitly opts into `Agent Approval` or `Hybrid` review policy — `Human Required` remains the default and unchanged behavior. There is still no agent-to-agent approval chain beyond the single configured reviewer agent.
 
 **Architectural invariant:** All persistent state lives in NodalMerge nodes. No separate memory DB. No vector DB. No agent-specific memory stores.
 
@@ -189,21 +254,25 @@ NodalMerge Studio serves as the **Control Tower** for human operators. The exten
 
 | Command | Description |
 |---|---|
-| `NodalMerge: Open Studio` | Open the main workspace dashboard |
-| `NodalMerge: Open Merge Review` | Review and approve/reject merge proposals |
-| `NodalMerge: Open Merge Conflict` | Resolve merge conflicts |
+| `NodalMerge: Open Studio` | Open the Studio shell (tabbed: Goal Workspace, Activity Center, Model & Agent Studio, Decision Convergence, Pathways) |
+| `NodalMerge: Open Review` | Open Decision Convergence for a specific merge proposal |
+| `NodalMerge: Open Decision Conflict` | Open Decision Convergence in conflict-resolution mode |
 | `NodalMerge: Restart Studio Host` | Restart the embedded Studio host |
 | `NodalMerge: Show Output` | Show Studio output channel |
 
 ### Control Tower Capabilities
 
-- View active work units, agents, and their status
-- Spawn, pause, resume, and stop agents
-- Inspect projections at any compression level
-- Review and approve/reject merge proposals
-- Browse the artifact DAG and replay timeline
-- Rollback to Known Good State
-- View workspace summary (active work units, pending merges, failures)
+- Create goals with a chosen review policy, target branch, and exploration strategy (single agent, multi-agent fanout, or multi-fork experiment)
+- View active work units, agents, and their status; spawn, pause, resume, and stop agents
+- Inspect projections, decision context, and reasoning chains at any compression level
+- Review and approve/reject/apply merge proposals, including converged multi-candidate decisions
+- Steer a running agent (pause + inject constraint) or fork from any point in its history
+- Compare experiment forks or counterfactual re-runs side by side and pick a winner
+- Browse the artifact DAG and scrub the replay timeline; branch from any checkpoint
+- Mark a checkpoint as Known Good, restore a branch to one, or fork a new exploration from one
+- View workspace summary (active work units, pending merges, failures, dead-letter queue)
+
+See [docs/reference/ui-reference.md](docs/reference/ui-reference.md) for the complete control-by-control inventory of every panel.
 
 ---
 
@@ -287,24 +356,34 @@ Define reusable orchestrator + worker team compositions:
 
 ## MCP Integration
 
-NodalMerge Studio exposes a frozen MCP v1 tool surface with 30+ tools. All tools use the `nm.v1.*` namespace (unchanged since plan slice 1; canonical constants in `McpToolNames`).
+NodalMerge Studio exposes a frozen MCP v1 tool surface with **63 tools** across 19 namespaces. All tools use the `nm_v1_*` namespace (unchanged since plan slice 1; canonical constants in `McpToolNames`).
 
 ### Tool Namespaces
 
 | Namespace | Purpose | Key Tools |
 |---|---|---|
-| `nm.v1.projection.*` | Context generation for agents | `get`, `list` |
-| `nm.v1.workunit.*` | Work unit lifecycle | `create`, `get`, `update`, `list` |
-| `nm.v1.task.*` | Task management (intent only) | `create`, `update`, `list`, `assign` |
-| `nm.v1.branch.*` | Branch management | `create`, `checkout`, `list`, `status` |
-| `nm.v1.merge.*` | Merge proposal workflow | `propose`, `validate`, `review`, `apply` |
-| `nm.v1.replay.*` | History inspection | `range`, `rollback`, `inspect` |
-| `nm.v1.state.*` | Known good state | `markKnownGood`, `findKnownGood`, `checkoutKnownGood` |
-| `nm.v1.snapshot.*` | Execution snapshots | `get`, `compare` |
-| `nm.v1.agent.*` | Agent lifecycle | `spawn`, `pause`, `resume`, `status`, `stop` |
-| `nm.v1.workspace.*` | Control tower summary | `summary` |
+| `nm_v1_projection_*` | Context generation for agents | `get`, `list` |
+| `nm_v1_workunit_*` | Work unit lifecycle | `create`, `get`, `update`, `list` |
+| `nm_v1_task_*` | Task management (intent only) | `create`, `update`, `list`, `assign` |
+| `nm_v1_branch_*` | Branch management | `create`, `checkout`, `list`, `status` |
+| `nm_v1_merge_*` | Merge proposal workflow | `propose`, `validate`, `review`, `apply` |
+| `nm_v1_replay_*` | History inspection | `range`, `rollback`, `inspect` |
+| `nm_v1_state_*` | Known good state | `markKnownGood`, `findKnownGood`, `checkoutKnownGood` |
+| `nm_v1_snapshot_*` | Execution snapshots | `get`, `compare` |
+| `nm_v1_agent_*` | Agent lifecycle | `spawn`, `pause`, `resume`, `status`, `stop` |
+| `nm_v1_workspace_*` | Control tower summary + file I/O + build/test/run execution | `summary`, `read`/`write`, `build`/`test`/`exec`/`run` |
+| `nm_v1_scheduler_*` | Work queue | `enqueue`, `pending` |
+| `nm_v1_artifact_*` | Knowledge artifacts | `record`, `query`, `list` |
+| `nm_v1_goal_*` | Decision-centric goal nodes | `create`, `list` |
+| `nm_v1_decision_*` | Decision log against proposals | `record`, `list` |
+| `nm_v1_evidence_*` | Build/test evidence attachment | `attach`, `list` |
+| `nm_v1_trajectory_*` | Lifecycle phase tracking + replay | `create`, `replay` |
+| `nm_v1_hypothesis_*` | Hypothesis forks | `fork`, `list` |
+| `nm_v1_model_*` | Cross-model comparison | `compare`, `replay` |
 
-See [docs/contracts/mcp-v1-contract.md](docs/contracts/mcp-v1-contract.md) for the complete catalog, request/response schemas, and error envelope format.
+**Phase 7 capabilities (Experiments, Steering, Counterfactuals, Review Policy, Promotion Branches) are REST-only** — they don't have dedicated `nm_v1_*` tools yet. See [docs/reference/api-reference.md](docs/reference/api-reference.md) for the full tool-by-tool catalog, which REST endpoints exist for each, and which tools are actually reachable by autonomous agents versus external MCP clients only.
+
+See [docs/contracts/mcp-v1-contract.md](docs/contracts/mcp-v1-contract.md) for the original frozen catalog, request/response schemas, and error envelope format (Goal/Decision/Evidence/Trajectory/Hypothesis/Reasoning/Model namespaces and all Phase 7 REST additions postdate that document — use the reference doc above for those).
 
 ---
 
@@ -328,7 +407,7 @@ Layer 1: NodalMerge Core (Rust)   — DAG storage, CRDT convergence, replication
 1. **NodalMerge is the source of truth.** All persistent state resides in NodalMerge nodes.
 2. **Agents reason over projections.** Agents never consume raw DAG history.
 3. **Work unit-centric execution.** Every agent session is scoped to exactly one work unit.
-4. **Human-governed promotion.** Agents propose; humans approve merges.
+4. **Human-governed promotion by default.** Agents propose; a human approves merges unless a goal explicitly opts into agent-approved review, and even then a promotion branch can keep automated applies off `main`.
 5. **Immutable history.** DAG nodes are append-only; updates create new nodes.
 
 See [docs/architecture/v1-architecture-spec.md](docs/architecture/v1-architecture-spec.md) for the full specification.
@@ -352,7 +431,7 @@ See [docs/architecture/v1-architecture-spec.md](docs/architecture/v1-architectur
 | `clients/vscode-extension` | VS Code extension (Control Tower) |
 | `clients/web-dashboard` | Web dashboard (placeholder) |
 | `tests/` | Unit and integration tests |
-| `docs/` | Architecture spec, MCP v1 contract, ADRs |
+| `docs/` | Architecture spec, MCP v1 contract, ADRs, [UI](docs/reference/ui-reference.md) and [API](docs/reference/api-reference.md) reference |
 | `plans/` | Slice-based execution plans |
 | `scripts/` | Build, dev, and verify scripts |
 

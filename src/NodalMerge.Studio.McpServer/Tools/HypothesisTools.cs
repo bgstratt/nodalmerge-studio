@@ -19,7 +19,7 @@ public sealed class HypothesisTools(IWorkUnitService workUnits, IWorkUnitCommand
         CancellationToken cancellationToken = default)
     {
         if (!Enum.TryParse<HypothesisForkType>(forkType, ignoreCase: true, out var hypothesisType))
-            return McpJson.Error(McpToolNames.HypothesisFork, $"Invalid forkType '{forkType}'. Use Code, Reasoning, Model, Research, Architecture, or Product.");
+            return McpJson.Error(McpToolNames.HypothesisFork, $"Invalid forkType '{forkType}'. Use Code, Reasoning, Model, Research, Architecture, Library, or Product.");
 
         var workUnit = await workUnitCommands.CreateAsync(
             new WorkUnitCreateCommand(goal, "studio", ParentWorkUnitId: parentWorkUnitId, ForkType: hypothesisType),

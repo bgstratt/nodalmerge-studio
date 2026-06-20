@@ -27,6 +27,9 @@ public static class StudioNodeKind
     public const string TrajectoryV1         = "studio/trajectory/v1";
     public const string HypothesisV1         = "studio/hypothesis/v1";
     public const string ReasoningCommitV1    = "studio/reasoning-commit/v1";
+    public const string ReviewTimerV1        = "studio/review-timer/v1";
+    public const string ExperimentV1         = "studio/experiment/v1";
+    public const string SteeringDecisionV1   = "studio/steering-decision/v1";
 }
 
 public interface IStudioNodeStore

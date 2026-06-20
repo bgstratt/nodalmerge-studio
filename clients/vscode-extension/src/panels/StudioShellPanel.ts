@@ -57,6 +57,7 @@ export class StudioShellPanel implements vscode.Disposable {
     this.modelAgentStudio.activate();
     this.pathways.activate();
     this.goalWorkspace.activate();
+    this.reviewPanel.activate();
   }
 
   /** Returns the currently-selected session ID from the Goal Workspace. */
@@ -109,6 +110,18 @@ export class StudioShellPanel implements vscode.Disposable {
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
+    if (msg.type === 'sessionOverrideChanged') {
+      const panelId = msg.panelId as string;
+      const sessionId = (msg.sessionId as string | undefined) || undefined;
+      if (panelId === ExecutionTimelinePanel.containerId) {
+        this.activityCenter.setSessionOverride(sessionId);
+      } else if (panelId === DecisionConvergencePanel.containerId) {
+        this.reviewPanel.setSessionOverride(sessionId);
+      } else if (panelId === TrajectoryReplayPanel.containerId) {
+        this.pathways.setSessionOverride(sessionId);
+      }
+      return;
+    }
     await Promise.all([
       this.activityCenter.handleMessage(msg),
       this.reviewPanel.handleMessage(msg),

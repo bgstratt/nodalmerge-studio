@@ -193,6 +193,28 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
                 JsonSerializer.Serialize(created), cancellationToken).ConfigureAwait(false);
         }
 
+        // Slice 20b — auto-trigger ApplyAsync for non-HumanRequired policies. The apply call
+        // hits the BeforeMerge gate which runs the inline reviewer, so the reviewer fires here
+        // rather than requiring the human to click "Apply". Fire-and-forget: errors surface in
+        // the proposal status (gate throws InvalidOperationException which is swallowed here).
+        if (workUnitId is not null && policyGate is not null)
+        {
+            var workUnits = serviceProvider.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+            if (workUnits is not null)
+            {
+                var wu = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false);
+                if (wu?.ReviewPolicy is ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid)
+                {
+                    var proposalIdToApply = created.ProposalId;
+                    _ = Task.Run(async () =>
+                    {
+                        try { await ApplyAsync(proposalIdToApply, CancellationToken.None).ConfigureAwait(false); }
+                        catch { /* reviewer rejection or gate block — proposal stays in current state */ }
+                    });
+                }
+            }
+        }
+
         return created;
     }
 
@@ -213,13 +235,52 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
             throw new ArgumentException("Decision must be 'Approved' or 'Rejected'.", nameof(decision));
         }
 
+        // Slice 20c — human override cancels any pending Hybrid timer.
+        if (!automated)
+        {
+            var timerService = serviceProvider.GetService(typeof(IReviewTimerService)) as IReviewTimerService;
+            if (timerService is not null)
+                await timerService.TryCancelAsync(proposalId, cancellationToken).ConfigureAwait(false);
+        }
+
         return automated
             ? await merge.AutomatedReviewAsync(proposalId, status, verificationResults ?? string.Empty, reviewerAgentId, cancellationToken).ConfigureAwait(false)
             : await merge.ReviewAsync(proposalId, status, cancellationToken).ConfigureAwait(false);
     }
 
-    public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default) =>
-        merge.ApplyAsync(proposalId, cancellationToken);
+    // Slice 20b — BeforeMerge gate. For AgentApproval/Hybrid policies the AutoReviewRule runs the
+    // reviewer inline and returns Allowed only when the proposal is approved. HumanRequired passes
+    // through immediately (no behavioral change for the default policy).
+    public async Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default)
+    {
+        if (policyGate is not null)
+        {
+            var proposal = await merge.GetAsync(proposalId, cancellationToken).ConfigureAwait(false);
+            var workUnits = serviceProvider.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+            WorkUnit? workUnit = null;
+            if (proposal?.WorkUnitId is { } wuid && workUnits is not null)
+                workUnit = await workUnits.GetAsync(wuid, cancellationToken).ConfigureAwait(false);
+
+            var ctx = new Dictionary<string, object?>
+            {
+                ["proposalId"] = proposalId,
+                ["workUnitId"] = proposal?.WorkUnitId,
+                ["workUnit"] = workUnit,
+                ["proposal"] = proposal,
+            };
+            var gateResult = await policyGate
+                .EvaluateAsync(PolicyCheckpoint.BeforeMerge, ctx, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!gateResult.Allowed)
+            {
+                var message = string.Join("; ", gateResult.Violations.Select(v => v.Message));
+                throw new InvalidOperationException($"BeforeMerge policy blocked apply: {message}");
+            }
+        }
+
+        return await merge.ApplyAsync(proposalId, cancellationToken).ConfigureAwait(false);
+    }
 
     // ── Diff parsing (moved from McpToolDispatcher) ────────────────────────────
 

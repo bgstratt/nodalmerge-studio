@@ -33,6 +33,7 @@ const playbackBar = document.getElementById('playback-bar') as HTMLElement;
 const btnLive     = document.getElementById('btn-live')    as HTMLButtonElement;
 const btnBranch   = document.getElementById('btn-branch')  as HTMLButtonElement;
 const btnKgs      = document.getElementById('btn-kgs')     as HTMLButtonElement;
+const btnRestoreKgs = document.getElementById('btn-restore-kgs') as HTMLButtonElement;
 
 // ── vscode API (only available inside WebView) ─────────────────────────────
 
@@ -120,15 +121,26 @@ if (scrubber) {
   });
 }
 
+// ── Session override picker ────────────────────────────────────────────────
+
+const dagSessionOverride = document.getElementById('dag-session-override') as HTMLSelectElement | null;
+if (dagSessionOverride) {
+  dagSessionOverride.addEventListener('change', () => {
+    vscode.postMessage({
+      type: 'sessionOverrideChanged',
+      panelId: 'shell-pane-trajectory-replay',
+      sessionId: dagSessionOverride.value || undefined,
+    });
+  });
+}
+
 // ── Replay mode selector (Slice 18d) ───────────────────────────────────────
 
 const replayModeSelect = document.getElementById('replay-mode') as HTMLSelectElement | null;
-let currentReplayMode = 'linear';
 
 if (replayModeSelect) {
   replayModeSelect.addEventListener('change', () => {
     const newMode = replayModeSelect.value;
-    currentReplayMode = newMode;
     vscode.postMessage({ type: 'replayModeChanged', mode: newMode });
 
     // Show/hide main DAG vs alternate view
@@ -230,6 +242,15 @@ if (btnKgs) {
       type:     'markKnownGood',
       branchId: replayState.cursor.branchId,
       nodeId:   replayState.cursor.nodeId,
+    });
+  });
+}
+
+if (btnRestoreKgs) {
+  btnRestoreKgs.addEventListener('click', () => {
+    vscode.postMessage({
+      type:     'restoreKnownGood',
+      branchId: replayState.cursor.branchId,
     });
   });
 }
@@ -377,6 +398,22 @@ window.addEventListener('message', (event: MessageEvent) => {
       registerTimeline(tl);
     }
     render();
+    return;
+  }
+
+  if (msg.type === 'updateSessionPicker' && msg.panelId === 'shell-pane-trajectory-replay') {
+    const sel = document.getElementById('dag-session-override') as HTMLSelectElement | null;
+    if (sel) {
+      const shellLabel = msg.shellSessionId ? ' (' + String(msg.shellSessionId).slice(0, 8) + '…)' : '';
+      sel.innerHTML = '<option value="">Follow Workspace' + shellLabel + '</option>';
+      for (const s of (msg.sessions as Array<{ sessionId: string; status: string }> ?? [])) {
+        const opt = document.createElement('option');
+        opt.value = s.sessionId;
+        opt.textContent = String(s.sessionId).slice(0, 12) + '… (' + s.status + ')';
+        sel.appendChild(opt);
+      }
+      sel.value = (msg.overrideSessionId as string) || '';
+    }
     return;
   }
 

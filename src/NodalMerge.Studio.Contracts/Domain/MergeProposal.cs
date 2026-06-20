@@ -33,7 +33,8 @@ public sealed record MergeProposal(
     string? WorkUnitId = null,
     IReadOnlyList<string>? FilesTouched = null,
     IReadOnlyList<string>? ReconciledFrom = null,
-    string? SupersededBy = null)
+    string? SupersededBy = null,
+    bool AutoApplied = false)
 {
     public IReadOnlyList<string> FilesTouched { get; init; } = FilesTouched ?? [];
     public IReadOnlyList<string> ReconciledFrom { get; init; } = ReconciledFrom ?? [];

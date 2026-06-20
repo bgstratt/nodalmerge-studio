@@ -52,15 +52,22 @@ export class ModelAgentStudioPanel {
 
   private async sendConfig(): Promise<void> {
     let pipelineProfiles: PipelineProfile[] = [];
+    let usePromotionBranch = false;
     try {
-      pipelineProfiles = await this.get<PipelineProfile[]>('/studio/agent-profiles');
+      [pipelineProfiles] = await Promise.all([
+        this.get<PipelineProfile[]>('/studio/agent-profiles'),
+      ]);
+      const opts = await this.get<{ usePromotionBranch?: boolean }>('/studio/options');
+      usePromotionBranch = opts.usePromotionBranch ?? false;
     } catch { /* server may not be running yet */ }
     void this.panel.webview.postMessage({
-      type:            'config',
-      profiles:        this.configService.getProfiles(),
-      templates:       this.configService.getTemplates(),
-      defaultTopology: this.configService.getDefaultTopology(),
+      type:                 'config',
+      profiles:             this.configService.getProfiles(),
+      templates:            this.configService.getTemplates(),
+      defaultTopology:      this.configService.getDefaultTopology(),
+      defaultReviewPolicy:  this.configService.getDefaultReviewPolicy(),
       pipelineProfiles,
+      usePromotionBranch,
     });
   }
 
@@ -125,6 +132,33 @@ export class ModelAgentStudioPanel {
           msg.apiKey as string | undefined,
         );
         void this.panel.webview.postMessage({ type: 'models', models });
+        break;
+      }
+
+      case 'saveSessionDefaults': {
+        const policy = msg.defaultReviewPolicy as string;
+        const usePromotionBranch = !!(msg.usePromotionBranch as boolean);
+        if (policy) {
+          await this.configService.saveDefaultReviewPolicy(policy);
+        }
+        try {
+          const currentOpts = await this.get<Record<string, unknown>>('/studio/options');
+          await this.post('/studio/options', { ...currentOpts, usePromotionBranch });
+        } catch { /* host may not be running */ }
+        void this.panel.webview.postMessage({ type: 'sessionDefaults', defaultReviewPolicy: policy, usePromotionBranch });
+        void vscode.window.showInformationMessage('NodalMerge: Session defaults saved.');
+        break;
+      }
+
+      case 'promoteToMain': {
+        try {
+          await this.post('/studio/branches/candidate/promote', {});
+          void vscode.window.showInformationMessage('NodalMerge: Candidate branch promoted to main.');
+          void this.panel.webview.postMessage({ type: 'promoteDone', success: true });
+        } catch (err) {
+          void vscode.window.showErrorMessage('NodalMerge: Promotion failed — ' + String(err));
+          void this.panel.webview.postMessage({ type: 'promoteDone', success: false });
+        }
         break;
       }
     }
@@ -362,6 +396,7 @@ const MAS_HTML = `
     <button class="tab-btn" data-tab="strategies">Exploration Strategies</button>
     <button class="tab-btn" data-tab="explore">Quick Explore</button>
     <button class="tab-btn" data-tab="pipeline-profiles">Pipeline Profiles</button>
+    <button class="tab-btn" data-tab="session-defaults">Session Defaults</button>
   </div>
 
   <div id="pane-profiles" class="tab-pane visible">
@@ -410,6 +445,33 @@ const MAS_HTML = `
       <tbody id="pipeline-profile-tbody"></tbody>
     </table>
     <button class="add-btn" id="btn-add-pipeline-profile">+ Add Pipeline Profile</button>
+  </div>
+
+  <div id="pane-session-defaults" class="tab-pane">
+    <div class="explore-form">
+      <h3>Session Defaults</h3>
+      <p class="sub">These defaults apply to new goals created in the Goal Workspace.</p>
+      <div class="field">
+        <label>Default Review Policy</label>
+        <select id="default-review-policy">
+          <option value="HumanRequired">Human Required — manual apply (default)</option>
+          <option value="AgentApproval">Agent Approval — reviewer agent auto-merges</option>
+          <option value="Hybrid">Hybrid — agent approves; auto-merges after 5 min</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Promotion Branch</label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+          <input type="checkbox" id="use-promotion-branch">
+          Use candidate branch — agents never write to main directly
+        </label>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <button id="btn-save-session-defaults">Save Session Defaults</button>
+        <button id="btn-promote-to-main" disabled>↑ Promote to Main</button>
+      </div>
+      <span id="session-defaults-status" class="status"></span>
+    </div>
   </div>
 
   <div class="save-bar">
@@ -793,6 +855,31 @@ const MAS_JS = `
     setStatus('Strategies saved.');
   });
 
+  // ── Session Defaults ──────────────────────────────────────────────────────
+  var usePromotionBranch = false;
+
+  document.getElementById('use-promotion-branch').addEventListener('change', function() {
+    usePromotionBranch = this.checked;
+    var promBtn = document.getElementById('btn-promote-to-main');
+    if (promBtn) { promBtn.disabled = !usePromotionBranch; }
+  });
+
+  document.getElementById('btn-save-session-defaults').addEventListener('click', function() {
+    var sel = document.getElementById('default-review-policy');
+    var reviewPolicy = sel ? sel.value : 'HumanRequired';
+    var cb = document.getElementById('use-promotion-branch');
+    var promotionEnabled = cb ? cb.checked : false;
+    vscode.postMessage({ type: 'saveSessionDefaults', defaultReviewPolicy: reviewPolicy, usePromotionBranch: promotionEnabled });
+    var statusEl = document.getElementById('session-defaults-status');
+    if (statusEl) { statusEl.textContent = 'Saved.'; setTimeout(function() { statusEl.textContent = ''; }, 2000); }
+  });
+
+  document.getElementById('btn-promote-to-main').addEventListener('click', function() {
+    this.disabled = true;
+    this.textContent = 'Promoting…';
+    vscode.postMessage({ type: 'promoteToMain' });
+  });
+
   // ── Pipeline Profiles ─────────────────────────────────────────────────────
   var pipelineProfiles = [];
   var PIPELINE_STAGES = ['Orchestrate', 'Plan', 'Execute', 'Review', 'Merge'];
@@ -899,6 +986,15 @@ const MAS_JS = `
       renderTemplates();
       updateExploreStrategySelector();
       renderPipelineProfiles();
+      var rpSel = document.getElementById('default-review-policy');
+      if (rpSel && msg.defaultReviewPolicy) { rpSel.value = msg.defaultReviewPolicy; }
+      if (typeof msg.usePromotionBranch !== 'undefined') {
+        usePromotionBranch = !!msg.usePromotionBranch;
+        var cb = document.getElementById('use-promotion-branch');
+        if (cb) { cb.checked = usePromotionBranch; }
+        var promBtn = document.getElementById('btn-promote-to-main');
+        if (promBtn) { promBtn.disabled = !usePromotionBranch; }
+      }
       return;
     }
     if (msg.type === 'apiKeySaved') {
@@ -907,6 +1003,28 @@ const MAS_JS = `
       if (msg.apiKeyRef) {
         const pi = profiles.findIndex(function(pr) { return pr.id === msg.profileId; });
         if (pi >= 0) { profiles[pi] = Object.assign({}, profiles[pi], { apiKeyRef: msg.apiKeyRef }); }
+      }
+      return;
+    }
+    if (msg.type === 'sessionDefaults') {
+      var sel = document.getElementById('default-review-policy');
+      if (sel && msg.defaultReviewPolicy) { sel.value = msg.defaultReviewPolicy; }
+      if (typeof msg.usePromotionBranch !== 'undefined') {
+        usePromotionBranch = !!msg.usePromotionBranch;
+        var sdCb = document.getElementById('use-promotion-branch');
+        if (sdCb) { sdCb.checked = usePromotionBranch; }
+        var sdPromBtn = document.getElementById('btn-promote-to-main');
+        if (sdPromBtn) { sdPromBtn.disabled = !usePromotionBranch; }
+      }
+      return;
+    }
+    if (msg.type === 'promoteDone') {
+      var promBtn2 = document.getElementById('btn-promote-to-main');
+      if (promBtn2) { promBtn2.disabled = !usePromotionBranch; promBtn2.textContent = '\\u2191 Promote to Main'; }
+      var sdStatus = document.getElementById('session-defaults-status');
+      if (sdStatus) {
+        sdStatus.textContent = msg.success ? 'Promoted to main.' : 'Promotion failed.';
+        setTimeout(function() { sdStatus.textContent = ''; }, 3000);
       }
       return;
     }

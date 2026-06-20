@@ -2,6 +2,14 @@
 
 Status: **Frozen for implementation** — updated for Phase 6.5 (command-surface hardening) + Phase 6.6 (workspace execution)
 
+> **Note:** This document predates Phase 6.7+ and Phase 7. It does not cover the `goal`, `decision`,
+> `evidence`, `trajectory`, `hypothesis`, `reasoning`, or `model` tool namespaces (all already in
+> code), nor the Phase 7 REST-only additions (Experiments, Steering, Counterfactuals, Review Policy,
+> Promotion Branches). See [docs/reference/api-reference.md](../reference/api-reference.md) for the
+> complete, currently-accurate tool and endpoint catalog, including which tools are dispatched to
+> autonomous agents versus reachable only by external MCP clients or REST/the VS Code extension.
+> Tool naming and the design principles below remain frozen and accurate.
+
 Canonical C# constants: `NodalMerge.Studio.Contracts.Versioning.McpToolNames`
 
 Architecture context: [v1 architecture spec](../architecture/v1-architecture-spec.md)

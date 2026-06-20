@@ -263,8 +263,27 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 $"Cannot apply proposal '{proposalId}': only Approved proposals can be merged (current: {proposal.Status}).");
         }
 
-        // Copy workspace files: source branch → target branch
-        await _fileWorkspace.ApplyBranchAsync(proposal.SourceBranch, proposal.TargetBranch, cancellationToken)
+        // Slice 21b — when promotion branch is on, land on the candidate instead of the
+        // work unit's parent branch so the canonical workspace is never touched directly.
+        // Slice 21c — a work unit can opt out of the session-wide promotion branch via
+        // BypassPromotionBranch, applying directly to the proposal's target branch.
+        var bypassPromotionBranch = false;
+        if (proposal.WorkUnitId is not null)
+        {
+            var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+            if (workUnits is not null)
+            {
+                var owningWorkUnit = await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false);
+                bypassPromotionBranch = owningWorkUnit?.BypassPromotionBranch ?? false;
+            }
+        }
+
+        var effectiveTarget = _workspaceOptions.UsePromotionBranch && !bypassPromotionBranch
+            ? _workspaceOptions.CandidateBranchId
+            : proposal.TargetBranch;
+
+        // Copy workspace files: source branch → effective target branch
+        await _fileWorkspace.ApplyBranchAsync(proposal.SourceBranch, effectiveTarget, cancellationToken)
             .ConfigureAwait(false);
 
         // Write changed files back to disk whenever a repository path is configured
@@ -513,6 +532,10 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IProposalReviewService, ProposalReviewService>();
         services.AddSingleton<IMergeReconciliationService, MergeReconciliationService>();
         services.AddSingleton<IAutomatedReviewGateService, AutomatedReviewGateService>();
+        // Slice 20b — BeforeMerge policy rule for AgentApproval/Hybrid policies.
+        services.AddSingleton<IPolicyRule, AutoReviewRule>();
+        // Slice 20c — Hybrid countdown timer.
+        services.AddSingleton<IReviewTimerService, ReviewTimerService>();
         return services;
     }
 }

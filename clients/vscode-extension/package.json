@@ -91,6 +91,12 @@
           "default": "",
           "description": "Name of the topology template to use when spawning a new workspace."
         },
+        "nodalmerge.defaultReviewPolicy": {
+          "type": "string",
+          "enum": ["HumanRequired", "AgentApproval", "Hybrid"],
+          "default": "HumanRequired",
+          "description": "Default review policy applied to new work units created in the Goal Workspace."
+        },
         "nodalmerge.requireBuildBeforeProposal": {
           "type": "boolean",
           "default": false,

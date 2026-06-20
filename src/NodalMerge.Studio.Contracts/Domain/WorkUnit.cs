@@ -43,7 +43,11 @@ public sealed record WorkUnit(
     WorkUnitExecutionInfo? ExecutionInfo = null,
     WorkUnitFanOutInfo? FanOutInfo = null,
     string? BranchedFromProposalId = null,
-    HypothesisForkType? ForkType = null);
+    HypothesisForkType? ForkType = null,
+    ReviewPolicy ReviewPolicy = ReviewPolicy.HumanRequired,
+    // Slice 21c — per-work-unit override: when true, applies always target the proposal's
+    // TargetBranch directly even if WorkspaceOptions.UsePromotionBranch is on session-wide.
+    bool BypassPromotionBranch = false);
 
 /// <summary>Failure/rejection counters, previously stored as parsed strings in Metadata.</summary>
 public sealed record WorkUnitExecutionInfo(int FailureAttemptCount, int AutomatedReviewRejectionCount);

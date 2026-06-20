@@ -9,7 +9,9 @@ public sealed record RuntimeSettingsSnapshot(
     bool UseLlmProfileSelection,
     bool BlockOverlappingFileScope = false,
     int MaxConcurrentWorkers = 3,
-    int SchedulerPollIntervalMs = 2_000);
+    int SchedulerPollIntervalMs = 2_000,
+    bool UsePromotionBranch = false,
+    string CandidateBranchId = "candidate");
 
 // Persists WorkspaceOptions's runtime-mutable fields to the node store on every mutation and
 // reapplies them on startup, so toggling a setting via REST survives a host restart. A single
@@ -24,7 +26,9 @@ public sealed class RuntimeSettingsService(IStudioNodeStore nodeStore, Workspace
             options.UseLlmProfileSelection,
             options.BlockOverlappingFileScope,
             options.MaxConcurrentWorkers,
-            options.SchedulerPollIntervalMs);
+            options.SchedulerPollIntervalMs,
+            options.UsePromotionBranch,
+            options.CandidateBranchId);
         await nodeStore.WriteNodeAsync(
             StudioNodeKind.RuntimeSettingsV1,
             EntityId,
@@ -46,5 +50,7 @@ public sealed class RuntimeSettingsService(IStudioNodeStore nodeStore, Workspace
         options.BlockOverlappingFileScope = snapshot.BlockOverlappingFileScope;
         options.MaxConcurrentWorkers = snapshot.MaxConcurrentWorkers;
         options.SchedulerPollIntervalMs = snapshot.SchedulerPollIntervalMs;
+        options.UsePromotionBranch = snapshot.UsePromotionBranch;
+        options.CandidateBranchId = snapshot.CandidateBranchId;
     }
 }

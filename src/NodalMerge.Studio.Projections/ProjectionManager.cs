@@ -21,6 +21,9 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly IOrchestrationDecisionLogService? _decisionLog;
     private readonly IDecisionNodeService? _decisionNodes;
     private readonly IEvidenceNodeService? _evidenceNodes;
+    private readonly IAgentProfileService? _agentProfiles;
+    private readonly ISteeringDecisionService? _steeringDecisions;
+    private readonly IFileWorkspaceService? _fileWorkspace;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
@@ -31,7 +34,10 @@ public sealed class ProjectionManager : IProjectionManager
         IWorkspaceExecutionCommandService? executionCommands = null,
         IOrchestrationDecisionLogService? decisionLog = null,
         IDecisionNodeService? decisionNodes = null,
-        IEvidenceNodeService? evidenceNodes = null)
+        IEvidenceNodeService? evidenceNodes = null,
+        IAgentProfileService? agentProfiles = null,
+        ISteeringDecisionService? steeringDecisions = null,
+        IFileWorkspaceService? fileWorkspace = null)
     {
         _workUnits          = workUnits;
         _tasks              = tasks;
@@ -42,6 +48,9 @@ public sealed class ProjectionManager : IProjectionManager
         _decisionLog        = decisionLog;
         _decisionNodes      = decisionNodes;
         _evidenceNodes      = evidenceNodes;
+        _agentProfiles      = agentProfiles;
+        _steeringDecisions  = steeringDecisions;
+        _fileWorkspace      = fileWorkspace;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -59,6 +68,8 @@ public sealed class ProjectionManager : IProjectionManager
             ProjectionType.TrajectoryTimeline => await BuildTrajectoryTimelineAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.ModelDivergenceView => await BuildModelDivergenceViewAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.ReasoningCommitGraph => await BuildReasoningCommitGraphAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.DecisionContext => await BuildDecisionContextAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.CounterfactualComparison => await BuildCounterfactualComparisonAsync(request, cancellationToken).ConfigureAwait(false),
             _ => throw new ArgumentOutOfRangeException(nameof(request), request.Type, "Unknown projection type.")
         };
 
@@ -592,6 +603,268 @@ public sealed class ProjectionManager : IProjectionManager
         }
 
         return Serialize(new ReasoningCommitGraphProjectionPayload(request.WorkUnitId, nodes, edges));
+    }
+
+    // ── Slice 24a — DecisionContext projection ─────────────────────────────────────────
+
+    private async Task<string> BuildDecisionContextAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new { error = "DecisionContext projection requires workUnitId." });
+
+        var wu = await _workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+        if (wu is null)
+            return Serialize(new { error = $"WorkUnit '{request.WorkUnitId}' not found." });
+
+        // 1. Plan — try to read plan.json from the work unit's branch.
+        var plan = new List<DecisionContextPlanEntry>();
+        if (_fileWorkspace is not null)
+        {
+            try
+            {
+                var planJson = await _fileWorkspace.ReadAsync(wu.BranchId, "plan.json", ct).ConfigureAwait(false);
+                if (planJson is not null)
+                {
+                    var planDoc = JsonSerializer.Deserialize<PlanDocument>(planJson, JsonOptions);
+                    if (planDoc?.Slices is not null)
+                    {
+                        plan = planDoc.Slices.Select(s => new DecisionContextPlanEntry(
+                            s.SliceId,
+                            s.Goal,
+                            s.FileScope,
+                            s.Steps)).ToList();
+                    }
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        // 2. Assumptions — collect from orchestration events for this work unit.
+        var assumptions = new List<string>();
+        if (_decisionLog is not null)
+        {
+            try
+            {
+                var events = await _decisionLog.GetEventsAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+                foreach (var evt in events.OrderBy(e => e.OccurredAt))
+                {
+                    if (!string.IsNullOrWhiteSpace(evt.Reason))
+                    {
+                        var reason = evt.Reason.Trim();
+                        if (!assumptions.Contains(reason))
+                            assumptions.Add(reason);
+                    }
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        // 3. Constraints — combine inherited constraint artifacts and steering decisions.
+        var constraints = new List<string>();
+        try
+        {
+            var chain = await _artifactLineage.GetChainAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+            foreach (var artifact in chain)
+            {
+                if (artifact.Type == ArtifactType.Constraint && !string.IsNullOrWhiteSpace(artifact.Title))
+                {
+                    if (!constraints.Contains(artifact.Title))
+                        constraints.Add(artifact.Title);
+                }
+            }
+        }
+        catch { /* best-effort */ }
+
+        string? steeredFromDecisionId = null;
+        if (_steeringDecisions is not null)
+        {
+            try
+            {
+                var steeringRecords = await _steeringDecisions.ListByWorkUnitAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+                foreach (var sd in steeringRecords)
+                {
+                    if (!string.IsNullOrWhiteSpace(sd.InjectedConstraint) && !constraints.Contains(sd.InjectedConstraint))
+                        constraints.Add(sd.InjectedConstraint);
+                    if (sd.NewChildWorkUnitId == request.WorkUnitId)
+                        steeredFromDecisionId = sd.SteeringDecisionId;
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        // 4. Evidence — pull build/test results.
+        var evidence = new List<DecisionContextEvidenceEntry>();
+        DecisionContextExecutionSummary? executionSummary = null;
+        if (_executionCommands is not null)
+        {
+            try
+            {
+                var execResult = await _executionCommands.GetLatestAsync(wu.BranchId, ct).ConfigureAwait(false);
+                if (execResult is not null)
+                {
+                    foreach (var build in execResult.Builds)
+                    {
+                        evidence.Add(new DecisionContextEvidenceEntry(
+                            "Build",
+                            build.Success
+                                ? $"{build.BuildSystem ?? "build"}: passed (exit {build.ExitCode})"
+                                : $"{build.BuildSystem ?? "build"}: failed (exit {build.ExitCode})",
+                            build.Success));
+                    }
+                    foreach (var test in execResult.Tests)
+                    {
+                        evidence.Add(new DecisionContextEvidenceEntry(
+                            "Test",
+                            test.Success
+                                ? $"{test.BuildSystem ?? "test"}: {test.Passed}/{test.TotalTests} passed"
+                                : $"{test.BuildSystem ?? "test"}: {test.Failed} failed / {test.TotalTests} total",
+                            test.Success));
+                    }
+
+                    var buildSystems = execResult.Builds
+                        .Select(b => b.BuildSystem)
+                        .Concat(execResult.Tests.Select(t => t.BuildSystem))
+                        .Where(bs => bs is not null)
+                        .Distinct()
+                        .ToList()!;
+                    var testSummary = execResult.Tests.Count > 0
+                        ? $"{execResult.Tests.Sum(t => t.Passed)} passed / {execResult.Tests.Sum(t => t.Failed)} failed"
+                        : null;
+                    executionSummary = new DecisionContextExecutionSummary(
+                        execResult.AllSucceeded,
+                        buildSystems,
+                        testSummary,
+                        execResult.ExecutedAt);
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        // 5. Allowed tools — resolve from the agent's profile.
+        var allowedTools = new List<string>();
+        string? agentModel = null;
+        string? agentProvider = null;
+        if (_agentProfiles is not null)
+        {
+            try
+            {
+                var ownerProfile = wu.Owner;
+                var profile = await _agentProfiles.GetAsync(ownerProfile, ct).ConfigureAwait(false);
+                if (profile is not null)
+                {
+                    allowedTools = profile.AllowedTools.ToList();
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        var payload = new DecisionContextProjectionPayload(
+            wu.WorkUnitId,
+            wu.Goal,
+            plan,
+            assumptions,
+            constraints,
+            evidence,
+            allowedTools,
+            executionSummary,
+            agentModel,
+            agentProvider,
+            steeredFromDecisionId);
+
+        return Serialize(payload);
+    }
+
+    // ── Slice 25b — CounterfactualComparison projection ──────────────────────────────
+
+    private async Task<string> BuildCounterfactualComparisonAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new { error = "CounterfactualComparison requires workUnitId to identify the original work unit." });
+
+        var originalWu = await _workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+        if (originalWu is null)
+            return Serialize(new { error = $"Original work unit '{request.WorkUnitId}' not found." });
+
+        // Find counterfactual work units — siblings with different profiles that are forked from proposals
+        var counterfactuals = new List<WorkUnit>();
+        if (originalWu.ParentWorkUnitId is not null)
+        {
+            var siblings = await _workUnits.GetChildrenAsync(originalWu.ParentWorkUnitId, ct).ConfigureAwait(false);
+            counterfactuals = siblings
+                .Where(w => w.WorkUnitId != originalWu.WorkUnitId && w.ForkType == HypothesisForkType.Model)
+                .ToList();
+        }
+
+        var counterfactualWu = counterfactuals.FirstOrDefault();
+        if (counterfactualWu is null)
+        {
+            // No counterfactual found — return empty comparison
+            return Serialize(new CounterfactualComparisonProjectionPayload(
+                request.WorkUnitId,
+                string.Empty,
+                string.Empty,
+                [],
+                [],
+                null, null, null, null,
+                "No counterfactual available yet.",
+                DateTimeOffset.UtcNow));
+        }
+
+        var allProposals = await _merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+
+        // Collect proposals for original work unit
+        var originalProposals = allProposals
+            .Where(p => p.WorkUnitId == originalWu.WorkUnitId)
+            .Select(p => new CounterfactualComparisonProposal(
+                p.ProposalId, p.Goal ?? originalWu.Goal, p.Status.ToString(),
+                p.Model, p.Provider, p.Confidence,
+                p.FilesTouched, p.ChangeDescription))
+            .ToList();
+
+        // Collect proposals for counterfactual work unit
+        var counterfactualProposals = allProposals
+            .Where(p => p.WorkUnitId == counterfactualWu.WorkUnitId)
+            .Select(p => new CounterfactualComparisonProposal(
+                p.ProposalId, p.Goal ?? counterfactualWu.Goal, p.Status.ToString(),
+                p.Model, p.Provider, p.Confidence,
+                p.FilesTouched, p.ChangeDescription))
+            .ToList();
+
+        // Determine original proposal ID from original work unit's proposals
+        var originalProposalId = originalProposals.FirstOrDefault()?.ProposalId ?? string.Empty;
+
+        // Determine model/provider from the proposals
+        var origModel = originalProposals.FirstOrDefault()?.Model;
+        var origProvider = originalProposals.FirstOrDefault()?.Provider;
+        var cfModel = counterfactualProposals.FirstOrDefault()?.Model;
+        var cfProvider = counterfactualProposals.FirstOrDefault()?.Provider;
+
+        // Simple "Which was better?" heuristic — compare confidence scores
+        string? whichWasBetter = null;
+        var origMaxConf = originalProposals.Max(p => p.Confidence);
+        var cfMaxConf = counterfactualProposals.Max(p => p.Confidence);
+        if (origMaxConf.HasValue && cfMaxConf.HasValue)
+        {
+            if (origMaxConf > cfMaxConf)
+                whichWasBetter = "Original";
+            else if (cfMaxConf > origMaxConf)
+                whichWasBetter = "Counterfactual";
+            else
+                whichWasBetter = "Equal";
+        }
+
+        var payload = new CounterfactualComparisonProjectionPayload(
+            originalWu.WorkUnitId,
+            counterfactualWu.WorkUnitId,
+            originalProposalId,
+            originalProposals,
+            counterfactualProposals,
+            origModel, origProvider,
+            cfModel, cfProvider,
+            whichWasBetter,
+            DateTimeOffset.UtcNow);
+
+        return Serialize(payload);
     }
 
     /// <summary>

@@ -60,6 +60,12 @@ internal sealed class InMemoryKnownGoodStateService : IKnownGoodStateService, IR
         return state;
     }
 
+    public Task<KnownGoodState?> GetAsync(string stateId, CancellationToken cancellationToken = default)
+    {
+        _states.TryGetValue(stateId, out var state);
+        return Task.FromResult(state);
+    }
+
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {
         var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.KnownGoodStateV1, cancellationToken)

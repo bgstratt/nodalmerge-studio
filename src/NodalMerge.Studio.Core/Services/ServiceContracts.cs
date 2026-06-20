@@ -295,6 +295,8 @@ public interface IOrchestratorService
         string? sliceId = null,
         IReadOnlyDictionary<string, string>? metadata = null,
         HypothesisForkType? forkType = null,
+        ReviewPolicy? reviewPolicy = null,
+        bool bypassPromotionBranch = false,
         CancellationToken cancellationToken = default);
 
     Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default);
@@ -312,7 +314,10 @@ public sealed record WorkUnitCreateCommand(
     string? ParentWorkUnitId = null,
     IReadOnlyList<string>? DependsOn = null,
     IReadOnlyList<string>? FileScope = null,
-    HypothesisForkType? ForkType = null);
+    HypothesisForkType? ForkType = null,
+    ReviewPolicy? ReviewPolicy = null,
+    bool BypassPromotionBranch = false,
+    string? SeedFromBranchId = null);
 
 public interface IWorkUnitCommandService
 {
@@ -339,6 +344,9 @@ public interface IKnownGoodStateService
         CancellationToken cancellationToken = default);
 
     Task<KnownGoodState?> CheckoutKnownGoodAsync(string stateId, CancellationToken cancellationToken = default);
+
+    // Non-mutating lookup by id — unlike CheckoutKnownGoodAsync, does not restore the branch.
+    Task<KnownGoodState?> GetAsync(string stateId, CancellationToken cancellationToken = default);
 }
 
 public interface IBranchService
@@ -688,6 +696,36 @@ public interface IPolicyGateService
     Task<IReadOnlyList<string>> ListRuleIdsAsync(CancellationToken ct = default);
 }
 
+// Slice 20b — runs a ReviewerAgentLoop inline (synchronously awaited) for AgentApproval/Hybrid
+// policies. Defined here so AutoReviewRule in Merge can depend on it without referencing AgentRuntime
+// (which references Merge — adding the reverse reference would be circular).
+public sealed record InlineReviewResult(bool Approved, string? Notes);
+
+public interface IInlineReviewerService
+{
+    Task<InlineReviewResult> ReviewAsync(
+        string workUnitId,
+        string proposalId,
+        CancellationToken ct = default);
+}
+
+// Slice 20c — Hybrid review policy: agent approves, timer starts; auto-merges at expiry or human
+// overrides first.
+public sealed record ReviewTimer(
+    string TimerId,
+    string ProposalId,
+    string WorkUnitId,
+    DateTimeOffset ExpiresAt,
+    bool Cancelled = false);
+
+public interface IReviewTimerService
+{
+    Task ScheduleAsync(string proposalId, string workUnitId, TimeSpan delay, CancellationToken ct = default);
+    Task TryCancelAsync(string proposalId, CancellationToken ct = default);
+    Task ProcessExpiredAsync(CancellationToken ct = default);
+    Task<ReviewTimer?> GetAsync(string proposalId, CancellationToken ct = default);
+}
+
 // Slice 14b — shape of the "activeSiblings" key FanOutService populates in BeforeEnqueue's
 // context bag. Built by FanOutService (it already depends on IWorkUnitService) so IPolicyRule
 // implementations living in Storage don't need their own IWorkUnitService dependency — that
@@ -819,4 +857,40 @@ public interface IWorkspaceExecutionCommandService
         string branchId,
         string resultId,
         CancellationToken ct = default);
+}
+
+// ── Slice 22a — Experiment runner ─────────────────────────────────────────
+
+public sealed record ExperimentForkSpec(
+    string? ProfileId,
+    string? ConstraintText = null);
+
+public sealed record ExperimentSpec(
+    string Goal,
+    string Owner,
+    HypothesisForkType ForkType,
+    IReadOnlyList<ExperimentForkSpec> Forks,
+    string? ComparisonMetricHint = null,
+    ReviewPolicy? ReviewPolicy = null,
+    string? SessionId = null);
+
+public sealed record ExperimentResult(
+    string ExperimentId,
+    string ParentWorkUnitId,
+    IReadOnlyList<string> ForkWorkUnitIds);
+
+public sealed record ExperimentNode(
+    string ExperimentId,
+    string ParentWorkUnitId,
+    HypothesisForkType ForkType,
+    IReadOnlyList<string> ForkWorkUnitIds,
+    string? ComparisonMetricHint,
+    DateTimeOffset CreatedAt,
+    string? SessionId = null);
+
+public interface IExperimentService
+{
+    Task<ExperimentResult> CreateAsync(ExperimentSpec spec, CancellationToken ct = default);
+    Task<ExperimentNode?> GetAsync(string experimentId, CancellationToken ct = default);
+    Task<IReadOnlyList<ExperimentNode>> ListAsync(CancellationToken ct = default);
 }

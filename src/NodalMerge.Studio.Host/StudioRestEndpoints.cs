@@ -20,7 +20,10 @@ public static class StudioRestEndpoints
         string? RepositoryPath = null,
         string? ParentWorkUnitId = null,
         IReadOnlyList<string>? DependsOn = null,
-        IReadOnlyList<string>? FileScope = null);
+        IReadOnlyList<string>? FileScope = null,
+        ReviewPolicy? ReviewPolicy = null,
+        bool BypassPromotionBranch = false,
+        string? SeedFromBranchId = null);
 
     private sealed record SpawnAgentBody(
         string AgentType,
@@ -81,6 +84,11 @@ public static class StudioRestEndpoints
 
     private sealed record CheckoutKnownGoodBody(string StateId);
 
+    private sealed record ForkKnownGoodBody(
+        string Goal,
+        string? ProfileId = null,
+        string? SessionId = null);
+
     private sealed record EnqueueBody(
         string WorkUnitId,
         string ProfileId,
@@ -104,7 +112,9 @@ public static class StudioRestEndpoints
         bool UseLlmProfileSelection,
         bool BlockOverlappingFileScope = false,
         int MaxConcurrentWorkers = 3,
-        int SchedulerPollIntervalMs = 2_000);
+        int SchedulerPollIntervalMs = 2_000,
+        bool UsePromotionBranch = false,
+        string CandidateBranchId = "candidate");
 
     private sealed record BuildRequestBody(
         string? BuildCommand = null,
@@ -157,6 +167,19 @@ public static class StudioRestEndpoints
         string? AgentModel = null,
         string? AgentProvider = null);
 
+    private sealed record CreateExperimentBody(
+        string Goal,
+        string Owner,
+        string ForkType,
+        IReadOnlyList<ExperimentForkBody> Forks,
+        string? ComparisonMetricHint = null,
+        string? ReviewPolicy = null,
+        string? SessionId = null);
+
+    private sealed record ExperimentForkBody(
+        string? ProfileId = null,
+        string? ConstraintText = null);
+
     // ── Registration ───────────────────────────────────────────────────────
 
     public static WebApplication MapStudioRestEndpoints(this WebApplication app)
@@ -188,10 +211,82 @@ public static class StudioRestEndpoints
         MapHypothesisEndpoints(app);
         MapReasoningEndpoints(app);
         MapModelEndpoints(app);
+        MapExperimentEndpoints(app);
+        MapSteeringEndpoints(app);
+        MapCounterfactualEndpoints(app);
         return app;
     }
 
     // ── /studio/policies — Slice 14a, visibility only (no per-rule toggle yet) ─────────────
+
+    // ── /studio/steering — Slice 23a/23b ──────────────────────────────────────────
+
+    private sealed record SteeringRedirectBody(
+        string WorkUnitId,
+        string AgentId,
+        string InjectedConstraint,
+        string? ProfileId = null,
+        string? SessionId = null);
+
+    private sealed record ForkFromNodeBody(
+        string WorkUnitId,
+        string? NodeId = null,
+        string? ProposalId = null,
+        string? NewGoal = null,
+        string? ConstraintText = null,
+        string? ProfileId = null,
+        string? SessionId = null);
+
+    private static void MapSteeringEndpoints(WebApplication app)
+    {
+        app.MapPost("/studio/steering/redirect", async (
+            SteeringRedirectBody body,
+            ISteeringService steering,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+            if (string.IsNullOrWhiteSpace(body.AgentId))
+                return Results.BadRequest(new { error = "agentId is required." });
+            if (string.IsNullOrWhiteSpace(body.InjectedConstraint))
+                return Results.BadRequest(new { error = "injectedConstraint is required." });
+
+            try
+            {
+                var command = new SteeringCommand(
+                    body.WorkUnitId, body.AgentId, body.InjectedConstraint,
+                    body.ProfileId, body.SessionId);
+                var result = await steering.PauseAndRedirectAsync(command, ct).ConfigureAwait(false);
+                return Results.Ok(result);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        app.MapPost("/studio/steering/fork-from-node", async (
+            ForkFromNodeBody body,
+            ISteeringService steering,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+
+            try
+            {
+                var command = new ForkFromNodeCommand(
+                    body.WorkUnitId, body.NodeId, body.ProposalId,
+                    body.NewGoal, body.ConstraintText, body.ProfileId, body.SessionId);
+                var result = await steering.ForkFromNodeAsync(command, ct).ConfigureAwait(false);
+                return Results.Ok(result);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+    }
 
     private static void MapPolicyEndpoints(WebApplication app)
     {
@@ -221,12 +316,15 @@ public static class StudioRestEndpoints
                 testCommand = options.TestCommand,
                 executionTimeoutSeconds = options.ExecutionTimeoutSeconds,
                 postMergeExecutionMode = options.PostMergeExecutionMode,
+                usePromotionBranch = options.UsePromotionBranch,
+                candidateBranchId = options.CandidateBranchId,
             }));
 
         app.MapPost("/studio/options", async (
             UpdateOptionsBody body,
             WorkspaceOptions options,
             RuntimeSettingsService runtimeSettings,
+            CandidateBranchService candidateBranch,
             CancellationToken ct) =>
         {
             // Slice 14e — the scheduler poll loop reads these straight off this same
@@ -237,12 +335,21 @@ public static class StudioRestEndpoints
                 return Results.BadRequest(new { error = "maxConcurrentWorkers must be at least 1." });
             if (body.SchedulerPollIntervalMs < 100)
                 return Results.BadRequest(new { error = "schedulerPollIntervalMs must be at least 100." });
+            if (string.IsNullOrWhiteSpace(body.CandidateBranchId))
+                return Results.BadRequest(new { error = "candidateBranchId must not be empty." });
 
             options.UseLlmProfileSelection = body.UseLlmProfileSelection;
             options.BlockOverlappingFileScope = body.BlockOverlappingFileScope;
             options.MaxConcurrentWorkers = body.MaxConcurrentWorkers;
             options.SchedulerPollIntervalMs = body.SchedulerPollIntervalMs;
+            options.UsePromotionBranch = body.UsePromotionBranch;
+            options.CandidateBranchId = body.CandidateBranchId;
             await runtimeSettings.PersistAsync(ct).ConfigureAwait(false);
+
+            // Slice 21a — ensure candidate branch exists as soon as the toggle is turned on.
+            if (options.UsePromotionBranch)
+                await candidateBranch.EnsureAsync(ct).ConfigureAwait(false);
+
             return Results.Ok(new
             {
                 useLlmProfileSelection = options.UseLlmProfileSelection,
@@ -255,6 +362,8 @@ public static class StudioRestEndpoints
                 testCommand = options.TestCommand,
                 executionTimeoutSeconds = options.ExecutionTimeoutSeconds,
                 postMergeExecutionMode = options.PostMergeExecutionMode,
+                usePromotionBranch = options.UsePromotionBranch,
+                candidateBranchId = options.CandidateBranchId,
             });
         });
     }
@@ -557,7 +666,9 @@ public static class StudioRestEndpoints
 
             var wu = await workUnitCommands.CreateAsync(
                 new WorkUnitCreateCommand(body.Goal, body.Owner, body.BranchId, body.SuccessCriteria,
-                    body.RepositoryPath, body.ParentWorkUnitId, body.DependsOn, body.FileScope),
+                    body.RepositoryPath, body.ParentWorkUnitId, body.DependsOn, body.FileScope,
+                    ReviewPolicy: body.ReviewPolicy, BypassPromotionBranch: body.BypassPromotionBranch,
+                    SeedFromBranchId: body.SeedFromBranchId),
                 ct).ConfigureAwait(false);
             return Results.Ok(wu);
         });
@@ -672,12 +783,25 @@ public static class StudioRestEndpoints
     {
         app.MapGet("/studio/agents", async (
             [FromQuery] bool all,
+            [FromQuery] string? sessionId,
             IAgentControlService agents,
+            IExecutionSessionService sessions,
+            IWorkUnitService workUnits,
             CancellationToken ct) =>
         {
             var list = all
                 ? await agents.ListAllAsync(ct).ConfigureAwait(false)
                 : await agents.ListActiveAsync(ct).ConfigureAwait(false);
+
+            if (sessionId is not null)
+            {
+                var session = await sessions.GetAsync(sessionId, ct).ConfigureAwait(false);
+                if (session is null)
+                    return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
+                var sessionWuIds = await GetSessionDescendantIdsAsync(sessions, workUnits, session.RootWorkUnitId, ct).ConfigureAwait(false);
+                list = list.Where(a => sessionWuIds.Contains(a.WorkUnitId)).ToList();
+            }
+
             return Results.Ok(list);
         });
 
@@ -915,12 +1039,12 @@ public static class StudioRestEndpoints
 
         app.MapPost("/studio/merges/{proposalId}/apply", async (
             string proposalId,
-            IMergeService merge,
+            IMergeCommandService mergeCommands,
             CancellationToken ct) =>
         {
             try
             {
-                var result = await merge.ApplyAsync(proposalId, ct).ConfigureAwait(false);
+                var result = await mergeCommands.ApplyAsync(proposalId, ct).ConfigureAwait(false);
                 return Results.Ok(result);
             }
             catch (KeyNotFoundException)
@@ -1062,6 +1186,19 @@ public static class StudioRestEndpoints
             var status = await branches.GetStatusAsync(branchId, ct).ConfigureAwait(false);
             return Results.Ok(status);
         });
+
+        // Slice 21b — explicit human action to promote candidate → main. Never automatic.
+        app.MapPost("/studio/branches/candidate/promote", async (
+            WorkspaceOptions options,
+            IFileWorkspaceService fileWorkspace,
+            CancellationToken ct) =>
+        {
+            if (!options.UsePromotionBranch)
+                return Results.BadRequest(new { error = "Promotion branch is not enabled. Set usePromotionBranch via POST /studio/options first." });
+
+            await fileWorkspace.ApplyBranchAsync(options.CandidateBranchId, "main", ct).ConfigureAwait(false);
+            return Results.Ok(new { promoted = true, source = options.CandidateBranchId, target = "main" });
+        });
     }
 
     // ── /studio/nodes ─────────────────────────────────────────────────────
@@ -1128,6 +1265,40 @@ public static class StudioRestEndpoints
             return result is null
                 ? Results.NotFound(new { error = $"Known good state '{body.StateId}' not found." })
                 : Results.Ok(result);
+        });
+
+        // Forks a new work unit from a known-good checkpoint's durable snapshot branch, instead of
+        // restoring in place — mirrors /studio/merges/{proposalId}/branch's pattern for proposals.
+        app.MapPost("/studio/state/{stateId}/fork", async (
+            string stateId,
+            ForkKnownGoodBody body,
+            IKnownGoodStateService kgs,
+            IOrchestratorService orchestrator,
+            IWorkScheduler scheduler,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.Goal))
+                return Results.BadRequest(new { error = "goal is required." });
+
+            var state = await kgs.GetAsync(stateId, ct).ConfigureAwait(false);
+            if (state is null)
+                return Results.NotFound(new { error = $"Known good state '{stateId}' not found." });
+            if (state.SnapshotBranchId is null)
+                return Results.BadRequest(new { error = $"Known good state '{stateId}' has no snapshot to fork from." });
+
+            var newWorkUnit = await orchestrator.CreateWorkUnitAsync(
+                body.Goal,
+                owner: "user",
+                seedFromBranchId: state.SnapshotBranchId,
+                cancellationToken: ct).ConfigureAwait(false);
+
+            if (!string.IsNullOrWhiteSpace(body.ProfileId))
+            {
+                await scheduler.EnqueueAsync(
+                    newWorkUnit.WorkUnitId, body.ProfileId, sessionId: body.SessionId, ct: ct).ConfigureAwait(false);
+            }
+
+            return Results.Ok(new { workUnitId = newWorkUnit.WorkUnitId });
         });
     }
 
@@ -1733,25 +1904,51 @@ public static class StudioRestEndpoints
         // WebSocket for timeline node data. Returns timeline entries (artifacts + orchestration
         // events) grouped by branch, plus the set of known branches so the frontend can render
         // them as DAG lanes without a separate init payload.
+        // Slice 19a — optional ?sessionId= filter restricts branches to those owned by the session.
         app.MapGet("/studio/replay/timeline", async (
             [FromQuery] string? branchId,
+            [FromQuery] string? sessionId,
             IBranchService branches,
+            IWorkUnitService workUnits,
+            IExecutionSessionService sessions,
             IReplayService replay,
             CancellationToken ct) =>
         {
-            var branchIds = await branches.ListBranchesAsync(ct).ConfigureAwait(false);
-            var targetBranches = branchId is { Length: > 0 }
-                ? new[] { branchId }
-                : branchIds.ToArray();
+            var allBranchIds = await branches.ListBranchesAsync(ct).ConfigureAwait(false);
+            IEnumerable<string> targetBranches;
 
+            if (branchId is { Length: > 0 })
+            {
+                targetBranches = new[] { branchId };
+            }
+            else if (sessionId is not null)
+            {
+                var session = await sessions.GetAsync(sessionId, ct).ConfigureAwait(false);
+                if (session is null)
+                    return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
+                var sessionWuIds = await GetSessionDescendantIdsAsync(sessions, workUnits, session.RootWorkUnitId, ct).ConfigureAwait(false);
+                var allWus = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+                var sessionBranchIds = allWus
+                    .Where(wu => sessionWuIds.Contains(wu.WorkUnitId))
+                    .Select(wu => wu.BranchId)
+                    .Distinct()
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                targetBranches = allBranchIds.Where(b => sessionBranchIds.Contains(b));
+            }
+            else
+            {
+                targetBranches = allBranchIds;
+            }
+
+            var resolvedBranches = targetBranches.ToArray();
             var timelines = new List<object>();
-            foreach (var b in targetBranches)
+            foreach (var b in resolvedBranches)
             {
                 var json = await replay.RangeAsync(b, cancellationToken: ct).ConfigureAwait(false);
                 timelines.Add(JsonSerializer.Deserialize<object>(json)!);
             }
 
-            return Results.Ok(new { branches = targetBranches, timelines });
+            return Results.Ok(new { branches = resolvedBranches, timelines });
         });
 
         app.MapGet("/studio/replay/timeline/{branchId}", async (
@@ -2135,15 +2332,29 @@ public static class StudioRestEndpoints
             [FromQuery] string? workUnitId,
             [FromQuery] string? branchId,
             [FromQuery] string? mode,
+            [FromQuery] string? sessionId,
             IWorkUnitService workUnits,
+            IExecutionSessionService sessions,
             IReplayService replay,
             CancellationToken ct) =>
         {
             var normalizedMode = mode?.Trim().ToLowerInvariant() ?? "linear";
 
+            // Resolve session-scoped work unit IDs once so all modes can filter against the same set.
+            HashSet<string>? sessionWuIds = null;
+            if (sessionId is not null)
+            {
+                var session = await sessions.GetAsync(sessionId, ct).ConfigureAwait(false);
+                if (session is null)
+                    return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
+                sessionWuIds = await GetSessionDescendantIdsAsync(sessions, workUnits, session.RootWorkUnitId, ct).ConfigureAwait(false);
+            }
+
             if (normalizedMode == "branchexplorer")
             {
                 var allUnits = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+                if (sessionWuIds is not null)
+                    allUnits = allUnits.Where(wu => sessionWuIds.Contains(wu.WorkUnitId)).ToList();
                 var byBranch = allUnits.GroupBy(wu => wu.BranchId).Select(g => new
                 {
                     branchId = g.Key,
@@ -2164,6 +2375,8 @@ public static class StudioRestEndpoints
             if (normalizedMode == "counterfactual")
             {
                 var allUnits = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+                if (sessionWuIds is not null)
+                    allUnits = allUnits.Where(wu => sessionWuIds.Contains(wu.WorkUnitId)).ToList();
                 WorkUnit? target = null;
                 if (workUnitId is not null)
                     target = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
@@ -2219,6 +2432,8 @@ public static class StudioRestEndpoints
             }
 
             var allUnits2 = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+            if (sessionWuIds is not null)
+                allUnits2 = allUnits2.Where(wu => sessionWuIds.Contains(wu.WorkUnitId)).ToList();
             var nodes = allUnits2.Select(wu => new
             {
                 workUnitId = wu.WorkUnitId,
@@ -2248,7 +2463,7 @@ public static class StudioRestEndpoints
                 return Results.BadRequest(new { error = "forkType is required." });
 
             if (!Enum.TryParse<HypothesisForkType>(body.ForkType, ignoreCase: true, out var hypothesisType))
-                return Results.BadRequest(new { error = "Invalid forkType. Use Code, Reasoning, Model, Research, Architecture, or Product." });
+                return Results.BadRequest(new { error = "Invalid forkType. Use Code, Reasoning, Model, Research, Architecture, Library, or Product." });
 
             var workUnit = await workUnitCommands.CreateAsync(
                 new WorkUnitCreateCommand(body.Goal, "studio", ParentWorkUnitId: body.ParentWorkUnitId, ForkType: hypothesisType),
@@ -2434,6 +2649,107 @@ public static class StudioRestEndpoints
                 proposals = relevantProposals,
                 replayMode = "ModelComparison"
             });
+        });
+    }
+
+    // ── /studio/experiments — Slice 22a ───────────────────────────────────
+
+    private static void MapExperimentEndpoints(WebApplication app)
+    {
+        app.MapPost("/studio/experiments", async (
+            CreateExperimentBody body,
+            IExperimentService experiments,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.Goal))
+                return Results.BadRequest(new { error = "goal is required." });
+            if (string.IsNullOrWhiteSpace(body.Owner))
+                return Results.BadRequest(new { error = "owner is required." });
+            if (body.Forks is null || body.Forks.Count < 2)
+                return Results.BadRequest(new { error = "At least 2 forks are required." });
+            if (!Enum.TryParse<HypothesisForkType>(body.ForkType, ignoreCase: true, out var forkType))
+                return Results.BadRequest(new { error = $"Unknown forkType '{body.ForkType}'. Valid: {string.Join(", ", Enum.GetNames<HypothesisForkType>())}" });
+
+            // Slice 22b — type-specific fork validation so callers get 400, not 500
+            var forkTypeError = forkType switch
+            {
+                HypothesisForkType.Model => body.Forks.Any(f => string.IsNullOrWhiteSpace(f.ProfileId))
+                    ? "Model experiments require every fork to have a profileId."
+                    : null,
+                HypothesisForkType.Architecture or HypothesisForkType.Library or HypothesisForkType.Product =>
+                    body.Forks.Any(f => string.IsNullOrWhiteSpace(f.ConstraintText))
+                        ? $"{forkType} experiments require every fork to have a constraintText."
+                        : null,
+                _ => null
+            };
+            if (forkTypeError is not null)
+                return Results.BadRequest(new { error = forkTypeError });
+
+            ReviewPolicy? reviewPolicy = null;
+            if (body.ReviewPolicy is not null && Enum.TryParse<ReviewPolicy>(body.ReviewPolicy, ignoreCase: true, out var rp))
+                reviewPolicy = rp;
+
+            var forks = body.Forks.Select(f => new ExperimentForkSpec(f.ProfileId, f.ConstraintText)).ToList();
+            var spec  = new ExperimentSpec(body.Goal, body.Owner, forkType, forks, body.ComparisonMetricHint, reviewPolicy, body.SessionId);
+            var result = await experiments.CreateAsync(spec, ct).ConfigureAwait(false);
+            return Results.Ok(result);
+        });
+
+        app.MapGet("/studio/experiments", async (
+            IExperimentService experiments,
+            CancellationToken ct) =>
+        {
+            var list = await experiments.ListAsync(ct).ConfigureAwait(false);
+            return Results.Ok(list);
+        });
+
+        app.MapGet("/studio/experiments/{experimentId}", async (
+            string experimentId,
+            IExperimentService experiments,
+            CancellationToken ct) =>
+        {
+            var node = await experiments.GetAsync(experimentId, ct).ConfigureAwait(false);
+            return node is null ? Results.NotFound() : Results.Ok(node);
+        });
+    }
+
+    // ── /studio/counterfactuals — Slice 25a ───────────────────────────────
+
+    private sealed record CreateCounterfactualBody(
+        string ProposalId,
+        string NewProfileId,
+        string? NewGoalOverride = null,
+        string? ConstraintText = null,
+        string? SessionId = null);
+
+    private static void MapCounterfactualEndpoints(WebApplication app)
+    {
+        app.MapPost("/studio/counterfactuals", async (
+            CreateCounterfactualBody body,
+            ICounterfactualService counterfactuals,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.ProposalId))
+                return Results.BadRequest(new { error = "proposalId is required." });
+            if (string.IsNullOrWhiteSpace(body.NewProfileId))
+                return Results.BadRequest(new { error = "newProfileId is required." });
+
+            try
+            {
+                var command = new CounterfactualCommand(
+                    body.ProposalId, body.NewProfileId,
+                    body.NewGoalOverride, body.ConstraintText, body.SessionId);
+                var result = await counterfactuals.CreateAsync(command, ct).ConfigureAwait(false);
+                return Results.Ok(result);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
         });
     }
 }

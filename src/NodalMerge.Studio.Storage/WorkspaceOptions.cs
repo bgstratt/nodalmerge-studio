@@ -32,4 +32,11 @@ public sealed class WorkspaceOptions
     public string TruncationMode { get; set; } = "Tail";   // "Head", "Tail", "HeadTail"
 
     public string PostMergeExecutionMode { get; set; } = "Disabled"; // "Disabled", "Async", "Blocking"
+
+    // ── Slice 21a — promotion branch ─────────────────────────────────────────
+
+    // When true, auto-apply (and manual merge review) targets CandidateBranchId instead of the
+    // work unit's parent branch.  Humans promote candidate → main via POST /studio/branches/candidate/promote.
+    public bool UsePromotionBranch { get; set; } = false;
+    public string CandidateBranchId { get; set; } = "candidate";
 }

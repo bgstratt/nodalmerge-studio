@@ -32,6 +32,7 @@ interface WorkUnit {
   proposalCount: number;
   fanOutInfo?: WorkUnitFanOutInfo | null;
   forkType?: string | null;
+  metadata?: Record<string, string> | null;
 }
 
 interface StudioOptions {
@@ -43,6 +44,7 @@ interface StudioOptions {
   requireTestBeforeProposal: boolean;
   buildCommand: string;
   testCommand: string;
+  usePromotionBranch?: boolean;
 }
 
 interface ExecutionSession {
@@ -50,6 +52,16 @@ interface ExecutionSession {
   rootWorkUnitId: string;
   status: string;
   startedAt: string;
+}
+
+interface KnownGoodState {
+  stateId: string;
+  branchId: string;
+  description: string;
+  verificationResults?: string | null;
+  createdAt: string;
+  createdBy: string;
+  snapshotBranchId?: string | null;
 }
 
 interface ArtifactRef {
@@ -182,32 +194,39 @@ export class GoalWorkspacePanel {
   private async sendStrategies(): Promise<void> {
     if (!this.configService) { return; }
     const templates = this.configService.getTemplates();
-    // Slice 18a — multi-model comparison: detect when 2+ orchestrator profiles
-    // have different models, and expose a live "Multi-Model Comparison" strategy.
     const profiles = this.configService.getProfiles();
     const orchModels = new Set(
       profiles
         .filter(p => p.domain === 'orchestration' && p.model)
         .map(p => p.model!)
     );
-    const strategies: Array<{ name: string; orchestrator: string; workers?: { profile: string }[]; disabled?: boolean; tooltip?: string }> = [...templates];
-    if (orchModels.size >= 2) {
-      strategies.push({
-        name: 'Multi-Model Comparison',
-        orchestrator: '',
-        workers: [],
-        disabled: false,
-      });
-    } else {
-      strategies.push({
-        name: '__multi_model__',
-        orchestrator: '',
-        workers: [],
-        disabled: true,
-        tooltip: 'Configure at least 2 orchestrator profiles with different models in Model & Agent Studio.',
-      });
+    const strategies: Array<{ name: string; orchestrator: string; workers?: { profile: string }[]; disabled?: boolean; tooltip?: string; experimentType?: string }> = [...templates];
+
+    // ── Slice 22c — Experiment strategies ──────────────────────────────────
+    const experimentStrategies = [
+      { name: 'Multi-Model Comparison', experimentType: 'Model' },
+      { name: 'Architecture Fork', experimentType: 'Architecture' },
+      { name: 'Library Comparison', experimentType: 'Library' },
+      { name: 'Product Strategy Fork', experimentType: 'Product' },
+    ];
+    for (const es of experimentStrategies) {
+      if (es.name === 'Multi-Model Comparison') {
+        if (orchModels.size >= 2) {
+          strategies.push({ name: es.name, orchestrator: '', workers: [], disabled: false, experimentType: es.experimentType });
+        } else {
+          strategies.push({
+            name: '__multi_model__',
+            orchestrator: '',
+            workers: [],
+            disabled: true,
+            tooltip: 'Configure at least 2 orchestrator profiles with different models in Model & Agent Studio.',
+          });
+        }
+      } else {
+        strategies.push({ name: es.name, orchestrator: '', workers: [], disabled: false, experimentType: es.experimentType });
+      }
     }
-    void this.panel.webview.postMessage({ type: 'strategies', strategies });
+    void this.panel.webview.postMessage({ type: 'strategies', strategies, profiles: profiles.map(p => ({ id: p.id, label: p.label, domain: p.domain, model: p.model })) });
   }
 
   // Slice 12c — live stage badges.
@@ -273,6 +292,83 @@ export class GoalWorkspacePanel {
     }
   }
 
+  private async loadDecisionContext(workUnitId: string): Promise<void> {
+    try {
+      const result = await this.get<{
+        data: {
+          workUnitId: string;
+          goal: string;
+          plan: Array<{ sliceId: string; goal: string; fileScope: string[]; steps: string[] }>;
+          assumptions: string[];
+          constraints: string[];
+          evidence: Array<{ kind: string; summary: string; success: boolean }>;
+          allowedTools: string[];
+          execution: {
+            allSucceeded: boolean;
+            buildSystems: string[];
+            testSummary?: string | null;
+            executedAt: string;
+          } | null;
+          agentModel?: string | null;
+          agentProvider?: string | null;
+          steeredFromDecisionId?: string | null;
+        };
+      }>('/studio/projections/DecisionContext?workUnitId=' + encodeURIComponent(workUnitId) + '&level=Normal');
+      void this.panel.webview.postMessage({
+        type: 'decisionContext',
+        workUnitId,
+        context: result.data ?? null,
+      });
+    } catch (err) {
+      void this.panel.webview.postMessage({
+        type: 'decisionContext',
+        workUnitId,
+        context: null,
+        error: String(err),
+      });
+    }
+  }
+
+  // Slice 25c — fetches the original-vs-counterfactual comparison for the "Compare with
+  // Original" link on a counterfactual work unit's badge.
+  private async loadCounterfactualComparison(workUnitId: string): Promise<void> {
+    try {
+      const result = await this.get<{
+        data: {
+          originalWorkUnitId: string;
+          counterfactualWorkUnitId: string;
+          originalProposalId: string;
+          originals: Array<{
+            proposalId: string; goal: string; status: string; model?: string | null;
+            provider?: string | null; confidence?: number | null; filesTouched: string[];
+            diffSummary?: string | null;
+          }>;
+          counterfactuals: Array<{
+            proposalId: string; goal: string; status: string; model?: string | null;
+            provider?: string | null; confidence?: number | null; filesTouched: string[];
+            diffSummary?: string | null;
+          }>;
+          originalModel?: string | null;
+          originalProvider?: string | null;
+          counterfactualModel?: string | null;
+          counterfactualProvider?: string | null;
+          whichWasBetter?: string | null;
+          comparedAt: string;
+        };
+      }>('/studio/projections/CounterfactualComparison?workUnitId=' + encodeURIComponent(workUnitId) + '&level=Normal');
+      void this.panel.webview.postMessage({
+        type: 'counterfactualComparison',
+        comparison: result.data ?? null,
+      });
+    } catch (err) {
+      void this.panel.webview.postMessage({
+        type: 'counterfactualComparison',
+        comparison: null,
+        error: String(err),
+      });
+    }
+  }
+
   private async loadProposal(proposalId: string): Promise<void> {
     try {
       const proposal = await this.get<ProposalDetail>('/studio/merges/' + proposalId);
@@ -291,7 +387,18 @@ export class GoalWorkspacePanel {
           if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
           break;
         case 'explorerRun':
-          await this.handleRun(msg.strategy as string, msg.goal as string);
+          await this.handleRun(
+            msg.strategy as string, msg.goal as string,
+            (msg.reviewPolicy as string) || undefined,
+            !!msg.bypassPromotionBranch,
+            (msg.forkConfig as Array<{ profileId: string; constraintHint?: string }>) || [],
+          );
+          break;
+        case 'explorerPickWinner':
+          await this.handlePickWinner(
+            msg.winnerId as string,
+            (msg.loserIds as string[]) ?? [],
+          );
           break;
         case 'explorerSelectWorkUnit':
           await this.loadTimeline(msg.workUnitId as string);
@@ -320,6 +427,24 @@ export class GoalWorkspacePanel {
         case 'explorerSetSchedulerPollIntervalMs':
           await this.updateOptions({ schedulerPollIntervalMs: msg.value as number });
           break;
+        case 'explorerSteeringAction':
+          await this.handleSteeringAction(
+            msg.action as string,
+            msg.workUnitId as string,
+            (msg.agentId as string) ?? '',
+          );
+          break;
+        case 'explorerCounterfactualAction':
+          await this.handleCounterfactualAction(
+            msg.workUnitId as string,
+          );
+          break;
+        case 'explorerSelectContextTab':
+          await this.loadDecisionContext(msg.workUnitId as string);
+          break;
+        case 'explorerLoadCounterfactualComparison':
+          await this.loadCounterfactualComparison(msg.workUnitId as string);
+          break;
         default:
           return;
       }
@@ -328,9 +453,168 @@ export class GoalWorkspacePanel {
     }
   }
 
-  private async handleRun(strategy: string, goal: string): Promise<void> {
+  private async handleSteeringAction(
+    action: string, workUnitId: string, agentId: string,
+  ): Promise<void> {
+    if (action === 'steerPause') {
+      // Open input box for constraint injection
+      const injected = await vscode.window.showInputBox({
+        prompt: 'Inject constraint or redirect...',
+        placeHolder: 'e.g. use Redis instead of SQLite',
+        ignoreFocusOut: true,
+      });
+      if (!injected || !injected.trim()) { return; }
+
+      try {
+        await this.post('/studio/steering/redirect', {
+          workUnitId,
+          agentId,
+          injectedConstraint: injected.trim(),
+          sessionId: this.selectedSessionId ?? undefined,
+        });
+        void vscode.window.showInformationMessage('NodalMerge: Forked with constraint — ' + injected.trim());
+        if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: Steering failed — ' + String(err));
+      }
+      return;
+    }
+
+    if (action === 'steerForkFromNode') {
+      const goal = await vscode.window.showInputBox({
+        prompt: 'Goal for the fork from this node',
+        placeHolder: 'e.g. Retry with a different approach',
+        ignoreFocusOut: true,
+      });
+      if (!goal || !goal.trim()) { return; }
+
+      const profile = await this.configService?.pickProfile('Select profile to run the forked work unit');
+      if (!profile) { return; }
+
+      const constraintText = await vscode.window.showInputBox({
+        prompt: 'Constraint (optional, press Enter to skip)',
+        placeHolder: 'e.g. use gRPC instead of REST',
+        ignoreFocusOut: true,
+      });
+
+      try {
+        await this.post('/studio/steering/fork-from-node', {
+          workUnitId,
+          newGoal: goal.trim(),
+          constraintText: constraintText?.trim() || undefined,
+          profileId: profile.id,
+          sessionId: this.selectedSessionId ?? undefined,
+        });
+        void vscode.window.showInformationMessage('NodalMerge: Forked from node — ' + goal.trim());
+        if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: Fork from node failed — ' + String(err));
+      }
+    }
+  }
+
+  // ── Slice 25c — Counterfactual: "Run with different model" ───────────────
+
+  private async handleCounterfactualAction(workUnitId: string): Promise<void> {
+    try {
+      // 1. Fetch the latest proposal for this work unit
+      const artifacts = await this.get<ArtifactRef[]>('/studio/workunits/' + workUnitId + '/artifacts');
+      const proposals = artifacts.filter(a => a.type === 'MergeProposal');
+      if (proposals.length === 0) {
+        void vscode.window.showWarningMessage('NodalMerge: no proposal available to counterfactual from — the work unit must have at least one MergeProposal artifact.');
+        return;
+      }
+      const latestProposal = proposals[proposals.length - 1];
+
+      // 2. Pick a different profile/model for the counterfactual
+      const profile = await this.configService?.pickProfile('Select a different profile/model for counterfactual');
+      if (!profile) { return; }
+
+      // 3. Optionally override the goal
+      const goalOverride = await vscode.window.showInputBox({
+        prompt: 'Goal override (optional, press Enter to use default)',
+        placeHolder: '[counterfactual] Re-run with ' + (profile.label || profile.id),
+        ignoreFocusOut: true,
+      });
+
+      // 4. Create the counterfactual
+      const result = await this.post<{
+        counterfactualId: string;
+        originalWorkUnitId: string;
+        newWorkUnitId: string;
+        originalProposalId: string;
+      }>('/studio/counterfactuals', {
+        proposalId: latestProposal.artifactId,
+        newProfileId: profile.id,
+        newGoalOverride: goalOverride?.trim() || undefined,
+        sessionId: this.selectedSessionId ?? undefined,
+      });
+
+      void vscode.window.showInformationMessage(
+        'NodalMerge: Counterfactual created — ' + result.newWorkUnitId
+        + ' (original: ' + result.originalWorkUnitId + ')');
+
+      // 5. Refresh the decision tree to show the new counterfactual node
+      if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: Counterfactual failed — ' + String(err));
+    }
+  }
+
+  private async handleRun(
+    strategy: string, goal: string, reviewPolicy?: string, bypassPromotionBranch?: boolean,
+    forkConfig?: Array<{ profileId: string; constraintHint?: string }>,
+  ): Promise<void> {
     if (!goal || !goal.trim()) {
       void vscode.window.showWarningMessage('NodalMerge: enter a goal before running.');
+      return;
+    }
+
+    // Slice 22c fix — Architecture/Library/Product Fork experiments. These were previously
+    // falling through to the topology-template lookup below (which always failed with
+    // "Strategy not found", since these strategy names are not template names). Route them
+    // to the real ExperimentService instead, using the fork-config panel's profile/constraint
+    // entries. Each fork is auto-enqueued by the backend when a profileId is present — no
+    // separate spawn call needed here (see ExperimentService.CreateAsync).
+    const EXPERIMENT_FORK_TYPES: Record<string, string> = {
+      'Architecture Fork': 'Architecture',
+      'Library Comparison': 'Library',
+      'Product Strategy Fork': 'Product',
+    };
+    if (strategy in EXPERIMENT_FORK_TYPES) {
+      const forks = (forkConfig ?? []).filter(f => f.profileId || f.constraintHint);
+      if (forks.length < 2) {
+        void vscode.window.showErrorMessage(
+          `NodalMerge: ${strategy} requires at least 2 fork entries with a constraint — configure them in the fork panel above.`,
+        );
+        void this.panel.webview.postMessage({ type: 'runResult', success: false, message: 'At least 2 forks required.' });
+        return;
+      }
+      try {
+        const result = await this.post<{ experimentId: string; parentWorkUnitId: string; forkWorkUnitIds: string[] }>(
+          '/studio/experiments',
+          {
+            goal,
+            owner: 'user',
+            forkType: EXPERIMENT_FORK_TYPES[strategy],
+            forks: forks.map(f => ({ profileId: f.profileId || undefined, constraintText: f.constraintHint || undefined })),
+            ...(reviewPolicy ? { reviewPolicy } : {}),
+          },
+        );
+        const session = await this.post<ExecutionSession>('/studio/sessions', {
+          rootWorkUnitId: result.parentWorkUnitId,
+          profileIds: forks.map(f => f.profileId).filter(Boolean),
+        });
+        this.selectedSessionId = session.sessionId;
+        this.onSessionChanged?.(this.selectedSessionId);
+        void this.panel.webview.postMessage({ type: 'runResult', success: true, sessionId: session.sessionId });
+        await this.refreshSessions();
+        await this.refreshDecisionTree(session.sessionId);
+        void vscode.window.showInformationMessage(`${strategy} experiment started: ${forks.length} forks.`);
+      } catch (err) {
+        void this.panel.webview.postMessage({ type: 'runResult', success: false, message: String(err) });
+        void vscode.window.showErrorMessage(`NodalMerge: ${strategy} failed — ` + String(err));
+      }
       return;
     }
 
@@ -364,10 +648,15 @@ export class GoalWorkspacePanel {
         }
 
         const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+        const reviewAndTarget = {
+          ...(reviewPolicy ? { reviewPolicy } : {}),
+          bypassPromotionBranch: !!bypassPromotionBranch,
+        };
         // Create a parent work unit to hold both model runs
         const parentWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
           goal,
           owner: 'user',
+          ...reviewAndTarget,
           ...(repositoryPath ? { repositoryPath } : {}),
         });
 
@@ -377,12 +666,14 @@ export class GoalWorkspacePanel {
             goal: `[${modelAProfile.model ?? modelAProfile.id}] ${goal}`,
             owner: modelAProfile.id,
             parentWorkUnitId: parentWu.workUnitId,
+            ...reviewAndTarget,
             ...(repositoryPath ? { repositoryPath } : {}),
           }),
           this.post<{ workUnitId: string }>('/studio/workunits', {
             goal: `[${modelBProfile.model ?? modelBProfile.id}] ${goal}`,
             owner: modelBProfile.id,
             parentWorkUnitId: parentWu.workUnitId,
+            ...reviewAndTarget,
             ...(repositoryPath ? { repositoryPath } : {}),
           }),
         ]);
@@ -452,6 +743,8 @@ export class GoalWorkspacePanel {
       const rootWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
         goal,
         owner: template.orchestrator,
+        ...(reviewPolicy ? { reviewPolicy } : {}),
+        bypassPromotionBranch: !!bypassPromotionBranch,
         ...(repositoryPath ? { repositoryPath } : {}),
       });
 
@@ -498,18 +791,10 @@ export class GoalWorkspacePanel {
         prompt: 'Goal for the first hypothesis fork', ignoreFocusOut: true,
       });
       if (!goalA) { return; }
-      const scopeARaw = await vscode.window.showInputBox({
-        prompt: 'File scope for the first fork (comma-separated, optional)', ignoreFocusOut: true,
-      });
       const goalB = await vscode.window.showInputBox({
         prompt: 'Goal for the second hypothesis fork', ignoreFocusOut: true,
       });
       if (!goalB) { return; }
-      const scopeBRaw = await vscode.window.showInputBox({
-        prompt: 'File scope for the second fork (comma-separated, optional)', ignoreFocusOut: true,
-      });
-      const parseScope = (s: string | undefined) =>
-        s ? s.split(',').map(x => x.trim()).filter(Boolean) : undefined;
 
       await this.post('/studio/hypotheses/fork', {
         goal: goalA, forkType: forkTypePick.label, parentWorkUnitId: workUnitId,
@@ -539,6 +824,12 @@ export class GoalWorkspacePanel {
       }
       const latest = proposals[proposals.length - 1];
       await this.branchFromProposal(latest.artifactId);
+      return;
+    }
+
+    if (action === 'forkKnownGood') {
+      const wu = await this.get<WorkUnit>('/studio/workunits/' + workUnitId);
+      await this.forkFromKnownGood(wu.branchId);
     }
   }
 
@@ -587,6 +878,39 @@ export class GoalWorkspacePanel {
     }
   }
 
+  private async handlePickWinner(winnerId: string, loserIds: string[]): Promise<void> {
+    try {
+      // Accept the winner's latest proposal
+      const artifacts = await this.get<ArtifactRef[]>('/studio/workunits/' + winnerId + '/artifacts');
+      const proposals = artifacts.filter(a => a.type === 'MergeProposal');
+      if (proposals.length > 0) {
+        const latest = proposals[proposals.length - 1];
+        await this.post('/studio/merges/' + latest.artifactId + '/review', { decision: 'Approved' });
+      }
+
+      // Reject each loser's latest proposal
+      for (const loserId of loserIds) {
+        try {
+          const losArtifacts = await this.get<ArtifactRef[]>('/studio/workunits/' + loserId + '/artifacts');
+          const losProposals = losArtifacts.filter(a => a.type === 'MergeProposal');
+          if (losProposals.length > 0) {
+            const latestLoser = losProposals[losProposals.length - 1];
+            await this.post('/studio/merges/' + latestLoser.artifactId + '/review', { decision: 'Rejected' });
+          }
+        } catch {
+          // each rejection is best-effort
+        }
+      }
+
+      void vscode.window.showInformationMessage(
+        'NodalMerge: Winner accepted, ' + loserIds.length + ' rejected.'
+      );
+      if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: Pick winner failed — ' + String(err));
+    }
+  }
+
   private async branchFromProposal(proposalId: string): Promise<void> {
     const goal = await vscode.window.showInputBox({
       prompt: 'Goal for the new hypothesis fork', placeHolder: 'e.g. Retry with a different model', ignoreFocusOut: true,
@@ -598,6 +922,31 @@ export class GoalWorkspacePanel {
       '/studio/merges/' + proposalId + '/branch',
       { goal, profileId: profile.id, ...(this.selectedSessionId ? { sessionId: this.selectedSessionId } : {}) });
     void vscode.window.showInformationMessage('NodalMerge: Forked new work unit ' + result.workUnitId + '.');
+    if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+  }
+
+  private async forkFromKnownGood(branchId: string): Promise<void> {
+    const states = await this.get<KnownGoodState[]>('/studio/state/knownGood/' + encodeURIComponent(branchId));
+    if (states.length === 0) {
+      void vscode.window.showWarningMessage('NodalMerge: no known-good checkpoints marked for this branch yet.');
+      return;
+    }
+    const picked = states.length === 1 ? states[0] : await vscode.window.showQuickPick(
+      states.map(s => ({ label: s.description, description: new Date(s.createdAt).toLocaleString(), state: s })),
+      { placeHolder: 'Select a known-good checkpoint', ignoreFocusOut: true },
+    ).then(p => p?.state);
+    if (!picked) { return; }
+
+    const goal = await vscode.window.showInputBox({
+      prompt: 'Goal for the new fork', placeHolder: 'e.g. Retry from the last known-good checkpoint', ignoreFocusOut: true,
+    });
+    if (!goal) { return; }
+    const profile = await this.configService?.pickProfile('Select profile to run the new fork');
+    if (!profile) { return; }
+    const result = await this.post<{ workUnitId: string }>(
+      '/studio/state/' + picked.stateId + '/fork',
+      { goal, profileId: profile.id, ...(this.selectedSessionId ? { sessionId: this.selectedSessionId } : {}) });
+    void vscode.window.showInformationMessage('NodalMerge: Forked new work unit ' + result.workUnitId + ' from known-good checkpoint.');
     if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
   }
 
@@ -667,6 +1016,16 @@ const GW_CSS = `
   button.ghost:hover { background: color-mix(in srgb, var(--nm-border) 50%, transparent); }
   .gw-settings-panel { flex-shrink: 0; padding: 8px 14px; border-bottom: 1px solid var(--nm-border); background: var(--nm-section-bg); }
   .gw-settings-row { display: flex; align-items: center; gap: 6px; font-size: 0.85em; cursor: pointer; }
+  /* Slice 21c — inline Review/Target controls */
+  .gw-options-row {
+    flex-shrink: 0; padding: 6px 14px; border-bottom: 1px solid var(--nm-border);
+    display: flex; gap: 18px; flex-wrap: wrap; align-items: center; font-size: 0.82em;
+  }
+  .gw-radio-group { display: flex; gap: 12px; align-items: center; }
+  .gw-radio-group-label { opacity: 0.6; text-transform: uppercase; font-size: 0.72em; letter-spacing: 0.05em; margin-right: 4px; }
+  .gw-radio-option { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  .gw-target-row { display: none; }
+  .gw-target-row.visible { display: flex; }
   .gw-body { flex: 1; display: flex; overflow: hidden; min-height: 0; }
   .gw-col { overflow-y: auto; padding: 10px 12px; }
   .gw-decision-tree { width: 280px; flex-shrink: 0; border-right: 1px solid var(--nm-border); }
@@ -745,6 +1104,80 @@ const GW_CSS = `
   .rc-edge-badge.fork { background: rgba(177,128,215,0.2); color: #b180d7; border: 1px solid rgba(177,128,215,0.4); }
   .rc-edge-badge.decided { background: rgba(77,172,38,0.2); color: var(--nm-success); border: 1px solid rgba(77,172,38,0.4); }
   .rc-edge-badge.evidenceattached { background: rgba(55,148,255,0.15); color: var(--nm-info); border: 1px solid rgba(55,148,255,0.35); }
+
+  /* Slice 22c — Inline fork config panel */
+  .gw-fork-config {
+    flex-shrink: 0; padding: 8px 14px; border-bottom: 1px solid var(--nm-border);
+    background: color-mix(in srgb, var(--nm-info) 8%, var(--nm-section-bg));
+    display: none; gap: 10px; flex-wrap: wrap; align-items: flex-end;
+  }
+  .gw-fork-config.visible { display: flex; }
+  .gw-fork-config .gw-field { min-width: 130px; }
+  .gw-fork-entry {
+    border: 1px solid var(--nm-border); border-radius: 4px;
+    padding: 6px 10px; background: var(--nm-section-bg);
+    display: flex; flex-direction: column; gap: 4px; min-width: 180px;
+  }
+  .gw-fork-entry-title { font-size: 0.78em; font-weight: 600; }
+  .gw-fork-entry select { font-size: 0.82em; }
+
+  /* Slice 22c — Experiment parent node badges */
+  .dn-exp-badges { display: flex; gap: 4px; margin-top: 2px; }
+  .dn-exp-badges .badge.forks { background: #b180d7; color: #fff; }
+  .dn-exp-badges .badge.cf { background: #2da198; color: #fff; }
+  .compare-link {
+    font-size: 0.74em; cursor: pointer; color: var(--nm-info); text-decoration: underline;
+    white-space: nowrap;
+  }
+  .compare-link:hover { opacity: 0.8; }
+
+  /* Slice 22c — Compare Results side-by-side view in Decision Lens */
+  .cmp-results { margin-top: 12px; }
+  .cmp-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  .cmp-fork-cards { display: flex; gap: 8px; }
+  .cmp-fork-card {
+    flex: 1; min-width: 0; border: 1px solid var(--nm-border); border-radius: 6px;
+    padding: 8px 10px; background: var(--nm-section-bg);
+  }
+  .cmp-fork-card.selected { border-color: var(--nm-success); border-width: 2px; }
+  .cmp-fork-card.rejected { opacity: 0.45; }
+  .cmp-fk-model { font-size: 0.82em; font-weight: 600; }
+  .cmp-fk-goal { font-size: 0.78em; opacity: 0.7; margin: 4px 0; }
+  .cmp-fk-meta { display: flex; gap: 6px; flex-wrap: wrap; font-size: 0.72em; margin-top: 4px; }
+  .cmp-pick-bar { margin-top: 10px; display: flex; gap: 6px; align-items: center; }
+  .cmp-pick-bar button.pick-winner { background: var(--nm-success); color: #fff; }
+  .cmp-pick-bar button.pick-winner:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Slice 24b — Decision Lens tab bar */
+  .gw-tab-bar { display: flex; gap: 0; margin-bottom: 8px; border-bottom: 1px solid var(--nm-border); }
+  .gw-tab-btn {
+    background: transparent; color: var(--nm-fg); border: none; border-bottom: 2px solid transparent;
+    padding: 3px 10px; font-size: 0.78em; cursor: pointer; font-family: var(--nm-font);
+    opacity: 0.55; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .gw-tab-btn.active { opacity: 1; border-bottom-color: var(--nm-info); color: var(--nm-info); }
+  .gw-tab-btn:hover { opacity: 0.8; }
+  .gw-tab-panel { display: none; }
+  .gw-tab-panel.active { display: block; }
+
+  /* Slice 24b — Context tab structured sections */
+  .ctx-section { margin-bottom: 12px; }
+  .ctx-section h3 {
+    font-size: 0.74em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    opacity: 0.5; margin: 0 0 4px;
+  }
+  .ctx-item { font-size: 0.84em; padding: 2px 0; }
+  .ctx-item.mono { font-family: var(--nm-mono); font-size: 0.8em; }
+  .ctx-evidence { font-size: 0.85em; padding: 2px 0; }
+  .ctx-evidence.success { color: var(--nm-success); }
+  .ctx-evidence.fail { color: var(--nm-error); }
+  .ctx-plan-entry { border: 1px solid var(--nm-border); border-radius: 4px; padding: 6px 10px; margin-bottom: 4px; background: var(--nm-section-bg); }
+  .ctx-plan-slice { font-size: 0.8em; font-weight: 600; }
+  .ctx-plan-goal { font-size: 0.82em; opacity: 0.75; margin-top: 2px; }
+  .ctx-plan-steps { font-size: 0.76em; margin-top: 4px; padding-left: 12px; }
+  .ctx-plan-steps li { opacity: 0.65; }
+  .ctx-copy-btn { font-size: 0.74em; margin-top: 8px; opacity: 0.6; }
+  .ctx-copy-btn:hover { opacity: 1; }
 `;
 
 const GW_HTML = `
@@ -763,6 +1196,22 @@ const GW_HTML = `
     </div>
     <button id="gw-run">&#x25B6; Run</button>
     <button id="gw-settings-btn" class="ghost" title="Exploration Settings">&#9881;</button>
+  </div>
+  <div class="gw-options-row">
+    <div class="gw-radio-group">
+      <span class="gw-radio-group-label">Review</span>
+      <label class="gw-radio-option"><input type="radio" name="gw-review-policy" value="HumanRequired" checked/> Human Required</label>
+      <label class="gw-radio-option"><input type="radio" name="gw-review-policy" value="AgentApproval"/> Agent Approval</label>
+      <label class="gw-radio-option"><input type="radio" name="gw-review-policy" value="Hybrid"/> Hybrid (5 min)</label>
+    </div>
+    <div class="gw-radio-group gw-target-row" id="gw-target-row">
+      <span class="gw-radio-group-label">Target</span>
+      <label class="gw-radio-option"><input type="radio" name="gw-target" value="candidate" checked/> Candidate Branch</label>
+      <label class="gw-radio-option"><input type="radio" name="gw-target" value="direct"/> Direct</label>
+    </div>
+  </div>
+  <div id="gw-fork-config" class="gw-fork-config">
+    <div id="gw-fork-entries" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end"></div>
   </div>
   <div id="gw-settings-panel" class="gw-settings-panel" style="display:none">
     <label class="gw-settings-row">
@@ -862,11 +1311,87 @@ const GW_JS = `
     var goal = document.getElementById('gw-goal').value.trim();
     var strategy = document.getElementById('gw-strategy').value;
     if (!goal) { return; }
+    var forkConfig = collectForkConfig();
+    var reviewPolicyEl = document.querySelector('input[name=gw-review-policy]:checked');
+    var targetEl = document.querySelector('input[name=gw-target]:checked');
     var btn = document.getElementById('gw-run');
     btn.disabled = true;
     btn.textContent = 'Running…';
-    vscode.postMessage({ type: 'explorerRun', strategy: strategy, goal: goal });
+    vscode.postMessage({
+      type: 'explorerRun', strategy: strategy, goal: goal, forkConfig: forkConfig,
+      reviewPolicy: reviewPolicyEl ? reviewPolicyEl.value : 'HumanRequired',
+      bypassPromotionBranch: targetEl ? targetEl.value === 'direct' : false,
+    });
   });
+
+  // ── Slice 22c — Strategy dropdown change reveals fork config panel ─────
+  document.getElementById('gw-strategy').addEventListener('change', function() {
+    var strategy = this.value;
+    var panel = document.getElementById('gw-fork-config');
+    if (strategy === 'Multi-Model Comparison' || strategy === 'Architecture Fork' || strategy === 'Library Comparison' || strategy === 'Product Strategy Fork') {
+      panel.classList.add('visible');
+      if (!state.forkConfig || !state.forkConfig.length) {
+        state.forkConfig = buildDefaultForkConfig(strategy);
+      }
+      renderForkConfigPanel(state.forkConfig);
+    } else {
+      panel.classList.remove('visible');
+    }
+  });
+
+  // ── Slice 22c — Inline fork config panel helpers ──────────────────────
+  function buildDefaultForkConfig(strategy) {
+    var orchProfiles = (state.agentProfiles || []).filter(function(p) { return p.domain === 'orchestration' && p.model; });
+    if (orchProfiles.length < 2) {
+      orchProfiles = (state.agentProfiles || []).filter(function(p) { return p.domain === 'orchestration'; });
+    }
+    var allProfiles = state.agentProfiles || [];
+    var numForks = strategy === 'Multi-Model Comparison' ? 2 : 2;
+    var entries = [];
+    for (var i = 0; i < numForks; i++) {
+      entries.push({ profileId: orchProfiles[i] ? orchProfiles[i].id : (allProfiles[i] ? allProfiles[i].id : ''), constraintHint: '' });
+    }
+    return entries;
+  }
+
+  function collectForkConfig() {
+    var entries = [];
+    var panel = document.getElementById('gw-fork-config');
+    if (!panel || !panel.classList.contains('visible')) { return entries; }
+    panel.querySelectorAll('.gw-fork-entry').forEach(function(entry) {
+      var sel = entry.querySelector('select');
+      var txt = entry.querySelector('input[type=text]');
+      entries.push({ profileId: sel ? sel.value : '', constraintHint: txt ? txt.value : '' });
+    });
+    return entries;
+  }
+
+  function renderForkConfigPanel(entries) {
+    state.forkConfig = entries || [];
+    var el = document.getElementById('gw-fork-entries');
+    if (!el) { return; }
+    var profiles = state.agentProfiles || [];
+    var html = '';
+    (entries || []).forEach(function(entry, i) {
+      html += '<div class="gw-fork-entry">';
+      html += '<div class="gw-fork-entry-title">Fork ' + (i + 1) + '</div>';
+      html += '<div class="gw-field"><label>Profile</label><select>' + profiles.map(function(p) {
+        return '<option value="' + esc(p.id) + '"' + (p.id === entry.profileId ? ' selected' : '') + '>' + esc(p.label) + (p.model ? ' (' + esc(p.model) + ')' : '') + '</option>';
+      }).join('') + '</select></div>';
+      html += '<div class="gw-field"><label>Constraint (optional)</label><input type="text" value="' + esc(entry.constraintHint || '') + '" placeholder="e.g. use gRPC instead of REST"/></div>';
+      html += '</div>';
+    });
+    var addBtn = '<div class="gw-field" style="align-self:flex-end"><button id="gw-add-fork-btn" class="ghost" style="padding:3px 10px;font-size:0.78em">+ Add Fork</button></div>';
+    el.innerHTML = html + addBtn;
+    var addBtnEl = document.getElementById('gw-add-fork-btn');
+    if (addBtnEl) {
+      addBtnEl.addEventListener('click', function() {
+        if (!state.forkConfig) { state.forkConfig = []; }
+        state.forkConfig.push({ profileId: (profiles[0] || {}).id || '', constraintHint: '' });
+        renderForkConfigPanel(state.forkConfig);
+      });
+    }
+  }
 
   // ── Exploration Settings ─────────────────────────────────────────────────
 
@@ -917,7 +1442,7 @@ const GW_JS = `
     renderDecisionTree(state.decisionNodes);
     if (state.selectedNodeId === workUnitId) {
       document.getElementById('gw-inspector').innerHTML = renderDecisionInspector(node);
-      bindWorkUnitActionButtons();
+      bindDecisionInspectorTabs();
     }
   }
 
@@ -953,7 +1478,27 @@ const GW_JS = `
       }
       if (wu.currentStage) { html += stageBadge(wu.currentStage); }
       if (wu.proposalCount) { html += '<span class="mono">' + wu.proposalCount + ' candidate(s)</span>'; }
-      html += '</div></div>';
+      html += '</div>';
+      // Slice 22c — Experiment parent badges
+      var children = (byParent[wu.workUnitId] || []);
+      if (children.length >= 2) {
+        var childForkTypes = children.map(function(c) { return c.forkType || ''; }).filter(function(t) { return t && t.toLowerCase() !== 'unknown'; });
+        if (childForkTypes.length >= 2 || children.length >= 2) {
+          html += '<div class="dn-exp-badges">';
+          html += '<span class="badge forks">' + children.length + ' forks</span>';
+          html += '<span class="compare-link" data-exp-parent="' + esc(wu.workUnitId) + '">Compare Results</span>';
+          html += '</div>';
+        }
+      }
+      // Slice 25c — Counterfactual badge + comparison link
+      var cfOriginalId = wu.metadata && wu.metadata.counterfactualFromWorkUnitId;
+      if (cfOriginalId) {
+        html += '<div class="dn-exp-badges">';
+        html += '<span class="badge cf">Counterfactual</span>';
+        html += '<span class="compare-link cf-compare-link" data-cf-original="' + esc(cfOriginalId) + '">Compare with Original</span>';
+        html += '</div>';
+      }
+      html += '</div>';
       (byParent[wu.workUnitId] || []).forEach(function(child) { renderNode(child, depth + 1); });
     }
     roots.forEach(function(r) { renderNode(r, 0); });
@@ -965,8 +1510,36 @@ const GW_JS = `
         renderDecisionTree(state.decisionNodes);
         document.getElementById('gw-timeline').innerHTML = '<p class="empty">Loading…</p>';
         document.getElementById('gw-inspector').innerHTML = renderDecisionInspector(state.decisionNodes.find(function(w) { return w.workUnitId === id; }));
-        bindWorkUnitActionButtons();
+        bindDecisionInspectorTabs();
         vscode.postMessage({ type: 'explorerSelectWorkUnit', workUnitId: id });
+      });
+    });
+    // Slice 22c — Compare Results link handler
+    el.querySelectorAll('.compare-link').forEach(function(link) {
+      link.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        var parentId = link.getAttribute('data-exp-parent');
+        if (!parentId) { return; }
+        var children = byParent[parentId] || [];
+        var proposalIds = [];
+        children.forEach(function(c) {
+          if (c.latestProposalId) { proposalIds.push(c.latestProposalId); }
+        });
+        // Fetch each child's timeline to find proposals
+        state.__compareChildren = children;
+        state.__compareParentId = parentId;
+        document.getElementById('gw-inspector').innerHTML = renderCompareResults(children, parentId);
+        bindCompareResultsButtons();
+      });
+    });
+    // Slice 25c — Compare with Original link handler
+    el.querySelectorAll('.cf-compare-link').forEach(function(link) {
+      link.addEventListener('click', function(ev) {
+        ev.stopPropagation();
+        var originalId = link.getAttribute('data-cf-original');
+        if (!originalId) { return; }
+        document.getElementById('gw-inspector').innerHTML = '<p class="empty">Loading comparison…</p>';
+        vscode.postMessage({ type: 'explorerLoadCounterfactualComparison', workUnitId: originalId });
       });
     });
     el.querySelectorAll('.dn-node').forEach(function(node) {
@@ -985,32 +1558,51 @@ const GW_JS = `
     html += '<button class="ghost" data-wu-action="forkHypothesis" data-wu="' + esc(workUnitId) + '">Fork Hypothesis</button>';
     html += '<button class="ghost" data-wu-action="reexplore" data-wu="' + esc(workUnitId) + '">Re-explore</button>';
     html += '<button class="ghost" data-wu-action="forkLatest" data-wu="' + esc(workUnitId) + '">Fork from latest candidate</button>';
+    html += '<button class="ghost" data-wu-action="forkKnownGood" data-wu="' + esc(workUnitId) + '">Fork from Known Good</button>';
     html += '</div>';
     el.innerHTML = html;
-    bindWorkUnitActionButtons();
+    bindDecisionInspectorTabs();
   }
 
-  function bindWorkUnitActionButtons() {
+  function bindDecisionInspectorTabs() {
     document.querySelectorAll('[data-wu-action]').forEach(function(btn) {
       btn.addEventListener('click', function() {
-        vscode.postMessage({
-          type: 'explorerWorkUnitAction',
-          action: btn.getAttribute('data-wu-action'),
-          workUnitId: btn.getAttribute('data-wu'),
-        });
+        var action = btn.getAttribute('data-wu-action');
+        if (action === 'steerPause' || action === 'steerForkFromNode') {
+          vscode.postMessage({
+            type: 'explorerSteeringAction',
+            action: action,
+            workUnitId: btn.getAttribute('data-wu'),
+            agentId: btn.getAttribute('data-agent') || '',
+          });
+        } else {
+          vscode.postMessage({
+            type: 'explorerWorkUnitAction',
+            action: action,
+            workUnitId: btn.getAttribute('data-wu'),
+          });
+        }
       });
     });
   }
 
   function renderDecisionInspector(wu) {
     if (!wu) { return '<p class="empty">Select a decision node or timeline item to inspect.</p>'; }
-    var html = '<div class="meta-grid">';
+
+    // ── Slice 24b — Tab bar ────────────────────────────────────────────────
+    var html = '<div class="gw-tab-bar">';
+    html += '<button class="gw-tab-btn active" data-gw-tab="metadata">Metadata</button>';
+    html += '<button class="gw-tab-btn" data-gw-tab="context">Context</button>';
+    html += '</div>';
+
+    // ── Metadata panel ────────────────────────────────────────────────────
+    html += '<div class="gw-tab-panel active" id="gw-panel-metadata">';
+    html += '<div class="meta-grid">';
     html += '<span class="meta-label">Decision Status</span>' + badge(wu.status);
     html += '<span class="meta-label">Phase</span><span>' + stageBadge(wu.currentStage) + '</span>';
     html += '<span class="meta-label">Initiator</span><span class="mono">' + esc(wu.owner) + '</span>';
     html += '<span class="meta-label">Executor</span><span class="mono">' + esc(wu.assignedAgent || '—') + '</span>';
     html += '<span class="meta-label">Hypothesis Fork</span><span class="mono">' + esc(wu.branchId) + '</span>';
-    // Slice 18b/18e — fork-type metadata
     if (wu.forkType && wu.forkType.toLowerCase() !== 'unknown') {
       html += '<span class="meta-label">Fork Type</span><span class="badge fork-type">' + esc(wu.forkType) + '</span>';
     }
@@ -1022,7 +1614,6 @@ const GW_JS = `
     html += '</div>';
     html += '<p>' + esc(wu.goal) + '</p>';
     if (wu.successCriteria) { html += '<p style="opacity:0.75"><em>' + esc(wu.successCriteria) + '</em></p>'; }
-    // Slice 18c — Evidence section
     if (state.selectedNodeEvidence && state.selectedNodeEvidence.length) {
       html += '<h2 style="margin-top:12px">Evidence</h2>';
       state.selectedNodeEvidence.forEach(function(ev) {
@@ -1035,16 +1626,228 @@ const GW_JS = `
         html += '<div style="font-size:0.85em;padding:2px 0">' + icon + ' ' + esc(summary) + '</div>';
       });
     }
-    // Slice 18f — Reasoning Chain section
     if (state.reasoningGraph) {
       html += renderReasoningChain(state.reasoningGraph);
     }
+    var statusLower = (wu.status || '').toLowerCase();
+    var isRunning = statusLower === 'running' || statusLower === 'executing' || statusLower === 'active' || statusLower === 'queued' || statusLower === 'retrying';
     html += '<div class="inspector-actions">';
     html += '<button class="ghost" data-wu-action="forkHypothesis" data-wu="' + esc(wu.workUnitId) + '">Fork Hypothesis</button>';
     html += '<button class="ghost" data-wu-action="reexplore" data-wu="' + esc(wu.workUnitId) + '">Re-explore</button>';
     html += '<button class="ghost" data-wu-action="forkLatest" data-wu="' + esc(wu.workUnitId) + '">Fork from latest candidate</button>';
+    html += '<button class="ghost" data-wu-action="forkKnownGood" data-wu="' + esc(wu.workUnitId) + '">Fork from Known Good</button>';
+    // Slice 25c — Counterfactual: "Run with different model" for completed work units
+    var isCompleted = statusLower === 'completed' || statusLower === 'merged';
+    if (isCompleted) {
+      html += '<button class="ghost" data-wu-action="counterfactual" data-wu="' + esc(wu.workUnitId) + '">↺ Run with different model</button>';
+    }
+    if (isRunning) {
+      html += '<button class="ghost" data-wu-action="steerPause" data-wu="' + esc(wu.workUnitId) + '" data-agent="' + esc(wu.assignedAgent || '') + '" style="color:var(--nm-warn);border-color:var(--nm-warn)">⏸ Pause & Redirect</button>';
+      html += '<button class="ghost" data-wu-action="steerForkFromNode" data-wu="' + esc(wu.workUnitId) + '">↳ Fork from here</button>';
+    }
     html += '</div>';
+    html += '</div>'; // end Metadata panel
+
+    // ── Context panel ─────────────────────────────────────────────────────
+    html += '<div class="gw-tab-panel" id="gw-panel-context">';
+    if (state.selectedNodeContext) {
+      html += renderContextTab(state.selectedNodeContext);
+    } else {
+      html += '<p class="empty">Context loading…</p>';
+    }
+    html += '</div>'; // end Context panel
+
     return html;
+  }
+
+  // ── Slice 24b — Context tab ────────────────────────────────────────────
+
+  function bindTabBarClick() {
+    document.querySelectorAll('.gw-tab-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var tab = btn.getAttribute('data-gw-tab');
+        document.querySelectorAll('.gw-tab-btn').forEach(function(b) { b.classList.remove('active'); });
+        document.querySelectorAll('.gw-tab-panel').forEach(function(p) { p.classList.remove('active'); });
+        btn.classList.add('active');
+        var panel = document.getElementById('gw-panel-' + tab);
+        if (panel) { panel.classList.add('active'); }
+
+        // If Context tab is selected and we have no data yet, request it
+        if (tab === 'context' && !state.selectedNodeContext && state.selectedNodeId) {
+          document.getElementById('gw-panel-context').innerHTML = '<p class="empty">Loading…</p>';
+          vscode.postMessage({ type: 'explorerSelectContextTab', workUnitId: state.selectedNodeId });
+        }
+      });
+    });
+  }
+
+  function renderContextTab(context) {
+    if (!context) { return '<p class="empty">No context data available for this decision node.</p>'; }
+    var html = '';
+
+    // Goal
+    html += '<div class="ctx-section">';
+    html += '<h3>Goal</h3>';
+    html += '<div class="ctx-item">' + esc(context.goal) + '</div>';
+    html += '</div>';
+
+    // Plan
+    if (context.plan && context.plan.length) {
+      html += '<div class="ctx-section">';
+      html += '<h3>Plan</h3>';
+      context.plan.forEach(function(slice) {
+        html += '<div class="ctx-plan-entry">';
+        html += '<div class="ctx-plan-slice mono">' + esc(slice.sliceId) + '</div>';
+        html += '<div class="ctx-plan-goal">' + esc(slice.goal) + '</div>';
+        if (slice.fileScope && slice.fileScope.length) {
+          html += '<div class="ctx-item" style="opacity:0.5;font-size:0.76em">📁 ' + esc(slice.fileScope.join(', ')) + '</div>';
+        }
+        if (slice.steps && slice.steps.length) {
+          html += '<ol class="ctx-plan-steps">';
+          slice.steps.forEach(function(step) { html += '<li>' + esc(step) + '</li>'; });
+          html += '</ol>';
+        }
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+
+    // Assumptions
+    if (context.assumptions && context.assumptions.length) {
+      html += '<div class="ctx-section">';
+      html += '<h3>Assumptions</h3>';
+      context.assumptions.forEach(function(a) {
+        html += '<div class="ctx-item">• ' + esc(a) + '</div>';
+      });
+      html += '</div>';
+    }
+
+    // Constraints
+    if (context.constraints && context.constraints.length) {
+      html += '<div class="ctx-section">';
+      html += '<h3>Constraints</h3>';
+      context.constraints.forEach(function(c) {
+        html += '<div class="ctx-item">🔒 ' + esc(c) + '</div>';
+      });
+      html += '</div>';
+    }
+
+    // Evidence
+    if (context.evidence && context.evidence.length) {
+      html += '<div class="ctx-section">';
+      html += '<h3>Evidence</h3>';
+      context.evidence.forEach(function(ev) {
+        var icon = ev.success ? '✅' : '❌';
+        var cls = ev.success ? 'success' : 'fail';
+        html += '<div class="ctx-evidence ' + cls + '">' + icon + ' ' + esc(ev.summary) + '</div>';
+      });
+      html += '</div>';
+    }
+
+    // Execution results
+    if (context.execution) {
+      html += '<div class="ctx-section">';
+      html += '<h3>Execution Results</h3>';
+      html += '<div class="ctx-item">' + (context.execution.allSucceeded ? '✅ All passed' : '❌ Some failed') + '</div>';
+      if (context.execution.buildSystems && context.execution.buildSystems.length) {
+        html += '<div class="ctx-item mono">Build systems: ' + esc(context.execution.buildSystems.join(', ')) + '</div>';
+      }
+      if (context.execution.testSummary) {
+        html += '<div class="ctx-item mono">' + esc(context.execution.testSummary) + '</div>';
+      }
+      if (context.execution.executedAt) {
+        html += '<div class="ctx-item" style="font-size:0.72em;opacity:0.5">' + esc(fmtTime(context.execution.executedAt)) + '</div>';
+      }
+      html += '</div>';
+    }
+
+    // Allowed Tools
+    if (context.allowedTools && context.allowedTools.length) {
+      html += '<div class="ctx-section">';
+      html += '<h3>Allowed Tools</h3>';
+      html += '<div class="ctx-item mono">' + esc(context.allowedTools.join(', ')) + '</div>';
+      html += '</div>';
+    }
+
+    // Model info
+    if (context.agentModel) {
+      html += '<div class="ctx-section">';
+      html += '<h3>Model</h3>';
+      html += '<div class="ctx-item mono">' + esc(context.agentModel) + (context.agentProvider ? ' @ ' + esc(context.agentProvider) : '') + '</div>';
+      html += '</div>';
+    }
+
+    // Steered-from indicator
+    if (context.steeredFromDecisionId) {
+      html += '<div class="ctx-section">';
+      html += '<h3>Steering</h3>';
+      html += '<div class="ctx-item mono">↳ Steered from decision ' + esc(context.steeredFromDecisionId) + '</div>';
+      html += '</div>';
+    }
+
+    // Copy as Markdown button
+    html += '<div class="inspector-actions">';
+    html += '<button class="ghost ctx-copy-btn" id="ctx-copy-markdown">📋 Copy as Markdown</button>';
+    html += '</div>';
+
+    return html;
+  }
+
+  function bindContextCopyButton() {
+    var btn = document.getElementById('ctx-copy-markdown');
+    if (!btn) { return; }
+    btn.addEventListener('click', function() {
+      var ctx = state.selectedNodeContext;
+      if (!ctx) { return; }
+      var md = '## Decision Context\\n\\n';
+      md += '**Goal:** ' + ctx.goal + '\\n\\n';
+      if (ctx.plan && ctx.plan.length) {
+        md += '### Plan\\n';
+        ctx.plan.forEach(function(s) {
+          md += '- **' + s.sliceId + ':** ' + s.goal + '\\n';
+          if (s.steps && s.steps.length) { s.steps.forEach(function(st) { md += '  1. ' + st + '\\n'; }); }
+        });
+        md += '\\n';
+      }
+      if (ctx.assumptions && ctx.assumptions.length) {
+        md += '### Assumptions\\n';
+        ctx.assumptions.forEach(function(a) { md += '- ' + a + '\\n'; });
+        md += '\\n';
+      }
+      if (ctx.constraints && ctx.constraints.length) {
+        md += '### Constraints\\n';
+        ctx.constraints.forEach(function(c) { md += '- ' + c + '\\n'; });
+        md += '\\n';
+      }
+      if (ctx.evidence && ctx.evidence.length) {
+        md += '### Evidence\\n';
+        ctx.evidence.forEach(function(ev) { md += '- ' + (ev.success ? '✅' : '❌') + ' ' + ev.summary + '\\n'; });
+        md += '\\n';
+      }
+      if (ctx.allowedTools && ctx.allowedTools.length) {
+        md += '### Allowed Tools\\n';
+        md += ctx.allowedTools.join(', ') + '\\n\\n';
+      }
+      if (ctx.agentModel) {
+        md += '**Model:** ' + ctx.agentModel + (ctx.agentProvider ? ' @ ' + ctx.agentProvider : '') + '\\n\\n';
+      }
+      if (ctx.steeredFromDecisionId) {
+        md += '**Steered from:** ' + ctx.steeredFromDecisionId + '\\n\\n';
+      }
+      navigator.clipboard.writeText(md).then(function() {
+        var btn = document.getElementById('ctx-copy-markdown');
+        if (btn) { btn.textContent = '✓ Copied!'; setTimeout(function() { if (btn) { btn.textContent = '📋 Copy as Markdown'; } }, 1500); }
+      }).catch(function() {
+        var btn = document.getElementById('ctx-copy-markdown');
+        if (btn) { btn.textContent = '⚠ Copy failed'; }
+      });
+    });
+  }
+
+  function bindDecisionInspectorTabs() {
+    bindTabBarClick();
+    bindDecisionInspectorTabs();
+    bindContextCopyButton();
   }
 
   // ── Timeline ─────────────────────────────────────────────────────────────
@@ -1178,6 +1981,155 @@ const GW_JS = `
     el.innerHTML = html;
   }
 
+  // ── Slice 22c — Compare Results side-by-side view ──────────────────────
+
+  function renderCompareResults(children, parentId) {
+    var profiles = state.agentProfiles || [];
+    var html = '<div class="cmp-results"><div class="cmp-header">';
+    html += '<h2>Fork Comparison</h2>';
+    html += '<span class="mono" style="font-size:0.72em">' + children.length + ' forks</span>';
+    html += '</div>';
+    html += '<div class="cmp-fork-cards">';
+    children.forEach(function(child, i) {
+      var profile = profiles.find(function(p) { return p.id === child.owner; }) || {};
+      var modelLabel = profile.model || profile.label || child.owner || 'Fork ' + (i + 1);
+      var won = state.__compareWinner === child.workUnitId;
+      var lost = state.__compareLosers && state.__compareLosers.indexOf(child.workUnitId) >= 0;
+      var cls = won ? ' selected' : (lost ? ' rejected' : '');
+      html += '<div class="cmp-fork-card' + cls + '" data-cmp-wu="' + esc(child.workUnitId) + '">';
+      html += '<div class="cmp-fk-model">🔀 ' + esc(modelLabel) + '</div>';
+      html += '<div class="cmp-fk-goal">' + esc((child.goal || '').substring(0, 120)) + '</div>';
+      html += '<div class="cmp-fk-meta">';
+      html += badge(child.status);
+      if (child.forkType && child.forkType.toLowerCase() !== 'unknown') {
+        html += '<span class="badge fork-type">' + esc(child.forkType) + '</span>';
+      }
+      html += '<span class="mono">' + (child.proposalCount || 0) + ' proposals</span>';
+      if (won) { html += '<span class="badge completed">★ Winner</span>'; }
+      html += '</div></div>';
+    });
+    html += '</div>';
+    if (!state.__compareWinner) {
+      html += '<div class="cmp-pick-bar">';
+      html += '<span style="font-size:0.78em;opacity:0.6">Select a fork then click Pick Winner:</span>';
+      html += '<button class="pick-winner" id="gw-pick-winner" disabled>Pick Winner</button>';
+      html += '</div>';
+    } else {
+      html += '<div class="cmp-pick-bar">';
+      html += '<span style="font-size:0.78em;color:var(--nm-success)">✔ Winner selected: ' + esc(state.__compareWinnerLabel || state.__compareWinner) + '</span>';
+      html += '<button class="ghost" id="gw-reset-compare" style="font-size:0.74em">Reset</button>';
+      html += '</div>';
+    }
+    html += '<div class="inspector-actions" style="margin-top:8px">';
+    html += '<button class="ghost" id="gw-compare-open-latest" style="font-size:0.8em">📋 View proposals</button>';
+    html += '</div>';
+    html += '</div>';
+    return html;
+  }
+
+  // ── Slice 25c — Counterfactual: original vs. counterfactual comparison ─
+  function renderCounterfactualComparison(comparison) {
+    if (!comparison) { return '<p class="empty">No comparison data available for this counterfactual.</p>'; }
+
+    function renderSide(label, model, provider, proposals) {
+      var html = '<div class="cmp-fork-card">';
+      html += '<div class="cmp-fk-model">🔀 ' + esc(label) + ': ' + esc(model || provider || 'unknown') + '</div>';
+      (proposals || []).forEach(function(p) {
+        html += '<div class="cmp-fk-goal">' + esc((p.goal || '').substring(0, 120)) + '</div>';
+        html += '<div class="cmp-fk-meta">';
+        html += badge(p.status);
+        if (typeof p.confidence === 'number') {
+          html += '<span class="mono">confidence: ' + Math.round(p.confidence * 100) + '%</span>';
+        }
+        html += '<span class="mono">' + (p.filesTouched || []).length + ' files</span>';
+        html += '</div>';
+        if (p.diffSummary) {
+          html += '<div class="cmp-fk-goal" style="opacity:0.6">' + esc(p.diffSummary.substring(0, 200)) + '</div>';
+        }
+      });
+      html += '</div>';
+      return html;
+    }
+
+    var htmlOut = '<div class="cmp-results"><div class="cmp-header">';
+    htmlOut += '<h2>Counterfactual Comparison</h2>';
+    htmlOut += '</div>';
+    htmlOut += '<div class="cmp-fork-cards">';
+    htmlOut += renderSide('Original', comparison.originalModel, comparison.originalProvider, comparison.originals);
+    htmlOut += renderSide('Counterfactual', comparison.counterfactualModel, comparison.counterfactualProvider, comparison.counterfactuals);
+    htmlOut += '</div>';
+    if (comparison.whichWasBetter) {
+      htmlOut += '<div class="cmp-pick-bar"><span style="font-size:0.78em;color:var(--nm-success)">Which was better: ' + esc(comparison.whichWasBetter) + '</span></div>';
+    }
+    htmlOut += '</div>';
+    return htmlOut;
+  }
+
+  function bindCompareResultsButtons() {
+    var children = state.__compareChildren || [];
+    var pickBtn = document.getElementById('gw-pick-winner');
+    var openBtn = document.getElementById('gw-compare-open-latest');
+    var resetBtn = document.getElementById('gw-reset-compare');
+
+    // Card click to select
+    document.querySelectorAll('.cmp-fork-card').forEach(function(card) {
+      card.addEventListener('click', function() {
+        var wuId = card.getAttribute('data-cmp-wu');
+        if (!wuId) { return; }
+        state.__comparePendingPick = wuId;
+        document.querySelectorAll('.cmp-fork-card').forEach(function(c) { c.classList.remove('selected'); });
+        card.classList.add('selected');
+        if (pickBtn) {
+          pickBtn.disabled = false;
+          pickBtn.textContent = 'Pick Winner: ' + esc(state.__comparePendingPickLabel || wuId);
+        }
+      });
+    });
+
+    if (pickBtn) {
+      pickBtn.addEventListener('click', function() {
+        var winnerId = state.__comparePendingPick;
+        if (!winnerId) { return; }
+        var winnerWU = children.find(function(c) { return c.workUnitId === winnerId; });
+        state.__compareWinner = winnerId;
+        state.__compareWinnerLabel = winnerWU ? (winnerWU.owner || winnerWU.goal || winnerId) : winnerId;
+        state.__compareLosers = children.filter(function(c) { return c.workUnitId !== winnerId; }).map(function(c) { return c.workUnitId; });
+        // Send pick winner action to extension host
+        vscode.postMessage({
+          type: 'explorerPickWinner',
+          winnerId: winnerId,
+          loserIds: state.__compareLosers,
+          parentId: state.__compareParentId || '',
+        });
+        // Re-render
+        document.getElementById('gw-inspector').innerHTML = renderCompareResults(children, state.__compareParentId);
+        bindCompareResultsButtons();
+      });
+    }
+
+    if (resetBtn) {
+      resetBtn.addEventListener('click', function() {
+        state.__compareWinner = null;
+        state.__compareWinnerLabel = null;
+        state.__compareLosers = null;
+        state.__comparePendingPick = null;
+        document.getElementById('gw-inspector').innerHTML = renderCompareResults(children, state.__compareParentId);
+        bindCompareResultsButtons();
+      });
+    }
+
+    if (openBtn) {
+      openBtn.addEventListener('click', function() {
+        var firstChild = children[0];
+        if (firstChild) {
+          state.selectedNodeId = firstChild.workUnitId;
+          renderDecisionTree(state.decisionNodes);
+          vscode.postMessage({ type: 'explorerSelectWorkUnit', workUnitId: firstChild.workUnitId });
+        }
+      });
+    }
+  }
+
   // ── Slice 18f — Reasoning Chain vertical timeline ───────────────────────
 
   function renderReasoningChain(graph) {
@@ -1244,12 +2196,26 @@ const GW_JS = `
       return;
     }
     if (msg.type === 'strategies') {
+      // Slice 22c — store profiles for fork config
+      if (msg.profiles) { state.agentProfiles = msg.profiles || []; }
       var sel = document.getElementById('gw-strategy');
       sel.innerHTML = (msg.strategies || []).map(function(t) {
         var disabled = t.disabled ? ' disabled' : '';
         var title = t.tooltip ? ' title="' + esc(t.tooltip) + '"' : '';
         return '<option value="' + esc(t.name) + '"' + disabled + title + '>' + esc(t.name) + '</option>';
       }).join('');
+      // Trigger fork config panel visibility if current selection is experiment
+      var currentVal = sel.value;
+      var panel = document.getElementById('gw-fork-config');
+      if (currentVal === 'Multi-Model Comparison' || currentVal === 'Architecture Fork' || currentVal === 'Library Comparison' || currentVal === 'Product Strategy Fork') {
+        panel.classList.add('visible');
+        if ((!state.forkConfig || !state.forkConfig.length) && state.agentProfiles) {
+          state.forkConfig = buildDefaultForkConfig(currentVal);
+        }
+        renderForkConfigPanel(state.forkConfig || buildDefaultForkConfig(currentVal));
+      } else {
+        panel.classList.remove('visible');
+      }
       return;
     }
     if (msg.type === 'sessions') {
@@ -1279,7 +2245,7 @@ const GW_JS = `
         var wu = state.decisionNodes.find(function(w) { return w.workUnitId === state.selectedNodeId; });
         if (wu) {
           document.getElementById('gw-inspector').innerHTML = renderDecisionInspector(wu);
-          bindWorkUnitActionButtons();
+          bindDecisionInspectorTabs();
         }
       }
       return;
@@ -1297,6 +2263,25 @@ const GW_JS = `
       document.getElementById('gw-llm-profile-checkbox').checked = !!msg.useLlmProfileSelection;
       document.getElementById('gw-max-concurrent-workers').value = msg.maxConcurrentWorkers;
       document.getElementById('gw-scheduler-poll-interval').value = msg.schedulerPollIntervalMs;
+      // Slice 21c — Target (Direct/Candidate) only makes sense when promotion branch is on.
+      document.getElementById('gw-target-row').classList.toggle('visible', !!msg.usePromotionBranch);
+      return;
+    }
+    if (msg.type === 'decisionContext') {
+      if (msg.workUnitId === state.selectedNodeId) {
+        state.selectedNodeContext = msg.context || null;
+        if (state.selectedNodeId) {
+          var wuCtx = state.decisionNodes.find(function(w) { return w.workUnitId === state.selectedNodeId; });
+          if (wuCtx) {
+            document.getElementById('gw-inspector').innerHTML = renderDecisionInspector(wuCtx);
+            bindDecisionInspectorTabs();
+          }
+        }
+      }
+      return;
+    }
+    if (msg.type === 'counterfactualComparison') {
+      document.getElementById('gw-inspector').innerHTML = renderCounterfactualComparison(msg.comparison);
       return;
     }
     if (msg.type === 'runResult') {

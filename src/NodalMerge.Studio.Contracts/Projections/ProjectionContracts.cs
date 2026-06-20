@@ -18,6 +18,8 @@ public enum ProjectionType
     TrajectoryTimeline,
     ModelDivergenceView,
     ReasoningCommitGraph,
+    DecisionContext,
+    CounterfactualComparison,
 }
 
 public enum ProjectionLevel
@@ -205,6 +207,68 @@ public sealed record ReasoningCommitGraphEdge(
     string FromCommitId,
     string ToCommitId,
     string EdgeType);
+
+/// <summary>
+/// DecisionContext projection — structured decision audit for a work unit.
+/// Assembles goal, plan, assumptions, constraints, evidence, allowed tools, and
+/// execution results without exposing raw prompt text.
+/// </summary>
+public sealed record DecisionContextProjectionPayload(
+    string WorkUnitId,
+    string Goal,
+    IReadOnlyList<DecisionContextPlanEntry> Plan,
+    IReadOnlyList<string> Assumptions,
+    IReadOnlyList<string> Constraints,
+    IReadOnlyList<DecisionContextEvidenceEntry> Evidence,
+    IReadOnlyList<string> AllowedTools,
+    DecisionContextExecutionSummary? Execution,
+    string? AgentModel,
+    string? AgentProvider,
+    string? SteeredFromDecisionId);
+
+public sealed record DecisionContextPlanEntry(
+    string SliceId,
+    string Goal,
+    IReadOnlyList<string> FileScope,
+    IReadOnlyList<string> Steps);
+
+public sealed record DecisionContextEvidenceEntry(
+    string Kind,
+    string Summary,
+    bool Success);
+
+public sealed record DecisionContextExecutionSummary(
+    bool AllSucceeded,
+    IReadOnlyList<string> BuildSystems,
+    string? TestSummary,
+    DateTimeOffset ExecutedAt);
+
+/// <summary>
+/// CounterfactualComparison projection — side-by-side comparison of an original work unit
+/// and a counterfactual (different model/profile) work unit that branched from the same proposal.
+/// </summary>
+public sealed record CounterfactualComparisonProjectionPayload(
+    string OriginalWorkUnitId,
+    string CounterfactualWorkUnitId,
+    string OriginalProposalId,
+    IReadOnlyList<CounterfactualComparisonProposal> Originals,
+    IReadOnlyList<CounterfactualComparisonProposal> Counterfactuals,
+    string? OriginalModel,
+    string? OriginalProvider,
+    string? CounterfactualModel,
+    string? CounterfactualProvider,
+    string? WhichWasBetter,
+    DateTimeOffset ComparedAt);
+
+public sealed record CounterfactualComparisonProposal(
+    string ProposalId,
+    string Goal,
+    string Status,
+    string? Model,
+    string? Provider,
+    double? Confidence,
+    IReadOnlyList<string> FilesTouched,
+    string? DiffSummary);
 
 public static class ProjectionCatalog
 {

@@ -55,7 +55,9 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
   private readonly secrets: vscode.SecretStorage | undefined;
   private readonly lmProxyBaseUrl: string | undefined;
   private readonly getSelectedSessionId?: () => string | undefined;
+  private localSessionOverride?: string;
   private pollTimer?: ReturnType<typeof setInterval>;
+  private usePromotionBranch = false;
 
   constructor(
     panel: vscode.WebviewPanel,
@@ -85,11 +87,36 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
 
   activate(): void {
     this.startPolling();
+    void this.sendSessionPicker();
   }
 
   /** Immediately re-polls — used by the shell when the selected session changes. */
   async triggerPoll(): Promise<void> {
     await this.poll();
+    void this.sendSessionPicker();
+  }
+
+  setSessionOverride(sessionId: string | undefined): void {
+    this.localSessionOverride = sessionId;
+    void this.sendSessionPicker();
+    void this.poll();
+  }
+
+  private getEffectiveSessionId(): string | undefined {
+    return this.localSessionOverride ?? this.getSelectedSessionId?.();
+  }
+
+  private async sendSessionPicker(): Promise<void> {
+    try {
+      const sessions = await this.get<Array<{ sessionId: string; status: string }>>('/studio/sessions');
+      void this.panel.webview.postMessage({
+        type: 'updateSessionPicker',
+        panelId: ExecutionTimelinePanel.containerId,
+        sessions,
+        shellSessionId: this.getSelectedSessionId?.(),
+        overrideSessionId: this.localSessionOverride,
+      });
+    } catch { /* host not ready */ }
   }
 
   private startPolling(): void {
@@ -107,16 +134,22 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
 
   private async poll(): Promise<void> {
     try {
-      const sessionId = this.getSelectedSessionId?.();
+      const sessionId = this.getEffectiveSessionId();
       const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
-      const [summary, workUnits, agents, merges, deadLetters] = await Promise.all([
+      const [summary, workUnits, agents, merges, deadLetters, opts] = await Promise.all([
         this.get<WorkspaceSummary>('/studio/workspace-summary' + params),
         this.get<WorkUnit[]>('/studio/workunits' + params),
         this.get<AgentInfo[]>('/studio/agents?all=true' + (sessionId ? '&sessionId=' + encodeURIComponent(sessionId) : '')),
         this.get<MergeProposal[]>('/studio/merges' + params),
         this.get<DeadLetterEntry[]>('/studio/dead-letter' + params),
+        this.get<{ usePromotionBranch?: boolean; candidateBranchId?: string }>('/studio/options'),
       ]);
-      void this.panel.webview.postMessage({ type: 'data', summary, workUnits, agents, merges, deadLetters });
+      this.usePromotionBranch = opts.usePromotionBranch ?? false;
+      void this.panel.webview.postMessage({
+        type: 'data', summary, workUnits, agents, merges, deadLetters,
+        usePromotionBranch: this.usePromotionBranch,
+        candidateBranchId: opts.candidateBranchId ?? 'candidate',
+      });
       this.notifications?.update(merges);
     } catch {
       // host not yet ready — suppress until healthy
@@ -139,8 +172,38 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
             ignoreFocusOut: true,
           });
           if (!owner) { return; }
+          const reviewPolicyPick = await vscode.window.showQuickPick(
+            [
+              { label: '$(person) Human Required', description: 'Proposal waits for manual apply (default)', value: 'HumanRequired' },
+              { label: '$(robot) Agent Approval', description: 'Reviewer agent approves; merges automatically', value: 'AgentApproval' },
+              { label: '$(clock) Hybrid (5 min)', description: 'Agent approves; auto-merges after 5 min unless overridden', value: 'Hybrid' },
+            ],
+            { placeHolder: 'Review policy', ignoreFocusOut: true }
+          );
+          if (!reviewPolicyPick) { return; }
+
+          // Slice 21c — when promotion branch is on, let the user pick the effective target;
+          // "Direct" sets BypassPromotionBranch so this work unit's applies skip candidate.
+          let bypassPromotionBranch = false;
+          if (this.usePromotionBranch) {
+            const targetPick = await vscode.window.showQuickPick(
+              [
+                { label: '$(git-branch) Candidate Branch', description: 'Applies land on candidate; promote to main manually (session default)', value: 'candidate' },
+                { label: '$(arrow-right) Direct', description: 'Bypass candidate — apply goes directly to parent branch', value: 'direct' },
+              ],
+              { placeHolder: 'Apply target', ignoreFocusOut: true },
+            );
+            if (!targetPick) { return; }
+            bypassPromotionBranch = targetPick.value === 'direct';
+          }
+
           const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-          await this.post('/studio/workunits', { goal, owner, ...(repositoryPath ? { repositoryPath } : {}) });
+          await this.post('/studio/workunits', {
+            goal, owner,
+            reviewPolicy: reviewPolicyPick.value,
+            bypassPromotionBranch,
+            ...(repositoryPath ? { repositoryPath } : {}),
+          });
           void this.poll();
           break;
         }
@@ -284,6 +347,15 @@ const ET_CSS = `
     margin-bottom: 4px;
   }
   .header-title { font-size: 1.15em; font-weight: 700; }
+  .session-override-picker {
+    font-size: 0.75em;
+    padding: 1px 4px;
+    border: 1px solid var(--nm-border);
+    border-radius: 3px;
+    background: var(--vscode-input-background, #3c3c3c);
+    color: var(--vscode-input-foreground, #ccc);
+    max-width: 150px;
+  }
   .pulse {
     display: inline-block;
     width: 7px; height: 7px; border-radius: 50%;
@@ -326,6 +398,7 @@ const ET_CSS = `
   .badge.stopped,
   .badge.completed { background: #555; color: #ccc; }
   .badge.failed   { background: var(--nm-error); color: #fff; }
+  .badge.interrupted { background: #c05020; color: #fff; }
   .actions { display: flex; gap: 4px; flex-shrink: 0; }
   button {
     background: var(--nm-btn);
@@ -363,7 +436,8 @@ const ET_CSS = `
 
 const ET_HTML = `
   <div class="header">
-     <span class="header-title">Activity Center<span class="pulse"></span></span>
+    <span class="header-title">Activity Center<span class="pulse"></span></span>
+    <select id="et-session-override" class="session-override-picker"><option value="">Follow Workspace</option></select>
     <span id="last-updated"></span>
   </div>
 
@@ -384,6 +458,8 @@ const ET_HTML = `
 
 const ET_JS = `
   const vscode = acquireVsCodeApi();
+  var globalUsePromotionBranch = false;
+  var globalCandidateBranchId = 'candidate';
 
   document.getElementById('btn-new-goal').addEventListener('click', function() {
     vscode.postMessage({ type: 'createWorkUnit' });
@@ -391,6 +467,13 @@ const ET_JS = `
   document.getElementById('btn-start-agent').addEventListener('click', function() {
     vscode.postMessage({ type: 'spawnAgent' });
   });
+
+  var etSessionOverride = document.getElementById('et-session-override');
+  if (etSessionOverride) {
+    etSessionOverride.addEventListener('change', function() {
+      vscode.postMessage({ type: 'sessionOverrideChanged', panelId: 'shell-pane-execution-timeline', sessionId: etSessionOverride.value || undefined });
+    });
+  }
 
   function esc(str) {
     return String(str || '')
@@ -431,6 +514,13 @@ const ET_JS = `
       html += '<span class="mono">' + esc(wu.workUnitId) + '</span>';
       html += '<span class="mono">fork: ' + esc(wu.branchId) + '</span>';
       html += '<span class="mono">owner: ' + esc(wu.owner) + '</span>';
+      if (wu.reviewPolicy && wu.reviewPolicy !== 'HumanRequired') {
+        var rp = wu.reviewPolicy === 'AgentApproval' ? '🤖 Agent Approval' : '⏱ Hybrid';
+        html += '<span class="badge reviewing">' + rp + '</span>';
+      }
+      if (globalUsePromotionBranch) {
+        html += '<span class="badge" title="Applies land on ' + esc(globalCandidateBranchId) + '; promote to main manually">→ ' + esc(globalCandidateBranchId) + '</span>';
+      }
       html += '</div>';
       html += '</div>';
     }
@@ -459,18 +549,23 @@ const ET_JS = `
     for (var i = 0; i < agents.length; i++) {
       var a = agents[i];
       var wu = goalMap[a.workUnitId];
-      var isPaused = (a.status || '').toLowerCase() === 'paused';
+      var statusLower = (a.status || '').toLowerCase();
+      var isPaused = statusLower === 'paused';
+      var isInterrupted = statusLower === 'interrupted';
       html += '<div class="card">';
       html += '<div class="row">';
       html += '<span class="title mono">' + esc(a.agentId) + '</span>';
       html += badge(a.status);
       html += '<div class="actions">';
-      if (isPaused) {
+      if (isInterrupted) {
+        html += '<button class="ghost" data-action="resumeInterrupted" data-wu="' + esc(a.workUnitId) + '">↺ Resume</button>';
+      } else if (isPaused) {
         html += '<button class="ghost" data-action="resumeAgent" data-id="' + esc(a.agentId) + '">Resume</button>';
+        html += '<button class="danger" data-action="stopAgent" data-id="' + esc(a.agentId) + '">Stop</button>';
       } else {
         html += '<button class="ghost" data-action="pauseAgent" data-id="' + esc(a.agentId) + '">Pause</button>';
+        html += '<button class="danger" data-action="stopAgent" data-id="' + esc(a.agentId) + '">Stop</button>';
       }
-      html += '<button class="danger" data-action="stopAgent" data-id="' + esc(a.agentId) + '">Stop</button>';
       html += '</div>';
       html += '</div>';
       if (wu) {
@@ -479,7 +574,12 @@ const ET_JS = `
       html += '</div>';
     }
     el.innerHTML = html;
-    el.querySelectorAll('[data-action]').forEach(function(btn) {
+    el.querySelectorAll('[data-action="resumeInterrupted"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'spawnAgent', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+    el.querySelectorAll('[data-action="pauseAgent"],[data-action="resumeAgent"],[data-action="stopAgent"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: btn.getAttribute('data-action'), agentId: btn.getAttribute('data-id') });
       });
@@ -572,7 +672,27 @@ const ET_JS = `
 
   window.addEventListener('message', function(event) {
     var msg = event.data;
+    if (msg.type === 'updateSessionPicker' && msg.panelId === 'shell-pane-execution-timeline') {
+      var sel = document.getElementById('et-session-override');
+      if (sel) {
+        var shellLabel = msg.shellSessionId ? ' (' + String(msg.shellSessionId).slice(0, 8) + '…)' : '';
+        sel.innerHTML = '<option value="">Follow Workspace' + esc(shellLabel) + '</option>';
+        for (var i = 0; i < (msg.sessions || []).length; i++) {
+          var s = msg.sessions[i];
+          var opt = document.createElement('option');
+          opt.value = s.sessionId;
+          opt.textContent = String(s.sessionId).slice(0, 12) + '… (' + s.status + ')';
+          sel.appendChild(opt);
+        }
+        sel.value = msg.overrideSessionId || '';
+      }
+      return;
+    }
     if (msg.type !== 'data') { return; }
+    if (typeof msg.usePromotionBranch !== 'undefined') {
+      globalUsePromotionBranch = !!msg.usePromotionBranch;
+      globalCandidateBranchId = msg.candidateBranchId || 'candidate';
+    }
     renderActiveGoals(msg.workUnits);
     renderAgents(msg.agents, msg.workUnits);
     renderPendingDecisions(msg.merges);

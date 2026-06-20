@@ -163,7 +163,7 @@ function toVsMessages(msgs: OaiMessage[], origToSafe: Record<string, string> = {
         try { input = JSON.parse(tc.function.arguments || '{}'); } catch { /* use empty object */ }
         // Use sanitized tool name if available
         const safeName = origToSafe[tc.function.name] ?? tc.function.name;
-        parts.push(new vscode.LanguageModelToolCallPart(tc.id, safeName, input));
+        parts.push(new vscode.LanguageModelToolCallPart(tc.id, safeName, input as object));
       }
       out.push(vscode.LanguageModelChatMessage.Assistant(parts.length === 1 && parts[0] instanceof vscode.LanguageModelTextPart
         ? parts[0].value

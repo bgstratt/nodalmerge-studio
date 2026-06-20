@@ -65,6 +65,7 @@ export class DecisionConvergencePanel {
   private readonly baseUrl: string;
   private readonly configService: AgentConfigService | undefined;
   private readonly getSelectedSessionId?: () => string | undefined;
+  private localSessionOverride?: string;
   private mode: 'proposal' | 'conflict' = 'proposal';
   private proposalId?: string;
   private workUnitId?: string;
@@ -79,6 +80,10 @@ export class DecisionConvergencePanel {
     this.baseUrl = baseUrl;
     this.configService = configService;
     this.getSelectedSessionId = getSelectedSessionId;
+  }
+
+  activate(): void {
+    void this.sendSessionPicker();
   }
 
   loadProposal(proposalId: string): void {
@@ -97,6 +102,7 @@ export class DecisionConvergencePanel {
 
   /** Reloads the currently loaded proposal/conflict, or loads latest pending — used by the shell when the selected session changes. */
   async triggerReload(): Promise<void> {
+    void this.sendSessionPicker();
     if (this.proposalId) {
       void this.load();
     } else if (this.workUnitId) {
@@ -104,6 +110,29 @@ export class DecisionConvergencePanel {
     } else {
       await this.loadLatestPending();
     }
+  }
+
+  setSessionOverride(sessionId: string | undefined): void {
+    this.localSessionOverride = sessionId;
+    void this.sendSessionPicker();
+    void this.triggerReload();
+  }
+
+  private getEffectiveSessionId(): string | undefined {
+    return this.localSessionOverride ?? this.getSelectedSessionId?.();
+  }
+
+  private async sendSessionPicker(): Promise<void> {
+    try {
+      const sessions = await this.get<Array<{ sessionId: string; status: string }>>('/studio/sessions');
+      void this.panel.webview.postMessage({
+        type: 'updateSessionPicker',
+        panelId: DecisionConvergencePanel.containerId,
+        sessions,
+        shellSessionId: this.getSelectedSessionId?.(),
+        overrideSessionId: this.localSessionOverride,
+      });
+    } catch { /* host not ready */ }
   }
 
   static getFragment(): { css: string; html: string; script: string } {
@@ -153,7 +182,7 @@ export class DecisionConvergencePanel {
 
   private async loadLatestPending(): Promise<void> {
     try {
-      const sessionId = this.getSelectedSessionId?.();
+      const sessionId = this.getEffectiveSessionId();
       const proposals = await this.get<MergeProposal[]>('/studio/merges' + (sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : ''));
       const pending = proposals.find(p => {
         const status = (p.status || '').toLowerCase();
@@ -366,6 +395,18 @@ const DC_CSS = `
     margin: 0; padding: 0 20px 40px;
   }
   .hidden { display: none; }
+  .dc-topbar {
+    display: flex; align-items: center; justify-content: flex-end;
+    padding: 8px 0 4px; border-bottom: 1px solid var(--nm-border);
+    margin-bottom: 4px;
+  }
+  .session-override-picker {
+    font-size: 0.75em; padding: 1px 4px;
+    border: 1px solid var(--nm-border); border-radius: 3px;
+    background: var(--vscode-input-background, #3c3c3c);
+    color: var(--vscode-input-foreground, #ccc);
+    max-width: 150px;
+  }
   h1 { font-size: 1.1em; font-weight: 700; margin: 18px 0 6px; }
   .meta-grid {
     display: grid;
@@ -466,6 +507,12 @@ const DC_CSS = `
   .diff-split-cell.right { border-left: 1px solid var(--nm-border); }
   .diff-split-meta { grid-column: 1 / -1; }
   .diff-empty { opacity: 0.6; padding: 8px 12px; font-size: 0.9em; }
+  .auto-applied-banner {
+    border-left: 3px solid var(--nm-success);
+    background: color-mix(in srgb, var(--nm-success) 8%, transparent);
+    padding: 8px 12px;
+    margin: 12px 0;
+  }
   .converged-banner {
     border-left: 3px solid var(--nm-info);
     padding: 8px 12px;
@@ -565,6 +612,9 @@ const DC_CSS = `
 `;
 
 const DC_HTML = `
+  <div class="dc-topbar">
+    <select id="dc-session-override" class="session-override-picker"><option value="">Follow Workspace</option></select>
+  </div>
   <div id="loading">Loading decision candidate…</div>
   <div id="content" class="hidden">
     <h1 id="title">Decision Convergence</h1>
@@ -577,6 +627,9 @@ const DC_HTML = `
     <section id="section-converged" class="hidden converged-banner">
       <strong>Converged decision</strong> — synthesized from <span id="converged-count"></span> candidate(s).
       <div id="converged-from"></div>
+    </section>
+    <section id="section-auto-applied" class="hidden auto-applied-banner">
+      🤖 <strong>Auto-applied by reviewer agent</strong> — no human action required.
     </section>
     <section id="section-conflict-report" class="hidden">
       <h2>Decision Conflict</h2>
@@ -628,6 +681,13 @@ const DC_HTML = `
 
 const DC_JS = `
   var vscode = acquireVsCodeApi();
+
+  var dcSessionOverride = document.getElementById('dc-session-override');
+  if (dcSessionOverride) {
+    dcSessionOverride.addEventListener('change', function() {
+      vscode.postMessage({ type: 'sessionOverrideChanged', panelId: 'shell-pane-decision-convergence', sessionId: dcSessionOverride.value || undefined });
+    });
+  }
 
   var STATUS_BUTTONS = {
     draft:          { validate: true,  accept: false, reject: false, apply: false },
@@ -851,6 +911,23 @@ const DC_JS = `
   window.addEventListener('message', function(event) {
     var msg = event.data;
 
+    if (msg.type === 'updateSessionPicker' && msg.panelId === 'shell-pane-decision-convergence') {
+      var sel = document.getElementById('dc-session-override');
+      if (sel) {
+        var shellLabel = msg.shellSessionId ? ' (' + String(msg.shellSessionId).slice(0, 8) + '…)' : '';
+        sel.innerHTML = '<option value="">Follow Workspace' + esc(shellLabel) + '</option>';
+        for (var i = 0; i < (msg.sessions || []).length; i++) {
+          var s = msg.sessions[i];
+          var opt = document.createElement('option');
+          opt.value = s.sessionId;
+          opt.textContent = String(s.sessionId).slice(0, 12) + '… (' + s.status + ')';
+          sel.appendChild(opt);
+        }
+        sel.value = msg.overrideSessionId || '';
+      }
+      return;
+    }
+
     if (msg.type === 'noPending') {
       var loadingEl2 = document.getElementById('loading');
       var contentEl2 = document.getElementById('content');
@@ -1045,6 +1122,14 @@ const DC_JS = `
     showIf('section-files', fileChanges.length > 0);
 
     showIf('section-rollback', !!p.rollbackPlan);
+
+    // Auto-applied banner: show when merged AND autoApplied flag is set OR verificationResults
+    // looks like reviewer text (plain string from the agent, not execution JSON).
+    var isAutoApplied = status === 'merged' && (
+      p.autoApplied === true ||
+      (p.verificationResults && !p.verificationResults.trim().startsWith('{'))
+    );
+    showIf('section-auto-applied', isAutoApplied);
 
     var btns = STATUS_BUTTONS[status] || { validate: false, accept: false, reject: false, apply: false };
     setDisabled('btn-validate', !btns.validate);

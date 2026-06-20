@@ -73,6 +73,15 @@ export class AgentConfigService {
       .update('defaultTopology', name, vscode.ConfigurationTarget.Workspace);
   }
 
+  getDefaultReviewPolicy(): string {
+    return vscode.workspace.getConfiguration('nodalmerge').get<string>('defaultReviewPolicy') ?? 'HumanRequired';
+  }
+
+  async saveDefaultReviewPolicy(policy: string): Promise<void> {
+    await vscode.workspace.getConfiguration('nodalmerge')
+      .update('defaultReviewPolicy', policy, vscode.ConfigurationTarget.Workspace);
+  }
+
   async resolveApiKey(profile: AgentProfile, secrets: vscode.SecretStorage): Promise<string | undefined> {
     if (!profile.apiKeyRef) { return undefined; }
     return secrets.get(profile.apiKeyRef);

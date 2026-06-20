@@ -19,5 +19,8 @@ public sealed class WorkUnitCommandService(IOrchestratorService orchestrator) : 
             command.DependsOn,
             command.FileScope,
             forkType: command.ForkType,
+            reviewPolicy: command.ReviewPolicy,
+            bypassPromotionBranch: command.BypassPromotionBranch,
+            seedFromBranchId: command.SeedFromBranchId,
             cancellationToken: cancellationToken);
 }

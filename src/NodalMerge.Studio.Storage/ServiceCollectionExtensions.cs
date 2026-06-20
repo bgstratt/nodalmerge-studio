@@ -88,6 +88,10 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IDecisionNodeService>(sp => sp.GetRequiredService<DecisionNodeService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<DecisionNodeService>());
 
+        services.AddSingleton<SteeringDecisionService>();
+        services.AddSingleton<ISteeringDecisionService>(sp => sp.GetRequiredService<SteeringDecisionService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<SteeringDecisionService>());
+
         services.AddSingleton<EvidenceNodeService>();
         services.AddSingleton<IEvidenceNodeService>(sp => sp.GetRequiredService<EvidenceNodeService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<EvidenceNodeService>());
@@ -101,6 +105,11 @@ public static class ServiceCollectionExtensions
         // abstraction.
         services.AddSingleton<RuntimeSettingsService>();
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<RuntimeSettingsService>());
+
+        // Slice 21a — must run after RuntimeSettingsService so UsePromotionBranch is already
+        // restored before we try to create the candidate branch.
+        services.AddSingleton<CandidateBranchService>();
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<CandidateBranchService>());
 
         // Registered last and ahead of AddStudioAgentRuntime in AddStudioServices, so its
         // StartAsync (which awaits every IRehydratable above) completes before the scheduler

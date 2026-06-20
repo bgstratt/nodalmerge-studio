@@ -57,11 +57,43 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
     // ── IHostedService ─────────────────────────────────────────────────────
 
-    public Task StartAsync(CancellationToken cancellationToken)
+    public async Task StartAsync(CancellationToken cancellationToken)
     {
+        await RehydrateInterruptedAgentsAsync(cancellationToken).ConfigureAwait(false);
         _pollCts = new CancellationTokenSource();
         _ = Task.Run(() => PollSchedulerAsync(_pollCts.Token), CancellationToken.None);
-        return Task.CompletedTask;
+    }
+
+    // Slice 19d — on startup, any work unit that was Executing/Active/Retrying when the host
+    // last stopped has no live agent loop. Register a synthetic "interrupted" agent record so
+    // the Execution Timeline shows these as Interrupted instead of silently absent.
+    private async Task RehydrateInterruptedAgentsAsync(CancellationToken ct)
+    {
+        try
+        {
+            var workUnits = _serviceProvider.GetService<IWorkUnitService>();
+            if (workUnits is null) { return; }
+
+            var all = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+            foreach (var wu in all)
+            {
+                var isRunning = wu.Status is WorkUnitStatus.Active or WorkUnitStatus.Executing or WorkUnitStatus.Retrying;
+                if (!isRunning || wu.AssignedAgent is null) { continue; }
+
+                // Only register if no live agent slot already covers this work unit
+                var hasLiveAgent = _agents.Values.Any(a => a.WorkUnitId == wu.WorkUnitId && a.Cts is not null);
+                if (hasLiveAgent) { continue; }
+
+                _agents.TryAdd(wu.AssignedAgent, new AgentRecord(wu.AssignedAgent, wu.WorkUnitId, "interrupted"));
+                _logger.LogInformation(
+                    "[Rehydration] Work unit {WorkUnitId} was interrupted — agent {AgentId} marked as interrupted.",
+                    wu.WorkUnitId, wu.AssignedAgent);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Rehydration] Failed to sweep for interrupted agents.");
+        }
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
@@ -97,6 +129,15 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 _logger.LogError(ex, "[Scheduler] Poll iteration failed.");
             }
+
+            // Slice 20c — check Hybrid review timers on each scheduler tick.
+            try
+            {
+                var timerService = _serviceProvider.GetService(typeof(IReviewTimerService)) as IReviewTimerService;
+                if (timerService is not null)
+                    await timerService.ProcessExpiredAsync(ct).ConfigureAwait(false);
+            }
+            catch { /* timer processing is best-effort */ }
 
             try { await Task.Delay(_options.SchedulerPollIntervalMs, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { break; }
@@ -563,6 +604,8 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<McpToolDispatcher>();
         services.AddSingleton<LlmClient>(_ => new LlmClient(llmHttpClient ?? new HttpClient()));
         services.AddSingleton<IProfileSelectionService, LlmProfileSelectionService>();
+        // Slice 20b — inline reviewer for AgentApproval/Hybrid BeforeMerge gate.
+        services.AddSingleton<IInlineReviewerService, InlineReviewerService>();
         return services;
     }
 }
