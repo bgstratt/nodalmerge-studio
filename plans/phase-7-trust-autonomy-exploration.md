@@ -18,8 +18,46 @@ passing `branchedFromProposalId`/`seedFromBranchId` into `CreateWorkUnitAsync` �
 persisted, so `BranchedFromProposalId` silently stayed null on any fork-from-node call that specified a
 `ProposalId`. Fixed to pass both params at creation time, matching `CounterfactualService`'s pattern.
 
-**Remaining gap:** none of these services have been walked end-to-end at runtime (webview click-through)
-— verification is now both code-level and unit-tested, but not manually demoed in the running extension.
+**Remaining gap (updated 2026-06-20):** added `AutoApplied` as a real signal threaded through
+`IMergeCommandService.ApplyAsync`/`IMergeService.ApplyAsync` (set `true` only at the two
+unambiguously-automatic call sites: the post-propose fire-and-forget trigger in
+`MergeCommandService.cs` and `ReviewTimerService.ProcessExpiredAsync`), added
+`ReviewTimerServiceTests.cs`/`AutoReviewRuleTests.cs` (13 new unit tests, all passing), and wired
+three new proactive notifications into `NotificationManager.ts` (auto-applied, reviewer-rejected,
+fan-out-blocked) — see `clients/vscode-extension/src/NotificationManager.ts`.
+
+Ran a live REST pass against a real `dotnet run` instance of the Host (no mocks, no unit-test
+fakes): `HumanRequired` baseline (propose → validate → human-approve → apply) confirmed unchanged,
+`autoApplied` correctly stays `false` on a human-driven apply; promotion-branch flow confirmed
+end-to-end (`UsePromotionBranch=true` lands the apply on `candidate`, `main` is untouched until
+`POST /studio/branches/candidate/promote`, after which `main` picks up the change).
+
+Still not exercised live, by deliberate scope decision rather than oversight: `AgentApproval`/
+`Hybrid` auto-apply, automated reviewer rejection, and fan-out file-scope blocking all require a
+real LLM-backed `ReviewerAgentLoop`/`OrchestratorAgentLoop` run (no credentials were available for
+this pass), so the `autoApplied: true` and "reviewer rejected"/"blocked from starting" notification
+paths were verified only at the unit-test level (Workstream B fakes), not against a live agent run.
+Likewise, no VS Code Extension Development Host driver exists in this repo, so the toasts themselves
+were never visually confirmed popping up — only that the REST DTOs they read (`autoApplied`,
+`verificationResults`, `WorkUnit.FanOutInfo.BlockedReason`) are correctly shaped on the wire.
+Re-run this pass with real provider credentials (and ideally a Playwright/`_electron` harness, see
+`/run-skill-generator`) to close the remaining gap.
+
+**Critical bug found and fixed (2026-06-20):** added `AutonomousReviewLlmHandler.cs` +
+`AutonomousReviewTests.cs` (`tests/NodalMerge.Studio.Integration.Tests/`) — scripted-LLM integration
+tests (same zero-cost `ScriptedLlmHandler` pattern as `FullAgentCycleTests`, no real API calls) that
+drive `AgentApproval`/`Hybrid` through the *real* `OrchestratorAgentLoop` → `WorkerAgentLoop` →
+`ReviewerAgentLoop` chain instead of the hand-written fakes in `AutoReviewRuleTests.cs`. They found
+that **`AgentApproval`/`Hybrid` had never actually completed an auto-merge, even with a real LLM**:
+`InMemoryMergeService.AutomatedReviewAsync` set an "Approved" automated review back to
+`ReadyForReview` (Slice 11d's original pre-gate-before-human semantics) instead of terminal
+`Approved`, so `InlineReviewerService`'s `proposal.Status is Approved or Merged` check never passed
+and every proposal stalled indefinitely with no human-visible signal. Fixed by having
+`AutomatedReviewAsync` check the owning work unit's `ReviewPolicy`: `AgentApproval`/`Hybrid` now
+land on terminal `Approved`; `HumanRequired`'s original pre-gate-bounces-to-ReadyForReview behavior
+is unchanged. Added `(UnderReview, Approved)` to `MergeProposalTransitions.CanTransition`
+(`MergeProposal.cs`) and updated `MergeProposalTransitionTests.UnderReview_transitions_for_automated_review`
+(renamed from `..._automated_pre_gate`) accordingly. Full suite (309 tests) green after the fix.
 
 ## Context
 

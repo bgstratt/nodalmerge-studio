@@ -71,7 +71,7 @@ public sealed class ReviewTimerService(
             try
             {
                 var mergeCommands = serviceProvider.GetRequiredService<IMergeCommandService>();
-                await mergeCommands.ApplyAsync(timer.ProposalId, ct).ConfigureAwait(false);
+                await mergeCommands.ApplyAsync(timer.ProposalId, ct, autoApplied: true).ConfigureAwait(false);
             }
             catch
             {

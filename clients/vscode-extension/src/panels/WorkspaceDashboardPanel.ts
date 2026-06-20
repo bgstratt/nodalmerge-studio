@@ -15,6 +15,7 @@ interface WorkUnit {
   owner: string;
   status: string;
   successCriteria?: string | null;
+  fanOutInfo?: { blockedReason?: string | null } | null;
 }
 
 interface AgentInfo {
@@ -158,7 +159,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
         usePromotionBranch: this.usePromotionBranch,
         candidateBranchId: opts.candidateBranchId ?? 'candidate',
       });
-      this.notifications?.update(merges);
+      this.notifications?.update(merges, workUnits);
     } catch {
       // host not yet ready — suppress until healthy
     }

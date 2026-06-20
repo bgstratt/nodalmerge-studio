@@ -165,7 +165,7 @@ public class AutomatedReviewGateServiceTests
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
-        public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default) =>
+        public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false) =>
             throw new NotSupportedException();
 
         public Task<MergeProposal?> GetAsync(string proposalId, CancellationToken cancellationToken = default) =>

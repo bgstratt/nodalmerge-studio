@@ -62,10 +62,12 @@ public class MergeProposalTransitionTests
 
     [Theory]
     [InlineData(MergeProposalStatus.ReadyForReview, MergeProposalStatus.UnderReview, true)]
+    // Slice 11d's pre-gate hands an Approved verdict back to ReadyForReview for a human.
     [InlineData(MergeProposalStatus.UnderReview, MergeProposalStatus.ReadyForReview, true)]
     [InlineData(MergeProposalStatus.UnderReview, MergeProposalStatus.Rejected, true)]
-    [InlineData(MergeProposalStatus.UnderReview, MergeProposalStatus.Approved, false)]
-    public void UnderReview_transitions_for_automated_pre_gate(
+    // Slice 20b/20c's inline reviewer (AgentApproval/Hybrid) terminates here directly instead.
+    [InlineData(MergeProposalStatus.UnderReview, MergeProposalStatus.Approved, true)]
+    public void UnderReview_transitions_for_automated_review(
         MergeProposalStatus from, MergeProposalStatus to, bool expected)
     {
         Assert.Equal(expected, MergeProposalTransitions.CanTransition(from, to));

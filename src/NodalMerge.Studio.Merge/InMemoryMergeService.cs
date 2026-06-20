@@ -207,8 +207,20 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 "Proposal must be ReadyForReview or UnderReview.");
         }
 
+        // Slice 11d's original automated pre-gate hands an Approved verdict back to
+        // ReadyForReview for a human to give final sign-off. Slice 20b/20c's inline reviewer
+        // (AgentApproval/Hybrid) reuses this same method, but for those policies the reviewer's
+        // Approved verdict is terminal — no human ever sees it — so it must land on Approved
+        // directly, or InlineReviewerService's `proposal.Status is Approved or Merged` check
+        // (the signal AutoReviewRule acts on) never becomes true and the proposal stalls forever.
+        var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+        var owningWorkUnit = proposal.WorkUnitId is not null && workUnits is not null
+            ? await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false)
+            : null;
+        var isInlineReviewPolicy = owningWorkUnit?.ReviewPolicy is ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid;
+
         var nextStatus = decision == MergeProposalStatus.Approved
-            ? MergeProposalStatus.ReadyForReview
+            ? (isInlineReviewPolicy ? MergeProposalStatus.Approved : MergeProposalStatus.ReadyForReview)
             : MergeProposalStatus.Rejected;
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, nextStatus))
@@ -253,7 +265,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         return updated;
     }
 
-    public async Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default)
+    public async Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false)
     {
         var proposal = GetRequired(proposalId);
 
@@ -292,7 +304,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             await WriteBackToRepositoryAsync(proposal.SourceBranch, cancellationToken).ConfigureAwait(false);
         }
 
-        var updated = proposal with { Status = MergeProposalStatus.Merged };
+        var updated = proposal with { Status = MergeProposalStatus.Merged, AutoApplied = autoApplied };
         _proposals[proposalId] = updated;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.MergeProposalV1,

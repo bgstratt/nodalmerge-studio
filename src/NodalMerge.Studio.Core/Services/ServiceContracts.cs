@@ -79,7 +79,7 @@ public interface ITaskService
         string? reviewerAgentId = null,
         CancellationToken cancellationToken = default);
 
-    Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default);
+    Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false);
 
     Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken cancellationToken = default);
 
@@ -120,7 +120,7 @@ public interface ITaskService
             string? reviewerAgentId = null,
             CancellationToken cancellationToken = default);
 
-        Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default);
+        Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false);
     }
 
     public interface IProposalReviewService

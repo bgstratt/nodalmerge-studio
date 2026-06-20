@@ -18,6 +18,7 @@ export interface MergeProposal {
   status: string;
   reconciledFrom?: string[];
   supersededBy?: string | null;
+  autoApplied?: boolean;
 }
 
 export interface DiffLine {

@@ -66,7 +66,7 @@ public class ProjectionManagerTests
         public Task<MergeProposal> ValidateAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> ReviewAsync(string id, MergeProposalStatus d, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<MergeProposal> ApplyAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> ApplyAsync(string id, CancellationToken ct = default, bool autoApplied = false) => throw new NotSupportedException();
         public Task<MergeProposal> SupersedeAsync(string proposalId, string supersededByProposalId, CancellationToken ct = default) => throw new NotSupportedException();
     }
 

@@ -51,6 +51,9 @@ public static class MergeProposalTransitions
             (MergeProposalStatus.ReadyForReview, MergeProposalStatus.UnderReview) => true,
             (MergeProposalStatus.UnderReview, MergeProposalStatus.ReadyForReview) => true,
             (MergeProposalStatus.UnderReview, MergeProposalStatus.Rejected) => true,
+            // Slice 20b — AgentApproval/Hybrid's inline reviewer terminates here directly,
+            // bypassing the ReadyForReview hand-back that Slice 11d's human-facing pre-gate uses.
+            (MergeProposalStatus.UnderReview, MergeProposalStatus.Approved) => true,
             (MergeProposalStatus.Approved, MergeProposalStatus.Merged) => true,
 
             (MergeProposalStatus.ReadyForReview, MergeProposalStatus.Superseded) => true,

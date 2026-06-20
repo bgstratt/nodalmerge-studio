@@ -208,7 +208,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
                     var proposalIdToApply = created.ProposalId;
                     _ = Task.Run(async () =>
                     {
-                        try { await ApplyAsync(proposalIdToApply, CancellationToken.None).ConfigureAwait(false); }
+                        try { await ApplyAsync(proposalIdToApply, CancellationToken.None, autoApplied: true).ConfigureAwait(false); }
                         catch { /* reviewer rejection or gate block — proposal stays in current state */ }
                     });
                 }
@@ -251,7 +251,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
     // Slice 20b — BeforeMerge gate. For AgentApproval/Hybrid policies the AutoReviewRule runs the
     // reviewer inline and returns Allowed only when the proposal is approved. HumanRequired passes
     // through immediately (no behavioral change for the default policy).
-    public async Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default)
+    public async Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false)
     {
         if (policyGate is not null)
         {
@@ -279,7 +279,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
             }
         }
 
-        return await merge.ApplyAsync(proposalId, cancellationToken).ConfigureAwait(false);
+        return await merge.ApplyAsync(proposalId, cancellationToken, autoApplied).ConfigureAwait(false);
     }
 
     // ── Diff parsing (moved from McpToolDispatcher) ────────────────────────────
