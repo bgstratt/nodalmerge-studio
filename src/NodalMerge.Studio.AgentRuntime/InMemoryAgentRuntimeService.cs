@@ -47,7 +47,16 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? BaseUrl = null,
         string? ApiKey = null,
         string? Provider = null,
-        CancellationTokenSource? Cts = null);
+        CancellationTokenSource? Cts = null,
+        string? CurrentActivity = null);
+
+    // Ephemeral UI chrome only — not part of durable DAG history (AP-5), so it's a plain
+    // in-memory update rather than an ExecutionEventStream append.
+    private void ReportActivity(string agentId, string? activity)
+    {
+        if (_agents.TryGetValue(agentId, out var r))
+            _agents[agentId] = r with { CurrentActivity = activity };
+    }
 
     // Captured at SpawnAsync("orchestrator", ...) time so ReinvokeOrchestratorAsync can restart
     // the loop with the same credentials/profile later, without the caller (WorkSchedulerService)
@@ -195,7 +204,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 {
                     var plannerLoop = new PlannerAgentLoop(
                         agentId, item.WorkUnitId, provider, model, baseUrl, apiKey!,
-                        dispatcher, llm, profile, item.SessionId);
+                        dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a));
                     completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
                 else if (profile?.Stage == PipelineStage.Review)
@@ -203,14 +212,19 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var proposalId = string.IsNullOrWhiteSpace(taskId) ? string.Empty : taskId;
                     var reviewerLoop = new ReviewerAgentLoop(
                         agentId, item.WorkUnitId, proposalId, provider, model, baseUrl, apiKey!,
-                        dispatcher, llm, profile, item.SessionId);
+                        dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a));
                     completion = await reviewerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
                 else
                 {
+                    // AttemptCount > 0 means this item was leased at least once before — either a
+                    // normal failure-retry or, per Phase 8c, a resume after a Host restart
+                    // interrupted it. Either way the worker should check existing branch/task
+                    // state before assuming a clean start.
                     var loop = new WorkerAgentLoop(
                         agentId, item.WorkUnitId, taskId, provider, model, baseUrl, apiKey!,
-                        dispatcher, llm, profile, item.SessionId);
+                        dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a),
+                        isResume: item.AttemptCount > 0);
                     completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
 
@@ -221,12 +235,12 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             }
 
             if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
-                _agents[agentId] = r with { Status = "stopped", Cts = null };
+                _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
         }
         catch (OperationCanceledException)
         {
             if (_agents.TryGetValue(agentId, out var r))
-                _agents[agentId] = r with { Status = "stopped", Cts = null };
+                _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
         }
         catch (Exception ex)
         {
@@ -235,7 +249,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             if (_agents.TryGetValue(agentId, out var r))
             {
                 var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
-                _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null };
+                _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null, CurrentActivity = null };
             }
         }
         finally
@@ -441,7 +455,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var loop = new OrchestratorAgentLoop(
                     agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm,
                     artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, workUnits,
-                    profile, sessionId, workspaceOptions.StallDetectionCycles);
+                    profile, sessionId, workspaceOptions.StallDetectionCycles, a => ReportActivity(agentId, a));
                 var completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 if (completion is AgentLoopCompletion.MaxIterationsExceeded or AgentLoopCompletion.Stalled)
                 {
@@ -482,13 +496,13 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 if (_agents.TryGetValue(agentId, out var r))
                 {
                     var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
-                    _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null };
+                    _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null, CurrentActivity = null };
                 }
             }
             finally
             {
                 if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
-                    _agents[agentId] = r with { Status = "stopped", Cts = null };
+                    _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
                 cts.Dispose();
             }
         }, CancellationToken.None);
@@ -514,7 +528,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
                 var loop = new WorkerAgentLoop(
-                    agentId, workUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm, profile);
+                    agentId, workUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm, profile,
+                    onActivity: a => ReportActivity(agentId, a));
                 await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 _logger.LogInformation("[Agent {AgentId}] Worker loop completed.", agentId);
             }
@@ -525,13 +540,13 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 if (_agents.TryGetValue(agentId, out var r))
                 {
                     var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
-                    _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null };
+                    _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null, CurrentActivity = null };
                 }
             }
             finally
             {
                 if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
-                    _agents[agentId] = r with { Status = "stopped", Cts = null };
+                    _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
                 cts.Dispose();
             }
         }, CancellationToken.None);
@@ -555,7 +570,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     {
         var current = GetRequired(agentId);
         current.Cts?.Cancel();
-        _agents[agentId] = current with { Status = "stopped", Cts = null };
+        _agents[agentId] = current with { Status = "stopped", Cts = null, CurrentActivity = null };
         return Task.CompletedTask;
     }
 
@@ -569,7 +584,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     {
         var active = _agents.Values
             .Where(a => a.Status == "active")
-            .Select(a => new AgentInfo(a.AgentId, a.WorkUnitId, a.Status))
+            .Select(a => new AgentInfo(a.AgentId, a.WorkUnitId, a.Status, a.CurrentActivity))
             .ToList();
 
         return Task.FromResult<IReadOnlyList<AgentInfo>>(active);
@@ -578,7 +593,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     public Task<IReadOnlyList<AgentInfo>> ListAllAsync(CancellationToken cancellationToken = default)
     {
         var all = _agents.Values
-            .Select(a => new AgentInfo(a.AgentId, a.WorkUnitId, a.Status))
+            .Select(a => new AgentInfo(a.AgentId, a.WorkUnitId, a.Status, a.CurrentActivity))
             .ToList();
 
         return Task.FromResult<IReadOnlyList<AgentInfo>>(all);

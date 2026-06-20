@@ -54,12 +54,16 @@ public class FanOutServiceTests
 
         await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, planJson);
 
+        // FanOutService.TryFanOutFromPlanAsync is idempotent and gated per parent (see
+        // FanOutService._parentGates) precisely because the orchestrator loop spawned above also
+        // calls it itself once it reaches end_turn (ImmediateEndTurnLlmHandler makes that
+        // near-instant). Either this call or that background one can be the one that actually
+        // creates the children, so assert on the converged final state rather than on which
+        // caller's own result happened to report ChildrenCreated/EnqueuedWorkUnitIds.
         var result = await fanOut.TryFanOutFromPlanAsync(parent.WorkUnitId);
 
-        Assert.Contains(FanOutAction.ChildrenCreated, result.Actions);
-        Assert.Single(result.EnqueuedWorkUnitIds);
-
         var children = await workUnits.GetChildrenAsync(parent.WorkUnitId);
+        Assert.Equal(2, children.Count);
         var s1 = children.Single(c => c.FanOutInfo?.SliceId == "s1");
         var s2 = children.Single(c => c.FanOutInfo?.SliceId == "s2");
 

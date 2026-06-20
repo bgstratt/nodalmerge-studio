@@ -25,7 +25,8 @@ internal sealed class OrchestratorAgentLoop(
     IWorkUnitService workUnits,
     AgentProfile? profile = null,
     string? sessionId = null,
-    int stallDetectionCycles = 4)
+    int stallDetectionCycles = 4,
+    Action<string?>? onActivity = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -97,10 +98,14 @@ internal sealed class OrchestratorAgentLoop(
             lastProjection = currentProjection;
 
             if (stallStreak >= _stallDetectionCycles)
+            {
+                onActivity?.Invoke(null);
                 return AgentLoopCompletion.Stalled;
+            }
 
             AppendDeltaToOutgoingMessage(messages, delta);
 
+            onActivity?.Invoke("Thinking...");
             var response = await llm.SendAsync(provider, model, baseUrl, apiKey, messages, _tools, _systemPrompt, ct)
                 .ConfigureAwait(false);
 
@@ -129,6 +134,7 @@ internal sealed class OrchestratorAgentLoop(
                     ? InjectSpawnCredentials(toolUse.Input)
                     : toolUse.Input;
 
+                onActivity?.Invoke(ActivityLabeler.Describe(toolUse.Name, toolUse.Input));
                 var result = await dispatcher
                     .DispatchAsync(toolUse.Name, input, _allowedTools, ct, sessionId)
                     .ConfigureAwait(false);
@@ -144,6 +150,8 @@ internal sealed class OrchestratorAgentLoop(
 
             messages.Add(new NmMessage("user", toolResults));
         }
+
+        onActivity?.Invoke(null);
 
         if (ct.IsCancellationRequested)
             return AgentLoopCompletion.Cancelled;

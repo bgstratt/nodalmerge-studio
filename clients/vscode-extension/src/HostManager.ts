@@ -65,11 +65,12 @@ export class HostManager implements vscode.Disposable {
   }
 
   private spawnProcess(): void {
-    const { cmd, args, env } = this.resolveHostCommand();
+    const { cmd, args, env, cwd } = this.resolveHostCommand();
     this.output.appendLine(`[NodalMerge] Spawning: ${cmd} ${args.join(' ')}`);
 
     this.process = cp.spawn(cmd, args, {
       env: { ...process.env, ...env },
+      cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       // On Windows, spawn without a window
       windowsHide: true,
@@ -96,11 +97,24 @@ export class HostManager implements vscode.Disposable {
     });
   }
 
-  private resolveHostCommand(): { cmd: string; args: string[]; env: Record<string, string> } {
+  private resolveHostCommand(): { cmd: string; args: string[]; env: Record<string, string>; cwd?: string } {
     const hostEnv: Record<string, string> = {
       Studio__Urls: `http://127.0.0.1:${this.port}`,
       ASPNETCORE_URLS: `http://127.0.0.1:${this.port}`,
     };
+
+    // Anchor durable storage (DAG node store, file blobs, branch workspace files) under the
+    // opened project instead of letting it fall back to the Host's process CWD / OS temp dir —
+    // otherwise a restart can't find its own data, and branch file contents sit somewhere a
+    // disk-cleanup tool could sweep. No folder open (single-file mode) — leave the Host's own
+    // defaults (temp dir) alone, there's no project to anchor to.
+    const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+    if (wsRoot) {
+      const dataRoot = path.join(wsRoot, '.nodalmerge');
+      hostEnv.Workspace__RootPath = path.join(dataRoot, 'workspace');
+      hostEnv.NodalMerge__Storage__Sqlite__DbPath = path.join(dataRoot, 'data', 'nodalmerge-nodes.db');
+      hostEnv.NodalMerge__Storage__FileBlobs__RootPath = path.join(dataRoot, 'data', 'blobs');
+    }
 
     // In extension development mode use `dotnet run` so there's no need to
     // pre-publish a binary. The extension path is clients/vscode-extension/ so
@@ -115,6 +129,7 @@ export class HostManager implements vscode.Disposable {
         cmd: 'dotnet',
         args: ['run', '--project', hostProject, '--no-launch-profile'],
         env: hostEnv,
+        cwd: wsRoot,
       };
     }
 
@@ -123,7 +138,7 @@ export class HostManager implements vscode.Disposable {
     const binaryName = HOST_BINARY_NAME[process.platform as keyof typeof HOST_BINARY_NAME]
       ?? 'NodalMerge.Studio.Host';
     const binaryPath = path.join(this.context.extensionPath, 'bin', rid, binaryName);
-    return { cmd: binaryPath, args: [], env: hostEnv };
+    return { cmd: binaryPath, args: [], env: hostEnv, cwd: wsRoot };
   }
 
   private async waitForHealth(): Promise<void> {

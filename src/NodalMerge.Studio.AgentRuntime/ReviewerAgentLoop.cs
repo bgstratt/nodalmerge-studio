@@ -14,7 +14,8 @@ internal sealed class ReviewerAgentLoop(
     McpToolDispatcher dispatcher,
     LlmClient llm,
     AgentProfile? profile = null,
-    string? sessionId = null)
+    string? sessionId = null,
+    Action<string?>? onActivity = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -56,6 +57,7 @@ internal sealed class ReviewerAgentLoop(
         var completedNaturally = false;
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
+            onActivity?.Invoke("Thinking...");
             var response = await llm.SendAsync(provider, model, baseUrl, apiKey, messages, _tools, _systemPrompt, ct)
                 .ConfigureAwait(false);
 
@@ -75,6 +77,7 @@ internal sealed class ReviewerAgentLoop(
             {
                 if (block is not NmToolUse toolUse) continue;
 
+                onActivity?.Invoke(ActivityLabeler.Describe(toolUse.Name, toolUse.Input));
                 var result = await dispatcher
                     .DispatchAsync(toolUse.Name, toolUse.Input, _allowedTools, ct, sessionId)
                     .ConfigureAwait(false);
@@ -87,6 +90,8 @@ internal sealed class ReviewerAgentLoop(
 
             messages.Add(new NmMessage("user", toolResults));
         }
+
+        onActivity?.Invoke(null);
 
         if (ct.IsCancellationRequested)
             return AgentLoopCompletion.Cancelled;

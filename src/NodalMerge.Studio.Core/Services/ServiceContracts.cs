@@ -382,7 +382,7 @@ public interface ISnapshotService
     Task<string> CompareAsync(string agentId, string workUnitId, string otherAgentId, CancellationToken cancellationToken = default);
 }
 
-public sealed record AgentInfo(string AgentId, string WorkUnitId, string Status);
+public sealed record AgentInfo(string AgentId, string WorkUnitId, string Status, string? CurrentActivity = null);
 
 public sealed record OrchestratorCredentials(
     string Provider,
@@ -497,7 +497,12 @@ public sealed record ScheduledItem(
     string? ApiKey,
     string? Provider,
     string? SessionId = null,
-    ConflictWarning? Conflict = null);
+    ConflictWarning? Conflict = null,
+    // Phase 8c — set on rehydrate for any item that held a lease when the Host died (i.e. a
+    // worker was actively executing it, not just sitting queued). TryAcquireAsync skips these
+    // until a human explicitly approves via ApproveResumeAsync/ApproveResumeAllAsync, mirroring
+    // the orchestrator-level Interrupted+manual-Resume pattern instead of silently auto-resuming.
+    bool AwaitingResume = false);
 
 public interface IWorkScheduler
 {
@@ -517,6 +522,13 @@ public interface IWorkScheduler
     Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default);
 
     Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default);
+
+    // Phase 8c — items flagged AwaitingResume on rehydrate (see ScheduledItem.AwaitingResume).
+    Task<IReadOnlyList<ScheduledItem>> ListAwaitingResumeAsync(CancellationToken ct = default);
+
+    Task ApproveResumeAsync(string workUnitId, CancellationToken ct = default);
+
+    Task<int> ApproveResumeAllAsync(CancellationToken ct = default);
 }
 
 // Slice 15f — shared enqueue entry point for MCP/REST/the agent-loop dispatcher, so the

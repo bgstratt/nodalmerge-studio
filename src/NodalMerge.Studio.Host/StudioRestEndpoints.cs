@@ -1325,6 +1325,34 @@ public static class StudioRestEndpoints
             return Results.Ok(enriched);
         });
 
+        // Phase 8c — items a Host restart interrupted mid-execution (see ScheduledItem.AwaitingResume).
+        // Listed separately from /pending so the dashboard can show them as a distinct
+        // "needs a human to resume" set rather than mixing them into the normal queue view.
+        app.MapGet("/studio/scheduler/awaiting-resume", async (
+            IWorkScheduler scheduler,
+            CancellationToken ct) =>
+        {
+            var items = await scheduler.ListAwaitingResumeAsync(ct).ConfigureAwait(false);
+            return Results.Ok(items);
+        });
+
+        app.MapPost("/studio/scheduler/{workUnitId}/resume", async (
+            string workUnitId,
+            IWorkScheduler scheduler,
+            CancellationToken ct) =>
+        {
+            await scheduler.ApproveResumeAsync(workUnitId, ct).ConfigureAwait(false);
+            return Results.Ok(new { workUnitId, status = "resumed" });
+        });
+
+        app.MapPost("/studio/scheduler/resume-all", async (
+            IWorkScheduler scheduler,
+            CancellationToken ct) =>
+        {
+            var count = await scheduler.ApproveResumeAllAsync(ct).ConfigureAwait(false);
+            return Results.Ok(new { resumedCount = count });
+        });
+
         app.MapPost("/studio/scheduler/enqueue", async (
             EnqueueBody body,
             ISchedulerCommandService scheduler,

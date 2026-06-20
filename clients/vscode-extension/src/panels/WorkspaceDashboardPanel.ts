@@ -23,6 +23,13 @@ interface AgentInfo {
   status: string;
 }
 
+interface ScheduledItem {
+  workUnitId: string;
+  profileId: string;
+  taskId?: string | null;
+  attemptCount: number;
+}
+
 interface WorkspaceSummary {
   activeWorkUnits: string[];
   activeAgents: string[];
@@ -136,17 +143,18 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
     try {
       const sessionId = this.getEffectiveSessionId();
       const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
-      const [summary, workUnits, agents, merges, deadLetters, opts] = await Promise.all([
+      const [summary, workUnits, agents, awaitingResume, merges, deadLetters, opts] = await Promise.all([
         this.get<WorkspaceSummary>('/studio/workspace-summary' + params),
         this.get<WorkUnit[]>('/studio/workunits' + params),
         this.get<AgentInfo[]>('/studio/agents?all=true' + (sessionId ? '&sessionId=' + encodeURIComponent(sessionId) : '')),
+        this.get<ScheduledItem[]>('/studio/scheduler/awaiting-resume'),
         this.get<MergeProposal[]>('/studio/merges' + params),
         this.get<DeadLetterEntry[]>('/studio/dead-letter' + params),
         this.get<{ usePromotionBranch?: boolean; candidateBranchId?: string }>('/studio/options'),
       ]);
       this.usePromotionBranch = opts.usePromotionBranch ?? false;
       void this.panel.webview.postMessage({
-        type: 'data', summary, workUnits, agents, merges, deadLetters,
+        type: 'data', summary, workUnits, agents, awaitingResume, merges, deadLetters,
         usePromotionBranch: this.usePromotionBranch,
         candidateBranchId: opts.candidateBranchId ?? 'candidate',
       });
@@ -257,6 +265,14 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           break;
         case 'stopAgent':
           await this.post('/studio/agents/' + String(msg.agentId) + '/stop', {});
+          void this.poll();
+          break;
+        case 'resumeWorker':
+          await this.post('/studio/scheduler/' + String(msg.workUnitId) + '/resume', {});
+          void this.poll();
+          break;
+        case 'resumeAllWorkers':
+          await this.post('/studio/scheduler/resume-all', {});
           void this.poll();
           break;
         case 'openMergeReview':
@@ -449,6 +465,10 @@ const ET_HTML = `
   <div id="agents"><p class="empty">No running agents.</p></div>
   <button class="add-btn" id="btn-start-agent">+ Start Agent</button>
 
+  <h2>Awaiting Resume</h2>
+  <div id="awaiting-resume"><p class="empty">Nothing awaiting resume.</p></div>
+  <button class="add-btn" id="btn-resume-all" style="display:none">↺ Resume All</button>
+
   <h2>Pending Decisions</h2>
   <div id="decisions"><p class="empty">No pending decisions.</p></div>
 
@@ -466,6 +486,9 @@ const ET_JS = `
   });
   document.getElementById('btn-start-agent').addEventListener('click', function() {
     vscode.postMessage({ type: 'spawnAgent' });
+  });
+  document.getElementById('btn-resume-all').addEventListener('click', function() {
+    vscode.postMessage({ type: 'resumeAllWorkers' });
   });
 
   var etSessionOverride = document.getElementById('et-session-override');
@@ -568,6 +591,9 @@ const ET_JS = `
       }
       html += '</div>';
       html += '</div>';
+      if (statusLower === 'active' && a.currentActivity) {
+        html += '<div class="row"><span class="pulse"></span><span class="mono">' + esc(a.currentActivity) + '</span></div>';
+      }
       if (wu) {
         html += '<div class="row"><span class="mono">' + esc(wu.goal) + '</span></div>';
       }
@@ -582,6 +608,39 @@ const ET_JS = `
     el.querySelectorAll('[data-action="pauseAgent"],[data-action="resumeAgent"],[data-action="stopAgent"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: btn.getAttribute('data-action'), agentId: btn.getAttribute('data-id') });
+      });
+    });
+  }
+
+  // Phase 8c — worker-level scheduler items a Host restart interrupted mid-execution. Mirrors
+  // the orchestrator-level "Interrupted" card above: no silent auto-resume, a human must click
+  // Resume (or Resume All for a busy fan-out with many interrupted children).
+  function renderAwaitingResume(items) {
+    var el = document.getElementById('awaiting-resume');
+    var resumeAllBtn = document.getElementById('btn-resume-all');
+    if (!items || !items.length) {
+      el.innerHTML = '<p class="empty">Nothing awaiting resume.</p>';
+      resumeAllBtn.style.display = 'none';
+      return;
+    }
+    resumeAllBtn.style.display = '';
+    var html = '';
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      html += '<div class="card">';
+      html += '<div class="row">';
+      html += '<span class="title mono">' + esc(it.workUnitId) + '</span>';
+      html += '<span class="badge">' + esc(it.profileId) + '</span>';
+      html += '<div class="actions">';
+      html += '<button class="ghost" data-action="resumeWorker" data-wu="' + esc(it.workUnitId) + '">↺ Resume</button>';
+      html += '</div>';
+      html += '</div>';
+      html += '</div>';
+    }
+    el.innerHTML = html;
+    el.querySelectorAll('[data-action="resumeWorker"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'resumeWorker', workUnitId: btn.getAttribute('data-wu') });
       });
     });
   }
@@ -695,6 +754,7 @@ const ET_JS = `
     }
     renderActiveGoals(msg.workUnits);
     renderAgents(msg.agents, msg.workUnits);
+    renderAwaitingResume(msg.awaitingResume || []);
     renderPendingDecisions(msg.merges);
     renderBlockedExplorations(msg.deadLetters || [], msg.workUnits);
     var ts = document.getElementById('last-updated');

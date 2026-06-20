@@ -17,12 +17,16 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
     private readonly IArtifactLineageService? _artifacts;
     private readonly IMergeService? _merge;
     private readonly IIntentGraphService? _intents;
+    private readonly IExecutionSessionService? _sessions;
 
     // IWorkUnitService is resolved lazily (via IServiceProvider) rather than constructor-injected:
     // its production implementation depends on IAgentControlService, which depends on IWorkScheduler
     // (this service) — a direct dependency here would be a circular constructor graph. Same pattern
     // as AgentWorkspaceService. IIntentGraphService has no such cycle (depends only on IStudioNodeStore
-    // and IArtifactLineageService) so it's constructor-injected directly.
+    // and IArtifactLineageService) so it's constructor-injected directly. IExecutionSessionService is
+    // likewise cycle-free, but kept optional (like Artifacts/Merge/Intents below) rather than required
+    // so existing direct (non-DI) constructions in tests don't all need updating — when null, Phase
+    // 8b's pause check in TryAcquireAsync is simply skipped.
     public WorkSchedulerService(
         IStudioNodeStore nodeStore,
         IExecutionEventStream events,
@@ -30,11 +34,13 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
         IServiceProvider? serviceProvider = null,
         IArtifactLineageService? artifacts = null,
         IMergeService? merge = null,
-        IIntentGraphService? intents = null)
+        IIntentGraphService? intents = null,
+        IExecutionSessionService? sessions = null)
     {
         _nodeStore       = nodeStore;
         _events          = events;
         _workspaces      = workspaces;
+        _sessions        = sessions;
         _serviceProvider = serviceProvider;
         _artifacts       = artifacts;
         _merge           = merge;
@@ -186,6 +192,21 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
             if (item.LeasedBy is not null && item.LeasedAt.HasValue &&
                 now - item.LeasedAt.Value < LeaseTimeout)
                 continue;
+
+            // Phase 8c — skip items interrupted by a Host restart until a human explicitly
+            // approves via ApproveResumeAsync/ApproveResumeAllAsync.
+            if (item.AwaitingResume)
+                continue;
+
+            // Phase 8b — a paused session must actually stop new dispatch under it, not just
+            // record a status flag (ExecutionSessionService.SetStatusAsync previously had no
+            // effect on the scheduler at all).
+            if (_sessions is not null && item.SessionId is not null)
+            {
+                var session = await _sessions.GetAsync(item.SessionId, ct).ConfigureAwait(false);
+                if (session?.Status == ExecutionSessionStatus.Paused)
+                    continue;
+            }
 
             var acquired = item with
             {
@@ -411,13 +432,56 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
                 continue;
 
             // The agent process that held this lease is gone now that the host restarted — clear
-            // the lease so the item becomes acquirable again. AttemptCount is real retry history,
-            // not lease state, so it's preserved as-is.
+            // the lease so the item is no longer seen as actively running. AttemptCount is real
+            // retry history, not lease state, so it's preserved as-is. Phase 8c — a held lease
+            // means a worker was actively executing this when the Host died, so instead of
+            // silently letting the poll loop re-acquire it immediately, flag it AwaitingResume
+            // and require an explicit ApproveResumeAsync/ApproveResumeAllAsync — the same
+            // no-auto-resume-on-restart guarantee InMemoryAgentRuntimeService already gives
+            // orchestrator-level work (Slice 19d). Items that were never leased (still queued,
+            // not yet started) are untouched — nothing was interrupted for those.
             if (item.LeasedBy is not null || item.LeasedAt is not null)
-                item = item with { LeasedBy = null, LeasedAt = null };
+                item = item with { LeasedBy = null, LeasedAt = null, AwaitingResume = true };
 
             _queue.TryAdd(entityId, item);
         }
+    }
+
+    public Task<IReadOnlyList<ScheduledItem>> ListAwaitingResumeAsync(CancellationToken ct = default)
+    {
+        IReadOnlyList<ScheduledItem> items = _queue.Values
+            .Where(i => i.AwaitingResume)
+            .OrderBy(i => i.AttemptCount)
+            .ToList();
+        return Task.FromResult(items);
+    }
+
+    public async Task ApproveResumeAsync(string workUnitId, CancellationToken ct = default)
+    {
+        if (!_queue.TryGetValue(workUnitId, out var item) || !item.AwaitingResume)
+            return;
+
+        var approved = item with { AwaitingResume = false };
+        if (!_queue.TryUpdate(workUnitId, approved, item))
+            return;
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.SchedulerV1, workUnitId,
+            JsonSerializer.Serialize(approved), ct).ConfigureAwait(false);
+    }
+
+    public async Task<int> ApproveResumeAllAsync(CancellationToken ct = default)
+    {
+        var count = 0;
+        foreach (var key in _queue.Values.Where(i => i.AwaitingResume).Select(i => i.WorkUnitId).ToList())
+        {
+            if (!_queue.TryGetValue(key, out var before) || !before.AwaitingResume)
+                continue;
+
+            await ApproveResumeAsync(key, ct).ConfigureAwait(false);
+            count++;
+        }
+        return count;
     }
 
     // Lazily resolved — IAgentControlService's production impl (InMemoryAgentRuntimeService)

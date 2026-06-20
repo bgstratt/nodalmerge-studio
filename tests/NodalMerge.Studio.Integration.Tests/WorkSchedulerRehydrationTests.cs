@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Host;
 
@@ -85,18 +86,110 @@ public class WorkSchedulerRehydrationTests : IDisposable
         Assert.Null(rehydratedLeased.LeasedBy);
         Assert.Null(rehydratedLeased.LeasedAt);
         Assert.Equal(1, rehydratedLeased.AttemptCount);
+        // Phase 8c — a held lease means a worker was actively executing this when the Host died,
+        // so rehydrate flags it for human approval instead of leaving it silently acquirable.
+        Assert.True(rehydratedLeased.AwaitingResume);
 
         var rehydratedUnleased = pending2.Single(i => i.WorkUnitId == unleasedWorkUnitId);
         Assert.Null(rehydratedUnleased.LeasedBy);
         Assert.Equal(0, rehydratedUnleased.AttemptCount);
+        // Never leased (still queued, not yet started) — nothing was interrupted, so it's
+        // untouched and stays immediately acquirable.
+        Assert.False(rehydratedUnleased.AwaitingResume);
 
-        // The previously-held lease is acquirable again now that it's been cleared.
         var first = await scheduler2.TryAcquireAsync("agent-2");
+        Assert.NotNull(first);
+        Assert.Equal(unleasedWorkUnitId, first!.WorkUnitId);
+
+        // The AwaitingResume item is NOT acquirable until a human approves it.
         var second = await scheduler2.TryAcquireAsync("agent-3");
+        Assert.Null(second);
+
+        await scheduler2.ApproveResumeAsync(leasedWorkUnitId);
+        var third = await scheduler2.TryAcquireAsync("agent-3");
+        Assert.NotNull(third);
+        Assert.Equal(leasedWorkUnitId, third!.WorkUnitId);
+    }
+
+    [Fact]
+    public async Task ListAwaitingResumeAsync_returns_only_items_interrupted_by_restart()
+    {
+        var app1 = BuildApp();
+        var orchestrator1 = app1.Services.GetRequiredService<IOrchestratorService>();
+        var scheduler1 = app1.Services.GetRequiredService<IWorkScheduler>();
+
+        var unitA = await orchestrator1.CreateWorkUnitAsync("Task A", "test");
+        var unitB = await orchestrator1.CreateWorkUnitAsync("Task B", "test");
+        await scheduler1.EnqueueAsync(unitA.WorkUnitId, "worker");
+        await scheduler1.EnqueueAsync(unitB.WorkUnitId, "worker");
+
+        var acquired = await scheduler1.TryAcquireAsync("agent-1");
+        Assert.NotNull(acquired);
+        var leasedWorkUnitId = acquired!.WorkUnitId;
+
+        await app1.DisposeAsync();
+
+        var app2 = BuildApp();
+        await RehydrateAsync(app2);
+        var scheduler2 = app2.Services.GetRequiredService<IWorkScheduler>();
+
+        var awaitingResume = await scheduler2.ListAwaitingResumeAsync();
+        Assert.Single(awaitingResume);
+        Assert.Equal(leasedWorkUnitId, awaitingResume[0].WorkUnitId);
+    }
+
+    [Fact]
+    public async Task ApproveResumeAllAsync_clears_every_flagged_item_and_returns_the_count()
+    {
+        var app1 = BuildApp();
+        var orchestrator1 = app1.Services.GetRequiredService<IOrchestratorService>();
+        var scheduler1 = app1.Services.GetRequiredService<IWorkScheduler>();
+
+        var unitA = await orchestrator1.CreateWorkUnitAsync("Task A", "test");
+        var unitB = await orchestrator1.CreateWorkUnitAsync("Task B", "test");
+        await scheduler1.EnqueueAsync(unitA.WorkUnitId, "worker");
+        await scheduler1.EnqueueAsync(unitB.WorkUnitId, "worker");
+
+        await scheduler1.TryAcquireAsync("agent-1");
+        await scheduler1.TryAcquireAsync("agent-2");
+
+        await app1.DisposeAsync();
+
+        var app2 = BuildApp();
+        await RehydrateAsync(app2);
+        var scheduler2 = app2.Services.GetRequiredService<IWorkScheduler>();
+
+        Assert.Equal(2, (await scheduler2.ListAwaitingResumeAsync()).Count);
+
+        var resumedCount = await scheduler2.ApproveResumeAllAsync();
+        Assert.Equal(2, resumedCount);
+        Assert.Empty(await scheduler2.ListAwaitingResumeAsync());
+
+        var first = await scheduler2.TryAcquireAsync("agent-3");
+        var second = await scheduler2.TryAcquireAsync("agent-4");
         Assert.NotNull(first);
         Assert.NotNull(second);
-        Assert.Equal(
-            new[] { leasedWorkUnitId, unleasedWorkUnitId }.OrderBy(x => x),
-            new[] { first!.WorkUnitId, second!.WorkUnitId }.OrderBy(x => x));
+    }
+
+    [Fact]
+    public async Task TryAcquireAsync_skips_items_whose_session_is_paused()
+    {
+        var app = BuildApp();
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var scheduler = app.Services.GetRequiredService<IWorkScheduler>();
+        var sessions = app.Services.GetRequiredService<IExecutionSessionService>();
+
+        var unit = await orchestrator.CreateWorkUnitAsync("Task A", "test");
+        var session = await sessions.CreateAsync(unit.WorkUnitId, "{}", ["worker"]);
+
+        await scheduler.EnqueueAsync(unit.WorkUnitId, "worker", sessionId: session.SessionId);
+
+        await sessions.SetStatusAsync(session.SessionId, ExecutionSessionStatus.Paused);
+        Assert.Null(await scheduler.TryAcquireAsync("agent-1"));
+
+        await sessions.SetStatusAsync(session.SessionId, ExecutionSessionStatus.Active);
+        var acquired = await scheduler.TryAcquireAsync("agent-1");
+        Assert.NotNull(acquired);
+        Assert.Equal(unit.WorkUnitId, acquired!.WorkUnitId);
     }
 }

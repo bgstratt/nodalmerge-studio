@@ -243,6 +243,15 @@ public class AutomatedReviewGateServiceTests
 
         public Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default) =>
             Task.CompletedTask;
+
+        public Task<IReadOnlyList<ScheduledItem>> ListAwaitingResumeAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ScheduledItem>>([]);
+
+        public Task ApproveResumeAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task<int> ApproveResumeAllAsync(CancellationToken ct = default) =>
+            Task.FromResult(0);
     }
 
     private sealed class FakeTaskService : ITaskService

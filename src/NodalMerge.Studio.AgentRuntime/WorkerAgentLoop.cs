@@ -14,7 +14,9 @@ internal sealed class WorkerAgentLoop(
     McpToolDispatcher dispatcher,
     LlmClient llm,
     AgentProfile? profile = null,
-    string? sessionId = null)
+    string? sessionId = null,
+    Action<string?>? onActivity = null,
+    bool isResume = false)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -57,14 +59,21 @@ internal sealed class WorkerAgentLoop(
 
     public async Task<AgentLoopCompletion> RunAsync(CancellationToken ct)
     {
+        var kickoff = $"Execute task {taskId} for work unit {workUnitId}. Your agent ID is {agentId}.";
+        if (isResume)
+            kickoff += " This work was previously interrupted (e.g. a host restart) — check " +
+                "existing files (nm_v1_workspace_list/nm_v1_workspace_read) and the task's current " +
+                "status before starting from scratch; partial progress may already be on the branch.";
+
         var messages = new List<NmMessage>
         {
-            new("user", [new NmText($"Execute task {taskId} for work unit {workUnitId}. Your agent ID is {agentId}.")])
+            new("user", [new NmText(kickoff)])
         };
 
         var completedNaturally = false;
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
+            onActivity?.Invoke("Thinking...");
             var response = await llm.SendAsync(provider, model, baseUrl, apiKey, messages, _tools, _systemPrompt, ct)
                 .ConfigureAwait(false);
 
@@ -84,6 +93,7 @@ internal sealed class WorkerAgentLoop(
             {
                 if (block is not NmToolUse toolUse) continue;
 
+                onActivity?.Invoke(ActivityLabeler.Describe(toolUse.Name, toolUse.Input));
                 var result = await dispatcher
                     .DispatchAsync(toolUse.Name, toolUse.Input, _allowedTools, ct, sessionId)
                     .ConfigureAwait(false);
@@ -96,6 +106,8 @@ internal sealed class WorkerAgentLoop(
 
             messages.Add(new NmMessage("user", toolResults));
         }
+
+        onActivity?.Invoke(null);
 
         if (ct.IsCancellationRequested)
             return AgentLoopCompletion.Cancelled;
