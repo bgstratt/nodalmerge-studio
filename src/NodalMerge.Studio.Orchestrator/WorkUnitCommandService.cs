@@ -22,5 +22,6 @@ public sealed class WorkUnitCommandService(IOrchestratorService orchestrator) : 
             reviewPolicy: command.ReviewPolicy,
             bypassPromotionBranch: command.BypassPromotionBranch,
             seedFromBranchId: command.SeedFromBranchId,
+            expectedOutputKind: command.ExpectedOutputKind ?? WorkUnitExpectedOutputKind.FileChange,
             cancellationToken: cancellationToken);
 }

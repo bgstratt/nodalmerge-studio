@@ -181,6 +181,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         HypothesisForkType? forkType = null,
         ReviewPolicy? reviewPolicy = null,
         bool bypassPromotionBranch = false,
+        WorkUnitExpectedOutputKind expectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
         CancellationToken cancellationToken = default)
     {
         // First work unit with a repositoryPath seeds the main branch for this session.
@@ -217,7 +218,8 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             BranchedFromProposalId: branchedFromProposalId,
             ForkType: forkType,
             ReviewPolicy: reviewPolicy ?? ReviewPolicy.HumanRequired,
-            BypassPromotionBranch: bypassPromotionBranch);
+            BypassPromotionBranch: bypassPromotionBranch,
+            ExpectedOutputKind: expectedOutputKind);
 
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }

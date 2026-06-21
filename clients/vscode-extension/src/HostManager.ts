@@ -1,4 +1,5 @@
 import * as cp from 'child_process';
+import * as fs from 'fs';
 import * as http from 'http';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -15,6 +16,19 @@ type HostStatus = 'idle' | 'starting' | 'ready' | 'stopped' | 'error';
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Name Studio used to (and, if a user opts in via workspaceDataPath, still can) store its data
+// under, directly inside the opened repo.
+const LEGACY_DATA_DIRNAME = '.nodalmerge';
+const MIGRATION_SUPPRESS_KEY = 'nodalmerge.suppressMigrationPromptThisSession';
+
+function directoryHasContent(dir: string): boolean {
+  try {
+    return fs.readdirSync(dir).length > 0;
+  } catch {
+    return false;
+  }
 }
 
 export class HostManager implements vscode.Disposable {
@@ -41,6 +55,11 @@ export class HostManager implements vscode.Disposable {
   get hostBaseUrl(): string { return `http://127.0.0.1:${this.port}`; }
 
   async start(): Promise<void> {
+    const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+    if (wsRoot) {
+      await this.maybePromptLegacyMigration(wsRoot);
+    }
+
     // If the port is already healthy (e.g. manually started host), just adopt it.
     if (await this.checkHealth()) {
       this._ready = true;
@@ -103,17 +122,19 @@ export class HostManager implements vscode.Disposable {
       ASPNETCORE_URLS: `http://127.0.0.1:${this.port}`,
     };
 
-    // Anchor durable storage (DAG node store, file blobs, branch workspace files) under the
-    // opened project instead of letting it fall back to the Host's process CWD / OS temp dir —
-    // otherwise a restart can't find its own data, and branch file contents sit somewhere a
-    // disk-cleanup tool could sweep. No folder open (single-file mode) — leave the Host's own
-    // defaults (temp dir) alone, there's no project to anchor to.
+    // Anchor durable storage (DAG node store, file blobs, branch workspace files) somewhere that
+    // survives a restart, instead of the Host's process CWD / OS temp dir — but never inside the
+    // opened repo by default; that's the user's working tree, not Studio's scratch space. No
+    // folder open (single-file mode) — leave the Host's own defaults (temp dir) alone, there's no
+    // workspace to anchor to either way.
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
     if (wsRoot) {
-      const dataRoot = path.join(wsRoot, '.nodalmerge');
-      hostEnv.Workspace__RootPath = path.join(dataRoot, 'workspace');
-      hostEnv.NodalMerge__Storage__Sqlite__DbPath = path.join(dataRoot, 'data', 'nodalmerge-nodes.db');
-      hostEnv.NodalMerge__Storage__FileBlobs__RootPath = path.join(dataRoot, 'data', 'blobs');
+      const dataRoot = this.resolveDataRoot(wsRoot);
+      if (dataRoot) {
+        hostEnv.Workspace__RootPath = path.join(dataRoot, 'workspace');
+        hostEnv.NodalMerge__Storage__Sqlite__DbPath = path.join(dataRoot, 'data', 'nodalmerge-nodes.db');
+        hostEnv.NodalMerge__Storage__FileBlobs__RootPath = path.join(dataRoot, 'data', 'blobs');
+      }
     }
 
     // In extension development mode use `dotnet run` so there's no need to
@@ -139,6 +160,107 @@ export class HostManager implements vscode.Disposable {
       ?? 'NodalMerge.Studio.Host';
     const binaryPath = path.join(this.context.extensionPath, 'bin', rid, binaryName);
     return { cmd: binaryPath, args: [], env: hostEnv, cwd: wsRoot };
+  }
+
+  // Empty (default) = VS Code's own per-workspace extension storage, which already lives outside
+  // any repo. A non-empty override is the user's explicit choice — relative paths resolve against
+  // the workspace folder (e.g. ".nodalmerge", if they actually want it versioned), absolute paths
+  // let them point anywhere (e.g. another drive).
+  private resolveDataRoot(wsRoot: string): string | undefined {
+    const override = vscode.workspace.getConfiguration('nodalmerge').get<string>('workspaceDataPath', '');
+    if (override) {
+      return path.isAbsolute(override) ? override : path.join(wsRoot, override);
+    }
+    return this.context.storageUri?.fsPath ?? this.context.globalStorageUri.fsPath;
+  }
+
+  // Repos that ran under the old default already have real branch history sitting in
+  // <repo>/.nodalmerge. Don't switch the default out from under them silently, and don't leave
+  // it there silently either — ask once per workspace (re-asking next time it's opened if the
+  // user picks "ask me later", but not on every restart within the same session).
+  private async maybePromptLegacyMigration(wsRoot: string): Promise<void> {
+    const config = vscode.workspace.getConfiguration('nodalmerge');
+    if (config.get<string>('workspaceDataPath', '')) {
+      return; // already an explicit choice on record
+    }
+
+    const legacyDir = path.join(wsRoot, LEGACY_DATA_DIRNAME);
+    if (!directoryHasContent(legacyDir)) {
+      return;
+    }
+
+    if (this.context.workspaceState.get<boolean>(MIGRATION_SUPPRESS_KEY)) {
+      return;
+    }
+
+    const choice = await vscode.window.showWarningMessage(
+      `NodalMerge Studio found existing data in "${LEGACY_DATA_DIRNAME}" inside this repository. ` +
+      'Studio no longer stores data inside your repo by default — choose how to proceed.',
+      'Move it outside the repo',
+      'Keep it in this repo',
+      'Ask me later',
+    );
+
+    if (choice === 'Move it outside the repo') {
+      await this.migrateLegacyData(legacyDir);
+    } else if (choice === 'Keep it in this repo') {
+      await config.update('workspaceDataPath', LEGACY_DATA_DIRNAME, vscode.ConfigurationTarget.Workspace);
+      await this.offerGitignoreEntry(wsRoot);
+    } else {
+      await this.context.workspaceState.update(MIGRATION_SUPPRESS_KEY, true);
+    }
+  }
+
+  private async migrateLegacyData(legacyDir: string): Promise<void> {
+    const target = this.context.storageUri?.fsPath ?? this.context.globalStorageUri.fsPath;
+
+    // Make sure nothing has the old directory open before moving it out from under the process.
+    this.killProcess();
+
+    try {
+      if (directoryHasContent(target)) {
+        vscode.window.showWarningMessage(
+          `NodalMerge's default data location (${target}) already has data — leaving ` +
+          `"${LEGACY_DATA_DIRNAME}" in place. Set "nodalmerge.workspaceDataPath" manually if you ` +
+          'want to merge them yourself.',
+        );
+        return;
+      }
+      await fs.promises.mkdir(path.dirname(target), { recursive: true });
+      await fs.promises.cp(legacyDir, target, { recursive: true });
+      await fs.promises.rm(legacyDir, { recursive: true, force: true });
+      vscode.window.showInformationMessage(`NodalMerge Studio data moved to ${target}.`);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Failed to migrate NodalMerge Studio data: ${String(err)}`);
+    }
+  }
+
+  private async offerGitignoreEntry(wsRoot: string): Promise<void> {
+    const gitignorePath = path.join(wsRoot, '.gitignore');
+    const entry = `${LEGACY_DATA_DIRNAME}/`;
+
+    let existing = '';
+    try {
+      existing = await fs.promises.readFile(gitignorePath, 'utf8');
+    } catch {
+      // No .gitignore yet — still worth offering to create the entry below.
+    }
+    const alreadyIgnored = existing
+      .split(/\r?\n/)
+      .some(line => line.trim() === entry || line.trim() === LEGACY_DATA_DIRNAME);
+    if (alreadyIgnored) {
+      return;
+    }
+
+    const choice = await vscode.window.showInformationMessage(
+      `Add "${entry}" to .gitignore so Studio's data directory isn't committed?`,
+      'Add to .gitignore',
+      'No thanks',
+    );
+    if (choice === 'Add to .gitignore') {
+      const separator = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
+      await fs.promises.appendFile(gitignorePath, `${separator}${entry}\n`);
+    }
   }
 
   private async waitForHealth(): Promise<void> {

@@ -23,7 +23,10 @@ internal sealed class PlannerAgentLoop(
 
         Workflow:
         1. Call nm_v1_workunit_get to understand the goal and learn your branchId.
-        2. Call nm_v1_workspace_list to see existing files in your branch.
+        2. Call nm_v1_workspace_list to see existing files in your branch. Always pass your
+           workUnitId on every workspace tool call alongside branchId — the server resolves the
+           authoritative branch from workUnitId, so this protects you if you ever misremember the
+           branchId string.
         3. Decompose the goal into independent slices. Each slice must have:
            - sliceId: short unique id (e.g. "s1", "s2")
            - goal: what this slice accomplishes
@@ -38,6 +41,12 @@ internal sealed class PlannerAgentLoop(
         - Prefer parallel slices with non-overlapping fileScope when possible.
         - Use dependsOn only when one slice truly needs another's output.
         - Write valid JSON only — no markdown fences in the file content.
+        - fileScope entries must be the exact, real relative paths from nm_v1_workspace_list — never
+          a filename guessed from the goal text. If the goal mentions a file by name only (e.g.
+          "update app.tsx"), find its actual path in the listing by matching the filename
+          case-insensitively (e.g. "web-react/src/App.tsx") and use that full path. Only use the
+          goal's literal name as-is when no matching file exists anywhere in the listing — i.e. it's
+          genuinely a new file.
         """;
 
     private readonly int _maxIterations = profile?.MaxIterations ?? 15;
@@ -130,23 +139,26 @@ internal sealed class PlannerAgentLoop(
             new(McpToolNames.WorkspaceRead, "Read a file from the branch working directory.",
                 Schema(["branchId", "path"], new()
                 {
-                    ["branchId"] = Str("Branch ID"),
-                    ["path"]     = Str("Relative file path")
+                    ["branchId"]   = Str("Branch ID"),
+                    ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                    ["path"]       = Str("Relative file path")
                 })),
 
             new(McpToolNames.WorkspaceWrite, "Create or fully overwrite a file in the branch working directory.",
                 Schema(["branchId", "path", "content"], new()
                 {
-                    ["branchId"] = Str("Branch ID"),
-                    ["path"]     = Str("Relative file path"),
-                    ["content"]  = Str("Full file content")
+                    ["branchId"]   = Str("Branch ID"),
+                    ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                    ["path"]       = Str("Relative file path"),
+                    ["content"]    = Str("Full file content")
                 })),
 
             new(McpToolNames.WorkspaceList, "List files in the branch working directory.",
                 Schema(["branchId"], new()
                 {
-                    ["branchId"] = Str("Branch ID"),
-                    ["path"]     = Str("Subdirectory (optional)")
+                    ["branchId"]   = Str("Branch ID"),
+                    ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                    ["path"]       = Str("Subdirectory (optional)")
                 })),
         ];
     }

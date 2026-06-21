@@ -66,7 +66,11 @@ public interface ITaskService
 
     Task<MergeProposal> ValidateAsync(string proposalId, CancellationToken cancellationToken = default);
 
-    Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus decision, CancellationToken cancellationToken = default);
+    Task<MergeProposal> ReviewAsync(
+        string proposalId,
+        MergeProposalStatus decision,
+        string? notes = null,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Automated pre-gate review (11d). Approved returns the proposal to ReadyForReview with
@@ -108,6 +112,7 @@ public interface ITaskService
             string? provider = null,
             string? sessionId = null,
             string? commandId = null,
+            string? noFileChangesJustification = null,
             CancellationToken cancellationToken = default);
 
         Task<MergeProposal> ValidateAsync(string proposalId, CancellationToken cancellationToken = default);
@@ -118,6 +123,7 @@ public interface ITaskService
             string? verificationResults = null,
             bool automated = false,
             string? reviewerAgentId = null,
+            string? notes = null,
             CancellationToken cancellationToken = default);
 
         Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false);
@@ -171,6 +177,18 @@ public interface IAutomatedReviewGateService
         string parentWorkUnitId,
         string proposalId,
         string agentId,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// After a human rejects a proposal from the review panel (optionally with steering notes),
+    /// resets the rejected work unit (or its children, for a reconciled fan-out proposal) for
+    /// retry — same retry/dead-letter budget shape as HandleAutomatedRejectionAsync, tracked
+    /// under its own counter so human and automated rejection cycles don't share a budget.
+    /// </summary>
+    Task<AutomatedRejectionResult> HandleHumanRejectionAsync(
+        string proposalId,
+        string? reviewNotes,
         string? sessionId = null,
         CancellationToken cancellationToken = default);
 }
@@ -297,6 +315,7 @@ public interface IOrchestratorService
         HypothesisForkType? forkType = null,
         ReviewPolicy? reviewPolicy = null,
         bool bypassPromotionBranch = false,
+        WorkUnitExpectedOutputKind expectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
         CancellationToken cancellationToken = default);
 
     Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default);
@@ -317,7 +336,8 @@ public sealed record WorkUnitCreateCommand(
     HypothesisForkType? ForkType = null,
     ReviewPolicy? ReviewPolicy = null,
     bool BypassPromotionBranch = false,
-    string? SeedFromBranchId = null);
+    string? SeedFromBranchId = null,
+    WorkUnitExpectedOutputKind? ExpectedOutputKind = null);
 
 public interface IWorkUnitCommandService
 {

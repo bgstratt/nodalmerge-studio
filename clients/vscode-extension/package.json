@@ -42,6 +42,11 @@
           "default": 5080,
           "description": "Port the Studio Host listens on."
         },
+        "nodalmerge.workspaceDataPath": {
+          "type": "string",
+          "default": "",
+          "description": "Where Studio stores branch files, the node-store database, and blobs. Empty (default) uses VS Code's per-workspace extension storage, outside your repository. Set a relative path (e.g. \".nodalmerge\") to store it inside this repo instead, or an absolute path to use a custom location."
+        },
         "nodalmerge.agentProfiles": {
           "type": "array",
           "default": [],

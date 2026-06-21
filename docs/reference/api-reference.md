@@ -190,11 +190,14 @@ Grouped by resource area; method + path + one-line purpose. `StudioRestEndpoints
 file that registers all of these.
 
 ### Workspace files & execution
+branchId is a query parameter on every one of these, not a route segment — branch ids like
+`merge/{workUnitId}` and `base/{proposalId}` contain a literal `/`, which a `{branchId}` route
+segment can never match.
 - `GET /studio/workspace-summary` — control-tower summary
-- `POST /studio/workspace/{branchId}/build|test|exec|run` — trigger build/test/build+test+lint/run on a branch
-- `GET /studio/workspace/{branchId}/exec/latest` — latest execution result
-- `GET /studio/workspace/{branchId}/exec/{resultId}/output` — cached stdout/stderr for a past result
-- `GET /studio/workspace/{branchId}/path` — branch working directory path
+- `POST /studio/workspace/build|test|exec|run?branchId=...` — trigger build/test/build+test+lint/run on a branch
+- `GET /studio/workspace/exec/latest?branchId=...` — latest execution result
+- `GET /studio/workspace/exec/output?branchId=...&resultId=...` — cached stdout/stderr for a past result
+- `GET /studio/workspace/path?branchId=...` — branch working directory path
 
 ### Work units
 - `GET /studio/workunits` — list (filter by branch/session)

@@ -12,7 +12,7 @@ namespace NodalMerge.Studio.Merge;
 // dispatcher executed.
 // Slice 16g — ProposalCreated policy gate (including WorkspaceExecutionRule) fires before diff,
 // attaching build/test results to VerificationResults.
-public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceService fileWorkspace, IArtifactLineageService artifactLineage, IExecutionEventStream events, IStudioNodeStore nodeStore, IServiceProvider serviceProvider, IPolicyGateService? policyGate = null) : IMergeCommandService
+public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceService fileWorkspace, IArtifactLineageService artifactLineage, IExecutionEventStream events, IStudioNodeStore nodeStore, IServiceProvider serviceProvider, IPolicyGateService? policyGate = null, IWorkUnitService? workUnits = null, WorkspaceOptions? workspaceOptions = null) : IMergeCommandService
 {
     public async Task<MergeProposal> ProposeAsync(
         string sourceBranch,
@@ -26,6 +26,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
         string? provider = null,
         string? sessionId = null,
         string? commandId = null,
+        string? noFileChangesJustification = null,
         CancellationToken cancellationToken = default)
     {
         // ── Idempotency ──────────────────────────────────────────────────────────
@@ -113,6 +114,49 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
             catch { /* best-effort */ }
         }
 
+        // ── Guard: reject proposals with no actual file changes ──────────────────
+        // Opt-in (WorkspaceOptions.EnforceExpectedOutputKind, default false) so this only fires for
+        // work units that explicitly expect FileChange output and weren't given an explicit
+        // noFileChangesJustification. Orchestration-only flows (reconciliation, fan-out tests, etc.)
+        // that leave the option off, or work units set to KnowledgeArtifact/Either, are unaffected.
+        if (filesTouched.Count == 0
+            && workspaceOptions is { EnforceExpectedOutputKind: true }
+            && string.IsNullOrWhiteSpace(noFileChangesJustification)
+            && workUnitId is not null
+            && workUnits is not null)
+        {
+            var owningWorkUnit = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false);
+            if (owningWorkUnit?.ExpectedOutputKind == WorkUnitExpectedOutputKind.FileChange)
+            {
+                const string noChangesMessage =
+                    "No file changes were detected and this task expects FileChange output. Call " +
+                    "nm_v1_workspace_write to create or modify files, or resubmit with " +
+                    "noFileChangesJustification explaining why no changes were needed.";
+                var rejectedProposal = new MergeProposal(
+                    $"MP-{Guid.NewGuid():N}",
+                    sourceBranch, targetBranch,
+                    goal ?? summary, summary, noChangesMessage,
+                    null, null, null,
+                    MergeProposalStatus.Rejected,
+                    WorkspaceChanges: workspaceChanges,
+                    DiffGeneratedAt:  diffGeneratedAt,
+                    AgentId:          agentId,
+                    Model:            model,
+                    Provider:         provider,
+                    SessionId:        sessionId,
+                    WorkUnitId:       workUnitId,
+                    FilesTouched:     []);
+                var savedRejected = await merge.ProposeAsync(rejectedProposal, cancellationToken).ConfigureAwait(false);
+
+                if (commandId is not null)
+                {
+                    await nodeStore.WriteNodeAsync(StudioNodeKind.CommandResultV1, commandId,
+                        JsonSerializer.Serialize(savedRejected), cancellationToken).ConfigureAwait(false);
+                }
+                return savedRejected;
+            }
+        }
+
         // ── Proposal creation ────────────────────────────────────────────────────
         var proposalId = $"MP-{Guid.NewGuid():N}";
 
@@ -140,7 +184,8 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
             Provider:         provider,
             SessionId:        sessionId,
             WorkUnitId:       workUnitId,
-            FilesTouched:     filesTouched);
+            FilesTouched:     filesTouched,
+            NoFileChangesJustification: noFileChangesJustification);
         var created = await merge.ProposeAsync(proposal, cancellationToken).ConfigureAwait(false);
 
         // ── Artifact lineage + execution event + status transition ─────────────────
@@ -227,6 +272,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
         string? verificationResults = null,
         bool automated = false,
         string? reviewerAgentId = null,
+        string? notes = null,
         CancellationToken cancellationToken = default)
     {
         if (!Enum.TryParse<MergeProposalStatus>(decision, ignoreCase: true, out var status) ||
@@ -245,7 +291,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
 
         return automated
             ? await merge.AutomatedReviewAsync(proposalId, status, verificationResults ?? string.Empty, reviewerAgentId, cancellationToken).ConfigureAwait(false)
-            : await merge.ReviewAsync(proposalId, status, cancellationToken).ConfigureAwait(false);
+            : await merge.ReviewAsync(proposalId, status, notes, cancellationToken).ConfigureAwait(false);
     }
 
     // Slice 20b — BeforeMerge gate. For AgentApproval/Hybrid policies the AutoReviewRule runs the

@@ -39,4 +39,11 @@ public sealed class WorkspaceOptions
     // work unit's parent branch.  Humans promote candidate → main via POST /studio/branches/candidate/promote.
     public bool UsePromotionBranch { get; set; } = false;
     public string CandidateBranchId { get; set; } = "candidate";
+
+    // ── Expected output kind enforcement ─────────────────────────────────────
+
+    // Opt-in, default false (matches RequireBuildBeforeProposal's convention above): when true,
+    // MergeCommandService.ProposeAsync rejects a proposal whose work unit expects FileChange
+    // output but whose diff touched zero files and carried no NoFileChangesJustification.
+    public bool EnforceExpectedOutputKind { get; set; } = false;
 }

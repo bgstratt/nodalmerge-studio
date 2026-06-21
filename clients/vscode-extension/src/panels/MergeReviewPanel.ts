@@ -19,6 +19,9 @@ export interface MergeProposal {
   reconciledFrom?: string[];
   supersededBy?: string | null;
   autoApplied?: boolean;
+  filesTouched?: string[];
+  noFileChangesJustification?: string | null;
+  reviewNotes?: string | null;
 }
 
 export interface DiffLine {
@@ -70,6 +73,7 @@ export class DecisionConvergencePanel {
   private mode: 'proposal' | 'conflict' = 'proposal';
   private proposalId?: string;
   private workUnitId?: string;
+  private lastProposal?: MergeProposal;
 
   constructor(
     panel: vscode.WebviewPanel,
@@ -163,6 +167,7 @@ export class DecisionConvergencePanel {
 
     try {
       const proposal = await this.get<MergeProposal>('/studio/merges/' + this.proposalId);
+      this.lastProposal = proposal;
       const changesRes = await this.get<{ fileChanges: ProposalFileChange[] }>(
         '/studio/merges/' + this.proposalId + '/file-changes');
       const constituents = (proposal.reconciledFrom && proposal.reconciledFrom.length)
@@ -233,12 +238,20 @@ export class DecisionConvergencePanel {
           await this.post('/studio/merges/' + this.proposalId + '/validate', {});
           break;
         case 'acceptDecision':
-          await this.post('/studio/merges/' + this.proposalId + '/review', { decision: 'Approved' });
+          await this.post('/studio/merges/' + this.proposalId + '/review', {
+            decision: 'Approved',
+            notes: (msg.notes as string | undefined) || undefined,
+            sessionId: this.getEffectiveSessionId(),
+          });
           void vscode.window.showInformationMessage('Decision accepted.');
           break;
         case 'rejectDecision':
-          await this.post('/studio/merges/' + this.proposalId + '/review', { decision: 'Rejected' });
-          void vscode.window.showWarningMessage('Decision rejected.');
+          await this.post('/studio/merges/' + this.proposalId + '/review', {
+            decision: 'Rejected',
+            notes: (msg.notes as string | undefined) || undefined,
+            sessionId: this.getEffectiveSessionId(),
+          });
+          void vscode.window.showWarningMessage('Decision rejected — retrying with your notes as steering context.');
           break;
         case 'applyDecision':
           await this.post('/studio/merges/' + this.proposalId + '/apply', {});
@@ -283,12 +296,28 @@ export class DecisionConvergencePanel {
             + ' (' + opened + ' file(s) opened read-only).');
           break;
         }
+        case 'runWorkspaceCheck': {
+          const kind = String(msg.kind ?? 'build');
+          const branchId = this.lastProposal?.sourceBranch;
+          if (!branchId) { return; }
+          // branchId is passed as a query param, not a route segment — ids like
+          // "merge/{workUnitId}" contain a literal "/", which a {branchId} route segment can
+          // never match (every call with one of those ids 404'd).
+          const endpoint = kind === 'run' ? 'run' : kind === 'test' ? 'test' : 'build';
+          try {
+            const result = await this.post(
+              '/studio/workspace/' + endpoint + '?branchId=' + encodeURIComponent(branchId), {});
+            void this.panel.webview.postMessage({ type: 'executionResult', kind, result });
+          } catch (err) {
+            void this.panel.webview.postMessage({ type: 'executionResult', kind, error: String(err) });
+            void vscode.window.showErrorMessage('NodalMerge: ' + kind + ' failed — ' + String(err));
+          }
+          return;
+        }
         case 'downloadExecOutput': {
-          const payload = String(msg.payload ?? '');
-          const slashIdx = payload.indexOf('/');
-          if (slashIdx < 0) { break; }
-          const branchId = payload.substring(0, slashIdx);
-          const resultId = payload.substring(slashIdx + 1);
+          const branchId = String(msg.branchId ?? '');
+          const resultId = String(msg.resultId ?? '');
+          if (!branchId || !resultId) { break; }
           try {
             const output = await this.get<{
               branchId: string;
@@ -301,7 +330,8 @@ export class DecisionConvergencePanel {
                 stdErr: string;
                 truncated: boolean;
               }[];
-            }>('/studio/workspace/' + branchId + '/exec/' + resultId + '/output');
+            }>('/studio/workspace/exec/output?branchId=' + encodeURIComponent(branchId)
+              + '&resultId=' + encodeURIComponent(resultId));
             const lines: string[] = [];
             for (const entry of output.entries) {
               lines.push(`# ${entry.kind}: ${entry.command || ''} (${entry.buildSystem || 'cmd'}) ${entry.truncated ? '[truncated]' : ''}`);
@@ -610,6 +640,44 @@ const DC_CSS = `
     border: 1px solid var(--nm-border);
     margin: 8px 12px 12px;
   }
+  .exec-trigger-row {
+    display: flex;
+    gap: 0;
+    margin: 0 0 4px -12px;
+  }
+  .no-changes-banner {
+    border-left: 3px solid var(--nm-warn);
+    background: rgba(204, 167, 0, 0.12);
+    color: var(--nm-warn);
+    font-weight: 600;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    font-size: 0.9em;
+  }
+  .exec-trigger-row button.ghost:disabled {
+    opacity: 0.5;
+  }
+  .review-notes-row {
+    margin: 12px 0;
+  }
+  .review-notes-row label {
+    display: block;
+    font-size: 0.85em;
+    opacity: 0.8;
+    margin-bottom: 4px;
+  }
+  .review-notes-row textarea {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border, var(--nm-border));
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-family: inherit;
+    font-size: 0.9em;
+    resize: vertical;
+  }
 `;
 
 const DC_HTML = `
@@ -662,6 +730,12 @@ const DC_HTML = `
     </section>
   <section id="section-evidence" class="hidden">
       <h2>Evidence</h2>
+      <div id="no-changes-banner" class="hidden no-changes-banner"></div>
+      <div class="exec-trigger-row">
+        <button id="btn-run-build" class="ghost">Run Build</button>
+        <button id="btn-run-test"  class="ghost">Run Tests</button>
+        <button id="btn-run-app"   class="ghost">Run App</button>
+      </div>
       <div id="evidence-results"></div>
       <div id="execution-results" class="hidden"></div>
     </section>
@@ -669,6 +743,10 @@ const DC_HTML = `
       <h2>Rollback plan</h2>
       <p id="rollback-plan"></p>
     </section>
+    <div id="review-notes-row" class="review-notes-row">
+      <label for="review-notes">Notes (steering direction for a reject, or context for an accept)</label>
+      <textarea id="review-notes" rows="3" placeholder="e.g. Missing the edge case for empty input — handle that and resubmit."></textarea>
+    </div>
     <div id="actions" class="actions">
       <button id="btn-validate">Validate Evidence</button>
       <button id="btn-accept" class="accept">Accept Decision</button>
@@ -728,11 +806,16 @@ const DC_JS = `
   document.getElementById('btn-validate').addEventListener('click', function() {
     vscode.postMessage({ type: 'validateEvidence' });
   });
+  function reviewNotesValue() {
+    var el = document.getElementById('review-notes');
+    var v = el && el.value ? el.value.trim() : '';
+    return v.length ? v : undefined;
+  }
   document.getElementById('btn-accept').addEventListener('click', function() {
-    vscode.postMessage({ type: 'acceptDecision' });
+    vscode.postMessage({ type: 'acceptDecision', notes: reviewNotesValue() });
   });
   document.getElementById('btn-reject').addEventListener('click', function() {
-    vscode.postMessage({ type: 'rejectDecision' });
+    vscode.postMessage({ type: 'rejectDecision', notes: reviewNotesValue() });
   });
   document.getElementById('btn-apply').addEventListener('click', function() {
     vscode.postMessage({ type: 'applyDecision' });
@@ -743,6 +826,105 @@ const DC_JS = `
   document.getElementById('btn-restore').addEventListener('click', function() {
     vscode.postMessage({ type: 'restoreWorkspace' });
   });
+
+  function runWorkspaceCheck(kind, btnId) {
+    ['btn-run-build', 'btn-run-test', 'btn-run-app'].forEach(function(id) { setDisabled(id, true); });
+    setText(btnId, 'Running…');
+    vscode.postMessage({ type: 'runWorkspaceCheck', kind: kind });
+  }
+  document.getElementById('btn-run-build').addEventListener('click', function() {
+    runWorkspaceCheck('build', 'btn-run-build');
+  });
+  document.getElementById('btn-run-test').addEventListener('click', function() {
+    runWorkspaceCheck('test', 'btn-run-test');
+  });
+  document.getElementById('btn-run-app').addEventListener('click', function() {
+    runWorkspaceCheck('run', 'btn-run-app');
+  });
+
+  function resetExecButtons() {
+    setText('btn-run-build', 'Run Build');
+    setText('btn-run-test', 'Run Tests');
+    setText('btn-run-app', 'Run App');
+    ['btn-run-build', 'btn-run-test', 'btn-run-app'].forEach(function(id) { setDisabled(id, false); });
+  }
+
+  function renderExecResult(parsedExec) {
+    var html = '<div class="exec-section">';
+
+    if (parsedExec.builds && parsedExec.builds.length) {
+      html += '<strong>Build</strong>';
+      parsedExec.builds.forEach(function(b) {
+        var icon = b.success ? '✅' : '❌';
+        var sys = b.buildSystem || 'cmd';
+        var dur = b.startedAt && b.completedAt
+          ? ((new Date(b.completedAt) - new Date(b.startedAt)) / 1000).toFixed(1) + 's'
+          : '';
+        html += '<div class="exec-row">' + icon + ' <span class="badge">' + esc(sys) + '</span>'
+          + ' <span class="cmd">' + esc(b.command || '') + '</span>'
+          + (dur ? ' <span style="opacity:0.6">(' + dur + ')</span>' : '')
+          + (b.exitCode !== 0 ? ' <span style="color:var(--nm-error)">exit ' + b.exitCode + '</span>' : '')
+          + '</div>';
+
+        var hasStdout = b.stdOut && b.stdOut.length > 0;
+        var hasStderr = b.stdErr && b.stdErr.length > 0;
+        if (hasStdout || hasStderr) {
+          var outId = 'exec-stdout-' + Math.random().toString(36).slice(2,8);
+          html += '<button class="exec-output-toggle" data-target="' + outId + '">▼ Output</button>';
+          html += '<pre class="exec-output-pre" id="' + outId + '" style="display:none">';
+          if (hasStderr) html += esc(b.stdErr) + '\\n';
+          if (hasStdout) html += esc(b.stdOut);
+          html += '</pre>';
+        }
+
+        if (b.truncated && parsedExec.nodeId) {
+          html += '<a class="exec-download-link" data-branch="' + esc(parsedExec.branchId) + '"'
+            + ' data-result="' + esc(parsedExec.nodeId) + '">'
+            + 'Download full output (truncated)</a>';
+        }
+      });
+    }
+
+    if (parsedExec.tests && parsedExec.tests.length) {
+      html += '<strong style="margin-top:8px;display:block">Tests</strong>';
+      parsedExec.tests.forEach(function(t) {
+        var icon = t.success ? '✅' : '⚠';
+        var sys = t.buildSystem || 'cmd';
+        if (t.failed === 0 && t.totalTests === 0) icon = t.success ? '✅' : '❌';
+        var summary = t.totalTests > 0
+          ? t.passed + ' passed / ' + t.failed + ' failed' + (t.skipped ? ' / ' + t.skipped + ' skipped' : '')
+          : '';
+        var dur = t.startedAt && t.completedAt
+          ? ((new Date(t.completedAt) - new Date(t.startedAt)) / 1000).toFixed(1) + 's'
+          : '';
+        html += '<div class="exec-row">' + icon + ' <span class="badge">' + esc(sys) + '</span>'
+          + ' <span class="cmd">' + esc(t.command || '') + '</span>'
+          + ' <span>' + summary + '</span>'
+          + (dur ? ' <span style="opacity:0.6">(' + dur + ')</span>' : '')
+          + '</div>';
+
+        var hasStdout = t.stdOut && t.stdOut.length > 0;
+        if (hasStdout) {
+          var tid = 'exec-testout-' + Math.random().toString(36).slice(2,8);
+          html += '<button class="exec-output-toggle" data-target="' + tid + '">▼ Output</button>';
+          html += '<pre class="exec-output-pre" id="' + tid + '" style="display:none">' + esc(t.stdOut) + '</pre>';
+        }
+
+        if (t.truncated && parsedExec.nodeId) {
+          html += '<a class="exec-download-link" data-branch="' + esc(parsedExec.branchId) + '"'
+            + ' data-result="' + esc(parsedExec.nodeId) + '">'
+            + 'Download full output (truncated)</a>';
+        }
+      });
+    }
+
+    if ((!parsedExec.builds || !parsedExec.builds.length) && (!parsedExec.tests || !parsedExec.tests.length)) {
+      html += '<span style="opacity:0.6;font-size:0.85em">No build/test results.</span>';
+    }
+
+    html += '</div>';
+    return html;
+  }
 
   // Slice 18g — card-based constituent rendering with model, confidence, rationale
   function renderConstituents(constituents, fallbackIds) {
@@ -893,10 +1075,11 @@ const DC_JS = `
       return;
     }
 
-    var download = ev.target.closest('[data-download]');
+    var download = ev.target.closest('[data-branch]');
     if (download) {
-      var payload = download.getAttribute('data-download');
-      vscode.postMessage({ type: 'downloadExecOutput', payload: payload });
+      var branchId = download.getAttribute('data-branch');
+      var resultId = download.getAttribute('data-result');
+      vscode.postMessage({ type: 'downloadExecOutput', branchId: branchId, resultId: resultId });
       return;
     }
   });
@@ -967,6 +1150,23 @@ const DC_JS = `
       return;
     }
 
+    if (msg.type === 'executionResult') {
+      resetExecButtons();
+      var execResultsEl2 = document.getElementById('execution-results');
+      if (msg.error) {
+        if (execResultsEl2) {
+          execResultsEl2.classList.remove('hidden');
+          execResultsEl2.innerHTML = '<span style="color:var(--nm-error)">' + esc(msg.kind) + ' failed: ' + esc(msg.error) + '</span>';
+        }
+        return;
+      }
+      if (execResultsEl2 && msg.result) {
+        execResultsEl2.classList.remove('hidden');
+        execResultsEl2.innerHTML = renderExecResult(msg.result);
+      }
+      return;
+    }
+
     if (msg.type !== 'proposal') { return; }
     showDecisionSections(true);
     showIf('section-conflict-report', false);
@@ -1028,89 +1228,38 @@ const DC_JS = `
 
     if (parsedExec && execResultsEl) {
       execResultsEl.classList.remove('hidden');
-      showIf('section-evidence', true);
-      var html = '<div class="exec-section">';
-
-      if (parsedExec.builds && parsedExec.builds.length) {
-        html += '<strong>Build</strong>';
-        parsedExec.builds.forEach(function(b) {
-          var icon = b.success ? '✅' : '❌';
-          var sys = b.buildSystem || 'cmd';
-          var dur = b.startedAt && b.completedAt
-            ? ((new Date(b.completedAt) - new Date(b.startedAt)) / 1000).toFixed(1) + 's'
-            : '';
-          html += '<div class="exec-row">' + icon + ' <span class="badge">' + esc(sys) + '</span>'
-            + ' <span class="cmd">' + esc(b.command || '') + '</span>'
-            + (dur ? ' <span style="opacity:0.6">(' + dur + ')</span>' : '')
-            + (b.exitCode !== 0 ? ' <span style="color:var(--nm-error)">exit ' + b.exitCode + '</span>' : '')
-            + '</div>';
-
-          var hasStdout = b.stdOut && b.stdOut.length > 0;
-          var hasStderr = b.stdErr && b.stdErr.length > 0;
-          if (hasStdout || hasStderr) {
-            var outId = 'exec-stdout-' + Math.random().toString(36).slice(2,8);
-            html += '<button class="exec-output-toggle" data-target="' + outId + '">▼ Output</button>';
-            html += '<pre class="exec-output-pre" id="' + outId + '" style="display:none">';
-            if (hasStderr) html += esc(b.stdErr) + '\\n';
-            if (hasStdout) html += esc(b.stdOut);
-            html += '</pre>';
-          }
-
-          if (b.truncated && parsedExec.nodeId) {
-            html += '<a class="exec-download-link" data-download="'
-              + esc(parsedExec.branchId) + '/' + esc(parsedExec.nodeId) + '">'
-              + 'Download full output (truncated)</a>';
-          }
-        });
-      }
-
-      if (parsedExec.tests && parsedExec.tests.length) {
-        html += '<strong style="margin-top:8px;display:block">Tests</strong>';
-        parsedExec.tests.forEach(function(t) {
-          var icon = t.success ? '✅' : '⚠';
-          var sys = t.buildSystem || 'cmd';
-          if (t.failed === 0 && t.totalTests === 0) icon = t.success ? '✅' : '❌';
-          var summary = t.totalTests > 0
-            ? t.passed + ' passed / ' + t.failed + ' failed' + (t.skipped ? ' / ' + t.skipped + ' skipped' : '')
-            : '';
-          var dur = t.startedAt && t.completedAt
-            ? ((new Date(t.completedAt) - new Date(t.startedAt)) / 1000).toFixed(1) + 's'
-            : '';
-          html += '<div class="exec-row">' + icon + ' <span class="badge">' + esc(sys) + '</span>'
-            + ' <span class="cmd">' + esc(t.command || '') + '</span>'
-            + ' <span>' + summary + '</span>'
-            + (dur ? ' <span style="opacity:0.6">(' + dur + ')</span>' : '')
-            + '</div>';
-
-          var hasStdout = t.stdOut && t.stdOut.length > 0;
-          if (hasStdout) {
-            var tid = 'exec-testout-' + Math.random().toString(36).slice(2,8);
-            html += '<button class="exec-output-toggle" data-target="' + tid + '">▼ Output</button>';
-            html += '<pre class="exec-output-pre" id="' + tid + '" style="display:none">' + esc(t.stdOut) + '</pre>';
-          }
-
-          if (t.truncated && parsedExec.nodeId) {
-            html += '<a class="exec-download-link" data-download="'
-              + esc(parsedExec.branchId) + '/' + esc(parsedExec.nodeId) + '">'
-              + 'Download full output (truncated)</a>';
-          }
-        });
-      }
-
-      if (!parsedExec.builds || !parsedExec.builds.length && (!parsedExec.tests || !parsedExec.tests.length)) {
-        html += '<span style="opacity:0.6;font-size:0.85em">No build/test results.</span>';
-      }
-
-      html += '</div>';
-      execResultsEl.innerHTML = html;
+      execResultsEl.innerHTML = renderExecResult(parsedExec);
     } else if (execResultsEl) {
       execResultsEl.classList.add('hidden');
       execResultsEl.innerHTML = '';
     }
 
-    showIf('section-evidence', !!(p.verificationResults || parsedExec));
+    // Evidence section now always visible (it also hosts the Run Build/Test/App triggers).
+    showIf('section-evidence', true);
+
+    // Flag proposals with no file diff at all — the goal/summary/rationale text can look fully
+    // complete even when the agent never actually wrote anything (see filesTouched).
+    var noChangesBannerEl = document.getElementById('no-changes-banner');
+    var hasNoFiles = !p.filesTouched || p.filesTouched.length === 0;
+    if (noChangesBannerEl) {
+      if (hasNoFiles && status !== 'rejected') {
+        var bannerText = '⚠ No file changes detected on this branch.';
+        if (p.noFileChangesJustification) {
+          bannerText += ' Agent justification: "' + esc(p.noFileChangesJustification) + '"';
+        } else {
+          bannerText += ' This proposal may only describe work without doing it — verify before accepting.';
+        }
+        noChangesBannerEl.textContent = bannerText;
+        noChangesBannerEl.classList.remove('hidden');
+      } else {
+        noChangesBannerEl.classList.add('hidden');
+      }
+    }
 
     setText('rollback-plan', p.rollbackPlan);
+
+    var reviewNotesEl = document.getElementById('review-notes');
+    if (reviewNotesEl) { reviewNotesEl.value = p.reviewNotes || ''; }
 
     var converged = p.reconciledFrom && p.reconciledFrom.length;
     showIf('section-converged', !!converged);

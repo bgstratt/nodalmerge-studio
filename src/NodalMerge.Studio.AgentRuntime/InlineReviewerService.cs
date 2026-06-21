@@ -25,10 +25,17 @@ public sealed class InlineReviewerService(
         var dispatcher = serviceProvider.GetRequiredService<McpToolDispatcher>();
         var llm = serviceProvider.GetRequiredService<LlmClient>();
 
+        // Slice — hand the reviewer filesTouched/justification up front instead of relying on it
+        // to remember to go fetch them; ReviewerAgentLoop's prompt already says to check this, but
+        // it previously had no tool that could (see ReviewerAgentLoop kickoff message).
+        var proposalForReview = await merge.GetAsync(proposalId, ct).ConfigureAwait(false);
+
         var loop = new ReviewerAgentLoop(
             agentId, workUnitId, proposalId,
             creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey,
-            dispatcher, llm);
+            dispatcher, llm,
+            filesTouched: proposalForReview?.FilesTouched,
+            noFileChangesJustification: proposalForReview?.NoFileChangesJustification);
 
         await loop.RunAsync(ct).ConfigureAwait(false);
 

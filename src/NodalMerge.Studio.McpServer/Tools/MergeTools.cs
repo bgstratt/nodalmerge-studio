@@ -60,12 +60,13 @@ public sealed class MergeTools(IMergeCommandService mergeCommands)
         string? verificationResults = null,
         bool automated = false,
         string? reviewerAgentId = null,
+        string? notes = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
             var proposal = await mergeCommands.ReviewAsync(
-                proposalId, decision, verificationResults, automated, reviewerAgentId, cancellationToken).ConfigureAwait(false);
+                proposalId, decision, verificationResults, automated, reviewerAgentId, notes, cancellationToken).ConfigureAwait(false);
             return McpJson.Ok(proposal);
         }
         catch (KeyNotFoundException)

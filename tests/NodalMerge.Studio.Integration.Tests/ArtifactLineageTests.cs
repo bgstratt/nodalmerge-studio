@@ -158,7 +158,7 @@ public class ArtifactLineageTests
         public Task<MergeProposal?> GetAsync(string proposalId, CancellationToken ct = default) =>
             Task.FromResult(_proposals.GetValueOrDefault(proposalId));
         public Task<MergeProposal> ValidateAsync(string proposalId, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus d, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus d, string? notes = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken ct = default, bool autoApplied = false) => throw new NotSupportedException();
         public Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken ct = default) =>

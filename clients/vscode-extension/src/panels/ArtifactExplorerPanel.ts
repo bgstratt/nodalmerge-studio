@@ -44,6 +44,7 @@ interface StudioOptions {
   requireTestBeforeProposal: boolean;
   buildCommand: string;
   testCommand: string;
+  enforceExpectedOutputKind?: boolean;
   usePromotionBranch?: boolean;
 }
 
@@ -273,22 +274,27 @@ export class GoalWorkspacePanel {
   }
 
   private async loadTimeline(workUnitId: string): Promise<void> {
-    try {
-      const [artifacts, events, evidence, reasoningGraph] = await Promise.all([
-        this.get<ArtifactRef[]>('/studio/workunits/' + workUnitId + '/artifacts'),
-        this.get<OrchestrationEvent[]>('/studio/workunits/' + workUnitId + '/orchestration-events'),
-        // Slice 18c — fetch evidence for the Decision Lens inspector
-        this.get<{ evidence: EvidenceEntry[] }>('/studio/evidence?workUnitId=' + encodeURIComponent(workUnitId)).catch(() => null),
-        // Slice 18f — fetch reasoning commit graph for the Reasoning Chain view
-        this.get<{ data: ReasoningCommitGraphPayload }>('/studio/projections/ReasoningCommitGraph?workUnitId=' + encodeURIComponent(workUnitId) + '&level=Normal').catch(() => null),
-      ]);
-      void this.panel.webview.postMessage({
-        type: 'timeline', workUnitId, artifacts, events,
-        evidence: evidence?.evidence ?? [],
-        reasoningGraph: reasoningGraph?.data ?? null,
-      });
-    } catch (err) {
-      void vscode.window.showErrorMessage('NodalMerge: failed to load timeline — ' + String(err));
+    // Each fetch is caught individually so one slow/erroring call (e.g. a transient blip on
+    // orchestration-events) can't take the whole Promise.all down — previously that left the
+    // panel stuck on "Loading…" forever, since no 'timeline' message was posted at all when any
+    // single call rejected.
+    const [artifacts, events, evidence, reasoningGraph] = await Promise.all([
+      this.get<ArtifactRef[]>('/studio/workunits/' + workUnitId + '/artifacts').catch(() => null),
+      this.get<OrchestrationEvent[]>('/studio/workunits/' + workUnitId + '/orchestration-events').catch(() => null),
+      // Slice 18c — fetch evidence for the Decision Lens inspector
+      this.get<{ evidence: EvidenceEntry[] }>('/studio/evidence?workUnitId=' + encodeURIComponent(workUnitId)).catch(() => null),
+      // Slice 18f — fetch reasoning commit graph for the Reasoning Chain view
+      this.get<{ data: ReasoningCommitGraphPayload }>('/studio/projections/ReasoningCommitGraph?workUnitId=' + encodeURIComponent(workUnitId) + '&level=Normal').catch(() => null),
+    ]);
+    void this.panel.webview.postMessage({
+      type: 'timeline', workUnitId,
+      artifacts: artifacts ?? [],
+      events: events ?? [],
+      evidence: evidence?.evidence ?? [],
+      reasoningGraph: reasoningGraph?.data ?? null,
+    });
+    if (artifacts === null || events === null) {
+      void vscode.window.showErrorMessage('NodalMerge: failed to load part of the timeline for ' + workUnitId + ' — showing what loaded.');
     }
   }
 
@@ -426,6 +432,15 @@ export class GoalWorkspacePanel {
           break;
         case 'explorerSetSchedulerPollIntervalMs':
           await this.updateOptions({ schedulerPollIntervalMs: msg.value as number });
+          break;
+        case 'explorerSetRequireBuildBeforeProposal':
+          await this.updateOptions({ requireBuildBeforeProposal: msg.value as boolean });
+          break;
+        case 'explorerSetRequireTestBeforeProposal':
+          await this.updateOptions({ requireTestBeforeProposal: msg.value as boolean });
+          break;
+        case 'explorerSetEnforceExpectedOutputKind':
+          await this.updateOptions({ enforceExpectedOutputKind: msg.value as boolean });
           break;
         case 'explorerSteeringAction':
           await this.handleSteeringAction(
@@ -1237,6 +1252,10 @@ const GW_HTML = `
       <input type="checkbox" id="gw-require-test-checkbox"/>
       Require tests before proposal
     </label>
+    <label class="gw-settings-row">
+      <input type="checkbox" id="gw-enforce-output-kind-checkbox"/>
+      Reject worker proposals with no file changes
+    </label>
   </div>
   <div class="gw-body">
     <div class="gw-col gw-decision-tree">
@@ -1256,7 +1275,7 @@ const GW_HTML = `
 
 const GW_JS = `
   var vscode = acquireVsCodeApi();
-  var state = { decisionNodes: [], selectedNodeId: null, timelineArtifacts: [], timelineEvents: [] };
+  var state = { decisionNodes: [], selectedNodeId: null, timelineArtifacts: [], timelineEvents: [], selectedSessionId: '' };
 
   function esc(s) {
     return String(s || '').replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>');
@@ -1303,6 +1322,7 @@ const GW_JS = `
   // ── Top bar ──────────────────────────────────────────────────────────────
 
   document.getElementById('gw-session').addEventListener('change', function(ev) {
+    state.selectedSessionId = ev.target.value;
     vscode.postMessage({ type: 'explorerSelectSession', sessionId: ev.target.value });
     document.getElementById('gw-tree').innerHTML = '<p class="empty">Loading…</p>';
   });
@@ -1402,6 +1422,18 @@ const GW_JS = `
 
   document.getElementById('gw-llm-profile-checkbox').addEventListener('change', function(ev) {
     vscode.postMessage({ type: 'explorerSetUseLlmProfileSelection', value: ev.target.checked });
+  });
+
+  document.getElementById('gw-require-build-checkbox').addEventListener('change', function(ev) {
+    vscode.postMessage({ type: 'explorerSetRequireBuildBeforeProposal', value: ev.target.checked });
+  });
+
+  document.getElementById('gw-require-test-checkbox').addEventListener('change', function(ev) {
+    vscode.postMessage({ type: 'explorerSetRequireTestBeforeProposal', value: ev.target.checked });
+  });
+
+  document.getElementById('gw-enforce-output-kind-checkbox').addEventListener('change', function(ev) {
+    vscode.postMessage({ type: 'explorerSetEnforceExpectedOutputKind', value: ev.target.checked });
   });
 
   document.getElementById('gw-max-concurrent-workers').addEventListener('change', function(ev) {
@@ -1564,7 +1596,7 @@ const GW_JS = `
     bindDecisionInspectorTabs();
   }
 
-  function bindDecisionInspectorTabs() {
+  function bindWorkUnitActionButtons() {
     document.querySelectorAll('[data-wu-action]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         var action = btn.getAttribute('data-wu-action');
@@ -1846,7 +1878,7 @@ const GW_JS = `
 
   function bindDecisionInspectorTabs() {
     bindTabBarClick();
-    bindDecisionInspectorTabs();
+    bindWorkUnitActionButtons();
     bindContextCopyButton();
   }
 
@@ -2225,13 +2257,24 @@ const GW_JS = `
       }).join('');
       sel2.innerHTML = options;
       sel2.value = msg.selectedSessionId || '';
+      state.selectedSessionId = msg.selectedSessionId || '';
       return;
     }
     if (msg.type === 'tree') {
+      // A poll for the previous session can still be in flight when the user starts a fresh
+      // one; without this check whichever response lands last wins, regardless of which
+      // session is actually selected now, so a stale poll can clobber the new tree with the
+      // old (possibly still-in-progress) session's work units.
+      if ((msg.sessionId || '') !== state.selectedSessionId) { return; }
       renderDecisionTree(msg.workUnits);
       return;
     }
     if (msg.type === 'timeline') {
+      // Same stale-response race as the tree message: clicking a second node before the
+      // first one's fetch resolves means an older, slower response can land after the
+      // newer one and overwrite it — or land for a node that's no longer selected at all,
+      // which used to render anyway since this had no workUnitId check.
+      if (msg.workUnitId !== state.selectedNodeId) { return; }
       renderTimeline(msg.artifacts, msg.events);
       // Slice 18c — store evidence and re-render inspector if node is still selected
       if (msg.evidence) {
@@ -2241,12 +2284,10 @@ const GW_JS = `
       if (msg.reasoningGraph) {
         state.reasoningGraph = msg.reasoningGraph;
       }
-      if (state.selectedNodeId && msg.workUnitId === state.selectedNodeId) {
-        var wu = state.decisionNodes.find(function(w) { return w.workUnitId === state.selectedNodeId; });
-        if (wu) {
-          document.getElementById('gw-inspector').innerHTML = renderDecisionInspector(wu);
-          bindDecisionInspectorTabs();
-        }
+      var wu = state.decisionNodes.find(function(w) { return w.workUnitId === state.selectedNodeId; });
+      if (wu) {
+        document.getElementById('gw-inspector').innerHTML = renderDecisionInspector(wu);
+        bindDecisionInspectorTabs();
       }
       return;
     }
@@ -2263,6 +2304,9 @@ const GW_JS = `
       document.getElementById('gw-llm-profile-checkbox').checked = !!msg.useLlmProfileSelection;
       document.getElementById('gw-max-concurrent-workers').value = msg.maxConcurrentWorkers;
       document.getElementById('gw-scheduler-poll-interval').value = msg.schedulerPollIntervalMs;
+      document.getElementById('gw-require-build-checkbox').checked = !!msg.requireBuildBeforeProposal;
+      document.getElementById('gw-require-test-checkbox').checked = !!msg.requireTestBeforeProposal;
+      document.getElementById('gw-enforce-output-kind-checkbox').checked = !!msg.enforceExpectedOutputKind;
       // Slice 21c — Target (Direct/Candidate) only makes sense when promotion branch is on.
       document.getElementById('gw-target-row').classList.toggle('visible', !!msg.usePromotionBranch);
       return;

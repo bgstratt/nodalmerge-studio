@@ -11,6 +11,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const output = vscode.window.createOutputChannel('NodalMerge Studio');
   context.subscriptions.push(output);
 
+  // Dev-mode auto-reload: when running via F5 against a live `npm run watch` esbuild rebuild,
+  // reload the window automatically once the bundle changes instead of requiring a manual
+  // "Developer: Reload Window" after every edit. Gated to Development so a normally-installed
+  // extension never does this.
+  if (context.extensionMode === vscode.ExtensionMode.Development) {
+    const bundleWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(context.extensionUri, 'out/*.js'),
+    );
+    let reloading = false;
+    const reload = () => {
+      if (reloading) { return; }
+      reloading = true;
+      void vscode.commands.executeCommand('workbench.action.reloadWindow');
+    };
+    context.subscriptions.push(
+      bundleWatcher,
+      bundleWatcher.onDidChange(reload),
+      bundleWatcher.onDidCreate(reload),
+    );
+  }
+
   const manager     = new HostManager(output, context);
   const agentConfig = new AgentConfigService();
   const lmProxy     = new LmApiProxy();

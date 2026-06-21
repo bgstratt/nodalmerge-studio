@@ -15,7 +15,9 @@ internal sealed class ReviewerAgentLoop(
     LlmClient llm,
     AgentProfile? profile = null,
     string? sessionId = null,
-    Action<string?>? onActivity = null)
+    Action<string?>? onActivity = null,
+    IReadOnlyList<string>? filesTouched = null,
+    string? noFileChangesJustification = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -34,6 +36,10 @@ internal sealed class ReviewerAgentLoop(
         - Always set automated=true on merge.review — you are the pre-gate, not the human approver.
         - verificationResults must be a concise note (what you checked and why you approved/rejected).
         - Reject if required files are missing, changes are obviously wrong, or scope does not match the goal.
+        - The kickoff message tells you the proposal's "Files touched." If that list is empty and no
+          justification is given, the proposal contains only descriptive text with no concrete change —
+          reject it. A justification is only valid if it credibly explains why no file change was needed
+          for this specific goal (e.g. "verified existing behavior already satisfies this").
         """;
 
     private readonly int _maxIterations = profile?.MaxIterations ?? 10;
@@ -47,11 +53,19 @@ internal sealed class ReviewerAgentLoop(
 
     public async Task<AgentLoopCompletion> RunAsync(CancellationToken ct)
     {
+        var filesTouchedNote = filesTouched is { Count: > 0 }
+            ? string.Join(", ", filesTouched)
+            : "NONE — no file changes were detected on the source branch.";
+        var justificationNote = string.IsNullOrWhiteSpace(noFileChangesJustification)
+            ? ""
+            : $" Worker's justification for no file changes: \"{noFileChangesJustification}\"";
+
         var messages = new List<NmMessage>
         {
             new("user", [new NmText(
                 $"Review merge proposal {proposalId} for work unit {workUnitId}. " +
-                $"Your agent ID is {agentId}. Submit automated review when done.")])
+                $"Your agent ID is {agentId}. Files touched: {filesTouchedNote}{justificationNote} " +
+                "Submit automated review when done.")])
         };
 
         var completedNaturally = false;
@@ -145,8 +159,25 @@ internal sealed class ReviewerAgentLoop(
             new(McpToolNames.WorkspaceRead, "Read a file from the branch working directory.",
                 Schema(["branchId", "path"], new()
                 {
-                    ["branchId"] = Str("Branch ID"),
-                    ["path"]     = Str("Relative file path"),
+                    ["branchId"]   = Str("Branch ID"),
+                    ["workUnitId"] = Str("The work unit under review — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                    ["path"]       = Str("Relative file path"),
+                })),
+
+            new(McpToolNames.WorkspaceList, "List files in the branch working directory.",
+                Schema(["branchId"], new()
+                {
+                    ["branchId"]   = Str("Branch ID"),
+                    ["workUnitId"] = Str("The work unit under review — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                    ["path"]       = Str("Sub-directory to list (optional, omit for all files)"),
+                })),
+
+            new(McpToolNames.WorkspaceDiff, "Show the diff between this branch and the target branch.",
+                Schema(["branchId", "targetBranchId"], new()
+                {
+                    ["branchId"]       = Str("Proposal's source branch"),
+                    ["workUnitId"]     = Str("The work unit under review — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                    ["targetBranchId"] = Str("Proposal's target branch"),
                 })),
         ];
     }

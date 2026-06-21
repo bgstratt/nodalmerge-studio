@@ -217,8 +217,14 @@ internal sealed class McpToolDispatcher(
 
     private async Task<string> MergeProposeAsync(JsonElement input, CancellationToken ct, string? sessionId)
     {
+        // Same class of bug as the workspace.* tools: trust WorkUnit.BranchId over whatever the
+        // agent typed as sourceBranch when a workUnitId is given, so a misremembered branch string
+        // can't produce a proposal that diffs an empty/wrong directory while reading as legitimate.
+        var resolvedSourceBranch = await ResolveBranchIdAsync(
+            Str(input, "workUnitId"), Str(input, "sourceBranch"), ct).ConfigureAwait(false) ?? Str(input, "sourceBranch")!;
+
         var created = await mergeCommands.ProposeAsync(
-            Str(input, "sourceBranch")!,
+            resolvedSourceBranch,
             Str(input, "targetBranch")!,
             Str(input, "summary")!,
             Str(input, "goal"),
@@ -228,9 +234,14 @@ internal sealed class McpToolDispatcher(
             model:      Str(input, "model"),
             provider:   Str(input, "provider"),
             sessionId:  sessionId,
+            noFileChangesJustification: Str(input, "noFileChangesJustification"),
             cancellationToken: ct).ConfigureAwait(false);
 
-        return ToJson(new { proposalId = created.ProposalId, status = created.Status.ToString() });
+        return ToJson(new {
+            proposalId = created.ProposalId,
+            status = created.Status.ToString(),
+            reason = created.Status == MergeProposalStatus.Rejected ? created.ChangeDescription : null,
+        });
     }
 
     private async Task<string> MergeValidateAsync(JsonElement input, CancellationToken ct)
@@ -269,7 +280,7 @@ internal sealed class McpToolDispatcher(
                 return ToJson(proposal);
             }
 
-            var reviewed = await merge.ReviewAsync(proposalId, decision, ct).ConfigureAwait(false);
+            var reviewed = await merge.ReviewAsync(proposalId, decision, cancellationToken: ct).ConfigureAwait(false);
             return ToJson(reviewed);
         }
         catch (KeyNotFoundException)
@@ -288,11 +299,29 @@ internal sealed class McpToolDispatcher(
         return ToJson(summary);
     }
 
+    // Slice — workers/planners/reviewers sometimes pass workUnitId (or "work-" + workUnitId) as
+    // branchId instead of the actual WorkUnit.BranchId, which silently writes/reads/diffs against
+    // an orphan directory that's never attached to the real merge proposal. When the call also
+    // carries a workUnitId, trust that and resolve the authoritative branch server-side — the
+    // agent-supplied branchId is then only a fallback for calls with no workUnitId at all.
+    private async Task<string?> ResolveBranchIdAsync(string? workUnitId, string? fallbackBranchId, CancellationToken ct)
+    {
+        if (workUnitId is not null)
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is not null) return wu.BranchId;
+        }
+        return fallbackBranchId;
+    }
+
+    private Task<string?> ResolveBranchIdAsync(JsonElement input, CancellationToken ct) =>
+        ResolveBranchIdAsync(Str(input, "workUnitId"), Str(input, "branchId"), ct);
+
     private async Task<string> WorkspaceReadAsync(JsonElement input, CancellationToken ct)
     {
-        var branchId = Str(input, "branchId");
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
         var path     = Str(input, "path");
-        if (branchId is null || path is null) return ToError("branchId and path are required.");
+        if (branchId is null || path is null) return ToError("branchId (or workUnitId) and path are required.");
         try
         {
             var content = await fileWorkspace.ReadAsync(branchId, path, ct).ConfigureAwait(false);
@@ -305,10 +334,10 @@ internal sealed class McpToolDispatcher(
 
     private async Task<string> WorkspaceWriteAsync(JsonElement input, CancellationToken ct)
     {
-        var branchId = Str(input, "branchId");
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
         var path     = Str(input, "path");
         var content  = Str(input, "content");
-        if (branchId is null || path is null || content is null) return ToError("branchId, path, and content are required.");
+        if (branchId is null || path is null || content is null) return ToError("branchId (or workUnitId), path, and content are required.");
 
         var scopeError = await CheckFileScopeAsync(branchId, path, ct).ConfigureAwait(false);
         if (scopeError is not null) return scopeError;
@@ -316,16 +345,16 @@ internal sealed class McpToolDispatcher(
         try
         {
             await fileWorkspace.WriteAsync(branchId, path, content, ct).ConfigureAwait(false);
-            return ToJson(new { written = true, path });
+            return ToJson(new { written = true, path, branchId });
         }
         catch (Exception ex) { return ToError(ex.Message); }
     }
 
     private async Task<string> WorkspaceDeleteAsync(JsonElement input, CancellationToken ct)
     {
-        var branchId = Str(input, "branchId");
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
         var path     = Str(input, "path");
-        if (branchId is null || path is null) return ToError("branchId and path are required.");
+        if (branchId is null || path is null) return ToError("branchId (or workUnitId) and path are required.");
 
         var scopeError = await CheckFileScopeAsync(branchId, path, ct).ConfigureAwait(false);
         if (scopeError is not null) return scopeError;
@@ -354,34 +383,34 @@ internal sealed class McpToolDispatcher(
 
     private async Task<string> WorkspaceListAsync(JsonElement input, CancellationToken ct)
     {
-        var branchId = Str(input, "branchId");
-        if (branchId is null) return ToError("branchId is required.");
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
+        if (branchId is null) return ToError("branchId (or workUnitId) is required.");
         try
         {
             var files = await fileWorkspace.ListAsync(branchId, Str(input, "path"), ct).ConfigureAwait(false);
-            return ToJson(new { files });
+            return ToJson(new { files, branchId });
         }
         catch (Exception ex) { return ToError(ex.Message); }
     }
 
     private async Task<string> WorkspaceDiffAsync(JsonElement input, CancellationToken ct)
     {
-        var sourceBranchId = Str(input, "branchId") ?? Str(input, "sourceBranchId");
+        var sourceBranchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false) ?? Str(input, "sourceBranchId");
         var targetBranchId = Str(input, "targetBranchId");
-        if (sourceBranchId is null || targetBranchId is null) return ToError("branchId and targetBranchId are required.");
+        if (sourceBranchId is null || targetBranchId is null) return ToError("branchId (or workUnitId) and targetBranchId are required.");
         try
         {
             var diff = await fileWorkspace.DiffAsync(sourceBranchId, targetBranchId, ct).ConfigureAwait(false);
-            return ToJson(new { diff });
+            return ToJson(new { diff, sourceBranchId });
         }
         catch (Exception ex) { return ToError(ex.Message); }
     }
 
     private async Task<string> WorkspaceExistsAsync(JsonElement input, CancellationToken ct)
     {
-        var branchId = Str(input, "branchId");
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
         var path     = Str(input, "path");
-        if (branchId is null || path is null) return ToError("branchId and path are required.");
+        if (branchId is null || path is null) return ToError("branchId (or workUnitId) and path are required.");
         try
         {
             var exists = await fileWorkspace.ExistsAsync(branchId, path, ct).ConfigureAwait(false);

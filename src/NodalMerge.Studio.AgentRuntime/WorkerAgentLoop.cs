@@ -31,6 +31,10 @@ internal sealed class WorkerAgentLoop(
         5. Use nm_v1_workspace_write or nm_v1_workspace_delete to make the required changes.
            IMPORTANT: Write = full file replacement. Always write the complete file content, not just a diff.
            If modifying an existing file, read it first, then write the complete updated version.
+           Before writing to a path that isn't in the nm_v1_workspace_list output, double-check for a
+           file with the same name elsewhere in the tree (different directory, or different case) —
+           that's almost always the real file to modify. Write to that real path instead of creating
+           a new one. Only write to a brand-new path when you're genuinely adding a new file.
         6. When work is complete, call nm_v1_task_update to set the task status to Completed.
         7. (Optional) If you learned something future work units shouldn't have to rediscover — a fact about
            the codebase, a decision you made, or a constraint that must hold — call nm_v1_artifact_record
@@ -42,7 +46,14 @@ internal sealed class WorkerAgentLoop(
 
         Rules:
         - Always get your branchId from nm_v1_workunit_get before calling workspace tools.
+        - Always pass your workUnitId on every workspace and merge.propose call, alongside
+          branchId/sourceBranch — the server resolves the authoritative branch from workUnitId,
+          so this protects you if you ever misremember the branchId string.
         - Write real, complete file content — do not describe what you would write.
+        - If nm_v1_merge_propose returns status "Rejected" with a reason about missing file
+          changes, you described the work without doing it — go back to step 5 and call
+          nm_v1_workspace_write, then propose again. Do not proceed to nm_v1_merge_validate on a
+          Rejected proposal.
         - Do not approve or apply merges yourself.
         - You are responsible for one task only. Do not create new tasks or spawn other agents.
         - If you cannot complete the task, call nm_v1_task_update with status Blocked and stop.
@@ -150,43 +161,49 @@ internal sealed class WorkerAgentLoop(
             new(McpToolNames.WorkspaceRead, "Read a file's full content from the branch working directory.",
                 Schema(["branchId", "path"], new()
                 {
-                    ["branchId"] = Str("Branch ID — get from nm_v1_workunit_get response"),
-                    ["path"]     = Str("Relative file path, e.g. src/Foo.cs")
+                    ["branchId"]   = Str("Branch ID — get from nm_v1_workunit_get response"),
+                    ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                    ["path"]       = Str("Relative file path, e.g. src/Foo.cs")
                 })),
 
             new(McpToolNames.WorkspaceWrite, "Create or fully overwrite a file in the branch working directory. Write = full replacement; there is no append mode.",
                 Schema(["branchId", "path", "content"], new()
                 {
-                    ["branchId"] = Str("Branch ID"),
-                    ["path"]     = Str("Relative file path, e.g. src/Foo.cs or README.md"),
-                    ["content"]  = Str("Complete file content to write")
+                    ["branchId"]   = Str("Branch ID"),
+                    ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                    ["path"]       = Str("Relative file path, e.g. src/Foo.cs or README.md"),
+                    ["content"]    = Str("Complete file content to write")
                 })),
 
             new(McpToolNames.WorkspaceDelete, "Delete a file from the branch working directory.",
                 Schema(["branchId", "path"], new()
                 {
-                    ["branchId"] = Str("Branch ID"),
-                    ["path"]     = Str("Relative file path to delete")
+                    ["branchId"]   = Str("Branch ID"),
+                    ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                    ["path"]       = Str("Relative file path to delete")
                 })),
 
             new(McpToolNames.WorkspaceExists, "Check whether a file exists in the branch working directory.",
                 Schema(["branchId", "path"], new()
                 {
-                    ["branchId"] = Str("Branch ID"),
-                    ["path"]     = Str("Relative file path to check")
+                    ["branchId"]   = Str("Branch ID"),
+                    ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                    ["path"]       = Str("Relative file path to check")
                 })),
 
             new(McpToolNames.WorkspaceList, "List files in the branch working directory.",
                 Schema(["branchId"], new()
                 {
-                    ["branchId"] = Str("Branch ID"),
-                    ["path"]     = Str("Sub-directory to list (optional, omit for all files)")
+                    ["branchId"]   = Str("Branch ID"),
+                    ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                    ["path"]       = Str("Sub-directory to list (optional, omit for all files)")
                 })),
 
             new(McpToolNames.WorkspaceDiff, "Show the diff between this branch and the target branch.",
                 Schema(["branchId", "targetBranchId"], new()
                 {
                     ["branchId"]       = Str("Your working branch ID"),
+                    ["workUnitId"]     = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
                     ["targetBranchId"] = Str("Branch to diff against (usually main)")
                 })),
 
@@ -199,7 +216,11 @@ internal sealed class WorkerAgentLoop(
                     ["goal"]              = Str("Goal that was accomplished (optional)"),
                     ["changeDescription"] = Str("Detailed change description (optional)"),
                     ["agentId"]           = Str("Your agent ID for attribution (optional)"),
-                    ["workUnitId"]        = Str("Your work unit ID for artifact tracking (optional)")
+                    ["workUnitId"]        = Str("Your work unit ID — strongly recommended; the server resolves the real branch from it and ignores sourceBranch if both are given, and it's also used for artifact tracking"),
+                    ["noFileChangesJustification"] = Str(
+                        "Only set this if you have a genuine reason for proposing zero file changes " +
+                        "(e.g. the task asked you to verify something that already works). Leave unset " +
+                        "for normal work — if you wrote files via workspace.write, you don't need this."),
                 })),
 
             new(McpToolNames.MergeValidate, "Validate a draft merge proposal, moving it to ReadyForReview.",

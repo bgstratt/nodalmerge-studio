@@ -34,7 +34,15 @@ public sealed record MergeProposal(
     IReadOnlyList<string>? FilesTouched = null,
     IReadOnlyList<string>? ReconciledFrom = null,
     string? SupersededBy = null,
-    bool AutoApplied = false)
+    bool AutoApplied = false,
+    // Set when the proposing agent explicitly asserts no file changes were needed for this task
+    // (e.g. "task asked me to verify X already works"). Surfaced to the automated reviewer and
+    // human review UI instead of letting an empty diff pass silently as if nothing was claimed.
+    string? NoFileChangesJustification = null,
+    // Free-text steering note a human reviewer attaches when approving/rejecting via the review
+    // panel — distinct from VerificationResults (which holds automated build/test output), so a
+    // human's "why" doesn't get mixed in with or overwritten by the automated reviewer's notes.
+    string? ReviewNotes = null)
 {
     public IReadOnlyList<string> FilesTouched { get; init; } = FilesTouched ?? [];
     public IReadOnlyList<string> ReconciledFrom { get; init; } = ReconciledFrom ?? [];

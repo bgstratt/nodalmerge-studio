@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using NodalMerge.Studio.Core.Services;
 
@@ -27,6 +28,18 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
         services.AddSingleton<IAgentWorkspaceService, AgentWorkspaceService>();
         AddRehydratableServices(services);
+
+        // Without this, WorkspaceOptions falls back to its default RootPath
+        // (%TEMP%/studio-workspace), a single fixed directory every test run on the machine
+        // shares and never cleans up. Children forked from "main" would inherit whatever files
+        // earlier, unrelated test runs left behind, which the merge reconciler's overlapping-file
+        // check then sees as siblings stepping on each other. TryAdd so a test that wires its own
+        // WorkspaceOptions (e.g. to flip EnforceExpectedOutputKind) before calling this still wins.
+        services.TryAddSingleton(new WorkspaceOptions
+        {
+            RootPath = Path.Combine(Path.GetTempPath(), "studio-workspace-tests", Guid.NewGuid().ToString("N"))
+        });
+
         AddFileWorkspaceService(services);
         AddPolicyGate(services);
         return services;

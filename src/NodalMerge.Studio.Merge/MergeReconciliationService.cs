@@ -219,14 +219,29 @@ public sealed class MergeReconciliationService(
 
         foreach (var (file, proposalIds) in candidates)
         {
+            var afterContents = new Dictionary<string, string?>();
+            foreach (var proposalId in proposalIds)
+            {
+                afterContents[proposalId] = await fileWorkspace
+                    .ReadAsync(byId[proposalId].SourceBranch, file, cancellationToken).ConfigureAwait(false);
+            }
+
+            // base/{proposalId} is a snapshot of the proposal's TargetBranch (usually "main"), not
+            // the immediate parent/sibling branch each child actually forked from. A file the
+            // children only inherited from their common parent (e.g. plan.json, which intentionally
+            // never lands in main) doesn't exist in that snapshot, so the line-diff below would see
+            // "added from nothing" for every sibling and flag a conflict despite nobody having
+            // touched it. Identical content across all flagged proposals is never a real conflict
+            // regardless of what the baseline snapshot does or doesn't contain.
+            if (afterContents.Values.Distinct().Count() <= 1)
+                continue;
+
             var ranges = new List<(string ProposalId, List<(int Start, int End)> Ranges)>();
             foreach (var proposalId in proposalIds)
             {
-                var proposal = byId[proposalId];
                 var before = await fileWorkspace
                     .ReadAsync($"base/{proposalId}", file, cancellationToken).ConfigureAwait(false);
-                var after = await fileWorkspace
-                    .ReadAsync(proposal.SourceBranch, file, cancellationToken).ConfigureAwait(false);
+                var after = afterContents[proposalId];
 
                 var hunks = LineDiffer.Diff(before, after, contextLines: 0);
                 var fileRanges = hunks

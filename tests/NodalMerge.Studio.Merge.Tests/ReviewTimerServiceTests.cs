@@ -147,6 +147,7 @@ public class ReviewTimerServiceTests
             string? provider = null,
             string? sessionId = null,
             string? commandId = null,
+            string? noFileChangesJustification = null,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
@@ -159,6 +160,7 @@ public class ReviewTimerServiceTests
             string? verificationResults = null,
             bool automated = false,
             string? reviewerAgentId = null,
+            string? notes = null,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
     }

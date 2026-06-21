@@ -22,6 +22,19 @@ public enum WorkUnitStatus
     Retrying
 }
 
+// What a completed task on this work unit should produce, used by the automated reviewer (and
+// optionally MergeCommandService, behind WorkspaceOptions.EnforceExpectedOutputKind) to tell a
+// proposal that only describes work apart from one that actually did it. FileChange is the
+// default — most worker tasks modify files. KnowledgeArtifact covers tasks satisfied by recording
+// a Research/Decision/Constraint artifact (nm.v1.artifact.record) instead, e.g. pure research.
+// Either disables the check for tasks where both are valid outcomes.
+public enum WorkUnitExpectedOutputKind
+{
+    FileChange,
+    KnowledgeArtifact,
+    Either
+}
+
 public sealed record WorkUnit(
     string WorkUnitId,
     string Goal,
@@ -47,10 +60,14 @@ public sealed record WorkUnit(
     ReviewPolicy ReviewPolicy = ReviewPolicy.HumanRequired,
     // Slice 21c — per-work-unit override: when true, applies always target the proposal's
     // TargetBranch directly even if WorkspaceOptions.UsePromotionBranch is on session-wide.
-    bool BypassPromotionBranch = false);
+    bool BypassPromotionBranch = false,
+    WorkUnitExpectedOutputKind ExpectedOutputKind = WorkUnitExpectedOutputKind.FileChange);
 
 /// <summary>Failure/rejection counters, previously stored as parsed strings in Metadata.</summary>
-public sealed record WorkUnitExecutionInfo(int FailureAttemptCount, int AutomatedReviewRejectionCount);
+public sealed record WorkUnitExecutionInfo(
+    int FailureAttemptCount,
+    int AutomatedReviewRejectionCount,
+    int HumanReviewRejectionCount = 0);
 
 /// <summary>Fan-out lineage: which plan slice this work unit fulfills and which branch it was seeded from.</summary>
 // Slice 14b — BlockedReason is set when a BeforeEnqueue policy rule rejects this slice (e.g.

@@ -23,7 +23,8 @@ public static class StudioRestEndpoints
         IReadOnlyList<string>? FileScope = null,
         ReviewPolicy? ReviewPolicy = null,
         bool BypassPromotionBranch = false,
-        string? SeedFromBranchId = null);
+        string? SeedFromBranchId = null,
+        WorkUnitExpectedOutputKind? ExpectedOutputKind = null);
 
     private sealed record SpawnAgentBody(
         string AgentType,
@@ -48,7 +49,7 @@ public static class StudioRestEndpoints
         string? Provider = null,
         string? SessionId = null);
 
-    private sealed record ReviewBody(string Decision);
+    private sealed record ReviewBody(string Decision, string? Notes = null, string? SessionId = null);
 
     private sealed record BranchProposalBody(
         string Goal,
@@ -114,7 +115,12 @@ public static class StudioRestEndpoints
         int MaxConcurrentWorkers = 3,
         int SchedulerPollIntervalMs = 2_000,
         bool UsePromotionBranch = false,
-        string CandidateBranchId = "candidate");
+        string CandidateBranchId = "candidate",
+        bool RequireBuildBeforeProposal = false,
+        bool RequireTestBeforeProposal = false,
+        string? BuildCommand = null,
+        string? TestCommand = null,
+        bool EnforceExpectedOutputKind = false);
 
     private sealed record BuildRequestBody(
         string? BuildCommand = null,
@@ -318,6 +324,7 @@ public static class StudioRestEndpoints
                 postMergeExecutionMode = options.PostMergeExecutionMode,
                 usePromotionBranch = options.UsePromotionBranch,
                 candidateBranchId = options.CandidateBranchId,
+                enforceExpectedOutputKind = options.EnforceExpectedOutputKind,
             }));
 
         app.MapPost("/studio/options", async (
@@ -344,6 +351,11 @@ public static class StudioRestEndpoints
             options.SchedulerPollIntervalMs = body.SchedulerPollIntervalMs;
             options.UsePromotionBranch = body.UsePromotionBranch;
             options.CandidateBranchId = body.CandidateBranchId;
+            options.RequireBuildBeforeProposal = body.RequireBuildBeforeProposal;
+            options.RequireTestBeforeProposal = body.RequireTestBeforeProposal;
+            options.BuildCommand = body.BuildCommand;
+            options.TestCommand = body.TestCommand;
+            options.EnforceExpectedOutputKind = body.EnforceExpectedOutputKind;
             await runtimeSettings.PersistAsync(ct).ConfigureAwait(false);
 
             // Slice 21a — ensure candidate branch exists as soon as the toggle is turned on.
@@ -364,6 +376,7 @@ public static class StudioRestEndpoints
                 postMergeExecutionMode = options.PostMergeExecutionMode,
                 usePromotionBranch = options.UsePromotionBranch,
                 candidateBranchId = options.CandidateBranchId,
+                enforceExpectedOutputKind = options.EnforceExpectedOutputKind,
             });
         });
     }
@@ -382,9 +395,14 @@ public static class StudioRestEndpoints
         });
 
         // ── Slice 16d — workspace execution REST endpoints (MCP parity) ────
+        //
+        // branchId is passed as a query parameter, not a route segment: branch ids like
+        // "merge/{workUnitId}" and "base/{proposalId}" (real, deliberate naming conventions —
+        // see InMemoryMergeService/MergeReconciliationService) contain a literal "/", which a
+        // plain {branchId} route segment can never match — every call with one of those ids 404'd.
 
-        app.MapPost("/studio/workspace/{branchId}/build", async (
-            string branchId,
+        app.MapPost("/studio/workspace/build", async (
+            [FromQuery] string branchId,
             BuildRequestBody body,
             IWorkspaceExecutionCommandService cmd,
             CancellationToken ct) =>
@@ -393,8 +411,8 @@ public static class StudioRestEndpoints
             return Results.Ok(result);
         });
 
-        app.MapPost("/studio/workspace/{branchId}/test", async (
-            string branchId,
+        app.MapPost("/studio/workspace/test", async (
+            [FromQuery] string branchId,
             TestRequestBody body,
             IWorkspaceExecutionCommandService cmd,
             CancellationToken ct) =>
@@ -403,8 +421,8 @@ public static class StudioRestEndpoints
             return Results.Ok(result);
         });
 
-        app.MapPost("/studio/workspace/{branchId}/exec", async (
-            string branchId,
+        app.MapPost("/studio/workspace/exec", async (
+            [FromQuery] string branchId,
             WorkspaceExecutionRequest body,
             IWorkspaceExecutionCommandService cmd,
             CancellationToken ct) =>
@@ -413,8 +431,8 @@ public static class StudioRestEndpoints
             return Results.Ok(result);
         });
 
-        app.MapPost("/studio/workspace/{branchId}/run", async (
-            string branchId,
+        app.MapPost("/studio/workspace/run", async (
+            [FromQuery] string branchId,
             RunRequestBody body,
             IWorkspaceExecutionCommandService cmd,
             CancellationToken ct) =>
@@ -423,8 +441,8 @@ public static class StudioRestEndpoints
             return Results.Ok(result);
         });
 
-        app.MapGet("/studio/workspace/{branchId}/exec/latest", async (
-            string branchId,
+        app.MapGet("/studio/workspace/exec/latest", async (
+            [FromQuery] string branchId,
             IWorkspaceExecutionCommandService cmd,
             CancellationToken ct) =>
         {
@@ -432,8 +450,8 @@ public static class StudioRestEndpoints
             return result is not null ? Results.Ok(result) : Results.NotFound();
         });
 
-        app.MapGet("/studio/workspace/{branchId}/path", async (
-            string branchId,
+        app.MapGet("/studio/workspace/path", async (
+            [FromQuery] string branchId,
             IWorkspaceExecutionCommandService cmd,
             CancellationToken ct) =>
         {
@@ -446,9 +464,9 @@ public static class StudioRestEndpoints
         // Slice 16m — output download endpoint. Returns cached (truncated) stdout/stderr from a
         // persisted execution result node. resultId is the ExecutionResultV1 entity ID (form:
         // "exec/{branchId}/20260618120000").
-        app.MapGet("/studio/workspace/{branchId}/exec/{resultId}/output", async (
-            string branchId,
-            string resultId,
+        app.MapGet("/studio/workspace/exec/output", async (
+            [FromQuery] string branchId,
+            [FromQuery] string resultId,
             IWorkspaceExecutionCommandService cmd,
             CancellationToken ct) =>
         {
@@ -668,7 +686,7 @@ public static class StudioRestEndpoints
                 new WorkUnitCreateCommand(body.Goal, body.Owner, body.BranchId, body.SuccessCriteria,
                     body.RepositoryPath, body.ParentWorkUnitId, body.DependsOn, body.FileScope,
                     ReviewPolicy: body.ReviewPolicy, BypassPromotionBranch: body.BypassPromotionBranch,
-                    SeedFromBranchId: body.SeedFromBranchId),
+                    SeedFromBranchId: body.SeedFromBranchId, ExpectedOutputKind: body.ExpectedOutputKind),
                 ct).ConfigureAwait(false);
             return Results.Ok(wu);
         });
@@ -1014,7 +1032,8 @@ public static class StudioRestEndpoints
         app.MapPost("/studio/merges/{proposalId}/review", async (
             string proposalId,
             ReviewBody body,
-            IMergeService merge,
+            IMergeCommandService mergeCommands,
+            IAutomatedReviewGateService reviewGate,
             CancellationToken ct) =>
         {
             if (!Enum.TryParse<MergeProposalStatus>(body.Decision, ignoreCase: true, out var status) ||
@@ -1024,7 +1043,18 @@ public static class StudioRestEndpoints
             }
             try
             {
-                var result = await merge.ReviewAsync(proposalId, status, ct).ConfigureAwait(false);
+                var result = await mergeCommands.ReviewAsync(
+                    proposalId, body.Decision, notes: body.Notes, cancellationToken: ct).ConfigureAwait(false);
+
+                // A human rejection retries the underlying work (with the reviewer's note recorded as
+                // a Constraint the next attempt inherits) the same way an automated rejection already
+                // did — previously a human reject just sat there with no path back to a worker at all.
+                if (status == MergeProposalStatus.Rejected)
+                {
+                    await reviewGate.HandleHumanRejectionAsync(
+                        proposalId, body.Notes, body.SessionId, ct).ConfigureAwait(false);
+                }
+
                 return Results.Ok(result);
             }
             catch (KeyNotFoundException)
@@ -2146,7 +2176,7 @@ public static class StudioRestEndpoints
             };
 
             if (mergeStatus != proposal.Status)
-                proposal = await merges.ReviewAsync(body.ProposalId, mergeStatus, ct).ConfigureAwait(false);
+                proposal = await merges.ReviewAsync(body.ProposalId, mergeStatus, cancellationToken: ct).ConfigureAwait(false);
 
             var decisionNode = new DecisionNode(
                 DecisionId: $"dec-{Guid.NewGuid():N}",

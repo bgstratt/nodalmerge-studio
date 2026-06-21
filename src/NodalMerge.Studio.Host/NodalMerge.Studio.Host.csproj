@@ -18,6 +18,10 @@
     <ProjectReference Include="..\NodalMerge.Studio.McpServer\NodalMerge.Studio.McpServer.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" />
+  </ItemGroup>
+
   <ItemGroup Condition="Exists('$(NodalMergeDotNetHostProject)')">
     <ProjectReference Include="$(NodalMergeDotNetHostProject)" />
   </ItemGroup>

@@ -99,6 +99,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     public async Task<MergeProposal> ReviewAsync(
         string proposalId,
         MergeProposalStatus decision,
+        string? notes = null,
         CancellationToken cancellationToken = default)
     {
         var proposal = GetRequired(proposalId);
@@ -110,7 +111,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 $"Proposals must be in ReadyForReview before human review.");
         }
 
-        var updated = proposal with { Status = decision };
+        var updated = proposal with { Status = decision, ReviewNotes = notes ?? proposal.ReviewNotes };
         _proposals[proposalId] = updated;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.MergeProposalV1,

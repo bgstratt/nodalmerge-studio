@@ -34,6 +34,10 @@ const btnLive     = document.getElementById('btn-live')    as HTMLButtonElement;
 const btnBranch   = document.getElementById('btn-branch')  as HTMLButtonElement;
 const btnKgs      = document.getElementById('btn-kgs')     as HTMLButtonElement;
 const btnRestoreKgs = document.getElementById('btn-restore-kgs') as HTMLButtonElement;
+const nodeDetail      = document.getElementById('node-detail')       as HTMLElement;
+const nodeDetailTitle = document.getElementById('node-detail-title') as HTMLElement;
+const nodeDetailBody  = document.getElementById('node-detail-body')  as HTMLElement;
+const nodeDetailClose = document.getElementById('node-detail-close') as HTMLButtonElement;
 
 // ── vscode API (only available inside WebView) ─────────────────────────────
 
@@ -94,6 +98,7 @@ svg.addEventListener('click', (e: MouseEvent) => {
   const target = e.target as SVGElement;
   const branchId  = target.getAttribute('data-branch-id');
   const nodeIndex = target.getAttribute('data-node-index');
+  const nodeId    = target.getAttribute('data-node-id');
   if (!branchId || nodeIndex === null) { return; }
 
   const idx = parseInt(nodeIndex, 10);
@@ -108,7 +113,27 @@ svg.addEventListener('click', (e: MouseEvent) => {
   if (branchId !== replayState.activeBranchId) {
     dispatch({ type: 'set-active-branch', branchId });
   }
+
+  // Slice — node detail drawer: ReplayNode.nodeId is seeded from the backend's
+  // artifact/orchestration-event id (see registerTimeline's replayOpId), so most clicks can
+  // resolve real content via /studio/replay/inspect. Locally-synthesized nodes (e.g. merge
+  // markers) won't resolve — the inspect response's `error` field is handled in renderNodeDetail.
+  if (nodeId) {
+    const node = replayState.nodesById[nodeId];
+    if (nodeDetail && nodeDetailTitle && nodeDetailBody) {
+      nodeDetail.classList.remove('hidden');
+      nodeDetailTitle.textContent = node?.opSummary ?? nodeId;
+      nodeDetailBody.innerHTML = '<div class="node-detail-row" style="opacity:0.5;font-style:italic">Loading…</div>';
+    }
+    vscode.postMessage({ type: 'inspectNode', branchId, nodeId });
+  }
 });
+
+if (nodeDetailClose) {
+  nodeDetailClose.addEventListener('click', () => {
+    if (nodeDetail) { nodeDetail.classList.add('hidden'); }
+  });
+}
 
 // ── Scrubber input ─────────────────────────────────────────────────────────
 
@@ -171,6 +196,47 @@ function escHtml(s: string): string {
 
 function badgeHtml(status: string): string {
   return '<span style="display:inline-block;border-radius:9px;padding:1px 8px;font-size:0.78em;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground)">' + escHtml(status) + '</span>';
+}
+
+function fmtDate(iso?: string | null): string {
+  if (!iso) { return '—'; }
+  try { return new Date(iso).toLocaleString(); } catch { return iso; }
+}
+
+function renderNodeDetail(payload: any): string {
+  if (!payload || payload.error) {
+    return '<div class="node-detail-row" style="opacity:0.6;font-style:italic">'
+      + escHtml(payload?.error ?? 'No additional detail available for this node.') + '</div>';
+  }
+  if (payload.kind === 'artifact') {
+    const a = payload.artifact ?? {};
+    let html = '<div class="node-detail-row"><span class="node-detail-label">Type</span>' + escHtml(a.type) + '</div>';
+    html += '<div class="node-detail-row"><span class="node-detail-label">Status</span>' + escHtml(a.status) + '</div>';
+    if (a.title) { html += '<div class="node-detail-row"><span class="node-detail-label">Title</span>' + escHtml(a.title) + '</div>'; }
+    html += '<div class="node-detail-row"><span class="node-detail-label">Owner</span>' + escHtml(a.ownedByAgentId || a.ownedByWorkUnitId || '—') + '</div>';
+    html += '<div class="node-detail-row"><span class="node-detail-label">Created</span>' + fmtDate(a.createdAt) + '</div>';
+    if (a.body) { html += '<div class="node-detail-body-text">' + escHtml(a.body) + '</div>'; }
+    return html;
+  }
+  if (payload.kind === 'orchestration-event') {
+    const ev = payload.orchestrationEvent ?? {};
+    let html = '<div class="node-detail-row"><span class="node-detail-label">Action</span>' + escHtml(ev.action) + '</div>';
+    html += '<div class="node-detail-row"><span class="node-detail-label">Stage</span>' + escHtml(ev.inputStage) + '</div>';
+    if (ev.reason) { html += '<div class="node-detail-row"><span class="node-detail-label">Reason</span>' + escHtml(ev.reason) + '</div>'; }
+    if (ev.spawnedIds && ev.spawnedIds.length) {
+      html += '<div class="node-detail-row"><span class="node-detail-label">Spawned</span>' + escHtml(ev.spawnedIds.join(', ')) + '</div>';
+    }
+    html += '<div class="node-detail-row"><span class="node-detail-label">Occurred</span>' + fmtDate(ev.occurredAt) + '</div>';
+    return html;
+  }
+  if (payload.kind === 'known-good-state') {
+    const k = payload.knownGoodState ?? {};
+    let html = '<div class="node-detail-row"><span class="node-detail-label">Checkpoint</span>' + escHtml(k.description) + '</div>';
+    html += '<div class="node-detail-row"><span class="node-detail-label">Created by</span>' + escHtml(k.createdBy) + '</div>';
+    html += '<div class="node-detail-row"><span class="node-detail-label">Created</span>' + fmtDate(k.createdAt) + '</div>';
+    return html;
+  }
+  return '<div class="node-detail-row" style="opacity:0.6;font-style:italic">No additional detail available for this node.</div>';
 }
 
 function renderBranchExplorer(data: any): string {
@@ -433,6 +499,13 @@ window.addEventListener('message', (event: MessageEvent) => {
         if (svg) svg.style.display = 'block';
         altView.style.display = 'none';
       }
+    }
+    return;
+  }
+
+  if (msg.type === 'nodeDetail') {
+    if (nodeDetailBody) {
+      nodeDetailBody.innerHTML = renderNodeDetail(msg.error ? { error: msg.error } : msg.detail);
     }
     return;
   }

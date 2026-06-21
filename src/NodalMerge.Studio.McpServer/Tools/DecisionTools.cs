@@ -38,7 +38,7 @@ public sealed class DecisionTools(IMergeService merges, IDecisionNodeService dec
 
         if (mergeStatus != proposal.Status)
         {
-            proposal = await merges.ReviewAsync(proposalId, mergeStatus, cancellationToken).ConfigureAwait(false);
+            proposal = await merges.ReviewAsync(proposalId, mergeStatus, cancellationToken: cancellationToken).ConfigureAwait(false);
         }
 
         // Persist decision node

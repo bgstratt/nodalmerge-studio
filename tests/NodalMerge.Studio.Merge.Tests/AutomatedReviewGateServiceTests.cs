@@ -60,6 +60,73 @@ public class AutomatedReviewGateServiceTests
         Assert.DoesNotContain((childId, WorkUnitStatus.Queued), workUnits.StatusCalls);
     }
 
+    [Fact]
+    public async Task HandleHumanRejectionAsync_retries_the_work_unit_itself_when_no_children()
+    {
+        const string workUnitId = "WU-SOLO";
+        const string proposalId = "MP-1";
+
+        var workUnits = new FakeWorkUnitService(MakeUnit(workUnitId, WorkUnitStatus.Proposed));
+        var merge = new FakeMergeService(MakeRejectedProposal(proposalId, workUnitId: workUnitId));
+        var scheduler = new FakeScheduler();
+        var artifactCommands = new FakeArtifactCommandService();
+        var gate = BuildGate(workUnits, merge, new FakeDeadLetterService(), scheduler, artifactCommands);
+
+        var result = await gate.HandleHumanRejectionAsync(proposalId, "Missing the empty-input edge case.");
+
+        Assert.Equal(AutomatedRejectionOutcome.RetriedWorkers, result.Outcome);
+        Assert.Contains((workUnitId, WorkUnitStatus.Queued), workUnits.StatusCalls);
+        Assert.Contains((workUnitId, "worker"), scheduler.Enqueued);
+        Assert.Equal(1, workUnits.Units[workUnitId].ExecutionInfo!.HumanReviewRejectionCount);
+        Assert.Single(artifactCommands.Recorded, r => r.WorkUnitId == workUnitId && r.Type == "Constraint");
+    }
+
+    [Fact]
+    public async Task HandleHumanRejectionAsync_retries_children_for_a_reconciled_fan_out_proposal()
+    {
+        const string parentId = "WU-PARENT";
+        const string childId = "WU-CHILD";
+        const string proposalId = "MP-1";
+
+        var workUnits = new FakeWorkUnitService(
+            MakeUnit(parentId, WorkUnitStatus.Proposed),
+            MakeUnit(childId, WorkUnitStatus.Proposed, parentId));
+        var merge = new FakeMergeService(MakeRejectedProposal(proposalId, workUnitId: parentId));
+        var scheduler = new FakeScheduler();
+        var gate = BuildGate(workUnits, merge, new FakeDeadLetterService(), scheduler);
+
+        var result = await gate.HandleHumanRejectionAsync(proposalId, reviewNotes: null);
+
+        Assert.Equal(AutomatedRejectionOutcome.RetriedWorkers, result.Outcome);
+        Assert.Contains((childId, WorkUnitStatus.Queued), workUnits.StatusCalls);
+        Assert.Contains((parentId, WorkUnitStatus.Executing), workUnits.StatusCalls);
+        Assert.Contains((childId, "worker"), scheduler.Enqueued);
+    }
+
+    [Fact]
+    public async Task HandleHumanRejectionAsync_escalates_to_dead_letter_after_max_rejections()
+    {
+        const string workUnitId = "WU-SOLO";
+        const string proposalId = "MP-1";
+
+        var workUnits = new FakeWorkUnitService(
+            MakeUnit(
+                workUnitId,
+                WorkUnitStatus.Proposed,
+                executionInfo: new WorkUnitExecutionInfo(FailureAttemptCount: 0, AutomatedReviewRejectionCount: 0, HumanReviewRejectionCount: 2)));
+        var merge = new FakeMergeService(MakeRejectedProposal(proposalId, workUnitId: workUnitId));
+        var deadLetter = new FakeDeadLetterService();
+        var gate = BuildGate(workUnits, merge, deadLetter);
+
+        var result = await gate.HandleHumanRejectionAsync(proposalId, "Still wrong.");
+
+        Assert.Equal(AutomatedRejectionOutcome.EscalatedToDeadLetter, result.Outcome);
+        Assert.Single(deadLetter.Calls);
+        Assert.Equal(workUnitId, deadLetter.Calls[0].WorkUnitId);
+        Assert.Contains("Still wrong", deadLetter.Calls[0].Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain((workUnitId, WorkUnitStatus.Queued), workUnits.StatusCalls);
+    }
+
     private static WorkUnit MakeUnit(
         string id,
         WorkUnitStatus status,
@@ -81,7 +148,8 @@ public class AutomatedReviewGateServiceTests
             [],
             ExecutionInfo: executionInfo);
 
-    private static MergeProposal MakeRejectedProposal(string proposalId, string reason = "Missing required file.") =>
+    private static MergeProposal MakeRejectedProposal(
+        string proposalId, string reason = "Missing required file.", string workUnitId = "WU-PARENT") =>
         new(
             proposalId,
             "feat/x",
@@ -92,13 +160,15 @@ public class AutomatedReviewGateServiceTests
             reason,
             null,
             null,
-            MergeProposalStatus.Rejected);
+            MergeProposalStatus.Rejected,
+            WorkUnitId: workUnitId);
 
     private static AutomatedReviewGateService BuildGate(
         FakeWorkUnitService workUnits,
         FakeMergeService merge,
         FakeDeadLetterService deadLetter,
-        FakeScheduler? scheduler = null)
+        FakeScheduler? scheduler = null,
+        FakeArtifactCommandService? artifactCommands = null)
     {
         scheduler ??= new FakeScheduler();
         return new AutomatedReviewGateService(
@@ -108,7 +178,8 @@ public class AutomatedReviewGateServiceTests
             scheduler,
             workUnits,
             new FakeTaskService(),
-            deadLetter);
+            deadLetter,
+            artifactCommands ?? new FakeArtifactCommandService());
     }
 
     private sealed class FakeAgentControlService(string autoReviewProfileId) : IAgentControlService
@@ -182,6 +253,7 @@ public class AutomatedReviewGateServiceTests
         public Task<MergeProposal> ReviewAsync(
             string proposalId,
             MergeProposalStatus decision,
+            string? notes = null,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
@@ -327,6 +399,40 @@ public class AutomatedReviewGateServiceTests
 
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+    }
+
+    private sealed class FakeArtifactCommandService : IArtifactCommandService
+    {
+        public List<(string WorkUnitId, string Type, string Title, string Body)> Recorded { get; } = [];
+
+        public Task<ArtifactRef> RecordAsync(
+            string workUnitId,
+            string type,
+            string title,
+            string body,
+            string? parentArtifactId = null,
+            CancellationToken ct = default)
+        {
+            Recorded.Add((workUnitId, type, title, body));
+            return Task.FromResult(new ArtifactRef(
+                $"KA-{Guid.NewGuid():N}",
+                Enum.Parse<ArtifactType>(type),
+                parentArtifactId ?? workUnitId,
+                ArtifactStatus.Active,
+                DateTimeOffset.UtcNow,
+                workUnitId,
+                null,
+                title,
+                body));
+        }
+
+        public Task<IReadOnlyList<ArtifactRef>> QueryAsync(
+            string workUnitId, string? type = null, string? keywords = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
+
+        public Task<IReadOnlyList<ArtifactRef>> ListAsync(
+            string workUnitId, bool includeAncestors = true, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
     }
 
     private sealed class FakeDeadLetterService : IDeadLetterService

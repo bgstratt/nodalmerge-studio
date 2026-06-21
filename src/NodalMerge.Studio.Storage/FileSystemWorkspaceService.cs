@@ -8,7 +8,10 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
     public Task InitBranchAsync(string branchId, string? seedFromBranchId = null, CancellationToken ct = default)
     {
         var branchDir = BranchDir(branchId);
-        if (Directory.Exists(branchDir))
+        // Directory.Exists alone isn't enough: a branch dir can be created empty (e.g. main,
+        // before any SeedRepositoryPath was ever supplied) and would otherwise never become
+        // eligible for seeding again, since this method no-ops on every subsequent call.
+        if (Directory.Exists(branchDir) && Directory.EnumerateFileSystemEntries(branchDir).Any())
             return Task.CompletedTask;
 
         Directory.CreateDirectory(branchDir);
@@ -16,7 +19,7 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         if (seedFromBranchId is not null)
         {
             var seedDir = BranchDir(seedFromBranchId);
-            if (Directory.Exists(seedDir))
+            if (Directory.Exists(seedDir) && Directory.EnumerateFileSystemEntries(seedDir).Any())
             {
                 CopyDirectory(seedDir, branchDir);
                 return Task.CompletedTask;
@@ -247,10 +250,17 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
     private static string SanitizeBranchId(string branchId) =>
         string.Concat(branchId.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
 
-    private static bool IsHidden(string path) =>
-        Path.GetFileName(path).StartsWith('.') ||
-        path.Contains(Path.DirectorySeparatorChar + ".") ||
-        path.Contains(Path.AltDirectorySeparatorChar + ".");
+    // Checking the raw absolute path for "any separator followed by a dot" looks right until
+    // RootPath itself sits under a dot-folder (e.g. .nodalmerge/workspace, our own default-ish
+    // layout for repo-local workspaces) — every file under every branch would then contain that
+    // ancestor segment and get treated as hidden, silently emptying every diff/list/copy. Only the
+    // portion of the path *inside* the branch (i.e. relative to RootPath) should count.
+    private bool IsHidden(string path)
+    {
+        var relative = Path.GetRelativePath(options.RootPath, path);
+        return relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .Any(segment => segment.Length > 0 && segment[0] == '.');
+    }
 
     private static void CopyDirectory(string source, string destination)
     {

@@ -215,6 +215,19 @@ export class TrajectoryReplayPanel {
       return;
     }
 
+    if (msg.type === 'inspectNode') {
+      const branchId = msg.branchId as string;
+      const nodeId = msg.nodeId as string;
+      try {
+        const detail = await this.get<unknown>(
+          '/studio/replay/inspect/' + encodeURIComponent(branchId) + '?nodeId=' + encodeURIComponent(nodeId));
+        void this.panel.webview.postMessage({ type: 'nodeDetail', nodeId, detail });
+      } catch (err) {
+        void this.panel.webview.postMessage({ type: 'nodeDetail', nodeId, error: String(err) });
+      }
+      return;
+    }
+
     if (msg.type === 'markKnownGood') {
       const label = await vscode.window.showInputBox({
         prompt:         'Label for this checkpoint',
@@ -363,6 +376,24 @@ const DAG_REPLAY_CSS = `
     #btn-kgs:hover    { filter: brightness(1.15); }
     #btn-restore-kgs { background: #c2740a; }
     #btn-restore-kgs:hover { filter: brightness(1.15); }
+    #node-detail {
+      border-top: 1px solid var(--nm-border);
+      max-height: 240px; overflow-y: auto;
+      flex-shrink: 0; font-size: 0.82em;
+      padding: 8px 14px;
+    }
+    #node-detail-header {
+      display: flex; justify-content: space-between; align-items: center;
+      font-weight: 600; margin-bottom: 6px;
+    }
+    #node-detail-close { background: transparent; padding: 0 6px; font-size: 0.9em; }
+    .node-detail-row { margin: 3px 0; }
+    .node-detail-label { opacity: 0.55; margin-right: 6px; }
+    .node-detail-body-text {
+      white-space: pre-wrap; background: rgba(127,127,127,0.12);
+      border-radius: 3px; padding: 6px; margin-top: 4px;
+      font-family: var(--nm-mono);
+    }
 `;
 
 const DAG_REPLAY_HTML = `
@@ -384,6 +415,13 @@ const DAG_REPLAY_HTML = `
   <div id="dag-scroll">
     <svg id="dag-svg"></svg>
     <div id="alternate-view" style="display:none;padding:12px;overflow-y:auto;"></div>
+  </div>
+  <div id="node-detail" class="hidden">
+    <div id="node-detail-header">
+      <span id="node-detail-title"></span>
+      <button id="node-detail-close">✕</button>
+    </div>
+    <div id="node-detail-body"></div>
   </div>
   <div id="scrubber-row">
     <span id="scrub-branch"></span>
