@@ -9,7 +9,10 @@ public sealed record BuildResult(
     string Command,          // the actual command that ran
     DateTimeOffset StartedAt,
     DateTimeOffset CompletedAt,
-    bool Truncated = false); // true if StdOut or StdErr exceeded MaxOutputBytes and was truncated
+    bool Truncated = false,  // true if StdOut or StdErr exceeded MaxOutputBytes and was truncated
+    string ProjectRoot = "", // Phase 9b — which WorkspaceProfile root this ran in; "" = branch root / explicit command override
+    bool Running = false,    // Phase 9c — true if this is a long-running process still alive (dev server), not a completed one-shot build
+    int? Pid = null);        // Phase 9c — process id when Running; lets callers target StopAsync
 
 public sealed record TestResult(
     bool Success,
@@ -23,7 +26,8 @@ public sealed record TestResult(
     string Command,
     DateTimeOffset StartedAt,
     DateTimeOffset CompletedAt,
-    bool Truncated = false); // true if StdOut exceeded MaxOutputBytes and was truncated
+    bool Truncated = false, // true if StdOut exceeded MaxOutputBytes and was truncated
+    string ProjectRoot = "");
 
 public sealed record LintResult(
     string RuleId,
@@ -50,7 +54,8 @@ public sealed record WorkspaceExecutionRequest(
     string? LintCommand = null,
     bool AllowAutoDetect = true,
     int TimeoutSeconds = 300,
-    Dictionary<string, string>? EnvironmentVariables = null);
+    Dictionary<string, string>? EnvironmentVariables = null,
+    string? RootPath = null);        // Phase 9f — limit auto-detected build/test to one WorkspaceProfile root (ProjectRoot.RelativePath); null/omitted = all roots. Ignored when BuildCommand/TestCommand is explicit.
 
 /// <summary>
 /// Lightweight execution summary for projection payloads — avoids embedding full BuildResult/TestResult output.

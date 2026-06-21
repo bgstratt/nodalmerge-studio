@@ -14,7 +14,8 @@ internal sealed class PlannerAgentLoop(
     LlmClient llm,
     AgentProfile? profile = null,
     string? sessionId = null,
-    Action<string?>? onActivity = null)
+    Action<string?>? onActivity = null,
+    string? ruleFileContext = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -23,19 +24,24 @@ internal sealed class PlannerAgentLoop(
 
         Workflow:
         1. Call nm_v1_workunit_get to understand the goal and learn your branchId.
-        2. Call nm_v1_workspace_list to see existing files in your branch. Always pass your
+        2. Call nm_v1_workspace_profile_get with your branchId to see the repo's detected project
+           roots (path + stack, e.g. "backend" = dotnet, "frontend" = npm) — a repo can contain
+           more than one project. Use this when slicing: a slice about an "endpoint" or "API"
+           belongs under a backend root, a slice about a "component" or "page" belongs under a
+           frontend root.
+        3. Call nm_v1_workspace_list to see existing files in your branch. Always pass your
            workUnitId on every workspace tool call alongside branchId — the server resolves the
            authoritative branch from workUnitId, so this protects you if you ever misremember the
            branchId string.
-        3. Decompose the goal into independent slices. Each slice must have:
+        4. Decompose the goal into independent slices. Each slice must have:
            - sliceId: short unique id (e.g. "s1", "s2")
            - goal: what this slice accomplishes
            - fileScope: list of file paths this slice may touch
            - dependsOn: list of sliceIds that must complete first (empty for independent slices)
            - steps: ordered implementation steps for the worker
-        4. Write plan.json to your branch using nm_v1_workspace_write with this exact JSON shape:
+        5. Write plan.json to your branch using nm_v1_workspace_write with this exact JSON shape:
            { "slices": [ { "sliceId": "...", "goal": "...", "fileScope": [...], "dependsOn": [...], "steps": [...] } ] }
-        5. Stop — the orchestrator will fan out child workers from your plan.
+        6. Stop — the orchestrator will fan out child workers from your plan.
 
         Rules:
         - Prefer parallel slices with non-overlapping fileScope when possible.
@@ -47,6 +53,9 @@ internal sealed class PlannerAgentLoop(
           case-insensitively (e.g. "web-react/src/App.tsx") and use that full path. Only use the
           goal's literal name as-is when no matching file exists anywhere in the listing — i.e. it's
           genuinely a new file.
+        - A single slice's fileScope should stay within one project root from step 2 whenever the
+          goal allows it — a worker that only looked at one root's files shouldn't be handed a
+          slice that also needs changes in another root.
         """;
 
     private readonly int _maxIterations = profile?.MaxIterations ?? 15;
@@ -60,9 +69,13 @@ internal sealed class PlannerAgentLoop(
 
     public async Task<AgentLoopCompletion> RunAsync(CancellationToken ct)
     {
+        var kickoff = $"Plan work unit {workUnitId}. Your agent ID is {agentId}. Write plan.json when done.";
+        if (ruleFileContext is not null)
+            kickoff += "\n\n" + ruleFileContext;
+
         var messages = new List<NmMessage>
         {
-            new("user", [new NmText($"Plan work unit {workUnitId}. Your agent ID is {agentId}. Write plan.json when done.")])
+            new("user", [new NmText(kickoff)])
         };
 
         var completedNaturally = false;
@@ -135,6 +148,13 @@ internal sealed class PlannerAgentLoop(
 
             new(McpToolNames.WorkspaceSummary, "Get a summary of the current workspace state.",
                 Schema([], new() { ["branchId"] = Str("Branch ID filter (optional)") })),
+
+            new(McpToolNames.WorkspaceProfileGet, "Get the detected project roots for a branch (path + stack, e.g. \"backend\"=dotnet, \"frontend\"=npm). Call this before slicing when a repo might hold more than one project.",
+                Schema(["branchId"], new()
+                {
+                    ["branchId"]   = Str("Branch ID"),
+                    ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                })),
 
             new(McpToolNames.WorkspaceRead, "Read a file from the branch working directory.",
                 Schema(["branchId", "path"], new()

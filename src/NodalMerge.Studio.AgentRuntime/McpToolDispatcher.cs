@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Projections;
@@ -24,8 +25,19 @@ internal sealed class McpToolDispatcher(
     ISchedulerCommandService scheduler,
     IExecutionEventStream events,
     IIntentGraphService intentGraph,
-    IWorkspaceExecutionCommandService executionCommands)
+    IWorkspaceExecutionCommandService executionCommands,
+    IWorkspaceProfileService workspaceProfiles)
 {
+    // Phase 9g — read-before-write enforcement. McpToolDispatcher is registered as a singleton
+    // (InMemoryAgentRuntimeService.cs) shared across every agent/run, so this cache lives here
+    // rather than per-loop: once any agent reads a path in a branch, that path stays "seen" for
+    // the rest of the branch's life. Per-(branch, path), not per-agent-session — the goal (don't
+    // blindly overwrite content nobody looked at) doesn't need session granularity, and threading
+    // agent/session identity through every workspace call for this would be unjustified complexity.
+    private readonly ConcurrentDictionary<string, byte> _readPaths = new();
+
+    private static string ReadCacheKey(string branchId, string path) => $"{branchId}:{path}";
+
     public async Task<string> DispatchAsync(
         string toolName,
         JsonElement input,
@@ -77,8 +89,11 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.WorkspaceTest    => await WorkspaceTestAsync(input, ct),
                 McpToolNames.WorkspaceExec    => await WorkspaceExecAsync(input, ct),
                 McpToolNames.WorkspaceRun     => await WorkspaceRunAsync(input, ct),
+                McpToolNames.WorkspaceRunStop => await WorkspaceRunStopAsync(input, ct),
                 McpToolNames.WorkspaceExecStatus => await WorkspaceExecStatusAsync(input, ct),
                 McpToolNames.WorkspacePath    => await WorkspacePathAsync(input, ct),
+                McpToolNames.WorkspaceProfileGet    => await WorkspaceProfileGetAsync(input, ct),
+                McpToolNames.WorkspaceProfileRescan => await WorkspaceProfileRescanAsync(input, ct),
                 _ => ToError($"Tool '{toolName}' is not dispatched by the agent runtime.")
             };
         }
@@ -325,9 +340,10 @@ internal sealed class McpToolDispatcher(
         try
         {
             var content = await fileWorkspace.ReadAsync(branchId, path, ct).ConfigureAwait(false);
-            return content is null
-                ? ToError($"File '{path}' not found in branch '{branchId}'.")
-                : ToJson(new { content });
+            if (content is null)
+                return ToError($"File '{path}' not found in branch '{branchId}'.");
+            _readPaths[ReadCacheKey(branchId, path)] = 0;
+            return ToJson(new { content });
         }
         catch (Exception ex) { return ToError(ex.Message); }
     }
@@ -344,7 +360,19 @@ internal sealed class McpToolDispatcher(
 
         try
         {
+            // Phase 9g — a file that already exists must be read in this branch before it can be
+            // overwritten. New files (don't yet exist) are unaffected — no read is required to
+            // create something genuinely new.
+            if (!_readPaths.ContainsKey(ReadCacheKey(branchId, path))
+                && await fileWorkspace.ExistsAsync(branchId, path, ct).ConfigureAwait(false))
+            {
+                return ToError(
+                    $"File '{path}' already exists with content you haven't read. " +
+                    "Call nm_v1_workspace_read first, then write the updated content.");
+            }
+
             await fileWorkspace.WriteAsync(branchId, path, content, ct).ConfigureAwait(false);
+            _readPaths[ReadCacheKey(branchId, path)] = 0;
             return ToJson(new { written = true, path, branchId });
         }
         catch (Exception ex) { return ToError(ex.Message); }
@@ -558,7 +586,8 @@ internal sealed class McpToolDispatcher(
             Str(input, "branchId")!,
             Str(input, "buildCommand"),
             Int(input, "timeoutSeconds") ?? 300,
-            ct).ConfigureAwait(false);
+            ct,
+            Str(input, "rootPath")).ConfigureAwait(false);
         return ToJson(result);
     }
 
@@ -568,7 +597,8 @@ internal sealed class McpToolDispatcher(
             Str(input, "branchId")!,
             Str(input, "testCommand"),
             Int(input, "timeoutSeconds") ?? 300,
-            ct).ConfigureAwait(false);
+            ct,
+            Str(input, "rootPath")).ConfigureAwait(false);
         return ToJson(result);
     }
 
@@ -590,11 +620,22 @@ internal sealed class McpToolDispatcher(
     {
         var result = await executionCommands.RunAsync(
             Str(input, "branchId")!,
-            Str(input, "runCommand"),
-            Int(input, "timeoutSeconds") ?? 120,
+            rootPath: Str(input, "rootPath"),
+            runCommand: Str(input, "runCommand"),
+            timeoutSeconds: Int(input, "timeoutSeconds") ?? 120,
             environmentVariables: null,
             ct: ct).ConfigureAwait(false);
         return ToJson(result);
+    }
+
+    private async Task<string> WorkspaceRunStopAsync(JsonElement input, CancellationToken ct)
+    {
+        var stopped = await executionCommands.StopAsync(
+            Str(input, "branchId")!,
+            pid: Int(input, "pid"),
+            rootPath: Str(input, "rootPath"),
+            ct: ct).ConfigureAwait(false);
+        return ToJson(new { stopped });
     }
 
     private async Task<string> WorkspaceExecStatusAsync(JsonElement input, CancellationToken ct)
@@ -607,6 +648,22 @@ internal sealed class McpToolDispatcher(
     {
         var path = await executionCommands.GetBranchPathAsync(Str(input, "branchId")!, ct).ConfigureAwait(false);
         return ToJson(new { branchId = Str(input, "branchId"), workingDirectory = path, exists = path is not null });
+    }
+
+    private async Task<string> WorkspaceProfileGetAsync(JsonElement input, CancellationToken ct)
+    {
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
+        if (branchId is null) return ToError("branchId (or workUnitId) is required.");
+        var profile = await workspaceProfiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
+        return ToJson(profile);
+    }
+
+    private async Task<string> WorkspaceProfileRescanAsync(JsonElement input, CancellationToken ct)
+    {
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
+        if (branchId is null) return ToError("branchId (or workUnitId) is required.");
+        var profile = await workspaceProfiles.RescanAsync(branchId, ct).ConfigureAwait(false);
+        return ToJson(profile);
     }
 
     private static string? Str(JsonElement input, string key) =>

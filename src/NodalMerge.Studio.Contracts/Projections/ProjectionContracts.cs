@@ -80,12 +80,16 @@ public sealed record ExecutionSnapshotProjectionPayload(
 public sealed record ArtifactChain(
     IReadOnlyList<ArtifactRef> Artifacts);
 
+/// <summary>Phase 9e — compact per-root summary (path + stack) for agent context; the full WorkspaceProfile (commands, run state) is available via nm_v1_workspace_profile_get. Phase 9h adds RuleFileContent so the projection delta carries a root's AGENTS.md-equivalent without a separate call.</summary>
+public sealed record ProjectRootSummary(string RelativePath, string Stack, string? RuleFileContent = null);
+
 public sealed record AgentWorkspaceProjectionPayload(
     string? AgentId,
     string? WorkUnitId,
     ArtifactChain Artifacts,
     IReadOnlyList<ArtifactRef> InheritedConstraints,
-    WorkspaceExecutionSummary? Execution = null);
+    WorkspaceExecutionSummary? Execution = null,
+    IReadOnlyList<ProjectRootSummary>? Roots = null);
 
 /// <summary>
 /// What changed in a work unit's artifact chain since the last cycle. Lets an orchestrator

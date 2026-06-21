@@ -7,6 +7,7 @@ namespace NodalMerge.Studio.Storage;
 
 internal sealed class WorkspaceExecutionService(
     IFileWorkspaceService fileWorkspace,
+    IWorkspaceProfileService profiles,
     WorkspaceOptions options) : IWorkspaceExecutionService
 {
     public async Task<BranchExecutionResult> ExecuteAsync(
@@ -23,30 +24,73 @@ internal sealed class WorkspaceExecutionService(
         var tests  = new List<TestResult>();
 
         if (request.Build)
-        {
-            var commands = ResolveBuildCommands(request, workDir);
-            foreach (var cmd in commands)
-            {
-                var result = await RunCommandAsync(workDir, cmd, request.TimeoutSeconds, ct);
-                builds.Add(result);
-            }
-        }
+            builds.AddRange(await RunBuildTargetsAsync(branchId, workDir, request, ct).ConfigureAwait(false));
 
         if (request.Test)
-        {
-            var commands = ResolveTestCommands(request, workDir);
-            foreach (var cmd in commands)
-            {
-                var result = await RunTestCommandAsync(workDir, cmd, request.TimeoutSeconds, ct);
-                tests.Add(result);
-            }
-        }
+            tests.AddRange(await RunTestTargetsAsync(branchId, workDir, request, ct).ConfigureAwait(false));
 
         return new BranchExecutionResult(
             branchId, builds, tests, [],
             builds.All(b => b.Success) && tests.All(t => t.Success),
             DateTimeOffset.UtcNow);
     }
+
+    // ── Phase 9b — per-root command resolution ───────────────────────────────
+    //
+    // Level 1 (explicit request.BuildCommand/TestCommand) keeps today's behavior exactly: one
+    // command at the branch root, no profile lookup. Level 2 (auto-detect) now resolves through
+    // the WorkspaceProfile instead of a single flat repo-root scan, so each detected sub-project
+    // builds/tests from its own directory.
+
+    private async Task<IReadOnlyList<BuildResult>> RunBuildTargetsAsync(
+        string branchId, string workDir, WorkspaceExecutionRequest request, CancellationToken ct)
+    {
+        if (request.BuildCommand is { Length: > 0 })
+            return [await RunCommandAsync(workDir, (request.BuildCommand, null!), request.TimeoutSeconds, ct)];
+
+        if (!request.AllowAutoDetect)
+            return [];
+
+        var profile = await profiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
+        var results = new List<BuildResult>();
+        foreach (var root in FilterRoots(profile.Roots, request.RootPath))
+        {
+            if (root.BuildCommand is null) continue;
+            var result = await RunCommandAsync(
+                RootDir(workDir, root.RelativePath), (root.BuildCommand, root.Stack),
+                request.TimeoutSeconds, ct, root.RelativePath);
+            results.Add(result);
+        }
+        return results;
+    }
+
+    private async Task<IReadOnlyList<TestResult>> RunTestTargetsAsync(
+        string branchId, string workDir, WorkspaceExecutionRequest request, CancellationToken ct)
+    {
+        if (request.TestCommand is { Length: > 0 })
+            return [await RunTestCommandAsync(workDir, (request.TestCommand, null!), request.TimeoutSeconds, ct)];
+
+        if (!request.AllowAutoDetect)
+            return [];
+
+        var profile = await profiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
+        var results = new List<TestResult>();
+        foreach (var root in FilterRoots(profile.Roots, request.RootPath))
+        {
+            if (root.TestCommand is null) continue;
+            var result = await RunTestCommandAsync(
+                RootDir(workDir, root.RelativePath), (root.TestCommand, root.Stack),
+                request.TimeoutSeconds, ct, root.RelativePath);
+            results.Add(result);
+        }
+        return results;
+    }
+
+    private static IEnumerable<ProjectRoot> FilterRoots(IReadOnlyList<ProjectRoot> roots, string? rootPath) =>
+        rootPath is null ? roots : roots.Where(r => r.RelativePath == rootPath);
+
+    private static string RootDir(string workDir, string relativePath) =>
+        relativePath.Length == 0 ? workDir : Path.Combine(workDir, relativePath);
 
     // ── Composite execution ──────────────────────────────────────────────────
 
@@ -104,79 +148,13 @@ internal sealed class WorkspaceExecutionService(
                     Directory.Delete(dir, recursive: true);
             }
             catch { /* best-effort cleanup */ }
+            finally
+            {
+                // The composite branch directory is gone — drop its cached profile too, or the
+                // cache grows forever keyed by one-shot GUID branch ids.
+                profiles.Invalidate(compositeId);
+            }
         }
-    }
-
-    // ── Auto-detection ───────────────────────────────────────────────────────
-
-    internal static IReadOnlyList<(string Command, string BuildSystem)> ResolveBuildCommands(
-        WorkspaceExecutionRequest request, string workDir)
-    {
-        if (request.BuildCommand is { Length: > 0 })
-            return [(request.BuildCommand, null!)];
-
-        if (!request.AllowAutoDetect)
-            return [];
-
-        var detected = new List<(string, string)>();
-
-        if (Directory.EnumerateFiles(workDir, "*.csproj", SearchOption.AllDirectories).Any() ||
-            Directory.EnumerateFiles(workDir, "*.slnx", SearchOption.AllDirectories).Any())
-            detected.Add(("dotnet build", "dotnet"));
-
-        if (File.Exists(Path.Combine(workDir, "Cargo.toml")))
-            detected.Add(("cargo build", "cargo"));
-
-        if (File.Exists(Path.Combine(workDir, "package.json")))
-            detected.Add((
-                Directory.Exists(Path.Combine(workDir, "node_modules"))
-                    ? "npm run build"
-                    : "npm install && npm run build",
-                "npm"));
-
-        if (File.Exists(Path.Combine(workDir, "go.mod")))
-            detected.Add(("go build ./...", "go"));
-
-        if (File.Exists(Path.Combine(workDir, "Makefile")))
-            detected.Add(("make", "make"));
-
-        if (File.Exists(Path.Combine(workDir, "CMakeLists.txt")))
-            detected.Add(("cmake --build build", "cmake"));
-
-        return detected;
-    }
-
-    internal static IReadOnlyList<(string Command, string BuildSystem)> ResolveTestCommands(
-        WorkspaceExecutionRequest request, string workDir)
-    {
-        if (request.TestCommand is { Length: > 0 })
-            return [(request.TestCommand, null!)];
-
-        if (!request.AllowAutoDetect)
-            return [];
-
-        var detected = new List<(string, string)>();
-
-        if (Directory.EnumerateFiles(workDir, "*.csproj", SearchOption.AllDirectories).Any() ||
-            Directory.EnumerateFiles(workDir, "*.slnx", SearchOption.AllDirectories).Any())
-            detected.Add(("dotnet test", "dotnet"));
-
-        if (File.Exists(Path.Combine(workDir, "Cargo.toml")))
-            detected.Add(("cargo test", "cargo"));
-
-        if (File.Exists(Path.Combine(workDir, "package.json")))
-            detected.Add(("npm test", "npm"));
-
-        if (File.Exists(Path.Combine(workDir, "go.mod")))
-            detected.Add(("go test ./...", "go"));
-
-        if (File.Exists(Path.Combine(workDir, "pyproject.toml")))
-            detected.Add(("pytest", "pytest"));
-
-        if (File.Exists(Path.Combine(workDir, "Makefile")))
-            detected.Add(("make test", "make"));
-
-        return detected;
     }
 
     // ── Command execution with truncation ────────────────────────────────────
@@ -185,7 +163,8 @@ internal sealed class WorkspaceExecutionService(
         string workDir,
         (string Command, string BuildSystem) cmd,
         int timeoutSec,
-        CancellationToken ct)
+        CancellationToken ct,
+        string projectRoot = "")
     {
         var startedAt = DateTimeOffset.UtcNow;
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -222,7 +201,7 @@ internal sealed class WorkspaceExecutionService(
             try { process.Kill(entireProcessTree: true); } catch { }
             stdout = "";
             stderr = $"[TIMEOUT] Command exceeded {timeoutSec}s limit.";
-            return new BuildResult(false, -1, stdout, stderr, cmd.BuildSystem, cmd.Command, startedAt, DateTimeOffset.UtcNow);
+            return new BuildResult(false, -1, stdout, stderr, cmd.BuildSystem, cmd.Command, startedAt, DateTimeOffset.UtcNow, ProjectRoot: projectRoot);
         }
 
         var stdoutRaw = stdout;
@@ -240,16 +219,18 @@ internal sealed class WorkspaceExecutionService(
             cmd.Command,
             startedAt,
             DateTimeOffset.UtcNow,
-            wasTruncated);
+            wasTruncated,
+            projectRoot);
     }
 
     private async Task<TestResult> RunTestCommandAsync(
         string workDir,
         (string Command, string BuildSystem) cmd,
         int timeoutSec,
-        CancellationToken ct)
+        CancellationToken ct,
+        string projectRoot = "")
     {
-        var buildResult = await RunCommandAsync(workDir, cmd, timeoutSec, ct);
+        var buildResult = await RunCommandAsync(workDir, cmd, timeoutSec, ct, projectRoot);
 
         var total = 0;
         var passed = 0;
@@ -267,7 +248,8 @@ internal sealed class WorkspaceExecutionService(
             cmd.Command,
             buildResult.StartedAt,
             buildResult.CompletedAt,
-            buildResult.Truncated);
+            buildResult.Truncated,
+            projectRoot);
     }
 
     internal static void TryParseTestOutput(

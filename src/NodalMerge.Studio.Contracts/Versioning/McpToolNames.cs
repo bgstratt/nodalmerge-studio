@@ -68,8 +68,11 @@ public static class McpToolNames
     public const string WorkspaceTest   = "nm_v1_workspace_test";
     public const string WorkspaceExec   = "nm_v1_workspace_exec";
     public const string WorkspaceRun    = "nm_v1_workspace_run";
+    public const string WorkspaceRunStop = "nm_v1_workspace_run_stop";
     public const string WorkspaceExecStatus = "nm_v1_workspace_exec_status";
     public const string WorkspacePath   = "nm_v1_workspace_path";
+    public const string WorkspaceProfileGet    = "nm_v1_workspace_profile_get";
+    public const string WorkspaceProfileRescan = "nm_v1_workspace_profile_rescan";
 
     public const string GoalCreate = "nm_v1_goal_create";
     public const string GoalList   = "nm_v1_goal_list";
@@ -141,8 +144,11 @@ public static class McpToolNames
         WorkspaceTest,
         WorkspaceExec,
         WorkspaceRun,
+        WorkspaceRunStop,
         WorkspaceExecStatus,
         WorkspacePath,
+        WorkspaceProfileGet,
+        WorkspaceProfileRescan,
         GoalCreate,
         GoalList,
         DecisionRecord,

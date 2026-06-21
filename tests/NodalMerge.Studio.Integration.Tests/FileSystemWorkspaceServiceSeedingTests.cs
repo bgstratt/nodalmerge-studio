@@ -36,8 +36,8 @@ public class FileSystemWorkspaceServiceSeedingTests : IDisposable
     {
         var options = new WorkspaceOptions { RootPath = _rootPath, SeedRepositoryPath = seedRepositoryPath };
         var services = new ServiceCollection();
-        services.AddSingleton(options);
         services.AddInMemoryStorage();
+        services.AddSingleton(options);
         var provider = services.BuildServiceProvider();
         return (provider.GetRequiredService<IFileWorkspaceService>(), options);
     }

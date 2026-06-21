@@ -1,5 +1,4 @@
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using NodalMerge.Studio.Core.Services;
 
@@ -33,9 +32,20 @@ public static class ServiceCollectionExtensions
         // (%TEMP%/studio-workspace), a single fixed directory every test run on the machine
         // shares and never cleans up. Children forked from "main" would inherit whatever files
         // earlier, unrelated test runs left behind, which the merge reconciler's overlapping-file
-        // check then sees as siblings stepping on each other. TryAdd so a test that wires its own
-        // WorkspaceOptions (e.g. to flip EnforceExpectedOutputKind) before calling this still wins.
-        services.TryAddSingleton(new WorkspaceOptions
+        // check then sees as siblings stepping on each other.
+        //
+        // Must be a real AddSingleton, not TryAdd: tests going through the full
+        // StudioWebApplication.Build pipeline call AddStudioServices first, which already
+        // registers a (non-Try) production-config-bound WorkspaceOptions — TryAdd would silently
+        // no-op against that earlier registration and every such test would share the production
+        // default path after all (confirmed: this caused real cross-test flakiness — FanOut/
+        // DeadLetter/FullAgentCycle-style tests intermittently failing under parallel runs because
+        // unrelated tests' branches collided in the same directory). A second AddSingleton call
+        // resolves last-wins, fixing isolation for every caller that doesn't explicitly override.
+        // A test that *does* want its own WorkspaceOptions (e.g. a fixed RootPath, or to flip
+        // EnforceExpectedOutputKind) must register it via AddSingleton *after* calling
+        // AddInMemoryStorage() — last registration wins, regardless of Try.
+        services.AddSingleton(new WorkspaceOptions
         {
             RootPath = Path.Combine(Path.GetTempPath(), "studio-workspace-tests", Guid.NewGuid().ToString("N"))
         });
@@ -91,6 +101,16 @@ public static class ServiceCollectionExtensions
         // Slice 16b/16c — workspace execution services
         services.AddSingleton<IWorkspaceExecutionService, WorkspaceExecutionService>();
         services.AddSingleton<IWorkspaceExecutionCommandService, WorkspaceExecutionCommandService>();
+
+        // Phase 9a — sub-project root detection. No persistence/rehydration: a WorkspaceProfile is
+        // cheap to recompute and branch directories are recreated identically on InitBranchAsync,
+        // so a cold Host just re-detects lazily on first access.
+        services.AddSingleton<IWorkspaceProfileService, WorkspaceProfileService>();
+
+        // Phase 9c — tracks long-running "run" processes (dev servers). Deliberately not durable:
+        // a Host restart kills anything it started, and there's nothing meaningful to resume a
+        // dev server into.
+        services.AddSingleton<RunningProcessRegistry>();
 
         // Phase 6.7b — decision-centric persistent node services
         services.AddSingleton<GoalNodeService>();

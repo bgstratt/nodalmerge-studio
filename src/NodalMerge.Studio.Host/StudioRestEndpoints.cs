@@ -124,15 +124,22 @@ public static class StudioRestEndpoints
 
     private sealed record BuildRequestBody(
         string? BuildCommand = null,
-        int TimeoutSeconds = 300);
+        int TimeoutSeconds = 300,
+        string? RootPath = null);
 
     private sealed record TestRequestBody(
         string? TestCommand = null,
-        int TimeoutSeconds = 300);
+        int TimeoutSeconds = 300,
+        string? RootPath = null);
 
     private sealed record RunRequestBody(
+        string? RootPath = null,
         string? RunCommand = null,
         int TimeoutSeconds = 120);
+
+    private sealed record StopRequestBody(
+        int? Pid = null,
+        string? RootPath = null);
 
     private sealed record RollbackRequestBody(string KnownGoodStateId);
 
@@ -407,7 +414,7 @@ public static class StudioRestEndpoints
             IWorkspaceExecutionCommandService cmd,
             CancellationToken ct) =>
         {
-            var result = await cmd.BuildAsync(branchId, body.BuildCommand, body.TimeoutSeconds, ct).ConfigureAwait(false);
+            var result = await cmd.BuildAsync(branchId, body.BuildCommand, body.TimeoutSeconds, ct, body.RootPath).ConfigureAwait(false);
             return Results.Ok(result);
         });
 
@@ -417,7 +424,7 @@ public static class StudioRestEndpoints
             IWorkspaceExecutionCommandService cmd,
             CancellationToken ct) =>
         {
-            var result = await cmd.TestAsync(branchId, body.TestCommand, body.TimeoutSeconds, ct).ConfigureAwait(false);
+            var result = await cmd.TestAsync(branchId, body.TestCommand, body.TimeoutSeconds, ct, body.RootPath).ConfigureAwait(false);
             return Results.Ok(result);
         });
 
@@ -437,8 +444,19 @@ public static class StudioRestEndpoints
             IWorkspaceExecutionCommandService cmd,
             CancellationToken ct) =>
         {
-            var result = await cmd.RunAsync(branchId, body.RunCommand, body.TimeoutSeconds, environmentVariables: null, ct: ct).ConfigureAwait(false);
+            var result = await cmd.RunAsync(branchId, body.RootPath, body.RunCommand, body.TimeoutSeconds, environmentVariables: null, ct: ct).ConfigureAwait(false);
             return Results.Ok(result);
+        });
+
+        // Phase 9c — stop process(es) started by /studio/workspace/run.
+        app.MapPost("/studio/workspace/run/stop", async (
+            [FromQuery] string branchId,
+            StopRequestBody body,
+            IWorkspaceExecutionCommandService cmd,
+            CancellationToken ct) =>
+        {
+            var stopped = await cmd.StopAsync(branchId, body.Pid, body.RootPath, ct).ConfigureAwait(false);
+            return Results.Ok(new { stopped });
         });
 
         app.MapGet("/studio/workspace/exec/latest", async (
@@ -459,6 +477,25 @@ public static class StudioRestEndpoints
             return path is not null
                 ? Results.Ok(new { branchId, workingDirectory = path, exists = true })
                 : Results.Ok(new { branchId, workingDirectory = (string?)null, exists = false });
+        });
+
+        // Phase 9d — detected project roots (paths, stacks, resolved build/test/run commands).
+        app.MapGet("/studio/workspace/profile", async (
+            [FromQuery] string branchId,
+            IWorkspaceProfileService profiles,
+            CancellationToken ct) =>
+        {
+            var profile = await profiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
+            return Results.Ok(profile);
+        });
+
+        app.MapPost("/studio/workspace/profile/rescan", async (
+            [FromQuery] string branchId,
+            IWorkspaceProfileService profiles,
+            CancellationToken ct) =>
+        {
+            var profile = await profiles.RescanAsync(branchId, ct).ConfigureAwait(false);
+            return Results.Ok(profile);
         });
 
         // Slice 16m — output download endpoint. Returns cached (truncated) stdout/stderr from a

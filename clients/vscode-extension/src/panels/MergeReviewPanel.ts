@@ -60,6 +60,22 @@ export interface ConstituentProposal {
   workspaceChanges?: string | null;
 }
 
+// Phase 9f — mirrors NodalMerge.Studio.Contracts.Domain.ProjectRoot/WorkspaceProfile.
+export interface ProjectRoot {
+  relativePath: string;   // "" = branch root itself
+  stack: string;
+  buildCommand?: string | null;
+  testCommand?: string | null;
+  runCommand?: string | null;
+  isLongRunning: boolean;
+}
+
+export interface WorkspaceProfile {
+  branchId: string;
+  roots: ProjectRoot[];
+  detectedAt: string;
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 export class DecisionConvergencePanel {
@@ -173,11 +189,21 @@ export class DecisionConvergencePanel {
       const constituents = (proposal.reconciledFrom && proposal.reconciledFrom.length)
         ? await this.get<ConstituentProposal[]>('/studio/merges/' + this.proposalId + '/constituents')
         : [];
+      // Phase 9f — per-root Build/Test/Run controls need the detected project roots.
+      // Best-effort: a repo this can't profile (or a host predating Phase 9) still gets the
+      // single-row "repo root" fallback the webview renders for an empty roots array.
+      let roots: ProjectRoot[] = [];
+      try {
+        const profile = await this.get<WorkspaceProfile>(
+          '/studio/workspace/profile?branchId=' + encodeURIComponent(proposal.sourceBranch));
+        roots = profile.roots ?? [];
+      } catch { /* fall back to single "repo root" row */ }
       await this.panel.webview.postMessage({
         type: 'proposal',
         proposal,
         fileChanges: changesRes.fileChanges ?? [],
         constituents,
+        roots,
       });
     } catch (err) {
       const msg = 'NodalMerge: failed to load proposal — ' + String(err);
@@ -298,6 +324,9 @@ export class DecisionConvergencePanel {
         }
         case 'runWorkspaceCheck': {
           const kind = String(msg.kind ?? 'build');
+          // "" is a valid rootPath (the branch root itself) — only treat undefined/missing as
+          // "no scoping" (run every detected root), never coalesce "" away.
+          const rootPath = typeof msg.rootPath === 'string' ? msg.rootPath : undefined;
           const branchId = this.lastProposal?.sourceBranch;
           if (!branchId) { return; }
           // branchId is passed as a query param, not a route segment — ids like
@@ -306,11 +335,27 @@ export class DecisionConvergencePanel {
           const endpoint = kind === 'run' ? 'run' : kind === 'test' ? 'test' : 'build';
           try {
             const result = await this.post(
-              '/studio/workspace/' + endpoint + '?branchId=' + encodeURIComponent(branchId), {});
-            void this.panel.webview.postMessage({ type: 'executionResult', kind, result });
+              '/studio/workspace/' + endpoint + '?branchId=' + encodeURIComponent(branchId),
+              rootPath !== undefined ? { rootPath } : {});
+            void this.panel.webview.postMessage({ type: 'executionResult', kind, rootPath, result });
           } catch (err) {
-            void this.panel.webview.postMessage({ type: 'executionResult', kind, error: String(err) });
+            void this.panel.webview.postMessage({ type: 'executionResult', kind, rootPath, error: String(err) });
             void vscode.window.showErrorMessage('NodalMerge: ' + kind + ' failed — ' + String(err));
+          }
+          return;
+        }
+        case 'stopWorkspaceRun': {
+          const rootPath = typeof msg.rootPath === 'string' ? msg.rootPath : undefined;
+          const branchId = this.lastProposal?.sourceBranch;
+          if (!branchId) { return; }
+          try {
+            const result = await this.post<{ stopped: number }>(
+              '/studio/workspace/run/stop?branchId=' + encodeURIComponent(branchId),
+              rootPath !== undefined ? { rootPath } : {});
+            void this.panel.webview.postMessage({ type: 'runStopResult', rootPath, stopped: result.stopped });
+          } catch (err) {
+            void this.panel.webview.postMessage({ type: 'runStopResult', rootPath, error: String(err) });
+            void vscode.window.showErrorMessage('NodalMerge: stop failed — ' + String(err));
           }
           return;
         }
@@ -640,11 +685,6 @@ const DC_CSS = `
     border: 1px solid var(--nm-border);
     margin: 8px 12px 12px;
   }
-  .exec-trigger-row {
-    display: flex;
-    gap: 0;
-    margin: 0 0 4px -12px;
-  }
   .no-changes-banner {
     border-left: 3px solid var(--nm-warn);
     background: rgba(204, 167, 0, 0.12);
@@ -654,9 +694,41 @@ const DC_CSS = `
     margin-bottom: 8px;
     font-size: 0.9em;
   }
-  .exec-trigger-row button.ghost:disabled {
-    opacity: 0.5;
+  /* ── Phase 9f — per-root Build/Test/Run-Stop rows ──────────────────── */
+  .root-row {
+    border: 1px solid var(--nm-border);
+    border-radius: 4px;
+    margin: 8px 0;
+    padding: 8px 10px;
   }
+  .root-row-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .root-label {
+    font-family: var(--nm-mono);
+    font-size: 0.9em;
+    font-weight: 600;
+  }
+  .root-run-status {
+    font-size: 0.78em;
+    opacity: 0.65;
+    margin-left: auto;
+  }
+  .root-run-status.running { color: var(--nm-success); opacity: 1; font-weight: 600; }
+  .root-row-actions {
+    display: flex;
+    gap: 6px;
+  }
+  .root-row-actions button.ghost {
+    margin: 0;
+  }
+  .root-row-actions button.ghost:disabled {
+    opacity: 0.4;
+  }
+  .root-row-results { margin-top: 6px; }
   .review-notes-row {
     margin: 12px 0;
   }
@@ -731,13 +803,10 @@ const DC_HTML = `
   <section id="section-evidence" class="hidden">
       <h2>Evidence</h2>
       <div id="no-changes-banner" class="hidden no-changes-banner"></div>
-      <div class="exec-trigger-row">
-        <button id="btn-run-build" class="ghost">Run Build</button>
-        <button id="btn-run-test"  class="ghost">Run Tests</button>
-        <button id="btn-run-app"   class="ghost">Run App</button>
-      </div>
       <div id="evidence-results"></div>
       <div id="execution-results" class="hidden"></div>
+      <h2 style="margin-top:14px">Build / Test / Run</h2>
+      <div id="root-rows"></div>
     </section>
     <section id="section-rollback" class="hidden">
       <h2>Rollback plan</h2>
@@ -827,26 +896,68 @@ const DC_JS = `
     vscode.postMessage({ type: 'restoreWorkspace' });
   });
 
-  function runWorkspaceCheck(kind, btnId) {
-    ['btn-run-build', 'btn-run-test', 'btn-run-app'].forEach(function(id) { setDisabled(id, true); });
-    setText(btnId, 'Running…');
-    vscode.postMessage({ type: 'runWorkspaceCheck', kind: kind });
-  }
-  document.getElementById('btn-run-build').addEventListener('click', function() {
-    runWorkspaceCheck('build', 'btn-run-build');
-  });
-  document.getElementById('btn-run-test').addEventListener('click', function() {
-    runWorkspaceCheck('test', 'btn-run-test');
-  });
-  document.getElementById('btn-run-app').addEventListener('click', function() {
-    runWorkspaceCheck('run', 'btn-run-app');
-  });
+  // ── Phase 9f — shared single-item renderers (used by both the persisted-evidence
+  // view below and the live per-root results) ──────────────────────────────────
+  function renderBuildRow(b, nodeId, branchId) {
+    var icon = b.success ? '✅' : '❌';
+    var sys = b.buildSystem || 'cmd';
+    var dur = b.startedAt && b.completedAt
+      ? ((new Date(b.completedAt) - new Date(b.startedAt)) / 1000).toFixed(1) + 's'
+      : '';
+    var html = '<div class="exec-row">' + icon + ' <span class="badge">' + esc(sys) + '</span>'
+      + ' <span class="cmd">' + esc(b.command || '') + '</span>'
+      + (dur ? ' <span style="opacity:0.6">(' + dur + ')</span>' : '')
+      + (b.exitCode !== 0 ? ' <span style="color:var(--nm-error)">exit ' + b.exitCode + '</span>' : '')
+      + '</div>';
 
-  function resetExecButtons() {
-    setText('btn-run-build', 'Run Build');
-    setText('btn-run-test', 'Run Tests');
-    setText('btn-run-app', 'Run App');
-    ['btn-run-build', 'btn-run-test', 'btn-run-app'].forEach(function(id) { setDisabled(id, false); });
+    var hasStdout = b.stdOut && b.stdOut.length > 0;
+    var hasStderr = b.stdErr && b.stdErr.length > 0;
+    if (hasStdout || hasStderr) {
+      var outId = 'exec-stdout-' + Math.random().toString(36).slice(2,8);
+      html += '<button class="exec-output-toggle" data-target="' + outId + '">▼ Output</button>';
+      html += '<pre class="exec-output-pre" id="' + outId + '" style="display:none">';
+      if (hasStderr) html += esc(b.stdErr) + '\\n';
+      if (hasStdout) html += esc(b.stdOut);
+      html += '</pre>';
+    }
+
+    if (b.truncated && nodeId) {
+      html += '<a class="exec-download-link" data-branch="' + esc(branchId) + '"'
+        + ' data-result="' + esc(nodeId) + '">'
+        + 'Download full output (truncated)</a>';
+    }
+    return html;
+  }
+
+  function renderTestRow(t, nodeId, branchId) {
+    var icon = t.success ? '✅' : '⚠';
+    var sys = t.buildSystem || 'cmd';
+    if (t.failed === 0 && t.totalTests === 0) icon = t.success ? '✅' : '❌';
+    var summary = t.totalTests > 0
+      ? t.passed + ' passed / ' + t.failed + ' failed' + (t.skipped ? ' / ' + t.skipped + ' skipped' : '')
+      : '';
+    var dur = t.startedAt && t.completedAt
+      ? ((new Date(t.completedAt) - new Date(t.startedAt)) / 1000).toFixed(1) + 's'
+      : '';
+    var html = '<div class="exec-row">' + icon + ' <span class="badge">' + esc(sys) + '</span>'
+      + ' <span class="cmd">' + esc(t.command || '') + '</span>'
+      + ' <span>' + summary + '</span>'
+      + (dur ? ' <span style="opacity:0.6">(' + dur + ')</span>' : '')
+      + '</div>';
+
+    var hasStdout = t.stdOut && t.stdOut.length > 0;
+    if (hasStdout) {
+      var tid = 'exec-testout-' + Math.random().toString(36).slice(2,8);
+      html += '<button class="exec-output-toggle" data-target="' + tid + '">▼ Output</button>';
+      html += '<pre class="exec-output-pre" id="' + tid + '" style="display:none">' + esc(t.stdOut) + '</pre>';
+    }
+
+    if (t.truncated && nodeId) {
+      html += '<a class="exec-download-link" data-branch="' + esc(branchId) + '"'
+        + ' data-result="' + esc(nodeId) + '">'
+        + 'Download full output (truncated)</a>';
+    }
+    return html;
   }
 
   function renderExecResult(parsedExec) {
@@ -854,68 +965,12 @@ const DC_JS = `
 
     if (parsedExec.builds && parsedExec.builds.length) {
       html += '<strong>Build</strong>';
-      parsedExec.builds.forEach(function(b) {
-        var icon = b.success ? '✅' : '❌';
-        var sys = b.buildSystem || 'cmd';
-        var dur = b.startedAt && b.completedAt
-          ? ((new Date(b.completedAt) - new Date(b.startedAt)) / 1000).toFixed(1) + 's'
-          : '';
-        html += '<div class="exec-row">' + icon + ' <span class="badge">' + esc(sys) + '</span>'
-          + ' <span class="cmd">' + esc(b.command || '') + '</span>'
-          + (dur ? ' <span style="opacity:0.6">(' + dur + ')</span>' : '')
-          + (b.exitCode !== 0 ? ' <span style="color:var(--nm-error)">exit ' + b.exitCode + '</span>' : '')
-          + '</div>';
-
-        var hasStdout = b.stdOut && b.stdOut.length > 0;
-        var hasStderr = b.stdErr && b.stdErr.length > 0;
-        if (hasStdout || hasStderr) {
-          var outId = 'exec-stdout-' + Math.random().toString(36).slice(2,8);
-          html += '<button class="exec-output-toggle" data-target="' + outId + '">▼ Output</button>';
-          html += '<pre class="exec-output-pre" id="' + outId + '" style="display:none">';
-          if (hasStderr) html += esc(b.stdErr) + '\\n';
-          if (hasStdout) html += esc(b.stdOut);
-          html += '</pre>';
-        }
-
-        if (b.truncated && parsedExec.nodeId) {
-          html += '<a class="exec-download-link" data-branch="' + esc(parsedExec.branchId) + '"'
-            + ' data-result="' + esc(parsedExec.nodeId) + '">'
-            + 'Download full output (truncated)</a>';
-        }
-      });
+      parsedExec.builds.forEach(function(b) { html += renderBuildRow(b, parsedExec.nodeId, parsedExec.branchId); });
     }
 
     if (parsedExec.tests && parsedExec.tests.length) {
       html += '<strong style="margin-top:8px;display:block">Tests</strong>';
-      parsedExec.tests.forEach(function(t) {
-        var icon = t.success ? '✅' : '⚠';
-        var sys = t.buildSystem || 'cmd';
-        if (t.failed === 0 && t.totalTests === 0) icon = t.success ? '✅' : '❌';
-        var summary = t.totalTests > 0
-          ? t.passed + ' passed / ' + t.failed + ' failed' + (t.skipped ? ' / ' + t.skipped + ' skipped' : '')
-          : '';
-        var dur = t.startedAt && t.completedAt
-          ? ((new Date(t.completedAt) - new Date(t.startedAt)) / 1000).toFixed(1) + 's'
-          : '';
-        html += '<div class="exec-row">' + icon + ' <span class="badge">' + esc(sys) + '</span>'
-          + ' <span class="cmd">' + esc(t.command || '') + '</span>'
-          + ' <span>' + summary + '</span>'
-          + (dur ? ' <span style="opacity:0.6">(' + dur + ')</span>' : '')
-          + '</div>';
-
-        var hasStdout = t.stdOut && t.stdOut.length > 0;
-        if (hasStdout) {
-          var tid = 'exec-testout-' + Math.random().toString(36).slice(2,8);
-          html += '<button class="exec-output-toggle" data-target="' + tid + '">▼ Output</button>';
-          html += '<pre class="exec-output-pre" id="' + tid + '" style="display:none">' + esc(t.stdOut) + '</pre>';
-        }
-
-        if (t.truncated && parsedExec.nodeId) {
-          html += '<a class="exec-download-link" data-branch="' + esc(parsedExec.branchId) + '"'
-            + ' data-result="' + esc(parsedExec.nodeId) + '">'
-            + 'Download full output (truncated)</a>';
-        }
-      });
+      parsedExec.tests.forEach(function(t) { html += renderTestRow(t, parsedExec.nodeId, parsedExec.branchId); });
     }
 
     if ((!parsedExec.builds || !parsedExec.builds.length) && (!parsedExec.tests || !parsedExec.tests.length)) {
@@ -924,6 +979,109 @@ const DC_JS = `
 
     html += '</div>';
     return html;
+  }
+
+  // ── Phase 9f — per-root Build/Test/Run-Stop controls ──────────────────────────
+  // Replaces the old single global Build/Test/Run buttons: a repo with more than one detected
+  // project root (a dotnet host + a React frontend, say) gets one row per root, each scoped to
+  // that root only, instead of one click silently building/testing/running everything at once.
+  var rootCapabilities = {}; // relativePath -> { build, test, run }
+  var rootRunState = {};     // relativePath -> { running, pid }
+
+  function rootRowId(rootPath) {
+    return 'root-row-' + (rootPath || 'repo-root').replace(/[^a-zA-Z0-9_-]/g, '_');
+  }
+
+  function renderRootRows(roots) {
+    var list = (roots && roots.length) ? roots : [{ relativePath: '', stack: '', buildCommand: null, testCommand: null, runCommand: null, isLongRunning: false }];
+    rootCapabilities = {};
+    list.forEach(function(root) {
+      rootCapabilities[root.relativePath] = {
+        build: !!root.buildCommand,
+        test: !!root.testCommand,
+        run: !!root.runCommand,
+      };
+      if (!rootRunState[root.relativePath]) { rootRunState[root.relativePath] = { running: false }; }
+    });
+
+    var html = list.map(function(root) {
+      var id = rootRowId(root.relativePath);
+      var label = root.relativePath || 'repo root';
+      // "none" is the Phase 9h synthetic rule-file-only root (a branch root with an AGENTS.md
+      // but no buildable project there) — not a real stack worth badging.
+      var stackBadge = (root.stack && root.stack !== 'none') ? '<span class="badge">' + esc(root.stack) + '</span>' : '';
+      var caps = rootCapabilities[root.relativePath];
+      return '<div class="root-row" data-root="' + esc(root.relativePath) + '">'
+        + '<div class="root-row-header">'
+        + '<span class="root-label">' + esc(label) + '</span>' + stackBadge
+        + '<span class="root-run-status" id="status-' + id + '"></span>'
+        + '</div>'
+        + '<div class="root-row-actions">'
+        + '<button class="ghost" data-action="build" id="btn-build-' + id + '"'
+          + (caps.build ? '' : ' disabled title="No build command detected for this root"') + '>Build</button>'
+        + '<button class="ghost" data-action="test" id="btn-test-' + id + '"'
+          + (caps.test ? '' : ' disabled title="No test command detected for this root"') + '>Test</button>'
+        + '<button class="ghost" data-action="run" id="btn-run-' + id + '"'
+          + (caps.run ? '' : ' disabled title="No run command detected for this root"') + '>Run</button>'
+        + '<button class="ghost" data-action="stop" id="btn-stop-' + id + '" style="display:none">Stop</button>'
+        + '</div>'
+        + '<div class="root-row-results" id="results-' + id + '"></div>'
+        + '</div>';
+    }).join('');
+
+    setHtml('root-rows', html);
+    list.forEach(function(root) { updateRunStatusUi(root.relativePath); });
+  }
+
+  function updateRunStatusUi(rootPath) {
+    var id = rootRowId(rootPath);
+    var state = rootRunState[rootPath] || { running: false };
+    var statusEl = document.getElementById('status-' + id);
+    var runBtn = document.getElementById('btn-run-' + id);
+    var stopBtn = document.getElementById('btn-stop-' + id);
+    if (!statusEl) return;
+    if (state.running) {
+      statusEl.textContent = 'Running (pid ' + state.pid + ')';
+      statusEl.classList.add('running');
+      if (runBtn) runBtn.style.display = 'none';
+      if (stopBtn) stopBtn.style.display = '';
+    } else {
+      statusEl.textContent = '';
+      statusEl.classList.remove('running');
+      if (runBtn) runBtn.style.display = '';
+      if (stopBtn) stopBtn.style.display = 'none';
+    }
+  }
+
+  function setRootBusy(rootPath, busy) {
+    var id = rootRowId(rootPath);
+    var caps = rootCapabilities[rootPath] || { build: false, test: false, run: false };
+    var buildBtn = document.getElementById('btn-build-' + id);
+    var testBtn  = document.getElementById('btn-test-' + id);
+    var runBtn   = document.getElementById('btn-run-' + id);
+    var stopBtn  = document.getElementById('btn-stop-' + id);
+    if (buildBtn) buildBtn.disabled = busy || !caps.build;
+    if (testBtn)  testBtn.disabled  = busy || !caps.test;
+    if (runBtn)   runBtn.disabled   = busy || !caps.run;
+    if (stopBtn)  stopBtn.disabled  = busy;
+  }
+
+  var rootRowsEl = document.getElementById('root-rows');
+  if (rootRowsEl) {
+    rootRowsEl.addEventListener('click', function(ev) {
+      var btn = ev.target.closest('[data-action]');
+      if (!btn || btn.disabled) return;
+      var row = btn.closest('.root-row');
+      if (!row) return;
+      var rootPath = row.getAttribute('data-root') || '';
+      var action = btn.getAttribute('data-action');
+      setRootBusy(rootPath, true);
+      if (action === 'stop') {
+        vscode.postMessage({ type: 'stopWorkspaceRun', rootPath: rootPath });
+        return;
+      }
+      vscode.postMessage({ type: 'runWorkspaceCheck', kind: action, rootPath: rootPath });
+    });
   }
 
   // Slice 18g — card-based constituent rendering with model, confidence, rationale
@@ -1151,19 +1309,58 @@ const DC_JS = `
     }
 
     if (msg.type === 'executionResult') {
-      resetExecButtons();
-      var execResultsEl2 = document.getElementById('execution-results');
+      var rootPath = typeof msg.rootPath === 'string' ? msg.rootPath : '';
+      setRootBusy(rootPath, false);
+      var resultsEl = document.getElementById('results-' + rootRowId(rootPath));
+      if (!resultsEl) return;
+
       if (msg.error) {
-        if (execResultsEl2) {
-          execResultsEl2.classList.remove('hidden');
-          execResultsEl2.innerHTML = '<span style="color:var(--nm-error)">' + esc(msg.kind) + ' failed: ' + esc(msg.error) + '</span>';
+        resultsEl.innerHTML = '<span style="color:var(--nm-error)">' + esc(msg.kind) + ' failed: ' + esc(msg.error) + '</span>';
+        return;
+      }
+
+      if (msg.kind === 'run') {
+        // RunAsync returns a raw BuildResult[] (not the {builds,tests} shape Build/Test use) —
+        // a long-running result comes back immediately with running:true/pid set; a one-shot
+        // run command blocks and comes back finished, rendered like a build row.
+        var runResults = msg.result || [];
+        var first = runResults[0];
+        if (first && first.running) {
+          rootRunState[rootPath] = { running: true, pid: first.pid };
+          updateRunStatusUi(rootPath);
+          resultsEl.innerHTML = '<div class="exec-row">▶ <span class="cmd">' + esc(first.command || '') + '</span></div>';
+        } else {
+          rootRunState[rootPath] = { running: false };
+          updateRunStatusUi(rootPath);
+          resultsEl.innerHTML = runResults.length
+            ? runResults.map(function(b) { return renderBuildRow(b, null, null); }).join('')
+            : '<span style="opacity:0.6;font-size:0.85em">No run command for this root.</span>';
         }
         return;
       }
-      if (execResultsEl2 && msg.result) {
-        execResultsEl2.classList.remove('hidden');
-        execResultsEl2.innerHTML = renderExecResult(msg.result);
+
+      // build/test: BranchExecutionResult shape { builds, tests, nodeId, branchId }
+      var result = msg.result || {};
+      var builds = result.builds || [];
+      var tests = result.tests || [];
+      var html = builds.map(function(b) { return renderBuildRow(b, result.nodeId, result.branchId); }).join('')
+        + tests.map(function(t) { return renderTestRow(t, result.nodeId, result.branchId); }).join('');
+      resultsEl.innerHTML = html || '<span style="opacity:0.6;font-size:0.85em">No results.</span>';
+      return;
+    }
+
+    if (msg.type === 'runStopResult') {
+      var stopRootPath = typeof msg.rootPath === 'string' ? msg.rootPath : '';
+      setRootBusy(stopRootPath, false);
+      var stopResultsEl = document.getElementById('results-' + rootRowId(stopRootPath));
+      if (msg.error) {
+        if (stopResultsEl) {
+          stopResultsEl.innerHTML = '<span style="color:var(--nm-error)">stop failed: ' + esc(msg.error) + '</span>';
+        }
+        return;
       }
+      rootRunState[stopRootPath] = { running: false };
+      updateRunStatusUi(stopRootPath);
       return;
     }
 
@@ -1234,8 +1431,9 @@ const DC_JS = `
       execResultsEl.innerHTML = '';
     }
 
-    // Evidence section now always visible (it also hosts the Run Build/Test/App triggers).
+    // Evidence section now always visible (it also hosts the per-root Build/Test/Run controls).
     showIf('section-evidence', true);
+    renderRootRows(msg.roots || []);
 
     // Flag proposals with no file diff at all — the goal/summary/rationale text can look fully
     // complete even when the agent never actually wrote anything (see filesTouched).

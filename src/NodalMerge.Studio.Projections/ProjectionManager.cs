@@ -24,6 +24,7 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly IAgentProfileService? _agentProfiles;
     private readonly ISteeringDecisionService? _steeringDecisions;
     private readonly IFileWorkspaceService? _fileWorkspace;
+    private readonly IWorkspaceProfileService? _workspaceProfiles;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
@@ -37,7 +38,8 @@ public sealed class ProjectionManager : IProjectionManager
         IEvidenceNodeService? evidenceNodes = null,
         IAgentProfileService? agentProfiles = null,
         ISteeringDecisionService? steeringDecisions = null,
-        IFileWorkspaceService? fileWorkspace = null)
+        IFileWorkspaceService? fileWorkspace = null,
+        IWorkspaceProfileService? workspaceProfiles = null)
     {
         _workUnits          = workUnits;
         _tasks              = tasks;
@@ -51,6 +53,7 @@ public sealed class ProjectionManager : IProjectionManager
         _agentProfiles      = agentProfiles;
         _steeringDecisions  = steeringDecisions;
         _fileWorkspace      = fileWorkspace;
+        _workspaceProfiles  = workspaceProfiles;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -272,36 +275,49 @@ public sealed class ProjectionManager : IProjectionManager
 
         var inheritedConstraints = ancestorChain.Where(a => a.Type == ArtifactType.Constraint).ToList();
 
+        WorkUnit? wu = null;
+        if (_executionCommands is not null || _workspaceProfiles is not null)
+            wu = await _workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+
         // ── Slice 16l — attach latest execution result ───────────────────────
         WorkspaceExecutionSummary? execution = null;
-        if (_executionCommands is not null)
+        if (_executionCommands is not null && wu is not null)
         {
             try
             {
-                var wu = await _workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
-                if (wu is not null)
+                var execResult = await _executionCommands.GetLatestAsync(wu.BranchId, ct).ConfigureAwait(false);
+                if (execResult is not null)
                 {
-                    var execResult = await _executionCommands.GetLatestAsync(wu.BranchId, ct).ConfigureAwait(false);
-                    if (execResult is not null)
-                    {
-                        var buildSystems = execResult.Builds
-                            .Select(b => b.BuildSystem)
-                            .Concat(execResult.Tests.Select(t => t.BuildSystem))
-                            .Where(bs => bs is not null)
-                            .Distinct()
-                            .ToList()!;
-                        var testSummary = execResult.Tests.Count > 0
-                            ? $"{execResult.Tests.Sum(t => t.Passed)} passed / {execResult.Tests.Sum(t => t.Failed)} failed"
-                            : null;
-                        execution = new WorkspaceExecutionSummary(
-                            execResult.AllSucceeded,
-                            buildSystems,
-                            testSummary,
-                            execResult.ExecutedAt);
-                    }
+                    var buildSystems = execResult.Builds
+                        .Select(b => b.BuildSystem)
+                        .Concat(execResult.Tests.Select(t => t.BuildSystem))
+                        .Where(bs => bs is not null)
+                        .Distinct()
+                        .ToList()!;
+                    var testSummary = execResult.Tests.Count > 0
+                        ? $"{execResult.Tests.Sum(t => t.Passed)} passed / {execResult.Tests.Sum(t => t.Failed)} failed"
+                        : null;
+                    execution = new WorkspaceExecutionSummary(
+                        execResult.AllSucceeded,
+                        buildSystems,
+                        testSummary,
+                        execResult.ExecutedAt);
                 }
             }
             catch { /* best-effort — never fail a projection for execution data */ }
+        }
+
+        // ── Phase 9e — attach detected project roots, so agents know a repo can hold more
+        // than one project before deciding where a file belongs.
+        IReadOnlyList<ProjectRootSummary>? roots = null;
+        if (_workspaceProfiles is not null && wu is not null)
+        {
+            try
+            {
+                var profile = await _workspaceProfiles.GetOrDetectAsync(wu.BranchId, ct).ConfigureAwait(false);
+                roots = profile.Roots.Select(r => new ProjectRootSummary(r.RelativePath, r.Stack, r.RuleFileContent)).ToList();
+            }
+            catch { /* best-effort — never fail a projection for profile data */ }
         }
 
         var payload = new AgentWorkspaceProjectionPayload(
@@ -309,7 +325,8 @@ public sealed class ProjectionManager : IProjectionManager
             workUnitId,
             new ArtifactChain(combined),
             inheritedConstraints,
-            execution);
+            execution,
+            roots);
 
         return Serialize(payload);
     }

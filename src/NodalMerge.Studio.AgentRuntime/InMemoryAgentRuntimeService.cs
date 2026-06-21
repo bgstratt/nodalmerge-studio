@@ -198,13 +198,15 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var ruleFileContext = await BuildRuleFileContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
 
                 AgentLoopCompletion completion;
                 if (profile?.Stage == PipelineStage.Plan)
                 {
                     var plannerLoop = new PlannerAgentLoop(
                         agentId, item.WorkUnitId, provider, model, baseUrl, apiKey!,
-                        dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a));
+                        dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a),
+                        ruleFileContext);
                     completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
                 else if (profile?.Stage == PipelineStage.Review)
@@ -224,7 +226,9 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var loop = new WorkerAgentLoop(
                         agentId, item.WorkUnitId, taskId, provider, model, baseUrl, apiKey!,
                         dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a),
-                        isResume: item.AttemptCount > 0);
+                        isResume: item.AttemptCount > 0, ruleFileContext: ruleFileContext,
+                        selfVerifyBuild: _options.RequireBuildBeforeProposal,
+                        selfVerifyTest: _options.RequireTestBeforeProposal);
                     completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
 
@@ -527,9 +531,12 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var ruleFileContext = await BuildRuleFileContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var loop = new WorkerAgentLoop(
                     agentId, workUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm, profile,
-                    onActivity: a => ReportActivity(agentId, a));
+                    onActivity: a => ReportActivity(agentId, a), ruleFileContext: ruleFileContext,
+                    selfVerifyBuild: _options.RequireBuildBeforeProposal,
+                    selfVerifyTest: _options.RequireTestBeforeProposal);
                 await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 _logger.LogInformation("[Agent {AgentId}] Worker loop completed.", agentId);
             }
@@ -604,6 +611,39 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         if (!_agents.TryGetValue(agentId, out var record))
             throw new KeyNotFoundException($"Agent '{agentId}' was not found.");
         return record;
+    }
+
+    // Phase 9h — best-effort root-level instruction injection (AGENTS.md/CLAUDE.md/.clinerules/
+    // .cursorrules). Resolved once up front and appended to the kickoff message rather than the
+    // static system prompt, since it's per-branch data, not a constant. Never throws — a missing
+    // work unit, an undetectable profile, or a repo with no rule files at all just means no
+    // context gets appended, not a failed spawn.
+    private async Task<string?> BuildRuleFileContextAsync(string workUnitId, CancellationToken ct)
+    {
+        try
+        {
+            var workUnits = _serviceProvider.GetRequiredService<IWorkUnitService>();
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null) return null;
+
+            var profiles = _serviceProvider.GetRequiredService<IWorkspaceProfileService>();
+            var profile = await profiles.GetOrDetectAsync(wu.BranchId, ct).ConfigureAwait(false);
+
+            var sections = profile.Roots
+                .Where(r => r.RuleFileContent is not null)
+                .Select(r =>
+                {
+                    var label = r.RelativePath.Length == 0 ? "repo root" : $"'{r.RelativePath}'";
+                    return $"Project root {label} ({r.Stack}) has its own instructions — follow them:\n\n{r.RuleFileContent}";
+                })
+                .ToList();
+
+            return sections.Count == 0 ? null : string.Join("\n\n", sections);
+        }
+        catch
+        {
+            return null;
+        }
     }
 }
 

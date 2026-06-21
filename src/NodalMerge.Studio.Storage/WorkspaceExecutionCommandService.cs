@@ -8,6 +8,8 @@ namespace NodalMerge.Studio.Storage;
 // (WorkspaceTools) and REST endpoints (StudioRestEndpoints) so they cannot drift.
 internal sealed class WorkspaceExecutionCommandService(
     IWorkspaceExecutionService execution,
+    IWorkspaceProfileService profiles,
+    RunningProcessRegistry runningProcesses,
     IFileWorkspaceService fileWorkspace,
     IStudioNodeStore nodeStore) : IWorkspaceExecutionCommandService
 {
@@ -15,12 +17,14 @@ internal sealed class WorkspaceExecutionCommandService(
         string branchId,
         string? buildCommand = null,
         int timeoutSeconds = 300,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        string? rootPath = null)
     {
         var request = new WorkspaceExecutionRequest(
             Build: true,
             BuildCommand: buildCommand,
-            TimeoutSeconds: timeoutSeconds);
+            TimeoutSeconds: timeoutSeconds,
+            RootPath: rootPath);
         return await ExecAndPersistAsync(branchId, request, ct).ConfigureAwait(false);
     }
 
@@ -28,12 +32,14 @@ internal sealed class WorkspaceExecutionCommandService(
         string branchId,
         string? testCommand = null,
         int timeoutSeconds = 300,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        string? rootPath = null)
     {
         var request = new WorkspaceExecutionRequest(
             Test: true,
             TestCommand: testCommand,
-            TimeoutSeconds: timeoutSeconds);
+            TimeoutSeconds: timeoutSeconds,
+            RootPath: rootPath);
         return await ExecAndPersistAsync(branchId, request, ct).ConfigureAwait(false);
     }
 
@@ -43,29 +49,73 @@ internal sealed class WorkspaceExecutionCommandService(
         CancellationToken ct = default) =>
         await ExecAndPersistAsync(branchId, request, ct).ConfigureAwait(false);
 
-    public async Task<BuildResult> RunAsync(
+    public async Task<IReadOnlyList<BuildResult>> RunAsync(
         string branchId,
+        string? rootPath = null,
         string? runCommand = null,
         int timeoutSeconds = 120,
         Dictionary<string, string>? environmentVariables = null,
         CancellationToken ct = default)
     {
-        // For "run", we do a single Build-style execution without test parsing
         var workDir = await GetWorkingDirAsync(branchId, ct).ConfigureAwait(false);
 
-        var command = runCommand ?? "dotnet run";
-        var request = new WorkspaceExecutionRequest(
-            Build: true,
-            BuildCommand: command,
-            TimeoutSeconds: timeoutSeconds,
-            AllowAutoDetect: runCommand is not null,
-            EnvironmentVariables: environmentVariables);
+        // Explicit command override: always one-shot — long-running-ness can't be inferred for an
+        // arbitrary caller-supplied command, so this keeps the pre-9c blocking behavior exactly.
+        if (runCommand is { Length: > 0 })
+        {
+            var dir = rootPath is { Length: > 0 } ? CombineRoot(workDir, rootPath) : workDir;
+            var result = await runningProcesses.RunOnceAsync(
+                rootPath ?? "", runCommand, dir, buildSystem: null, timeoutSeconds, environmentVariables, ct)
+                .ConfigureAwait(false);
+            return [result];
+        }
 
-        var result = await execution.ExecuteAsync(branchId, request, ct).ConfigureAwait(false);
-        return result.Builds.FirstOrDefault()
-            ?? new BuildResult(false, -1, "", "No build results.", null, command,
-                DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        var profile = await profiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
+
+        IReadOnlyList<ProjectRoot> targets;
+        if (rootPath is { Length: > 0 })
+        {
+            var match = profile.Roots.FirstOrDefault(r => r.RelativePath == rootPath);
+            if (match is null)
+                return [new BuildResult(false, -1, "", $"No detected root at '{rootPath}'.", null, "",
+                    DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, ProjectRoot: rootPath)];
+            targets = [match];
+        }
+        else
+        {
+            targets = profile.Roots.Where(r => r.RunCommand is not null).ToList();
+        }
+
+        var results = new List<BuildResult>();
+        foreach (var root in targets)
+        {
+            if (root.RunCommand is null)
+            {
+                results.Add(new BuildResult(false, -1, "", $"Root '{root.RelativePath}' has no resolved run command.",
+                    null, "", DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, ProjectRoot: root.RelativePath));
+                continue;
+            }
+
+            var dir = CombineRoot(workDir, root.RelativePath);
+            var result = root.IsLongRunning
+                ? runningProcesses.StartLongRunning(branchId, root.RelativePath, root.RunCommand, dir, root.Stack, environmentVariables)
+                : await runningProcesses.RunOnceAsync(
+                    root.RelativePath, root.RunCommand, dir, root.Stack, timeoutSeconds, environmentVariables, ct)
+                    .ConfigureAwait(false);
+            results.Add(result);
+        }
+        return results;
     }
+
+    public Task<int> StopAsync(
+        string branchId,
+        int? pid = null,
+        string? rootPath = null,
+        CancellationToken ct = default) =>
+        Task.FromResult(runningProcesses.Stop(branchId, pid, rootPath));
+
+    private static string CombineRoot(string workDir, string relativePath) =>
+        relativePath.Length == 0 ? workDir : Path.Combine(workDir, relativePath);
 
     public async Task<BranchExecutionResult?> GetLatestAsync(
         string branchId,

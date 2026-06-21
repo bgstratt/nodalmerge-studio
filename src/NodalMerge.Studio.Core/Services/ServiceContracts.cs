@@ -845,6 +845,26 @@ public interface IWorkspaceExecutionService
         CancellationToken ct = default);
 }
 
+// Phase 9a — detects sub-project roots inside a branch's working directory (one per directory
+// containing a recognized build-system marker file), each with its own resolved build/test/run
+// commands. Replaces the single-flat-detection assumption in IWorkspaceExecutionService for
+// multi-project repos.
+public interface IWorkspaceProfileService
+{
+    /// <summary>Returns the cached profile for this branch, detecting it on first access.</summary>
+    Task<WorkspaceProfile> GetOrDetectAsync(string branchId, CancellationToken ct = default);
+
+    /// <summary>Forces re-detection, bypassing (and refreshing) the cache.</summary>
+    Task<WorkspaceProfile> RescanAsync(string branchId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Drops the cached profile for a branch with no recompute. For ephemeral branches (e.g. the
+    /// temp composite branches ExecuteCompositeAsync creates and deletes per call) — without this
+    /// the cache would grow forever, keyed by GUID branch ids that no longer exist on disk.
+    /// </summary>
+    void Invalidate(string branchId);
+}
+
 // Slice 16c — shared entry point for workspace execution commands — called by both MCP tools
 // (WorkspaceTools) and REST endpoints (StudioRestEndpoints) so they cannot drift.
 public interface IWorkspaceExecutionCommandService
@@ -853,13 +873,15 @@ public interface IWorkspaceExecutionCommandService
         string branchId,
         string? buildCommand = null,
         int timeoutSeconds = 300,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        string? rootPath = null);
 
     Task<BranchExecutionResult> TestAsync(
         string branchId,
         string? testCommand = null,
         int timeoutSeconds = 300,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        string? rootPath = null);
 
     Task<BranchExecutionResult> ExecAsync(
         string branchId,
@@ -870,11 +892,27 @@ public interface IWorkspaceExecutionCommandService
         string branchId,
         CancellationToken ct = default);
 
-    Task<BuildResult> RunAsync(
+    /// <summary>
+    /// Runs the application in a branch. With no <paramref name="rootPath"/>/<paramref name="runCommand"/>,
+    /// runs every WorkspaceProfile root with a resolved RunCommand (Phase 9c) — long-running roots
+    /// (dev servers) are started detached and tracked (see <see cref="StopAsync"/>); one-shot roots
+    /// block up to <paramref name="timeoutSeconds"/> exactly like Build/Test. An explicit
+    /// <paramref name="runCommand"/> always runs once, since long-running-ness can't be inferred for
+    /// an arbitrary caller-supplied command.
+    /// </summary>
+    Task<IReadOnlyList<BuildResult>> RunAsync(
         string branchId,
+        string? rootPath = null,
         string? runCommand = null,
         int timeoutSeconds = 120,
         Dictionary<string, string>? environmentVariables = null,
+        CancellationToken ct = default);
+
+    /// <summary>Stops tracked long-running processes for a branch (see <see cref="RunAsync"/>). Narrows by pid and/or rootPath when given. Returns the count stopped.</summary>
+    Task<int> StopAsync(
+        string branchId,
+        int? pid = null,
+        string? rootPath = null,
         CancellationToken ct = default);
 
     Task<string?> GetBranchPathAsync(

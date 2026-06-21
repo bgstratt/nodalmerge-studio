@@ -16,7 +16,10 @@ internal sealed class WorkerAgentLoop(
     AgentProfile? profile = null,
     string? sessionId = null,
     Action<string?>? onActivity = null,
-    bool isResume = false)
+    bool isResume = false,
+    string? ruleFileContext = null,
+    bool selfVerifyBuild = false,
+    bool selfVerifyTest = false)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -26,23 +29,31 @@ internal sealed class WorkerAgentLoop(
         Workflow:
         1. Call nm_v1_task_update to set your task status to InProgress.
         2. Call nm_v1_workunit_get to understand the broader goal and to learn your branchId.
-        3. Use nm_v1_workspace_list to explore the existing files in your branch.
-        4. Use nm_v1_workspace_read to read files you need to understand or modify.
-        5. Use nm_v1_workspace_write or nm_v1_workspace_delete to make the required changes.
+        3. Call nm_v1_workspace_profile_get with your branchId to see the repo's detected project
+           roots (path + stack, e.g. "backend" = dotnet, "frontend" = npm) — a repo can contain
+           more than one project. Use this to figure out which root the task actually belongs to
+           before exploring files: "endpoint" usually means a controller/route handler in a
+           backend root, not a new frontend file; "component" or "page" usually means a frontend
+           root. If the task is ambiguous about which root, check the root whose stack matches the
+           terminology first.
+        4. Use nm_v1_workspace_list, scoped to that root's path, to explore the existing files there.
+        5. Use nm_v1_workspace_read to read files you need to understand or modify.
+        6. Use nm_v1_workspace_write or nm_v1_workspace_delete to make the required changes.
            IMPORTANT: Write = full file replacement. Always write the complete file content, not just a diff.
            If modifying an existing file, read it first, then write the complete updated version.
            Before writing to a path that isn't in the nm_v1_workspace_list output, double-check for a
-           file with the same name elsewhere in the tree (different directory, or different case) —
-           that's almost always the real file to modify. Write to that real path instead of creating
-           a new one. Only write to a brand-new path when you're genuinely adding a new file.
-        6. When work is complete, call nm_v1_task_update to set the task status to Completed.
-        7. (Optional) If you learned something future work units shouldn't have to rediscover — a fact about
+           file with the same name elsewhere in the tree (different directory, or different case),
+           and check whether a different root (from step 3) is the one that actually owns this
+           concern — that's almost always the real file to modify. Write to that real path instead
+           of creating a new one. Only write to a brand-new path when you're genuinely adding a new file.
+        7. When work is complete, call nm_v1_task_update to set the task status to Completed.
+        8. (Optional) If you learned something future work units shouldn't have to rediscover — a fact about
            the codebase, a decision you made, or a constraint that must hold — call nm_v1_artifact_record
            with type Research, Decision, or Constraint. Check nm_v1_artifact_query first to avoid duplicates.
-        8. Call nm_v1_workspace_diff to review your changes against the target branch (usually main).
-        9. Call nm_v1_merge_propose with an accurate summary listing the files changed. Include your agentId and workUnitId.
-        10. Call nm_v1_merge_validate to move the proposal to ReadyForReview.
-        11. Stop — a human will review and approve the merge.
+        9. Call nm_v1_workspace_diff to review your changes against the target branch (usually main).
+        10. Call nm_v1_merge_propose with an accurate summary listing the files changed. Include your agentId and workUnitId.
+        11. Call nm_v1_merge_validate to move the proposal to ReadyForReview.
+        12. Stop — a human will review and approve the merge.
 
         Rules:
         - Always get your branchId from nm_v1_workunit_get before calling workspace tools.
@@ -51,7 +62,7 @@ internal sealed class WorkerAgentLoop(
           so this protects you if you ever misremember the branchId string.
         - Write real, complete file content — do not describe what you would write.
         - If nm_v1_merge_propose returns status "Rejected" with a reason about missing file
-          changes, you described the work without doing it — go back to step 5 and call
+          changes, you described the work without doing it — go back to step 6 and call
           nm_v1_workspace_write, then propose again. Do not proceed to nm_v1_merge_validate on a
           Rejected proposal.
         - Do not approve or apply merges yourself.
@@ -75,6 +86,16 @@ internal sealed class WorkerAgentLoop(
             kickoff += " This work was previously interrupted (e.g. a host restart) — check " +
                 "existing files (nm_v1_workspace_list/nm_v1_workspace_read) and the task's current " +
                 "status before starting from scratch; partial progress may already be on the branch.";
+        if (ruleFileContext is not null)
+            kickoff += "\n\n" + ruleFileContext;
+        if (selfVerifyBuild || selfVerifyTest)
+        {
+            var what = selfVerifyBuild && selfVerifyTest ? "build and test" : selfVerifyBuild ? "build" : "test";
+            kickoff += $"\n\nThis workspace requires a passing {what} before a merge proposal is " +
+                "accepted. Call nm_v1_workspace_build / nm_v1_workspace_test scoped to the root(s) " +
+                "you touched after writing files. If it fails, read the error output, fix it, and " +
+                "retry before calling nm_v1_merge_propose.";
+        }
 
         var messages = new List<NmMessage>
         {
@@ -228,6 +249,31 @@ internal sealed class WorkerAgentLoop(
 
             new(McpToolNames.WorkspaceSummary, "Get a summary of the current workspace state.",
                 Schema([], new() { ["branchId"] = Str("Branch ID filter (optional)") })),
+
+            new(McpToolNames.WorkspaceProfileGet, "Get the detected project roots for a branch (path + stack, e.g. \"backend\"=dotnet, \"frontend\"=npm). Call this before exploring files when a repo might hold more than one project.",
+                Schema(["branchId"], new()
+                {
+                    ["branchId"]   = Str("Branch ID"),
+                    ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
+                })),
+
+            new(McpToolNames.WorkspaceBuild, "Run build on a branch, auto-detecting the build command per WorkspaceProfile root. Use rootPath to scope to the one root you touched instead of rebuilding everything.",
+                Schema(["branchId"], new()
+                {
+                    ["branchId"]       = Str("Branch ID — pass it directly; this tool does not resolve it from workUnitId"),
+                    ["buildCommand"]   = Str("Explicit build command override (optional) — omit to auto-detect per root"),
+                    ["timeoutSeconds"] = Str("Timeout in seconds (optional, default 300)"),
+                    ["rootPath"]       = Str("Limit to one root's RelativePath from nm_v1_workspace_profile_get (optional) — omit to build every detected root"),
+                })),
+
+            new(McpToolNames.WorkspaceTest, "Run tests on a branch, auto-detecting the test command per WorkspaceProfile root. Use rootPath to scope to the one root you touched instead of testing everything.",
+                Schema(["branchId"], new()
+                {
+                    ["branchId"]       = Str("Branch ID — pass it directly; this tool does not resolve it from workUnitId"),
+                    ["testCommand"]    = Str("Explicit test command override (optional) — omit to auto-detect per root"),
+                    ["timeoutSeconds"] = Str("Timeout in seconds (optional, default 300)"),
+                    ["rootPath"]       = Str("Limit to one root's RelativePath from nm_v1_workspace_profile_get (optional) — omit to test every detected root"),
+                })),
 
             new(McpToolNames.ArtifactRecord, "Record a durable knowledge note (Research, Decision, or Constraint) so future work units don't have to rediscover it.",
                 Schema(["workUnitId", "type", "title", "body"], new()
