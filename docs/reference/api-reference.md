@@ -7,8 +7,8 @@ actually reaches each one. It supersedes the tool counts in
 document remains the source of truth for tool-naming design principles and the error envelope
 format.
 
-Ground truth as of this writing: **63 MCP tools** (`McpToolNames.All`), **39 of them** dispatched
-in-process to autonomous agents (`McpToolDispatcher.cs`), and **103 REST routes**
+Ground truth as of this writing: **66 MCP tools** (`McpToolNames.All`), **42 of them** dispatched
+in-process to autonomous agents (`McpToolDispatcher.cs`), and **112 REST routes**
 (`StudioRestEndpoints.cs`).
 
 ---
@@ -31,7 +31,7 @@ caller can still be heavily used — just by agents, via the MCP tool it shares 
 
 ---
 
-## MCP Tool Catalog (63 tools)
+## MCP Tool Catalog (66 tools)
 
 ✅ = dispatched in-process to orchestrator/worker agents · — = MCP-client or REST/extension only
 
@@ -104,14 +104,15 @@ caller can still be heavily used — just by agents, via the MCP tool it shares 
 
 *(Agents cannot pause/resume themselves or each other — those are human/extension-only actions today, which is the right default but worth knowing if you're designing an agent-to-agent steering flow.)*
 
-### Workspace — file I/O (6) and execution (6)
+### Workspace — file I/O (6), execution (7), and profile (2)
 | Tool | Dispatched | Purpose |
 |---|---|---|
 | `nm_v1_workspace_read` / `_write` / `_delete` / `_list` / `_diff` / `_exists` | ✅ all | Branch-scoped file operations (write/delete respect `fileScope`) |
 | `nm_v1_workspace_summary` | ✅ | Control-tower summary (active work units, agents, merges, failures) |
-| `nm_v1_workspace_build` / `_test` / `_exec` / `_run` | ✅ all | Run build / test / build+test+lint / the app on a branch |
+| `nm_v1_workspace_build` / `_test` / `_exec` / `_run` / `_run_stop` | ✅ all | Run build / test / build+test+lint / app run / run-stop on a branch |
 | `nm_v1_workspace_exec_status` | ✅ | Latest persisted execution result for a branch |
 | `nm_v1_workspace_path` | ✅ | Branch working-directory filesystem path |
+| `nm_v1_workspace_profile_get` / `_profile_rescan` | ✅ both | Detected project roots/stacks and resolved build/test/run command profile |
 
 ### Scheduler (2)
 | Tool | Dispatched | Purpose |
@@ -184,7 +185,7 @@ caller can still be heavily used — just by agents, via the MCP tool it shares 
 
 ---
 
-## REST Endpoint Catalog (103 routes)
+## REST Endpoint Catalog (112 routes)
 
 Grouped by resource area; method + path + one-line purpose. `StudioRestEndpoints.cs` is the single
 file that registers all of these.
@@ -195,9 +196,12 @@ branchId is a query parameter on every one of these, not a route segment — bra
 segment can never match.
 - `GET /studio/workspace-summary` — control-tower summary
 - `POST /studio/workspace/build|test|exec|run?branchId=...` — trigger build/test/build+test+lint/run on a branch
+- `POST /studio/workspace/run/stop?branchId=...` — stop one/all branch run processes
 - `GET /studio/workspace/exec/latest?branchId=...` — latest execution result
 - `GET /studio/workspace/exec/output?branchId=...&resultId=...` — cached stdout/stderr for a past result
 - `GET /studio/workspace/path?branchId=...` — branch working directory path
+- `GET /studio/workspace/profile?branchId=...` — detected workspace roots/stacks/commands
+- `POST /studio/workspace/profile/rescan?branchId=...` — refresh detected workspace profile
 
 ### Work units
 - `GET /studio/workunits` — list (filter by branch/session)
@@ -209,6 +213,8 @@ segment can never match.
 - `GET /studio/workunits/{id}/intents` — intent graph
 - `GET /studio/workunits/{id}/conflict-report` — merge conflict report (Reviewing status)
 - `GET /studio/workunits/{id}/proposal-dag` — proposal/branch/reconciliation DAG
+- `POST /studio/workunits/{id}/cancel` — cancel a work unit
+- `POST /studio/stop-all` — stop all active agents/work units
 
 ### Tasks
 - `GET /studio/tasks` (list) · `GET /studio/tasks/{id}` (get) · `POST /studio/tasks` (create) · `PUT /studio/tasks/{id}` (update) · `POST /studio/tasks/{id}/assign` (assign)
@@ -245,7 +251,9 @@ segment can never match.
 - `GET /studio/agent-profiles` (list) · `GET /studio/agent-profiles/{id}` (get) · `POST` (create) · `PUT /studio/agent-profiles/{id}` (update)
 
 ### Scheduler
-- `GET /studio/scheduler/pending` · `POST /studio/scheduler/enqueue`
+- `GET /studio/scheduler/pending` · `GET /studio/scheduler/awaiting-resume`
+- `POST /studio/scheduler/{workUnitId}/resume` · `POST /studio/scheduler/resume-all`
+- `POST /studio/scheduler/enqueue`
 
 ### Sessions
 - `GET/POST /studio/sessions` · `GET /studio/sessions/{id}` · `POST /studio/sessions/{id}/pause|resume|abandon` · `GET /studio/sessions/{id}/workunits` · `POST /studio/sessions/{id}/branch`
@@ -318,9 +326,10 @@ auto-enqueue both call this).
 `workunits/{id}/conflict-report`, `workunits/{id}/artifacts`.
 
 ### Used by agents only (via MCP, in-process) — no extension UI button calls these directly
-`workspace/{branchId}/build|test|exec|run` (the extension's "Require build/test before proposal"
+`/studio/workspace/build|test|exec|run|run/stop?branchId=...` (the extension's "Require build/test before proposal"
 checkboxes configure a *server-side policy gate* that runs these automatically when a proposal is
-created — there's no manual "run build now" button), `artifact` record/query/list (generic),
+created — there's no manual "run build now" button), `workspace/profile` + `workspace/profile/rescan`
+(agents use these to detect roots/commands), `artifact` record/query/list (generic),
 `intent_record`, `snapshot_get`, `task_*` (the extension never does direct task CRUD — tasks are an
 agent-internal intent-tracking primitive), `branch_create`/`branch_list` (the extension manages
 branches implicitly; it never lists raw branches).

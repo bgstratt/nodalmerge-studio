@@ -155,7 +155,7 @@ Agents receive compact projections — not full DAG history. Projections compres
 
 ### MCP-Native
 
-Full MCP v1 tool surface with 30+ frozen tool names under `nm.v1.*` namespaces. Integrate any MCP-compatible client with the Studio host.
+Full MCP v1 tool surface with 66 frozen tool names under `nm_v1_*` namespaces. Integrate any MCP-compatible client with the Studio host.
 
 ---
 
@@ -356,7 +356,7 @@ Define reusable orchestrator + worker team compositions:
 
 ## MCP Integration
 
-NodalMerge Studio exposes a frozen MCP v1 tool surface with **63 tools** across 19 namespaces. All tools use the `nm_v1_*` namespace (unchanged since plan slice 1; canonical constants in `McpToolNames`).
+NodalMerge Studio exposes a frozen MCP v1 tool surface with **66 tools** across 19 namespaces. All tools use the `nm_v1_*` namespace (unchanged since plan slice 1; canonical constants in `McpToolNames`).
 
 ### Tool Namespaces
 
@@ -371,7 +371,7 @@ NodalMerge Studio exposes a frozen MCP v1 tool surface with **63 tools** across 
 | `nm_v1_state_*` | Known good state | `markKnownGood`, `findKnownGood`, `checkoutKnownGood` |
 | `nm_v1_snapshot_*` | Execution snapshots | `get`, `compare` |
 | `nm_v1_agent_*` | Agent lifecycle | `spawn`, `pause`, `resume`, `status`, `stop` |
-| `nm_v1_workspace_*` | Control tower summary + file I/O + build/test/run execution | `summary`, `read`/`write`, `build`/`test`/`exec`/`run` |
+| `nm_v1_workspace_*` | Control tower summary + file I/O + build/test/run execution + workspace profile | `summary`, `read`/`write`, `build`/`test`/`exec`/`run`/`run_stop`, `profile_get`/`profile_rescan` |
 | `nm_v1_scheduler_*` | Work queue | `enqueue`, `pending` |
 | `nm_v1_artifact_*` | Knowledge artifacts | `record`, `query`, `list` |
 | `nm_v1_goal_*` | Decision-centric goal nodes | `create`, `list` |
@@ -379,6 +379,7 @@ NodalMerge Studio exposes a frozen MCP v1 tool surface with **63 tools** across 
 | `nm_v1_evidence_*` | Build/test evidence attachment | `attach`, `list` |
 | `nm_v1_trajectory_*` | Lifecycle phase tracking + replay | `create`, `replay` |
 | `nm_v1_hypothesis_*` | Hypothesis forks | `fork`, `list` |
+| `nm_v1_reasoning_*` | Reasoning commit log | `record` |
 | `nm_v1_model_*` | Cross-model comparison | `compare`, `replay` |
 
 **Phase 7 capabilities (Experiments, Steering, Counterfactuals, Review Policy, Promotion Branches) are REST-only** — they don't have dedicated `nm_v1_*` tools yet. See [docs/reference/api-reference.md](docs/reference/api-reference.md) for the full tool-by-tool catalog, which REST endpoints exist for each, and which tools are actually reachable by autonomous agents versus external MCP clients only.

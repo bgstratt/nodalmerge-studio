@@ -25,7 +25,7 @@ The MCP contract is the stable operating-system API for Studio:
 
 | Document | Purpose |
 |----------|---------|
-| [mcp-v1-contract.md](./mcp-v1-contract.md) | Frozen MCP tool surface (`nm.v1.*`) |
+| [mcp-v1-contract.md](./mcp-v1-contract.md) | Frozen MCP tool surface (`nm_v1_*`) |
 | [projection-v1-contract.md](./projection-v1-contract.md) | Projection types, levels, payload shapes |
 | [../architecture/crdt-vs-cognition-layer.md](../architecture/crdt-vs-cognition-layer.md) | CRDT substrate vs agent cognition layer |
 | [../architecture/v1-architecture-spec.md](../architecture/v1-architecture-spec.md) | Product architecture (the "what") |
@@ -43,8 +43,8 @@ The MCP contract is the stable operating-system API for Studio:
 
 ## Versioning rules
 
-1. MCP tool names use the `nm.v1.*` prefix and are frozen in `McpToolNames`.
-2. Breaking changes require `nm.v2.*` — do not rename v1 tools.
+1. MCP tool names use the `nm_v1_*` prefix and are frozen in `McpToolNames`.
+2. Breaking changes require `nm_v2_*` — do not rename v1 tools.
 3. Non-breaking additions may extend v1 with new tools only when backward compatible.
 4. Typed MCP DTOs live under `NodalMerge.Studio.Contracts.Mcp.*` and should match the markdown contract.
 

@@ -62,6 +62,7 @@ public class FanOutConcurrencyTests
     {
         var app = StudioWebApplication.Build(
             [],
+            llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services =>
             {
                 services.AddInMemoryStorage();

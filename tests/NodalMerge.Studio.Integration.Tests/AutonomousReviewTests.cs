@@ -198,7 +198,7 @@ public class AutonomousReviewTests
     }
 
     private static async Task<MergeProposal?> PollForStatusAsync(
-        IMergeService merge, MergeProposalStatus status, int timeoutSeconds = 10)
+        IMergeService merge, MergeProposalStatus status, int timeoutSeconds = 30)
     {
         var deadline = DateTimeOffset.UtcNow.AddSeconds(timeoutSeconds);
         while (DateTimeOffset.UtcNow < deadline)

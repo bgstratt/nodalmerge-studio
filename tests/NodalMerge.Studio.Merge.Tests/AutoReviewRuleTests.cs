@@ -169,5 +169,8 @@ public class AutoReviewRuleTests
 
         public Task<ReviewTimer?> GetAsync(string proposalId, CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<IReadOnlyList<ReviewTimer>> ListPendingAsync(string? workUnitId = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ReviewTimer>>([]);
     }
 }

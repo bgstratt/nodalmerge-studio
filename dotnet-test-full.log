@@ -1,0 +1,54 @@
+  Determining projects to restore...
+C:\Users\bgstr\source\repos\nodalmerge\nodalmerge-host\src\NodalMerge.DotNetHost\NodalMerge.DotNetHost.csproj : warning NU1903: Package 'SQLitePCLRaw.lib.e_sqlite3' 2.1.10 has a known high severity vulnerability, https://github.com/advisories/GHSA-2m69-gcr7-jv3q [C:\Users\bgstr\source\repos\nodalmerge-studio\NodalMerge.Studio.slnx]
+C:\Users\bgstr\source\repos\nodalmerge\nodalmerge-host\src\NodalMerge.Host.Composition\NodalMerge.Host.Composition.csproj : warning NU1903: Package 'SQLitePCLRaw.lib.e_sqlite3' 2.1.10 has a known high severity vulnerability, https://github.com/advisories/GHSA-2m69-gcr7-jv3q [C:\Users\bgstr\source\repos\nodalmerge-studio\NodalMerge.Studio.slnx]
+  All projects are up-to-date for restore.
+  NodalMerge.Studio.Contracts -> C:\Users\bgstr\source\repos\nodalmerge-studio\src\NodalMerge.Studio.Contracts\bin\Debug\net10.0\NodalMerge.Studio.Contracts.dll
+  NodalMerge.Studio.Core -> C:\Users\bgstr\source\repos\nodalmerge-studio\src\NodalMerge.Studio.Core\bin\Debug\net10.0\NodalMerge.Studio.Core.dll
+  NodalMerge.Studio.Contracts.Tests -> C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Contracts.Tests\bin\Debug\net10.0\NodalMerge.Studio.Contracts.Tests.dll
+Test run for C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Contracts.Tests\bin\Debug\net10.0\NodalMerge.Studio.Contracts.Tests.dll (.NETCoreApp,Version=v10.0)
+  NodalMerge.Studio.Storage -> C:\Users\bgstr\source\repos\nodalmerge-studio\src\NodalMerge.Studio.Storage\bin\Debug\net10.0\NodalMerge.Studio.Storage.dll
+  NodalMerge.Studio.Core.Tests -> C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Core.Tests\bin\Debug\net10.0\NodalMerge.Studio.Core.Tests.dll
+A total of 1 test files matched the specified pattern.
+Test run for C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Core.Tests\bin\Debug\net10.0\NodalMerge.Studio.Core.Tests.dll (.NETCoreApp,Version=v10.0)
+  NodalMerge.Studio.Tasks -> C:\Users\bgstr\source\repos\nodalmerge-studio\src\NodalMerge.Studio.Tasks\bin\Debug\net10.0\NodalMerge.Studio.Tasks.dll
+  NodalMerge.Studio.Projections -> C:\Users\bgstr\source\repos\nodalmerge-studio\src\NodalMerge.Studio.Projections\bin\Debug\net10.0\NodalMerge.Studio.Projections.dll
+  NodalMerge.Studio.Merge -> C:\Users\bgstr\source\repos\nodalmerge-studio\src\NodalMerge.Studio.Merge\bin\Debug\net10.0\NodalMerge.Studio.Merge.dll
+A total of 1 test files matched the specified pattern.
+  NodalMerge.Studio.Orchestrator -> C:\Users\bgstr\source\repos\nodalmerge-studio\src\NodalMerge.Studio.Orchestrator\bin\Debug\net10.0\NodalMerge.Studio.Orchestrator.dll
+  NodalMerge.Studio.Merge.Tests -> C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Merge.Tests\bin\Debug\net10.0\NodalMerge.Studio.Merge.Tests.dll
+Test run for C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Merge.Tests\bin\Debug\net10.0\NodalMerge.Studio.Merge.Tests.dll (.NETCoreApp,Version=v10.0)
+  NodalMerge.Studio.Projections.Tests -> C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Projections.Tests\bin\Debug\net10.0\NodalMerge.Studio.Projections.Tests.dll
+Test run for C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Projections.Tests\bin\Debug\net10.0\NodalMerge.Studio.Projections.Tests.dll (.NETCoreApp,Version=v10.0)
+  NodalMerge.Studio.Tasks.Tests -> C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Tasks.Tests\bin\Debug\net10.0\NodalMerge.Studio.Tasks.Tests.dll
+Test run for C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Tasks.Tests\bin\Debug\net10.0\NodalMerge.Studio.Tasks.Tests.dll (.NETCoreApp,Version=v10.0)
+  NodalMerge.Studio.AgentRuntime -> C:\Users\bgstr\source\repos\nodalmerge-studio\src\NodalMerge.Studio.AgentRuntime\bin\Debug\net10.0\NodalMerge.Studio.AgentRuntime.dll
+A total of 1 test files matched the specified pattern.
+A total of 1 test files matched the specified pattern.
+A total of 1 test files matched the specified pattern.
+
+Passed!  - Failed:     0, Passed:    11, Skipped:     0, Total:    11, Duration: 72 ms - NodalMerge.Studio.Contracts.Tests.dll (net10.0)
+  NodalMerge.Studio.McpServer -> C:\Users\bgstr\source\repos\nodalmerge-studio\src\NodalMerge.Studio.McpServer\bin\Debug\net10.0\NodalMerge.Studio.McpServer.dll
+C:\Users\bgstr\source\repos\nodalmerge\nodalmerge-host\src\NodalMerge.Host.Composition\NodalMerge.Host.Composition.csproj : warning NU1903: Package 'SQLitePCLRaw.lib.e_sqlite3' 2.1.10 has a known high severity vulnerability, https://github.com/advisories/GHSA-2m69-gcr7-jv3q
+C:\Users\bgstr\source\repos\nodalmerge\nodalmerge-host\src\NodalMerge.DotNetHost\NodalMerge.DotNetHost.csproj : warning NU1903: Package 'SQLitePCLRaw.lib.e_sqlite3' 2.1.10 has a known high severity vulnerability, https://github.com/advisories/GHSA-2m69-gcr7-jv3q
+  NodalMerge.Studio.AgentRuntime.Tests -> C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.AgentRuntime.Tests\bin\Debug\net10.0\NodalMerge.Studio.AgentRuntime.Tests.dll
+Test run for C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.AgentRuntime.Tests\bin\Debug\net10.0\NodalMerge.Studio.AgentRuntime.Tests.dll (.NETCoreApp,Version=v10.0)
+  NodalMerge.Host.Abstractions -> C:\Users\bgstr\source\repos\nodalmerge\nodalmerge-host\src\NodalMerge.Host.Abstractions\bin\Debug\net10.0\NodalMerge.Host.Abstractions.dll
+
+Passed!  - Failed:     0, Passed:    39, Skipped:     0, Total:    39, Duration: 71 ms - NodalMerge.Studio.Core.Tests.dll (net10.0)
+  NodalMerge.Host.Composition -> C:\Users\bgstr\source\repos\nodalmerge\nodalmerge-host\src\NodalMerge.Host.Composition\bin\Debug\net10.0\NodalMerge.Host.Composition.dll
+A total of 1 test files matched the specified pattern.
+  NodalMerge.DotNetHost -> C:\Users\bgstr\source\repos\nodalmerge\nodalmerge-host\src\NodalMerge.DotNetHost\bin\Debug\net10.0\NodalMerge.DotNetHost.dll
+
+Passed!  - Failed:     0, Passed:    11, Skipped:     0, Total:    11, Duration: 119 ms - NodalMerge.Studio.Tasks.Tests.dll (net10.0)
+
+Passed!  - Failed:     0, Passed:    19, Skipped:     0, Total:    19, Duration: 181 ms - NodalMerge.Studio.Projections.Tests.dll (net10.0)
+
+Passed!  - Failed:     0, Passed:    52, Skipped:     0, Total:    52, Duration: 277 ms - NodalMerge.Studio.Merge.Tests.dll (net10.0)
+  NodalMerge.Studio.Host -> C:\Users\bgstr\source\repos\nodalmerge-studio\src\NodalMerge.Studio.Host\bin\Debug\net10.0\NodalMerge.Studio.Host.dll
+
+Passed!  - Failed:     0, Passed:    17, Skipped:     0, Total:    17, Duration: 57 ms - NodalMerge.Studio.AgentRuntime.Tests.dll (net10.0)
+  NodalMerge.Studio.Integration.Tests -> C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Integration.Tests\bin\Debug\net10.0\NodalMerge.Studio.Integration.Tests.dll
+Test run for C:\Users\bgstr\source\repos\nodalmerge-studio\tests\NodalMerge.Studio.Integration.Tests\bin\Debug\net10.0\NodalMerge.Studio.Integration.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+
+Passed!  - Failed:     0, Passed:   194, Skipped:     0, Total:   194, Duration: 43 s - NodalMerge.Studio.Integration.Tests.dll (net10.0)

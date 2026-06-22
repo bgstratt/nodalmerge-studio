@@ -1,6 +1,6 @@
 # MCP v1 contract (frozen)
 
-Status: **Frozen for implementation** — updated for Phase 6.5 (command-surface hardening) + Phase 6.6 (workspace execution)
+Status: **Frozen for implementation** — updated for Phase 6.5 (command-surface hardening), Phase 6.6 (workspace execution), and Phase 9 workspace execution/profile parity additions
 
 > **Note:** This document predates Phase 6.7+ and Phase 7. It does not cover the `goal`, `decision`,
 > `evidence`, `trajectory`, `hypothesis`, `reasoning`, or `model` tool namespaces (all already in
@@ -179,8 +179,11 @@ nm_v1_artifact_*
 | `nm_v1_workspace_test` | Run tests on a branch (parses dotnet/cargo/pytest/go output) |
 | `nm_v1_workspace_exec` | Run build + test + lint on a branch with full `WorkspaceExecutionRequest` |
 | `nm_v1_workspace_run` | Run the application in the branch (e.g., `dotnet run`) |
+| `nm_v1_workspace_run_stop` | Stop a process started by `nm_v1_workspace_run` |
 | `nm_v1_workspace_exec_status` | Query latest persisted execution result for a branch |
 | `nm_v1_workspace_path` | Get branch working directory filesystem path |
+| `nm_v1_workspace_profile_get` | Get detected workspace profile (roots, stacks, resolved commands) for a branch |
+| `nm_v1_workspace_profile_rescan` | Re-scan and refresh detected workspace profile for a branch |
 
 ---
 
@@ -474,13 +477,16 @@ Every MCP tool has a corresponding REST endpoint via the Studio Host. The mappin
 
 | MCP Tool | REST Endpoint |
 |----------|--------------|
-| `nm_v1_workspace_build` | `POST /studio/workspace/{branchId}/build` |
-| `nm_v1_workspace_test` | `POST /studio/workspace/{branchId}/test` |
-| `nm_v1_workspace_exec` | `POST /studio/workspace/{branchId}/exec` |
-| `nm_v1_workspace_run` | `POST /studio/workspace/{branchId}/run` |
-| `nm_v1_workspace_exec_status` | `GET /studio/workspace/{branchId}/exec/latest` |
-| `nm_v1_workspace_path` | `GET /studio/workspace/{branchId}/path` |
-| Output download (16m) | `GET /studio/workspace/{branchId}/exec/{resultId}/output` |
+| `nm_v1_workspace_build` | `POST /studio/workspace/build?branchId=...` |
+| `nm_v1_workspace_test` | `POST /studio/workspace/test?branchId=...` |
+| `nm_v1_workspace_exec` | `POST /studio/workspace/exec?branchId=...` |
+| `nm_v1_workspace_run` | `POST /studio/workspace/run?branchId=...` |
+| `nm_v1_workspace_run_stop` | `POST /studio/workspace/run/stop?branchId=...` |
+| `nm_v1_workspace_exec_status` | `GET /studio/workspace/exec/latest?branchId=...` |
+| `nm_v1_workspace_path` | `GET /studio/workspace/path?branchId=...` |
+| `nm_v1_workspace_profile_get` | `GET /studio/workspace/profile?branchId=...` |
+| `nm_v1_workspace_profile_rescan` | `POST /studio/workspace/profile/rescan?branchId=...` |
+| Output download (16m) | `GET /studio/workspace/exec/output?branchId=...&resultId=...` |
 
 ---
 
@@ -488,5 +494,5 @@ Every MCP tool has a corresponding REST endpoint via the Studio Host. The mappin
 
 * Raw DAG node CRUD
 * Vector DB / agent memory stores
-* Agent-controlled merges without human review
+* Agent-controlled merges without explicit per-goal review-policy opt-in
 * Unversioned tool names
