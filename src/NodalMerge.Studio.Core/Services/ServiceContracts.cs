@@ -17,6 +17,12 @@ public interface IProjectionManager
         ProjectionType type,
         ProjectionLevel targetLevel,
         CancellationToken cancellationToken = default);
+
+    // Slice — LLM scan context. Assembles the bounded text sent to the model: the current
+    // RunRetrospective stats plus a capped sample of rejection/steering/review-note free text.
+    // Lives here (not in Host) because every data source it needs is already a ProjectionManager
+    // dependency.
+    Task<string> BuildInsightScanContextAsync(CancellationToken cancellationToken = default);
 }
 
 public interface ITaskService
@@ -477,6 +483,43 @@ public interface IArtifactLineageService
     Task<ArtifactRef> UpdateStatusAsync(string artifactId, ArtifactStatus status, CancellationToken ct = default);
 
     Task<ArtifactRef> ReparentAsync(string artifactId, string newParentArtifactId, CancellationToken ct = default);
+
+    // Slice — Knowledge Promotion. Constraint artifacts with no owning work unit are durable,
+    // workspace-wide guidance (promoted Findings), distinct from the per-work-unit Constraint
+    // artifacts an agent records via nm_v1_artifact_record. GetChainAsync intentionally excludes
+    // these since it only indexes work-unit-owned artifacts.
+    Task<IReadOnlyList<ArtifactRef>> GetGlobalConstraintsAsync(CancellationToken ct = default);
+}
+
+// Slice — Knowledge Promotion. Review lifecycle for Findings detected by either the deterministic
+// or LLM scan (Insights tab). Modeled on IMergeService's Propose/Review shape, simplified since
+// there's no build/apply step — promotion's durable effect happens inside ReviewAsync itself.
+public interface IFindingService
+{
+    Task<Finding> ProposeAsync(Finding finding, CancellationToken ct = default);
+
+    Task<Finding?> GetAsync(string findingId, CancellationToken ct = default);
+
+    Task<IReadOnlyList<Finding>> ListAsync(CancellationToken ct = default);
+
+    /// <summary>decision must be Promoted, Dismissed, or Investigating — Open is the initial state
+    /// only, never a review outcome.</summary>
+    Task<Finding> ReviewAsync(
+        string findingId, FindingStatus decision, string? notes = null, CancellationToken ct = default);
+}
+
+// Slice — LLM scan. A second, independent Finding detector (alongside FindingDetectorService's
+// deterministic rules) that calls a real model with the user's own credentials. Lives behind this
+// interface because the concrete LLM-calling machinery (LlmClient) is internal to AgentRuntime —
+// same split as every other cross-project service here (public contract in Core, implementation in
+// the owning project).
+public sealed record InsightLlmScanRequest(string Provider, string Model, string BaseUrl, string ApiKey, string ContextText);
+
+public sealed record LlmFindingSuggestion(string Title, string Summary);
+
+public interface IInsightLlmAnalyzerService
+{
+    Task<IReadOnlyList<LlmFindingSuggestion>> AnalyzeAsync(InsightLlmScanRequest request, CancellationToken ct = default);
 }
 
 public interface IFanOutService

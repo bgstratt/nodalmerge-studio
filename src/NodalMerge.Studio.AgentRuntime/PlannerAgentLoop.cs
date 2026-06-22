@@ -15,7 +15,8 @@ internal sealed class PlannerAgentLoop(
     AgentProfile? profile = null,
     string? sessionId = null,
     Action<string?>? onActivity = null,
-    string? ruleFileContext = null)
+    string? ruleFileContext = null,
+    string? constraintsContext = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -70,6 +71,8 @@ internal sealed class PlannerAgentLoop(
     public async Task<AgentLoopCompletion> RunAsync(CancellationToken ct)
     {
         var kickoff = $"Plan work unit {workUnitId}. Your agent ID is {agentId}. Write plan.json when done.";
+        if (constraintsContext is not null)
+            kickoff += "\n\n" + constraintsContext;
         if (ruleFileContext is not null)
             kickoff += "\n\n" + ruleFileContext;
 

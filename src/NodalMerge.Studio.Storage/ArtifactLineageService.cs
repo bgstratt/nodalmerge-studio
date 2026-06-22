@@ -94,6 +94,13 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
         return updated;
     }
 
+    public Task<IReadOnlyList<ArtifactRef>> GetGlobalConstraintsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ArtifactRef>>(
+            _byId.Values
+                .Where(a => a.OwnedByWorkUnitId is null && a.Type == ArtifactType.Constraint)
+                .OrderBy(a => a.CreatedAt)
+                .ToList());
+
     public async Task RehydrateAsync(CancellationToken ct = default)
     {
         var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.ArtifactRefV1, ct).ConfigureAwait(false);

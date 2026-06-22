@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import type { MergeProposal } from './MergeReviewPanel';
 import type { NotificationManager } from '../NotificationManager';
 import type { AgentConfigService } from '../AgentConfigService';
+import { resolveRepositoryPath } from '../repositoryPath';
 import { scopeViewCss, wrapViewScript } from './sharedWebviewChrome';
 
 const POLL_INTERVAL_MS = 2_000;
@@ -49,6 +50,12 @@ interface DeadLetterEntry {
   attemptCount: number;
   occurredAt: string;
   maxAttemptsReached: boolean;
+}
+
+interface FindingSignal {
+  findingId: string;
+  title: string;
+  status: string;
 }
 
 // ── Panel ──────────────────────────────────────────────────────────────────
@@ -144,7 +151,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
     try {
       const sessionId = this.getEffectiveSessionId();
       const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
-      const [summary, workUnits, agents, awaitingResume, merges, deadLetters, opts] = await Promise.all([
+      const [summary, workUnits, agents, awaitingResume, merges, deadLetters, opts, findings] = await Promise.all([
         this.get<WorkspaceSummary>('/studio/workspace-summary' + params),
         this.get<WorkUnit[]>('/studio/workunits' + params),
         this.get<AgentInfo[]>('/studio/agents?all=true' + (sessionId ? '&sessionId=' + encodeURIComponent(sessionId) : '')),
@@ -152,6 +159,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
         this.get<MergeProposal[]>('/studio/merges' + params),
         this.get<DeadLetterEntry[]>('/studio/dead-letter' + params),
         this.get<{ usePromotionBranch?: boolean; candidateBranchId?: string }>('/studio/options'),
+        this.get<FindingSignal[]>('/studio/findings?status=Open'),
       ]);
       this.usePromotionBranch = opts.usePromotionBranch ?? false;
       void this.panel.webview.postMessage({
@@ -159,7 +167,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
         usePromotionBranch: this.usePromotionBranch,
         candidateBranchId: opts.candidateBranchId ?? 'candidate',
       });
-      this.notifications?.update(merges, workUnits);
+      this.notifications?.update(merges, workUnits, findings);
     } catch {
       // host not yet ready — suppress until healthy
     }
@@ -206,7 +214,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
             bypassPromotionBranch = targetPick.value === 'direct';
           }
 
-          const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+          const repositoryPath = resolveRepositoryPath();
           await this.post('/studio/workunits', {
             goal, owner,
             reviewPolicy: reviewPolicyPick.value,

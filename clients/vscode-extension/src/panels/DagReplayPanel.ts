@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { resolveRepositoryPath } from '../repositoryPath';
 import { scopeViewCss } from './sharedWebviewChrome';
 
 const POLL_INTERVAL_MS = 2_000;
@@ -195,7 +196,7 @@ export class TrajectoryReplayPanel {
       });
       if (!goal) { return; }
       try {
-        const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+        const repositoryPath = resolveRepositoryPath();
         const sourceBranchId = msg.sourceBranchId as string | undefined;
         const wu = await this.post<WorkUnit>('/studio/workunits', {
           goal, owner: 'user',

@@ -20,6 +20,7 @@ public enum ProjectionType
     ReasoningCommitGraph,
     DecisionContext,
     CounterfactualComparison,
+    RunRetrospective,
 }
 
 public enum ProjectionLevel
@@ -35,7 +36,10 @@ public sealed record ProjectionRequest(
     ProjectionLevel Level,
     string? WorkUnitId = null,
     string? BranchId = null,
-    string? AgentId = null);
+    string? AgentId = null,
+    // RunRetrospective-only — every other handler ignores these. Null = all-time.
+    DateTimeOffset? Since = null,
+    DateTimeOffset? Until = null);
 
 public sealed record ProjectionResult(
     ProjectionType Type,
@@ -273,6 +277,85 @@ public sealed record CounterfactualComparisonProposal(
     double? Confidence,
     IReadOnlyList<string> FilesTouched,
     string? DiffSummary);
+
+/// <summary>
+/// RunRetrospective projection — analytics dashboard for the Insights tab. Aggregates outcomes
+/// across the entire DAG history (all work units/proposals/decisions/sessions), computed fresh on
+/// every request — there is no scheduled or background trigger, only the user-initiated "Run
+/// Analysis" action. Each stat list below is deliberately a flat row shape so a future phase could
+/// promote an individual row into a reviewable "Insight" finding without reshaping this payload.
+/// </summary>
+public sealed record RunRetrospectiveProjectionPayload(
+    DateTimeOffset? Since,
+    DateTimeOffset? Until,
+    int TotalSessions,
+    IReadOnlyDictionary<string, int> SessionsByStatus,
+    int TotalWorkUnits,
+    IReadOnlyDictionary<string, int> WorkUnitsByStatus,
+    double OverallSuccessRate,
+    double AverageReworkCycles,
+    FailureCauseStat? TopFailureCause,
+    ModelPerformanceStat? MostSuccessfulModel,
+    ForkWinRateStat? MostSuccessfulStrategy,
+    IReadOnlyList<ModelPerformanceStat> ModelPerformance,
+    IReadOnlyList<ModelStagePerformanceStat> ModelPerformanceByStage,
+    IReadOnlyList<ForkWinRateStat> ForkWinRates,
+    IReadOnlyList<ForkConstraintWinRateStat> ForkConstraintWinRates,
+    IReadOnlyList<FailureCauseStat> FailureCauses,
+    IReadOnlyList<ReviewOutcomeStat> ReviewOutcomes,
+    DateTimeOffset GeneratedAt);
+
+public sealed record ModelPerformanceStat(
+    string Model,
+    string? Provider,
+    int ProposalCount,
+    int MergedCount,
+    int RejectedCount,
+    double AcceptanceRate,
+    double? AvgConfidence);
+
+public sealed record ForkWinRateStat(
+    string ForkType,
+    int TotalForks,
+    int Wins,
+    int Losses,
+    int Pending,
+    double WinRate);
+
+/// <summary>Stage is resolved heuristically from WorkUnit.Owner — when a work unit was created via
+/// a strategy/template, Owner is the orchestrating AgentProfile's id; rows where Owner doesn't match
+/// a known profile (e.g. "user") are excluded rather than mislabeled.</summary>
+public sealed record ModelStagePerformanceStat(
+    string Model,
+    string Stage,
+    int ProposalCount,
+    int MergedCount,
+    int RejectedCount,
+    double AcceptanceRate);
+
+/// <summary>Sub-bucket of an Architecture/Library/Product fork by the specific constraint text the
+/// fork was created with (e.g. "Mapster" vs "AutoMapper") — sourced from the structured
+/// WorkUnit.Metadata key ExperimentService stores per fork type, not free-text parsing.</summary>
+public sealed record ForkConstraintWinRateStat(
+    string ForkType,
+    string Constraint,
+    int TotalForks,
+    int Wins,
+    int Losses,
+    int Pending,
+    double WinRate);
+
+/// <summary>Category is one of: ExecutionFailure, AutomatedReviewRejection, HumanReviewRejection —
+/// sourced from WorkUnit.ExecutionInfo's typed counters rather than free-text evidence parsing.</summary>
+public sealed record FailureCauseStat(
+    string Category,
+    int TotalCount,
+    int WorkUnitsAffected);
+
+public sealed record ReviewOutcomeStat(
+    string Outcome,
+    int Count,
+    double? AvgConfidence);
 
 public static class ProjectionCatalog
 {

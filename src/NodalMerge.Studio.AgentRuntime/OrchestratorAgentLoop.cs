@@ -103,6 +103,12 @@ internal sealed class OrchestratorAgentLoop(
                 return AgentLoopCompletion.Stalled;
             }
 
+            // Inherited constraints (global, promoted via Knowledge Promotion, plus this work
+            // unit's own ancestor chain) rarely change mid-run — fold them into the kickoff message
+            // once rather than repeating them every cycle alongside the delta.
+            if (i == 0 && currentProjection.InheritedConstraints.Count > 0)
+                AppendConstraintsToOutgoingMessage(messages, currentProjection.InheritedConstraints);
+
             AppendDeltaToOutgoingMessage(messages, delta);
 
             onActivity?.Invoke("Thinking...");
@@ -219,6 +225,20 @@ internal sealed class OrchestratorAgentLoop(
         IReadOnlyList<NmContent> newContent = last.Content is [NmText only]
             ? [new NmText($"{only.Text}\n\n{deltaText}")]
             : [.. last.Content, new NmText(deltaText)];
+        messages[^1] = last with { Content = newContent };
+    }
+
+    // Promoted Knowledge Findings (and any work-unit-lineage Constraint artifacts) reach the model
+    // here — this was previously computed by the projection but never read by any agent loop.
+    private static void AppendConstraintsToOutgoingMessage(List<NmMessage> messages, IReadOnlyList<ArtifactRef> constraints)
+    {
+        var lines = constraints.Select(c => $"- {c.Title ?? c.ArtifactId}: {c.Body ?? ""}");
+        var text = "[Known constraints — durable guidance from prior runs; apply unless this work unit's goal explicitly says otherwise]\n"
+            + string.Join("\n", lines);
+        var last = messages[^1];
+        IReadOnlyList<NmContent> newContent = last.Content is [NmText only]
+            ? [new NmText($"{only.Text}\n\n{text}")]
+            : [.. last.Content, new NmText(text)];
         messages[^1] = last with { Content = newContent };
     }
 

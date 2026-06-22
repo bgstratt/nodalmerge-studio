@@ -8,6 +8,7 @@ export const COMMANDS = {
   OPEN_STUDIO:        'nodalmerge.openStudio',
   OPEN_MERGE_REVIEW:  'nodalmerge.openMergeReview',
   OPEN_MERGE_REVIEW_CONFLICT: 'nodalmerge.openMergeReviewConflict',
+  OPEN_INSIGHTS:      'nodalmerge.openInsights',
 } as const;
 
 export const HOST_BINARY_NAME = {

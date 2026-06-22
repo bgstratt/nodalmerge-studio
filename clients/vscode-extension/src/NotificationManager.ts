@@ -7,18 +7,35 @@ interface WorkUnitBlockSignal {
   fanOutInfo?: { blockedReason?: string | null } | null;
 }
 
+interface FindingSignal {
+  findingId: string;
+  title: string;
+  status: string;
+}
+
 export class NotificationManager {
   // Track last known status per proposal so we only fire once per transition.
   private readonly seenStatuses = new Map<string, string>();
   // Track last known blocked-reason per work unit so we only fire once per transition.
   private readonly seenBlockedReasons = new Map<string, string | null>();
+  // Track findings we've already notified about so a re-poll while still Open doesn't refire.
+  private readonly seenFindingIds = new Set<string>();
   private readonly onOpenReview: (proposalId: string) => void;
+  private readonly onOpenInsights: () => void;
 
-  constructor(onOpenReview: (proposalId: string) => void) {
+  constructor(onOpenReview: (proposalId: string) => void, onOpenInsights: () => void = () => {}) {
     this.onOpenReview = onOpenReview;
+    this.onOpenInsights = onOpenInsights;
   }
 
-  update(proposals: MergeProposal[], workUnits: WorkUnitBlockSignal[] = []): void {
+  update(proposals: MergeProposal[], workUnits: WorkUnitBlockSignal[] = [], findings: FindingSignal[] = []): void {
+    for (const f of findings) {
+      if (f.status === 'Open' && !this.seenFindingIds.has(f.findingId)) {
+        void this.notifyFindingReady(f);
+      }
+      this.seenFindingIds.add(f.findingId);
+    }
+
     for (const p of proposals) {
       const prev = this.seenStatuses.get(p.proposalId);
       const curr = (p.status ?? '').toLowerCase();
@@ -84,5 +101,16 @@ export class NotificationManager {
     await vscode.window.showWarningMessage(
       'NodalMerge: "' + wu.goal + '" is blocked from starting — ' + blockedReason
     );
+  }
+
+  private async notifyFindingReady(f: FindingSignal): Promise<void> {
+    const action = await vscode.window.showInformationMessage(
+      'NodalMerge: new finding ready for review — "' + f.title + '"',
+      'Open Insights',
+      'Dismiss'
+    );
+    if (action === 'Open Insights') {
+      this.onOpenInsights();
+    }
   }
 }

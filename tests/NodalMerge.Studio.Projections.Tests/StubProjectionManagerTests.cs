@@ -116,6 +116,10 @@ public class ProjectionManagerTests
             Task.FromResult<IReadOnlyList<ArtifactRef>>(
                 _byWorkUnit.TryGetValue(workUnitId, out var list) ? [.. list.OrderBy(a => a.CreatedAt)] : []);
 
+        public Task<IReadOnlyList<ArtifactRef>> GetGlobalConstraintsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ArtifactRef>>(
+                [.. _byId.Values.Where(a => a.OwnedByWorkUnitId is null && a.Type == ArtifactType.Constraint).OrderBy(a => a.CreatedAt)]);
+
         public Task<IReadOnlyList<ArtifactRef>> GetChildrenAsync(string parentArtifactId, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
 

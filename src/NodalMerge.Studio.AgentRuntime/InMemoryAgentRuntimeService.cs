@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
+using NodalMerge.Studio.Contracts.Projections;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Storage;
 
@@ -203,10 +205,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 AgentLoopCompletion completion;
                 if (profile?.Stage == PipelineStage.Plan)
                 {
+                    var constraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var plannerLoop = new PlannerAgentLoop(
                         agentId, item.WorkUnitId, provider, model, baseUrl, apiKey!,
                         dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a),
-                        ruleFileContext);
+                        ruleFileContext, constraintsContext);
                     completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
                 else if (profile?.Stage == PipelineStage.Review)
@@ -645,6 +648,32 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             return null;
         }
     }
+
+    // Promoted Knowledge Findings (global Constraint artifacts, no owning work unit) plus this
+    // work unit's own ancestor-chain constraints — previously computed by AgentWorkspace's
+    // InheritedConstraints field but never read by any agent loop. The orchestrator fetches the
+    // live projection every cycle and folds this in itself; the planner has no projection-fetch
+    // loop of its own, so it's resolved once up front here, same shape as ruleFileContext above.
+    private async Task<string?> BuildConstraintsContextAsync(string workUnitId, CancellationToken ct)
+    {
+        try
+        {
+            var projections = _serviceProvider.GetRequiredService<IProjectionManager>();
+            var result = await projections.GetAsync(
+                new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal, WorkUnitId: workUnitId),
+                ct).ConfigureAwait(false);
+            var payload = JsonSerializer.Deserialize<AgentWorkspaceProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+            if (payload is null || payload.InheritedConstraints.Count == 0) return null;
+
+            var lines = payload.InheritedConstraints.Select(c => $"- {c.Title ?? c.ArtifactId}: {c.Body ?? ""}");
+            return "Known constraints — durable guidance from prior runs; apply unless this work unit's goal explicitly says otherwise:\n"
+                + string.Join("\n", lines);
+        }
+        catch
+        {
+            return null;
+        }
+    }
 }
 
 public static class ServiceCollectionExtensions
@@ -658,6 +687,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<InMemoryAgentRuntimeService>());
         services.AddSingleton<McpToolDispatcher>();
         services.AddSingleton<LlmClient>(_ => new LlmClient(llmHttpClient ?? new HttpClient()));
+        services.AddSingleton<IInsightLlmAnalyzerService, InsightLlmAnalyzerService>();
         services.AddSingleton<IProfileSelectionService, LlmProfileSelectionService>();
         // Slice 20b — inline reviewer for AgentApproval/Hybrid BeforeMerge gate.
         services.AddSingleton<IInlineReviewerService, InlineReviewerService>();

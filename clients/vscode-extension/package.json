@@ -32,6 +32,10 @@
       {
         "command": "nodalmerge.openMergeReviewConflict",
         "title": "NodalMerge: Open Decision Conflict"
+      },
+      {
+        "command": "nodalmerge.openInsights",
+        "title": "NodalMerge: Open Insights"
       }
     ],
     "configuration": {
@@ -46,6 +50,11 @@
           "type": "string",
           "default": "",
           "description": "Where Studio stores branch files, the node-store database, and blobs. Empty (default) uses VS Code's per-workspace extension storage, outside your repository. Set a relative path (e.g. \".nodalmerge\") to store it inside this repo instead, or an absolute path to use a custom location."
+        },
+        "nodalmerge.repositoryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the repository Studio should operate against (seed branches from, build/test/run in). Empty (default) uses the first folder open in this VS Code window. Set this to point Studio at a different checkout than the one currently open."
         },
         "nodalmerge.agentProfiles": {
           "type": "array",

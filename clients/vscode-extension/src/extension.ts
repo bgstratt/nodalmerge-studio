@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { HostManager } from './HostManager';
 import { StudioShellPanel } from './panels/StudioShellPanel';
 import { DecisionConvergencePanel } from './panels/MergeReviewPanel';
+import { InsightsPanel } from './panels/InsightsPanel';
 import { NotificationManager } from './NotificationManager';
 import { AgentConfigService } from './AgentConfigService';
 import { LmApiProxy } from './LmApiProxy';
@@ -83,11 +84,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       shell.showTab(DecisionConvergencePanel.containerId);
       shell.reviewPanel.loadConflict(workUnitId);
     }),
+
+    vscode.commands.registerCommand(COMMANDS.OPEN_INSIGHTS, () => {
+      const shell = StudioShellPanel.createOrShow(
+        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
+      );
+      shell.showTab(InsightsPanel.containerId);
+    }),
   );
 
-  const notificationManager = new NotificationManager((proposalId) => {
-    void vscode.commands.executeCommand(COMMANDS.OPEN_MERGE_REVIEW, proposalId);
-  });
+  const notificationManager = new NotificationManager(
+    (proposalId) => {
+      void vscode.commands.executeCommand(COMMANDS.OPEN_MERGE_REVIEW, proposalId);
+    },
+    () => {
+      void vscode.commands.executeCommand(COMMANDS.OPEN_INSIGHTS);
+    },
+  );
 
   try {
     await manager.start();

@@ -45,6 +45,7 @@ public static class StudioServiceCollectionExtensions
 
         services.AddNodalMergeStorage();
         services.AddStudioProjections();
+        services.AddSingleton<FindingDetectorService>();
         services.AddStudioTasks();
         services.AddStudioMerge();
         services.AddStudioAgentRuntime(llmHttpClient);

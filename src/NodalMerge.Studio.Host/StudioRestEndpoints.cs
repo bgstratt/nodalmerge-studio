@@ -227,6 +227,8 @@ public static class StudioRestEndpoints
         MapExperimentEndpoints(app);
         MapSteeringEndpoints(app);
         MapCounterfactualEndpoints(app);
+        MapFindingEndpoints(app);
+        MapInsightEndpoints(app);
         return app;
     }
 
@@ -1907,6 +1909,8 @@ public static class StudioRestEndpoints
             [FromQuery] string? workUnitId,
             [FromQuery] string? branchId,
             [FromQuery] string? agentId,
+            [FromQuery] string? since,
+            [FromQuery] string? until,
             IProjectionManager projections,
             CancellationToken ct) =>
         {
@@ -1915,11 +1919,19 @@ public static class StudioRestEndpoints
             {
                 return Results.BadRequest(new { error = "Invalid projectionType or projectionLevel." });
             }
+            if (since is not null && !DateTimeOffset.TryParse(since, out _) ||
+                until is not null && !DateTimeOffset.TryParse(until, out _))
+            {
+                return Results.BadRequest(new { error = "Invalid since/until — expected an ISO 8601 timestamp." });
+            }
 
             try
             {
                 var result = await projections.GetAsync(
-                    new ProjectionRequest(type, projectionLevel, workUnitId, branchId, agentId),
+                    new ProjectionRequest(
+                        type, projectionLevel, workUnitId, branchId, agentId,
+                        since is null ? null : DateTimeOffset.Parse(since),
+                        until is null ? null : DateTimeOffset.Parse(until)),
                     ct).ConfigureAwait(false);
 
                 return Results.Ok(new
@@ -2874,6 +2886,112 @@ public static class StudioRestEndpoints
             {
                 return Results.BadRequest(new { error = ex.Message });
             }
+        });
+    }
+
+    // ── /studio/findings — Knowledge Promotion review queue ─────────────────────
+
+    private sealed record ReviewFindingBody(string Decision, string? Notes = null);
+
+    private static void MapFindingEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/findings", async (
+            [FromQuery] string? status,
+            IFindingService findings,
+            CancellationToken ct) =>
+        {
+            var all = await findings.ListAsync(ct).ConfigureAwait(false);
+            if (status is null)
+                return Results.Ok(all);
+
+            if (!Enum.TryParse<FindingStatus>(status, ignoreCase: true, out var parsed))
+                return Results.BadRequest(new { error = "Invalid status." });
+
+            return Results.Ok(all.Where(f => f.Status == parsed).ToList());
+        });
+
+        app.MapPost("/studio/findings/{findingId}/review", async (
+            string findingId,
+            ReviewFindingBody body,
+            IFindingService findings,
+            CancellationToken ct) =>
+        {
+            if (!Enum.TryParse<FindingStatus>(body.Decision, ignoreCase: true, out var decision) ||
+                decision == FindingStatus.Open)
+            {
+                return Results.BadRequest(new { error = "decision must be Promoted, Dismissed, or Investigating." });
+            }
+
+            try
+            {
+                var updated = await findings.ReviewAsync(findingId, decision, body.Notes, ct).ConfigureAwait(false);
+                return Results.Ok(updated);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (NotSupportedException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+    }
+
+    // ── /studio/insights — manual-only detectors (deterministic + LLM scan) ─────────
+
+    private sealed record LlmScanBody(string Provider, string Model, string BaseUrl, string ApiKey);
+
+    private static void MapInsightEndpoints(WebApplication app)
+    {
+        // Deterministic detector — re-runs the heuristic rules over the current RunRetrospective
+        // stats. Never scheduled; only ever triggered by this endpoint, which only the Insights
+        // tab's "Detect Findings" button calls.
+        app.MapPost("/studio/insights/detect-findings", async (
+            FindingDetectorService detector,
+            CancellationToken ct) =>
+        {
+            var created = await detector.DetectDeterministicAsync(ct).ConfigureAwait(false);
+            return Results.Ok(created);
+        });
+
+        // LLM scan — calls a real model using the caller's own credentials (same shape as spawning
+        // an orchestrator). Never chained automatically after the deterministic detector or after
+        // a regular run; only ever triggered by this endpoint, from the Insights tab's
+        // "Run LLM Scan" button.
+        app.MapPost("/studio/insights/llm-scan", async (
+            LlmScanBody body,
+            IProjectionManager projections,
+            IInsightLlmAnalyzerService analyzer,
+            IFindingService findings,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.Provider) || string.IsNullOrWhiteSpace(body.Model) ||
+                string.IsNullOrWhiteSpace(body.BaseUrl) || string.IsNullOrWhiteSpace(body.ApiKey))
+            {
+                return Results.BadRequest(new { error = "provider, model, baseUrl, and apiKey are required." });
+            }
+
+            var contextText = await projections.BuildInsightScanContextAsync(ct).ConfigureAwait(false);
+            var suggestions = await analyzer.AnalyzeAsync(
+                new InsightLlmScanRequest(body.Provider, body.Model, body.BaseUrl, body.ApiKey, contextText), ct)
+                .ConfigureAwait(false);
+
+            var created = new List<Finding>();
+            foreach (var s in suggestions)
+            {
+                created.Add(await findings.ProposeAsync(new Finding(
+                    FindingId: $"finding-{Guid.NewGuid():N}",
+                    Kind: FindingKind.KnowledgeGuideline,
+                    Source: FindingSource.LlmScan,
+                    Title: s.Title,
+                    Summary: s.Summary,
+                    SupportingDataJson: null,
+                    Status: FindingStatus.Open,
+                    CreatedAt: DateTimeOffset.UtcNow), ct).ConfigureAwait(false));
+            }
+
+            return Results.Ok(created);
         });
     }
 }

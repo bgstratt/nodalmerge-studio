@@ -25,6 +25,8 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly ISteeringDecisionService? _steeringDecisions;
     private readonly IFileWorkspaceService? _fileWorkspace;
     private readonly IWorkspaceProfileService? _workspaceProfiles;
+    private readonly IExecutionSessionService? _sessions;
+    private readonly IStudioNodeStore? _nodeStore;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
@@ -39,7 +41,9 @@ public sealed class ProjectionManager : IProjectionManager
         IAgentProfileService? agentProfiles = null,
         ISteeringDecisionService? steeringDecisions = null,
         IFileWorkspaceService? fileWorkspace = null,
-        IWorkspaceProfileService? workspaceProfiles = null)
+        IWorkspaceProfileService? workspaceProfiles = null,
+        IExecutionSessionService? sessions = null,
+        IStudioNodeStore? nodeStore = null)
     {
         _workUnits          = workUnits;
         _tasks              = tasks;
@@ -54,6 +58,8 @@ public sealed class ProjectionManager : IProjectionManager
         _steeringDecisions  = steeringDecisions;
         _fileWorkspace      = fileWorkspace;
         _workspaceProfiles  = workspaceProfiles;
+        _sessions           = sessions;
+        _nodeStore          = nodeStore;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -73,6 +79,7 @@ public sealed class ProjectionManager : IProjectionManager
             ProjectionType.ReasoningCommitGraph => await BuildReasoningCommitGraphAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.DecisionContext => await BuildDecisionContextAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.CounterfactualComparison => await BuildCounterfactualComparisonAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.RunRetrospective => await BuildRunRetrospectiveAsync(request, cancellationToken).ConfigureAwait(false),
             _ => throw new ArgumentOutOfRangeException(nameof(request), request.Type, "Unknown projection type.")
         };
 
@@ -84,6 +91,53 @@ public sealed class ProjectionManager : IProjectionManager
         ProjectionLevel targetLevel,
         CancellationToken cancellationToken = default) =>
         GetAsync(new ProjectionRequest(type, targetLevel), cancellationToken);
+
+    // Capped deliberately — this text goes straight into a real, paid LLM call per click, not free
+    // heuristics. ~30 text samples and a fixed overall character ceiling keep token usage bounded
+    // regardless of how much history has accumulated.
+    private const int MaxScanTextSamples = 30;
+    private const int MaxScanContextChars = 6_000;
+
+    public async Task<string> BuildInsightScanContextAsync(CancellationToken cancellationToken = default)
+    {
+        var retroJson = await BuildRunRetrospectiveAsync(
+            new ProjectionRequest(ProjectionType.RunRetrospective, ProjectionLevel.Normal), cancellationToken)
+            .ConfigureAwait(false);
+
+        var samples = new List<string>();
+
+        if (_nodeStore is not null)
+        {
+            var decisionRecords = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.DecisionV1, cancellationToken).ConfigureAwait(false);
+            samples.AddRange(decisionRecords
+                .Select(r => JsonSerializer.Deserialize<DecisionNode>(r.PayloadJson))
+                .Where(d => d is not null && d.Outcome == DecisionOutcome.Rejected && !string.IsNullOrWhiteSpace(d.Rationale))
+                .OrderByDescending(d => d!.DecidedAt)
+                .Take(MaxScanTextSamples)
+                .Select(d => $"[rejection rationale] {d!.Rationale}"));
+
+            var steeringRecords = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.SteeringDecisionV1, cancellationToken).ConfigureAwait(false);
+            samples.AddRange(steeringRecords
+                .Select(r => JsonSerializer.Deserialize<SteeringDecision>(r.PayloadJson))
+                .Where(s => s is not null && !string.IsNullOrWhiteSpace(s.InjectedConstraint))
+                .OrderByDescending(s => s!.SteeredAt)
+                .Take(MaxScanTextSamples)
+                .Select(s => $"[human steering note] {s!.InjectedConstraint}"));
+        }
+
+        var proposals = await _merges.ListAsync(sourceBranch: null, cancellationToken).ConfigureAwait(false);
+        samples.AddRange(proposals
+            .Where(p => p.Status == MergeProposalStatus.Rejected && !string.IsNullOrWhiteSpace(p.ReviewNotes))
+            .Take(MaxScanTextSamples)
+            .Select(p => $"[review note] {p.ReviewNotes}"));
+
+        var contextText = $"[Aggregate statistics]\n{retroJson}\n\n[Sampled history — up to {MaxScanTextSamples} entries per category]\n"
+            + string.Join("\n", samples);
+
+        return contextText.Length > MaxScanContextChars
+            ? contextText[..MaxScanContextChars] + "\n...[truncated]"
+            : contextText;
+    }
 
     private async Task<string> BuildWorkUnitAsync(ProjectionRequest request, CancellationToken ct)
     {
@@ -273,7 +327,12 @@ public sealed class ProjectionManager : IProjectionManager
         combined.AddRange(ancestorChain);
         combined.AddRange(enriched);
 
-        var inheritedConstraints = ancestorChain.Where(a => a.Type == ArtifactType.Constraint).ToList();
+        // Global constraints (promoted Knowledge Findings, no owning work unit) apply to every
+        // work unit regardless of lineage — folded in ahead of the ancestor-chain ones.
+        var globalConstraints = await _artifactLineage.GetGlobalConstraintsAsync(ct).ConfigureAwait(false);
+        var inheritedConstraints = globalConstraints
+            .Concat(ancestorChain.Where(a => a.Type == ArtifactType.Constraint))
+            .ToList();
 
         WorkUnit? wu = null;
         if (_executionCommands is not null || _workspaceProfiles is not null)
@@ -883,6 +942,243 @@ public sealed class ProjectionManager : IProjectionManager
 
         return Serialize(payload);
     }
+
+    // Manual-only analytics dashboard for the Insights tab — computed fresh from the full DAG
+    // history on every request, never on a schedule. Terminal WorkUnitStatus values (Merged,
+    // Failed, DeadLettered, Cancelled) are treated as "decided"; everything else (Created, Active,
+    // Waiting, Queued, Executing, Proposed, Reviewing, Retrying) is still in flight and excluded
+    // from the success-rate denominator.
+    private async Task<string> BuildRunRetrospectiveAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        var allWorkUnits = await _workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+        var allProposals = await _merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+        var allSessions = _sessions is not null
+            ? await _sessions.ListAsync(ct).ConfigureAwait(false)
+            : [];
+
+        var workUnits = allWorkUnits
+            .Where(w => InRange(w.CreatedAt, request.Since, request.Until))
+            .ToList();
+        var workUnitsById = workUnits.ToDictionary(w => w.WorkUnitId);
+
+        // A proposal has no CreatedAt of its own — date-range filtering goes through its work unit.
+        // Unfiltered (the common case) keeps every proposal, including ones with no WorkUnitId.
+        var proposals = (request.Since is null && request.Until is null)
+            ? allProposals
+            : allProposals.Where(p => p.WorkUnitId is not null && workUnitsById.ContainsKey(p.WorkUnitId)).ToList();
+
+        var sessions = allSessions
+            .Where(s => InRange(s.StartedAt, request.Since, request.Until))
+            .ToList();
+
+        var workUnitsByStatus = workUnits
+            .GroupBy(w => w.Status.ToString())
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var mergedCount = workUnitsByStatus.GetValueOrDefault(WorkUnitStatus.Merged.ToString());
+        var failedCount = workUnitsByStatus.GetValueOrDefault(WorkUnitStatus.Failed.ToString());
+        var deadLetteredCount = workUnitsByStatus.GetValueOrDefault(WorkUnitStatus.DeadLettered.ToString());
+        var cancelledCount = workUnitsByStatus.GetValueOrDefault(WorkUnitStatus.Cancelled.ToString());
+        var decidedCount = mergedCount + failedCount + deadLetteredCount + cancelledCount;
+        var overallSuccessRate = decidedCount == 0 ? 0d : (double)mergedCount / decidedCount;
+
+        var sessionsByStatus = sessions
+            .GroupBy(s => s.Status.ToString())
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var modelPerformance = proposals
+            .Where(p => p.Model is not null)
+            .GroupBy(p => (p.Model!, p.Provider))
+            .Select(g =>
+            {
+                var merged = g.Count(p => p.Status == MergeProposalStatus.Merged);
+                var rejected = g.Count(p => p.Status == MergeProposalStatus.Rejected);
+                var decided = merged + rejected;
+                var confidences = g.Where(p => p.Confidence.HasValue).Select(p => p.Confidence!.Value).ToList();
+                return new ModelPerformanceStat(
+                    g.Key.Item1, g.Key.Item2,
+                    g.Count(), merged, rejected,
+                    decided == 0 ? 0d : (double)merged / decided,
+                    confidences.Count == 0 ? null : confidences.Average());
+            })
+            .OrderByDescending(s => s.ProposalCount)
+            .ToList();
+
+        var forkWinRates = workUnits
+            .Where(w => w.ForkType is not null)
+            .GroupBy(w => w.ForkType!.Value)
+            .Select(g =>
+            {
+                var wins = 0;
+                var losses = 0;
+                var pending = 0;
+                foreach (var wu in g)
+                {
+                    var wuProposals = proposals.Where(p => p.WorkUnitId == wu.WorkUnitId).ToList();
+                    if (wuProposals.Any(p => p.Status == MergeProposalStatus.Merged)) { wins++; }
+                    else if (wuProposals.Any(p => p.Status is MergeProposalStatus.Rejected or MergeProposalStatus.Superseded)) { losses++; }
+                    else { pending++; }
+                }
+                var decided = wins + losses;
+                return new ForkWinRateStat(
+                    g.Key.ToString(), g.Count(), wins, losses, pending,
+                    decided == 0 ? 0d : (double)wins / decided);
+            })
+            .OrderByDescending(s => s.TotalForks)
+            .ToList();
+
+        var failureCauses = new List<FailureCauseStat>
+        {
+            new(
+                "ExecutionFailure",
+                workUnits.Sum(w => w.ExecutionInfo?.FailureAttemptCount ?? 0),
+                workUnits.Count(w => (w.ExecutionInfo?.FailureAttemptCount ?? 0) > 0)),
+            new(
+                "AutomatedReviewRejection",
+                workUnits.Sum(w => w.ExecutionInfo?.AutomatedReviewRejectionCount ?? 0),
+                workUnits.Count(w => (w.ExecutionInfo?.AutomatedReviewRejectionCount ?? 0) > 0)),
+            new(
+                "HumanReviewRejection",
+                workUnits.Sum(w => w.ExecutionInfo?.HumanReviewRejectionCount ?? 0),
+                workUnits.Count(w => (w.ExecutionInfo?.HumanReviewRejectionCount ?? 0) > 0)),
+        }.OrderByDescending(f => f.TotalCount).ToList();
+
+        var reviewOutcomes = new List<ReviewOutcomeStat>();
+        if (_nodeStore is not null)
+        {
+            var decisionRecords = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.DecisionV1, ct).ConfigureAwait(false);
+            var decisions = decisionRecords
+                .Select(r => JsonSerializer.Deserialize<DecisionNode>(r.PayloadJson))
+                .Where(d => d is not null && InRange(d.DecidedAt, request.Since, request.Until))
+                .Select(d => d!)
+                .ToList();
+            reviewOutcomes = decisions
+                .GroupBy(d => d.Outcome.ToString())
+                .Select(g =>
+                {
+                    var confidences = g.Where(d => d.Confidence.HasValue).Select(d => d.Confidence!.Value).ToList();
+                    return new ReviewOutcomeStat(g.Key, g.Count(), confidences.Count == 0 ? null : confidences.Average());
+                })
+                .OrderByDescending(s => s.Count)
+                .ToList();
+        }
+
+        // Model performance by pipeline stage — WorkUnit.Owner is the orchestrating AgentProfile's
+        // id when created via a strategy/template (e.g. ArtifactExplorerPanel's "owner: template.
+        // orchestrator"); rows whose Owner doesn't resolve to a known profile (e.g. "user") are
+        // simply excluded rather than mislabeled.
+        var modelPerformanceByStage = new List<ModelStagePerformanceStat>();
+        if (_agentProfiles is not null)
+        {
+            var ownerIds = proposals
+                .Where(p => p.Model is not null && p.WorkUnitId is not null && workUnitsById.ContainsKey(p.WorkUnitId))
+                .Select(p => workUnitsById[p.WorkUnitId!].Owner)
+                .Distinct()
+                .ToList();
+            var profilesByOwner = new Dictionary<string, AgentProfile>();
+            foreach (var ownerId in ownerIds)
+            {
+                var profile = await _agentProfiles.GetAsync(ownerId, ct).ConfigureAwait(false);
+                if (profile is not null) { profilesByOwner[ownerId] = profile; }
+            }
+
+            var stageRows = proposals
+                .Where(p => p.Model is not null && p.WorkUnitId is not null && workUnitsById.ContainsKey(p.WorkUnitId))
+                .Select(p => new { Proposal = p, Owner = workUnitsById[p.WorkUnitId!].Owner })
+                .Where(x => profilesByOwner.ContainsKey(x.Owner))
+                .Select(x => new { x.Proposal, Stage = profilesByOwner[x.Owner].Stage.ToString() })
+                .ToList();
+
+            modelPerformanceByStage = stageRows
+                .GroupBy(x => (x.Proposal.Model!, x.Stage))
+                .Select(g =>
+                {
+                    var merged = g.Count(x => x.Proposal.Status == MergeProposalStatus.Merged);
+                    var rejected = g.Count(x => x.Proposal.Status == MergeProposalStatus.Rejected);
+                    var decided = merged + rejected;
+                    return new ModelStagePerformanceStat(
+                        g.Key.Item1, g.Key.Item2, g.Count(), merged, rejected,
+                        decided == 0 ? 0d : (double)merged / decided);
+                })
+                .OrderByDescending(s => s.ProposalCount)
+                .ToList();
+        }
+
+        // Sub-bucket Architecture/Library/Product forks by the structured constraint metadata key
+        // ExperimentService stores per fork type (architectureConstraint/libraryConstraint/
+        // productStrategy) — exact grouping, not free-text keyword matching.
+        var forkConstraintWinRates = workUnits
+            .Where(w => w.ForkType is HypothesisForkType.Architecture or HypothesisForkType.Library or HypothesisForkType.Product)
+            .Select(w => new { WorkUnit = w, Constraint = w.Metadata?.GetValueOrDefault(ForkConstraintMetadataKey(w.ForkType!.Value)) })
+            .Where(x => !string.IsNullOrWhiteSpace(x.Constraint))
+            .GroupBy(x => (x.WorkUnit.ForkType!.Value.ToString(), x.Constraint!))
+            .Select(g =>
+            {
+                var wins = 0;
+                var losses = 0;
+                var pending = 0;
+                foreach (var x in g)
+                {
+                    var wuProposals = proposals.Where(p => p.WorkUnitId == x.WorkUnit.WorkUnitId).ToList();
+                    if (wuProposals.Any(p => p.Status == MergeProposalStatus.Merged)) { wins++; }
+                    else if (wuProposals.Any(p => p.Status is MergeProposalStatus.Rejected or MergeProposalStatus.Superseded)) { losses++; }
+                    else { pending++; }
+                }
+                var decided = wins + losses;
+                return new ForkConstraintWinRateStat(
+                    g.Key.Item1, g.Key.Item2, g.Count(), wins, losses, pending,
+                    decided == 0 ? 0d : (double)wins / decided);
+            })
+            .OrderByDescending(s => s.TotalForks)
+            .ToList();
+
+        const int minSampleSize = 5;
+        var averageReworkCycles = workUnits.Count == 0
+            ? 0d
+            : workUnits.Average(w => (double)(w.ExecutionInfo?.FailureAttemptCount ?? 0));
+        var topFailureCause = failureCauses.FirstOrDefault(f => f.TotalCount > 0);
+        var mostSuccessfulModel = modelPerformance
+            .Where(s => s.ProposalCount >= minSampleSize)
+            .OrderByDescending(s => s.AcceptanceRate)
+            .FirstOrDefault();
+        var mostSuccessfulStrategy = forkWinRates
+            .Where(s => s.Wins + s.Losses >= minSampleSize)
+            .OrderByDescending(s => s.WinRate)
+            .FirstOrDefault();
+
+        var payload = new RunRetrospectiveProjectionPayload(
+            request.Since,
+            request.Until,
+            sessions.Count,
+            sessionsByStatus,
+            workUnits.Count,
+            workUnitsByStatus,
+            overallSuccessRate,
+            averageReworkCycles,
+            topFailureCause,
+            mostSuccessfulModel,
+            mostSuccessfulStrategy,
+            modelPerformance,
+            modelPerformanceByStage,
+            forkWinRates,
+            forkConstraintWinRates,
+            failureCauses,
+            reviewOutcomes,
+            DateTimeOffset.UtcNow);
+
+        return Serialize(payload);
+    }
+
+    private static bool InRange(DateTimeOffset value, DateTimeOffset? since, DateTimeOffset? until) =>
+        (since is null || value >= since) && (until is null || value <= until);
+
+    private static string ForkConstraintMetadataKey(HypothesisForkType forkType) => forkType switch
+    {
+        HypothesisForkType.Architecture => "architectureConstraint",
+        HypothesisForkType.Library => "libraryConstraint",
+        HypothesisForkType.Product => "productStrategy",
+        _ => "experimentConstraint",
+    };
 
     /// <summary>
     /// Recursively collects all descendant work unit IDs starting from <paramref name="parentId"/>.

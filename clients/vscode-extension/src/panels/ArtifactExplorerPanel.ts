@@ -3,6 +3,7 @@ import { scopeViewCss, wrapViewScript } from './sharedWebviewChrome';
 import type { AgentConfigService } from '../AgentConfigService';
 import type { ProposalFileChange } from './MergeReviewPanel';
 import { COMMANDS } from '../constants';
+import { resolveRepositoryPath } from '../repositoryPath';
 
 const POLL_INTERVAL_MS = 2_000;
 
@@ -241,16 +242,44 @@ export class GoalWorkspacePanel {
   private async sendSettings(): Promise<void> {
     try {
       const opts = await this.get<StudioOptions>('/studio/options');
-      void this.panel.webview.postMessage({ type: 'explorerSettings', ...opts });
+      void this.panel.webview.postMessage({
+        type: 'explorerSettings', ...opts, ...this.getRepositoryPathSettings(),
+      });
     } catch {
       // host not ready yet
     }
   }
 
+  // repositoryPath is extension-side config (nodalmerge.repositoryPath), not a backend
+  // WorkspaceOptions field, so it's read directly from VS Code config rather than /studio/options.
+  private getRepositoryPathSettings(): { repositoryPathOverride: string; effectiveRepositoryPath: string } {
+    const override = vscode.workspace.getConfiguration('nodalmerge').get<string>('repositoryPath', '');
+    const autoDetected = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath ?? '';
+    return {
+      repositoryPathOverride: override,
+      effectiveRepositoryPath: override || autoDetected,
+    };
+  }
+
+  private async handleBrowseRepositoryPath(): Promise<void> {
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFolders: true,
+      canSelectFiles: false,
+      canSelectMany: false,
+      openLabel: 'Use as Workspace Folder',
+    });
+    if (!picked || picked.length === 0) { return; }
+    await vscode.workspace.getConfiguration('nodalmerge')
+      .update('repositoryPath', picked[0].fsPath, vscode.ConfigurationTarget.Workspace);
+    void this.panel.webview.postMessage({ type: 'explorerSettings', ...this.getRepositoryPathSettings() });
+  }
+
   private async updateOptions(patch: Partial<StudioOptions>): Promise<void> {
     const current = await this.get<StudioOptions>('/studio/options');
     const updated = await this.post<StudioOptions>('/studio/options', { ...current, ...patch });
-    void this.panel.webview.postMessage({ type: 'explorerSettings', ...updated });
+    void this.panel.webview.postMessage({
+      type: 'explorerSettings', ...updated, ...this.getRepositoryPathSettings(),
+    });
   }
 
   private async refreshSessions(): Promise<void> {
@@ -441,6 +470,14 @@ export class GoalWorkspacePanel {
           break;
         case 'explorerSetEnforceExpectedOutputKind':
           await this.updateOptions({ enforceExpectedOutputKind: msg.value as boolean });
+          break;
+        case 'explorerBrowseRepositoryPath':
+          await this.handleBrowseRepositoryPath();
+          break;
+        case 'explorerClearRepositoryPath':
+          await vscode.workspace.getConfiguration('nodalmerge')
+            .update('repositoryPath', '', vscode.ConfigurationTarget.Workspace);
+          void this.panel.webview.postMessage({ type: 'explorerSettings', ...this.getRepositoryPathSettings() });
           break;
         case 'explorerSteeringAction':
           await this.handleSteeringAction(
@@ -662,7 +699,7 @@ export class GoalWorkspacePanel {
           throw new Error('One or both orchestrator profiles missing LLM credentials.');
         }
 
-        const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+        const repositoryPath = resolveRepositoryPath();
         const reviewAndTarget = {
           ...(reviewPolicy ? { reviewPolicy } : {}),
           bypassPromotionBranch: !!bypassPromotionBranch,
@@ -754,7 +791,7 @@ export class GoalWorkspacePanel {
         );
       }
 
-      const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+      const repositoryPath = resolveRepositoryPath();
       const rootWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
         goal,
         owner: template.orchestrator,
@@ -1031,6 +1068,8 @@ const GW_CSS = `
   button.ghost:hover { background: color-mix(in srgb, var(--nm-border) 50%, transparent); }
   .gw-settings-panel { flex-shrink: 0; padding: 8px 14px; border-bottom: 1px solid var(--nm-border); background: var(--nm-section-bg); }
   .gw-settings-row { display: flex; align-items: center; gap: 6px; font-size: 0.85em; cursor: pointer; }
+  .gw-repo-path-row { cursor: default; }
+  .gw-repo-path-row #gw-repo-path-display { flex: 1; min-width: 0; font-size: 0.85em; padding: 2px 6px; }
   /* Slice 21c — inline Review/Target controls */
   .gw-options-row {
     flex-shrink: 0; padding: 6px 14px; border-bottom: 1px solid var(--nm-border);
@@ -1229,7 +1268,15 @@ const GW_HTML = `
     <div id="gw-fork-entries" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end"></div>
   </div>
   <div id="gw-settings-panel" class="gw-settings-panel" style="display:none">
-    <label class="gw-settings-row">
+    <label class="gw-settings-row" style="padding-bottom:8px;border-bottom:1px solid var(--nm-border)">
+      Workspace Folder
+    </label>
+    <div class="gw-settings-row gw-repo-path-row">
+      <input type="text" id="gw-repo-path-display" readonly title="The repository Studio operates against"/>
+      <button id="gw-repo-path-browse" class="ghost">Browse&hellip;</button>
+      <button id="gw-repo-path-clear" class="ghost" title="Use the open VS Code folder instead">Use Open Folder</button>
+    </div>
+    <label class="gw-settings-row" style="margin-top:8px;border-top:1px solid var(--nm-border);padding-top:8px">
       <input type="checkbox" id="gw-llm-profile-checkbox"/>
       Auto-select agent profiles by capability
     </label>
@@ -1418,6 +1465,14 @@ const GW_JS = `
   document.getElementById('gw-settings-btn').addEventListener('click', function() {
     var panel = document.getElementById('gw-settings-panel');
     panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+  });
+
+  document.getElementById('gw-repo-path-browse').addEventListener('click', function() {
+    vscode.postMessage({ type: 'explorerBrowseRepositoryPath' });
+  });
+
+  document.getElementById('gw-repo-path-clear').addEventListener('click', function() {
+    vscode.postMessage({ type: 'explorerClearRepositoryPath' });
   });
 
   document.getElementById('gw-llm-profile-checkbox').addEventListener('change', function(ev) {
@@ -2301,6 +2356,13 @@ const GW_JS = `
       return;
     }
     if (msg.type === 'explorerSettings') {
+      if (msg.effectiveRepositoryPath !== undefined) {
+        var repoDisplay = document.getElementById('gw-repo-path-display');
+        repoDisplay.value = msg.effectiveRepositoryPath || '(no folder open)';
+        repoDisplay.title = msg.repositoryPathOverride
+          ? 'Override: ' + msg.effectiveRepositoryPath
+          : 'Auto-detected from the open VS Code folder: ' + msg.effectiveRepositoryPath;
+      }
       document.getElementById('gw-llm-profile-checkbox').checked = !!msg.useLlmProfileSelection;
       document.getElementById('gw-max-concurrent-workers').value = msg.maxConcurrentWorkers;
       document.getElementById('gw-scheduler-poll-interval').value = msg.schedulerPollIntervalMs;

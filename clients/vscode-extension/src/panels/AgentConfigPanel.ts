@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import type { AgentConfigService, AgentProfile, TopologyTemplate } from '../AgentConfigService';
+import { resolveRepositoryPath } from '../repositoryPath';
 import { scopeViewCss, wrapViewScript } from './sharedWebviewChrome';
 
 export interface PipelineProfile {
@@ -190,7 +191,7 @@ export class ModelAgentStudioPanel {
         );
       }
 
-      const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+      const repositoryPath = resolveRepositoryPath();
       const orchWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
         goal,
         owner: template.orchestrator,

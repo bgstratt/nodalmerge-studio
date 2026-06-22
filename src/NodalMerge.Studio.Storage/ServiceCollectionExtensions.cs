@@ -129,6 +129,10 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IEvidenceNodeService>(sp => sp.GetRequiredService<EvidenceNodeService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<EvidenceNodeService>());
 
+        services.AddSingleton<FindingService>();
+        services.AddSingleton<IFindingService>(sp => sp.GetRequiredService<FindingService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<FindingService>());
+
         services.AddSingleton<ExecutionEventStreamService>();
         services.AddSingleton<IExecutionEventStream>(sp => sp.GetRequiredService<ExecutionEventStreamService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<ExecutionEventStreamService>());

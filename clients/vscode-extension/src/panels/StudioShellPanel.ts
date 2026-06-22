@@ -5,6 +5,7 @@ import { ModelAgentStudioPanel } from './AgentConfigPanel';
 import { ExecutionTimelinePanel } from './WorkspaceDashboardPanel';
 import { TrajectoryReplayPanel } from './DagReplayPanel';
 import { GoalWorkspacePanel } from './ArtifactExplorerPanel';
+import { InsightsPanel } from './InsightsPanel';
 import type { NotificationManager } from '../NotificationManager';
 import type { AgentConfigService } from '../AgentConfigService';
 
@@ -27,6 +28,7 @@ export class StudioShellPanel implements vscode.Disposable {
   readonly modelAgentStudio: ModelAgentStudioPanel;
   readonly pathways: TrajectoryReplayPanel;
   readonly goalWorkspace: GoalWorkspacePanel;
+  readonly insights: InsightsPanel;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -44,6 +46,7 @@ export class StudioShellPanel implements vscode.Disposable {
     this.modelAgentStudio    = new ModelAgentStudioPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
     this.pathways    = new TrajectoryReplayPanel(panel, baseUrl, this.getSelectedSessionId);
     this.goalWorkspace       = new GoalWorkspacePanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl, this.onSessionChanged);
+    this.insights            = new InsightsPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
 
     this.panel.webview.html = this.buildHtml(extensionUri);
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
@@ -58,6 +61,7 @@ export class StudioShellPanel implements vscode.Disposable {
     this.pathways.activate();
     this.goalWorkspace.activate();
     this.reviewPanel.activate();
+    this.insights.activate();
   }
 
   /** Returns the currently-selected session ID from the Goal Workspace. */
@@ -128,6 +132,7 @@ export class StudioShellPanel implements vscode.Disposable {
       this.modelAgentStudio.handleMessage(msg),
       this.pathways.handleMessage(msg),
       this.goalWorkspace.handleMessage(msg),
+      this.insights.handleMessage(msg),
     ]);
   }
 
@@ -146,6 +151,7 @@ export class StudioShellPanel implements vscode.Disposable {
     const executionTimelineFragment    = ExecutionTimelinePanel.getFragment();
     const decisionConvergenceFragment  = DecisionConvergencePanel.getFragment();
     const trajectoryFragment           = TrajectoryReplayPanel.getFragment(webview, extensionUri, nonce);
+    const insightsFragment             = InsightsPanel.getFragment();
 
     const tabs: TabDef[] = [
       { id: GoalWorkspacePanel.containerId, label: 'Goal Workspace' },
@@ -153,6 +159,7 @@ export class StudioShellPanel implements vscode.Disposable {
       { id: ExecutionTimelinePanel.containerId, label: 'Activity Center' },
       { id: DecisionConvergencePanel.containerId, label: 'Review' },
       { id: TrajectoryReplayPanel.containerId, label: 'Pathways' },
+      { id: InsightsPanel.containerId, label: 'Insights' },
     ];
     const tabButtonsHtml = tabs
       .map(t => `<button class="nm-shell-tab${t.id === GoalWorkspacePanel.containerId ? ' active' : ''}" data-tab="${t.id}">${t.label}</button>`)
@@ -173,6 +180,7 @@ ${modelAgentStudioFragment.css}
 ${executionTimelineFragment.css}
 ${decisionConvergenceFragment.css}
 ${trajectoryFragment.css}
+${insightsFragment.css}
   </style>
 </head>
 <body>
@@ -183,6 +191,7 @@ ${modelAgentStudioFragment.html}
 ${executionTimelineFragment.html}
 ${decisionConvergenceFragment.html}
 ${trajectoryFragment.html}
+${insightsFragment.html}
   </div>
   <script nonce="${nonce}">
     (function() {
@@ -215,6 +224,9 @@ ${decisionConvergenceFragment.script}
   <script nonce="${nonce}">
 ${goalWorkspaceFragment.script}
   </script>
+  <script nonce="${nonce}">
+${insightsFragment.script}
+  </script>
 ${trajectoryFragment.scriptTag}
 </body>
 </html>`;
@@ -225,6 +237,7 @@ ${trajectoryFragment.scriptTag}
     this.activityCenter.dispose();
     this.goalWorkspace.dispose();
     this.pathways.dispose();
+    this.insights.dispose();
     this.panel.dispose();
     for (const d of this.disposables) { d.dispose(); }
     this.disposables.length = 0;
