@@ -255,24 +255,43 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
     // layout for repo-local workspaces) — every file under every branch would then contain that
     // ancestor segment and get treated as hidden, silently emptying every diff/list/copy. Only the
     // portion of the path *inside* the branch (i.e. relative to RootPath) should count.
+    // Mirrors WorkspaceProfileService.IgnoredDirNames — dependency/build directories are
+    // reinstallable or regenerable, not actual merge content. Without this, ApplyBranchAsync
+    // copies every file under e.g. node_modules one at a time (tens of thousands of File.Copy
+    // calls for a typical npm project), which is both pointless and slow enough to blow past
+    // the webview's apply request timeout.
+    private static readonly string[] IgnoredDirNames =
+        ["node_modules", "bin", "obj", "dist", "build", "target", "__pycache__", "venv"];
+
     private bool IsHidden(string path)
     {
         var relative = Path.GetRelativePath(options.RootPath, path);
         return relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            .Any(segment => segment.Length > 0 && segment[0] == '.');
+            .Any(segment => segment.Length > 0 &&
+                (segment[0] == '.' || IgnoredDirNames.Contains(segment, StringComparer.OrdinalIgnoreCase)));
     }
+
+    // Dotfiles (e.g. .env) are deliberately NOT excluded here, unlike IsHidden above — seeding a
+    // new branch is the one place a dotfile genuinely needs to come along (a project's .env is
+    // often required for it to run at all), whereas IsHidden's callers are list/diff/apply, where
+    // dotfiles are conventionally treated as not-part-of-the-tracked-diff.
+    private static bool IsIgnoredDirSegment(string relative) =>
+        relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            .Any(segment => IgnoredDirNames.Contains(segment, StringComparer.OrdinalIgnoreCase));
 
     private static void CopyDirectory(string source, string destination)
     {
         foreach (var dir in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories))
         {
             var relative = Path.GetRelativePath(source, dir);
+            if (IsIgnoredDirSegment(relative)) continue;
             Directory.CreateDirectory(Path.Combine(destination, relative));
         }
 
         foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
         {
             var relative = Path.GetRelativePath(source, file);
+            if (IsIgnoredDirSegment(relative)) continue;
             File.Copy(file, Path.Combine(destination, relative), overwrite: true);
         }
     }

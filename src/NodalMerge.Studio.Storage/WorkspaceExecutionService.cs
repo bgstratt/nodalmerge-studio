@@ -170,18 +170,7 @@ internal sealed class WorkspaceExecutionService(
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(TimeSpan.FromSeconds(timeoutSec));
 
-        var (fileName, arguments) = SplitCommand(cmd.Command);
-
-        var psi = new ProcessStartInfo
-        {
-            FileName = fileName,
-            Arguments = arguments,
-            WorkingDirectory = workDir,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
+        var psi = CreateProcessStartInfo(cmd.Command, workDir);
 
         using var process = Process.Start(psi)!;
 
@@ -349,5 +338,36 @@ internal sealed class WorkspaceExecutionService(
 
         var spaceIndex = command.IndexOf(' ');
         return (command[..spaceIndex], command[(spaceIndex + 1)..]);
+    }
+
+    // Windows resolves things like "npm"/"npx"/"yarn" to *.cmd shims that only cmd.exe (or a
+    // shell) knows how to launch — CreateProcess called directly with FileName="npm" fails with
+    // "The system cannot find the file specified" even though `npm` works fine interactively.
+    // Routing every command through "cmd /c" on Windows sidesteps that without having to special-
+    // case which commands happen to be batch-file shims today.
+    internal static ProcessStartInfo CreateProcessStartInfo(string command, string workDir)
+    {
+        var psi = new ProcessStartInfo
+        {
+            WorkingDirectory = workDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        if (OperatingSystem.IsWindows())
+        {
+            psi.FileName = "cmd.exe";
+            psi.Arguments = $"/c {command}";
+        }
+        else
+        {
+            var (fileName, arguments) = SplitCommand(command);
+            psi.FileName = fileName;
+            psi.Arguments = arguments;
+        }
+
+        return psi;
     }
 }

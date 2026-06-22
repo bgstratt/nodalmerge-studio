@@ -41,17 +41,7 @@ internal sealed class RunningProcessRegistry
         // about to start a fresh one (e.g. the agent edited code and wants to re-run the server).
         Stop(branchId, pid: null, projectRoot: projectRoot);
 
-        var (fileName, arguments) = WorkspaceExecutionService.SplitCommand(command);
-        var psi = new ProcessStartInfo
-        {
-            FileName = fileName,
-            Arguments = arguments,
-            WorkingDirectory = workDir,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
+        var psi = WorkspaceExecutionService.CreateProcessStartInfo(command, workDir);
         if (environmentVariables is not null)
             foreach (var (key, value) in environmentVariables)
                 psi.Environment[key] = value;
@@ -101,17 +91,7 @@ internal sealed class RunningProcessRegistry
         CancellationToken ct)
     {
         var startedAt = DateTimeOffset.UtcNow;
-        var (fileName, arguments) = WorkspaceExecutionService.SplitCommand(command);
-        var psi = new ProcessStartInfo
-        {
-            FileName = fileName,
-            Arguments = arguments,
-            WorkingDirectory = workDir,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
+        var psi = WorkspaceExecutionService.CreateProcessStartInfo(command, workDir);
         if (environmentVariables is not null)
             foreach (var (key, value) in environmentVariables)
                 psi.Environment[key] = value;
