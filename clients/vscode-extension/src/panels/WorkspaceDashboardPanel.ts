@@ -268,6 +268,21 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           await this.post('/studio/agents/' + String(msg.agentId) + '/stop', {});
           void this.poll();
           break;
+        case 'cancelWorkUnit':
+          await this.post('/studio/workunits/' + String(msg.workUnitId) + '/cancel', {});
+          void this.poll();
+          break;
+        case 'stopAll': {
+          const confirmed = await vscode.window.showWarningMessage(
+            'Stop all active goals, agents, and pending reviews?',
+            { modal: true },
+            'Stop All',
+          );
+          if (confirmed !== 'Stop All') { return; }
+          await this.post('/studio/stop-all', {});
+          void this.poll();
+          break;
+        }
         case 'resumeWorker':
           await this.post('/studio/scheduler/' + String(msg.workUnitId) + '/resume', {});
           void this.poll();
@@ -413,7 +428,8 @@ const ET_CSS = `
   .badge.active   { background: var(--nm-success); color: #fff; }
   .badge.paused   { background: var(--nm-warn); color: #000; }
   .badge.stopped,
-  .badge.completed { background: #555; color: #ccc; }
+  .badge.completed,
+  .badge.cancelled { background: #555; color: #ccc; }
   .badge.failed   { background: var(--nm-error); color: #fff; }
   .badge.interrupted { background: #c05020; color: #fff; }
   .actions { display: flex; gap: 4px; flex-shrink: 0; }
@@ -455,6 +471,7 @@ const ET_HTML = `
   <div class="header">
     <span class="header-title">Activity Center<span class="pulse"></span></span>
     <select id="et-session-override" class="session-override-picker"><option value="">Follow Workspace</option></select>
+    <button class="danger" id="btn-stop-all" title="Cancel every active goal, stop every agent, and cancel pending review timers">🛑 Stop All</button>
     <span id="last-updated"></span>
   </div>
 
@@ -491,6 +508,9 @@ const ET_JS = `
   document.getElementById('btn-resume-all').addEventListener('click', function() {
     vscode.postMessage({ type: 'resumeAllWorkers' });
   });
+  document.getElementById('btn-stop-all').addEventListener('click', function() {
+    vscode.postMessage({ type: 'stopAll' });
+  });
 
   var etSessionOverride = document.getElementById('et-session-override');
   if (etSessionOverride) {
@@ -522,7 +542,9 @@ const ET_JS = `
     var html = '';
     for (var i = 0; i < goals.length; i++) {
       var wu = goals[i];
-      var isReviewing = (wu.status || '').toLowerCase() === 'reviewing';
+      var status = (wu.status || '').toLowerCase();
+      var isReviewing = status === 'reviewing';
+      var isStoppable = ['cancelled', 'completed', 'merged'].indexOf(status) === -1;
       html += '<div class="card">';
       html += '<div class="row">';
       html += '<span class="title" title="' + esc(wu.goal) + '">' + esc(wu.goal) + '</span>';
@@ -532,6 +554,9 @@ const ET_JS = `
         html += '<button class="ghost" data-action="openConflictReview" data-wu="' + esc(wu.workUnitId) + '">View Conflict →</button>';
       }
       html += '<button class="ghost" data-action="spawnAgent" data-wu="' + esc(wu.workUnitId) + '">Spawn</button>';
+      if (isStoppable) {
+        html += '<button class="danger" data-action="cancelWorkUnit" data-wu="' + esc(wu.workUnitId) + '">Stop</button>';
+      }
       html += '</div>';
       html += '</div>';
       html += '<div class="row">';
@@ -557,6 +582,11 @@ const ET_JS = `
     el.querySelectorAll('[data-action="openConflictReview"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: 'openConflictReview', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+    el.querySelectorAll('[data-action="cancelWorkUnit"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'cancelWorkUnit', workUnitId: btn.getAttribute('data-wu') });
       });
     });
   }

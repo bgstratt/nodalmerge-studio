@@ -727,6 +727,35 @@ public static class StudioRestEndpoints
                 ct).ConfigureAwait(false);
             return Results.Ok(wu);
         });
+
+        // Stop controls — cancels one goal's whole subtree (the work unit plus every descendant
+        // spawned via fan-out), stopping their agents and pending review timers. Already
+        // Completed/Merged work units are left untouched, so committed work survives a cancel.
+        app.MapPost("/studio/workunits/{workUnitId}/cancel", async (
+            string workUnitId,
+            IWorkUnitCommandService workUnitCommands,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var cancelled = await workUnitCommands.CancelAsync(workUnitId, ct).ConfigureAwait(false);
+                return Results.Ok(new { cancelledWorkUnitIds = cancelled.Select(w => w.WorkUnitId).ToList() });
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        // Global stop-all — same routine as the single-goal cancel above, applied to every
+        // currently non-terminal root work unit, across every session.
+        app.MapPost("/studio/stop-all", async (
+            IWorkUnitCommandService workUnitCommands,
+            CancellationToken ct) =>
+        {
+            var cancelled = await workUnitCommands.CancelAllActiveAsync(ct).ConfigureAwait(false);
+            return Results.Ok(new { cancelledWorkUnitIds = cancelled.Select(w => w.WorkUnitId).ToList() });
+        });
     }
 
         // ── /studio/tasks ─────────────────────────────────────────────────────────

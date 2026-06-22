@@ -342,6 +342,16 @@ public sealed record WorkUnitCreateCommand(
 public interface IWorkUnitCommandService
 {
     Task<WorkUnit> CreateAsync(WorkUnitCreateCommand command, CancellationToken cancellationToken = default);
+
+    // Stop controls — cancels one goal's whole subtree (the work unit plus every descendant
+    // spawned via fan-out), stopping their agents and pending review timers. Work units already
+    // Completed/Merged are left untouched (WorkUnitTransitions forbids cancelling out of those
+    // states), so already-committed work survives a cancel.
+    Task<IReadOnlyList<WorkUnit>> CancelAsync(string workUnitId, CancellationToken cancellationToken = default);
+
+    // Stop-all — runs CancelAsync against every non-terminal root work unit (no parent), across
+    // every session, for a single "stop everything" control.
+    Task<IReadOnlyList<WorkUnit>> CancelAllActiveAsync(CancellationToken cancellationToken = default);
 }
 
 public interface IAgentRuntimeService
@@ -756,6 +766,10 @@ public interface IReviewTimerService
     Task TryCancelAsync(string proposalId, CancellationToken ct = default);
     Task ProcessExpiredAsync(CancellationToken ct = default);
     Task<ReviewTimer?> GetAsync(string proposalId, CancellationToken ct = default);
+
+    // Stop controls — lets a work-unit/global cancel routine find every still-pending timer it
+    // needs to cancel without having to know proposal IDs up front.
+    Task<IReadOnlyList<ReviewTimer>> ListPendingAsync(string? workUnitId = null, CancellationToken ct = default);
 }
 
 // Slice 14b — shape of the "activeSiblings" key FanOutService populates in BeforeEnqueue's

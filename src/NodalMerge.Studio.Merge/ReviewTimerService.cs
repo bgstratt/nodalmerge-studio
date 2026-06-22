@@ -87,4 +87,27 @@ public sealed class ReviewTimerService(
             .ConfigureAwait(false);
         return json is null ? null : JsonSerializer.Deserialize<ReviewTimer>(json);
     }
+
+    public async Task<IReadOnlyList<ReviewTimer>> ListPendingAsync(string? workUnitId = null, CancellationToken ct = default)
+    {
+        var records = await nodeStore
+            .ReadAllNodesAsync(StudioNodeKind.ReviewTimerV1, ct)
+            .ConfigureAwait(false);
+
+        var pending = new List<ReviewTimer>();
+        foreach (var (_, payloadJson) in records)
+        {
+            ReviewTimer? timer;
+            try { timer = JsonSerializer.Deserialize<ReviewTimer>(payloadJson); }
+            catch { continue; }
+
+            if (timer is null || timer.Cancelled)
+                continue;
+            if (workUnitId is not null && timer.WorkUnitId != workUnitId)
+                continue;
+
+            pending.Add(timer);
+        }
+        return pending;
+    }
 }
