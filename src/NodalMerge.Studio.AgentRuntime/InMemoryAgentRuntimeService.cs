@@ -200,16 +200,20 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var ruleFileContext = await BuildRuleFileContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
 
                 AgentLoopCompletion completion;
                 if (profile?.Stage == PipelineStage.Plan)
                 {
                     var constraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                    var promptGuidanceContext = await BuildPromptGuidanceContextAsync(PipelineStage.Plan, ct).ConfigureAwait(false);
+                    var combinedContext = string.Join("\n\n", new[] { constraintsContext, promptGuidanceContext }.Where(s => s is not null));
                     var plannerLoop = new PlannerAgentLoop(
                         agentId, item.WorkUnitId, provider, model, baseUrl, apiKey!,
                         dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a),
-                        ruleFileContext, constraintsContext);
+                        ruleFileContext, combinedContext.Length == 0 ? null : combinedContext,
+                        conversationLog: conversationLog);
                     completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
                 else if (profile?.Stage == PipelineStage.Review)
@@ -217,7 +221,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var proposalId = string.IsNullOrWhiteSpace(taskId) ? string.Empty : taskId;
                     var reviewerLoop = new ReviewerAgentLoop(
                         agentId, item.WorkUnitId, proposalId, provider, model, baseUrl, apiKey!,
-                        dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a));
+                        dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a),
+                        conversationLog: conversationLog);
                     completion = await reviewerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
                 else
@@ -226,12 +231,20 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     // normal failure-retry or, per Phase 8c, a resume after a Host restart
                     // interrupted it. Either way the worker should check existing branch/task
                     // state before assuming a clean start.
+    // promptGuidanceContext below carries both universal KnowledgeGuideline constraints (the
+                    // same feed Orchestrator/Planner already get) and Execute-stage PromptImprovement
+                    // guidance — Worker writes the actual code, so it needs both, not just the latter.
+                    var workerConstraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                    var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, ct).ConfigureAwait(false);
+                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
                     var loop = new WorkerAgentLoop(
                         agentId, item.WorkUnitId, taskId, provider, model, baseUrl, apiKey!,
                         dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a),
                         isResume: item.AttemptCount > 0, ruleFileContext: ruleFileContext,
                         selfVerifyBuild: _options.RequireBuildBeforeProposal,
-                        selfVerifyTest: _options.RequireTestBeforeProposal);
+                        selfVerifyTest: _options.RequireTestBeforeProposal,
+                        promptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
+                        conversationLog: conversationLog);
                     completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
 
@@ -459,10 +472,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var automatedReview = _serviceProvider.GetRequiredService<IAutomatedReviewGateService>();
                 var workUnits = _serviceProvider.GetRequiredService<IWorkUnitService>();
                 var workspaceOptions = _serviceProvider.GetRequiredService<WorkspaceOptions>();
+                var findingsService = _serviceProvider.GetRequiredService<IFindingService>();
+                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var loop = new OrchestratorAgentLoop(
                     agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm,
                     artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, workUnits,
-                    profile, sessionId, workspaceOptions.StallDetectionCycles, a => ReportActivity(agentId, a));
+                    findingsService,
+                    profile, sessionId, workspaceOptions.StallDetectionCycles, a => ReportActivity(agentId, a),
+                    conversationLog: conversationLog);
                 var completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 if (completion is AgentLoopCompletion.MaxIterationsExceeded or AgentLoopCompletion.Stalled)
                 {
@@ -534,12 +551,18 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var ruleFileContext = await BuildRuleFileContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
+                var workerConstraintsContext = await BuildConstraintsContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
+                var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, cts.Token).ConfigureAwait(false);
+                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
                 var loop = new WorkerAgentLoop(
                     agentId, workUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm, profile,
                     onActivity: a => ReportActivity(agentId, a), ruleFileContext: ruleFileContext,
                     selfVerifyBuild: _options.RequireBuildBeforeProposal,
-                    selfVerifyTest: _options.RequireTestBeforeProposal);
+                    selfVerifyTest: _options.RequireTestBeforeProposal,
+                    promptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
+                    conversationLog: conversationLog);
                 await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 _logger.LogInformation("[Agent {AgentId}] Worker loop completed.", agentId);
             }
@@ -674,6 +697,26 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             return null;
         }
     }
+
+    // Promoted PromptImprovement findings targeting this stage — stage-scoped, unlike the
+    // universal constraints above. Used by loops (Planner, Worker) that have no projection-fetch
+    // loop of their own and so resolve this once up front, same shape as the helpers above.
+    private async Task<string?> BuildPromptGuidanceContextAsync(PipelineStage stage, CancellationToken ct)
+    {
+        try
+        {
+            var findings = _serviceProvider.GetRequiredService<IFindingService>();
+            var promptGuidance = await findings.ListPromotedPromptGuidanceAsync(stage, ct).ConfigureAwait(false);
+            if (promptGuidance.Count == 0) return null;
+
+            var lines = promptGuidance.Select(f => $"- {f.Title}: {f.Summary}");
+            return "[Process guidance — promoted prompt improvements for this stage]\n" + string.Join("\n", lines);
+        }
+        catch
+        {
+            return null;
+        }
+    }
 }
 
 public static class ServiceCollectionExtensions
@@ -686,7 +729,8 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IAgentControlService>(sp => sp.GetRequiredService<InMemoryAgentRuntimeService>());
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<InMemoryAgentRuntimeService>());
         services.AddSingleton<McpToolDispatcher>();
-        services.AddSingleton<LlmClient>(_ => new LlmClient(llmHttpClient ?? new HttpClient()));
+        services.AddSingleton<LlmClient>(sp =>
+            new LlmClient(llmHttpClient ?? new HttpClient(), sp.GetRequiredService<ILogger<LlmClient>>()));
         services.AddSingleton<IInsightLlmAnalyzerService, InsightLlmAnalyzerService>();
         services.AddSingleton<IProfileSelectionService, LlmProfileSelectionService>();
         // Slice 20b — inline reviewer for AgentApproval/Hybrid BeforeMerge gate.

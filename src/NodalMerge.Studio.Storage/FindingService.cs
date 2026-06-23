@@ -27,6 +27,12 @@ public sealed class FindingService(IStudioNodeStore nodeStore, IArtifactLineageS
         Task.FromResult<IReadOnlyList<Finding>>(
             _findings.Values.OrderByDescending(f => f.CreatedAt).ToList());
 
+    public Task<IReadOnlyList<Finding>> ListPromotedPromptGuidanceAsync(PipelineStage stage, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Finding>>(_findings.Values
+            .Where(f => f.Kind == FindingKind.PromptImprovement && f.Status == FindingStatus.Promoted && f.TargetStage == stage)
+            .OrderBy(f => f.CreatedAt)
+            .ToList());
+
     public async Task<Finding> ReviewAsync(
         string findingId, FindingStatus decision, string? notes = null, CancellationToken ct = default)
     {
@@ -51,16 +57,25 @@ public sealed class FindingService(IStudioNodeStore nodeStore, IArtifactLineageS
         return updated;
     }
 
-    // The part that "does something": a promoted KnowledgeGuideline becomes a durable, workspace-
-    // wide Constraint artifact (no owning work unit), which BuildAgentWorkspaceAsync folds into
-    // InheritedConstraints for every future work unit. PromptImprovement's promotion action (editing
-    // an AgentProfile's SystemPrompt) is Phase 4 — deliberately not implemented yet.
-    private async Task<string> PromoteAsync(Finding finding, CancellationToken ct)
-    {
-        if (finding.Kind != FindingKind.KnowledgeGuideline)
-            throw new NotSupportedException(
-                $"Promotion for FindingKind.{finding.Kind} is not implemented yet.");
+    // The part that "does something". KnowledgeGuideline becomes a durable, workspace-wide
+    // Constraint artifact (no owning work unit), which BuildAgentWorkspaceAsync folds into
+    // InheritedConstraints for every future work unit, any stage. PromptImprovement creates no
+    // artifact at all — it's stage-scoped, not universal, so the durable effect is just this
+    // Finding's own persisted Status=Promoted + TargetStage, read directly by the matching stage's
+    // agent loop via ListPromotedPromptGuidanceAsync. Never mutates AgentProfile.SystemPrompt: a
+    // profile with an empty SystemPrompt falls back to a hardcoded per-loop default that isn't
+    // visible anywhere in the UI, so appending to it would silently replace an agent's entire
+    // built-in instructions rather than improve them.
+    private Task<string?> PromoteAsync(Finding finding, CancellationToken ct) =>
+        finding.Kind switch
+        {
+            FindingKind.KnowledgeGuideline => PromoteKnowledgeGuidelineAsync(finding, ct),
+            FindingKind.PromptImprovement => PromotePromptImprovementAsync(finding),
+            _ => throw new NotSupportedException($"Promotion for FindingKind.{finding.Kind} is not implemented yet."),
+        };
 
+    private async Task<string?> PromoteKnowledgeGuidelineAsync(Finding finding, CancellationToken ct)
+    {
         var artifact = new ArtifactRef(
             ArtifactId: $"constraint-{Guid.NewGuid():N}",
             Type: ArtifactType.Constraint,
@@ -74,6 +89,14 @@ public sealed class FindingService(IStudioNodeStore nodeStore, IArtifactLineageS
 
         await artifactLineage.RecordAsync(artifact, ct).ConfigureAwait(false);
         return artifact.ArtifactId;
+    }
+
+    private static Task<string?> PromotePromptImprovementAsync(Finding finding)
+    {
+        if (finding.TargetStage is null)
+            throw new InvalidOperationException(
+                $"Finding '{finding.FindingId}' is a PromptImprovement with no TargetStage set — cannot promote.");
+        return Task.FromResult<string?>(null);
     }
 
     public async Task RehydrateAsync(CancellationToken ct = default)

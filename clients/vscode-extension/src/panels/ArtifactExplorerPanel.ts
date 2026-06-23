@@ -140,6 +140,36 @@ interface ReasoningCommitGraphEdge {
   edgeType: string;
 }
 
+// Phase 11 — Conversation Transcripts
+interface ConversationToolCall {
+  toolUseId: string;
+  name: string;
+  inputJson: string;
+}
+
+interface ConversationToolResult {
+  toolUseId: string;
+  result: string;
+  truncated: boolean;
+}
+
+interface ConversationLogEntry {
+  logId: string;
+  workUnitId: string;
+  agentId: string;
+  agentRole: string;
+  taskId?: string | null;
+  cycleNumber: number;
+  assistantText?: string | null;
+  toolCalls: ConversationToolCall[];
+  toolResults: ConversationToolResult[];
+  stopReason: string;
+  occurredAt: string;
+  sessionId?: string | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 export class GoalWorkspacePanel {
@@ -364,6 +394,36 @@ export class GoalWorkspacePanel {
     }
   }
 
+  // Phase 11 — deep-link entry point from Activity Center's "View live transcript" action.
+  // Mirrors DecisionConvergencePanel.loadProposal/loadConflict: fetches the single work unit
+  // directly by ID rather than requiring it to already be part of the currently selected
+  // session's decision tree, since the agent the user clicked on may belong to a different
+  // session than whatever Goal Workspace currently has selected.
+  async openConversationStandalone(workUnitId: string): Promise<void> {
+    try {
+      const workUnit = await this.get<Record<string, unknown>>('/studio/workunits/' + workUnitId);
+      void this.panel.webview.postMessage({ type: 'gwOpenConversationStandalone', workUnit });
+      await this.loadConversationLog(workUnitId);
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: failed to open transcript — ' + String(err));
+    }
+  }
+
+  // Phase 11 — fetches the durable per-cycle LLM transcript for the Conversation tab. Lazy-loaded
+  // like Context, then re-fetched by the webview on a timer while the work unit is still running
+  // (see 'explorerSelectConversationTab' handling below and the webview's conversation poll).
+  private async loadConversationLog(workUnitId: string): Promise<void> {
+    try {
+      const entries = await this.get<ConversationLogEntry[]>(
+        '/studio/workunits/' + workUnitId + '/conversation-log');
+      void this.panel.webview.postMessage({ type: 'conversationLog', workUnitId, entries: entries ?? [] });
+    } catch (err) {
+      void this.panel.webview.postMessage({
+        type: 'conversationLog', workUnitId, entries: [], error: String(err),
+      });
+    }
+  }
+
   // Slice 25c — fetches the original-vs-counterfactual comparison for the "Compare with
   // Original" link on a counterfactual work unit's badge.
   private async loadCounterfactualComparison(workUnitId: string): Promise<void> {
@@ -493,6 +553,9 @@ export class GoalWorkspacePanel {
           break;
         case 'explorerSelectContextTab':
           await this.loadDecisionContext(msg.workUnitId as string);
+          break;
+        case 'explorerSelectConversationTab':
+          await this.loadConversationLog(msg.workUnitId as string);
           break;
         case 'explorerLoadCounterfactualComparison':
           await this.loadCounterfactualComparison(msg.workUnitId as string);
@@ -1214,6 +1277,21 @@ const GW_CSS = `
   .gw-tab-panel { display: none; }
   .gw-tab-panel.active { display: block; }
 
+  /* Phase 11 — Conversation tab */
+  .conv-entry {
+    border: 1px solid var(--nm-border); border-radius: 6px; padding: 8px 10px;
+    margin-bottom: 8px; background: var(--nm-section-bg);
+  }
+  .conv-entry-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .conv-text { white-space: pre-wrap; font-size: 0.85em; margin: 4px 0; }
+  .conv-tool { margin-top: 4px; font-size: 0.82em; }
+  .conv-tool summary { cursor: pointer; opacity: 0.85; }
+  .conv-tool-label { opacity: 0.55; font-size: 0.85em; margin-top: 4px; }
+  .conv-pre {
+    white-space: pre-wrap; background: rgba(127,127,127,0.12); border-radius: 3px;
+    padding: 6px; margin: 2px 0; font-family: var(--nm-mono); max-height: 240px; overflow-y: auto;
+  }
+
   /* Slice 24b — Context tab structured sections */
   .ctx-section { margin-bottom: 12px; }
   .ctx-section h3 {
@@ -1322,7 +1400,10 @@ const GW_HTML = `
 
 const GW_JS = `
   var vscode = acquireVsCodeApi();
-  var state = { decisionNodes: [], selectedNodeId: null, timelineArtifacts: [], timelineEvents: [], selectedSessionId: '' };
+  var state = {
+    decisionNodes: [], selectedNodeId: null, timelineArtifacts: [], timelineEvents: [], selectedSessionId: '',
+    selectedNodeConversation: null, conversationPollTimer: null,
+  };
 
   function esc(s) {
     return String(s || '').replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>');
@@ -1593,7 +1674,9 @@ const GW_JS = `
     el.querySelectorAll('.dn-node').forEach(function(node) {
       node.addEventListener('click', function() {
         var id = node.getAttribute('data-wu');
+        stopConversationPoll();
         state.selectedNodeId = id;
+        state.selectedNodeConversation = null;
         renderDecisionTree(state.decisionNodes);
         document.getElementById('gw-timeline').innerHTML = '<p class="empty">Loading…</p>';
         document.getElementById('gw-inspector').innerHTML = renderDecisionInspector(state.decisionNodes.find(function(w) { return w.workUnitId === id; }));
@@ -1680,6 +1763,7 @@ const GW_JS = `
     var html = '<div class="gw-tab-bar">';
     html += '<button class="gw-tab-btn active" data-gw-tab="metadata">Metadata</button>';
     html += '<button class="gw-tab-btn" data-gw-tab="context">Context</button>';
+    html += '<button class="gw-tab-btn" data-gw-tab="conversation">Conversation</button>';
     html += '</div>';
 
     // ── Metadata panel ────────────────────────────────────────────────────
@@ -1744,10 +1828,94 @@ const GW_JS = `
     }
     html += '</div>'; // end Context panel
 
+    // ── Conversation panel (Phase 11) ──────────────────────────────────────
+    html += '<div class="gw-tab-panel" id="gw-panel-conversation">';
+    if (state.selectedNodeConversation) {
+      html += renderConversationTab(state.selectedNodeConversation);
+    } else {
+      html += '<p class="empty">Conversation loading…</p>';
+    }
+    html += '</div>'; // end Conversation panel
+
+    return html;
+  }
+
+  // Phase 11 — same running-status check used for the steering buttons above; reused so the
+  // Conversation tab's poll knows when to stop without recomputing the status string twice.
+  function isWuRunning(wu) {
+    var statusLower = (wu.status || '').toLowerCase();
+    return statusLower === 'running' || statusLower === 'executing' || statusLower === 'active' ||
+      statusLower === 'queued' || statusLower === 'retrying';
+  }
+
+  // Phase 11 — one row per logged cycle, newest first within each agent so the most recent
+  // reasoning is visible without scrolling; tool calls/results render as collapsible blocks since
+  // they can be large (workspace.read of a big file, etc.).
+  function renderConversationTab(entries) {
+    if (!entries || !entries.length) {
+      return '<p class="empty">No conversation recorded yet for this decision node.</p>';
+    }
+    var totalIn = 0, totalOut = 0, haveTokens = false;
+    entries.forEach(function(e) {
+      if (e.inputTokens != null) { totalIn += e.inputTokens; haveTokens = true; }
+      if (e.outputTokens != null) { totalOut += e.outputTokens; haveTokens = true; }
+    });
+    var html = '';
+    if (haveTokens) {
+      html += '<div class="conv-token-total" style="font-size:0.8em;opacity:0.7;margin-bottom:8px">'
+        + 'Tokens this run — ↑' + totalIn.toLocaleString() + ' in / ↓' + totalOut.toLocaleString() + ' out</div>';
+    }
+    html += '<div id="conv-list">';
+    entries.slice().reverse().forEach(function(e) {
+      html += '<div class="conv-entry">';
+      html += '<div class="conv-entry-head">';
+      html += '<span class="badge">' + esc(e.agentRole) + '</span>';
+      html += '<span class="mono" style="font-size:0.78em;opacity:0.6">' + esc(e.agentId) + '</span>';
+      html += '<span style="font-size:0.78em;opacity:0.55">cycle ' + e.cycleNumber + '</span>';
+      html += '<span style="font-size:0.72em;opacity:0.45">' + fmtTime(e.occurredAt) + '</span>';
+      if (e.inputTokens != null || e.outputTokens != null) {
+        html += '<span style="font-size:0.72em;opacity:0.5">↑' + (e.inputTokens != null ? e.inputTokens.toLocaleString() : '—')
+          + ' ↓' + (e.outputTokens != null ? e.outputTokens.toLocaleString() : '—') + '</span>';
+      }
+      html += '</div>';
+      if (e.assistantText) {
+        html += '<div class="conv-text">' + esc(e.assistantText) + '</div>';
+      }
+      (e.toolCalls || []).forEach(function(call) {
+        var result = (e.toolResults || []).find(function(r) { return r.toolUseId === call.toolUseId; });
+        html += '<details class="conv-tool">';
+        html += '<summary>🔧 ' + esc(call.name) + '</summary>';
+        html += '<div class="conv-tool-label">Input</div>';
+        html += '<pre class="conv-pre">' + esc(call.inputJson) + '</pre>';
+        if (result) {
+          html += '<div class="conv-tool-label">Result' + (result.truncated ? ' (truncated)' : '') + '</div>';
+          html += '<pre class="conv-pre">' + esc(result.result) + '</pre>';
+        }
+        html += '</details>';
+      });
+      html += '</div>';
+    });
+    html += '</div>';
     return html;
   }
 
   // ── Slice 24b — Context tab ────────────────────────────────────────────
+
+  function stopConversationPoll() {
+    if (state.conversationPollTimer) { clearInterval(state.conversationPollTimer); state.conversationPollTimer = null; }
+  }
+
+  // Phase 11 — only polls while the Conversation tab is the one visible and its work unit is
+  // still running; reuses the 2s cadence already used everywhere else in this panel (tree/session
+  // polling) rather than introducing a faster or push-based mechanism.
+  function startConversationPoll(workUnitId) {
+    stopConversationPoll();
+    state.conversationPollTimer = setInterval(function() {
+      var wu = state.decisionNodes.find(function(w) { return w.workUnitId === workUnitId; });
+      if (!wu || !isWuRunning(wu) || state.selectedNodeId !== workUnitId) { stopConversationPoll(); return; }
+      vscode.postMessage({ type: 'explorerSelectConversationTab', workUnitId: workUnitId });
+    }, 2000);
+  }
 
   function bindTabBarClick() {
     document.querySelectorAll('.gw-tab-btn').forEach(function(btn) {
@@ -1763,6 +1931,18 @@ const GW_JS = `
         if (tab === 'context' && !state.selectedNodeContext && state.selectedNodeId) {
           document.getElementById('gw-panel-context').innerHTML = '<p class="empty">Loading…</p>';
           vscode.postMessage({ type: 'explorerSelectContextTab', workUnitId: state.selectedNodeId });
+        }
+
+        // Phase 11 — Conversation tab: fetch on first view, then poll while the work unit runs.
+        if (tab === 'conversation' && state.selectedNodeId) {
+          if (!state.selectedNodeConversation) {
+            document.getElementById('gw-panel-conversation').innerHTML = '<p class="empty">Loading…</p>';
+          }
+          vscode.postMessage({ type: 'explorerSelectConversationTab', workUnitId: state.selectedNodeId });
+          var wu = state.decisionNodes.find(function(w) { return w.workUnitId === state.selectedNodeId; });
+          if (wu && isWuRunning(wu)) { startConversationPoll(state.selectedNodeId); }
+        } else {
+          stopConversationPoll();
         }
       });
     });
@@ -2383,6 +2563,38 @@ const GW_JS = `
             bindDecisionInspectorTabs();
           }
         }
+      }
+      return;
+    }
+    if (msg.type === 'gwOpenConversationStandalone') {
+      var wu = msg.workUnit;
+      if (!wu) { return; }
+      stopConversationPoll();
+      state.selectedNodeId = wu.workUnitId;
+      state.selectedNodeConversation = null;
+      state.selectedNodeContext = null;
+      // Not necessarily part of the currently selected session's tree — cache it anyway so the
+      // existing decisionNodes-driven helpers (poll lookup, tab re-render) keep working. A later
+      // 'tree' poll for the active session will overwrite this array and may drop it again; that
+      // only affects the Metadata tab's re-render, not the Conversation tab already on screen.
+      state.decisionNodes = (state.decisionNodes || []).filter(function(w) { return w.workUnitId !== wu.workUnitId; });
+      state.decisionNodes.push(wu);
+      document.getElementById('gw-inspector').innerHTML = renderDecisionInspector(wu);
+      bindDecisionInspectorTabs();
+      document.querySelectorAll('.gw-tab-btn').forEach(function(b) {
+        b.classList.toggle('active', b.getAttribute('data-gw-tab') === 'conversation');
+      });
+      document.querySelectorAll('.gw-tab-panel').forEach(function(p) {
+        p.classList.toggle('active', p.id === 'gw-panel-conversation');
+      });
+      if (isWuRunning(wu)) { startConversationPoll(wu.workUnitId); }
+      return;
+    }
+    if (msg.type === 'conversationLog') {
+      if (msg.workUnitId === state.selectedNodeId) {
+        state.selectedNodeConversation = msg.entries || [];
+        var convPanel = document.getElementById('gw-panel-conversation');
+        if (convPanel) { convPanel.innerHTML = renderConversationTab(state.selectedNodeConversation); }
       }
       return;
     }

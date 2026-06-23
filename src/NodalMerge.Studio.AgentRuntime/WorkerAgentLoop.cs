@@ -1,5 +1,6 @@
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Versioning;
+using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.AgentRuntime;
 
@@ -19,7 +20,9 @@ internal sealed class WorkerAgentLoop(
     bool isResume = false,
     string? ruleFileContext = null,
     bool selfVerifyBuild = false,
-    bool selfVerifyTest = false)
+    bool selfVerifyTest = false,
+    string? promptGuidanceContext = null,
+    IConversationLogService? conversationLog = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -88,6 +91,8 @@ internal sealed class WorkerAgentLoop(
                 "status before starting from scratch; partial progress may already be on the branch.";
         if (ruleFileContext is not null)
             kickoff += "\n\n" + ruleFileContext;
+        if (promptGuidanceContext is not null)
+            kickoff += "\n\n" + promptGuidanceContext;
         if (selfVerifyBuild || selfVerifyTest)
         {
             var what = selfVerifyBuild && selfVerifyTest ? "build and test" : selfVerifyBuild ? "build" : "test";
@@ -113,6 +118,8 @@ internal sealed class WorkerAgentLoop(
 
             if (response.StopReason == "end_turn")
             {
+                await ConversationLogRecorder.RecordTurnAsync(
+                    conversationLog, workUnitId, agentId, "Worker", taskId, i, response, [], sessionId, ct).ConfigureAwait(false);
                 completedNaturally = true;
                 break;
             }
@@ -132,6 +139,9 @@ internal sealed class WorkerAgentLoop(
 
                 toolResults.Add(new NmToolResult(toolUse.Id, result));
             }
+
+            await ConversationLogRecorder.RecordTurnAsync(
+                conversationLog, workUnitId, agentId, "Worker", taskId, i, response, toolResults, sessionId, ct).ConfigureAwait(false);
 
             if (toolResults.Count == 0)
                 break;

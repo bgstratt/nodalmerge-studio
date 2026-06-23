@@ -619,6 +619,9 @@ const ET_JS = `
       html += '<span class="title mono">' + esc(a.agentId) + '</span>';
       html += badge(a.status);
       html += '<div class="actions">';
+      // Phase 11 — deep-links into Goal Workspace's Decision Lens Conversation tab; the
+      // transcript is durable, so this is offered regardless of pause/interrupted/active state.
+      html += '<button class="ghost" data-action="viewTranscript" data-wu="' + esc(a.workUnitId) + '">View live transcript</button>';
       if (isInterrupted) {
         html += '<button class="ghost" data-action="resumeInterrupted" data-wu="' + esc(a.workUnitId) + '">↺ Resume</button>';
       } else if (isPaused) {
@@ -642,6 +645,11 @@ const ET_JS = `
     el.querySelectorAll('[data-action="resumeInterrupted"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: 'spawnAgent', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+    el.querySelectorAll('[data-action="viewTranscript"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'activityViewTranscript', workUnitId: btn.getAttribute('data-wu') });
       });
     });
     el.querySelectorAll('[data-action="pauseAgent"],[data-action="resumeAgent"],[data-action="stopAgent"]').forEach(function(btn) {

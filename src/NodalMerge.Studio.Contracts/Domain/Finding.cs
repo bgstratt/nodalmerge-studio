@@ -13,8 +13,6 @@ public enum FindingStatus
     Investigating,
 }
 
-// PromptImprovement is reserved for Phase 4 — kept here now so the pipeline doesn't need to
-// reshape when that promotion action (editing an AgentProfile's SystemPrompt) is added.
 public enum FindingKind
 {
     KnowledgeGuideline,
@@ -25,6 +23,10 @@ public enum FindingSource
 {
     Deterministic,
     LlmScan,
+    // Hand-curated findings brought in from another repo's export file (POST
+    // /studio/findings/import) — always lands as Open, never pre-promoted, so it goes through the
+    // same human review as anything else.
+    Imported,
 }
 
 public sealed record Finding(
@@ -38,6 +40,13 @@ public sealed record Finding(
     DateTimeOffset CreatedAt,
     string? ReviewNotes = null,
     DateTimeOffset? ReviewedAt = null,
-    // Set when Promoted — the resulting global Constraint ArtifactRef's id, so the review UI can
-    // link straight to the durable effect this Finding produced.
-    string? PromotedArtifactId = null);
+    // Set when a KnowledgeGuideline Finding is Promoted — the resulting global Constraint
+    // ArtifactRef's id, so the review UI can link straight to the durable effect this Finding
+    // produced. Always null for PromptImprovement findings — their promotion creates no artifact;
+    // the durable effect is just this Finding's own Status=Promoted + TargetStage (see below),
+    // read directly by the matching pipeline stage's agent loop.
+    string? PromotedArtifactId = null,
+    // Required for PromptImprovement findings, unused for KnowledgeGuideline. Scopes which
+    // pipeline stage's agent loop(s) should see this guidance once Promoted — Title/Summary double
+    // as both the review-UI text and the literal text appended to that stage's outgoing prompt.
+    PipelineStage? TargetStage = null);

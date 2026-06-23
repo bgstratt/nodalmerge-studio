@@ -126,6 +126,15 @@ export class StudioShellPanel implements vscode.Disposable {
       }
       return;
     }
+    // Phase 11 — Activity Center's "View live transcript" link. Mirrors the showTab + direct
+    // panel-method pattern extension.ts already uses for notification/dead-letter deep links
+    // (see showTab doc comment above) rather than relying on the broadcast below, since the
+    // target work unit may not belong to whatever session Goal Workspace currently has selected.
+    if (msg.type === 'activityViewTranscript') {
+      this.showTab(GoalWorkspacePanel.containerId);
+      await this.goalWorkspace.openConversationStandalone(msg.workUnitId as string);
+      return;
+    }
     await Promise.all([
       this.activityCenter.handleMessage(msg),
       this.reviewPanel.handleMessage(msg),

@@ -506,6 +506,12 @@ public interface IFindingService
     /// only, never a review outcome.</summary>
     Task<Finding> ReviewAsync(
         string findingId, FindingStatus decision, string? notes = null, CancellationToken ct = default);
+
+    /// <summary>Promoted PromptImprovement findings targeting this pipeline stage — read directly
+    /// by that stage's agent loop(s) when building their outgoing prompt context, the same way
+    /// promoted KnowledgeGuideline findings reach every loop via InheritedConstraints, just
+    /// stage-scoped instead of universal.</summary>
+    Task<IReadOnlyList<Finding>> ListPromotedPromptGuidanceAsync(PipelineStage stage, CancellationToken ct = default);
 }
 
 // Slice — LLM scan. A second, independent Finding detector (alongside FindingDetectorService's
@@ -515,7 +521,10 @@ public interface IFindingService
 // the owning project).
 public sealed record InsightLlmScanRequest(string Provider, string Model, string BaseUrl, string ApiKey, string ContextText);
 
-public sealed record LlmFindingSuggestion(string Title, string Summary);
+// TargetStage is meaningful only when Kind is PromptImprovement — the analyzer parses it
+// defensively (bad/missing values default to KnowledgeGuideline/null) so a malformed model
+// response degrades to "no actionable suggestion" rather than crashing the scan.
+public sealed record LlmFindingSuggestion(string Title, string Summary, FindingKind Kind = FindingKind.KnowledgeGuideline, PipelineStage? TargetStage = null);
 
 public interface IInsightLlmAnalyzerService
 {
@@ -747,6 +756,18 @@ public interface IOrchestrationDecisionLogService
         CancellationToken ct = default);
 
     Task<IReadOnlyList<OrchestrationEvent>> GetEventsAsync(string workUnitId, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Durable, append-only log of each agent-loop cycle's LLM exchange — what the OrchestrationEvent/
+/// DecisionNode records can't show, since those only capture a decision's outcome, not the
+/// reasoning path that produced it. One entry per cycle, never updated after being recorded.
+/// </summary>
+public interface IConversationLogService
+{
+    Task<ConversationLogEntry> RecordAsync(ConversationLogEntry entry, CancellationToken ct = default);
+
+    Task<IReadOnlyList<ConversationLogEntry>> GetEntriesAsync(string workUnitId, CancellationToken ct = default);
 }
 
 // Slice 14a — pluggable validation seam checked at defined pipeline checkpoints. Ships with zero

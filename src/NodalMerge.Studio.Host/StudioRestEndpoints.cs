@@ -619,6 +619,19 @@ public static class StudioRestEndpoints
             return Results.Ok(events);
         });
 
+        app.MapGet("/studio/workunits/{workUnitId}/conversation-log", async (
+            string workUnitId,
+            IWorkUnitService workUnits,
+            IConversationLogService conversationLog,
+            CancellationToken ct) =>
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+            var entries = await conversationLog.GetEntriesAsync(workUnitId, ct).ConfigureAwait(false);
+            return Results.Ok(entries);
+        });
+
         app.MapGet("/studio/workunits/{workUnitId}/intents", async (
             string workUnitId,
             IWorkUnitService workUnits,
@@ -2893,6 +2906,12 @@ public static class StudioRestEndpoints
 
     private sealed record ReviewFindingBody(string Decision, string? Notes = null);
 
+    // Shape matches the portable export format InsightsPanel.ts writes — deliberately just the
+    // repo-agnostic fields (no findingId/status/source/promotedArtifactId, which are meaningless,
+    // or actively wrong, once moved to a different repo).
+    private sealed record ImportFindingEntry(string? Kind, string? Title, string? Summary, string? TargetStage);
+    private sealed record ImportFindingsBody(List<ImportFindingEntry>? Findings);
+
     private static void MapFindingEndpoints(WebApplication app)
     {
         app.MapGet("/studio/findings", async (
@@ -2935,6 +2954,58 @@ public static class StudioRestEndpoints
             {
                 return Results.BadRequest(new { error = ex.Message });
             }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        // Imports a file exported from another repo's Findings queue. Never pre-promoted — every
+        // entry lands as Open, Source=Imported, so it goes through the same human review as a
+        // locally-detected finding. Invalid entries are skipped rather than failing the whole
+        // batch, so one malformed line in a hand-edited file doesn't sink the rest.
+        app.MapPost("/studio/findings/import", async (
+            ImportFindingsBody body,
+            IFindingService findings,
+            CancellationToken ct) =>
+        {
+            var imported = new List<Finding>();
+            var skipped = 0;
+
+            foreach (var entry in body.Findings ?? [])
+            {
+                if (!Enum.TryParse<FindingKind>(entry.Kind, ignoreCase: true, out var kind) ||
+                    string.IsNullOrWhiteSpace(entry.Title) ||
+                    string.IsNullOrWhiteSpace(entry.Summary))
+                {
+                    skipped++;
+                    continue;
+                }
+
+                PipelineStage? targetStage = null;
+                if (kind == FindingKind.PromptImprovement)
+                {
+                    if (!Enum.TryParse<PipelineStage>(entry.TargetStage, ignoreCase: true, out var parsedStage))
+                    {
+                        skipped++;
+                        continue;
+                    }
+                    targetStage = parsedStage;
+                }
+
+                imported.Add(await findings.ProposeAsync(new Finding(
+                    FindingId: $"finding-{Guid.NewGuid():N}",
+                    Kind: kind,
+                    Source: FindingSource.Imported,
+                    Title: entry.Title,
+                    Summary: entry.Summary,
+                    SupportingDataJson: null,
+                    Status: FindingStatus.Open,
+                    CreatedAt: DateTimeOffset.UtcNow,
+                    TargetStage: targetStage), ct).ConfigureAwait(false));
+            }
+
+            return Results.Ok(new { imported, skipped });
         });
     }
 
@@ -2951,8 +3022,9 @@ public static class StudioRestEndpoints
             FindingDetectorService detector,
             CancellationToken ct) =>
         {
-            var created = await detector.DetectDeterministicAsync(ct).ConfigureAwait(false);
-            return Results.Ok(created);
+            var knowledgeFindings = await detector.DetectDeterministicAsync(ct).ConfigureAwait(false);
+            var promptFindings = await detector.DetectPromptImprovementsAsync(ct).ConfigureAwait(false);
+            return Results.Ok(knowledgeFindings.Concat(promptFindings).ToList());
         });
 
         // LLM scan — calls a real model using the caller's own credentials (same shape as spawning
@@ -2966,10 +3038,13 @@ public static class StudioRestEndpoints
             IFindingService findings,
             CancellationToken ct) =>
         {
-            if (string.IsNullOrWhiteSpace(body.Provider) || string.IsNullOrWhiteSpace(body.Model) ||
-                string.IsNullOrWhiteSpace(body.BaseUrl) || string.IsNullOrWhiteSpace(body.ApiKey))
+            // Model and apiKey are deliberately not required here — a vscode-lm-resolved profile
+            // (AgentConfigService.resolveSpawnLlmConfig) legitimately sends both blank, since the
+            // local LM proxy resolves the actual model and needs no real key. Same tolerance every
+            // other spawn path in this system already has for that provider.
+            if (string.IsNullOrWhiteSpace(body.Provider) || string.IsNullOrWhiteSpace(body.BaseUrl))
             {
-                return Results.BadRequest(new { error = "provider, model, baseUrl, and apiKey are required." });
+                return Results.BadRequest(new { error = "provider and baseUrl are required." });
             }
 
             var contextText = await projections.BuildInsightScanContextAsync(ct).ConfigureAwait(false);
@@ -2982,13 +3057,14 @@ public static class StudioRestEndpoints
             {
                 created.Add(await findings.ProposeAsync(new Finding(
                     FindingId: $"finding-{Guid.NewGuid():N}",
-                    Kind: FindingKind.KnowledgeGuideline,
+                    Kind: s.Kind,
                     Source: FindingSource.LlmScan,
                     Title: s.Title,
                     Summary: s.Summary,
                     SupportingDataJson: null,
                     Status: FindingStatus.Open,
-                    CreatedAt: DateTimeOffset.UtcNow), ct).ConfigureAwait(false));
+                    CreatedAt: DateTimeOffset.UtcNow,
+                    TargetStage: s.TargetStage), ct).ConfigureAwait(false));
             }
 
             return Results.Ok(created);

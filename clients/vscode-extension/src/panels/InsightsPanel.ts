@@ -89,6 +89,16 @@ interface Finding {
   reviewNotes?: string | null;
   reviewedAt?: string | null;
   promotedArtifactId?: string | null;
+  targetStage?: string | null;
+}
+
+// The portable export shape — deliberately excludes findingId/status/source/promotedArtifactId,
+// which are meaningless (or actively wrong) once moved to a different repo.
+interface ExportableFinding {
+  kind: string;
+  title: string;
+  summary: string;
+  targetStage?: string | null;
 }
 
 // ── Panel ──────────────────────────────────────────────────────────────────
@@ -106,6 +116,7 @@ export class InsightsPanel {
   private readonly configService: AgentConfigService | undefined;
   private readonly secrets: vscode.SecretStorage | undefined;
   private readonly lmProxyBaseUrl: string | undefined;
+  private currentStatusFilter = 'Open';
 
   constructor(
     panel: vscode.WebviewPanel,
@@ -139,7 +150,13 @@ export class InsightsPanel {
   }
 
   private sendProfiles(): void {
-    const profiles = (this.configService?.getProfiles() ?? []).filter(p => p.model);
+    // vscode-lm profiles legitimately have an empty model — the LM proxy resolves the actual
+    // model at runtime, so a blank model string there isn't "unconfigured." Excluding them (the
+    // way Multi-Model Comparison's orchProfiles filter does, since that feature needs a distinct
+    // model name to label "A vs B") would hide every default Orchestrator/Worker profile here for
+    // no reason — this scan has no such requirement.
+    const profiles = (this.configService?.getProfiles() ?? [])
+      .filter(p => p.model || p.provider === 'vscode-lm');
     void this.panel.webview.postMessage({
       type: 'insightsProfiles',
       profiles: profiles.map(p => ({ id: p.id, label: p.label, model: p.model })),
@@ -148,8 +165,13 @@ export class InsightsPanel {
 
   private async sendFindings(): Promise<void> {
     try {
-      const findings = await this.get<Finding[]>('/studio/findings');
-      void this.panel.webview.postMessage({ type: 'insightsFindingsList', findings });
+      const query = this.currentStatusFilter === 'All' ? '' : '?status=' + encodeURIComponent(this.currentStatusFilter);
+      const findings = await this.get<Finding[]>('/studio/findings' + query);
+      void this.panel.webview.postMessage({
+        type: 'insightsFindingsList',
+        findings,
+        statusFilter: this.currentStatusFilter,
+      });
     } catch {
       // host not ready yet
     }
@@ -194,12 +216,93 @@ export class InsightsPanel {
         }
         return;
       }
+      case 'insightsFindingsFilterChanged': {
+        this.currentStatusFilter = (msg.status as string) || 'Open';
+        await this.sendFindings();
+        return;
+      }
+      case 'insightsExportFindings': {
+        await this.handleExportFindings(msg.findings as ExportableFinding[]);
+        return;
+      }
+      case 'insightsImportFindings': {
+        await this.handleImportFindings();
+        return;
+      }
       default:
         return;
     }
   }
 
+  private async handleExportFindings(findings: ExportableFinding[]): Promise<void> {
+    if (!findings || findings.length === 0) {
+      void vscode.window.showWarningMessage('NodalMerge: select at least one finding to export.');
+      return;
+    }
+    const uri = await vscode.window.showSaveDialog({
+      filters: { 'JSON': ['json'] },
+      saveLabel: 'Export Findings',
+      defaultUri: vscode.Uri.file('nodalmerge-findings.json'),
+    });
+    if (!uri) { return; }
+
+    const payload = { version: 1, exportedAt: new Date().toISOString(), findings };
+    try {
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(payload, null, 2), 'utf8'));
+      void vscode.window.showInformationMessage(
+        `NodalMerge: exported ${findings.length} finding(s) to ${uri.fsPath}.`,
+      );
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: export failed — ' + String(err));
+    }
+  }
+
+  private async handleImportFindings(): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectMany: false,
+      filters: { 'JSON': ['json'] },
+      openLabel: 'Import Findings',
+    });
+    if (!uris || uris.length === 0) { return; }
+
+    let entries: unknown[];
+    try {
+      const bytes = await vscode.workspace.fs.readFile(uris[0]);
+      const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as { findings?: unknown[] };
+      entries = Array.isArray(parsed.findings) ? parsed.findings : [];
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: could not read findings file — ' + String(err));
+      return;
+    }
+    if (entries.length === 0) {
+      void vscode.window.showWarningMessage('NodalMerge: no findings found in that file.');
+      return;
+    }
+
+    try {
+      const result = await this.post<{ imported: Finding[]; skipped: number }>(
+        '/studio/findings/import', { findings: entries },
+      );
+      const skippedNote = result.skipped > 0
+        ? `, skipped ${result.skipped} invalid entr${result.skipped === 1 ? 'y' : 'ies'}`
+        : '';
+      void vscode.window.showInformationMessage(
+        `NodalMerge: imported ${result.imported.length} finding(s)${skippedNote}.`,
+      );
+      await this.sendFindings();
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: import failed — ' + String(err));
+    }
+  }
+
   private async handleRunLlmScan(profileId: string): Promise<void> {
+    if (!profileId) {
+      void vscode.window.showWarningMessage(
+        'NodalMerge: no profile selected — add one with a model set in Model & Agent Studio first.',
+      );
+      void this.panel.webview.postMessage({ type: 'insightsLlmScanDone' });
+      return;
+    }
     if (!this.configService || !this.secrets || !this.lmProxyBaseUrl) {
       void vscode.window.showWarningMessage(
         'NodalMerge: LLM credentials required — configure profiles in Model & Agent Studio.',
@@ -306,7 +409,7 @@ const IN_HTML = `
   <div id="in-body"><p class="in-empty">No analysis run yet — click "Run Analysis" to aggregate outcomes across every goal, work unit, and proposal recorded so far.</p></div>
 
   <div class="in-section">
-    <h3>Findings — Knowledge Promotion</h3>
+    <h3>Findings — Knowledge &amp; Process Improvements</h3>
     <div class="in-findings-toolbar">
       <button id="in-detect-btn">Detect Findings</button>
       <span class="in-hint">free, instant, deterministic rules</span>
@@ -315,13 +418,30 @@ const IN_HTML = `
       <button id="in-llm-scan-btn">Run LLM Scan</button>
       <span class="in-hint">calls a real model with your credentials — real cost &amp; latency</span>
     </div>
+    <div class="in-findings-toolbar">
+      <label class="in-hint" for="in-findings-status">View:</label>
+      <select id="in-findings-status">
+        <option value="Open">Open</option>
+        <option value="Promoted">Promoted</option>
+        <option value="Dismissed">Dismissed</option>
+        <option value="Investigating">Investigating</option>
+        <option value="All">All</option>
+      </select>
+      <span id="in-export-controls" style="display:none">
+        <button id="in-select-all-btn">Select All</button>
+        <button id="in-export-btn">Export Selected</button>
+      </span>
+      <span style="flex:1"></span>
+      <button id="in-import-btn">Import Findings&hellip;</button>
+      <span class="in-hint">bring in findings exported from another repo</span>
+    </div>
     <div id="in-findings-list"><p class="in-empty">No findings yet.</p></div>
   </div>
 `;
 
 const IN_JS = `
   var vscode = acquireVsCodeApi();
-  var state = { profiles: [] };
+  var state = { profiles: [], lastFindings: [] };
 
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -341,10 +461,34 @@ const IN_JS = `
 
   document.getElementById('in-llm-scan-btn').addEventListener('click', function() {
     var profileId = document.getElementById('in-llm-profile').value;
-    if (!profileId) { return; }
     this.disabled = true;
     this.textContent = 'Scanning…';
     vscode.postMessage({ type: 'insightsRunLlmScan', profileId: profileId });
+  });
+
+  document.getElementById('in-findings-status').addEventListener('change', function() {
+    document.getElementById('in-export-controls').style.display = this.value === 'Promoted' ? '' : 'none';
+    vscode.postMessage({ type: 'insightsFindingsFilterChanged', status: this.value });
+  });
+
+  document.getElementById('in-select-all-btn').addEventListener('click', function() {
+    document.querySelectorAll('.in-finding-select').forEach(function(cb) { cb.checked = true; });
+  });
+
+  document.getElementById('in-export-btn').addEventListener('click', function() {
+    var ids = Array.prototype.map.call(
+      document.querySelectorAll('.in-finding-select:checked'),
+      function(cb) { return cb.getAttribute('data-finding-id'); }
+    );
+    var selected = (state.lastFindings || []).filter(function(f) { return ids.indexOf(f.findingId) !== -1; });
+    var exportable = selected.map(function(f) {
+      return { kind: f.kind, title: f.title, summary: f.summary, targetStage: f.targetStage || null };
+    });
+    vscode.postMessage({ type: 'insightsExportFindings', findings: exportable });
+  });
+
+  document.getElementById('in-import-btn').addEventListener('click', function() {
+    vscode.postMessage({ type: 'insightsImportFindings' });
   });
 
   function renderHighlights(data) {
@@ -447,24 +591,47 @@ const IN_JS = `
       '</tr></thead><tbody>' + body + '</tbody></table></div>';
   }
 
-  function findingBadgeLabel(source) { return source === 'LlmScan' ? 'LLM scan' : 'deterministic'; }
+  function findingSourceBadgeLabel(source) { return source === 'LlmScan' ? 'LLM scan' : source === 'Imported' ? 'imported' : 'deterministic'; }
+  function findingKindBadgeLabel(kind) { return kind === 'PromptImprovement' ? 'Prompt' : 'Knowledge'; }
 
-  function renderFindings(findings) {
-    var open = (findings || []).filter(function(f) { return f.status === 'Open'; });
-    if (!open.length) { return '<p class="in-empty">No findings yet.</p>'; }
-    return open.map(function(f) {
-      return '' +
-        '<div class="in-finding-card" data-finding-id="' + esc(f.findingId) + '">' +
-          '<div class="in-finding-card-head">' +
-            '<span class="in-finding-title">' + esc(f.title) + '</span>' +
-            '<span class="in-finding-badge">' + esc(findingBadgeLabel(f.source)) + '</span>' +
-          '</div>' +
-          '<div class="in-finding-summary">' + esc(f.summary) + '</div>' +
-          '<div class="in-finding-actions">' +
+  function renderFindings(findings, statusFilter) {
+    var list = findings || [];
+    if (!list.length) { return '<p class="in-empty">No findings yet.</p>'; }
+    return list.map(function(f) {
+      var stageBadge = f.kind === 'PromptImprovement' && f.targetStage
+        ? '<span class="in-finding-badge">' + esc(f.targetStage) + '</span>'
+        : '';
+      // Open/Investigating are non-terminal — still actionable. Promoted/Dismissed are terminal:
+      // ReviewAsync has no revert path, so showing Promote/Dismiss/Investigate there would imply
+      // an undo capability that doesn't exist.
+      var actionable = f.status === 'Open' || f.status === 'Investigating';
+      var actions = actionable
+        ? '<div class="in-finding-actions">' +
             '<button class="in-finding-promote">Promote</button>' +
             '<button class="in-finding-dismiss">Dismiss</button>' +
             '<button class="in-finding-investigate">Investigate</button>' +
+          '</div>'
+        : '';
+      var metaParts = [];
+      if (f.reviewedAt) { metaParts.push('Reviewed ' + new Date(f.reviewedAt).toLocaleString()); }
+      if (f.reviewNotes) { metaParts.push('Notes: ' + f.reviewNotes); }
+      if (f.promotedArtifactId) { metaParts.push('Artifact: ' + f.promotedArtifactId); }
+      var meta = metaParts.length ? '<div class="in-finding-meta">' + esc(metaParts.join(' · ')) + '</div>' : '';
+      var checkbox = statusFilter === 'Promoted'
+        ? '<input type="checkbox" class="in-finding-select" data-finding-id="' + esc(f.findingId) + '">'
+        : '';
+      return '' +
+        '<div class="in-finding-card" data-finding-id="' + esc(f.findingId) + '">' +
+          '<div class="in-finding-card-head">' +
+            checkbox +
+            '<span class="in-finding-title">' + esc(f.title) + '</span>' +
+            '<span class="in-finding-badge">' + esc(findingKindBadgeLabel(f.kind)) + '</span>' +
+            stageBadge +
+            '<span class="in-finding-badge">' + esc(findingSourceBadgeLabel(f.source)) + '</span>' +
           '</div>' +
+          '<div class="in-finding-summary">' + esc(f.summary) + '</div>' +
+          meta +
+          actions +
         '</div>';
     }).join('');
   }
@@ -511,12 +678,16 @@ const IN_JS = `
       state.profiles = msg.profiles || [];
       var sel = document.getElementById('in-llm-profile');
       sel.innerHTML = state.profiles.length
-        ? state.profiles.map(function(p) { return '<option value="' + esc(p.id) + '">' + esc(p.label) + ' (' + esc(p.model) + ')</option>'; }).join('')
+        ? state.profiles.map(function(p) { return '<option value="' + esc(p.id) + '">' + esc(p.label) + (p.model ? ' (' + esc(p.model) + ')' : '') + '</option>'; }).join('')
         : '<option value="">(no profile configured)</option>';
       return;
     }
     if (msg.type === 'insightsFindingsList') {
-      document.getElementById('in-findings-list').innerHTML = renderFindings(msg.findings);
+      state.lastFindings = msg.findings || [];
+      var statusSel = document.getElementById('in-findings-status');
+      if (msg.statusFilter && statusSel.value !== msg.statusFilter) { statusSel.value = msg.statusFilter; }
+      document.getElementById('in-export-controls').style.display = statusSel.value === 'Promoted' ? '' : 'none';
+      document.getElementById('in-findings-list').innerHTML = renderFindings(state.lastFindings, statusSel.value);
       bindFindingActions();
       document.getElementById('in-detect-btn').disabled = false;
       return;

@@ -1,5 +1,6 @@
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Versioning;
+using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.AgentRuntime;
 
@@ -17,7 +18,8 @@ internal sealed class ReviewerAgentLoop(
     string? sessionId = null,
     Action<string?>? onActivity = null,
     IReadOnlyList<string>? filesTouched = null,
-    string? noFileChangesJustification = null)
+    string? noFileChangesJustification = null,
+    IConversationLogService? conversationLog = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -79,6 +81,8 @@ internal sealed class ReviewerAgentLoop(
 
             if (response.StopReason == "end_turn")
             {
+                await ConversationLogRecorder.RecordTurnAsync(
+                    conversationLog, workUnitId, agentId, "Reviewer", null, i, response, [], sessionId, ct).ConfigureAwait(false);
                 completedNaturally = true;
                 break;
             }
@@ -98,6 +102,9 @@ internal sealed class ReviewerAgentLoop(
 
                 toolResults.Add(new NmToolResult(toolUse.Id, result));
             }
+
+            await ConversationLogRecorder.RecordTurnAsync(
+                conversationLog, workUnitId, agentId, "Reviewer", null, i, response, toolResults, sessionId, ct).ConfigureAwait(false);
 
             if (toolResults.Count == 0)
                 break;

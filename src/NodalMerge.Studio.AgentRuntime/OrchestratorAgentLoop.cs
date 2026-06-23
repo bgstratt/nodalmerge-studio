@@ -23,10 +23,12 @@ internal sealed class OrchestratorAgentLoop(
     IMergeReconciliationService mergeReconciliation,
     IAutomatedReviewGateService automatedReview,
     IWorkUnitService workUnits,
+    IFindingService findings,
     AgentProfile? profile = null,
     string? sessionId = null,
     int stallDetectionCycles = 4,
-    Action<string?>? onActivity = null)
+    Action<string?>? onActivity = null,
+    IConversationLogService? conversationLog = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -109,6 +111,13 @@ internal sealed class OrchestratorAgentLoop(
             if (i == 0 && currentProjection.InheritedConstraints.Count > 0)
                 AppendConstraintsToOutgoingMessage(messages, currentProjection.InheritedConstraints);
 
+            if (i == 0)
+            {
+                var promptGuidance = await findings.ListPromotedPromptGuidanceAsync(PipelineStage.Orchestrate, ct).ConfigureAwait(false);
+                if (promptGuidance.Count > 0)
+                    AppendPromptGuidanceToOutgoingMessage(messages, promptGuidance);
+            }
+
             AppendDeltaToOutgoingMessage(messages, delta);
 
             onActivity?.Invoke("Thinking...");
@@ -124,6 +133,8 @@ internal sealed class OrchestratorAgentLoop(
                 var awaitingReview = chain.Any(a => a.Type == ArtifactType.MergeProposal && a.Status == ArtifactStatus.Active);
                 var action = awaitingReview ? OrchestrationAction.AwaitReview : OrchestrationAction.NoOp;
                 await RecordDecisionAsync(action, [], text, ct).ConfigureAwait(false);
+                await ConversationLogRecorder.RecordTurnAsync(
+                    conversationLog, workUnitId, agentId, "Orchestrator", null, i, response, [], sessionId, ct).ConfigureAwait(false);
                 completedNaturally = true;
                 break;
             }
@@ -150,6 +161,9 @@ internal sealed class OrchestratorAgentLoop(
                 if (await RecordToolDecisionAsync(toolUse.Name, toolUse.Input, result, ct).ConfigureAwait(false))
                     madeRoutingDecisionLastCycle = true;
             }
+
+            await ConversationLogRecorder.RecordTurnAsync(
+                conversationLog, workUnitId, agentId, "Orchestrator", null, i, response, toolResults, sessionId, ct).ConfigureAwait(false);
 
             if (toolResults.Count == 0)
                 break;
@@ -234,6 +248,20 @@ internal sealed class OrchestratorAgentLoop(
     {
         var lines = constraints.Select(c => $"- {c.Title ?? c.ArtifactId}: {c.Body ?? ""}");
         var text = "[Known constraints — durable guidance from prior runs; apply unless this work unit's goal explicitly says otherwise]\n"
+            + string.Join("\n", lines);
+        var last = messages[^1];
+        IReadOnlyList<NmContent> newContent = last.Content is [NmText only]
+            ? [new NmText($"{only.Text}\n\n{text}")]
+            : [.. last.Content, new NmText(text)];
+        messages[^1] = last with { Content = newContent };
+    }
+
+    // Promoted PromptImprovement findings targeting this stage — scoped guidance, unlike the
+    // universal constraints above. Same single-NmText-folding pattern as AppendConstraintsToOutgoingMessage.
+    private static void AppendPromptGuidanceToOutgoingMessage(List<NmMessage> messages, IReadOnlyList<Finding> promptGuidance)
+    {
+        var lines = promptGuidance.Select(f => $"- {f.Title}: {f.Summary}");
+        var text = "[Process guidance — promoted prompt improvements for this stage]\n"
             + string.Join("\n", lines);
         var last = messages[^1];
         IReadOnlyList<NmContent> newContent = last.Content is [NmText only]

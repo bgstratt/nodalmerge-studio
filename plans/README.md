@@ -108,6 +108,40 @@ today — fixed as part of 15d.
 | 15e | Agent command consolidation | Planned |
 | 15f | Scheduler & Artifact command consolidation | Planned |
 
+## Phase 10 — Insights: Knowledge Promotion & Prompt Improvements
+
+See [insights-plan.md](./insights-plan.md). Turns the Insights tab from a read-only analytics
+dashboard into a human-gated pipeline that changes how future runs behave: deterministic + LLM-scan
+detection, a `Finding` review queue (Promote/Dismiss/Investigate), global Knowledge Promotion and
+stage-scoped Prompt Improvements wired into Orchestrator/Planner/Worker prompts, and (in progress)
+an active-findings history view plus file-based export/import across repos.
+
+| Slice | Focus | Status |
+|-------|-------|--------|
+| 10a | Retrospective highlights, date-range filtering, Workspace Intelligence sub-bucketing | Complete |
+| 10b | `Finding` domain + `IFindingService` review pipeline + REST | Complete |
+| 10c | Deterministic + LLM-scan detectors; global Constraint promotion; `InheritedConstraints` wired into Orchestrator/Planner | Complete |
+| 10d | Insights tab UI structure | Complete |
+| 10e | `PromptImprovement` findings — stage-scoped context-injection promotion | Complete |
+| 10f | Promoted guidance wired into Orchestrator/Planner/Worker outgoing prompts | Complete |
+| 10g | Worker wired into global `KnowledgeGuideline` constraints | Complete |
+| 10h | Status filter/history view; export Promoted findings to file; import findings from file | In progress |
+
+## Phase 11 — Conversation Transcripts
+
+See [phase-11-conversation-transcripts.md](./phase-11-conversation-transcripts.md). Adds a durable,
+append-only log of each agent-loop cycle's LLM exchange (assistant text, tool calls, tool results) —
+previously discarded the instant a loop's `RunAsync()` returned — surfaced as a "Conversation" tab
+in Goal Workspace's Decision Lens, plus a "View live transcript" deep-link from Activity Center.
+
+| Slice | Focus | Status |
+|---|---|---|
+| 11a | `ConversationLogEntry` domain type, `ConversationLogService`, node-store persistence | Complete |
+| 11b | Shared recorder helper wired into all four agent loops + their construction sites | Complete |
+| 11c | `GET /studio/workunits/{workUnitId}/conversation-log` REST endpoint | Complete |
+| 11d | Goal Workspace Decision Lens "Conversation" tab, with live 2s polling while running | Complete |
+| 11e | Activity Center "View live transcript" deep-link into Goal Workspace | Complete |
+
 ## Slice document template
 
 Each slice file should include:

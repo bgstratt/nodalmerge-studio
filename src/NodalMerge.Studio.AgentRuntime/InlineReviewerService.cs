@@ -24,6 +24,7 @@ public sealed class InlineReviewerService(
         var agentId = $"reviewer-auto-{Guid.NewGuid():N}";
         var dispatcher = serviceProvider.GetRequiredService<McpToolDispatcher>();
         var llm = serviceProvider.GetRequiredService<LlmClient>();
+        var conversationLog = serviceProvider.GetRequiredService<IConversationLogService>();
 
         // Slice — hand the reviewer filesTouched/justification up front instead of relying on it
         // to remember to go fetch them; ReviewerAgentLoop's prompt already says to check this, but
@@ -35,7 +36,8 @@ public sealed class InlineReviewerService(
             creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey,
             dispatcher, llm,
             filesTouched: proposalForReview?.FilesTouched,
-            noFileChangesJustification: proposalForReview?.NoFileChangesJustification);
+            noFileChangesJustification: proposalForReview?.NoFileChangesJustification,
+            conversationLog: conversationLog);
 
         await loop.RunAsync(ct).ConfigureAwait(false);
 

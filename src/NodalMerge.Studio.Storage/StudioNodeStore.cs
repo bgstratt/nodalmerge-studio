@@ -31,6 +31,7 @@ public static class StudioNodeKind
     public const string ExperimentV1         = "studio/experiment/v1";
     public const string SteeringDecisionV1   = "studio/steering-decision/v1";
     public const string FindingV1            = "studio/finding/v1";
+    public const string ConversationLogV1    = "studio/conversation-log/v1";
 }
 
 public interface IStudioNodeStore
