@@ -44,7 +44,8 @@ public sealed class AutomatedReviewGateService(
                 proposal.ProposalId);
         }
 
-        var creds = agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+        var creds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Review)
+            ?? agentControl.GetOrchestratorCredentials(parentWorkUnitId);
         await scheduler.EnqueueAsync(
             parentWorkUnitId,
             profileId,
@@ -105,7 +106,8 @@ public sealed class AutomatedReviewGateService(
         }
 
         var children = await workUnits.GetChildrenAsync(parentWorkUnitId, cancellationToken).ConfigureAwait(false);
-        var creds = agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+        var creds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Execute)
+            ?? agentControl.GetOrchestratorCredentials(parentWorkUnitId);
         foreach (var child in children)
         {
             if (child.Status is not WorkUnitStatus.Proposed and not WorkUnitStatus.Merged)
@@ -210,8 +212,11 @@ public sealed class AutomatedReviewGateService(
             ? children.Where(c => c.Status is WorkUnitStatus.Proposed or WorkUnitStatus.Merged).ToList()
             : [workUnit];
 
-        var creds = agentControl.GetOrchestratorCredentials(workUnitId)
-            ?? (workUnit.ParentWorkUnitId is { } parentId ? agentControl.GetOrchestratorCredentials(parentId) : null);
+        var creds = agentControl.GetCredentialsForStage(workUnitId, PipelineStage.Execute)
+            ?? agentControl.GetOrchestratorCredentials(workUnitId)
+            ?? (workUnit.ParentWorkUnitId is { } parentId
+                ? agentControl.GetCredentialsForStage(parentId, PipelineStage.Execute) ?? agentControl.GetOrchestratorCredentials(parentId)
+                : null);
         foreach (var target in retryTargets)
         {
             try

@@ -13,15 +13,14 @@ export interface AgentProfile {
   systemPromptHint?: string;
 }
 
-export interface TopologyWorker {
-  profile: string;
-  branch?: string;
-}
-
 export interface TopologyTemplate {
   name:         string;
   orchestrator: string;
-  workers?:     TopologyWorker[];
+  // Optional per-stage credential profile overrides — when unset, that stage inherits the
+  // orchestrator's profile (today's behavior). Profile ids reference entries from getProfiles().
+  planner?:     string;
+  worker?:      string;
+  reviewer?:    string;
 }
 
 /** LLM connection fields passed to POST /studio/agents/spawn. */
@@ -38,7 +37,7 @@ const DEFAULT_PROFILES: AgentProfile[] = [
 ];
 
 const DEFAULT_TEMPLATES: TopologyTemplate[] = [
-  { name: 'Default', orchestrator: 'orchestrator', workers: [{ profile: 'worker' }] },
+  { name: 'Default', orchestrator: 'orchestrator', worker: 'worker' },
 ];
 
 export class AgentConfigService {

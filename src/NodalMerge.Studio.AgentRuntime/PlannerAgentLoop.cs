@@ -95,7 +95,8 @@ internal sealed class PlannerAgentLoop(
             if (response.StopReason == "end_turn")
             {
                 await ConversationLogRecorder.RecordTurnAsync(
-                    conversationLog, workUnitId, agentId, "Planner", null, i, response, [], sessionId, ct).ConfigureAwait(false);
+                    conversationLog, workUnitId, agentId, "Planner", null, i, response, [], sessionId, ct,
+                    provider, model).ConfigureAwait(false);
                 completedNaturally = true;
                 break;
             }
@@ -117,7 +118,8 @@ internal sealed class PlannerAgentLoop(
             }
 
             await ConversationLogRecorder.RecordTurnAsync(
-                conversationLog, workUnitId, agentId, "Planner", null, i, response, toolResults, sessionId, ct).ConfigureAwait(false);
+                conversationLog, workUnitId, agentId, "Planner", null, i, response, toolResults, sessionId, ct,
+                provider, model).ConfigureAwait(false);
 
             if (toolResults.Count == 0)
                 break;
@@ -183,12 +185,13 @@ internal sealed class PlannerAgentLoop(
                     ["content"]    = Str("Full file content")
                 })),
 
-            new(McpToolNames.WorkspaceList, "List files in the branch working directory.",
+            new(McpToolNames.WorkspaceList, "List files in the branch working directory. To find a specific existing file by name, omit path and set pattern to that filename.",
                 Schema(["branchId"], new()
                 {
                     ["branchId"]   = Str("Branch ID"),
                     ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
-                    ["path"]       = Str("Subdirectory (optional)")
+                    ["path"]       = Str("Subdirectory (optional, omit to search the entire branch)"),
+                    ["pattern"]    = Str("Filter to paths matching this filename or wildcard pattern (* and ?), case-insensitive (optional)")
                 })),
         ];
     }

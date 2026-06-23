@@ -79,7 +79,7 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         return Task.FromResult(File.Exists(fullPath));
     }
 
-    public Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, CancellationToken ct = default)
+    public Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, string? pattern = null, CancellationToken ct = default)
     {
         var branchDir = BranchDir(branchId);
         var searchRoot = subPath is { Length: > 0 }
@@ -89,13 +89,33 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         if (!Directory.Exists(searchRoot))
             return Task.FromResult<IReadOnlyList<string>>([]);
 
+        var matcher = PatternMatcher(pattern);
         var files = Directory.EnumerateFiles(searchRoot, "*", SearchOption.AllDirectories)
             .Where(f => !IsHidden(f))
             .Select(f => Path.GetRelativePath(branchDir, f).Replace('\\', '/'))
+            .Where(matcher)
             .OrderBy(f => f)
             .ToList();
 
         return Task.FromResult<IReadOnlyList<string>>(files);
+    }
+
+    // Translates a plain filename ("Foo.cs") into a substring match and a wildcard pattern
+    // ("*Foo*"/"Foo?.cs") into a regex — null/empty pattern matches everything.
+    private static Func<string, bool> PatternMatcher(string? pattern)
+    {
+        if (string.IsNullOrEmpty(pattern))
+            return _ => true;
+
+        var regexPattern = "^.*" + string.Concat(pattern.Select(c => c switch
+        {
+            '*' => ".*",
+            '?' => ".",
+            _   => System.Text.RegularExpressions.Regex.Escape(c.ToString())
+        })) + ".*$";
+        var regex = new System.Text.RegularExpressions.Regex(
+            regexPattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return regex.IsMatch;
     }
 
     public async Task<string> DiffAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default)

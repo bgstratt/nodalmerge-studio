@@ -122,7 +122,8 @@ public sealed class FanOutService : IFanOutService
                     actions.Add(FanOutAction.ChildrenCreated);
             }
 
-            var creds = _agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+            var creds = _agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Execute)
+                ?? _agentControl.GetOrchestratorCredentials(parentWorkUnitId);
             var children = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
             foreach (var child in children)
             {

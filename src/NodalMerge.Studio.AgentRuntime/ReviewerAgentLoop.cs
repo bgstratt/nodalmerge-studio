@@ -82,7 +82,8 @@ internal sealed class ReviewerAgentLoop(
             if (response.StopReason == "end_turn")
             {
                 await ConversationLogRecorder.RecordTurnAsync(
-                    conversationLog, workUnitId, agentId, "Reviewer", null, i, response, [], sessionId, ct).ConfigureAwait(false);
+                    conversationLog, workUnitId, agentId, "Reviewer", null, i, response, [], sessionId, ct,
+                    provider, model).ConfigureAwait(false);
                 completedNaturally = true;
                 break;
             }
@@ -104,7 +105,8 @@ internal sealed class ReviewerAgentLoop(
             }
 
             await ConversationLogRecorder.RecordTurnAsync(
-                conversationLog, workUnitId, agentId, "Reviewer", null, i, response, toolResults, sessionId, ct).ConfigureAwait(false);
+                conversationLog, workUnitId, agentId, "Reviewer", null, i, response, toolResults, sessionId, ct,
+                provider, model).ConfigureAwait(false);
 
             if (toolResults.Count == 0)
                 break;
@@ -171,12 +173,13 @@ internal sealed class ReviewerAgentLoop(
                     ["path"]       = Str("Relative file path"),
                 })),
 
-            new(McpToolNames.WorkspaceList, "List files in the branch working directory.",
+            new(McpToolNames.WorkspaceList, "List files in the branch working directory. To find a specific existing file by name, omit path and set pattern to that filename.",
                 Schema(["branchId"], new()
                 {
                     ["branchId"]   = Str("Branch ID"),
                     ["workUnitId"] = Str("The work unit under review — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
-                    ["path"]       = Str("Sub-directory to list (optional, omit for all files)"),
+                    ["path"]       = Str("Sub-directory to list (optional, omit to search the entire branch)"),
+                    ["pattern"]    = Str("Filter to paths matching this filename or wildcard pattern (* and ?), case-insensitive (optional)"),
                 })),
 
             new(McpToolNames.WorkspaceDiff, "Show the diff between this branch and the target branch.",

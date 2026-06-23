@@ -18,7 +18,9 @@ internal static class ConversationLogRecorder
         LlmResponse response,
         IReadOnlyList<NmContent> toolResults,
         string? sessionId,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? provider = null,
+        string? model = null)
     {
         if (conversationLog is null)
             return;
@@ -45,6 +47,8 @@ internal static class ConversationLogRecorder
             OccurredAt: DateTimeOffset.UtcNow,
             SessionId: sessionId,
             InputTokens: response.InputTokens,
-            OutputTokens: response.OutputTokens), ct).ConfigureAwait(false);
+            OutputTokens: response.OutputTokens,
+            Provider: provider,
+            Model: model), ct).ConfigureAwait(false);
     }
 }

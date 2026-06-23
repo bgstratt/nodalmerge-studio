@@ -212,7 +212,8 @@ internal sealed class McpToolDispatcher(
         var agentId = await agentControl.SpawnAsync(
             Str(input, "agentType")!, Str(input, "workUnitId")!,
             Str(input, "taskId"), Str(input, "model"), Str(input, "baseUrl"), Str(input, "apiKey"),
-            Str(input, "provider"), Str(input, "profileId"), Str(input, "autoReviewProfileId"), ct).ConfigureAwait(false);
+            Str(input, "provider"), Str(input, "profileId"), Str(input, "autoReviewProfileId"),
+            cancellationToken: ct).ConfigureAwait(false);
         return ToJson(new { agentId });
     }
 
@@ -415,7 +416,7 @@ internal sealed class McpToolDispatcher(
         if (branchId is null) return ToError("branchId (or workUnitId) is required.");
         try
         {
-            var files = await fileWorkspace.ListAsync(branchId, Str(input, "path"), ct).ConfigureAwait(false);
+            var files = await fileWorkspace.ListAsync(branchId, Str(input, "path"), Str(input, "pattern"), ct).ConfigureAwait(false);
             return ToJson(new { files, branchId });
         }
         catch (Exception ex) { return ToError(ex.Message); }

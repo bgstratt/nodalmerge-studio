@@ -439,6 +439,7 @@ public interface IAgentControlService
         string? provider = null,
         string? profileId = null,
         string? autoReviewProfileId = null,
+        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
         CancellationToken cancellationToken = default);
 
     // Re-enters the orchestrator loop for a work unit whose orchestrator was previously
@@ -451,6 +452,13 @@ public interface IAgentControlService
     /// Used by fan-out to enqueue child workers with the same credentials.
     /// </summary>
     OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId);
+
+    /// <summary>
+    /// Per-stage credential override captured at orchestrator spawn time (e.g. a different model
+    /// for Plan vs Execute vs Review), or null if no override was configured for that stage —
+    /// callers fall back to <see cref="GetOrchestratorCredentials"/> in that case.
+    /// </summary>
+    OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage);
 
     /// <summary>
     /// Profile ID for the automated reviewer pre-gate, captured at orchestrator spawn time.
@@ -883,7 +891,11 @@ public interface IFileWorkspaceService
     Task WriteAsync(string branchId, string relativePath, string content, CancellationToken ct = default);
     Task DeleteAsync(string branchId, string relativePath, CancellationToken ct = default);
     Task<bool> ExistsAsync(string branchId, string relativePath, CancellationToken ct = default);
-    Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, CancellationToken ct = default);
+    // pattern: optional case-insensitive filter against each result's relative path, supporting
+    // * (any run of characters) and ? (any single character) wildcards — a plain filename like
+    // "WeatherForecastController.cs" matches as a substring, so callers can find a specific file by
+    // name across the whole branch (subPath omitted) without already knowing its directory.
+    Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, string? pattern = null, CancellationToken ct = default);
     Task<string> DiffAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default);
     Task ApplyBranchAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default);
     Task CopyFilesAsync(

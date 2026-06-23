@@ -28,7 +28,8 @@ internal sealed class OrchestratorAgentLoop(
     string? sessionId = null,
     int stallDetectionCycles = 4,
     Action<string?>? onActivity = null,
-    IConversationLogService? conversationLog = null)
+    IConversationLogService? conversationLog = null,
+    IAgentControlService? agentControl = null)
 {
     private static readonly string DefaultSystemPrompt =
         """
@@ -134,7 +135,8 @@ internal sealed class OrchestratorAgentLoop(
                 var action = awaitingReview ? OrchestrationAction.AwaitReview : OrchestrationAction.NoOp;
                 await RecordDecisionAsync(action, [], text, ct).ConfigureAwait(false);
                 await ConversationLogRecorder.RecordTurnAsync(
-                    conversationLog, workUnitId, agentId, "Orchestrator", null, i, response, [], sessionId, ct).ConfigureAwait(false);
+                    conversationLog, workUnitId, agentId, "Orchestrator", null, i, response, [], sessionId, ct,
+                    provider, model).ConfigureAwait(false);
                 completedNaturally = true;
                 break;
             }
@@ -163,7 +165,8 @@ internal sealed class OrchestratorAgentLoop(
             }
 
             await ConversationLogRecorder.RecordTurnAsync(
-                conversationLog, workUnitId, agentId, "Orchestrator", null, i, response, toolResults, sessionId, ct).ConfigureAwait(false);
+                conversationLog, workUnitId, agentId, "Orchestrator", null, i, response, toolResults, sessionId, ct,
+                provider, model).ConfigureAwait(false);
 
             if (toolResults.Count == 0)
                 break;
@@ -322,16 +325,32 @@ internal sealed class OrchestratorAgentLoop(
     private JsonElement InjectSpawnCredentials(JsonElement input)
     {
         var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(input) ?? [];
-        // Always overwrite credentials — the model must not hallucinate them.
-        dict["model"]    = JsonSerializer.SerializeToElement(model);
-        dict["baseUrl"]  = JsonSerializer.SerializeToElement(baseUrl);
-        dict["apiKey"]   = JsonSerializer.SerializeToElement(apiKey);
-        dict["provider"] = JsonSerializer.SerializeToElement(provider);
         // Default profileId to "worker" if the model didn't specify one.
         if (!dict.ContainsKey("profileId"))
             dict["profileId"] = JsonSerializer.SerializeToElement("worker");
+        var profileId = dict["profileId"].ValueKind == JsonValueKind.String ? dict["profileId"].GetString() : null;
+
+        // Always overwrite credentials — the model must not hallucinate them. Per-stage overrides
+        // (configured on the run's Agent Topology) take precedence over this loop's own
+        // credentials, so e.g. Planning can use a different model than Orchestration/Execution.
+        var stageCreds = agentControl?.GetCredentialsForStage(workUnitId, StageForProfileId(profileId));
+        dict["model"]    = JsonSerializer.SerializeToElement(stageCreds?.Model ?? model);
+        dict["baseUrl"]  = JsonSerializer.SerializeToElement(stageCreds?.BaseUrl ?? baseUrl);
+        dict["apiKey"]   = JsonSerializer.SerializeToElement(stageCreds?.ApiKey ?? apiKey);
+        dict["provider"] = JsonSerializer.SerializeToElement(stageCreds?.Provider ?? provider);
         return JsonSerializer.SerializeToElement(dict);
     }
+
+    // The only enqueue/spawn calls this loop ever issues are the Planner (via
+    // nm_v1_scheduler_enqueue, profileId="planner") and, on the legacy direct-spawn path, a Worker
+    // (profileId defaults to "worker" above) — same string convention already used elsewhere in
+    // this codebase (e.g. AutomatedReviewGateService's literal "worker"/"reviewer" checks).
+    private static PipelineStage StageForProfileId(string? profileId) => profileId switch
+    {
+        "planner"  => PipelineStage.Plan,
+        "reviewer" => PipelineStage.Review,
+        _          => PipelineStage.Execute,
+    };
 
     private static IReadOnlyList<LlmToolDef> FilterTools(IReadOnlyList<string>? allowedTools)
     {

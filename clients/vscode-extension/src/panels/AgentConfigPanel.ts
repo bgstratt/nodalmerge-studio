@@ -390,11 +390,11 @@ const MAS_CSS = `
 const MAS_HTML = `
   <div class="header">
     <h1>Model & Agent Studio</h1>
-    <p class="sub">Configure models, agent profiles, and exploration strategies.</p>
+    <p class="sub">Configure models, agent profiles, and agent topology.</p>
   </div>
   <div class="tabs">
     <button class="tab-btn active" data-tab="profiles">Profiles</button>
-    <button class="tab-btn" data-tab="strategies">Exploration Strategies</button>
+    <button class="tab-btn" data-tab="strategies">Agent Topology</button>
     <button class="tab-btn" data-tab="explore">Quick Explore</button>
     <button class="tab-btn" data-tab="pipeline-profiles">Pipeline Profiles</button>
     <button class="tab-btn" data-tab="session-defaults">Session Defaults</button>
@@ -412,16 +412,16 @@ const MAS_HTML = `
   <div id="pane-strategies" class="tab-pane">
     <div id="template-form-area"></div>
     <table>
-      <thead><tr><th>Name</th><th>Planner Profile</th><th>Executor Profiles</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Orchestrator Profile</th><th>Planner Profile</th><th>Worker Profile</th><th>Reviewer Profile</th><th></th></tr></thead>
       <tbody id="template-tbody"></tbody>
     </table>
-    <button class="add-btn" id="btn-add-template">+ Add Exploration Strategy</button>
+    <button class="add-btn" id="btn-add-template">+ Add Topology</button>
   </div>
 
   <div id="pane-explore" class="tab-pane">
     <div class="explore-form">
       <div class="field">
-        <label>Exploration Strategy</label>
+        <label>Agent Topology</label>
         <select id="explore-strategy"></select>
       </div>
       <div class="field">
@@ -730,19 +730,26 @@ const MAS_JS = `
     showProfileForm(-1);
   });
 
-  // ── Exploration Strategies ─────────────────────────────────────────────────
+  // ── Agent Topology ───────────────────────────────────────────────────────────
+  function profileLabel(profileId) {
+    if (!profileId) { return '— inherit Orchestrator —'; }
+    const p = profiles.find(function(pr) { return pr.id === profileId; });
+    return p ? p.label : profileId;
+  }
+
   function renderTemplates() {
     const tbody = document.getElementById('template-tbody');
     if (!tbody) { return; }
     tbody.innerHTML = '';
     templates.forEach(function(t, i) {
-      const executors = (t.workers || []).map(function(w) { return w.profile; }).join(', ') || '—';
       const isDefault = t.name === defaultTopology;
       const tr = document.createElement('tr');
       tr.innerHTML =
         '<td>' + esc(t.name) + (isDefault ? '<span class="default-badge">default</span>' : '') + '</td>' +
-        '<td class="mono">' + esc(t.orchestrator) + '</td>' +
-        '<td class="mono">' + esc(executors) + '</td>' +
+        '<td class="mono">' + esc(profileLabel(t.orchestrator)) + '</td>' +
+        '<td class="mono">' + esc(profileLabel(t.planner)) + '</td>' +
+        '<td class="mono">' + esc(profileLabel(t.worker)) + '</td>' +
+        '<td class="mono">' + esc(profileLabel(t.reviewer)) + '</td>' +
         '<td><div class="act-cell">' +
           (isDefault ? '' : '<button class="ghost" data-action="setDefault" data-idx="' + i + '">Set Default</button>') +
           '<button class="ghost" data-action="edit" data-idx="' + i + '">Edit</button>' +
@@ -773,34 +780,50 @@ const MAS_JS = `
     renderTemplates();
   }
 
+  function profileOptions(selected, includeInherit) {
+    const lead = includeInherit ? '<option value="">— inherit Orchestrator —</option>' : '';
+    return lead + profiles.map(function(p) {
+      const sel = p.id === selected ? ' selected' : '';
+      return '<option value="' + esc(p.id) + '"' + sel + '>' + esc(p.label) + ' (' + esc(p.domain) + ')</option>';
+    }).join('');
+  }
+
   function showTemplateForm(idx) {
     const isNew = idx === -1;
-    const t = isNew ? { name: '', orchestrator: '', workers: [] } : templates[idx];
-    const workersStr = (t.workers || []).map(function(w) { return w.profile; }).join(', ');
+    const t = isNew ? { name: '', orchestrator: '', planner: '', worker: '', reviewer: '' } : templates[idx];
     const area = document.getElementById('template-form-area');
     area.innerHTML =
       '<div class="form-box">' +
-      '<h3>' + (isNew ? 'Add Exploration Strategy' : 'Edit Exploration Strategy') + '</h3>' +
+      '<h3>' + (isNew ? 'Add Topology' : 'Edit Topology') + '</h3>' +
       '<div class="field"><label>Name</label>' +
         '<input type="text" id="tmpl-name" value="' + esc(t.name) + '" placeholder="e.g. Default"></div>' +
-      '<div class="field"><label>Planner Profile ID</label>' +
-        '<input type="text" id="tmpl-orch" value="' + esc(t.orchestrator) + '" placeholder="e.g. orchestrator"></div>' +
-      '<div class="field"><label>Executor Profile IDs (comma-separated)</label>' +
-        '<input type="text" id="tmpl-workers" value="' + esc(workersStr) + '" placeholder="e.g. worker, docs-agent"></div>' +
+      '<div class="field"><label>Orchestrator Profile</label>' +
+        '<select id="tmpl-orch">' + profileOptions(t.orchestrator, false) + '</select></div>' +
+      '<div class="field"><label>Planner Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+        '<select id="tmpl-planner">' + profileOptions(t.planner, true) + '</select></div>' +
+      '<div class="field"><label>Worker Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+        '<select id="tmpl-worker">' + profileOptions(t.worker, true) + '</select></div>' +
+      '<div class="field"><label>Reviewer Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+        '<select id="tmpl-reviewer">' + profileOptions(t.reviewer, true) + '</select></div>' +
       '<div class="form-actions">' +
         '<button id="tmpl-save">Save</button>' +
         '<button class="ghost" id="tmpl-cancel">Cancel</button>' +
       '</div></div>';
 
     document.getElementById('tmpl-save').addEventListener('click', function() {
-      const name  = document.getElementById('tmpl-name').value.trim();
-      const orch  = document.getElementById('tmpl-orch').value.trim();
-      const wStr  = document.getElementById('tmpl-workers').value.trim();
-      if (!name || !orch) { alert('Name and Planner Profile are required.'); return; }
-      const workers = wStr
-        ? wStr.split(',').map(function(s) { return { profile: s.trim() }; }).filter(function(w) { return w.profile; })
-        : [];
-      const tmpl = { name: name, orchestrator: orch, workers: workers };
+      const name     = document.getElementById('tmpl-name').value.trim();
+      const orch     = document.getElementById('tmpl-orch').value;
+      const planner  = document.getElementById('tmpl-planner').value;
+      const worker   = document.getElementById('tmpl-worker').value;
+      const reviewer = document.getElementById('tmpl-reviewer').value;
+      if (!name || !orch) { alert('Name and Orchestrator Profile are required.'); return; }
+      const tmpl = {
+        name: name,
+        orchestrator: orch,
+        planner: planner || undefined,
+        worker: worker || undefined,
+        reviewer: reviewer || undefined,
+      };
       if (isNew) { templates.push(tmpl); }
       else       { templates[idx] = tmpl; }
       document.getElementById('template-form-area').innerHTML = '';

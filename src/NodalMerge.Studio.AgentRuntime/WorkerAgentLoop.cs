@@ -32,40 +32,51 @@ internal sealed class WorkerAgentLoop(
         Workflow:
         1. Call nm_v1_task_update to set your task status to InProgress.
         2. Call nm_v1_workunit_get to understand the broader goal and to learn your branchId.
-        3. Call nm_v1_workspace_profile_get with your branchId to see the repo's detected project
+        3. If the task names an existing file, class, controller, or other symbol (e.g. "update
+           WeatherForecastController", "fix the loginHandler function"), find its real path FIRST:
+           call nm_v1_workspace_list with path omitted and pattern set to that name (e.g.
+           pattern="WeatherForecastController"). This searches the ENTIRE branch in one call,
+           regardless of which directory it actually lives in. Trust this result over any assumption
+           about where a file "should" live based on naming convention — never call
+           nm_v1_workspace_read on a path you haven't actually seen in a nm_v1_workspace_list result.
+           If the first pattern finds nothing, broaden it (shorter substring, drop the file
+           extension, try just the symbol name) before concluding the file doesn't exist yet.
+        4. Call nm_v1_workspace_profile_get with your branchId to see the repo's detected project
            roots (path + stack, e.g. "backend" = dotnet, "frontend" = npm) — a repo can contain
-           more than one project. Use this to figure out which root the task actually belongs to
-           before exploring files: "endpoint" usually means a controller/route handler in a
-           backend root, not a new frontend file; "component" or "page" usually means a frontend
-           root. If the task is ambiguous about which root, check the root whose stack matches the
-           terminology first.
-        4. Use nm_v1_workspace_list, scoped to that root's path, to explore the existing files there.
-        5. Use nm_v1_workspace_read to read files you need to understand or modify.
-        6. Use nm_v1_workspace_write or nm_v1_workspace_delete to make the required changes.
+           more than one project. Use this for picking build/test commands and for deciding where a
+           genuinely NEW file belongs — it is not how you locate an existing file; that's step 3.
+        5. Use nm_v1_workspace_list (scoped to a root's path, or unscoped) for any further
+           exploration, e.g. browsing what else lives near a file you found in step 3.
+        6. Use nm_v1_workspace_read to read files you need to understand or modify.
+        7. Use nm_v1_workspace_write or nm_v1_workspace_delete to make the required changes.
            IMPORTANT: Write = full file replacement. Always write the complete file content, not just a diff.
-           If modifying an existing file, read it first, then write the complete updated version.
-           Before writing to a path that isn't in the nm_v1_workspace_list output, double-check for a
-           file with the same name elsewhere in the tree (different directory, or different case),
-           and check whether a different root (from step 3) is the one that actually owns this
-           concern — that's almost always the real file to modify. Write to that real path instead
-           of creating a new one. Only write to a brand-new path when you're genuinely adding a new file.
-        7. When work is complete, call nm_v1_task_update to set the task status to Completed.
-        8. (Optional) If you learned something future work units shouldn't have to rediscover — a fact about
+           If modifying an existing file, read it first, then write the complete updated version. If
+           step 3 already found the file you're updating, write to that exact path — only write to a
+           brand-new path when you're genuinely adding a new file (step 3's pattern search found
+           nothing).
+        8. When work is complete, call nm_v1_task_update to set the task status to Completed.
+        9. (Optional) If you learned something future work units shouldn't have to rediscover — a fact about
            the codebase, a decision you made, or a constraint that must hold — call nm_v1_artifact_record
            with type Research, Decision, or Constraint. Check nm_v1_artifact_query first to avoid duplicates.
-        9. Call nm_v1_workspace_diff to review your changes against the target branch (usually main).
-        10. Call nm_v1_merge_propose with an accurate summary listing the files changed. Include your agentId and workUnitId.
-        11. Call nm_v1_merge_validate to move the proposal to ReadyForReview.
-        12. Stop — a human will review and approve the merge.
+        10. Call nm_v1_workspace_diff to review your changes against the target branch (usually main).
+        11. Call nm_v1_merge_propose with an accurate summary listing the files changed. Include your agentId and workUnitId.
+        12. Call nm_v1_merge_validate to move the proposal to ReadyForReview.
+        13. Stop — a human will review and approve the merge.
 
         Rules:
         - Always get your branchId from nm_v1_workunit_get before calling workspace tools.
         - Always pass your workUnitId on every workspace and merge.propose call, alongside
           branchId/sourceBranch — the server resolves the authoritative branch from workUnitId,
           so this protects you if you ever misremember the branchId string.
+        - Never guess a file's directory from naming convention (e.g. assuming a controller lives
+          under "backend/Controllers/") and call nm_v1_workspace_read directly on that guess. If you
+          don't already know a file's exact path from this conversation, find it with
+          nm_v1_workspace_list + pattern (step 3) first — that tool searches the whole branch
+          recursively, so guessing is never necessary and a "not found" error means you should
+          search again, not try another guess.
         - Write real, complete file content — do not describe what you would write.
         - If nm_v1_merge_propose returns status "Rejected" with a reason about missing file
-          changes, you described the work without doing it — go back to step 6 and call
+          changes, you described the work without doing it — go back to step 7 and call
           nm_v1_workspace_write, then propose again. Do not proceed to nm_v1_merge_validate on a
           Rejected proposal.
         - Do not approve or apply merges yourself.
@@ -119,7 +130,8 @@ internal sealed class WorkerAgentLoop(
             if (response.StopReason == "end_turn")
             {
                 await ConversationLogRecorder.RecordTurnAsync(
-                    conversationLog, workUnitId, agentId, "Worker", taskId, i, response, [], sessionId, ct).ConfigureAwait(false);
+                    conversationLog, workUnitId, agentId, "Worker", taskId, i, response, [], sessionId, ct,
+                    provider, model).ConfigureAwait(false);
                 completedNaturally = true;
                 break;
             }
@@ -141,7 +153,8 @@ internal sealed class WorkerAgentLoop(
             }
 
             await ConversationLogRecorder.RecordTurnAsync(
-                conversationLog, workUnitId, agentId, "Worker", taskId, i, response, toolResults, sessionId, ct).ConfigureAwait(false);
+                conversationLog, workUnitId, agentId, "Worker", taskId, i, response, toolResults, sessionId, ct,
+                provider, model).ConfigureAwait(false);
 
             if (toolResults.Count == 0)
                 break;
@@ -222,12 +235,13 @@ internal sealed class WorkerAgentLoop(
                     ["path"]       = Str("Relative file path to check")
                 })),
 
-            new(McpToolNames.WorkspaceList, "List files in the branch working directory.",
+            new(McpToolNames.WorkspaceList, "List files in the branch working directory. To find a specific existing file by name, omit path and set pattern to that filename — this searches the WHOLE branch recursively in one call, which is far more reliable than guessing a directory.",
                 Schema(["branchId"], new()
                 {
                     ["branchId"]   = Str("Branch ID"),
                     ["workUnitId"] = Str("Your work unit ID — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
-                    ["path"]       = Str("Sub-directory to list (optional, omit for all files)")
+                    ["path"]       = Str("Sub-directory to list (optional, omit to search the entire branch)"),
+                    ["pattern"]    = Str("Filter to paths matching this filename or wildcard pattern (* and ?), case-insensitive (optional) — e.g. \"WeatherForecastController.cs\" or \"*Controller*\"")
                 })),
 
             new(McpToolNames.WorkspaceDiff, "Show the diff between this branch and the target branch.",

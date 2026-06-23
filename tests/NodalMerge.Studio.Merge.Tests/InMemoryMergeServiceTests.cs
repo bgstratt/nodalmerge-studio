@@ -37,7 +37,7 @@ public class InMemoryMergeServiceTests
         public Task WriteAsync(string b, string p, string c, CancellationToken ct = default) => Task.CompletedTask;
         public Task DeleteAsync(string b, string p, CancellationToken ct = default) => Task.CompletedTask;
         public Task<bool> ExistsAsync(string b, string p, CancellationToken ct = default) => Task.FromResult(false);
-        public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, string? p2 = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
         public Task<string> DiffAsync(string s, string t, CancellationToken ct = default) => Task.FromResult(string.Empty);
         public Task ApplyBranchAsync(string s, string t, CancellationToken ct = default) => Task.CompletedTask;
         public Task CopyFilesAsync(string s, string t, IReadOnlyList<string> paths, CancellationToken ct = default) => Task.CompletedTask;

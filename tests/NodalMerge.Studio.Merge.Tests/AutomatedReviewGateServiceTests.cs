@@ -188,6 +188,8 @@ public class AutomatedReviewGateServiceTests
 
         public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
 
+        public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
+
         public Task<string> SpawnAsync(
             string agentType,
             string workUnitId,
@@ -198,6 +200,7 @@ public class AutomatedReviewGateServiceTests
             string? provider = null,
             string? profileId = null,
             string? autoReviewProfileId = null,
+            IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
             CancellationToken cancellationToken = default) =>
             Task.FromResult("agent");
 

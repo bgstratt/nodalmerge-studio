@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { scopeViewCss, wrapViewScript } from './sharedWebviewChrome';
-import type { AgentConfigService } from '../AgentConfigService';
+import type { AgentConfigService, SpawnLlmConfig } from '../AgentConfigService';
 import type { ProposalFileChange } from './MergeReviewPanel';
 import { COMMANDS } from '../constants';
 import { resolveRepositoryPath } from '../repositoryPath';
@@ -168,6 +168,8 @@ interface ConversationLogEntry {
   sessionId?: string | null;
   inputTokens?: number | null;
   outputTokens?: number | null;
+  provider?: string | null;
+  model?: string | null;
 }
 
 // ── Panel ──────────────────────────────────────────────────────────────────
@@ -854,6 +856,23 @@ export class GoalWorkspacePanel {
         );
       }
 
+      // Agent Topology — resolve credentials for any stage that has its own profile configured;
+      // unset stages fall back to the Orchestrator's credentials on the backend.
+      const stageCredentials: Record<string, SpawnLlmConfig> = {};
+      const stagePlans: Array<[string, string | undefined]> = [
+        ['Plan', template.planner],
+        ['Execute', template.worker],
+        ['Review', template.reviewer],
+      ];
+      for (const [stage, profileId] of stagePlans) {
+        if (!profileId) { continue; }
+        const cfg = await this.configService.resolveSpawnLlmConfig(profileId, this.secrets, this.lmProxyBaseUrl);
+        if (!cfg) {
+          throw new Error(`Profile "${profileId}" is missing LLM credentials — set it up in Model & Agent Studio.`);
+        }
+        stageCredentials[stage] = cfg;
+      }
+
       const repositoryPath = resolveRepositoryPath();
       const rootWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
         goal,
@@ -872,6 +891,7 @@ export class GoalWorkspacePanel {
         agentType: 'orchestrator',
         workUnitId: rootWu.workUnitId,
         ...orchCfg,
+        ...(Object.keys(stageCredentials).length > 0 ? { stageCredentials } : {}),
       });
 
       this.selectedSessionId = session.sessionId;
@@ -1319,7 +1339,7 @@ const GW_HTML = `
       <select id="gw-session"><option value="">(no exploration)</option></select>
     </div>
     <div class="gw-field">
-      <label>Exploration Strategy</label>
+      <label>Investigation Strategy</label>
       <select id="gw-strategy"></select>
     </div>
     <div class="gw-field">
@@ -1856,14 +1876,28 @@ const GW_JS = `
       return '<p class="empty">No conversation recorded yet for this decision node.</p>';
     }
     var totalIn = 0, totalOut = 0, haveTokens = false;
+    var modelsByRole = {};
     entries.forEach(function(e) {
       if (e.inputTokens != null) { totalIn += e.inputTokens; haveTokens = true; }
       if (e.outputTokens != null) { totalOut += e.outputTokens; haveTokens = true; }
+      if (e.model) {
+        var key = e.agentRole + '|' + e.model + '|' + (e.provider || '');
+        modelsByRole[key] = { role: e.agentRole, model: e.model, provider: e.provider };
+      }
     });
     var html = '';
     if (haveTokens) {
-      html += '<div class="conv-token-total" style="font-size:0.8em;opacity:0.7;margin-bottom:8px">'
+      html += '<div class="conv-token-total" style="font-size:0.8em;opacity:0.7;margin-bottom:4px">'
         + 'Tokens this run — ↑' + totalIn.toLocaleString() + ' in / ↓' + totalOut.toLocaleString() + ' out</div>';
+    }
+    var modelKeys = Object.keys(modelsByRole);
+    if (modelKeys.length > 0) {
+      html += '<div class="conv-model-summary" style="font-size:0.8em;opacity:0.7;margin-bottom:8px">Models this run — '
+        + modelKeys.map(function(k) {
+            var m = modelsByRole[k];
+            return esc(m.role) + ': ' + esc(m.model) + (m.provider ? ' (' + esc(m.provider) + ')' : '');
+          }).join(', ')
+        + '</div>';
     }
     html += '<div id="conv-list">';
     entries.slice().reverse().forEach(function(e) {
@@ -1871,6 +1905,10 @@ const GW_JS = `
       html += '<div class="conv-entry-head">';
       html += '<span class="badge">' + esc(e.agentRole) + '</span>';
       html += '<span class="mono" style="font-size:0.78em;opacity:0.6">' + esc(e.agentId) + '</span>';
+      if (e.model) {
+        html += '<span class="mono" style="font-size:0.78em;opacity:0.7">' + esc(e.model)
+          + (e.provider ? ' (' + esc(e.provider) + ')' : '') + '</span>';
+      }
       html += '<span style="font-size:0.78em;opacity:0.55">cycle ' + e.cycleNumber + '</span>';
       html += '<span style="font-size:0.72em;opacity:0.45">' + fmtTime(e.occurredAt) + '</span>';
       if (e.inputTokens != null || e.outputTokens != null) {

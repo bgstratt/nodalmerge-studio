@@ -21,7 +21,12 @@ public sealed record ConversationLogEntry(
     // Usage tokens from the underlying LlmResponse for this cycle — null when the provider didn't
     // report usage (some OpenAI-compatible endpoints omit it).
     int? InputTokens = null,
-    int? OutputTokens = null);
+    int? OutputTokens = null,
+    // Which provider/model actually served this cycle — the loop's own credentials, which may
+    // differ per stage when a Goal's Agent Topology configures a distinct profile for Plan/Execute/
+    // Review. Lets a human confirm a multi-model run is actually routing to different models.
+    string? Provider = null,
+    string? Model = null);
 
 public sealed record ConversationToolCall(string ToolUseId, string Name, string InputJson);
 

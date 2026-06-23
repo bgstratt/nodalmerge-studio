@@ -64,7 +64,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     // the loop with the same credentials/profile later, without the caller (WorkSchedulerService)
     // needing to remember or re-supply them.
     private sealed record OrchestratorRegistration(
-        string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? AutoReviewProfileId);
+        string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? AutoReviewProfileId,
+        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? StageCredentials = null);
 
     // ── IHostedService ─────────────────────────────────────────────────────
 
@@ -373,6 +374,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? provider = null,
         string? profileId = null,
         string? autoReviewProfileId = null,
+        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
         CancellationToken cancellationToken = default)
     {
         var agentId = $"{agentType}-{Guid.NewGuid():N}";
@@ -400,7 +402,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
                 _orchestratorRegistrations[workUnitId] = new OrchestratorRegistration(
-                    resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId, autoReviewProfileId);
+                    resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId, autoReviewProfileId, stageCredentials);
             }
             else if (agentType == "worker" && taskId is not null)
                 StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
@@ -436,6 +438,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
         return new OrchestratorCredentials(reg.Provider, reg.Model, reg.BaseUrl, reg.ApiKey, reg.ProfileId);
     }
+
+    public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) =>
+        _orchestratorRegistrations.TryGetValue(workUnitId, out var reg)
+            ? reg.StageCredentials?.GetValueOrDefault(stage)
+            : null;
 
     public string? GetAutoReviewProfileId(string workUnitId)
     {
@@ -479,7 +486,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, workUnits,
                     findingsService,
                     profile, sessionId, workspaceOptions.StallDetectionCycles, a => ReportActivity(agentId, a),
-                    conversationLog: conversationLog);
+                    conversationLog: conversationLog, agentControl: this);
                 var completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 if (completion is AgentLoopCompletion.MaxIterationsExceeded or AgentLoopCompletion.Stalled)
                 {

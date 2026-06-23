@@ -35,7 +35,13 @@ public static class StudioRestEndpoints
         string? ApiKey = null,
         string? Provider = null,
         string? ProfileId = null,
-        string? AutoReviewProfileId = null);
+        string? AutoReviewProfileId = null,
+        // Agent Topology — per-stage credential overrides, keyed by PipelineStage name ("Plan",
+        // "Execute", "Review"). String-keyed rather than PipelineStage-keyed to avoid relying on
+        // enum-dictionary-key JSON conventions; parsed via Enum.TryParse below.
+        Dictionary<string, StageCredentialDto>? StageCredentials = null);
+
+    private sealed record StageCredentialDto(string Provider, string Model, string BaseUrl, string ApiKey);
 
     private sealed record ProposeMergeBody(
         string SourceBranch,
@@ -919,9 +925,21 @@ public static class StudioRestEndpoints
             if (wu is null)
                 return Results.NotFound(new { error = $"Work unit '{body.WorkUnitId}' not found." });
 
+            IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null;
+            if (body.StageCredentials is { Count: > 0 })
+            {
+                var resolved = new Dictionary<PipelineStage, OrchestratorCredentials>();
+                foreach (var (key, dto) in body.StageCredentials)
+                {
+                    if (Enum.TryParse<PipelineStage>(key, ignoreCase: true, out var stage))
+                        resolved[stage] = new OrchestratorCredentials(dto.Provider, dto.Model, dto.BaseUrl, dto.ApiKey, null);
+                }
+                stageCredentials = resolved;
+            }
+
             var agentId = await agents.SpawnAsync(
                 body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey,
-                body.Provider, body.ProfileId, body.AutoReviewProfileId, ct).ConfigureAwait(false);
+                body.Provider, body.ProfileId, body.AutoReviewProfileId, stageCredentials, ct).ConfigureAwait(false);
             return Results.Ok(new { agentId, agentType = body.AgentType, workUnitId = body.WorkUnitId, branchId = wu.BranchId });
         });
 

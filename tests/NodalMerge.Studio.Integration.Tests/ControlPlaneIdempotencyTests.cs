@@ -227,7 +227,8 @@ public class ControlPlaneIdempotencyTests
 
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
-            string? autoReviewProfileId = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+            string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
 
         public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default)
         {
@@ -236,6 +237,7 @@ public class ControlPlaneIdempotencyTests
         }
 
         public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
+        public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
         public string? GetAutoReviewProfileId(string workUnitId) => null;
 
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
@@ -348,7 +350,7 @@ public class ControlPlaneIdempotencyTests
         public Task WriteAsync(string b, string p, string c, CancellationToken ct = default) => Task.CompletedTask;
         public Task DeleteAsync(string b, string p, CancellationToken ct = default) => Task.CompletedTask;
         public Task<bool> ExistsAsync(string b, string p, CancellationToken ct = default) => Task.FromResult(false);
-        public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, string? p = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
         public Task<string> DiffAsync(string s, string t, CancellationToken ct = default) => Task.FromResult(string.Empty);
         public Task ApplyBranchAsync(string s, string t, CancellationToken ct = default) => Task.CompletedTask;
         public Task CopyFilesAsync(string s, string t, IReadOnlyList<string> paths, CancellationToken ct = default) => Task.CompletedTask;

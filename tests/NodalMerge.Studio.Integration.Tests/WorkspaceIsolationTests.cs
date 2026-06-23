@@ -81,7 +81,7 @@ public class WorkspaceIsolationTests
         public Task<bool> ExistsAsync(string branchId, string relativePath, CancellationToken ct = default) =>
             Task.FromResult(_branches.TryGetValue(branchId, out var files) && files.ContainsKey(relativePath));
 
-        public Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, CancellationToken ct = default) =>
+        public Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, string? pattern = null, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<string>>(_branches.TryGetValue(branchId, out var files) ? files.Keys.ToList() : []);
 
         public Task<string> DiffAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default) =>
