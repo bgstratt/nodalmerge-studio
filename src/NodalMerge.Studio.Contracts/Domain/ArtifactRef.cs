@@ -12,6 +12,7 @@ public enum ArtifactType
     MergeProposal,
     MergeResult,
     ChangeIntent,
+    ExternalChangeset,
 }
 
 public enum ArtifactStatus

@@ -95,6 +95,12 @@ public class WorkspaceIsolationTests
 
         public Task<string?> GetWorkingDirectoryAsync(string branchId, CancellationToken ct = default) =>
             Task.FromResult<string?>(_branches.ContainsKey(branchId) ? $"/fake/{branchId}" : null);
+
+        public Task<WorkspaceDiff> DiffExternalPathAsync(string branchId, string externalPath, CancellationToken ct = default) =>
+            Task.FromResult(new WorkspaceDiff([], [], [], string.Empty));
+
+        public Task ApplyExternalPathAsync(string branchId, string externalPath, CancellationToken ct = default) =>
+            Task.CompletedTask;
     }
 
     private static WorkUnit MakeWorkUnit(string id, string branchId, IReadOnlyList<string>? fileScope = null) =>

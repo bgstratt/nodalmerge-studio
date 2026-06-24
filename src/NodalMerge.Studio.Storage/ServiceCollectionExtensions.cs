@@ -156,6 +156,10 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<CandidateBranchService>();
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<CandidateBranchService>());
 
+        services.AddSingleton<RepositorySyncService>();
+        services.AddSingleton<IRepositorySyncService>(sp => sp.GetRequiredService<RepositorySyncService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<RepositorySyncService>());
+
         // Registered last and ahead of AddStudioAgentRuntime in AddStudioServices, so its
         // StartAsync (which awaits every IRehydratable above) completes before the scheduler
         // poll loop's StartAsync begins.

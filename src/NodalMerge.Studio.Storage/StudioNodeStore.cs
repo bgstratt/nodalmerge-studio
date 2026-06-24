@@ -33,6 +33,7 @@ public static class StudioNodeKind
     public const string FindingV1            = "studio/finding/v1";
     public const string ConversationLogV1    = "studio/conversation-log/v1";
     public const string FileLeaseV1          = "studio/file-lease/v1";
+    public const string RepositorySyncStateV1 = "studio/repository-sync-state/v1";
 }
 
 public interface IStudioNodeStore

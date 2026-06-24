@@ -975,6 +975,39 @@ public interface IFileWorkspaceService
         IReadOnlyList<string> relativePaths,
         CancellationToken ct = default);
     Task<string?> GetWorkingDirectoryAsync(string branchId, CancellationToken ct = default);
+
+    // Compares branchId's working directory against an arbitrary absolute directory outside
+    // RootPath (e.g. the live repository on disk) rather than another branch id — used to detect
+    // drift between "main" and the real repo. Read-only; see ApplyExternalPathAsync to mirror it in.
+    Task<WorkspaceDiff> DiffExternalPathAsync(string branchId, string externalPath, CancellationToken ct = default);
+
+    // Always a full destructive mirror: files present in branchId but absent from externalPath are
+    // deleted, same "delete what's absent from source" semantics as ApplyBranchAsync today. This is
+    // not specific to a repository switch — ordinary drift (a file removed on disk) needs exactly
+    // the same deletion behavior to stay correct. Do not special-case or soften this for either caller.
+    Task ApplyExternalPathAsync(string branchId, string externalPath, CancellationToken ct = default);
+}
+
+// Carries a structural fingerprint of the external path alongside the diff so callers never need a
+// second tree walk just to get one (see RepositorySyncService).
+public sealed record WorkspaceDiff(
+    IReadOnlyList<string> Added, IReadOnlyList<string> Modified, IReadOnlyList<string> Deleted,
+    // Diagnostic signal only (relative path + size + last-write time, no content reads) — NOT a
+    // content hash. Two repositories could theoretically collide; never used to decide sync
+    // behavior (path-string equality still drives RepositoryDrift vs. RepositorySwitch).
+    string ExternalFingerprint)
+{
+    public bool IsEmpty => Added.Count == 0 && Modified.Count == 0 && Deleted.Count == 0;
+}
+
+public interface IRepositorySyncService
+{
+    Task<PendingExternalSync?> SyncBranchFromRepositoryAsync(
+        string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct = default);
+
+    // Non-mutating lookup — lets a caller find the chain's current tail via
+    // LatestExternalChangesetId, mirrors IKnownGoodStateService.GetAsync's role.
+    Task<RepositorySyncState?> GetStateAsync(string branchId, CancellationToken ct = default);
 }
 
 public sealed record WorkspaceSummary(

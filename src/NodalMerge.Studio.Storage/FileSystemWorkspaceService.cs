@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using NodalMerge.Studio.Core.Services;
 
@@ -244,6 +245,68 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         return Task.FromResult<string?>(Directory.Exists(dir) ? dir : null);
     }
 
+    public async Task<WorkspaceDiff> DiffExternalPathAsync(string branchId, string externalPath, CancellationToken ct = default)
+    {
+        var branchDir = BranchDir(branchId);
+
+        var branchFiles = Directory.Exists(branchDir)
+            ? Directory.EnumerateFiles(branchDir, "*", SearchOption.AllDirectories)
+                .Select(f => Path.GetRelativePath(branchDir, f).Replace('\\', '/'))
+                .Where(rel => !IsIgnoredDirSegment(rel))
+                .ToHashSet()
+            : new HashSet<string>();
+
+        var externalEntries = EnumerateExternalEntries(externalPath);
+        var externalFiles = externalEntries.Keys.ToHashSet();
+
+        var added   = externalFiles.Except(branchFiles).OrderBy(f => f).ToList();
+        var deleted = branchFiles.Except(externalFiles).OrderBy(f => f).ToList();
+        var modified = new List<string>();
+
+        foreach (var file in externalFiles.Intersect(branchFiles).OrderBy(f => f))
+        {
+            ct.ThrowIfCancellationRequested();
+            var branchText   = await File.ReadAllTextAsync(Path.Combine(branchDir, file), ct).ConfigureAwait(false);
+            var externalText = await File.ReadAllTextAsync(Path.Combine(externalPath, file), ct).ConfigureAwait(false);
+            if (branchText != externalText)
+                modified.Add(file);
+        }
+
+        return new WorkspaceDiff(added, modified, deleted, ComputeFingerprint(externalEntries));
+    }
+
+    public Task ApplyExternalPathAsync(string branchId, string externalPath, CancellationToken ct = default)
+    {
+        var branchDir = BranchDir(branchId);
+        if (!Directory.Exists(branchDir))
+            Directory.CreateDirectory(branchDir);
+
+        var sourceRelative = EnumerateExternalEntries(externalPath).Keys.ToHashSet();
+
+        // Delete files in branchDir absent from externalPath (always a full destructive mirror —
+        // see the interface doc-comment; this is correct for ordinary drift, not just a switch).
+        foreach (var targetFile in Directory.EnumerateFiles(branchDir, "*", SearchOption.AllDirectories))
+        {
+            var rel = Path.GetRelativePath(branchDir, targetFile).Replace('\\', '/');
+            if (IsIgnoredDirSegment(rel)) continue;
+            if (!sourceRelative.Contains(rel))
+                File.Delete(targetFile);
+        }
+
+        foreach (var rel in sourceRelative)
+        {
+            ct.ThrowIfCancellationRequested();
+            var srcFull = Path.Combine(externalPath, rel);
+            var dstFull = Path.Combine(branchDir, rel);
+            var dstDirPath = Path.GetDirectoryName(dstFull)!;
+            if (!Directory.Exists(dstDirPath))
+                Directory.CreateDirectory(dstDirPath);
+            File.Copy(srcFull, dstFull, overwrite: true);
+        }
+
+        return Task.CompletedTask;
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     private string BranchDir(string branchId) =>
@@ -281,7 +344,7 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
     // calls for a typical npm project), which is both pointless and slow enough to blow past
     // the webview's apply request timeout.
     private static readonly string[] IgnoredDirNames =
-        ["node_modules", "bin", "obj", "dist", "build", "target", "__pycache__", "venv"];
+        ["node_modules", "bin", "obj", "dist", "build", "target", "__pycache__", "venv", ".git"];
 
     private bool IsHidden(string path)
     {
@@ -298,6 +361,38 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
     private static bool IsIgnoredDirSegment(string relative) =>
         relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             .Any(segment => IgnoredDirNames.Contains(segment, StringComparer.OrdinalIgnoreCase));
+
+    // Used by DiffExternalPathAsync/ApplyExternalPathAsync — externalPath has no relationship to
+    // RootPath at all, so (unlike IsHidden) this enumerates and excludes purely relative to its own
+    // root, via the same IsIgnoredDirSegment rule CopyDirectory already uses for seeding (keeps
+    // dotfiles like .env, drops node_modules/bin/obj/.../.git).
+    private static Dictionary<string, (long Length, long LastWriteUtcTicks)> EnumerateExternalEntries(string externalPath)
+    {
+        var result = new Dictionary<string, (long Length, long LastWriteUtcTicks)>(StringComparer.Ordinal);
+        if (!Directory.Exists(externalPath))
+            return result;
+
+        foreach (var file in Directory.EnumerateFiles(externalPath, "*", SearchOption.AllDirectories))
+        {
+            var relative = Path.GetRelativePath(externalPath, file).Replace('\\', '/');
+            if (IsIgnoredDirSegment(relative)) continue;
+            var info = new FileInfo(file);
+            result[relative] = (info.Length, info.LastWriteTimeUtc.Ticks);
+        }
+
+        return result;
+    }
+
+    // Diagnostic structural fingerprint (relative path + size + last-write time, no content reads)
+    // — see WorkspaceDiff.ExternalFingerprint's doc-comment for what this is and isn't used for.
+    private static string ComputeFingerprint(Dictionary<string, (long Length, long LastWriteUtcTicks)> entries)
+    {
+        var lines = entries
+            .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+            .Select(kv => $"{kv.Key}:{kv.Value.Length}:{kv.Value.LastWriteUtcTicks}");
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', lines)));
+        return Convert.ToHexString(hash)[..16];
+    }
 
     private static void CopyDirectory(string source, string destination)
     {

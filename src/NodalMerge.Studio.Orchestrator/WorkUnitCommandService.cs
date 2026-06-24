@@ -14,7 +14,8 @@ public sealed class WorkUnitCommandService(
     IOrchestratorService orchestrator,
     IWorkUnitService workUnits,
     IAgentControlService agentControl,
-    IReviewTimerService reviewTimers) : IWorkUnitCommandService
+    IReviewTimerService reviewTimers,
+    IRepositorySyncService repositorySync) : IWorkUnitCommandService
 {
     private static readonly HashSet<WorkUnitStatus> TerminalStatuses = new()
     {
@@ -32,16 +33,42 @@ public sealed class WorkUnitCommandService(
         // service and call IOrchestratorService directly with their own explicit seed already, so
         // this default only ever reaches a genuinely fresh, human- or tool-initiated creation.
         var seedFromBranchId = command.SeedFromBranchId;
+        var isFreshTopLevelGoal = false;
         if (seedFromBranchId is null)
         {
             if (command.ParentWorkUnitId is null)
             {
                 seedFromBranchId = "main";
+                isFreshTopLevelGoal = true;
             }
             else
             {
                 var parent = await workUnits.GetAsync(command.ParentWorkUnitId, cancellationToken).ConfigureAwait(false);
                 seedFromBranchId = parent?.BranchId;
+            }
+        }
+
+        // Only the implicit "fresh top-level goal" path triggers a live repository sync — forks
+        // (explicit SeedFromBranchId) and children (ParentWorkUnitId set) intentionally inherit
+        // whatever their seed branch already holds, not a freshly re-synced "main". The sync must
+        // run before orchestrator.CreateWorkUnitAsync below so this new work unit's own branch
+        // seeds from a fresh "main". Its return value isn't used directly for metadata — a no-op
+        // sync still needs the generation this goal was planned against — so GetStateAsync is
+        // re-read regardless of whether SyncBranchFromRepositoryAsync itself did anything.
+        IReadOnlyDictionary<string, string>? metadata = null;
+        if (isFreshTopLevelGoal && !string.IsNullOrWhiteSpace(command.RepositoryPath))
+        {
+            await repositorySync.SyncBranchFromRepositoryAsync(
+                seedFromBranchId!, command.RepositoryPath, SyncTrigger.GoalCreation, cancellationToken)
+                .ConfigureAwait(false);
+
+            var syncState = await repositorySync.GetStateAsync(seedFromBranchId!, cancellationToken).ConfigureAwait(false);
+            if (syncState is not null)
+            {
+                var meta = new Dictionary<string, string> { ["workspaceGeneration"] = syncState.Generation.ToString() };
+                if (syncState.LatestExternalChangesetId is not null)
+                    meta["lastExternalChangesetId"] = syncState.LatestExternalChangesetId;
+                metadata = meta;
             }
         }
 
@@ -54,6 +81,7 @@ public sealed class WorkUnitCommandService(
             command.ParentWorkUnitId,
             command.DependsOn,
             command.FileScope,
+            metadata: metadata,
             forkType: command.ForkType,
             reviewPolicy: command.ReviewPolicy,
             bypassPromotionBranch: command.BypassPromotionBranch,

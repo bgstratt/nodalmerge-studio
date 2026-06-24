@@ -42,6 +42,9 @@ public class InMemoryMergeServiceTests
         public Task ApplyBranchAsync(string s, string t, CancellationToken ct = default) => Task.CompletedTask;
         public Task CopyFilesAsync(string s, string t, IReadOnlyList<string> paths, CancellationToken ct = default) => Task.CompletedTask;
         public Task<string?> GetWorkingDirectoryAsync(string b, CancellationToken ct = default) => Task.FromResult<string?>(null);
+        public Task<NodalMerge.Studio.Core.Services.WorkspaceDiff> DiffExternalPathAsync(string b, string e, CancellationToken ct = default) =>
+            Task.FromResult(new NodalMerge.Studio.Core.Services.WorkspaceDiff([], [], [], string.Empty));
+        public Task ApplyExternalPathAsync(string b, string e, CancellationToken ct = default) => Task.CompletedTask;
     }
 
     private static MergeProposal MakeProposal(string id, string source = "feat/x", string target = "main") =>
