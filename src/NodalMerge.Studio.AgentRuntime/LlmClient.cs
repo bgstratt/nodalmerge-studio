@@ -262,7 +262,9 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
             _            => "end_turn"
         };
 
-        return new LlmResponse(contents, stopReason, raw.Usage?.PromptTokens, raw.Usage?.CompletionTokens);
+        return new LlmResponse(
+            contents, stopReason, raw.Usage?.PromptTokens, raw.Usage?.CompletionTokens,
+            raw.Usage?.Estimated ?? false);
     }
 
     // OpenAI requires one message per tool result; a NmMessage with tool results expands
@@ -324,7 +326,10 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
 
     private sealed record OpenAiUsage(
         [property: JsonPropertyName("prompt_tokens")]     int? PromptTokens,
-        [property: JsonPropertyName("completion_tokens")] int? CompletionTokens);
+        [property: JsonPropertyName("completion_tokens")] int? CompletionTokens,
+        // Set by LmApiProxy.ts when these counts come from VS Code's countTokens() rather than a
+        // real provider-reported usage block (vscode-lm/Copilot never reports real usage).
+        [property: JsonPropertyName("estimated")]         bool? Estimated = null);
 
     private sealed record OpenAiChoice(
         [property: JsonPropertyName("finish_reason")] string? FinishReason,
@@ -347,7 +352,8 @@ internal sealed record LlmResponse(
     IReadOnlyList<NmContent> Content,
     string StopReason,
     int? InputTokens = null,
-    int? OutputTokens = null);
+    int? OutputTokens = null,
+    bool TokensEstimated = false);
 
 internal sealed record LlmToolDef(
     [property: JsonPropertyName("name")]         string Name,

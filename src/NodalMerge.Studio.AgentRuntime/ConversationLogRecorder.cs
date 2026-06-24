@@ -49,6 +49,7 @@ internal static class ConversationLogRecorder
             InputTokens: response.InputTokens,
             OutputTokens: response.OutputTokens,
             Provider: provider,
-            Model: model), ct).ConfigureAwait(false);
+            Model: model,
+            TokensEstimated: response.TokensEstimated), ct).ConfigureAwait(false);
     }
 }

@@ -26,7 +26,10 @@ public sealed record ConversationLogEntry(
     // differ per stage when a Goal's Agent Topology configures a distinct profile for Plan/Execute/
     // Review. Lets a human confirm a multi-model run is actually routing to different models.
     string? Provider = null,
-    string? Model = null);
+    string? Model = null,
+    // True when InputTokens/OutputTokens came from a client-side tokenizer estimate (vscode-lm)
+    // rather than a real provider-reported usage block — the UI renders these with a "~" prefix.
+    bool TokensEstimated = false);
 
 public sealed record ConversationToolCall(string ToolUseId, string Name, string InputJson);
 

@@ -58,6 +58,12 @@ interface FindingSignal {
   status: string;
 }
 
+interface FileLeaseInfo {
+  path: string;
+  holderWorkUnitId: string | null;
+  waitQueue: string[];
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 export class ExecutionTimelinePanel implements vscode.Disposable {
@@ -151,19 +157,20 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
     try {
       const sessionId = this.getEffectiveSessionId();
       const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
-      const [summary, workUnits, agents, awaitingResume, merges, deadLetters, opts, findings] = await Promise.all([
+      const [summary, workUnits, agents, awaitingResume, merges, deadLetters, fileLeases, opts, findings] = await Promise.all([
         this.get<WorkspaceSummary>('/studio/workspace-summary' + params),
         this.get<WorkUnit[]>('/studio/workunits' + params),
         this.get<AgentInfo[]>('/studio/agents?all=true' + (sessionId ? '&sessionId=' + encodeURIComponent(sessionId) : '')),
         this.get<ScheduledItem[]>('/studio/scheduler/awaiting-resume'),
         this.get<MergeProposal[]>('/studio/merges' + params),
         this.get<DeadLetterEntry[]>('/studio/dead-letter' + params),
+        this.get<FileLeaseInfo[]>('/studio/file-leases'),
         this.get<{ usePromotionBranch?: boolean; candidateBranchId?: string }>('/studio/options'),
         this.get<FindingSignal[]>('/studio/findings?status=Open'),
       ]);
       this.usePromotionBranch = opts.usePromotionBranch ?? false;
       void this.panel.webview.postMessage({
-        type: 'data', summary, workUnits, agents, awaitingResume, merges, deadLetters,
+        type: 'data', summary, workUnits, agents, awaitingResume, merges, deadLetters, fileLeases,
         usePromotionBranch: this.usePromotionBranch,
         candidateBranchId: opts.candidateBranchId ?? 'candidate',
       });
@@ -309,6 +316,17 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           await this.post('/studio/dead-letter/' + String(msg.entryId) + '/retry', {});
           void this.poll();
           break;
+        case 'releaseFileLease': {
+          const confirmed = await vscode.window.showWarningMessage(
+            'Force-release every file lease held by "' + String(msg.workUnitId) + '"? The next queued worker will be promoted automatically.',
+            { modal: true },
+            'Release',
+          );
+          if (confirmed !== 'Release') { return; }
+          await this.post('/studio/file-leases/release', { workUnitId: msg.workUnitId });
+          void this.poll();
+          break;
+        }
       }
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: ' + String(err));
@@ -500,6 +518,9 @@ const ET_HTML = `
 
   <h2>Blocked Explorations</h2>
   <div id="blocked"><p class="empty">No blocked explorations.</p></div>
+
+  <h2>File Lease Conflicts</h2>
+  <div id="file-leases"><p class="empty">No file lease conflicts.</p></div>
 `;
 
 const ET_JS = `
@@ -776,6 +797,45 @@ const ET_JS = `
     });
   }
 
+  // Phase 12 — only leases with a non-empty wait queue are actionable (a held lease with no
+  // waiter is just normal in-flight work); "Force Release" is the manual-override path for a
+  // holder that crashed mid-write, leaving no live agent to Stop and no proposal to reject.
+  function renderFileLeases(leases, goals) {
+    var el = document.getElementById('file-leases');
+    var contested = (leases || []).filter(function(l) { return l.waitQueue && l.waitQueue.length > 0; });
+    if (!contested.length) {
+      el.innerHTML = '<p class="empty">No file lease conflicts.</p>';
+      return;
+    }
+    var goalMap = {};
+    for (var j = 0; j < (goals || []).length; j++) { goalMap[goals[j].workUnitId] = goals[j]; }
+    function label(workUnitId) {
+      var wu = goalMap[workUnitId];
+      return wu ? wu.goal : workUnitId;
+    }
+    var html = '';
+    for (var i = 0; i < contested.length; i++) {
+      var l = contested[i];
+      html += '<div class="card">';
+      html += '<div class="row">';
+      html += '<span class="title mono" title="' + esc(l.path) + '">' + esc(l.path) + '</span>';
+      html += '<span class="badge interrupted">' + esc(String(l.waitQueue.length)) + ' waiting</span>';
+      html += '<div class="actions">';
+      html += '<button class="danger" data-action="releaseFileLease" data-wu="' + esc(l.holderWorkUnitId) + '">Force Release</button>';
+      html += '</div>';
+      html += '</div>';
+      html += '<div class="row"><span class="mono">held by: ' + esc(label(l.holderWorkUnitId)) + '</span></div>';
+      html += '<div class="row"><span class="mono">queued: ' + esc(l.waitQueue.map(label).join(', ')) + '</span></div>';
+      html += '</div>';
+    }
+    el.innerHTML = html;
+    el.querySelectorAll('[data-action="releaseFileLease"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'releaseFileLease', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+  }
+
   window.addEventListener('message', function(event) {
     var msg = event.data;
     if (msg.type === 'updateSessionPicker' && msg.panelId === 'shell-pane-execution-timeline') {
@@ -804,6 +864,7 @@ const ET_JS = `
     renderAwaitingResume(msg.awaitingResume || []);
     renderPendingDecisions(msg.merges);
     renderBlockedExplorations(msg.deadLetters || [], msg.workUnits);
+    renderFileLeases(msg.fileLeases || [], msg.workUnits);
     var ts = document.getElementById('last-updated');
     if (ts) { ts.textContent = 'updated ' + new Date().toLocaleTimeString(); }
   });

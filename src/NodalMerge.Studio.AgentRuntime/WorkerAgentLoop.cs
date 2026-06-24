@@ -1,3 +1,4 @@
+using System.Text.Json;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Versioning;
 using NodalMerge.Studio.Core.Services;
@@ -140,6 +141,7 @@ internal sealed class WorkerAgentLoop(
                 break;
 
             var toolResults = new List<NmContent>();
+            var awaitingFileLease = false;
             foreach (var block in response.Content)
             {
                 if (block is not NmToolUse toolUse) continue;
@@ -150,11 +152,25 @@ internal sealed class WorkerAgentLoop(
                     .ConfigureAwait(false);
 
                 toolResults.Add(new NmToolResult(toolUse.Id, result));
+
+                if (IsAwaitingFileLeaseResult(result))
+                    awaitingFileLease = true;
             }
 
             await ConversationLogRecorder.RecordTurnAsync(
                 conversationLog, workUnitId, agentId, "Worker", taskId, i, response, toolResults, sessionId, ct,
                 provider, model).ConfigureAwait(false);
+
+            // Phase 12 — a write hit a file another active sibling currently holds the lease on.
+            // Exit now, on this same turn: don't send the conflict back to the LLM for "please
+            // wait/retry" prose first — that would burn a model call for a wait that's resolved
+            // entirely server-side (the scheduler parks this item; IFileLeaseService's
+            // release-and-resume hook re-enqueues it with isResume:true once the holder merges).
+            if (awaitingFileLease)
+            {
+                onActivity?.Invoke(null);
+                return AgentLoopCompletion.AwaitingFileLease;
+            }
 
             if (toolResults.Count == 0)
                 break;
@@ -170,6 +186,23 @@ internal sealed class WorkerAgentLoop(
         return completedNaturally
             ? AgentLoopCompletion.Succeeded
             : AgentLoopCompletion.MaxIterationsExceeded;
+    }
+
+    // Phase 12 — McpToolDispatcher.CheckFileLeaseAsync's conflict result is a JSON object with an
+    // "awaitingFileLease" property, distinguishable from a plain ToError(...) string. Parsed
+    // defensively: any non-object or unparseable result is just a normal tool result, not a signal.
+    private static bool IsAwaitingFileLeaseResult(string resultJson)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(resultJson);
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty("awaitingFileLease", out _);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     private static IReadOnlyList<LlmToolDef> FilterTools(IReadOnlyList<string>? allowedTools)

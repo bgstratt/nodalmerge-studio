@@ -170,6 +170,7 @@ interface ConversationLogEntry {
   outputTokens?: number | null;
   provider?: string | null;
   model?: string | null;
+  tokensEstimated?: boolean;
 }
 
 // ── Panel ──────────────────────────────────────────────────────────────────
@@ -593,6 +594,36 @@ export class GoalWorkspacePanel {
         if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
       } catch (err) {
         void vscode.window.showErrorMessage('NodalMerge: Steering failed — ' + String(err));
+      }
+      return;
+    }
+
+    if (action === 'steerDeadLetterRetry') {
+      let entry: { entryId: string; reason: string; attemptCount: number } | undefined;
+      try {
+        entry = await this.get<{ entryId: string; reason: string; attemptCount: number }>(
+          '/studio/dead-letter/by-work-unit/' + workUnitId,
+        );
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: Could not load dead-letter entry — ' + String(err));
+        return;
+      }
+
+      const steeringContext = await vscode.window.showInputBox({
+        prompt: 'Failed because: ' + entry.reason + ' — describe the correction',
+        placeHolder: 'e.g. the file lives at repo root, not under src/ — start the search there',
+        ignoreFocusOut: true,
+      });
+      if (!steeringContext || !steeringContext.trim()) { return; }
+
+      try {
+        await this.post('/studio/dead-letter/' + entry.entryId + '/retry-with-context', {
+          steeringContext: steeringContext.trim(),
+        });
+        void vscode.window.showInformationMessage('NodalMerge: Retrying with steering context.');
+        if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: Steered retry failed — ' + String(err));
       }
       return;
     }
@@ -1165,9 +1196,11 @@ const GW_CSS = `
   .gw-target-row.visible { display: flex; }
   .gw-body { flex: 1; display: flex; overflow: hidden; min-height: 0; }
   .gw-col { overflow-y: auto; padding: 10px 12px; }
-  .gw-decision-tree { width: 280px; flex-shrink: 0; border-right: 1px solid var(--nm-border); }
-  .gw-timeline { flex: 1; min-width: 0; border-right: 1px solid var(--nm-border); }
+  .gw-decision-tree { width: 280px; flex-shrink: 0; }
+  .gw-timeline { flex: 1; min-width: 0; }
   .gw-inspector { width: 320px; flex-shrink: 0; }
+  .gw-resizer { width: 5px; flex-shrink: 0; cursor: col-resize; background: var(--nm-border); }
+  .gw-resizer:hover, .gw-resizer.gw-resizing { background: var(--nm-info); }
   h2 {
     font-size: 0.78em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em;
     opacity: 0.5; margin: 0 0 8px;
@@ -1403,15 +1436,17 @@ const GW_HTML = `
     </label>
   </div>
   <div class="gw-body">
-    <div class="gw-col gw-decision-tree">
+    <div class="gw-col gw-decision-tree" id="gw-col-tree">
       <h2>Decision Tree</h2>
       <div id="gw-tree"><p class="empty">Create a goal to start exploring decisions.</p></div>
     </div>
-    <div class="gw-col gw-timeline">
+    <div class="gw-resizer" id="gw-resizer-tree"></div>
+    <div class="gw-col gw-timeline" id="gw-col-timeline">
       <h2>Reasoning & Execution Timeline</h2>
       <div id="gw-timeline"><p class="empty">Select a decision node to see its reasoning and execution timeline.</p></div>
     </div>
-    <div class="gw-col gw-inspector">
+    <div class="gw-resizer" id="gw-resizer-inspector"></div>
+    <div class="gw-col gw-inspector" id="gw-col-inspector">
       <h2>Decision Lens</h2>
       <div id="gw-inspector"><p class="empty">Select a decision node or timeline item to inspect.</p></div>
     </div>
@@ -1604,6 +1639,63 @@ const GW_JS = `
     vscode.postMessage({ type: 'explorerSetSchedulerPollIntervalMs', value: value });
   });
 
+  // ── Resizable columns ─────────────────────────────────────────────────────
+
+  (function setupColumnResizers() {
+    var MIN_COL_WIDTH = 50;
+    var MIN_TIMELINE_WIDTH = 50;
+    var treeEl = document.getElementById('gw-col-tree');
+    var inspectorEl = document.getElementById('gw-col-inspector');
+    var bodyEl = document.querySelector('.gw-body');
+
+    var saved = null;
+    try { saved = JSON.parse(localStorage.getItem('nm-gw-column-widths') || 'null'); } catch (e) { saved = null; }
+    if (saved && saved.tree) { treeEl.style.width = saved.tree + 'px'; }
+    if (saved && saved.inspector) { inspectorEl.style.width = saved.inspector + 'px'; }
+
+    function persistWidths() {
+      try {
+        localStorage.setItem('nm-gw-column-widths', JSON.stringify({
+          tree: treeEl.getBoundingClientRect().width,
+          inspector: inspectorEl.getBoundingClientRect().width,
+        }));
+      } catch (e) { /* localStorage unavailable — resizing still works, just won't persist */ }
+    }
+
+    function bindResizer(resizerEl, targetEl, otherEl, direction) {
+      resizerEl.addEventListener('mousedown', function(downEv) {
+        downEv.preventDefault();
+        var startX = downEv.clientX;
+        var startWidth = targetEl.getBoundingClientRect().width;
+        // Recomputed per-drag (not just once) since the other fixed column may have been
+        // resized since this resizer was bound, and the timeline needs to keep its own floor.
+        var maxWidth = bodyEl.getBoundingClientRect().width - otherEl.getBoundingClientRect().width - MIN_TIMELINE_WIDTH - 10;
+        resizerEl.classList.add('gw-resizing');
+        document.body.style.cursor = 'col-resize';
+
+        function onMove(moveEv) {
+          var next = startWidth + (moveEv.clientX - startX) * direction;
+          next = Math.max(MIN_COL_WIDTH, Math.min(next, maxWidth));
+          targetEl.style.width = next + 'px';
+        }
+        function onUp() {
+          document.removeEventListener('mousemove', onMove);
+          document.removeEventListener('mouseup', onUp);
+          resizerEl.classList.remove('gw-resizing');
+          document.body.style.cursor = '';
+          persistWidths();
+        }
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+      });
+    }
+
+    // Dragging the tree|timeline resizer right grows the tree column; dragging the
+    // timeline|inspector resizer right shrinks the inspector column (it's anchored to the right).
+    bindResizer(document.getElementById('gw-resizer-tree'), treeEl, inspectorEl, 1);
+    bindResizer(document.getElementById('gw-resizer-inspector'), inspectorEl, treeEl, -1);
+  })();
+
   // ── Live stage updates ───────────────────────────────────────────────────
 
   function connectStageSocket(wsUrl) {
@@ -1758,7 +1850,7 @@ const GW_JS = `
     document.querySelectorAll('[data-wu-action]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         var action = btn.getAttribute('data-wu-action');
-        if (action === 'steerPause' || action === 'steerForkFromNode') {
+        if (action === 'steerPause' || action === 'steerForkFromNode' || action === 'steerDeadLetterRetry') {
           vscode.postMessage({
             type: 'explorerSteeringAction',
             action: action,
@@ -1836,6 +1928,9 @@ const GW_JS = `
       html += '<button class="ghost" data-wu-action="steerPause" data-wu="' + esc(wu.workUnitId) + '" data-agent="' + esc(wu.assignedAgent || '') + '" style="color:var(--nm-warn);border-color:var(--nm-warn)">⏸ Pause & Redirect</button>';
       html += '<button class="ghost" data-wu-action="steerForkFromNode" data-wu="' + esc(wu.workUnitId) + '">↳ Fork from here</button>';
     }
+    if (statusLower === 'deadlettered') {
+      html += '<button class="ghost" data-wu-action="steerDeadLetterRetry" data-wu="' + esc(wu.workUnitId) + '" style="color:var(--nm-error);border-color:var(--nm-error)">🛠 Steer & Retry</button>';
+    }
     html += '</div>';
     html += '</div>'; // end Metadata panel
 
@@ -1875,11 +1970,12 @@ const GW_JS = `
     if (!entries || !entries.length) {
       return '<p class="empty">No conversation recorded yet for this decision node.</p>';
     }
-    var totalIn = 0, totalOut = 0, haveTokens = false;
+    var totalIn = 0, totalOut = 0, haveTokens = false, anyEstimated = false;
     var modelsByRole = {};
     entries.forEach(function(e) {
       if (e.inputTokens != null) { totalIn += e.inputTokens; haveTokens = true; }
       if (e.outputTokens != null) { totalOut += e.outputTokens; haveTokens = true; }
+      if (e.tokensEstimated && (e.inputTokens != null || e.outputTokens != null)) { anyEstimated = true; }
       if (e.model) {
         var key = e.agentRole + '|' + e.model + '|' + (e.provider || '');
         modelsByRole[key] = { role: e.agentRole, model: e.model, provider: e.provider };
@@ -1887,8 +1983,12 @@ const GW_JS = `
     });
     var html = '';
     if (haveTokens) {
-      html += '<div class="conv-token-total" style="font-size:0.8em;opacity:0.7;margin-bottom:4px">'
-        + 'Tokens this run — ↑' + totalIn.toLocaleString() + ' in / ↓' + totalOut.toLocaleString() + ' out</div>';
+      var totalTilde = anyEstimated ? '~' : '';
+      var totalTitle = anyEstimated
+        ? ' title="Includes one or more estimated counts (vscode-lm models don’t report real token usage; estimated via VS Code’s tokenizer, not the provider’s exact count)"'
+        : '';
+      html += '<div class="conv-token-total"' + totalTitle + ' style="font-size:0.8em;opacity:0.7;margin-bottom:4px">'
+        + 'Tokens this run — ' + totalTilde + '↑' + totalIn.toLocaleString() + ' in / ' + totalTilde + '↓' + totalOut.toLocaleString() + ' out</div>';
     }
     var modelKeys = Object.keys(modelsByRole);
     if (modelKeys.length > 0) {
@@ -1912,8 +2012,12 @@ const GW_JS = `
       html += '<span style="font-size:0.78em;opacity:0.55">cycle ' + e.cycleNumber + '</span>';
       html += '<span style="font-size:0.72em;opacity:0.45">' + fmtTime(e.occurredAt) + '</span>';
       if (e.inputTokens != null || e.outputTokens != null) {
-        html += '<span style="font-size:0.72em;opacity:0.5">↑' + (e.inputTokens != null ? e.inputTokens.toLocaleString() : '—')
-          + ' ↓' + (e.outputTokens != null ? e.outputTokens.toLocaleString() : '—') + '</span>';
+        var tilde = e.tokensEstimated ? '~' : '';
+        var tokenTitle = e.tokensEstimated
+          ? ' title="Estimated via VS Code’s tokenizer — vscode-lm models don’t report real token usage, so this is not the provider’s exact count"'
+          : '';
+        html += '<span style="font-size:0.72em;opacity:0.5"' + tokenTitle + '>' + tilde + '↑' + (e.inputTokens != null ? e.inputTokens.toLocaleString() : '—')
+          + ' ' + tilde + '↓' + (e.outputTokens != null ? e.outputTokens.toLocaleString() : '—') + '</span>';
       }
       html += '</div>';
       if (e.assistantText) {

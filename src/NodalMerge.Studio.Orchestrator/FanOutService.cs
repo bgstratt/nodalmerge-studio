@@ -33,6 +33,7 @@ public sealed class FanOutService : IFanOutService
     private readonly IOrchestrationDecisionLogService _decisionLog;
     private readonly IPolicyGateService _policyGate;
     private readonly IAgentProfileService _agentProfiles;
+    private readonly IMergeService _merge;
 
     public FanOutService(
         IWorkUnitService workUnits,
@@ -45,7 +46,8 @@ public sealed class FanOutService : IFanOutService
         IProfileSelectionService profileSelection,
         IOrchestrationDecisionLogService decisionLog,
         IPolicyGateService policyGate,
-        IAgentProfileService agentProfiles)
+        IAgentProfileService agentProfiles,
+        IMergeService merge)
     {
         _workUnits         = workUnits;
         _orchestrator      = orchestrator;
@@ -58,6 +60,7 @@ public sealed class FanOutService : IFanOutService
         _decisionLog       = decisionLog;
         _agentProfiles     = agentProfiles;
         _policyGate        = policyGate;
+        _merge             = merge;
     }
 
     public Task<FanOutResult> TryFanOutFromPlanAsync(
@@ -129,6 +132,8 @@ public sealed class FanOutService : IFanOutService
             {
                 if (!await IsReadyToEnqueueAsync(child, ct).ConfigureAwait(false))
                     continue;
+
+                await RefreshBranchFromDependenciesAsync(child, ct).ConfigureAwait(false);
 
                 if (await EnqueueChildWorkerAsync(child, parentWorkUnitId, creds, sessionId, ct).ConfigureAwait(false))
                 {
@@ -243,11 +248,61 @@ public sealed class FanOutService : IFanOutService
             if (dep is null)
                 return false;
 
-            if (dep.Status is not WorkUnitStatus.Proposed and not WorkUnitStatus.Merged)
+            // Phase 12 — Proposed only means a proposal exists and is awaiting review; its
+            // content isn't real yet. A dependent must not start until its dependency's output
+            // has actually landed, same reasoning as the file-lease queue's merge-gated release.
+            if (dep.Status is not WorkUnitStatus.Merged)
                 return false;
         }
 
         return true;
+    }
+
+    // Phase 12 — every child's branch is seeded once from parent.BranchId at fan-out time
+    // (EnsureChildWorkUnitsAsync above) and never refreshed. That's correct for an independent
+    // slice, but a dependent slice declared via dependsOn needs its dependency's actual merged
+    // output — not just file-lease-conflict overlap, the narrower case the lease queue handles —
+    // since a semantic dependency (a class, schema, contract another slice introduced) may touch
+    // files the dependent never declared an interest in.
+    //
+    // Deliberately CopyFilesAsync (additive) over each dependency's own FilesTouched, not
+    // ApplyBranchAsync (the merge-apply primitive): ApplyBranchAsync does a destructive full
+    // mirror — it deletes every file in the target that isn't present in the source
+    // (FileSystemWorkspaceService.ApplyBranchAsync, "Delete files in target that are absent in
+    // source"), which is correct for landing ONE proposal into a target branch but wrong here —
+    // with two-or-more dependencies, applying dep2's whole branch after dep1's would wipe out
+    // every one of dep1's files that dep2's branch doesn't also happen to contain. Copying only
+    // each dependency's own declared FilesTouched is purely additive: dependency order can only
+    // affect which dependency's content wins on a genuine overlap, never delete an unrelated
+    // dependency's contribution.
+    private async Task RefreshBranchFromDependenciesAsync(WorkUnit child, CancellationToken ct)
+    {
+        if (child.DependsOn.Count == 0)
+            return;
+
+        foreach (var depId in child.DependsOn)
+        {
+            var dep = await _workUnits.GetAsync(depId, ct).ConfigureAwait(false);
+            if (dep is null)
+                continue;
+
+            var chain = await _artifacts.GetChainAsync(dep.WorkUnitId, ct).ConfigureAwait(false);
+            var proposalRef = chain.LastOrDefault(a => a.Type == ArtifactType.MergeProposal);
+            if (proposalRef is null)
+                continue;
+
+            var proposal = await _merge.GetAsync(proposalRef.ArtifactId, ct).ConfigureAwait(false);
+            if (proposal is null)
+                continue;
+
+            var files = proposal.FilesTouched.Count > 0
+                ? proposal.FilesTouched
+                : await _fileWorkspace.ListAsync(dep.BranchId, ct: ct).ConfigureAwait(false);
+            if (files.Count == 0)
+                continue;
+
+            await _fileWorkspace.CopyFilesAsync(dep.BranchId, child.BranchId, files, ct).ConfigureAwait(false);
+        }
     }
 
     private async Task<bool> EnqueueChildWorkerAsync(

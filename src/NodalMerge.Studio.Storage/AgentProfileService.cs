@@ -8,6 +8,27 @@ namespace NodalMerge.Studio.Storage;
 
 public sealed class AgentProfileService : IAgentProfileService, IRehydratable
 {
+    // Discovery tools a profile for this stage can't function without, regardless of how its
+    // AllowedTools list was customized — a worker that can't list/profile the workspace is stuck
+    // guessing file paths (see the Program.cs dead-letter this was added to fix). Enforced on
+    // every load/save below so neither a persisted profile from before this list existed, nor a
+    // future hand-edit via the profile editor, can silently drop them.
+    private static readonly IReadOnlyDictionary<PipelineStage, string[]> RequiredToolsByStage = new Dictionary<PipelineStage, string[]>
+    {
+        [PipelineStage.Execute] = [McpToolNames.WorkspaceList, McpToolNames.WorkspaceProfileGet],
+    };
+
+    private static AgentProfile EnsureRequiredTools(AgentProfile profile)
+    {
+        if (!RequiredToolsByStage.TryGetValue(profile.Stage, out var required))
+            return profile;
+
+        var missing = required.Where(t => !profile.AllowedTools.Contains(t)).ToArray();
+        return missing.Length == 0
+            ? profile
+            : profile with { AllowedTools = [.. profile.AllowedTools, .. missing] };
+    }
+
     private readonly ConcurrentDictionary<string, AgentProfile> _profiles = new();
     private readonly IStudioNodeStore _nodeStore;
 
@@ -49,17 +70,20 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 PipelineStage.Execute,
                 string.Empty,
                 [
+                    McpToolNames.WorkUnitGet,
                     McpToolNames.TaskUpdate,
-                    McpToolNames.TaskList,
-                    McpToolNames.TaskAssign,
+                    McpToolNames.WorkspaceSummary,
                     McpToolNames.WorkspaceRead,
                     McpToolNames.WorkspaceWrite,
                     McpToolNames.WorkspaceDelete,
+                    McpToolNames.WorkspaceExists,
+                    McpToolNames.WorkspaceList,
+                    McpToolNames.WorkspaceProfileGet,
+                    McpToolNames.WorkspaceBuild,
+                    McpToolNames.WorkspaceTest,
+                    McpToolNames.WorkspaceDiff,
                     McpToolNames.MergePropose,
                     McpToolNames.MergeValidate,
-                    McpToolNames.BranchCreate,
-                    McpToolNames.BranchStatus,
-                    McpToolNames.SnapshotGet,
                     McpToolNames.ArtifactRecord,
                     McpToolNames.ArtifactQuery,
                     McpToolNames.ArtifactList,
@@ -103,6 +127,7 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
 
     public async Task<AgentProfile> CreateAsync(AgentProfile profile, CancellationToken cancellationToken = default)
     {
+        profile = EnsureRequiredTools(profile);
         _profiles[profile.AgentProfileId] = profile;
         await Persist(profile, cancellationToken).ConfigureAwait(false);
         return profile;
@@ -118,6 +143,7 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
     {
         if (!_profiles.ContainsKey(profile.AgentProfileId))
             throw new KeyNotFoundException($"Agent profile '{profile.AgentProfileId}' was not found.");
+        profile = EnsureRequiredTools(profile);
         _profiles[profile.AgentProfileId] = profile;
         await Persist(profile, cancellationToken).ConfigureAwait(false);
         return profile;
@@ -136,7 +162,7 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
         {
             var profile = JsonSerializer.Deserialize<AgentProfile>(payloadJson);
             if (profile is not null)
-                _profiles[entityId] = profile;
+                _profiles[entityId] = EnsureRequiredTools(profile);
         }
     }
 

@@ -86,6 +86,10 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IIntentGraphService>(sp => sp.GetRequiredService<IntentGraphService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<IntentGraphService>());
 
+        services.AddSingleton<FileLeaseService>();
+        services.AddSingleton<IFileLeaseService>(sp => sp.GetRequiredService<FileLeaseService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<FileLeaseService>());
+
         services.AddSingleton<InMemoryDeadLetterService>();
         services.AddSingleton<IDeadLetterService>(sp => sp.GetRequiredService<InMemoryDeadLetterService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryDeadLetterService>());

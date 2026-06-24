@@ -9,7 +9,20 @@ namespace NodalMerge.Studio.AgentRuntime.Tests;
 public class InMemoryAgentRuntimeServiceTests
 {
     private static InMemoryAgentRuntimeService Build() =>
-        new(new NoopServiceProvider(), NullLogger<InMemoryAgentRuntimeService>.Instance, new NoopAgentProfileService(), new NoopScheduler(), new NoopEventStream(), new WorkspaceOptions());
+        new(new NoopServiceProvider(), NullLogger<InMemoryAgentRuntimeService>.Instance, new NoopAgentProfileService(), new NoopScheduler(), new NoopEventStream(), new WorkspaceOptions(), new NoopFileLeaseService());
+
+    private sealed class NoopFileLeaseService : IFileLeaseService
+    {
+        public Task<(bool Granted, string? HolderWorkUnitId)> TryAcquireOrEnqueueAsync(
+            string workUnitId, string path, CancellationToken ct = default) =>
+            Task.FromResult<(bool Granted, string? HolderWorkUnitId)>((true, workUnitId));
+        public Task<string?> ReleaseAndAdvanceAsync(string path, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+        public Task<IReadOnlyList<string>> ForceReleaseAllForWorkUnitAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<IReadOnlyList<FileLeaseInfo>> ListAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<FileLeaseInfo>>([]);
+    }
 
     private sealed class NoopScheduler : IWorkScheduler
     {
@@ -19,6 +32,8 @@ public class InMemoryAgentRuntimeServiceTests
         public Task<ScheduledItem?> TryAcquireAsync(string agentId, CancellationToken ct = default) =>
             Task.FromResult<ScheduledItem?>(null);
         public Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default) => Task.CompletedTask;
+        public Task MarkAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
         public Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ScheduledItem>>([]);
         public Task<IReadOnlyList<ScheduledItem>> ListAwaitingResumeAsync(CancellationToken ct = default) =>

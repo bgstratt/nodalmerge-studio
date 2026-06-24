@@ -26,7 +26,8 @@ internal sealed class McpToolDispatcher(
     IExecutionEventStream events,
     IIntentGraphService intentGraph,
     IWorkspaceExecutionCommandService executionCommands,
-    IWorkspaceProfileService workspaceProfiles)
+    IWorkspaceProfileService workspaceProfiles,
+    IFileLeaseService fileLease)
 {
     // Phase 9g — read-before-write enforcement. McpToolDispatcher is registered as a singleton
     // (InMemoryAgentRuntimeService.cs) shared across every agent/run, so this cache lives here
@@ -356,8 +357,8 @@ internal sealed class McpToolDispatcher(
         var content  = Str(input, "content");
         if (branchId is null || path is null || content is null) return ToError("branchId (or workUnitId), path, and content are required.");
 
-        var scopeError = await CheckFileScopeAsync(branchId, path, ct).ConfigureAwait(false);
-        if (scopeError is not null) return scopeError;
+        var leaseConflict = await CheckFileLeaseAsync(branchId, path, ct).ConfigureAwait(false);
+        if (leaseConflict is not null) return leaseConflict;
 
         try
         {
@@ -385,8 +386,8 @@ internal sealed class McpToolDispatcher(
         var path     = Str(input, "path");
         if (branchId is null || path is null) return ToError("branchId (or workUnitId) and path are required.");
 
-        var scopeError = await CheckFileScopeAsync(branchId, path, ct).ConfigureAwait(false);
-        if (scopeError is not null) return scopeError;
+        var leaseConflict = await CheckFileLeaseAsync(branchId, path, ct).ConfigureAwait(false);
+        if (leaseConflict is not null) return leaseConflict;
 
         try
         {
@@ -396,18 +397,37 @@ internal sealed class McpToolDispatcher(
         catch (Exception ex) { return ToError(ex.Message); }
     }
 
-    private async Task<string?> CheckFileScopeAsync(string branchId, string path, CancellationToken ct)
+    // Phase 12 — replaces the old static FileScope hard block (CheckFileScopeAsync, removed).
+    // A file's lease is held by whichever active sibling first successfully writes/deletes it;
+    // anyone else wanting the same path while it's held is queued instead of rejected outright.
+    // The branch's owning WorkUnitId (not necessarily the caller's own workUnitId — same
+    // resolution CheckFileScopeAsync used) is the identity attributed to the lease, since a
+    // branch is 1:1 with the WorkUnit that owns it.
+    private async Task<string?> CheckFileLeaseAsync(string branchId, string path, CancellationToken ct)
     {
         var owners = await workUnits.ListAsync(branchId, ct).ConfigureAwait(false);
         var owner = owners.FirstOrDefault();
-        if (owner is null || owner.FileScope.Count == 0)
+        if (owner is null)
             return null;
 
-        var allowed = await agentWorkspaces
-            .ValidateWriteAsync(owner.WorkUnitId, path, owner.FileScope, ct)
+        var (granted, holderWorkUnitId) = await fileLease
+            .TryAcquireOrEnqueueAsync(owner.WorkUnitId, path, ct)
             .ConfigureAwait(false);
 
-        return allowed ? null : ToError($"File {path} is outside your declared scope {string.Join(", ", owner.FileScope)}.");
+        if (granted)
+            return null;
+
+        // Distinguishable from a plain ToError(...) string by the "awaitingFileLease" key —
+        // WorkerAgentLoop checks for this exact shape to exit its loop on the same turn, without
+        // sending the conflict back to the LLM for "please retry" prose first.
+        return ToJson(new
+        {
+            awaitingFileLease = path,
+            heldBy = holderWorkUnitId,
+            message = $"File '{path}' is currently leased by work unit '{holderWorkUnitId}' until its " +
+                "merge is applied. You've been queued and will be automatically resumed once it's " +
+                "available — stop now, do not retry.",
+        });
     }
 
     private async Task<string> WorkspaceListAsync(JsonElement input, CancellationToken ct)

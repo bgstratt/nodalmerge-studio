@@ -142,6 +142,24 @@ in Goal Workspace's Decision Lens, plus a "View live transcript" deep-link from 
 | 11d | Goal Workspace Decision Lens "Conversation" tab, with live 2s polling while running | Complete |
 | 11e | Activity Center "View live transcript" deep-link into Goal Workspace | Complete |
 
+## Phase 12 — File Ownership & Merge-Gated Leasing
+
+See [phase-12-file-ownership-leasing.md](./phase-12-file-ownership-leasing.md). Replaces the
+immutable, hard `FileScope` write-time block (which conflated edit authorization with concurrency
+ownership, and trapped Workers that correctly discovered a file the Planner had guessed wrong) with
+a merge-gated FIFO file lease queue, plus tightens `dependsOn` gating so a dependent slice's branch
+is refreshed with its dependency's actual merged output before it starts.
+
+| Slice | Focus | Status |
+|---|---|---|
+| 12a | `IFileLeaseService` — per-path holder + FIFO wait queue, persisted/rehydratable | Done |
+| 12b | Write-time enforcement — remove hard `FileScope` block, wire `CheckFileLeaseAsync` into `McpToolDispatcher` | Done |
+| 12c | Zero-context-burn suspend — `AgentLoopCompletion.AwaitingFileLease`, `WorkerAgentLoop` exits same-turn on conflict | Done |
+| 12d | Scheduler parking — `ScheduledItem.AwaitingFileLease`, skip in acquire sweep, release-and-resume hook on `MergeApplyAsync`, force-release on failure | Done |
+| 12e | Tighten `dependsOn` gating to `Merged`-only; proactively refresh a dependent's branch from its merged dependencies before enqueue | Done |
+| 12f | Planner prompt — `fileScope` as hint not permission, empty-branch deferral rule, semantic-vs-file `dependsOn` rule | Done |
+| 12g | Tests — unit (`FileLeaseService`, dispatcher, loop, scheduler, fan-out) + integration (two-slice collision-and-resume scenario) | Done |
+
 ## Slice document template
 
 Each slice file should include:

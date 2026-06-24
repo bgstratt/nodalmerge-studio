@@ -198,6 +198,12 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
             if (item.AwaitingResume)
                 continue;
 
+            // Phase 12 — skip items parked by MarkAwaitingFileLeaseAsync until
+            // IFileLeaseService's release-and-advance hook clears the flag via
+            // ClearAwaitingFileLeaseAsync (on the holder's actual merge).
+            if (item.AwaitingFileLease)
+                continue;
+
             // Phase 8b — a paused session must actually stop new dispatch under it, not just
             // record a status flag (ExecutionSessionService.SetStatusAsync previously had no
             // effect on the scheduler at all).
@@ -347,6 +353,42 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
                 StudioNodeKind.SchedulerV1, workUnitId,
                 "{\"status\":\"failed\"}", ct).ConfigureAwait(false);
         }
+    }
+
+    // Phase 12 — called instead of ReleaseAsync when a worker's loop exits with
+    // AgentLoopCompletion.AwaitingFileLease. The item stays in _queue (unlike ReleaseAsync's
+    // TryRemove) so it's still visible/listed, but TryAcquireAsync's AwaitingFileLease skip keeps
+    // it from being picked up again until ClearAwaitingFileLeaseAsync runs.
+    public async Task MarkAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default)
+    {
+        if (!_queue.TryGetValue(workUnitId, out var item))
+            return;
+
+        var parked = item with { LeasedBy = null, LeasedAt = null, AwaitingFileLease = true };
+        if (!_queue.TryUpdate(workUnitId, parked, item))
+            return;
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.SchedulerV1, workUnitId,
+            JsonSerializer.Serialize(parked), ct).ConfigureAwait(false);
+    }
+
+    // Phase 12 — called by IFileLeaseService's release-and-advance hook for the WorkUnitId it
+    // just promoted to holder. The item was never removed from _queue, so clearing the flag alone
+    // is enough to make it eligible for TryAcquireAsync again — its AttemptCount is already > 0
+    // from its prior run, which is what gives the resumed WorkerAgentLoop isResume: true.
+    public async Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default)
+    {
+        if (!_queue.TryGetValue(workUnitId, out var item) || !item.AwaitingFileLease)
+            return;
+
+        var resumed = item with { AwaitingFileLease = false };
+        if (!_queue.TryUpdate(workUnitId, resumed, item))
+            return;
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.SchedulerV1, workUnitId,
+            JsonSerializer.Serialize(resumed), ct).ConfigureAwait(false);
     }
 
     private async Task<string> ResolveOrchestratorWorkUnitIdAsync(string workUnitId, CancellationToken ct)

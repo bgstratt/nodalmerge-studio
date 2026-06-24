@@ -48,17 +48,32 @@ internal sealed class PlannerAgentLoop(
 
         Rules:
         - Prefer parallel slices with non-overlapping fileScope when possible.
-        - Use dependsOn only when one slice truly needs another's output.
+        - Use dependsOn whenever one slice truly needs another's output — and that's not limited to
+          slices touching the same files. If a slice introduces an abstraction, contract, schema,
+          interface, service, model, or migration that another slice's steps will need to call,
+          import, or build on, the consuming slice must declare dependsOn the producing slice even
+          when their fileScope lists are completely disjoint. Don't rely on file overlap alone to
+          infer ordering — a worker is only allowed to start once every slice it dependsOn has
+          actually been merged, so an undeclared dependency means it starts too early, against
+          stale or missing content.
         - Write valid JSON only — no markdown fences in the file content.
-        - fileScope entries must be the exact, real relative paths from nm_v1_workspace_list — never
-          a filename guessed from the goal text. If the goal mentions a file by name only (e.g.
-          "update app.tsx"), find its actual path in the listing by matching the filename
-          case-insensitively (e.g. "web-react/src/App.tsx") and use that full path. Only use the
-          goal's literal name as-is when no matching file exists anywhere in the listing — i.e. it's
-          genuinely a new file.
+        - fileScope is a routing hint, not a hard permission boundary — workers are no longer
+          blocked from writing outside it. Still make it the exact, real relative paths from
+          nm_v1_workspace_list whenever you can, never a filename guessed from the goal text: it's
+          used to route the slice to a matching specialist profile and to warn about sibling
+          overlap. If the goal mentions a file by name only (e.g. "update app.tsx"), find its
+          actual path in the listing by matching the filename case-insensitively (e.g.
+          "web-react/src/App.tsx") and use that full path. Only use the goal's literal name as-is
+          when no matching file exists anywhere in the listing — i.e. it's genuinely a new file.
         - A single slice's fileScope should stay within one project root from step 2 whenever the
           goal allows it — a worker that only looked at one root's files shouldn't be handed a
           slice that also needs changes in another root.
+        - If nm_v1_workspace_list returns zero files for the entire branch, this is a genuinely
+          empty repo — do not guess conventional framework paths (e.g. "src/App.tsx",
+          "Program.cs") out of thin air. Either write a single slice with fileScope: [] whose first
+          step is "scaffold the project structure," or make scaffolding its own slice that every
+          feature slice dependsOn, so nothing else starts until real files and real paths exist to
+          target.
         """;
 
     private readonly int _maxIterations = profile?.MaxIterations ?? 15;

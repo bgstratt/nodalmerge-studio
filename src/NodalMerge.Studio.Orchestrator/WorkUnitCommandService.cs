@@ -21,8 +21,31 @@ public sealed class WorkUnitCommandService(
         WorkUnitStatus.Completed, WorkUnitStatus.Merged, WorkUnitStatus.Cancelled,
     };
 
-    public Task<WorkUnit> CreateAsync(WorkUnitCreateCommand command, CancellationToken cancellationToken = default) =>
-        orchestrator.CreateWorkUnitAsync(
+    public async Task<WorkUnit> CreateAsync(WorkUnitCreateCommand command, CancellationToken cancellationToken = default)
+    {
+        // A work unit with no explicit seed otherwise gets an empty branch directory —
+        // FileSystemWorkspaceService.InitBranchAsync only copies from seedFromBranchId when one
+        // is given, and only falls back to SeedRepositoryPath for branchId "main" itself. Without
+        // this, every fresh goal starts blind to every previously applied/merged change (and even
+        // to the originally seeded repo), and every fork-without-a-parent-seed starts blind to
+        // whatever its parent is currently holding. Fan-out/steering/fork-from-node bypass this
+        // service and call IOrchestratorService directly with their own explicit seed already, so
+        // this default only ever reaches a genuinely fresh, human- or tool-initiated creation.
+        var seedFromBranchId = command.SeedFromBranchId;
+        if (seedFromBranchId is null)
+        {
+            if (command.ParentWorkUnitId is null)
+            {
+                seedFromBranchId = "main";
+            }
+            else
+            {
+                var parent = await workUnits.GetAsync(command.ParentWorkUnitId, cancellationToken).ConfigureAwait(false);
+                seedFromBranchId = parent?.BranchId;
+            }
+        }
+
+        return await orchestrator.CreateWorkUnitAsync(
             command.Goal,
             command.Owner,
             command.BranchId,
@@ -34,9 +57,10 @@ public sealed class WorkUnitCommandService(
             forkType: command.ForkType,
             reviewPolicy: command.ReviewPolicy,
             bypassPromotionBranch: command.BypassPromotionBranch,
-            seedFromBranchId: command.SeedFromBranchId,
+            seedFromBranchId: seedFromBranchId,
             expectedOutputKind: command.ExpectedOutputKind ?? WorkUnitExpectedOutputKind.FileChange,
-            cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
 
     public async Task<IReadOnlyList<WorkUnit>> CancelAsync(string workUnitId, CancellationToken cancellationToken = default)
     {

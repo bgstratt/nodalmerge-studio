@@ -218,6 +218,7 @@ public static class StudioRestEndpoints
         MapSessionStateEndpoints(app);
         MapArtifactEndpoints(app);
         MapDeadLetterEndpoints(app);
+        MapFileLeaseEndpoints(app);
         MapOptionsEndpoints(app);
         MapPolicyEndpoints(app);
         MapProjectionEndpoints(app);
@@ -1692,7 +1693,78 @@ public static class StudioRestEndpoints
                 _ => Results.BadRequest(new { error = result.Message ?? "Retry failed." }),
             };
         });
+
+        app.MapGet("/studio/dead-letter/by-work-unit/{workUnitId}", async (
+            string workUnitId,
+            IDeadLetterService deadLetter,
+            CancellationToken ct) =>
+        {
+            var entry = await deadLetter.GetLatestForWorkUnitAsync(workUnitId, ct).ConfigureAwait(false);
+            return entry is null
+                ? Results.NotFound(new { error = $"No dead-letter entry found for work unit '{workUnitId}'." })
+                : Results.Ok(entry);
+        });
+
+        app.MapPost("/studio/dead-letter/{entryId}/retry-with-context", async (
+            string entryId,
+            RetryWithContextBody body,
+            IDeadLetterService deadLetter,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.SteeringContext))
+                return Results.BadRequest(new { error = "steeringContext is required." });
+
+            var result = await deadLetter.RetryWithContextAsync(entryId, body.SteeringContext, ct)
+                .ConfigureAwait(false);
+            return result.Outcome switch
+            {
+                DeadLetterRetryOutcome.Retried => Results.Ok(result),
+                DeadLetterRetryOutcome.NotFound => Results.NotFound(new { error = result.Message }),
+                DeadLetterRetryOutcome.MaxAttemptsReached => Results.Conflict(new { error = result.Message }),
+                DeadLetterRetryOutcome.InvalidState => Results.BadRequest(new { error = result.Message }),
+                _ => Results.BadRequest(new { error = result.Message ?? "Retry failed." }),
+            };
+        });
     }
+
+    private sealed record RetryWithContextBody(string SteeringContext);
+
+    // ── /studio/file-leases — Phase 12 manual-release admin override ───────────
+    // Closes the one remaining gap after StopAsync/ReviewAsync(Rejected) were wired to release
+    // leases automatically: a lease with no live agent to stop and no pending proposal to
+    // reject (e.g. a crash mid-write before either of those could run) had no recovery path at
+    // all. /release reuses ForceReleaseAllForWorkUnitAsync — same mechanics as those two
+    // automatic call sites, including clearing the promoted waiter's scheduler-level
+    // AwaitingFileLease flag so it actually resumes rather than sitting parked forever despite
+    // already holding the lease it was waiting on.
+    private static void MapFileLeaseEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/file-leases", async (
+            IFileLeaseService fileLease,
+            CancellationToken ct) =>
+        {
+            var leases = await fileLease.ListAsync(ct).ConfigureAwait(false);
+            return Results.Ok(leases);
+        });
+
+        app.MapPost("/studio/file-leases/release", async (
+            ReleaseFileLeaseBody body,
+            IFileLeaseService fileLease,
+            IWorkScheduler scheduler,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+
+            var promoted = await fileLease.ForceReleaseAllForWorkUnitAsync(body.WorkUnitId, ct).ConfigureAwait(false);
+            foreach (var promotedWorkUnitId in promoted)
+                await scheduler.ClearAwaitingFileLeaseAsync(promotedWorkUnitId, ct).ConfigureAwait(false);
+
+            return Results.Ok(new { workUnitId = body.WorkUnitId, promotedWorkUnitIds = promoted });
+        });
+    }
+
+    private sealed record ReleaseFileLeaseBody(string WorkUnitId);
 
     // ── /studio/agent-profiles ────────────────────────────────────────────────
 

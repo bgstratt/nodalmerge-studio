@@ -40,10 +40,14 @@ public sealed class SteeringService(
             ["steeredBy"]             = "user",
         };
 
+        // Seed from the original's own branch (its in-flight work, not main) — otherwise a steer
+        // on a root-level work unit (no parent) gets an empty branch instead of continuing from
+        // wherever the paused agent had actually gotten to.
         var fork = await orchestrator.CreateWorkUnitAsync(
             goal:             forkedGoal,
             owner:            original.Owner,
             parentWorkUnitId: original.ParentWorkUnitId,
+            seedFromBranchId: original.BranchId,
             forkType:         HypothesisForkType.Reasoning,
             metadata:         forkMeta,
             reviewPolicy:     original.ReviewPolicy,
@@ -99,12 +103,14 @@ public sealed class SteeringService(
         // When a proposal is specified, seed the fork's branch from that proposal's base state
         // (the same base/{proposalId} snapshot IOrchestratorService.CreateWorkUnitAsync already
         // knows how to seed from) and record the lineage via branchedFromProposalId directly,
-        // rather than mutating the returned record after the fact.
+        // rather than mutating the returned record after the fact. Otherwise fall back to the
+        // original's own current branch — not an empty one — so forking from a root-level node
+        // (no parent) still continues from whatever's actually there.
         var fork = await orchestrator.CreateWorkUnitAsync(
             goal:                   forkGoal,
             owner:                  original.Owner,
             parentWorkUnitId:       original.ParentWorkUnitId,
-            seedFromBranchId:       command.ProposalId is not null ? $"base/{command.ProposalId}" : null,
+            seedFromBranchId:       command.ProposalId is not null ? $"base/{command.ProposalId}" : original.BranchId,
             branchedFromProposalId: command.ProposalId,
             forkType:               HypothesisForkType.Reasoning,
             metadata:               forkMeta,

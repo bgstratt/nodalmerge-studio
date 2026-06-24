@@ -133,18 +133,58 @@ export class LmApiProxy implements vscode.Disposable {
       this.output.appendLine(`[LmApiProxy] assistant content preview: ${preview.replace(/\r?\n/g, ' ')} `);
     }
 
+    const usage = await estimateUsage(model, vsMessages, vsTools, textContent, toolCalls, cts.token);
+
     return {
       id:      `chatcmpl-vscode-${Date.now()}`,
       object:  'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model:   model.id,
       choices: [{ index: 0, message, finish_reason: finishReason }],
-      usage:   { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      usage,
     };
   }
 
   dispose(): void {
     this.server?.close();
+  }
+}
+
+// ── Usage estimation ──────────────────────────────────────────────────────
+//
+// VS Code's Language Model API never reports real provider-side token usage (Copilot/vscode-lm
+// don't expose it), so this is a best-effort estimate built from the model's own tokenizer via
+// countTokens() — covers prompt messages + tool definitions for input, and response text + tool
+// calls for output. Marked `estimated: true` so downstream (LlmClient.cs -> ConversationLogEntry
+// -> the Conversation tab) can render it as approximate (e.g. a "~" prefix) rather than implying
+// the same precision as a real provider-reported count.
+async function estimateUsage(
+  model: vscode.LanguageModelChat,
+  vsMessages: vscode.LanguageModelChatMessage[],
+  vsTools: vscode.LanguageModelChatTool[],
+  textContent: string,
+  toolCalls: OaiToolCall[],
+  token: vscode.CancellationToken,
+): Promise<{ prompt_tokens: number; completion_tokens: number; total_tokens: number; estimated: true }> {
+  try {
+    const messageCounts = await Promise.all(vsMessages.map(m => model.countTokens(m, token)));
+    const toolDefsTokens = vsTools.length > 0 ? await model.countTokens(JSON.stringify(vsTools), token) : 0;
+    const promptTokens = messageCounts.reduce((sum, n) => sum + n, 0) + toolDefsTokens;
+
+    const textTokens = textContent ? await model.countTokens(textContent, token) : 0;
+    const toolCallTokens = toolCalls.length > 0 ? await model.countTokens(JSON.stringify(toolCalls), token) : 0;
+    const completionTokens = textTokens + toolCallTokens;
+
+    return {
+      prompt_tokens:     promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens:      promptTokens + completionTokens,
+      estimated:         true,
+    };
+  } catch {
+    // countTokens isn't guaranteed to succeed for every model/provider — fall back to zero
+    // rather than fail the whole request over a usage estimate.
+    return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, estimated: true };
   }
 }
 

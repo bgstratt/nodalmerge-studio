@@ -21,6 +21,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     private readonly IWorkScheduler _scheduler;
     private readonly IExecutionEventStream _events;
     private readonly WorkspaceOptions _options;
+    private readonly IFileLeaseService _fileLease;
     private int _activeWorkerCount;
     private CancellationTokenSource? _pollCts;
 
@@ -30,7 +31,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         IAgentProfileService profileService,
         IWorkScheduler scheduler,
         IExecutionEventStream events,
-        WorkspaceOptions options)
+        WorkspaceOptions options,
+        IFileLeaseService fileLease)
     {
         _serviceProvider = serviceProvider;
         _logger          = logger;
@@ -38,6 +40,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         _scheduler       = scheduler;
         _events          = events;
         _options         = options;
+        _fileLease       = fileLease;
     }
 
     private sealed record AgentRecord(
@@ -162,6 +165,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         var agentId = $"worker-{Guid.NewGuid():N}";
         var cts = new CancellationTokenSource();
         var success = false;
+        var awaitingFileLease = false;
         string? failureReason = null;
 
         try
@@ -205,6 +209,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var ruleFileContext = await BuildRuleFileContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
 
                 AgentLoopCompletion completion;
+                var workerProgressVerified = true;
                 if (profile?.Stage == PipelineStage.Plan)
                 {
                     var constraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
@@ -238,6 +243,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var workerConstraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, ct).ConfigureAwait(false);
                     var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
+                    // Snapshotted before the loop runs: if the task was already Completed coming
+                    // in (e.g. re-queued after a rejection, before the underlying task got reset —
+                    // see AutomatedReviewGateService), the agent can't legitimately transition it
+                    // and a post-run "Completed" check alone would be fooled by that stale state.
+                    var taskServiceForVerify = _serviceProvider.GetService<ITaskService>();
+                    var taskStatusBeforeRun = !string.IsNullOrWhiteSpace(taskId) && taskServiceForVerify is not null
+                        ? (await taskServiceForVerify.GetAsync(taskId, ct).ConfigureAwait(false))?.Status
+                        : null;
                     var loop = new WorkerAgentLoop(
                         agentId, item.WorkUnitId, taskId, provider, model, baseUrl, apiKey!,
                         dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a),
@@ -247,12 +260,22 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         promptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
                         conversationLog: conversationLog);
                     completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
+
+                    if (completion == AgentLoopCompletion.Succeeded)
+                    {
+                        workerProgressVerified = await VerifyWorkerProgressAsync(
+                            item.WorkUnitId, taskId, agentId, taskStatusBeforeRun, ct).ConfigureAwait(false);
+                    }
                 }
 
-                if (completion == AgentLoopCompletion.Succeeded)
+                if (completion == AgentLoopCompletion.Succeeded && workerProgressVerified)
                     success = true;
+                else if (completion == AgentLoopCompletion.AwaitingFileLease)
+                    awaitingFileLease = true;
                 else if (completion == AgentLoopCompletion.MaxIterationsExceeded)
                     failureReason = "Max iterations reached";
+                else if (completion == AgentLoopCompletion.Succeeded && !workerProgressVerified)
+                    failureReason = "Agent ended its turn without completing the task or producing a merge proposal.";
             }
 
             if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
@@ -285,10 +308,58 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
             cts.Dispose();
             Interlocked.Decrement(ref _activeWorkerCount);
-            await _scheduler.ReleaseAsync(item.WorkUnitId, success).ConfigureAwait(false);
-            _logger.LogInformation(
-                "[Scheduler] Released workUnit={WorkUnitId} success={Success}", item.WorkUnitId, success);
+
+            // Phase 12 — a lease conflict isn't success or failure: park the item (kept queued,
+            // not removed/dead-lettered) instead of calling ReleaseAsync, which would otherwise
+            // treat this as a plain failure and drop it.
+            if (awaitingFileLease)
+            {
+                await _scheduler.MarkAwaitingFileLeaseAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                _logger.LogInformation(
+                    "[Scheduler] Parked workUnit={WorkUnitId} awaiting file lease", item.WorkUnitId);
+            }
+            else
+            {
+                await _scheduler.ReleaseAsync(item.WorkUnitId, success).ConfigureAwait(false);
+                _logger.LogInformation(
+                    "[Scheduler] Released workUnit={WorkUnitId} success={Success}", item.WorkUnitId, success);
+            }
         }
+    }
+
+    // A worker stopping with stopReason "end_turn" only means the model stopped talking — it says
+    // nothing about whether real work happened. WorkerAgentLoop reports that as Succeeded
+    // unconditionally, so this re-checks for an actual outcome before trusting it: either the task
+    // transitioned to Completed during this run (not just already Completed coming in — that's
+    // the stale-state trap a re-queued-after-rejection task can fall into), or this agent's own run
+    // produced a MergeProposal for the work unit.
+    private async Task<bool> VerifyWorkerProgressAsync(
+        string workUnitId,
+        string? taskId,
+        string agentId,
+        NodalMerge.Studio.Contracts.Domain.TaskStatus? taskStatusBeforeRun,
+        CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(taskId) &&
+            taskStatusBeforeRun != NodalMerge.Studio.Contracts.Domain.TaskStatus.Completed)
+        {
+            var taskService = _serviceProvider.GetService<ITaskService>();
+            var task = taskService is not null
+                ? await taskService.GetAsync(taskId, ct).ConfigureAwait(false)
+                : null;
+            if (task?.Status == NodalMerge.Studio.Contracts.Domain.TaskStatus.Completed)
+                return true;
+        }
+
+        var mergeService = _serviceProvider.GetService<IMergeService>();
+        if (mergeService is not null)
+        {
+            var proposals = await mergeService.ListAsync(cancellationToken: ct).ConfigureAwait(false);
+            if (proposals.Any(p => p.WorkUnitId == workUnitId && p.AgentId == agentId))
+                return true;
+        }
+
+        return false;
     }
 
     private async Task RecordDeadLetterAsync(
@@ -310,6 +381,10 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             reason,
             string.IsNullOrWhiteSpace(item.TaskId) ? null : item.TaskId,
             sessionId: item.SessionId,
+            model: item.Model,
+            baseUrl: item.BaseUrl,
+            apiKey: item.ApiKey,
+            provider: item.Provider,
             cancellationToken: ct).ConfigureAwait(false);
     }
 
@@ -503,6 +578,10 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                             profile?.AgentProfileId ?? "orchestrator",
                             reason,
                             sessionId: sessionId,
+                            model: model,
+                            baseUrl: baseUrl,
+                            apiKey: apiKey,
+                            provider: provider,
                             cancellationToken: cts.Token).ConfigureAwait(false);
                     }
                 }
@@ -522,6 +601,10 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         profile?.AgentProfileId ?? "orchestrator",
                         ex.Message.Length > 200 ? ex.Message[..200] : ex.Message,
                         sessionId: sessionId,
+                        model: model,
+                        baseUrl: baseUrl,
+                        apiKey: apiKey,
+                        provider: provider,
                         cancellationToken: CancellationToken.None).ConfigureAwait(false);
                 }
                 if (_agents.TryGetValue(agentId, out var r))
@@ -606,12 +689,24 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         return Task.CompletedTask;
     }
 
-    public Task StopAsync(string agentId, CancellationToken cancellationToken = default)
+    public async Task StopAsync(string agentId, CancellationToken cancellationToken = default)
     {
         var current = GetRequired(agentId);
         current.Cts?.Cancel();
         _agents[agentId] = current with { Status = "stopped", Cts = null, CurrentActivity = null };
-        return Task.CompletedTask;
+
+        // Phase 12 — an explicit stop is a deliberate "abandon this run," unlike a transient
+        // failure with retries left (where the lease must stay held — see ForceReleaseAll's only
+        // other caller, InMemoryDeadLetterService, gated on MaxAttemptsReached for the same
+        // reason): nothing will automatically retry after a human stops it, so any file lease(s)
+        // it held would otherwise strand their wait queues forever with no recovery path. Does
+        // NOT fire on host-restart cancellation (IHostedService.StopAsync, a different method) —
+        // that path is the existing AwaitingResume rehydrate-and-approve flow, where the lease
+        // staying held across the restart is correct.
+        var promoted = await _fileLease.ForceReleaseAllForWorkUnitAsync(current.WorkUnitId, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var promotedWorkUnitId in promoted)
+            await _scheduler.ClearAwaitingFileLeaseAsync(promotedWorkUnitId, cancellationToken).ConfigureAwait(false);
     }
 
     public Task<string> GetStatusAsync(string agentId, CancellationToken cancellationToken = default)

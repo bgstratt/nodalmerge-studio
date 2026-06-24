@@ -16,18 +16,25 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     private readonly IExecutionEventStream _events;
     private readonly IArtifactLineageService _artifacts;
     private readonly IServiceProvider? _serviceProvider;
+    private readonly IFileLeaseService? _fileLease;
 
     // IWorkUnitService is resolved lazily (via IServiceProvider) rather than constructor-injected:
     // its production implementation (InMemoryWorkUnitService) already depends on IMergeService
     // (this service), so a direct dependency here would be a circular constructor graph — same
-    // pattern used by WorkSchedulerService for the same interface.
+    // pattern used by WorkSchedulerService for the same interface. IWorkScheduler is resolved the
+    // same lazy way below (Phase 12's release-and-resume hook) for the identical reason —
+    // WorkSchedulerService takes IMergeService directly, so a direct dependency back here would
+    // be the same cycle. IFileLeaseService has no such cycle, so it's constructor-injected
+    // directly — but kept optional (default null) so the existing direct (non-DI) test
+    // constructions don't all need updating; when null, the release-and-resume hook is skipped.
     public InMemoryMergeService(
         IStudioNodeStore nodeStore,
         IFileWorkspaceService fileWorkspace,
         WorkspaceOptions workspaceOptions,
         IExecutionEventStream events,
         IArtifactLineageService artifacts,
-        IServiceProvider? serviceProvider = null)
+        IServiceProvider? serviceProvider = null,
+        IFileLeaseService? fileLease = null)
     {
         _nodeStore        = nodeStore;
         _fileWorkspace    = fileWorkspace;
@@ -35,6 +42,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         _events           = events;
         _artifacts        = artifacts;
         _serviceProvider  = serviceProvider;
+        _fileLease        = fileLease;
     }
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
@@ -162,6 +170,26 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 ExecutionEventKind.MergeProposalStatusChanged,
                 new MergeProposalStatusChangedPayload(proposalId, proposal.Status, updated.Status),
                 ct: cancellationToken).ConfigureAwait(false);
+        }
+
+        // Phase 12 — a human rejecting a proposal through this (non-automated) path is a
+        // deliberate, final decision with no automatic retry tied to it (unlike
+        // AutomatedReviewGateService's rejection-count retry loop, which already releases leases
+        // itself via IDeadLetterService.RecordFailureAsync only once it gives up for good —
+        // releasing on every one of ITS rejections here too would race an upcoming auto-retry).
+        // Nothing else will ever merge this content, so its leases must be released now or they'd
+        // strand their wait queues with no recovery path — there's no future event for a
+        // human-rejected proposal to hang a release off of otherwise.
+        if (decision == MergeProposalStatus.Rejected && proposal.WorkUnitId is not null && _fileLease is not null)
+        {
+            var promoted = await _fileLease.ForceReleaseAllForWorkUnitAsync(proposal.WorkUnitId, cancellationToken)
+                .ConfigureAwait(false);
+            var scheduler = _serviceProvider?.GetService(typeof(IWorkScheduler)) as IWorkScheduler;
+            if (scheduler is not null)
+            {
+                foreach (var promotedWorkUnitId in promoted)
+                    await scheduler.ClearAwaitingFileLeaseAsync(promotedWorkUnitId, cancellationToken).ConfigureAwait(false);
+            }
         }
 
         return updated;
@@ -298,6 +326,38 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // Copy workspace files: source branch → effective target branch
         await _fileWorkspace.ApplyBranchAsync(proposal.SourceBranch, effectiveTarget, cancellationToken)
             .ConfigureAwait(false);
+
+        // Phase 12 — release-and-resume: this proposal's holder kept a write lease on every file
+        // it touched (McpToolDispatcher.CheckFileLeaseAsync) until this exact moment. Now that the
+        // files have actually landed in effectiveTarget, advance each path's FIFO queue; if a
+        // sibling was waiting, copy the just-merged content into its branch and clear its parked
+        // scheduler flag so it resumes (isResume: true, from its own already-elevated AttemptCount)
+        // with current content instead of the stale snapshot it was forked from.
+        if (_fileLease is not null && proposal.FilesTouched is { Count: > 0 } filesTouched)
+        {
+            var scheduler = _serviceProvider?.GetService(typeof(IWorkScheduler)) as IWorkScheduler;
+            var workUnitsForResume = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+
+            foreach (var touchedPath in filesTouched)
+            {
+                var waiterWorkUnitId = await _fileLease.ReleaseAndAdvanceAsync(touchedPath, cancellationToken)
+                    .ConfigureAwait(false);
+                if (waiterWorkUnitId is null)
+                    continue;
+
+                var waiter = workUnitsForResume is not null
+                    ? await workUnitsForResume.GetAsync(waiterWorkUnitId, cancellationToken).ConfigureAwait(false)
+                    : null;
+                if (waiter is not null)
+                {
+                    await _fileWorkspace.CopyFilesAsync(
+                        effectiveTarget, waiter.BranchId, [touchedPath], cancellationToken).ConfigureAwait(false);
+                }
+
+                if (scheduler is not null)
+                    await scheduler.ClearAwaitingFileLeaseAsync(waiterWorkUnitId, cancellationToken).ConfigureAwait(false);
+            }
+        }
 
         // Write changed files back to disk whenever a repository path is configured
         if (!string.IsNullOrWhiteSpace(_workspaceOptions.SeedRepositoryPath))
@@ -436,9 +496,29 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             {
                 try
                 {
+                    var mergedUnit = await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false);
                     await workUnits.UpdateStatusAsync(
                         proposal.WorkUnitId, WorkUnitStatus.Merged, proposal.SessionId, cancellationToken).ConfigureAwait(false);
                     await workUnits.SetCurrentStageAsync(proposal.WorkUnitId, null, cancellationToken).ConfigureAwait(false);
+
+                    // Phase 12 — IsReadyToEnqueueAsync now gates a dependent on its dependency
+                    // reaching Merged, not Proposed. The existing trigger for
+                    // TryEnqueueReadyDependentsAsync fires at worker-completion time (Proposed),
+                    // which is too early for a dependent under the tighter gate; this is the
+                    // complementary trigger for the gate's later threshold. Reconciliation doesn't
+                    // need an equivalent merge-time call — it already tolerates a Merged child
+                    // (MergeReconciliationService.cs:48) and is re-checked whenever the *other*
+                    // sibling's own worker later completes.
+                    if (mergedUnit?.ParentWorkUnitId is { } parentWorkUnitId)
+                    {
+                        var fanOut = _serviceProvider?.GetService(typeof(IFanOutService)) as IFanOutService;
+                        if (fanOut is not null)
+                        {
+                            await fanOut
+                                .TryEnqueueReadyDependentsAsync(parentWorkUnitId, proposal.SessionId, cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                    }
                 }
                 catch (InvalidOperationException) { }
                 catch (KeyNotFoundException) { }

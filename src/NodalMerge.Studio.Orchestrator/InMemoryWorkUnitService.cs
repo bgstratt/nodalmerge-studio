@@ -184,11 +184,16 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         WorkUnitExpectedOutputKind expectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
         CancellationToken cancellationToken = default)
     {
-        // First work unit with a repositoryPath seeds the main branch for this session.
+        // First work unit with a repositoryPath seeds the main branch for this session. Setting
+        // the option alone doesn't move any files — InitBranchAsync only copies from
+        // SeedRepositoryPath the moment branchId "main" is actually initialized, and it no-ops on
+        // every call after that (see its own comment). So trigger that initialization here, now
+        // that the option is set, rather than leaving "main" to be discovered empty later.
         if (!string.IsNullOrWhiteSpace(repositoryPath) &&
             string.IsNullOrWhiteSpace(_workspaceOptions.SeedRepositoryPath))
         {
             _workspaceOptions.SeedRepositoryPath = repositoryPath;
+            await _branchService.CreateBranchAsync("main", null, cancellationToken).ConfigureAwait(false);
         }
 
         var resolvedBranchId = await _branchService

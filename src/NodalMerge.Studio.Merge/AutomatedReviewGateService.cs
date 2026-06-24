@@ -91,6 +91,8 @@ public sealed class AutomatedReviewGateService(
             var reason = string.IsNullOrWhiteSpace(proposal.VerificationResults)
                 ? "Automated review rejected the reconciled proposal."
                 : $"Automated review rejected: {proposal.VerificationResults}";
+            var failedCreds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Review)
+                ?? agentControl.GetOrchestratorCredentials(parentWorkUnitId);
 
             await deadLetter.RecordFailureAsync(
                 parentWorkUnitId,
@@ -100,6 +102,10 @@ public sealed class AutomatedReviewGateService(
                 reason,
                 taskId: proposalId,
                 sessionId: sessionId,
+                model: failedCreds?.Model,
+                baseUrl: failedCreds?.BaseUrl,
+                apiKey: failedCreds?.ApiKey,
+                provider: failedCreds?.Provider,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
 
             return new AutomatedRejectionResult(AutomatedRejectionOutcome.EscalatedToDeadLetter);
@@ -124,7 +130,7 @@ public sealed class AutomatedReviewGateService(
                 continue;
             }
 
-            var childTasks = await tasks.ListAsync(child.WorkUnitId, cancellationToken).ConfigureAwait(false);
+            var childTasks = await ResetTasksForRetryAsync(child.WorkUnitId, cancellationToken).ConfigureAwait(false);
             var task = childTasks.FirstOrDefault();
             await scheduler.EnqueueAsync(
                 child.WorkUnitId,
@@ -174,6 +180,12 @@ public sealed class AutomatedReviewGateService(
         };
         await workUnits.CreateAsync(workUnit with { ExecutionInfo = executionInfo }, cancellationToken).ConfigureAwait(false);
 
+        var creds = agentControl.GetCredentialsForStage(workUnitId, PipelineStage.Execute)
+            ?? agentControl.GetOrchestratorCredentials(workUnitId)
+            ?? (workUnit.ParentWorkUnitId is { } executeParentId
+                ? agentControl.GetCredentialsForStage(executeParentId, PipelineStage.Execute) ?? agentControl.GetOrchestratorCredentials(executeParentId)
+                : null);
+
         if (rejectionCount >= InMemoryDeadLetterService.MaxFailureAttempts)
         {
             var reason = string.IsNullOrWhiteSpace(reviewNotes)
@@ -188,6 +200,10 @@ public sealed class AutomatedReviewGateService(
                 reason,
                 taskId: proposalId,
                 sessionId: sessionId,
+                model: creds?.Model,
+                baseUrl: creds?.BaseUrl,
+                apiKey: creds?.ApiKey,
+                provider: creds?.Provider,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
 
             return new AutomatedRejectionResult(AutomatedRejectionOutcome.EscalatedToDeadLetter);
@@ -212,11 +228,6 @@ public sealed class AutomatedReviewGateService(
             ? children.Where(c => c.Status is WorkUnitStatus.Proposed or WorkUnitStatus.Merged).ToList()
             : [workUnit];
 
-        var creds = agentControl.GetCredentialsForStage(workUnitId, PipelineStage.Execute)
-            ?? agentControl.GetOrchestratorCredentials(workUnitId)
-            ?? (workUnit.ParentWorkUnitId is { } parentId
-                ? agentControl.GetCredentialsForStage(parentId, PipelineStage.Execute) ?? agentControl.GetOrchestratorCredentials(parentId)
-                : null);
         foreach (var target in retryTargets)
         {
             try
@@ -230,7 +241,7 @@ public sealed class AutomatedReviewGateService(
                 continue;
             }
 
-            var targetTasks = await tasks.ListAsync(target.WorkUnitId, cancellationToken).ConfigureAwait(false);
+            var targetTasks = await ResetTasksForRetryAsync(target.WorkUnitId, cancellationToken).ConfigureAwait(false);
             var task = targetTasks.FirstOrDefault();
             await scheduler.EnqueueAsync(
                 target.WorkUnitId,
@@ -258,6 +269,25 @@ public sealed class AutomatedReviewGateService(
         }
 
         return new AutomatedRejectionResult(AutomatedRejectionOutcome.RetriedWorkers);
+    }
+
+    // A rejected proposal's underlying task(s) are usually already Completed (the worker that
+    // produced the rejected proposal finished its task before proposing). TaskTransitions has no
+    // legal exit from Completed, so without this the re-queued worker can't even mark itself
+    // InProgress — it just fights the task state machine for a few cycles and gives up. CreateAsync
+    // is an unconditional upsert (unlike UpdateAsync, which enforces the transition table), so it's
+    // the only way to legitimately reopen a Completed task here.
+    private async Task<IReadOnlyList<StudioTask>> ResetTasksForRetryAsync(
+        string workUnitId, CancellationToken cancellationToken)
+    {
+        var existingTasks = await tasks.ListAsync(workUnitId, cancellationToken).ConfigureAwait(false);
+        foreach (var t in existingTasks.Where(t => t.Status != NodalMerge.Studio.Contracts.Domain.TaskStatus.Open))
+        {
+            await tasks.CreateAsync(
+                t with { Status = NodalMerge.Studio.Contracts.Domain.TaskStatus.Open, Assignee = null },
+                cancellationToken).ConfigureAwait(false);
+        }
+        return existingTasks;
     }
 
     private async Task<MergeProposal?> FindReviewableProposalAsync(

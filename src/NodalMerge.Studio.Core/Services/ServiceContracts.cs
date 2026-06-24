@@ -230,6 +230,12 @@ public interface IDeadLetterService
         string? taskId = null,
         string? lastProjectionSnapshot = null,
         string? sessionId = null,
+        // Whatever credentials the failed run actually used — captured on the entry so retry can
+        // use them directly instead of depending on the live (and ephemeral) orchestrator registry.
+        string? model = null,
+        string? baseUrl = null,
+        string? apiKey = null,
+        string? provider = null,
         CancellationToken cancellationToken = default);
 
     Task<DeadLetterEntry?> GetAsync(string entryId, CancellationToken cancellationToken = default);
@@ -241,6 +247,16 @@ public interface IDeadLetterService
     Task<IReadOnlyList<DeadLetterEntry>> ListAsync(CancellationToken cancellationToken = default);
 
     Task<DeadLetterRetryResult> RetryAsync(string entryId, CancellationToken cancellationToken = default);
+
+    // Human-steered retry: appends corrective context to the work unit's Goal so the agent
+    // actually sees it (projections only ever surface Goal/SuccessCriteria, not Metadata), and
+    // resets FailureAttemptCount since the correction addresses a different root cause than the
+    // one that produced the prior failures. Bypasses the MaxFailureAttempts cap for the same
+    // reason — that cap exists to stop retrying the *same* mistake, not a corrected one.
+    Task<DeadLetterRetryResult> RetryWithContextAsync(
+        string entryId,
+        string steeringContext,
+        CancellationToken cancellationToken = default);
 }
 
 public enum DeadLetterRetryOutcome
@@ -592,7 +608,14 @@ public sealed record ScheduledItem(
     // worker was actively executing it, not just sitting queued). TryAcquireAsync skips these
     // until a human explicitly approves via ApproveResumeAsync/ApproveResumeAllAsync, mirroring
     // the orchestrator-level Interrupted+manual-Resume pattern instead of silently auto-resuming.
-    bool AwaitingResume = false);
+    bool AwaitingResume = false,
+    // Phase 12 — set when the agent loop exits with AgentLoopCompletion.AwaitingFileLease (a
+    // write hit a file another active sibling currently holds). Mirrors AwaitingResume's "park,
+    // don't remove or dead-letter" shape: TryAcquireAsync skips these until IFileLeaseService's
+    // release-and-advance hook (on the holder's actual merge) clears the flag, at which point the
+    // item — never removed from the queue — is simply eligible for re-acquisition again with
+    // AttemptCount > 0, so the resumed WorkerAgentLoop gets isResume: true automatically.
+    bool AwaitingFileLease = false);
 
 public interface IWorkScheduler
 {
@@ -610,6 +633,18 @@ public interface IWorkScheduler
     Task<ScheduledItem?> TryAcquireAsync(string agentId, CancellationToken ct = default);
 
     Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default);
+
+    // Phase 12 — called instead of ReleaseAsync when a worker's loop exits with
+    // AgentLoopCompletion.AwaitingFileLease: parks the item (kept in the queue, lease cleared so
+    // it's no longer "actively running") rather than removing or dead-lettering it. Mirrors the
+    // AwaitingResume flag's "skip until cleared" shape in TryAcquireAsync.
+    Task MarkAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default);
+
+    // Phase 12 — called by IFileLeaseService's release-and-advance hook (on the holder's actual
+    // merge) for the WorkUnitId it just promoted to holder. Clears the flag in place; the item was
+    // never removed from the queue, so it's immediately eligible for TryAcquireAsync again with
+    // AttemptCount > 0, which is what gives the resumed WorkerAgentLoop isResume: true.
+    Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default);
 
     Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default);
 
@@ -865,6 +900,42 @@ public interface IIntentGraphService
 
     Task RemoveIntentAsync(string intentId, CancellationToken ct = default);
 }
+
+// Phase 12 — replaces the old hard, static FileScope write-time block. A file's lease is held by
+// whichever active sibling WorkUnit first successfully writes it, and is held until that holder's
+// MergeProposal touching the file is actually merged. Anyone else who wants the same path while
+// it's held is queued (FIFO) instead of rejected outright — see FileLeaseService for the
+// merge-gated release/resume mechanics.
+public interface IFileLeaseService
+{
+    Task<(bool Granted, string? HolderWorkUnitId)> TryAcquireOrEnqueueAsync(
+        string workUnitId, string path, CancellationToken ct = default);
+
+    // Clears the current holder for path and promotes the next FIFO waiter (if any) to holder,
+    // returning its WorkUnitId so the caller can copy the merged file into its branch and resume it.
+    Task<string?> ReleaseAndAdvanceAsync(string path, CancellationToken ct = default);
+
+    // Failure/dead-letter/manual-stop path: a holder that will never merge must not strand its
+    // queue(s) forever. No content is forwarded here — nothing was ever merged. Returns every
+    // WorkUnitId promoted to holder as a result (one per path released with a non-empty queue) —
+    // the caller must clear each one's IWorkScheduler.AwaitingFileLease flag (this service can't
+    // do it itself: IWorkScheduler's own production implementation optionally depends on
+    // IMergeService, which optionally depends back on this interface — a direct dependency here
+    // would be circular), or a promoted waiter would sit parked forever despite already holding
+    // the lease it was waiting on.
+    Task<IReadOnlyList<string>> ForceReleaseAllForWorkUnitAsync(string workUnitId, CancellationToken ct = default);
+
+    // Admin/dashboard visibility — every path currently held or queued. Lets a human spot a
+    // stuck lease (no live agent to StopAsync, no pending proposal to reject) before reaching for
+    // the matching manual-release endpoint below.
+    Task<IReadOnlyList<FileLeaseInfo>> ListAsync(CancellationToken ct = default);
+}
+
+// Admin-facing read model for IFileLeaseService.ListAsync — deliberately separate from
+// FileLeaseService's own internal FileLeaseState record (that one's persisted/serialized
+// verbatim and includes the "removed" tombstone shape ReleaseAndAdvanceAsync writes; this one is
+// just the current, real state callers actually want to look at).
+public sealed record FileLeaseInfo(string Path, string? HolderWorkUnitId, IReadOnlyList<string> WaitQueue);
 
 public interface IStateReconstructionService
 {
