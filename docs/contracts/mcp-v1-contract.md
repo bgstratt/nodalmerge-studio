@@ -144,6 +144,7 @@ nm_v1_artifact_*
 |------|---------|
 | `nm_v1_scheduler_enqueue` | Enqueue work unit for agent execution (supports `model`/`baseUrl`/`apiKey`/`provider` overrides) |
 | `nm_v1_scheduler_pending` | List pending scheduled items |
+| `nm_v1_clarification_request` | Record a human clarification question; with `blocking=true`, pause scheduler execution until resume |
 
 ### Intents
 
@@ -170,6 +171,13 @@ nm_v1_artifact_*
 | `nm_v1_workspace_list` | List files in branch workspace |
 | `nm_v1_workspace_diff` | Diff between two branches |
 | `nm_v1_workspace_exists` | Check if file exists in branch workspace |
+| `nm_v1_workspace_symbol_definition` | Compiler-backed symbol definition lookup |
+| `nm_v1_workspace_symbol_references` | Compiler-backed symbol reference/call-site lookup |
+| `nm_v1_workspace_symbol_implementation` | Compiler-backed symbol implementation lookup |
+
+Routing guidance: when semantic tools are enabled in the active profile, they are authoritative for
+definition/reference/implementation questions. `nm_v1_workspace_search` remains for text/content
+search (comments, literals, config keys, docs).
 
 ### Workspace Execution (Phase 6.6)
 

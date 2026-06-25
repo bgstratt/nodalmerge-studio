@@ -13,9 +13,17 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
     // guessing file paths (see the Program.cs dead-letter this was added to fix). Enforced on
     // every load/save below so neither a persisted profile from before this list existed, nor a
     // future hand-edit via the profile editor, can silently drop them.
+    //
+    // WorkspaceSearch is required everywhere ListAsync/ProfileGet are: content search is now the
+    // primary discovery primitive (filename matching alone reproduces the same guessing problem).
+    // ArtifactQuery is required for Plan/Review because recorded Constraints/Decisions are a
+    // governance mechanism — a Planner or Reviewer profile that drops it can silently re-derive or
+    // ignore a constraint an earlier work unit already established.
     private static readonly IReadOnlyDictionary<PipelineStage, string[]> RequiredToolsByStage = new Dictionary<PipelineStage, string[]>
     {
-        [PipelineStage.Execute] = [McpToolNames.WorkspaceList, McpToolNames.WorkspaceProfileGet],
+        [PipelineStage.Execute] = [McpToolNames.WorkspaceList, McpToolNames.WorkspaceProfileGet, McpToolNames.WorkspaceSearch],
+        [PipelineStage.Plan]    = [McpToolNames.WorkspaceList, McpToolNames.WorkspaceProfileGet, McpToolNames.WorkspaceSearch, McpToolNames.ArtifactQuery],
+        [PipelineStage.Review]  = [McpToolNames.WorkspaceSearch, McpToolNames.ArtifactQuery],
     };
 
     private static AgentProfile EnsureRequiredTools(AgentProfile profile)
@@ -58,9 +66,18 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 [
                     McpToolNames.WorkUnitGet,
                     McpToolNames.WorkspaceSummary,
+                    McpToolNames.WorkspaceStatus,
+                    McpToolNames.WorkspaceProfileGet,
                     McpToolNames.WorkspaceRead,
+                    McpToolNames.WorkspaceReadMany,
                     McpToolNames.WorkspaceWrite,
                     McpToolNames.WorkspaceList,
+                    McpToolNames.WorkspaceSearch,
+                    McpToolNames.WorkspaceSymbolDefinition,
+                    McpToolNames.WorkspaceSymbolReferences,
+                    McpToolNames.WorkspaceSymbolImplementation,
+                    McpToolNames.ClarificationRequest,
+                    McpToolNames.ArtifactQuery,
                 ],
                 15,
                 []),
@@ -73,14 +90,23 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                     McpToolNames.WorkUnitGet,
                     McpToolNames.TaskUpdate,
                     McpToolNames.WorkspaceSummary,
+                    McpToolNames.WorkspaceStatus,
                     McpToolNames.WorkspaceRead,
+                    McpToolNames.WorkspaceReadMany,
                     McpToolNames.WorkspaceWrite,
+                    McpToolNames.WorkspaceReplace,
                     McpToolNames.WorkspaceDelete,
                     McpToolNames.WorkspaceExists,
                     McpToolNames.WorkspaceList,
+                    McpToolNames.WorkspaceSearch,
+                    McpToolNames.WorkspaceSymbolDefinition,
+                    McpToolNames.WorkspaceSymbolReferences,
+                    McpToolNames.WorkspaceSymbolImplementation,
+                    McpToolNames.ClarificationRequest,
                     McpToolNames.WorkspaceProfileGet,
                     McpToolNames.WorkspaceBuild,
                     McpToolNames.WorkspaceTest,
+                    McpToolNames.WorkspaceExec,
                     McpToolNames.WorkspaceDiff,
                     McpToolNames.MergePropose,
                     McpToolNames.MergeValidate,
@@ -116,8 +142,23 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                     McpToolNames.MergeReview,
                     McpToolNames.ProjectionGet,
                     McpToolNames.WorkspaceRead,
+                    McpToolNames.WorkspaceReadMany,
+                    McpToolNames.WorkspaceList,
+                    McpToolNames.WorkspaceSearch,
+                    McpToolNames.WorkspaceSymbolDefinition,
+                    McpToolNames.WorkspaceSymbolReferences,
+                    McpToolNames.WorkspaceSymbolImplementation,
+                    McpToolNames.ClarificationRequest,
+                    McpToolNames.WorkspaceDiff,
+                    McpToolNames.WorkspaceProfileGet,
+                    McpToolNames.WorkspaceBuild,
+                    McpToolNames.WorkspaceTest,
+                    McpToolNames.ArtifactQuery,
                 ],
-                10,
+                // 10 -> 14: the build/test verification step (workspace_profile_get + scoped build +
+                // scoped test) adds 2-3 tool calls on top of the original projection/artifact/diff/
+                // review sequence.
+                14,
                 []),
         };
 

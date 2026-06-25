@@ -32,6 +32,7 @@ public class InMemoryAgentRuntimeServiceTests
         public Task<ScheduledItem?> TryAcquireAsync(string agentId, CancellationToken ct = default) =>
             Task.FromResult<ScheduledItem?>(null);
         public Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default) => Task.CompletedTask;
+        public Task MarkAwaitingResumeAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
         public Task MarkAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
         public Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
         public Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default) =>
@@ -57,6 +58,10 @@ public class InMemoryAgentRuntimeServiceTests
 
         public Task<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default) =>
             Task.FromResult<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?>(null);
+
+        public Task<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>> GetEventsByKindAsync(
+            IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEventKind> kinds, DateTimeOffset? since = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>>([]);
     }
 
     private sealed class NoopServiceProvider : IServiceProvider

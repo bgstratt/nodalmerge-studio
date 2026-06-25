@@ -55,4 +55,14 @@ public enum ExecutionEventKind
     // Orchestration
     OrchestrationDecision,
     ConflictDetected,
+    ClarificationRequested,
+    ClarificationResponded,
+
+    // Phase 14 — workspace usage instrumentation
+    WorkspaceSearchExecuted,
+    WorkspaceReadExecuted,
+    FileLeaseContended,
+
+    // Slice 15g — constrained external documentation fetch audit trail
+    ExternalDocFetched,
 }

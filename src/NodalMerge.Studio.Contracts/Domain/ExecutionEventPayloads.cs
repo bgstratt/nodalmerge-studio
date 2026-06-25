@@ -137,3 +137,46 @@ public sealed record ConflictDetectedPayload(
     string WorkUnitId,
     IReadOnlyList<string> OverlappingFiles,
     IReadOnlyList<string> ConflictingWorkUnitIds);
+
+public sealed record ClarificationRequestedPayload(
+    string RequestId,
+    string WorkUnitId,
+    string Question,
+    string? Context,
+    bool Blocking,
+    IReadOnlyList<string> Options,
+    string? RequestedByAgentId,
+    DateTimeOffset RequestedAt);
+
+public sealed record ClarificationRespondedPayload(
+    string RequestId,
+    string WorkUnitId,
+    string Response,
+    string? Note,
+    string? RespondedBy,
+    DateTimeOffset RespondedAt,
+    bool Resumed);
+
+// Phase 14 — workspace usage instrumentation. These feed WorkspaceUsageMetricsService's
+// aggregation queries; see plans/phase-14-usage-instrumentation-and-read-many.md.
+public sealed record WorkspaceSearchExecutedPayload(
+    string Query,
+    IReadOnlyList<string> MatchedPaths,
+    int MatchCount,
+    bool Truncated);
+
+public sealed record WorkspaceReadExecutedPayload(IReadOnlyList<string> Paths);
+
+public sealed record FileLeaseContendedPayload(
+    string Path,
+    string RequestingWorkUnitId,
+    string HolderWorkUnitId);
+
+public sealed record ExternalDocFetchedPayload(
+    string ArtifactId,
+    string WorkUnitId,
+    string Url,
+    string ContentHash,
+    bool Truncated,
+    int SnapshotBytes,
+    DateTimeOffset FetchedAt);

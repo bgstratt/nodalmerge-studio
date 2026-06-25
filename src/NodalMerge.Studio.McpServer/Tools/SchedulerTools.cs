@@ -6,7 +6,7 @@ using NodalMerge.Studio.Core.Services;
 namespace NodalMerge.Studio.McpServer.Tools;
 
 [McpServerToolType]
-public sealed class SchedulerTools(ISchedulerCommandService scheduler)
+public sealed class SchedulerTools(ISchedulerCommandService scheduler, IClarificationCommandService clarifications)
 {
     [McpServerTool(Name = McpToolNames.SchedulerEnqueue)]
     [Description("Enqueue a work unit for a worker agent to pick up. Use this instead of nm_v1_agent_spawn when the orchestrator wants to delegate worker execution to the scheduler.")]
@@ -39,5 +39,42 @@ public sealed class SchedulerTools(ISchedulerCommandService scheduler)
     {
         var items = await scheduler.ListPendingAsync(cancellationToken).ConfigureAwait(false);
         return McpJson.Ok(new { items });
+    }
+
+    [McpServerTool(Name = McpToolNames.ClarificationRequest)]
+    [Description("Request a human clarification for a work unit. With blocking=true, the scheduler entry is paused awaiting resume.")]
+    public async Task<string> ClarificationRequestAsync(
+        string workUnitId,
+        string question,
+        string? context = null,
+        bool blocking = true,
+        string[]? options = null,
+        string? requestedByAgentId = null,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await clarifications.RequestAsync(
+                workUnitId,
+                question,
+                context,
+                blocking,
+                options,
+                requestedByAgentId,
+                sessionId,
+                cancellationToken).ConfigureAwait(false);
+            return McpJson.Ok(new
+            {
+                requestId = result.RequestId,
+                workUnitId = result.WorkUnitId,
+                status = result.Status,
+                awaitingClarification = result.ParkedAwaitingResponse,
+            });
+        }
+        catch (Exception ex)
+        {
+            return McpJson.Error(McpToolNames.ClarificationRequest, ex.Message);
+        }
     }
 }

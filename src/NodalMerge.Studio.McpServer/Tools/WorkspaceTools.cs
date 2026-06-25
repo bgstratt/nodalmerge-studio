@@ -12,7 +12,8 @@ public sealed class WorkspaceTools(
     IWorkspaceService workspace,
     IWorkspaceExecutionCommandService executionCommand,
     IFileWorkspaceService fileWorkspace,
-    IWorkspaceProfileService workspaceProfiles)
+    IWorkspaceProfileService workspaceProfiles,
+    IWorkspaceSemanticNavigationService semanticNavigation)
 {
     // ── Existing ──────────────────────────────────────────────────────────
 
@@ -21,6 +22,18 @@ public sealed class WorkspaceTools(
     {
         var summary = await workspace.GetSummaryAsync(branchId, cancellationToken).ConfigureAwait(false);
         return McpJson.Ok(summary);
+    }
+
+    [McpServerTool(Name = McpToolNames.WorkspaceStatus), Description("Get a concise workspace status view with changed files and proposal summaries.")]
+    public async Task<string> StatusAsync(
+        [Description("Optional branch ID filter.")] string? branchId = null,
+        [Description("Optional work unit ID to resolve the authoritative branch and current proposal chain.")] string? workUnitId = null,
+        [Description("Maximum changed-file entries to return.")] int limit = 50,
+        [Description("Changed-file page offset.")] int offset = 0,
+        CancellationToken cancellationToken = default)
+    {
+        var status = await workspace.GetStatusAsync(branchId, workUnitId, limit, offset, cancellationToken).ConfigureAwait(false);
+        return McpJson.Ok(status);
     }
 
     // ── Slice 16d — workspace execution tools ─────────────────────────────
@@ -132,5 +145,52 @@ public sealed class WorkspaceTools(
     {
         var profile = await workspaceProfiles.RescanAsync(branchId, cancellationToken).ConfigureAwait(false);
         return McpJson.Ok(profile);
+    }
+
+    // ── Phase 15b — semantic navigation tools ───────────────────────────
+
+    [McpServerTool(Name = McpToolNames.WorkspaceSymbolDefinition), Description("Find symbol definition locations in a branch using compiler-backed semantic navigation.")]
+    public async Task<string> SymbolDefinitionAsync(
+        [Description("The branch ID.")] string branchId,
+        [Description("Symbol name to resolve (optional when path+line are supplied). Example: IUserRepository")] string? symbol = null,
+        [Description("Relative file path to resolve a symbol at a location (optional).") ] string? path = null,
+        [Description("1-based line number for path-based lookup (optional).") ] int? line = null,
+        [Description("1-based column number for path-based lookup (optional).") ] int? column = null,
+        [Description("Maximum results to return.")] int maxResults = 200,
+        CancellationToken cancellationToken = default)
+    {
+        var query = new WorkspaceSymbolQuery(symbol, path, line, column, maxResults);
+        var (locations, truncated) = await semanticNavigation.FindDefinitionsAsync(branchId, query, cancellationToken).ConfigureAwait(false);
+        return McpJson.Ok(new { locations, truncated, branchId });
+    }
+
+    [McpServerTool(Name = McpToolNames.WorkspaceSymbolReferences), Description("Find symbol reference locations in a branch using compiler-backed semantic navigation.")]
+    public async Task<string> SymbolReferencesAsync(
+        [Description("The branch ID.")] string branchId,
+        [Description("Symbol name to resolve (optional when path+line are supplied). Example: IUserRepository")] string? symbol = null,
+        [Description("Relative file path to resolve a symbol at a location (optional).") ] string? path = null,
+        [Description("1-based line number for path-based lookup (optional).") ] int? line = null,
+        [Description("1-based column number for path-based lookup (optional).") ] int? column = null,
+        [Description("Maximum results to return.")] int maxResults = 200,
+        CancellationToken cancellationToken = default)
+    {
+        var query = new WorkspaceSymbolQuery(symbol, path, line, column, maxResults);
+        var (locations, truncated) = await semanticNavigation.FindReferencesAsync(branchId, query, cancellationToken).ConfigureAwait(false);
+        return McpJson.Ok(new { locations, truncated, branchId });
+    }
+
+    [McpServerTool(Name = McpToolNames.WorkspaceSymbolImplementation), Description("Find symbol implementation locations in a branch using compiler-backed semantic navigation.")]
+    public async Task<string> SymbolImplementationAsync(
+        [Description("The branch ID.")] string branchId,
+        [Description("Symbol name to resolve (optional when path+line are supplied). Example: IUserRepository")] string? symbol = null,
+        [Description("Relative file path to resolve a symbol at a location (optional).") ] string? path = null,
+        [Description("1-based line number for path-based lookup (optional).") ] int? line = null,
+        [Description("1-based column number for path-based lookup (optional).") ] int? column = null,
+        [Description("Maximum results to return.")] int maxResults = 200,
+        CancellationToken cancellationToken = default)
+    {
+        var query = new WorkspaceSymbolQuery(symbol, path, line, column, maxResults);
+        var (locations, truncated) = await semanticNavigation.FindImplementationsAsync(branchId, query, cancellationToken).ConfigureAwait(false);
+        return McpJson.Ok(new { locations, truncated, branchId });
     }
 }

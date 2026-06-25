@@ -11,7 +11,8 @@ public sealed record RuntimeSettingsSnapshot(
     int MaxConcurrentWorkers = 3,
     int SchedulerPollIntervalMs = 2_000,
     bool UsePromotionBranch = false,
-    string CandidateBranchId = "candidate");
+    string CandidateBranchId = "candidate",
+    bool DocFetchTools = false);
 
 // Persists WorkspaceOptions's runtime-mutable fields to the node store on every mutation and
 // reapplies them on startup, so toggling a setting via REST survives a host restart. A single
@@ -28,7 +29,8 @@ public sealed class RuntimeSettingsService(IStudioNodeStore nodeStore, Workspace
             options.MaxConcurrentWorkers,
             options.SchedulerPollIntervalMs,
             options.UsePromotionBranch,
-            options.CandidateBranchId);
+            options.CandidateBranchId,
+            options.DocFetchTools);
         await nodeStore.WriteNodeAsync(
             StudioNodeKind.RuntimeSettingsV1,
             EntityId,
@@ -52,5 +54,6 @@ public sealed class RuntimeSettingsService(IStudioNodeStore nodeStore, Workspace
         options.SchedulerPollIntervalMs = snapshot.SchedulerPollIntervalMs;
         options.UsePromotionBranch = snapshot.UsePromotionBranch;
         options.CandidateBranchId = snapshot.CandidateBranchId;
+        options.DocFetchTools = snapshot.DocFetchTools;
     }
 }

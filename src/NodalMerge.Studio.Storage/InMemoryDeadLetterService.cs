@@ -174,15 +174,82 @@ public sealed class InMemoryDeadLetterService(
         return new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried);
     }
 
+    public async Task<DeadLetterRetryResult> RetryWithCredentialOverrideAsync(
+        string entryId,
+        string? overrideModel,
+        string? overrideBaseUrl,
+        string? overrideApiKey,
+        string? overrideProvider,
+        string? overrideProfileId,
+        CancellationToken cancellationToken)
+    {
+        if (!_entries.TryGetValue(entryId, out var entry))
+            return new DeadLetterRetryResult(DeadLetterRetryOutcome.NotFound, "Dead-letter entry not found.");
+
+        if (entry.MaxAttemptsReached || entry.AttemptCount >= MaxFailureAttempts)
+        {
+            return new DeadLetterRetryResult(
+                DeadLetterRetryOutcome.MaxAttemptsReached,
+                "Max attempts reached.");
+        }
+
+        var unit = await workUnits.GetAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
+        if (unit is null)
+            return new DeadLetterRetryResult(DeadLetterRetryOutcome.InvalidState, "Work unit not found.");
+
+        if (unit.Status is not WorkUnitStatus.DeadLettered and not WorkUnitStatus.Retrying)
+        {
+            return new DeadLetterRetryResult(
+                DeadLetterRetryOutcome.InvalidState,
+                $"Work unit is in status {unit.Status}; expected DeadLettered.");
+        }
+
+        var profileId = overrideProfileId ?? entry.ProfileId;
+        var creds = ResolveRetryCredentials(entry, unit, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider);
+
+        try
+        {
+            await workUnits
+                .UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Retrying, null, cancellationToken)
+                .ConfigureAwait(false);
+            await workUnits.SetCurrentStageAsync(entry.WorkUnitId, entry.Stage, cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException) { }
+
+        await scheduler.EnqueueAsync(
+            entry.WorkUnitId,
+            profileId,
+            taskId: entry.TaskId,
+            model: creds.Model,
+            baseUrl: creds.BaseUrl,
+            apiKey: creds.ApiKey,
+            provider: creds.Provider,
+            sessionId: null,
+            ct: cancellationToken).ConfigureAwait(false);
+
+        return new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried);
+    }
+
     // Prefer whatever credentials were captured directly on the entry at failure time — those are
     // exactly what the failed run used, regardless of stage. Only entries recorded before this
     // capture existed (or a run that genuinely had no credentials) fall through to the live
     // in-memory orchestrator registry, which is best-effort: it doesn't survive a Host restart or
     // the orchestrator's own loop completing, so by retry time it may simply have nothing for this
     // work unit anymore.
+    // When credential overrides are supplied, they take top priority — this lets a human retry
+    // with a different model/profile (e.g. switching from vscode-lm to deepseek) without spawning
+    // a new work unit.
     private (string? Model, string? BaseUrl, string? ApiKey, string? Provider) ResolveRetryCredentials(
-        DeadLetterEntry entry, WorkUnit unit)
+        DeadLetterEntry entry, WorkUnit unit,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null)
     {
+        // Phase Y — human-chosen credential override takes absolute priority.
+        if (!string.IsNullOrWhiteSpace(overrideModel) || !string.IsNullOrWhiteSpace(overrideBaseUrl))
+            return (overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider);
+
         if (!string.IsNullOrWhiteSpace(entry.BaseUrl) || !string.IsNullOrWhiteSpace(entry.Model))
             return (entry.Model, entry.BaseUrl, entry.ApiKey, entry.Provider);
 
@@ -197,7 +264,12 @@ public sealed class InMemoryDeadLetterService(
     public async Task<DeadLetterRetryResult> RetryWithContextAsync(
         string entryId,
         string steeringContext,
-        CancellationToken cancellationToken = default)
+        string? overrideModel,
+        string? overrideBaseUrl,
+        string? overrideApiKey,
+        string? overrideProvider,
+        string? overrideProfileId,
+        CancellationToken cancellationToken)
     {
         if (!_entries.TryGetValue(entryId, out var entry))
             return new DeadLetterRetryResult(DeadLetterRetryOutcome.NotFound, "Dead-letter entry not found.");
@@ -229,7 +301,8 @@ public sealed class InMemoryDeadLetterService(
         };
         await workUnits.CreateAsync(amendedUnit, cancellationToken).ConfigureAwait(false);
 
-        var creds = ResolveRetryCredentials(entry, unit);
+        var profileId = overrideProfileId ?? entry.ProfileId;
+        var creds = ResolveRetryCredentials(entry, unit, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider);
 
         try
         {
@@ -242,7 +315,7 @@ public sealed class InMemoryDeadLetterService(
 
         await scheduler.EnqueueAsync(
             entry.WorkUnitId,
-            entry.ProfileId,
+            profileId,
             taskId: entry.TaskId,
             model: creds.Model,
             baseUrl: creds.BaseUrl,
@@ -264,6 +337,14 @@ public sealed class InMemoryDeadLetterService(
 
         return new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried);
     }
+
+    // Phase Y — obsolete overload kept for backward compat with existing callers that use the
+    // old 3-parameter signature; delegates to the full override-capable overload with null overrides.
+    public Task<DeadLetterRetryResult> RetryWithContextAsync(
+        string entryId,
+        string steeringContext,
+        CancellationToken cancellationToken = default)
+        => RetryWithContextAsync(entryId, steeringContext, null, null, null, null, null, cancellationToken);
 
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {

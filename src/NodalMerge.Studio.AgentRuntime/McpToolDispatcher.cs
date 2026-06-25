@@ -23,11 +23,14 @@ internal sealed class McpToolDispatcher(
     IArtifactCommandService artifactCommands,
     IProjectionManager projections,
     ISchedulerCommandService scheduler,
+    IClarificationCommandService clarifications,
     IExecutionEventStream events,
     IIntentGraphService intentGraph,
+    IDocFetchCommandService docFetch,
     IWorkspaceExecutionCommandService executionCommands,
     IWorkspaceProfileService workspaceProfiles,
-    IFileLeaseService fileLease)
+    IFileLeaseService fileLease,
+    IWorkspaceSemanticNavigationService semanticNavigation)
 {
     // Phase 9g — read-before-write enforcement. McpToolDispatcher is registered as a singleton
     // (InMemoryAgentRuntimeService.cs) shared across every agent/run, so this cache lives here
@@ -71,17 +74,26 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.MergeValidate    => await MergeValidateAsync(input, ct),
                 McpToolNames.MergeReview      => await MergeReviewAsync(input, ct),
                 McpToolNames.WorkspaceSummary => await WorkspaceSummaryAsync(input, ct),
+                McpToolNames.WorkspaceStatus  => await WorkspaceStatusAsync(input, ct),
+                McpToolNames.DocFetch         => await DocFetchAsync(input, ct, sessionId),
                 McpToolNames.SnapshotGet      => await SnapshotGetAsync(input, ct),
                 McpToolNames.ProjectionGet    => await ProjectionGetAsync(input, ct),
                 McpToolNames.MergeApply       => await MergeApplyAsync(input, ct, sessionId),
-                McpToolNames.WorkspaceRead    => await WorkspaceReadAsync(input, ct),
-                McpToolNames.WorkspaceWrite   => await WorkspaceWriteAsync(input, ct),
-                McpToolNames.WorkspaceDelete  => await WorkspaceDeleteAsync(input, ct),
+                McpToolNames.WorkspaceRead    => await WorkspaceReadAsync(input, ct, sessionId),
+                McpToolNames.WorkspaceReadMany => await WorkspaceReadManyAsync(input, ct, sessionId),
+                McpToolNames.WorkspaceWrite   => await WorkspaceWriteAsync(input, ct, sessionId),
+                McpToolNames.WorkspaceDelete  => await WorkspaceDeleteAsync(input, ct, sessionId),
                 McpToolNames.WorkspaceList    => await WorkspaceListAsync(input, ct),
+                McpToolNames.WorkspaceSearch  => await WorkspaceSearchAsync(input, ct, sessionId),
+                McpToolNames.WorkspaceSymbolDefinition => await WorkspaceSymbolDefinitionAsync(input, ct),
+                McpToolNames.WorkspaceSymbolReferences => await WorkspaceSymbolReferencesAsync(input, ct),
+                McpToolNames.WorkspaceSymbolImplementation => await WorkspaceSymbolImplementationAsync(input, ct),
+                McpToolNames.WorkspaceReplace => await WorkspaceReplaceAsync(input, ct, sessionId),
                 McpToolNames.WorkspaceDiff    => await WorkspaceDiffAsync(input, ct),
                 McpToolNames.WorkspaceExists  => await WorkspaceExistsAsync(input, ct),
                 McpToolNames.SchedulerEnqueue => await SchedulerEnqueueAsync(input, ct, sessionId),
                 McpToolNames.SchedulerPending => await SchedulerPendingAsync(ct),
+                McpToolNames.ClarificationRequest => await ClarificationRequestAsync(input, ct, sessionId),
                 McpToolNames.IntentRecord     => await IntentRecordAsync(input, ct),
                 McpToolNames.ArtifactRecord   => await ArtifactRecordAsync(input, ct),
                 McpToolNames.ArtifactQuery    => await ArtifactQueryAsync(input, ct),
@@ -316,6 +328,40 @@ internal sealed class McpToolDispatcher(
         return ToJson(summary);
     }
 
+    private async Task<string> WorkspaceStatusAsync(JsonElement input, CancellationToken ct)
+    {
+        var status = await workspace.GetStatusAsync(
+            Str(input, "branchId"),
+            Str(input, "workUnitId"),
+            Int(input, "limit") ?? 50,
+            Int(input, "offset") ?? 0,
+            ct).ConfigureAwait(false);
+        return ToJson(status);
+    }
+
+    private async Task<string> DocFetchAsync(JsonElement input, CancellationToken ct, string? sessionId)
+    {
+        var url = Str(input, "url");
+        var reason = Str(input, "reason");
+        var workUnitId = Str(input, "workUnitId");
+        if (url is null || reason is null || workUnitId is null)
+            return ToError("url, reason, and workUnitId are required.");
+
+        try
+        {
+            var fetched = await docFetch.FetchAsync(url, reason, workUnitId, sessionId, ct).ConfigureAwait(false);
+            return ToJson(fetched);
+        }
+        catch (ArgumentException ex)
+        {
+            return ToError(ex.Message);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return ToError(ex.Message);
+        }
+    }
+
     // Slice — workers/planners/reviewers sometimes pass workUnitId (or "work-" + workUnitId) as
     // branchId instead of the actual WorkUnit.BranchId, which silently writes/reads/diffs against
     // an orphan directory that's never attached to the real merge proposal. When the call also
@@ -334,7 +380,7 @@ internal sealed class McpToolDispatcher(
     private Task<string?> ResolveBranchIdAsync(JsonElement input, CancellationToken ct) =>
         ResolveBranchIdAsync(Str(input, "workUnitId"), Str(input, "branchId"), ct);
 
-    private async Task<string> WorkspaceReadAsync(JsonElement input, CancellationToken ct)
+    private async Task<string> WorkspaceReadAsync(JsonElement input, CancellationToken ct, string? sessionId)
     {
         var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
         var path     = Str(input, "path");
@@ -345,19 +391,48 @@ internal sealed class McpToolDispatcher(
             if (content is null)
                 return ToError($"File '{path}' not found in branch '{branchId}'.");
             _readPaths[ReadCacheKey(branchId, path)] = 0;
+            await RecordWorkspaceReadAsync(sessionId, Str(input, "workUnitId"), [path], ct).ConfigureAwait(false);
             return ToJson(new { content });
         }
         catch (Exception ex) { return ToError(ex.Message); }
     }
 
-    private async Task<string> WorkspaceWriteAsync(JsonElement input, CancellationToken ct)
+    private async Task<string> WorkspaceReadManyAsync(JsonElement input, CancellationToken ct, string? sessionId)
+    {
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
+        var paths    = StrArray(input, "paths");
+        if (branchId is null) return ToError("branchId (or workUnitId) is required.");
+        if (paths is null or { Count: 0 } or { Count: > 50 })
+            return ToError("paths must be a non-empty array of at most 50 entries.");
+
+        try
+        {
+            var files = await fileWorkspace.ReadManyAsync(branchId, paths, ct).ConfigureAwait(false);
+            foreach (var file in files.Where(f => f.Found))
+                _readPaths[ReadCacheKey(branchId, file.Path)] = 0;
+            await RecordWorkspaceReadAsync(sessionId, Str(input, "workUnitId"), paths, ct).ConfigureAwait(false);
+            return ToJson(new { files, branchId });
+        }
+        catch (Exception ex) { return ToError(ex.Message); }
+    }
+
+    private async Task RecordWorkspaceReadAsync(
+        string? sessionId, string? workUnitId, IReadOnlyList<string> paths, CancellationToken ct)
+    {
+        if (sessionId is null) return;
+        await events.AppendAsync(
+            sessionId, workUnitId, ExecutionEventKind.WorkspaceReadExecuted,
+            new WorkspaceReadExecutedPayload(paths), ct: ct).ConfigureAwait(false);
+    }
+
+    private async Task<string> WorkspaceWriteAsync(JsonElement input, CancellationToken ct, string? sessionId)
     {
         var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
         var path     = Str(input, "path");
         var content  = Str(input, "content");
         if (branchId is null || path is null || content is null) return ToError("branchId (or workUnitId), path, and content are required.");
 
-        var leaseConflict = await CheckFileLeaseAsync(branchId, path, ct).ConfigureAwait(false);
+        var leaseConflict = await CheckFileLeaseAsync(branchId, path, sessionId, ct).ConfigureAwait(false);
         if (leaseConflict is not null) return leaseConflict;
 
         try
@@ -380,13 +455,46 @@ internal sealed class McpToolDispatcher(
         catch (Exception ex) { return ToError(ex.Message); }
     }
 
-    private async Task<string> WorkspaceDeleteAsync(JsonElement input, CancellationToken ct)
+    private async Task<string> WorkspaceReplaceAsync(JsonElement input, CancellationToken ct, string? sessionId)
+    {
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
+        var path     = Str(input, "path");
+        var oldText  = Str(input, "oldText");
+        var newText  = Str(input, "newText");
+        if (branchId is null || path is null || oldText is null || newText is null)
+            return ToError("branchId (or workUnitId), path, oldText, and newText are required.");
+
+        var leaseConflict = await CheckFileLeaseAsync(branchId, path, sessionId, ct).ConfigureAwait(false);
+        if (leaseConflict is not null) return leaseConflict;
+
+        var expectedMatches = Int(input, "expectedMatches") ?? 1;
+        try
+        {
+            var result = await fileWorkspace
+                .ReplaceAsync(branchId, path, oldText, newText, expectedMatches, ct)
+                .ConfigureAwait(false);
+            _readPaths[ReadCacheKey(branchId, path)] = 0;
+            return ToJson(new
+            {
+                replaced = true,
+                path,
+                branchId,
+                matches = result.Matches,
+                oldLength = result.OldLength,
+                newLength = result.NewLength,
+                diff = result.Diff,
+            });
+        }
+        catch (Exception ex) { return ToError(ex.Message); }
+    }
+
+    private async Task<string> WorkspaceDeleteAsync(JsonElement input, CancellationToken ct, string? sessionId)
     {
         var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
         var path     = Str(input, "path");
         if (branchId is null || path is null) return ToError("branchId (or workUnitId) and path are required.");
 
-        var leaseConflict = await CheckFileLeaseAsync(branchId, path, ct).ConfigureAwait(false);
+        var leaseConflict = await CheckFileLeaseAsync(branchId, path, sessionId, ct).ConfigureAwait(false);
         if (leaseConflict is not null) return leaseConflict;
 
         try
@@ -403,7 +511,7 @@ internal sealed class McpToolDispatcher(
     // The branch's owning WorkUnitId (not necessarily the caller's own workUnitId — same
     // resolution CheckFileScopeAsync used) is the identity attributed to the lease, since a
     // branch is 1:1 with the WorkUnit that owns it.
-    private async Task<string?> CheckFileLeaseAsync(string branchId, string path, CancellationToken ct)
+    private async Task<string?> CheckFileLeaseAsync(string branchId, string path, string? sessionId, CancellationToken ct)
     {
         var owners = await workUnits.ListAsync(branchId, ct).ConfigureAwait(false);
         var owner = owners.FirstOrDefault();
@@ -416,6 +524,16 @@ internal sealed class McpToolDispatcher(
 
         if (granted)
             return null;
+
+        // Phase 14 — records contention for WorkspaceUsageMetricsService's hot-spot query, the
+        // evidence future Phase-12 leasing decisions (timeout, region-locking, etc.) hinge on.
+        if (sessionId is not null && holderWorkUnitId is not null)
+        {
+            await events.AppendAsync(
+                sessionId, owner.WorkUnitId, ExecutionEventKind.FileLeaseContended,
+                new FileLeaseContendedPayload(path, owner.WorkUnitId, holderWorkUnitId),
+                ct: ct).ConfigureAwait(false);
+        }
 
         // Distinguishable from a plain ToError(...) string by the "awaitingFileLease" key —
         // WorkerAgentLoop checks for this exact shape to exit its loop on the same turn, without
@@ -442,6 +560,38 @@ internal sealed class McpToolDispatcher(
         catch (Exception ex) { return ToError(ex.Message); }
     }
 
+    private async Task<string> WorkspaceSearchAsync(JsonElement input, CancellationToken ct, string? sessionId)
+    {
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
+        var query    = Str(input, "query");
+        if (branchId is null || query is null) return ToError("branchId (or workUnitId) and query are required.");
+        try
+        {
+            var (matches, truncated) = await fileWorkspace.SearchAsync(
+                branchId,
+                query,
+                subPath: Str(input, "path"),
+                filePattern: Str(input, "filePattern"),
+                regex: Bool(input, "regex") ?? false,
+                caseSensitive: Bool(input, "caseSensitive") ?? false,
+                contextLines: Int(input, "contextLines") ?? 3,
+                maxResults: Int(input, "maxResults") ?? 200,
+                ct: ct).ConfigureAwait(false);
+
+            if (sessionId is not null)
+            {
+                await events.AppendAsync(
+                    sessionId, Str(input, "workUnitId"), ExecutionEventKind.WorkspaceSearchExecuted,
+                    new WorkspaceSearchExecutedPayload(
+                        query, matches.Select(m => m.Path).Distinct().ToList(), matches.Count, truncated),
+                    ct: ct).ConfigureAwait(false);
+            }
+
+            return ToJson(new { matches, truncated, branchId });
+        }
+        catch (Exception ex) { return ToError(ex.Message); }
+    }
+
     private async Task<string> WorkspaceDiffAsync(JsonElement input, CancellationToken ct)
     {
         var sourceBranchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false) ?? Str(input, "sourceBranchId");
@@ -453,6 +603,46 @@ internal sealed class McpToolDispatcher(
             return ToJson(new { diff, sourceBranchId });
         }
         catch (Exception ex) { return ToError(ex.Message); }
+    }
+
+    private WorkspaceSymbolQuery BuildSymbolQuery(JsonElement input) => new(
+        Symbol: Str(input, "symbol"),
+        Path: Str(input, "path"),
+        Line: Int(input, "line"),
+        Column: Int(input, "column"),
+        MaxResults: Int(input, "maxResults") ?? 200);
+
+    private async Task<string> WorkspaceSymbolDefinitionAsync(JsonElement input, CancellationToken ct)
+    {
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
+        if (branchId is null) return ToError("branchId (or workUnitId) is required.");
+
+        var (locations, truncated) = await semanticNavigation
+            .FindDefinitionsAsync(branchId, BuildSymbolQuery(input), ct)
+            .ConfigureAwait(false);
+        return ToJson(new { locations, truncated, branchId });
+    }
+
+    private async Task<string> WorkspaceSymbolReferencesAsync(JsonElement input, CancellationToken ct)
+    {
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
+        if (branchId is null) return ToError("branchId (or workUnitId) is required.");
+
+        var (locations, truncated) = await semanticNavigation
+            .FindReferencesAsync(branchId, BuildSymbolQuery(input), ct)
+            .ConfigureAwait(false);
+        return ToJson(new { locations, truncated, branchId });
+    }
+
+    private async Task<string> WorkspaceSymbolImplementationAsync(JsonElement input, CancellationToken ct)
+    {
+        var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
+        if (branchId is null) return ToError("branchId (or workUnitId) is required.");
+
+        var (locations, truncated) = await semanticNavigation
+            .FindImplementationsAsync(branchId, BuildSymbolQuery(input), ct)
+            .ConfigureAwait(false);
+        return ToJson(new { locations, truncated, branchId });
     }
 
     private async Task<string> WorkspaceExistsAsync(JsonElement input, CancellationToken ct)
@@ -525,6 +715,34 @@ internal sealed class McpToolDispatcher(
     {
         var items = await scheduler.ListPendingAsync(ct).ConfigureAwait(false);
         return ToJson(items);
+    }
+
+    private async Task<string> ClarificationRequestAsync(JsonElement input, CancellationToken ct, string? sessionId)
+    {
+        var workUnitId = Str(input, "workUnitId");
+        var question = Str(input, "question");
+        if (workUnitId is null || question is null)
+            return ToError("workUnitId and question are required.");
+
+        var options = StrArray(input, "options");
+        var result = await clarifications.RequestAsync(
+            workUnitId,
+            question,
+            context: Str(input, "context"),
+            blocking: Bool(input, "blocking") ?? true,
+            options: options,
+            requestedByAgentId: Str(input, "requestedByAgentId"),
+            sessionId: sessionId,
+            ct: ct).ConfigureAwait(false);
+
+        return ToJson(new
+        {
+            requestId = result.RequestId,
+            workUnitId = result.WorkUnitId,
+            status = result.Status,
+            awaitingClarification = result.ParkedAwaitingResponse,
+            message = "Clarification requested and execution paused. Stop now and wait for human response."
+        });
     }
 
     private async Task<string> IntentRecordAsync(JsonElement input, CancellationToken ct)

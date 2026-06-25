@@ -64,6 +64,36 @@ interface FileLeaseInfo {
   waitQueue: string[];
 }
 
+interface ClarificationInboxItem {
+  requestId: string;
+  sessionId?: string | null;
+  workUnitId: string;
+  goal: string;
+  question: string;
+  context?: string | null;
+  blocking: boolean;
+  options: string[];
+  requestedByAgentId?: string | null;
+  requestedAt: string;
+  status: string;
+  awaitingResume: boolean;
+}
+
+interface ClarificationGoalMetric {
+  workUnitId: string;
+  goal: string;
+  requests: number;
+  answered: number;
+  abandoned: number;
+}
+
+interface ClarificationMetrics {
+  requests: number;
+  answered: number;
+  abandoned: number;
+  perGoal: ClarificationGoalMetric[];
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 export class ExecutionTimelinePanel implements vscode.Disposable {
@@ -157,11 +187,13 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
     try {
       const sessionId = this.getEffectiveSessionId();
       const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
-      const [summary, workUnits, agents, awaitingResume, merges, deadLetters, fileLeases, opts, findings] = await Promise.all([
+      const [summary, workUnits, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases, opts, findings] = await Promise.all([
         this.get<WorkspaceSummary>('/studio/workspace-summary' + params),
         this.get<WorkUnit[]>('/studio/workunits' + params),
         this.get<AgentInfo[]>('/studio/agents?all=true' + (sessionId ? '&sessionId=' + encodeURIComponent(sessionId) : '')),
         this.get<ScheduledItem[]>('/studio/scheduler/awaiting-resume'),
+        this.get<ClarificationInboxItem[]>('/studio/clarifications'),
+        this.get<ClarificationMetrics>('/studio/clarifications/metrics'),
         this.get<MergeProposal[]>('/studio/merges' + params),
         this.get<DeadLetterEntry[]>('/studio/dead-letter' + params),
         this.get<FileLeaseInfo[]>('/studio/file-leases'),
@@ -170,7 +202,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
       ]);
       this.usePromotionBranch = opts.usePromotionBranch ?? false;
       void this.panel.webview.postMessage({
-        type: 'data', summary, workUnits, agents, awaitingResume, merges, deadLetters, fileLeases,
+        type: 'data', summary, workUnits, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases,
         usePromotionBranch: this.usePromotionBranch,
         candidateBranchId: opts.candidateBranchId ?? 'candidate',
       });
@@ -306,6 +338,44 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           await this.post('/studio/scheduler/resume-all', {});
           void this.poll();
           break;
+        case 'respondClarification': {
+          const workUnitId = String(msg.workUnitId ?? '');
+          const requestId = String(msg.requestId ?? '');
+          const options = Array.isArray(msg.options) ? msg.options.map(v => String(v)) : [];
+          if (!workUnitId || !requestId) { return; }
+
+          let response: string | undefined;
+          if (options.length > 0) {
+            const picked = await vscode.window.showQuickPick(
+              options.map(o => ({ label: o, value: o })),
+              { placeHolder: 'Select clarification response', ignoreFocusOut: true },
+            );
+            response = picked?.value;
+          } else {
+            response = await vscode.window.showInputBox({
+              prompt: 'Clarification response',
+              placeHolder: 'Enter response for the agent',
+              ignoreFocusOut: true,
+            });
+          }
+          if (!response) { return; }
+
+          const note = await vscode.window.showInputBox({
+            prompt: 'Optional note',
+            placeHolder: 'Additional context for the response (optional)',
+            ignoreFocusOut: true,
+          });
+
+          await this.post('/studio/clarifications/' + encodeURIComponent(workUnitId) + '/respond', {
+            requestId,
+            response,
+            note: note || null,
+            resume: true,
+            respondedBy: 'vscode-user',
+          });
+          void this.poll();
+          break;
+        }
         case 'openMergeReview':
           void vscode.commands.executeCommand('nodalmerge.openMergeReview', msg.proposalId as string);
           break;
@@ -513,6 +583,10 @@ const ET_HTML = `
   <div id="awaiting-resume"><p class="empty">Nothing awaiting resume.</p></div>
   <button class="add-btn" id="btn-resume-all" style="display:none">↺ Resume All</button>
 
+  <h2>Clarification Inbox</h2>
+  <div id="clarifications"><p class="empty">No active clarification requests.</p></div>
+  <div id="clarification-metrics" class="empty">No clarification metrics yet.</div>
+
   <h2>Pending Decisions</h2>
   <div id="decisions"><p class="empty">No pending decisions.</p></div>
 
@@ -713,6 +787,81 @@ const ET_JS = `
     });
   }
 
+  function relTime(iso) {
+    var ms = Date.now() - Date.parse(iso);
+    if (!isFinite(ms)) { return 'unknown age'; }
+    var mins = Math.floor(ms / 60000);
+    if (mins < 1) { return 'just now'; }
+    if (mins < 60) { return mins + 'm ago'; }
+    var hrs = Math.floor(mins / 60);
+    if (hrs < 24) { return hrs + 'h ago'; }
+    var days = Math.floor(hrs / 24);
+    return days + 'd ago';
+  }
+
+  function renderClarifications(items, metrics) {
+    var el = document.getElementById('clarifications');
+    if (!items || !items.length) {
+      el.innerHTML = '<p class="empty">No active clarification requests.</p>';
+    } else {
+      var html = '';
+      for (var i = 0; i < items.length; i++) {
+        var c = items[i];
+        var statusBadge = c.awaitingResume ? 'awaiting' : c.status;
+        html += '<div class="card">';
+        html += '<div class="row">';
+        html += '<span class="title" title="' + esc(c.goal) + '">' + esc(c.goal) + '</span>';
+        html += '<span class="badge ' + (c.awaitingResume ? 'paused' : '') + '">' + esc(statusBadge) + '</span>';
+        html += '<div class="actions">';
+        html += '<button class="ghost" data-action="respondClarification" data-rid="' + esc(c.requestId) + '" data-wu="' + esc(c.workUnitId) + '">Respond</button>';
+        html += '</div>';
+        html += '</div>';
+        html += '<div class="row"><span class="mono">' + esc(c.question) + '</span></div>';
+        if (c.context) {
+          html += '<div class="row"><span class="mono">context: ' + esc(c.context) + '</span></div>';
+        }
+        if (c.options && c.options.length) {
+          html += '<div class="row"><span class="mono">options: ' + esc(c.options.join(' | ')) + '</span></div>';
+        }
+        html += '<div class="row">';
+        html += '<span class="mono">workUnit: ' + esc(c.workUnitId) + '</span>';
+        html += '<span class="mono">session: ' + esc(c.sessionId || 'n/a') + '</span>';
+        html += '<span class="mono">age: ' + esc(relTime(c.requestedAt)) + '</span>';
+        html += '<span class="mono">blocking: ' + esc(String(!!c.blocking)) + '</span>';
+        html += '</div>';
+        html += '</div>';
+      }
+      el.innerHTML = html;
+      el.querySelectorAll('[data-action="respondClarification"]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var rid = btn.getAttribute('data-rid');
+          var wu = btn.getAttribute('data-wu');
+          var found = null;
+          for (var j = 0; j < items.length; j++) {
+            if (String(items[j].requestId) === String(rid)) { found = items[j]; break; }
+          }
+          vscode.postMessage({ type: 'respondClarification', requestId: rid, workUnitId: wu, options: found ? found.options : [] });
+        });
+      });
+    }
+
+    var met = document.getElementById('clarification-metrics');
+    if (!metrics) {
+      met.innerHTML = '<p class="empty">No clarification metrics yet.</p>';
+      return;
+    }
+    var top = (metrics.perGoal || []).slice(0, 5).map(function(g) {
+      return '<span class="mono">' + esc(g.goal) + ': ' + esc(String(g.requests)) + ' req / ' + esc(String(g.answered)) + ' answered / ' + esc(String(g.abandoned)) + ' abandoned</span>';
+    }).join('<br/>');
+    met.innerHTML =
+      '<div class="card">' +
+      '<div class="row"><span class="mono">requests: ' + esc(String(metrics.requests || 0)) + '</span>' +
+      '<span class="mono">answered: ' + esc(String(metrics.answered || 0)) + '</span>' +
+      '<span class="mono">abandoned: ' + esc(String(metrics.abandoned || 0)) + '</span></div>' +
+      (top ? '<div class="row">' + top + '</div>' : '<div class="row"><span class="empty">No per-goal data.</span></div>') +
+      '</div>';
+  }
+
   var DECISION_STATUS_COLOR = {
     draft:          '',
     readyforreview: 'active',
@@ -862,6 +1011,7 @@ const ET_JS = `
     renderActiveGoals(msg.workUnits);
     renderAgents(msg.agents, msg.workUnits);
     renderAwaitingResume(msg.awaitingResume || []);
+    renderClarifications(msg.clarifications || [], msg.clarificationMetrics || null);
     renderPendingDecisions(msg.merges);
     renderBlockedExplorations(msg.deadLetters || [], msg.workUnits);
     renderFileLeases(msg.fileLeases || [], msg.workUnits);

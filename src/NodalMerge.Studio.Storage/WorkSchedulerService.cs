@@ -355,6 +355,20 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
         }
     }
 
+    public async Task MarkAwaitingResumeAsync(string workUnitId, CancellationToken ct = default)
+    {
+        if (!_queue.TryGetValue(workUnitId, out var item))
+            return;
+
+        var parked = item with { LeasedBy = null, LeasedAt = null, AwaitingResume = true };
+        if (!_queue.TryUpdate(workUnitId, parked, item))
+            return;
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.SchedulerV1, workUnitId,
+            JsonSerializer.Serialize(parked), ct).ConfigureAwait(false);
+    }
+
     // Phase 12 — called instead of ReleaseAsync when a worker's loop exits with
     // AgentLoopCompletion.AwaitingFileLease. The item stays in _queue (unlike ReleaseAsync's
     // TryRemove) so it's still visible/listed, but TryAcquireAsync's AwaitingFileLease skip keeps
@@ -473,17 +487,21 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
             if (item is null || item.WorkUnitId is null)
                 continue;
 
-            // The agent process that held this lease is gone now that the host restarted — clear
-            // the lease so the item is no longer seen as actively running. AttemptCount is real
-            // retry history, not lease state, so it's preserved as-is. Phase 8c — a held lease
-            // means a worker was actively executing this when the Host died, so instead of
-            // silently letting the poll loop re-acquire it immediately, flag it AwaitingResume
-            // and require an explicit ApproveResumeAsync/ApproveResumeAllAsync — the same
-            // no-auto-resume-on-restart guarantee InMemoryAgentRuntimeService already gives
-            // orchestrator-level work (Slice 19d). Items that were never leased (still queued,
-            // not yet started) are untouched — nothing was interrupted for those.
-            if (item.LeasedBy is not null || item.LeasedAt is not null)
-                item = item with { LeasedBy = null, LeasedAt = null, AwaitingResume = true };
+            // The agent process (if any) that held this lease is gone now that the host
+            // restarted — clear the lease either way. AttemptCount is real retry history, not
+            // lease state, so it's preserved as-is. Phase 8c originally only flagged items that
+            // held a lease at the moment the Host died, on the theory that a never-leased item
+            // was undisturbed backlog. But the scheduler's queue spans every session in the
+            // workspace, not just the one a human is currently looking at — so "undisturbed
+            // backlog" from a session nobody asked to resume would silently start competing with
+            // a fresh goal the moment any agent polls. Every item that survives a restart, leased
+            // or not, is therefore parked behind AwaitingResume and needs an explicit
+            // ApproveResumeAsync/ApproveResumeAllAsync — the same no-auto-resume-on-restart
+            // guarantee InMemoryAgentRuntimeService already gives orchestrator-level work (Slice
+            // 19d). Goals enqueued fresh in the current run go through EnqueueAsync, never this
+            // method, so they stay immediately eligible and can run in parallel with whatever
+            // older sessions are still sitting here awaiting approval.
+            item = item with { LeasedBy = null, LeasedAt = null, AwaitingResume = true };
 
             _queue.TryAdd(entityId, item);
         }

@@ -47,9 +47,12 @@ public static class McpToolNames
     public const string AgentStop = "nm_v1_agent_stop";
 
     public const string WorkspaceSummary = "nm_v1_workspace_summary";
+    public const string WorkspaceStatus = "nm_v1_workspace_status";
+    public const string DocFetch = "nm_v1_doc_fetch";
 
     public const string SchedulerEnqueue = "nm_v1_scheduler_enqueue";
     public const string SchedulerPending = "nm_v1_scheduler_pending";
+    public const string ClarificationRequest = "nm_v1_clarification_request";
 
     public const string IntentRecord = "nm_v1_intent_record";
 
@@ -57,12 +60,18 @@ public static class McpToolNames
     public const string ArtifactQuery  = "nm_v1_artifact_query";
     public const string ArtifactList   = "nm_v1_artifact_list";
 
-    public const string WorkspaceRead   = "nm_v1_workspace_read";
-    public const string WorkspaceWrite  = "nm_v1_workspace_write";
-    public const string WorkspaceDelete = "nm_v1_workspace_delete";
-    public const string WorkspaceList   = "nm_v1_workspace_list";
-    public const string WorkspaceDiff   = "nm_v1_workspace_diff";
-    public const string WorkspaceExists = "nm_v1_workspace_exists";
+    public const string WorkspaceRead    = "nm_v1_workspace_read";
+    public const string WorkspaceReadMany = "nm_v1_workspace_read_many";
+    public const string WorkspaceWrite   = "nm_v1_workspace_write";
+    public const string WorkspaceDelete  = "nm_v1_workspace_delete";
+    public const string WorkspaceList    = "nm_v1_workspace_list";
+    public const string WorkspaceSearch  = "nm_v1_workspace_search";
+    public const string WorkspaceSymbolDefinition = "nm_v1_workspace_symbol_definition";
+    public const string WorkspaceSymbolReferences = "nm_v1_workspace_symbol_references";
+    public const string WorkspaceSymbolImplementation = "nm_v1_workspace_symbol_implementation";
+    public const string WorkspaceReplace = "nm_v1_workspace_replace";
+    public const string WorkspaceDiff    = "nm_v1_workspace_diff";
+    public const string WorkspaceExists  = "nm_v1_workspace_exists";
 
     public const string WorkspaceBuild  = "nm_v1_workspace_build";
     public const string WorkspaceTest   = "nm_v1_workspace_test";
@@ -128,16 +137,25 @@ public static class McpToolNames
         AgentStatus,
         AgentStop,
         WorkspaceSummary,
+        WorkspaceStatus,
+        DocFetch,
         SchedulerEnqueue,
         SchedulerPending,
+        ClarificationRequest,
         IntentRecord,
         ArtifactRecord,
         ArtifactQuery,
         ArtifactList,
         WorkspaceRead,
+        WorkspaceReadMany,
         WorkspaceWrite,
         WorkspaceDelete,
         WorkspaceList,
+        WorkspaceSearch,
+        WorkspaceSymbolDefinition,
+        WorkspaceSymbolReferences,
+        WorkspaceSymbolImplementation,
+        WorkspaceReplace,
         WorkspaceDiff,
         WorkspaceExists,
         WorkspaceBuild,

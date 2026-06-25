@@ -28,16 +28,25 @@ public class InMemoryMergeServiceTests
 
         public Task<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default) =>
             Task.FromResult<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?>(null);
+
+        public Task<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>> GetEventsByKindAsync(
+            IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEventKind> kinds, DateTimeOffset? since = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>>([]);
     }
 
     private sealed class NoopFileWorkspaceService : NodalMerge.Studio.Core.Services.IFileWorkspaceService
     {
         public Task InitBranchAsync(string b, string? s = null, CancellationToken ct = default) => Task.CompletedTask;
         public Task<string?> ReadAsync(string b, string p, CancellationToken ct = default) => Task.FromResult<string?>(null);
+        public Task<IReadOnlyList<NodalMerge.Studio.Core.Services.WorkspaceFileRead>> ReadManyAsync(string b, IReadOnlyList<string> paths, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<NodalMerge.Studio.Core.Services.WorkspaceFileRead>>(
+                paths.Select(p => new NodalMerge.Studio.Core.Services.WorkspaceFileRead(p, null, false)).ToList());
         public Task WriteAsync(string b, string p, string c, CancellationToken ct = default) => Task.CompletedTask;
         public Task DeleteAsync(string b, string p, CancellationToken ct = default) => Task.CompletedTask;
         public Task<bool> ExistsAsync(string b, string p, CancellationToken ct = default) => Task.FromResult(false);
         public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, string? p2 = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<(IReadOnlyList<NodalMerge.Studio.Core.Services.WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(string b, string query, string? s = null, string? fp = null, bool regex = false, bool cs = false, int cl = 3, int mr = 200, CancellationToken ct = default) => Task.FromResult<(IReadOnlyList<NodalMerge.Studio.Core.Services.WorkspaceSearchMatch>, bool)>(([], false));
+        public Task<NodalMerge.Studio.Core.Services.WorkspaceReplaceResult> ReplaceAsync(string b, string p, string oldText, string newText, int expectedMatches = 1, CancellationToken ct = default) => Task.FromResult(new NodalMerge.Studio.Core.Services.WorkspaceReplaceResult(0, 0, 0, string.Empty));
         public Task<string> DiffAsync(string s, string t, CancellationToken ct = default) => Task.FromResult(string.Empty);
         public Task ApplyBranchAsync(string s, string t, CancellationToken ct = default) => Task.CompletedTask;
         public Task CopyFilesAsync(string s, string t, IReadOnlyList<string> paths, CancellationToken ct = default) => Task.CompletedTask;
@@ -75,6 +84,11 @@ public class InMemoryMergeServiceTests
 
         public Task<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default) =>
             Task.FromResult(Events.FirstOrDefault(e => e.EventId == eventId));
+
+        public Task<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>> GetEventsByKindAsync(
+            IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEventKind> kinds, DateTimeOffset? since = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>>(
+                [.. Events.Where(e => kinds.Contains(e.Kind) && (since is null || e.OccurredAt > since.Value))]);
     }
 
     private sealed class RecordingWorkUnitService : NodalMerge.Studio.Core.Services.IWorkUnitService

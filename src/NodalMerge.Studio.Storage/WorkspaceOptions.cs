@@ -46,4 +46,19 @@ public sealed class WorkspaceOptions
     // MergeCommandService.ProposeAsync rejects a proposal whose work unit expects FileChange
     // output but whose diff touched zero files and carried no NoFileChangesJustification.
     public bool EnforceExpectedOutputKind { get; set; } = false;
+
+    // ── Slice 15g — constrained external documentation fetch ─────────────────
+
+    // Runtime gate for nm_v1_doc_fetch.
+    public bool DocFetchTools { get; set; } = false;
+
+    // Request guards. Allowlist may be empty (meaning "allow all except denylist").
+    public List<string> DocFetchAllowedSchemes { get; set; } = ["https"];
+    public List<string> DocFetchAllowedDomains { get; set; } = [];
+    public List<string> DocFetchDeniedDomains  { get; set; } = [];
+
+    // Content/latency bounds.
+    public int DocFetchMaxContentBytes { get; set; } = 32 * 1024;
+    public int DocFetchTimeoutSeconds  { get; set; } = 15;
+    public int DocFetchSummaryMaxChars { get; set; } = 400;
 }

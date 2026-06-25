@@ -50,7 +50,7 @@ public class WorkSchedulerRehydrationTests : IDisposable
     }
 
     [Fact]
-    public async Task Pending_and_leased_items_survive_a_restart_and_leases_are_cleared()
+    public async Task Pending_items_survive_a_restart_leases_are_cleared_and_all_require_approval()
     {
         var app1 = BuildApp();
         var orchestrator1 = app1.Services.GetRequiredService<IOrchestratorService>();
@@ -86,24 +86,25 @@ public class WorkSchedulerRehydrationTests : IDisposable
         Assert.Null(rehydratedLeased.LeasedBy);
         Assert.Null(rehydratedLeased.LeasedAt);
         Assert.Equal(1, rehydratedLeased.AttemptCount);
-        // Phase 8c — a held lease means a worker was actively executing this when the Host died,
-        // so rehydrate flags it for human approval instead of leaving it silently acquirable.
         Assert.True(rehydratedLeased.AwaitingResume);
 
         var rehydratedUnleased = pending2.Single(i => i.WorkUnitId == unleasedWorkUnitId);
         Assert.Null(rehydratedUnleased.LeasedBy);
         Assert.Equal(0, rehydratedUnleased.AttemptCount);
-        // Never leased (still queued, not yet started) — nothing was interrupted, so it's
-        // untouched and stays immediately acquirable.
-        Assert.False(rehydratedUnleased.AwaitingResume);
+        // Never leased (still queued, not yet started) doesn't mean undisturbed — it's still
+        // backlog from a run nobody asked to resume, so it's gated behind approval too.
+        Assert.True(rehydratedUnleased.AwaitingResume);
 
+        // Neither item is acquirable until a human approves it.
+        Assert.Null(await scheduler2.TryAcquireAsync("agent-2"));
+
+        await scheduler2.ApproveResumeAsync(unleasedWorkUnitId);
         var first = await scheduler2.TryAcquireAsync("agent-2");
         Assert.NotNull(first);
         Assert.Equal(unleasedWorkUnitId, first!.WorkUnitId);
 
-        // The AwaitingResume item is NOT acquirable until a human approves it.
-        var second = await scheduler2.TryAcquireAsync("agent-3");
-        Assert.Null(second);
+        // The still-unapproved item remains blocked.
+        Assert.Null(await scheduler2.TryAcquireAsync("agent-3"));
 
         await scheduler2.ApproveResumeAsync(leasedWorkUnitId);
         var third = await scheduler2.TryAcquireAsync("agent-3");
@@ -112,7 +113,7 @@ public class WorkSchedulerRehydrationTests : IDisposable
     }
 
     [Fact]
-    public async Task ListAwaitingResumeAsync_returns_only_items_interrupted_by_restart()
+    public async Task ListAwaitingResumeAsync_returns_every_item_that_survived_a_restart()
     {
         var app1 = BuildApp();
         var orchestrator1 = app1.Services.GetRequiredService<IOrchestratorService>();
@@ -123,10 +124,7 @@ public class WorkSchedulerRehydrationTests : IDisposable
         await scheduler1.EnqueueAsync(unitA.WorkUnitId, "worker");
         await scheduler1.EnqueueAsync(unitB.WorkUnitId, "worker");
 
-        var acquired = await scheduler1.TryAcquireAsync("agent-1");
-        Assert.NotNull(acquired);
-        var leasedWorkUnitId = acquired!.WorkUnitId;
-
+        // Neither item is acquired before the restart — both are plain, never-leased backlog.
         await app1.DisposeAsync();
 
         var app2 = BuildApp();
@@ -134,8 +132,39 @@ public class WorkSchedulerRehydrationTests : IDisposable
         var scheduler2 = app2.Services.GetRequiredService<IWorkScheduler>();
 
         var awaitingResume = await scheduler2.ListAwaitingResumeAsync();
-        Assert.Single(awaitingResume);
-        Assert.Equal(leasedWorkUnitId, awaitingResume[0].WorkUnitId);
+        Assert.Equal(2, awaitingResume.Count);
+        Assert.Contains(awaitingResume, i => i.WorkUnitId == unitA.WorkUnitId);
+        Assert.Contains(awaitingResume, i => i.WorkUnitId == unitB.WorkUnitId);
+    }
+
+    [Fact]
+    public async Task A_freshly_enqueued_goal_is_not_gated_by_an_older_session_awaiting_resume()
+    {
+        var app1 = BuildApp();
+        var orchestrator1 = app1.Services.GetRequiredService<IOrchestratorService>();
+        var scheduler1 = app1.Services.GetRequiredService<IWorkScheduler>();
+
+        var staleUnit = await orchestrator1.CreateWorkUnitAsync("Stale goal from a prior session", "test");
+        await scheduler1.EnqueueAsync(staleUnit.WorkUnitId, "worker");
+
+        await app1.DisposeAsync();
+
+        var app2 = BuildApp();
+        await RehydrateAsync(app2);
+        var orchestrator2 = app2.Services.GetRequiredService<IOrchestratorService>();
+        var scheduler2 = app2.Services.GetRequiredService<IWorkScheduler>();
+
+        // The rehydrated backlog is gated — an agent polling right after restart gets nothing.
+        Assert.Null(await scheduler2.TryAcquireAsync("agent-1"));
+
+        // A brand-new goal added in this run (EnqueueAsync, not RehydrateAsync) is immediately
+        // eligible and runs alongside the still-gated stale session, not blocked behind it.
+        var freshUnit = await orchestrator2.CreateWorkUnitAsync("Fresh goal for this session", "test");
+        await scheduler2.EnqueueAsync(freshUnit.WorkUnitId, "worker");
+
+        var acquired = await scheduler2.TryAcquireAsync("agent-1");
+        Assert.NotNull(acquired);
+        Assert.Equal(freshUnit.WorkUnitId, acquired!.WorkUnitId);
     }
 
     [Fact]

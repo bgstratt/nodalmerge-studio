@@ -21,6 +21,8 @@ internal static class ActivityLabeler
             McpToolNames.WorkspaceDiff   => "Reviewing changes",
             McpToolNames.WorkspaceExists => "Checking file",
             McpToolNames.WorkspaceSummary => "Reading workspace summary",
+            McpToolNames.WorkspaceStatus => "Reading workspace status",
+            McpToolNames.DocFetch => "Fetching external documentation",
 
             McpToolNames.TaskUpdate => "Updating task status",
             McpToolNames.TaskCreate => "Creating task",
@@ -38,6 +40,7 @@ internal static class ActivityLabeler
             McpToolNames.MergeReview   => "Reviewing merge",
 
             McpToolNames.SchedulerEnqueue => "Enqueuing worker",
+            McpToolNames.ClarificationRequest => "Requesting clarification",
             McpToolNames.AgentSpawn       => "Spawning worker",
             McpToolNames.AgentStatus      => "Checking agent status",
             McpToolNames.AgentStop        => "Stopping agent",

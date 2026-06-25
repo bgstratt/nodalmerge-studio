@@ -1,5 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
+using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
@@ -51,6 +53,18 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         return await File.ReadAllTextAsync(fullPath, ct).ConfigureAwait(false);
     }
 
+    public async Task<IReadOnlyList<WorkspaceFileRead>> ReadManyAsync(
+        string branchId, IReadOnlyList<string> paths, CancellationToken ct = default)
+    {
+        var results = new List<WorkspaceFileRead>(paths.Count);
+        foreach (var path in paths)
+        {
+            var content = await ReadAsync(branchId, path, ct).ConfigureAwait(false);
+            results.Add(new WorkspaceFileRead(path, content, Found: content is not null));
+        }
+        return results;
+    }
+
     public async Task WriteAsync(string branchId, string relativePath, string content, CancellationToken ct = default)
     {
         var bytes = Encoding.UTF8.GetByteCount(content);
@@ -64,6 +78,61 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
             Directory.CreateDirectory(dir);
 
         await File.WriteAllTextAsync(fullPath, content, ct).ConfigureAwait(false);
+    }
+
+    public async Task<WorkspaceReplaceResult> ReplaceAsync(
+        string branchId, string relativePath, string oldText, string newText, int expectedMatches = 1,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrEmpty(oldText))
+            throw new ArgumentException("oldText must not be empty.");
+
+        var content = await ReadAsync(branchId, relativePath, ct).ConfigureAwait(false)
+            ?? throw new InvalidOperationException($"File '{relativePath}' not found in branch '{branchId}'.");
+
+        var actualMatches = CountOccurrences(content, oldText);
+        if (actualMatches != expectedMatches)
+            throw new InvalidOperationException(
+                $"Expected {expectedMatches} occurrence(s) of oldText in '{relativePath}' but found {actualMatches}.");
+
+        var diff = BuildReplaceDiff(content, oldText, newText);
+        var updated = content.Replace(oldText, newText, StringComparison.Ordinal);
+
+        await WriteAsync(branchId, relativePath, updated, ct).ConfigureAwait(false);
+
+        return new WorkspaceReplaceResult(actualMatches, content.Length, updated.Length, diff);
+    }
+
+    private static int CountOccurrences(string content, string needle)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = content.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += needle.Length;
+        }
+        return count;
+    }
+
+    // Bounded by construction: one "@@ line {n} @@ / - / +" block per occurrence, and occurrence
+    // count was already validated against expectedMatches before this runs.
+    private static string BuildReplaceDiff(string content, string oldText, string newText)
+    {
+        var sb = new StringBuilder();
+        var searchIndex = 0;
+        int occurrence;
+        while ((occurrence = content.IndexOf(oldText, searchIndex, StringComparison.Ordinal)) >= 0)
+        {
+            var line = content[..occurrence].Count(c => c == '\n') + 1;
+            sb.AppendLine($"@@ line {line} @@");
+            foreach (var l in oldText.Split('\n'))
+                sb.AppendLine($"- {l.TrimEnd('\r')}");
+            foreach (var l in newText.Split('\n'))
+                sb.AppendLine($"+ {l.TrimEnd('\r')}");
+            searchIndex = occurrence + oldText.Length;
+        }
+        return sb.ToString().TrimEnd();
     }
 
     public Task DeleteAsync(string branchId, string relativePath, CancellationToken ct = default)
@@ -117,6 +186,90 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         var regex = new System.Text.RegularExpressions.Regex(
             regexPattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         return regex.IsMatch;
+    }
+
+    public async Task<(IReadOnlyList<WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(
+        string branchId, string query, string? subPath = null, string? filePattern = null,
+        bool regex = false, bool caseSensitive = false, int contextLines = 3, int maxResults = 200,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrEmpty(query))
+            throw new ArgumentException("query must not be empty.");
+
+        contextLines = Math.Clamp(contextLines, 0, 20);
+        maxResults = Math.Clamp(maxResults, 1, 1000);
+
+        var branchDir = BranchDir(branchId);
+        var searchRoot = subPath is { Length: > 0 } ? SafePath(branchId, subPath) : branchDir;
+        if (!Directory.Exists(searchRoot))
+            return ([], false);
+
+        var queryPattern = regex ? query : Regex.Escape(query);
+        var queryRegexOptions = caseSensitive ? RegexOptions.None : RegexOptions.IgnoreCase;
+        var queryRegex = new Regex(queryPattern, queryRegexOptions);
+
+        var fileMatcher = PatternMatcher(filePattern);
+        var files = Directory.EnumerateFiles(searchRoot, "*", SearchOption.AllDirectories)
+            .Where(f => !IsHidden(f))
+            .Select(f => Path.GetRelativePath(branchDir, f).Replace('\\', '/'))
+            .Where(fileMatcher)
+            .OrderBy(f => f, StringComparer.Ordinal);
+
+        var matches = new List<WorkspaceSearchMatch>();
+        foreach (var relative in files)
+        {
+            ct.ThrowIfCancellationRequested();
+            var fullPath = Path.Combine(branchDir, relative);
+            var info = new FileInfo(fullPath);
+            if (info.Length > options.MaxReadBytes)
+                continue;
+            if (await IsBinaryAsync(fullPath, ct).ConfigureAwait(false))
+                continue;
+
+            string[] lines;
+            try
+            {
+                lines = await File.ReadAllLinesAsync(fullPath, ct).ConfigureAwait(false);
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            for (var i = 0; i < lines.Length; i++)
+            {
+                if (!queryRegex.IsMatch(lines[i]))
+                    continue;
+
+                var start = Math.Max(0, i - contextLines);
+                var end = Math.Min(lines.Length - 1, i + contextLines);
+                var snippet = string.Join('\n', lines[start..(end + 1)]);
+                matches.Add(new WorkspaceSearchMatch(relative, i + 1, start + 1, end + 1, snippet));
+
+                if (matches.Count >= maxResults)
+                    return (matches, true);
+            }
+        }
+
+        return (matches, false);
+    }
+
+    // Cheap binary-detection heuristic (same as most grep tools): a null byte anywhere in the first
+    // chunk of a file means it isn't text. Without this, scanning a repo containing node_modules
+    // (past IsHidden), images, DLLs, or PDFs produces garbage matches or decode exceptions.
+    private static async Task<bool> IsBinaryAsync(string fullPath, CancellationToken ct)
+    {
+        const int SampleSize = 8192;
+        var buffer = new byte[SampleSize];
+        await using var stream = new FileStream(
+            fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.Asynchronous);
+        var read = await stream.ReadAsync(buffer.AsMemory(0, SampleSize), ct).ConfigureAwait(false);
+        for (var i = 0; i < read; i++)
+        {
+            if (buffer[i] == 0)
+                return true;
+        }
+        return false;
     }
 
     public async Task<string> DiffAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default)
@@ -212,15 +365,20 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
             ? Directory.EnumerateFiles(sourceDir, "*", SearchOption.AllDirectories)
                 .Where(f => !IsHidden(f))
                 .Select(f => Path.GetRelativePath(sourceDir, f).Replace('\\', '/'))
+                .Where(rel => !IsPlanArtifact(rel))
                 .ToHashSet()
             : new HashSet<string>();
 
-        // Delete files in target that are absent in source (approved diff == merged result)
+        // Delete files in target that are absent in source (approved diff == merged result). The
+        // target's own plan.json (if any) is skipped entirely here, not just left out of deletion —
+        // it belongs to the target work unit's own planning, not to this merge's diff, regardless of
+        // whether the source happens to have one too.
         if (Directory.Exists(targetDir))
         {
             foreach (var targetFile in Directory.EnumerateFiles(targetDir, "*", SearchOption.AllDirectories).Where(f => !IsHidden(f)))
             {
                 var rel = Path.GetRelativePath(targetDir, targetFile).Replace('\\', '/');
+                if (IsPlanArtifact(rel)) continue;
                 if (!sourceRelative.Contains(rel))
                     File.Delete(targetFile);
             }
@@ -252,7 +410,7 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         var branchFiles = Directory.Exists(branchDir)
             ? Directory.EnumerateFiles(branchDir, "*", SearchOption.AllDirectories)
                 .Select(f => Path.GetRelativePath(branchDir, f).Replace('\\', '/'))
-                .Where(rel => !IsIgnoredDirSegment(rel))
+                .Where(rel => !IsIgnoredDirSegment(rel) && !IsPlanArtifact(rel))
                 .ToHashSet()
             : new HashSet<string>();
 
@@ -288,7 +446,7 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         foreach (var targetFile in Directory.EnumerateFiles(branchDir, "*", SearchOption.AllDirectories))
         {
             var rel = Path.GetRelativePath(branchDir, targetFile).Replace('\\', '/');
-            if (IsIgnoredDirSegment(rel)) continue;
+            if (IsIgnoredDirSegment(rel) || IsPlanArtifact(rel)) continue;
             if (!sourceRelative.Contains(rel))
                 File.Delete(targetFile);
         }
@@ -362,6 +520,18 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             .Any(segment => IgnoredDirNames.Contains(segment, StringComparer.OrdinalIgnoreCase));
 
+    // plan.json is an internal planning artifact (PlanDocumentPaths.FileName) written explicitly by
+    // the Planner via WriteAsync and read explicitly by FanOutService — never meant to travel via a
+    // bulk copy. Every caller below passes a path already relative to a single branch/external root
+    // (not RootPath), so a plain equality check is unambiguous: it only matches the planner's own
+    // root-level file, never a same-named file nested in real project content (e.g. "docs/plan.json").
+    // Without this, seeding a new branch from a parent that has its own plan.json — or merging a
+    // child branch up to its parent/main — leaks a stale, unrelated plan onto the target, and
+    // FanOutService.ProcessAsync (which reads whatever plan.json sits on the target, regardless of
+    // which goal wrote it) blindly fans out from it instead of the target's own current goal.
+    private static bool IsPlanArtifact(string relativeToRoot) =>
+        relativeToRoot.Replace('\\', '/') == PlanDocumentPaths.FileName;
+
     // Used by DiffExternalPathAsync/ApplyExternalPathAsync — externalPath has no relationship to
     // RootPath at all, so (unlike IsHidden) this enumerates and excludes purely relative to its own
     // root, via the same IsIgnoredDirSegment rule CopyDirectory already uses for seeding (keeps
@@ -375,7 +545,7 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         foreach (var file in Directory.EnumerateFiles(externalPath, "*", SearchOption.AllDirectories))
         {
             var relative = Path.GetRelativePath(externalPath, file).Replace('\\', '/');
-            if (IsIgnoredDirSegment(relative)) continue;
+            if (IsIgnoredDirSegment(relative) || IsPlanArtifact(relative)) continue;
             var info = new FileInfo(file);
             result[relative] = (info.Length, info.LastWriteTimeUtc.Ticks);
         }
@@ -406,7 +576,7 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
         {
             var relative = Path.GetRelativePath(source, file);
-            if (IsIgnoredDirSegment(relative)) continue;
+            if (IsIgnoredDirSegment(relative) || IsPlanArtifact(relative)) continue;
             File.Copy(file, Path.Combine(destination, relative), overwrite: true);
         }
     }

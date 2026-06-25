@@ -81,6 +81,21 @@ public sealed class ExecutionEventStreamService : IExecutionEventStream, IRehydr
         return Task.FromResult(ev);
     }
 
+    public Task<IReadOnlyList<ExecutionEvent>> GetEventsByKindAsync(
+        IReadOnlyList<ExecutionEventKind> kinds,
+        DateTimeOffset? since = null,
+        CancellationToken ct = default)
+    {
+        var kindSet = kinds.ToHashSet();
+        var events = _events.Values
+            .Where(ev => kindSet.Contains(ev.Kind))
+            .Where(ev => since is null || ev.OccurredAt > since.Value)
+            .OrderBy(ev => ev.OccurredAt)
+            .ToList();
+
+        return Task.FromResult<IReadOnlyList<ExecutionEvent>>(events);
+    }
+
     public async Task RehydrateAsync(CancellationToken ct = default)
     {
         var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.ExecutionEventV1, ct).ConfigureAwait(false);

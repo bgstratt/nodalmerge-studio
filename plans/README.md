@@ -160,6 +160,40 @@ is refreshed with its dependency's actual merged output before it starts.
 | 12f | Planner prompt — `fileScope` as hint not permission, empty-branch deferral rule, semantic-vs-file `dependsOn` rule | Done |
 | 12g | Tests — unit (`FileLeaseService`, dispatcher, loop, scheduler, fan-out) + integration (two-slice collision-and-resume scenario) | Done |
 
+## Phase 14 — Workspace Usage Instrumentation + `workspace_read_many`
+
+See [phase-14-usage-instrumentation-and-read-many.md](./phase-14-usage-instrumentation-and-read-many.md).
+Ships the one capability item Phase 13 deferred (`workspace_read_many`) and adds just enough
+event-log instrumentation (search/read/lease-contention events + an on-demand aggregation service +
+read-only REST endpoints) to let any future Phase-12 file-leasing coordination work (region-locking,
+lease timeout, etc.) be decided from evidence instead of speculation. No Phase-12-deferred item is
+implemented here.
+
+| Slice | Focus | Status |
+|---|---|---|
+| 14a | `workspace_read_many` — contract, impl, dispatcher, tool defs, profile `AllowedTools` | Done |
+| 14b | `WorkspaceSearchExecuted`/`WorkspaceReadExecuted`/`FileLeaseContended` events | Done |
+| 14c | `IExecutionEventStream.GetEventsByKindAsync`; `WorkspaceUsageMetricsService` | Done |
+| 14d | `/studio/usage-metrics/*` REST endpoints | Done |
+| 14e | Tests — read-many, metrics aggregation, end-to-end event emission, lease contention | Done |
+
+## Phase 15 — Agent Tool Surface Expansion
+
+See [phase-15-agent-tool-surface-expansion.md](./phase-15-agent-tool-surface-expansion.md).
+Adds high-value coding-agent capabilities with explicit safety controls: compiler-backed semantic
+navigation, structured clarification/human-question workflow, constrained external doc fetch with
+artifact capture, and a workspace status helper for changed-files summaries.
+
+| Slice | Focus | Status |
+|---|---|---|
+| 15a | Semantic navigation service foundation (`definition`, `references`, `implementations`) | Done |
+| 15b | Semantic MCP/REST/dispatcher integration + profile gating | Done |
+| 15c | Semantic adoption rules in prompts/profiles (semantic-authoritative routing) + safe read-only semantic extras | Done |
+| 15d | Clarification workflow as orchestration state transition (not in-loop wait) | Done |
+| 15e | Clarification inbox/respond/resume UX + clarification metrics | Done |
+| 15f | Lean workspace status helper (`workspace_status`) for changed-files/proposal summary | Done |
+| 15g | External documentation fetch with provenance snapshot + artifact lineage | Planned |
+
 ## Slice document template
 
 Each slice file should include:

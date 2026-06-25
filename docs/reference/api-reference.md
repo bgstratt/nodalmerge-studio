@@ -104,21 +104,27 @@ caller can still be heavily used — just by agents, via the MCP tool it shares 
 
 *(Agents cannot pause/resume themselves or each other — those are human/extension-only actions today, which is the right default but worth knowing if you're designing an agent-to-agent steering flow.)*
 
-### Workspace — file I/O (6), execution (7), and profile (2)
+### Workspace — file I/O (6), execution (7), semantic navigation (3), and profile (2)
 | Tool | Dispatched | Purpose |
 |---|---|---|
 | `nm_v1_workspace_read` / `_write` / `_delete` / `_list` / `_diff` / `_exists` | ✅ all | Branch-scoped file operations (write/delete respect `fileScope`) |
 | `nm_v1_workspace_summary` | ✅ | Control-tower summary (active work units, agents, merges, failures) |
+| `nm_v1_workspace_symbol_definition` / `_symbol_references` / `_symbol_implementation` | ✅ all | Compiler-backed symbol navigation for definition/reference/implementation questions |
 | `nm_v1_workspace_build` / `_test` / `_exec` / `_run` / `_run_stop` | ✅ all | Run build / test / build+test+lint / app run / run-stop on a branch |
 | `nm_v1_workspace_exec_status` | ✅ | Latest persisted execution result for a branch |
 | `nm_v1_workspace_path` | ✅ | Branch working-directory filesystem path |
 | `nm_v1_workspace_profile_get` / `_profile_rescan` | ✅ both | Detected project roots/stacks and resolved build/test/run command profile |
 
-### Scheduler (2)
+Routing rule: when the semantic tools are allowed in a profile, they are the authoritative path for
+symbol definition/reference/implementation queries. Use `nm_v1_workspace_search` for text/content
+questions (comments, literals, config keys, docs), not for symbol relationship resolution.
+
+### Scheduler (3)
 | Tool | Dispatched | Purpose |
 |---|---|---|
 | `nm_v1_scheduler_enqueue` | ✅ | Queue a work unit for a profile (parallel execution, used by Experiments) |
 | `nm_v1_scheduler_pending` | ✅ | List pending scheduler queue items |
+| `nm_v1_clarification_request` | ✅ | Request human clarification and (optionally) pause execution awaiting response |
 
 ### Intent (1)
 | Tool | Dispatched | Purpose |
@@ -249,11 +255,19 @@ segment can never match.
 
 ### Agent profiles
 - `GET /studio/agent-profiles` (list) · `GET /studio/agent-profiles/{id}` (get) · `POST` (create) · `PUT /studio/agent-profiles/{id}` (update)
+- Planner/Worker/Reviewer default profile prompts enforce semantic-authoritative routing: use
+  `nm_v1_workspace_symbol_definition` / `_references` / `_implementation` for symbol relationships,
+  and reserve `nm_v1_workspace_search` for text/content discovery.
 
 ### Scheduler
 - `GET /studio/scheduler/pending` · `GET /studio/scheduler/awaiting-resume`
 - `POST /studio/scheduler/{workUnitId}/resume` · `POST /studio/scheduler/resume-all`
 - `POST /studio/scheduler/enqueue`
+
+### Clarifications
+- `GET /studio/clarifications/awaiting`
+- `POST /studio/clarifications/request`
+- `POST /studio/clarifications/{workUnitId}/respond`
 
 ### Sessions
 - `GET/POST /studio/sessions` · `GET /studio/sessions/{id}` · `POST /studio/sessions/{id}/pause|resume|abandon` · `GET /studio/sessions/{id}/workunits` · `POST /studio/sessions/{id}/branch`

@@ -101,6 +101,9 @@ public static class ServiceCollectionExtensions
         // Slice 15f — shared command services that every transport (MCP/REST/dispatcher) calls.
         services.AddSingleton<ISchedulerCommandService, SchedulerCommandService>();
         services.AddSingleton<IArtifactCommandService, ArtifactCommandService>();
+        services.AddSingleton<IClarificationCommandService, ClarificationCommandService>();
+        services.AddSingleton<IExternalDocFetcher, ExternalDocFetcher>();
+        services.AddSingleton<IDocFetchCommandService, DocFetchCommandService>();
 
         // Slice 16b/16c — workspace execution services
         services.AddSingleton<IWorkspaceExecutionService, WorkspaceExecutionService>();
@@ -110,6 +113,10 @@ public static class ServiceCollectionExtensions
         // cheap to recompute and branch directories are recreated identically on InitBranchAsync,
         // so a cold Host just re-detects lazily on first access.
         services.AddSingleton<IWorkspaceProfileService, WorkspaceProfileService>();
+
+        // Phase 15a — Roslyn-backed semantic navigation for definition/reference/implementation
+        // lookup in branch workspaces. Read-only and recomputed per call; no persistence.
+        services.AddSingleton<IWorkspaceSemanticNavigationService, WorkspaceSemanticNavigationService>();
 
         // Phase 9c — tracks long-running "run" processes (dev servers). Deliberately not durable:
         // a Host restart kills anything it started, and there's nothing meaningful to resume a
@@ -144,6 +151,9 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ExecutionEventStreamService>();
         services.AddSingleton<IExecutionEventStream>(sp => sp.GetRequiredService<ExecutionEventStreamService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<ExecutionEventStreamService>());
+
+        // Phase 14 — derived from the event log above, no persistence of its own.
+        services.AddSingleton<IWorkspaceUsageMetricsService, WorkspaceUsageMetricsService>();
 
         // No domain interface to forward — RuntimeSettingsService is only ever consumed
         // directly (by /studio/options) for its PersistAsync side effect, not through an

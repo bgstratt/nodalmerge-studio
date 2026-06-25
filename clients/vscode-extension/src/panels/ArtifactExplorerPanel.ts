@@ -543,11 +543,15 @@ export class GoalWorkspacePanel {
           void this.panel.webview.postMessage({ type: 'explorerSettings', ...this.getRepositoryPathSettings() });
           break;
         case 'explorerSteeringAction':
-          await this.handleSteeringAction(
-            msg.action as string,
-            msg.workUnitId as string,
-            (msg.agentId as string) ?? '',
-          );
+          if ((msg.action as string) === 'steerDeadLetterRetrySend') {
+            await this.handleSteeredRetrySend(msg);
+          } else {
+            await this.handleSteeringAction(
+              msg.action as string,
+              msg.workUnitId as string,
+              (msg.agentId as string) ?? '',
+            );
+          }
           break;
         case 'explorerCounterfactualAction':
           await this.handleCounterfactualAction(
@@ -658,6 +662,45 @@ export class GoalWorkspacePanel {
       } catch (err) {
         void vscode.window.showErrorMessage('NodalMerge: Fork from node failed — ' + String(err));
       }
+    }
+
+  }
+
+  // Phase Y — Steer & Retry with credential override from the Decision Lens inline UI.
+  private async handleSteeredRetrySend(msg: Record<string, unknown>): Promise<void> {
+    const workUnitId = msg.workUnitId as string;
+    const steeringContext = (msg.steeringContext as string) || '';
+    const overrideModel = (msg.overrideModel as string) || undefined;
+    const overrideBaseUrl = (msg.overrideBaseUrl as string) || undefined;
+    const overrideApiKey = (msg.overrideApiKey as string) || undefined;
+    const overrideProvider = (msg.overrideProvider as string) || undefined;
+    const overrideProfileId = (msg.overrideProfileId as string) || undefined;
+
+    // Load the dead-letter entry to get the entryId
+    let entry: { entryId: string; reason: string; attemptCount: number } | undefined;
+    try {
+      entry = await this.get<{ entryId: string; reason: string; attemptCount: number }>(
+        '/studio/dead-letter/by-work-unit/' + workUnitId,
+      );
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: Could not load dead-letter entry — ' + String(err));
+      return;
+    }
+
+    try {
+      await this.post('/studio/dead-letter/' + entry.entryId + '/retry-with-context', {
+        steeringContext: steeringContext || 'Retry with steering direction.',
+        overrideModel,
+        overrideBaseUrl,
+        overrideApiKey,
+        overrideProvider,
+        overrideProfileId,
+      });
+      void vscode.window.showInformationMessage(
+        'NodalMerge: Retrying with steering' + (overrideProfileId ? ' using profile ' + overrideProfileId : '') + '.');
+      if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: Steered retry failed — ' + String(err));
     }
   }
 
@@ -1639,6 +1682,15 @@ const GW_JS = `
     vscode.postMessage({ type: 'explorerSetSchedulerPollIntervalMs', value: value });
   });
 
+  // Phase Y — Steer & Retry profile toggle
+  function toggleSteerRetryProfile(workUnitId) {
+    var checkbox = document.getElementById('dl-use-new-profile-' + workUnitId);
+    var select = document.getElementById('dl-profile-select-' + workUnitId);
+    if (checkbox && select) {
+      select.style.display = checkbox.checked ? 'block' : 'none';
+    }
+  }
+
   // ── Resizable columns ─────────────────────────────────────────────────────
 
   (function setupColumnResizers() {
@@ -1857,6 +1909,39 @@ const GW_JS = `
             workUnitId: btn.getAttribute('data-wu'),
             agentId: btn.getAttribute('data-agent') || '',
           });
+        } else if (action === 'steerDeadLetterRetrySend') {
+          var wuId = btn.getAttribute('data-wu');
+          var contextEl = document.getElementById('dl-steer-context-' + wuId);
+          var steeringContext = contextEl ? contextEl.value : '';
+          var useNewProfile = document.getElementById('dl-use-new-profile-' + wuId);
+          var profileSelect = document.getElementById('dl-profile-select-' + wuId);
+          var overrideModel = '';
+          var overrideBaseUrl = '';
+          var overrideApiKey = '';
+          var overrideProvider = '';
+          var overrideProfileId = '';
+          if (useNewProfile && useNewProfile.checked && profileSelect && profileSelect.value) {
+            // Look up the selected profile's model/detail from agentProfiles
+            var selId = profileSelect.value;
+            var prof = (state.agentProfiles || []).find(function(p) { return p.id === selId; });
+            if (prof) {
+              overrideModel = prof.model || '';
+              overrideBaseUrl = prof.baseUrl || '';
+              overrideProvider = prof.provider || '';
+              overrideProfileId = prof.id || '';
+            }
+          }
+          vscode.postMessage({
+            type: 'explorerSteeringAction',
+            action: 'steerDeadLetterRetrySend',
+            workUnitId: wuId,
+            steeringContext: steeringContext.trim() || '',
+            overrideModel: overrideModel || undefined,
+            overrideBaseUrl: overrideBaseUrl || undefined,
+            overrideApiKey: overrideApiKey || undefined,
+            overrideProvider: overrideProvider || undefined,
+            overrideProfileId: overrideProfileId || undefined,
+          });
         } else {
           vscode.postMessage({
             type: 'explorerWorkUnitAction',
@@ -1864,6 +1949,14 @@ const GW_JS = `
             workUnitId: btn.getAttribute('data-wu'),
           });
         }
+      });
+    });
+    // Inline onchange attributes are blocked by the webview's CSP (script-src is nonce-only,
+    // no unsafe-inline), so the profile checkbox is wired here instead of via onchange="".
+    document.querySelectorAll('[id^="dl-use-new-profile-"]').forEach(function(checkbox) {
+      checkbox.addEventListener('change', function() {
+        var workUnitId = checkbox.id.slice('dl-use-new-profile-'.length);
+        toggleSteerRetryProfile(workUnitId);
       });
     });
   }
@@ -1929,7 +2022,19 @@ const GW_JS = `
       html += '<button class="ghost" data-wu-action="steerForkFromNode" data-wu="' + esc(wu.workUnitId) + '">↳ Fork from here</button>';
     }
     if (statusLower === 'deadlettered') {
-      html += '<button class="ghost" data-wu-action="steerDeadLetterRetry" data-wu="' + esc(wu.workUnitId) + '" style="color:var(--nm-error);border-color:var(--nm-error)">🛠 Steer & Retry</button>';
+      html += '<div class="steer-retry-section" style="margin-top:8px;padding:8px;border:1px solid var(--nm-error);border-radius:4px">';
+      html += '<div style="font-size:0.85em;opacity:0.8;margin-bottom:6px">🛠 Steer & Retry — correct the agent and optionally swap the model:</div>';
+      html += '<textarea id="dl-steer-context-' + esc(wu.workUnitId) + '" rows="2" placeholder="e.g. the file lives at repo root, not under src/ — start the search there" style="width:100%;margin-bottom:6px"></textarea>';
+      html += '<label style="display:flex;align-items:center;gap:4px;font-size:0.82em;margin-bottom:6px">';
+      html += '<input type="checkbox" id="dl-use-new-profile-' + esc(wu.workUnitId) + '"/> Use new agent profile';
+      html += '</label>';
+      html += '<select id="dl-profile-select-' + esc(wu.workUnitId) + '" style="display:none;width:100%;margin-bottom:6px">';
+      (state.agentProfiles || []).forEach(function(p) {
+        html += '<option value="' + esc(p.id) + '">' + esc(p.label) + (p.model ? ' (' + esc(p.model) + ')' : '') + '</option>';
+      });
+      html += '</select>';
+      html += '<button class="ghost" data-wu-action="steerDeadLetterRetrySend" data-wu="' + esc(wu.workUnitId) + '" style="color:var(--nm-error);border-color:var(--nm-error)">🛠 Retry</button>';
+      html += '</div>';
     }
     html += '</div>';
     html += '</div>'; // end Metadata panel

@@ -106,6 +106,23 @@ public static class StudioRestEndpoints
         string? Provider = null,
         string? SessionId = null);
 
+    private sealed record ClarificationRequestBody(
+        string WorkUnitId,
+        string Question,
+        string? Context = null,
+        bool Blocking = true,
+        IReadOnlyList<string>? Options = null,
+        string? RequestedByAgentId = null,
+        string? SessionId = null);
+
+    private sealed record ClarificationResponseBody(
+        string Response,
+        string? RequestId = null,
+        string? Note = null,
+        string? RespondedBy = null,
+        bool Resume = true,
+        string? SessionId = null);
+
     private sealed record CreateSessionBody(
         string RootWorkUnitId,
         IReadOnlyList<string> ProfileIds,
@@ -126,7 +143,8 @@ public static class StudioRestEndpoints
         bool RequireTestBeforeProposal = false,
         string? BuildCommand = null,
         string? TestCommand = null,
-        bool EnforceExpectedOutputKind = false);
+        bool EnforceExpectedOutputKind = false,
+        bool DocFetchTools = false);
 
     private sealed record BuildRequestBody(
         string? BuildCommand = null,
@@ -146,6 +164,19 @@ public static class StudioRestEndpoints
     private sealed record StopRequestBody(
         int? Pid = null,
         string? RootPath = null);
+
+    private sealed record WorkspaceSymbolRequestBody(
+        string? Symbol = null,
+        string? Path = null,
+        int? Line = null,
+        int? Column = null,
+        int MaxResults = 200);
+
+    private sealed record DocFetchRequestBody(
+        string Url,
+        string Reason,
+        string WorkUnitId,
+        string? SessionId = null);
 
     private sealed record RollbackRequestBody(string KnownGoodStateId);
 
@@ -213,12 +244,14 @@ public static class StudioRestEndpoints
         MapNodeStoreEndpoints(app);
         MapAgentProfileEndpoints(app);
         MapSchedulerEndpoints(app);
+        MapClarificationEndpoints(app);
         MapSessionEndpoints(app);
         MapEventStreamEndpoints(app);
         MapSessionStateEndpoints(app);
         MapArtifactEndpoints(app);
         MapDeadLetterEndpoints(app);
         MapFileLeaseEndpoints(app);
+        MapUsageMetricsEndpoints(app);
         MapOptionsEndpoints(app);
         MapPolicyEndpoints(app);
         MapProjectionEndpoints(app);
@@ -341,6 +374,7 @@ public static class StudioRestEndpoints
                 usePromotionBranch = options.UsePromotionBranch,
                 candidateBranchId = options.CandidateBranchId,
                 enforceExpectedOutputKind = options.EnforceExpectedOutputKind,
+                docFetchTools = options.DocFetchTools,
             }));
 
         app.MapPost("/studio/options", async (
@@ -372,6 +406,7 @@ public static class StudioRestEndpoints
             options.BuildCommand = body.BuildCommand;
             options.TestCommand = body.TestCommand;
             options.EnforceExpectedOutputKind = body.EnforceExpectedOutputKind;
+            options.DocFetchTools = body.DocFetchTools;
             await runtimeSettings.PersistAsync(ct).ConfigureAwait(false);
 
             // Slice 21a — ensure candidate branch exists as soon as the toggle is turned on.
@@ -393,6 +428,7 @@ public static class StudioRestEndpoints
                 usePromotionBranch = options.UsePromotionBranch,
                 candidateBranchId = options.CandidateBranchId,
                 enforceExpectedOutputKind = options.EnforceExpectedOutputKind,
+                docFetchTools = options.DocFetchTools,
             });
         });
     }
@@ -408,6 +444,19 @@ public static class StudioRestEndpoints
         {
             var summary = await workspace.GetSummaryAsync(branchId, ct).ConfigureAwait(false);
             return Results.Ok(summary);
+        });
+
+        app.MapGet("/studio/workspace-status", async (
+            [FromQuery] string? branchId,
+            [FromQuery] string? workUnitId,
+            [FromQuery] int? limit,
+            [FromQuery] int? offset,
+            IWorkspaceService workspace,
+            CancellationToken ct) =>
+        {
+            var status = await workspace.GetStatusAsync(
+                branchId, workUnitId, limit is null or <= 0 ? 50 : limit.Value, offset ?? 0, ct).ConfigureAwait(false);
+            return Results.Ok(status);
         });
 
         // ── Slice 16d — workspace execution REST endpoints (MCP parity) ────
@@ -505,6 +554,69 @@ public static class StudioRestEndpoints
         {
             var profile = await profiles.RescanAsync(branchId, ct).ConfigureAwait(false);
             return Results.Ok(profile);
+        });
+
+        app.MapPost("/studio/workspace/symbol/definition", async (
+            [FromQuery] string branchId,
+            WorkspaceSymbolRequestBody body,
+            IWorkspaceSemanticNavigationService semantic,
+            CancellationToken ct) =>
+        {
+            var query = new WorkspaceSymbolQuery(body.Symbol, body.Path, body.Line, body.Column, body.MaxResults);
+            var (locations, truncated) = await semantic.FindDefinitionsAsync(branchId, query, ct).ConfigureAwait(false);
+            return Results.Ok(new { locations, truncated, branchId });
+        });
+
+        app.MapPost("/studio/workspace/symbol/references", async (
+            [FromQuery] string branchId,
+            WorkspaceSymbolRequestBody body,
+            IWorkspaceSemanticNavigationService semantic,
+            CancellationToken ct) =>
+        {
+            var query = new WorkspaceSymbolQuery(body.Symbol, body.Path, body.Line, body.Column, body.MaxResults);
+            var (locations, truncated) = await semantic.FindReferencesAsync(branchId, query, ct).ConfigureAwait(false);
+            return Results.Ok(new { locations, truncated, branchId });
+        });
+
+        app.MapPost("/studio/workspace/symbol/implementation", async (
+            [FromQuery] string branchId,
+            WorkspaceSymbolRequestBody body,
+            IWorkspaceSemanticNavigationService semantic,
+            CancellationToken ct) =>
+        {
+            var query = new WorkspaceSymbolQuery(body.Symbol, body.Path, body.Line, body.Column, body.MaxResults);
+            var (locations, truncated) = await semantic.FindImplementationsAsync(branchId, query, ct).ConfigureAwait(false);
+            return Results.Ok(new { locations, truncated, branchId });
+        });
+
+        app.MapPost("/studio/doc/fetch", async (
+            DocFetchRequestBody body,
+            IDocFetchCommandService docs,
+            WorkspaceOptions options,
+            CancellationToken ct) =>
+        {
+            if (!options.DocFetchTools)
+                return Results.BadRequest(new { error = "Doc fetch tools are disabled by configuration." });
+            if (string.IsNullOrWhiteSpace(body.Url))
+                return Results.BadRequest(new { error = "url is required." });
+            if (string.IsNullOrWhiteSpace(body.Reason))
+                return Results.BadRequest(new { error = "reason is required." });
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+
+            try
+            {
+                var result = await docs.FetchAsync(body.Url, body.Reason, body.WorkUnitId, body.SessionId, ct).ConfigureAwait(false);
+                return Results.Ok(result);
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
         });
 
         // Slice 16m — output download endpoint. Returns cached (truncated) stdout/stderr from a
@@ -1500,6 +1612,104 @@ public static class StudioRestEndpoints
         });
     }
 
+    private static void MapClarificationEndpoints(WebApplication app)
+    {
+        app.MapGet("/studio/clarifications", async (
+            IClarificationCommandService clarifications,
+            CancellationToken ct) =>
+        {
+            var items = await clarifications.ListActiveRequestsAsync(ct).ConfigureAwait(false);
+            return Results.Ok(items);
+        });
+
+        app.MapGet("/studio/clarifications/metrics", async (
+            IClarificationCommandService clarifications,
+            CancellationToken ct) =>
+        {
+            var metrics = await clarifications.GetMetricsAsync(ct).ConfigureAwait(false);
+            return Results.Ok(metrics);
+        });
+
+        app.MapGet("/studio/clarifications/awaiting", async (
+            IClarificationCommandService clarifications,
+            CancellationToken ct) =>
+        {
+            var items = await clarifications.ListAwaitingAsync(ct).ConfigureAwait(false);
+            return Results.Ok(items);
+        });
+
+        app.MapPost("/studio/clarifications/request", async (
+            ClarificationRequestBody body,
+            IClarificationCommandService clarifications,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+            if (string.IsNullOrWhiteSpace(body.Question))
+                return Results.BadRequest(new { error = "question is required." });
+
+            try
+            {
+                var result = await clarifications.RequestAsync(
+                    body.WorkUnitId,
+                    body.Question,
+                    body.Context,
+                    body.Blocking,
+                    body.Options,
+                    body.RequestedByAgentId,
+                    body.SessionId,
+                    ct).ConfigureAwait(false);
+                return Results.Ok(result);
+            }
+            catch (KeyNotFoundException)
+            {
+                return Results.NotFound(new { error = $"Work unit '{body.WorkUnitId}' not found." });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        app.MapPost("/studio/clarifications/{workUnitId}/respond", async (
+            string workUnitId,
+            ClarificationResponseBody body,
+            IClarificationCommandService clarifications,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(workUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+            if (string.IsNullOrWhiteSpace(body.Response))
+                return Results.BadRequest(new { error = "response is required." });
+
+            try
+            {
+                var result = await clarifications.RespondAsync(
+                    workUnitId,
+                    body.Response,
+                    body.Note,
+                    body.RespondedBy,
+                    body.RequestId,
+                    body.Resume,
+                    body.SessionId,
+                    ct).ConfigureAwait(false);
+                return Results.Ok(result);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+    }
+
     // ── /studio/sessions ──────────────────────────────────────────────────────
 
     private static void MapSessionEndpoints(WebApplication app)
@@ -1681,9 +1891,25 @@ public static class StudioRestEndpoints
         app.MapPost("/studio/dead-letter/{entryId}/retry", async (
             string entryId,
             IDeadLetterService deadLetter,
+            DeadLetterRetryBody? body,
             CancellationToken ct) =>
         {
-            var result = await deadLetter.RetryAsync(entryId, ct).ConfigureAwait(false);
+            DeadLetterRetryResult result;
+            if (body is not null)
+            {
+                result = await deadLetter.RetryWithCredentialOverrideAsync(
+                    entryId,
+                    body.OverrideModel,
+                    body.OverrideBaseUrl,
+                    body.OverrideApiKey,
+                    body.OverrideProvider,
+                    body.OverrideProfileId,
+                    ct).ConfigureAwait(false);
+            }
+            else
+            {
+                result = await deadLetter.RetryAsync(entryId, ct).ConfigureAwait(false);
+            }
             return result.Outcome switch
             {
                 DeadLetterRetryOutcome.Retried => Results.Ok(result),
@@ -1714,8 +1940,15 @@ public static class StudioRestEndpoints
             if (string.IsNullOrWhiteSpace(body.SteeringContext))
                 return Results.BadRequest(new { error = "steeringContext is required." });
 
-            var result = await deadLetter.RetryWithContextAsync(entryId, body.SteeringContext, ct)
-                .ConfigureAwait(false);
+            var result = await deadLetter.RetryWithContextAsync(
+                entryId,
+                body.SteeringContext,
+                body.OverrideModel,
+                body.OverrideBaseUrl,
+                body.OverrideApiKey,
+                body.OverrideProvider,
+                body.OverrideProfileId,
+                ct).ConfigureAwait(false);
             return result.Outcome switch
             {
                 DeadLetterRetryOutcome.Retried => Results.Ok(result),
@@ -1727,7 +1960,24 @@ public static class StudioRestEndpoints
         });
     }
 
-    private sealed record RetryWithContextBody(string SteeringContext);
+    // Phase Y — credential overrides let a human retry a dead-lettered work unit with a
+    // different model/profile (e.g. switching from vscode-lm to deepseek) without spawning
+    // a new work unit. When set, these take absolute priority over the entry's captured
+    // credentials and the live orchestrator registry in ResolveRetryCredentials.
+    private sealed record DeadLetterRetryBody(
+        string? OverrideModel = null,
+        string? OverrideBaseUrl = null,
+        string? OverrideApiKey = null,
+        string? OverrideProvider = null,
+        string? OverrideProfileId = null);
+
+    private sealed record RetryWithContextBody(
+        string SteeringContext,
+        string? OverrideModel = null,
+        string? OverrideBaseUrl = null,
+        string? OverrideApiKey = null,
+        string? OverrideProvider = null,
+        string? OverrideProfileId = null);
 
     // ── /studio/file-leases — Phase 12 manual-release admin override ───────────
     // Closes the one remaining gap after StopAsync/ReviewAsync(Rejected) were wired to release
@@ -1765,6 +2015,46 @@ public static class StudioRestEndpoints
     }
 
     private sealed record ReleaseFileLeaseBody(string WorkUnitId);
+
+    // ── /studio/usage-metrics — Phase 14 evidence for future Phase-12 leasing decisions ─────────
+    // Raw JSON only, no dashboard panel (matches /studio/file-leases) — exists so contention/hit
+    // data can accumulate and actually inform whether any of phase-12-file-ownership-leasing.md's
+    // deferred coordination features (timeout, region-locking, etc.) are worth building.
+    private static void MapUsageMetricsEndpoints(WebApplication app)
+    {
+        static DateTimeOffset? Since(double? sinceHours) =>
+            sinceHours is { } h ? DateTimeOffset.UtcNow.AddHours(-h) : null;
+
+        app.MapGet("/studio/usage-metrics/file-hits", async (
+            IWorkspaceUsageMetricsService usageMetrics,
+            int? topN,
+            double? sinceHours,
+            CancellationToken ct) =>
+        {
+            var hits = await usageMetrics.GetTopFileHitsAsync(topN ?? 20, Since(sinceHours), ct).ConfigureAwait(false);
+            return Results.Ok(hits);
+        });
+
+        app.MapGet("/studio/usage-metrics/lease-contention", async (
+            IWorkspaceUsageMetricsService usageMetrics,
+            int? topN,
+            double? sinceHours,
+            CancellationToken ct) =>
+        {
+            var hotSpots = await usageMetrics.GetLeaseContentionHotSpotsAsync(topN ?? 20, Since(sinceHours), ct).ConfigureAwait(false);
+            return Results.Ok(hotSpots);
+        });
+
+        app.MapGet("/studio/usage-metrics/search-activity", async (
+            IWorkspaceUsageMetricsService usageMetrics,
+            string? workUnitId,
+            double? sinceHours,
+            CancellationToken ct) =>
+        {
+            var summary = await usageMetrics.GetSearchUsageAsync(workUnitId, Since(sinceHours), ct).ConfigureAwait(false);
+            return Results.Ok(summary);
+        });
+    }
 
     // ── /studio/agent-profiles ────────────────────────────────────────────────
 

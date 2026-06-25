@@ -64,6 +64,17 @@ public class WorkspaceIsolationTests
         public Task<string?> ReadAsync(string branchId, string relativePath, CancellationToken ct = default) =>
             Task.FromResult(_branches.TryGetValue(branchId, out var files) && files.TryGetValue(relativePath, out var c) ? c : null);
 
+        public Task<IReadOnlyList<WorkspaceFileRead>> ReadManyAsync(string branchId, IReadOnlyList<string> paths, CancellationToken ct = default)
+        {
+            var files = _branches.TryGetValue(branchId, out var b) ? b : null;
+            IReadOnlyList<WorkspaceFileRead> results = paths
+                .Select(p => files is not null && files.TryGetValue(p, out var c)
+                    ? new WorkspaceFileRead(p, c, true)
+                    : new WorkspaceFileRead(p, null, false))
+                .ToList();
+            return Task.FromResult(results);
+        }
+
         public Task WriteAsync(string branchId, string relativePath, string content, CancellationToken ct = default)
         {
             if (!_branches.TryGetValue(branchId, out var files))
@@ -83,6 +94,17 @@ public class WorkspaceIsolationTests
 
         public Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, string? pattern = null, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<string>>(_branches.TryGetValue(branchId, out var files) ? files.Keys.ToList() : []);
+
+        public Task<(IReadOnlyList<WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(
+            string branchId, string query, string? subPath = null, string? filePattern = null,
+            bool regex = false, bool caseSensitive = false, int contextLines = 3, int maxResults = 200,
+            CancellationToken ct = default) =>
+            Task.FromResult<(IReadOnlyList<WorkspaceSearchMatch>, bool)>(([], false));
+
+        public Task<WorkspaceReplaceResult> ReplaceAsync(
+            string branchId, string relativePath, string oldText, string newText, int expectedMatches = 1,
+            CancellationToken ct = default) =>
+            Task.FromResult(new WorkspaceReplaceResult(0, 0, 0, string.Empty));
 
         public Task<string> DiffAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default) =>
             Task.FromResult(string.Empty);

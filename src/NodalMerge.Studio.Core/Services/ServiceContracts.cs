@@ -248,6 +248,18 @@ public interface IDeadLetterService
 
     Task<DeadLetterRetryResult> RetryAsync(string entryId, CancellationToken cancellationToken = default);
 
+    // When credential overrides are supplied, ResolveRetryCredentials prefers them over the
+    // dead-letter entry's captured credentials — this lets a human retry with a different
+    // model/profile (e.g. switching from vscode-lm to deepseek) without spawning a new work unit.
+    Task<DeadLetterRetryResult> RetryWithCredentialOverrideAsync(
+        string entryId,
+        string? overrideModel,
+        string? overrideBaseUrl,
+        string? overrideApiKey,
+        string? overrideProvider,
+        string? overrideProfileId,
+        CancellationToken cancellationToken = default);
+
     // Human-steered retry: appends corrective context to the work unit's Goal so the agent
     // actually sees it (projections only ever surface Goal/SuccessCriteria, not Metadata), and
     // resets FailureAttemptCount since the correction addresses a different root cause than the
@@ -256,6 +268,11 @@ public interface IDeadLetterService
     Task<DeadLetterRetryResult> RetryWithContextAsync(
         string entryId,
         string steeringContext,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideProfileId = null,
         CancellationToken cancellationToken = default);
 }
 
@@ -591,6 +608,64 @@ public sealed record ConflictWarning(
     IReadOnlyList<string> OverlappingFiles,
     IReadOnlyList<string> ConflictingWorkUnitIds);
 
+public sealed record ClarificationRequest(
+    string RequestId,
+    string WorkUnitId,
+    string Question,
+    string? Context,
+    bool Blocking,
+    IReadOnlyList<string> Options,
+    string? RequestedByAgentId,
+    DateTimeOffset RequestedAt,
+    string? Response = null,
+    string? ResponseNote = null,
+    string? RespondedBy = null,
+    DateTimeOffset? RespondedAt = null);
+
+public sealed record ClarificationRequestResult(
+    string RequestId,
+    string WorkUnitId,
+    bool Blocking,
+    bool ParkedAwaitingResponse,
+    string Status);
+
+public sealed record ClarificationResponseResult(
+    string RequestId,
+    string WorkUnitId,
+    bool Resumed,
+    string Status);
+
+public sealed record ClarificationInboxItem(
+    string RequestId,
+    string? SessionId,
+    string WorkUnitId,
+    string Goal,
+    string Question,
+    string? Context,
+    bool Blocking,
+    IReadOnlyList<string> Options,
+    string? RequestedByAgentId,
+    DateTimeOffset RequestedAt,
+    string Status,
+    string? Response,
+    string? ResponseNote,
+    string? RespondedBy,
+    DateTimeOffset? RespondedAt,
+    bool AwaitingResume);
+
+public sealed record ClarificationGoalMetric(
+    string WorkUnitId,
+    string Goal,
+    int Requests,
+    int Answered,
+    int Abandoned);
+
+public sealed record ClarificationMetrics(
+    int Requests,
+    int Answered,
+    int Abandoned,
+    IReadOnlyList<ClarificationGoalMetric> PerGoal);
+
 public sealed record ScheduledItem(
     string WorkUnitId,
     string ProfileId,
@@ -634,6 +709,10 @@ public interface IWorkScheduler
 
     Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default);
 
+    // Phase 15d — park a queued item in AwaitingResume without dropping it. Used by the
+    // clarification workflow to pause execution until a human response resumes it.
+    Task MarkAwaitingResumeAsync(string workUnitId, CancellationToken ct = default);
+
     // Phase 12 — called instead of ReleaseAsync when a worker's loop exits with
     // AgentLoopCompletion.AwaitingFileLease: parks the item (kept in the queue, lease cleared so
     // it's no longer "actively running") rather than removing or dead-lettering it. Mirrors the
@@ -674,6 +753,35 @@ public interface ISchedulerCommandService
     Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default);
 }
 
+public interface IClarificationCommandService
+{
+    Task<ClarificationRequestResult> RequestAsync(
+        string workUnitId,
+        string question,
+        string? context = null,
+        bool blocking = true,
+        IReadOnlyList<string>? options = null,
+        string? requestedByAgentId = null,
+        string? sessionId = null,
+        CancellationToken ct = default);
+
+    Task<IReadOnlyList<ScheduledItem>> ListAwaitingAsync(CancellationToken ct = default);
+
+    Task<IReadOnlyList<ClarificationInboxItem>> ListActiveRequestsAsync(CancellationToken ct = default);
+
+    Task<ClarificationMetrics> GetMetricsAsync(CancellationToken ct = default);
+
+    Task<ClarificationResponseResult> RespondAsync(
+        string workUnitId,
+        string response,
+        string? note = null,
+        string? respondedBy = null,
+        string? requestId = null,
+        bool resume = true,
+        string? sessionId = null,
+        CancellationToken ct = default);
+}
+
 // Slice 15f — shared artifact command entry point for MCP/REST/the agent-loop dispatcher.
 // Moves the CollectChainWithAncestorsAsync walk (copy-pasted verbatim between ArtifactTools.cs
 // and McpToolDispatcher.cs) into a single implementation.
@@ -696,6 +804,46 @@ public interface IArtifactCommandService
     Task<IReadOnlyList<ArtifactRef>> ListAsync(
         string workUnitId,
         bool includeAncestors = true,
+        CancellationToken ct = default);
+}
+
+public sealed record ExternalDocFetchContent(
+    string ContentType,
+    string Snapshot,
+    bool Truncated,
+    int SnapshotBytes);
+
+public interface IExternalDocFetcher
+{
+    Task<ExternalDocFetchContent> FetchAsync(
+        Uri normalizedUrl,
+        int maxBytes,
+        TimeSpan timeout,
+        CancellationToken ct = default);
+}
+
+public sealed record DocFetchResult(
+    string ArtifactId,
+    string WorkUnitId,
+    string RequestedUrl,
+    string NormalizedUrl,
+    string Reason,
+    DateTimeOffset FetchedAt,
+    string ContentHash,
+    string HashAlgorithm,
+    string ContentType,
+    string Snapshot,
+    bool Truncated,
+    int SnapshotBytes,
+    string? Summary);
+
+public interface IDocFetchCommandService
+{
+    Task<DocFetchResult> FetchAsync(
+        string url,
+        string reason,
+        string workUnitId,
+        string? sessionId = null,
         CancellationToken ct = default);
 }
 
@@ -763,11 +911,48 @@ public interface IExecutionEventStream
         CancellationToken ct = default);
 
     Task<ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default);
+
+    // Phase 14 — cross-session lookup for usage-instrumentation aggregation (WorkspaceUsageMetricsService).
+    // GetSessionEventsAsync is scoped to one session; metrics like "top hit files across all workspaces"
+    // need to scan by kind regardless of session.
+    Task<IReadOnlyList<ExecutionEvent>> GetEventsByKindAsync(
+        IReadOnlyList<ExecutionEventKind> kinds,
+        DateTimeOffset? since = null,
+        CancellationToken ct = default);
 }
+
+// Phase 14 — derived/on-demand usage metrics computed from the execution event log, used to decide
+// (with evidence instead of speculation) whether any of phase-12-file-ownership-leasing.md's deferred
+// coordination features are actually worth building. No persistence of its own.
+public interface IWorkspaceUsageMetricsService
+{
+    Task<IReadOnlyList<FileHitCount>> GetTopFileHitsAsync(
+        int topN = 20, DateTimeOffset? since = null, CancellationToken ct = default);
+
+    Task<IReadOnlyList<LeaseContentionHotSpot>> GetLeaseContentionHotSpotsAsync(
+        int topN = 20, DateTimeOffset? since = null, CancellationToken ct = default);
+
+    Task<SearchUsageSummary> GetSearchUsageAsync(
+        string? workUnitId = null, DateTimeOffset? since = null, CancellationToken ct = default);
+}
+
+public sealed record FileHitCount(string Path, int Hits);
+
+public sealed record LeaseContentionHotSpot(
+    string Path, int ContentionCount, IReadOnlyList<string> ContendingWorkUnitIds);
+
+public sealed record SearchUsageSummary(int SearchCount, int TotalMatches, int TruncatedCount);
 
 public interface IWorkspaceService
 {
     Task<WorkspaceSummary> GetSummaryAsync(string? branchId = null, CancellationToken cancellationToken = default);
+
+    Task<WorkspaceStatus> GetStatusAsync(
+        string? branchId = null,
+        string? workUnitId = null,
+        int limit = 50,
+        int offset = 0,
+        CancellationToken cancellationToken = default);
 }
 
 public interface IAgentWorkspaceService
@@ -967,6 +1152,35 @@ public interface IFileWorkspaceService
     // "WeatherForecastController.cs" matches as a substring, so callers can find a specific file by
     // name across the whole branch (subPath omitted) without already knowing its directory.
     Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, string? pattern = null, CancellationToken ct = default);
+
+    // Content search (grep), as opposed to ListAsync's filename-only matching. query is matched
+    // literally unless regex=true; caseSensitive defaults to false. filePattern reuses ListAsync's
+    // wildcard syntax to scope which files get scanned. contextLines (clamped to [0,20]) controls
+    // how many surrounding lines accompany each match, so callers don't need an immediate follow-up
+    // ReadAsync just to see what's around a hit. Binary files (null-byte heuristic on the first
+    // chunk) and files over MaxReadBytes are skipped silently, same as ListAsync skips hidden paths.
+    // Returns Truncated=true once maxResults (clamped to [1,1000]) matches have been found.
+    Task<(IReadOnlyList<WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(
+        string branchId, string query, string? subPath = null, string? filePattern = null,
+        bool regex = false, bool caseSensitive = false, int contextLines = 3, int maxResults = 200,
+        CancellationToken ct = default);
+
+    // Targeted edit, as opposed to WriteAsync's full-file replacement. expectedMatches defaults to
+    // 1 (uniqueness required, mirroring Claude Code's Edit tool): throws if oldText's literal
+    // occurrence count in the file isn't exactly expectedMatches, naming the actual count in the
+    // message so the caller can adjust (add context if too many, fix the assumption if zero). Pass
+    // expectedMatches=N explicitly to replace N legitimate occurrences at once.
+    Task<WorkspaceReplaceResult> ReplaceAsync(
+        string branchId, string relativePath, string oldText, string newText, int expectedMatches = 1,
+        CancellationToken ct = default);
+
+    // Batched ReadAsync — collapses the search-then-read-several-hits pattern into one round trip.
+    // A missing path comes back as Found=false/Content=null in its own slot rather than failing the
+    // whole call, matching ReadAsync's existing "null means not found" convention. Callers should
+    // clamp paths to a sane count (e.g. [1,50]); this method itself does not reject an oversized list.
+    Task<IReadOnlyList<WorkspaceFileRead>> ReadManyAsync(
+        string branchId, IReadOnlyList<string> paths, CancellationToken ct = default);
+
     Task<string> DiffAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default);
     Task ApplyBranchAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default);
     Task CopyFilesAsync(
@@ -1000,6 +1214,59 @@ public sealed record WorkspaceDiff(
     public bool IsEmpty => Added.Count == 0 && Modified.Count == 0 && Deleted.Count == 0;
 }
 
+// Line is 1-based and points at the matching line; StartLine/EndLine bound the context window
+// (inclusive, also 1-based) that Snippet's joined text spans.
+public sealed record WorkspaceSearchMatch(
+    string Path, int Line, int StartLine, int EndLine, string Snippet);
+
+// OldLength/NewLength are character counts of the file content before/after the replacement.
+// Diff is a short "@@ line {n} @@ / - old / + new" block per replaced occurrence, not a full unified
+// diff — enough to confirm the edit landed correctly without a follow-up full-file read.
+public sealed record WorkspaceReplaceResult(
+    int Matches, long OldLength, long NewLength, string Diff);
+
+// One slot of a ReadManyAsync batch. Found=false/Content=null when the path doesn't exist in the
+// branch — mirrors ReadAsync's null-means-not-found convention rather than throwing per-path.
+public sealed record WorkspaceFileRead(string Path, string? Content, bool Found);
+
+// Read-only semantic query input. Symbol can be omitted when path+line(+column) are provided,
+// in which case the implementation resolves the symbol at that source location.
+public sealed record WorkspaceSymbolQuery(
+    string? Symbol = null,
+    string? Path = null,
+    int? Line = null,
+    int? Column = null,
+    int MaxResults = 200);
+
+// Symbol location in branch-relative coordinates (1-based line/column).
+public sealed record WorkspaceSymbolLocation(
+    string Path,
+    int Line,
+    int Column,
+    string SymbolName,
+    string? ContainingSymbol = null,
+    string? Kind = null);
+
+// Phase 15a — compiler-backed semantic navigation for branch workspaces.
+// Read-only by design: definition/reference/implementation lookup only.
+public interface IWorkspaceSemanticNavigationService
+{
+    Task<(IReadOnlyList<WorkspaceSymbolLocation> Locations, bool Truncated)> FindDefinitionsAsync(
+        string branchId,
+        WorkspaceSymbolQuery query,
+        CancellationToken ct = default);
+
+    Task<(IReadOnlyList<WorkspaceSymbolLocation> Locations, bool Truncated)> FindReferencesAsync(
+        string branchId,
+        WorkspaceSymbolQuery query,
+        CancellationToken ct = default);
+
+    Task<(IReadOnlyList<WorkspaceSymbolLocation> Locations, bool Truncated)> FindImplementationsAsync(
+        string branchId,
+        WorkspaceSymbolQuery query,
+        CancellationToken ct = default);
+}
+
 public interface IRepositorySyncService
 {
     Task<PendingExternalSync?> SyncBranchFromRepositoryAsync(
@@ -1016,6 +1283,51 @@ public sealed record WorkspaceSummary(
     IReadOnlyList<string> PendingMerges,
     IReadOnlyList<string> Failures,
     IReadOnlyList<string> KnownGoodStates);
+
+public enum WorkspaceChangeKind
+{
+    Added,
+    Modified,
+    Deleted,
+    Changed,
+}
+
+public sealed record WorkspaceStatusFileChange(
+    string Path,
+    WorkspaceChangeKind ChangeKind,
+    string? ProposalId = null);
+
+public sealed record WorkspaceStatusProposalSummary(
+    string ProposalId,
+    MergeProposalStatus Status,
+    IReadOnlyList<string> FilesTouched,
+    int AddedFiles,
+    int ModifiedFiles,
+    int DeletedFiles,
+    int? AddedLines,
+    int? RemovedLines,
+    string? Summary,
+    DateTimeOffset? DiffGeneratedAt);
+
+public sealed record WorkspaceStatusDiffStats(
+    int AddedFiles,
+    int ModifiedFiles,
+    int DeletedFiles,
+    int? AddedLines = null,
+    int? RemovedLines = null);
+
+public sealed record WorkspaceStatus(
+    string? BranchId,
+    string? WorkUnitId,
+    WorkUnitStatus? CurrentWorkUnitStatus,
+    IReadOnlyList<WorkspaceStatusFileChange> ChangedFiles,
+    IReadOnlyList<WorkspaceStatusProposalSummary> ProposalSummaries,
+    WorkspaceStatusDiffStats? DiffStats,
+    bool Truncated,
+    int Limit,
+    int Offset,
+    int NextOffset,
+    DateTimeOffset GeneratedAt);
 
 // Slice 16b — executes build, test, and lint commands inside a branch's working directory.
 // Language-agnostic — runs whatever command string it receives via Process.Start.

@@ -325,6 +325,9 @@ public class AutomatedReviewGateServiceTests
         public Task MarkAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) =>
             Task.CompletedTask;
 
+        public Task MarkAwaitingResumeAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
         public Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) =>
             Task.CompletedTask;
 
@@ -495,8 +498,25 @@ public class AutomatedReviewGateServiceTests
         public Task<DeadLetterRetryResult> RetryAsync(string entryId, CancellationToken cancellationToken = default) =>
             Task.FromResult(new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried));
 
+        public Task<DeadLetterRetryResult> RetryWithCredentialOverrideAsync(
+            string entryId,
+            string? overrideModel,
+            string? overrideBaseUrl,
+            string? overrideApiKey,
+            string? overrideProvider,
+            string? overrideProfileId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried));
+
         public Task<DeadLetterRetryResult> RetryWithContextAsync(
-            string entryId, string steeringContext, CancellationToken cancellationToken = default) =>
+            string entryId,
+            string steeringContext,
+            string? overrideModel = null,
+            string? overrideBaseUrl = null,
+            string? overrideApiKey = null,
+            string? overrideProvider = null,
+            string? overrideProfileId = null,
+            CancellationToken cancellationToken = default) =>
             Task.FromResult(new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried));
     }
 }

@@ -287,6 +287,106 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             knownGoodStates);
     }
 
+    public async Task<WorkspaceStatus> GetStatusAsync(
+        string? branchId = null,
+        string? workUnitId = null,
+        int limit = 50,
+        int offset = 0,
+        CancellationToken cancellationToken = default)
+    {
+        if (limit <= 0)
+            throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be greater than zero.");
+        if (offset < 0)
+            throw new ArgumentOutOfRangeException(nameof(offset), "Offset cannot be negative.");
+
+        WorkUnit? currentWorkUnit = null;
+        var resolvedBranchId = branchId;
+        if (workUnitId is not null)
+        {
+            currentWorkUnit = GetRequired(workUnitId);
+            resolvedBranchId ??= currentWorkUnit.BranchId;
+        }
+
+        var proposalSnapshots = new List<(DateTimeOffset SortKey, WorkspaceStatusProposalSummary Summary, IReadOnlyList<WorkspaceStatusFileChange> ChangedFiles)>();
+
+        if (workUnitId is not null)
+        {
+            var chain = await _artifactLineage.GetChainAsync(workUnitId, cancellationToken).ConfigureAwait(false);
+            foreach (var proposalRef in chain.Where(a => a.Type == ArtifactType.MergeProposal).OrderBy(a => a.CreatedAt))
+            {
+                var proposal = await _mergeService.GetAsync(proposalRef.ArtifactId, cancellationToken).ConfigureAwait(false);
+                if (proposal is null)
+                    continue;
+
+                var snapshot = BuildProposalSnapshot(proposal, proposalRef.CreatedAt);
+                proposalSnapshots.Add(snapshot);
+            }
+        }
+        else
+        {
+            var proposals = await _mergeService.ListAsync(resolvedBranchId, cancellationToken).ConfigureAwait(false);
+            foreach (var proposal in proposals.OrderBy(p => p.DiffGeneratedAt ?? DateTimeOffset.MinValue))
+            {
+                proposalSnapshots.Add(BuildProposalSnapshot(proposal, proposal.DiffGeneratedAt ?? DateTimeOffset.MinValue));
+            }
+        }
+
+        var mergedFiles = new Dictionary<string, WorkspaceStatusFileChange>(StringComparer.OrdinalIgnoreCase);
+        int addedFiles = 0;
+        int modifiedFiles = 0;
+        int deletedFiles = 0;
+        int? addedLines = 0;
+        int? removedLines = null;
+
+        foreach (var snapshot in proposalSnapshots)
+        {
+            foreach (var fileChange in snapshot.ChangedFiles)
+            {
+                mergedFiles[fileChange.Path] = fileChange;
+            }
+
+            addedFiles += snapshot.Summary.AddedFiles;
+            modifiedFiles += snapshot.Summary.ModifiedFiles;
+            deletedFiles += snapshot.Summary.DeletedFiles;
+            if (snapshot.Summary.AddedLines is not null)
+                addedLines += snapshot.Summary.AddedLines;
+            if (snapshot.Summary.RemovedLines is null)
+                removedLines = null;
+            else
+                removedLines = (removedLines ?? 0) + snapshot.Summary.RemovedLines.Value;
+        }
+
+        var orderedFiles = mergedFiles.Values
+            .OrderBy(f => f.Path, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(f => f.ChangeKind)
+            .ToList();
+
+        var pagedFiles = orderedFiles.Skip(offset).Take(limit).ToList();
+        var nextOffset = Math.Min(offset + pagedFiles.Count, orderedFiles.Count);
+        var truncated = orderedFiles.Count > nextOffset;
+
+        var orderedProposals = proposalSnapshots
+            .OrderByDescending(p => p.SortKey)
+            .ThenByDescending(p => p.Summary.ProposalId, StringComparer.Ordinal)
+            .Select(p => p.Summary)
+            .ToList();
+
+        return new WorkspaceStatus(
+            resolvedBranchId,
+            workUnitId,
+            currentWorkUnit?.Status,
+            pagedFiles,
+            orderedProposals,
+            orderedFiles.Count == 0 && addedFiles == 0 && modifiedFiles == 0 && deletedFiles == 0
+                ? null
+                : new WorkspaceStatusDiffStats(addedFiles, modifiedFiles, deletedFiles, addedLines, removedLines),
+            truncated,
+            limit,
+            offset,
+            nextOffset,
+            DateTimeOffset.UtcNow);
+    }
+
     public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken cancellationToken = default)
     {
         var children = _workUnits.Values
@@ -303,6 +403,85 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             .OrderBy(w => w.CreatedAt)
             .ToList();
         return Task.FromResult<IReadOnlyList<WorkUnit>>(dependents);
+    }
+
+    private static (DateTimeOffset SortKey, WorkspaceStatusProposalSummary Summary, IReadOnlyList<WorkspaceStatusFileChange> ChangedFiles) BuildProposalSnapshot(MergeProposal proposal, DateTimeOffset sortKey)
+    {
+        var (changedFiles, addedLines, removedLines) = ParseChangedFiles(proposal.ProposalId, proposal.WorkspaceChanges, proposal.FilesTouched);
+        var addedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Added);
+        var modifiedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Modified);
+        var deletedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Deleted);
+
+        return (
+            sortKey,
+            new WorkspaceStatusProposalSummary(
+                proposal.ProposalId,
+                proposal.Status,
+                proposal.FilesTouched,
+                addedFiles,
+                modifiedFiles,
+                deletedFiles,
+                addedLines,
+                removedLines,
+                proposal.Summary,
+                proposal.DiffGeneratedAt),
+            changedFiles);
+    }
+
+    private static (IReadOnlyList<WorkspaceStatusFileChange> ChangedFiles, int? AddedLines, int? RemovedLines) ParseChangedFiles(
+        string proposalId,
+        string? workspaceChanges,
+        IReadOnlyList<string> fallbackFilesTouched)
+    {
+        if (string.IsNullOrWhiteSpace(workspaceChanges))
+        {
+            var fallbackChanges = fallbackFilesTouched
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(path => new WorkspaceStatusFileChange(path, WorkspaceChangeKind.Changed, proposalId))
+                .ToList();
+            return (fallbackChanges, null, null);
+        }
+
+        var changes = new List<WorkspaceStatusFileChange>();
+        WorkspaceChangeKind? currentKind = null;
+        int addedLines = 0;
+
+        foreach (var rawLine in workspaceChanges.Split('\n'))
+        {
+            var line = rawLine.TrimEnd('\r');
+            if (line.StartsWith("+++ ADDED: ", StringComparison.Ordinal))
+            {
+                currentKind = WorkspaceChangeKind.Added;
+                changes.Add(new WorkspaceStatusFileChange(line["+++ ADDED: ".Length..], WorkspaceChangeKind.Added, proposalId));
+                continue;
+            }
+
+            if (line.StartsWith("~~~ MODIFIED: ", StringComparison.Ordinal))
+            {
+                currentKind = WorkspaceChangeKind.Modified;
+                changes.Add(new WorkspaceStatusFileChange(line["~~~ MODIFIED: ".Length..], WorkspaceChangeKind.Modified, proposalId));
+                continue;
+            }
+
+            if (line.StartsWith("--- DELETED: ", StringComparison.Ordinal))
+            {
+                currentKind = WorkspaceChangeKind.Deleted;
+                changes.Add(new WorkspaceStatusFileChange(line["--- DELETED: ".Length..], WorkspaceChangeKind.Deleted, proposalId));
+                continue;
+            }
+
+            if (currentKind is WorkspaceChangeKind.Added or WorkspaceChangeKind.Modified && line.StartsWith("+ ", StringComparison.Ordinal))
+                addedLines++;
+        }
+
+        if (changes.Count == 0)
+        {
+            changes.AddRange(fallbackFilesTouched
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(path => new WorkspaceStatusFileChange(path, WorkspaceChangeKind.Changed, proposalId)));
+        }
+
+        return (changes, addedLines, null);
     }
 
     // Slice 0a — bypasses CreateAsync's parent-existence check (children can be loaded before

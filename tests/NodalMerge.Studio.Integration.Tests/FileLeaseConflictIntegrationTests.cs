@@ -139,6 +139,88 @@ public class FileLeaseConflictIntegrationTests
     }
 
     /// <summary>
+    /// Phase 14 — same collision as the first test, but with an explicit sessionId on both
+    /// EnqueueAsync calls so the waiter's collision actually gets attributed to a session: proves
+    /// McpToolDispatcher.CheckFileLeaseAsync records a FileLeaseContended event on conflict, and
+    /// that WorkspaceUsageMetricsService surfaces it as a lease-contention hot spot.
+    /// </summary>
+    [Fact]
+    public async Task ConflictingWaiter_RecordsFileLeaseContendedEvent()
+    {
+        const string path = "src/Shared.cs";
+        const string sessionId = "SES-lease-contention-1";
+        var fakeHandler = new FileLeaseConflictLlmHandler { Path = path };
+
+        var app = StudioWebApplication.Build(
+            [],
+            llmHttpClient: new HttpClient(fakeHandler),
+            configureServices: services => services.AddInMemoryStorage());
+
+        var orchestratorSvc = app.Services.GetRequiredService<IOrchestratorService>();
+        var scheduler        = app.Services.GetRequiredService<IWorkScheduler>();
+        var tasks             = app.Services.GetRequiredService<ITaskService>();
+        var fileWorkspace     = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var events            = app.Services.GetRequiredService<IExecutionEventStream>();
+        var usageMetrics      = app.Services.GetRequiredService<IWorkspaceUsageMetricsService>();
+        var agentRuntime      = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
+
+        await agentRuntime.StartAsync(CancellationToken.None);
+        try
+        {
+            var holder = await orchestratorSvc.CreateWorkUnitAsync("Introduce Shared.cs", "test");
+            var waiter = await orchestratorSvc.CreateWorkUnitAsync("Also touch Shared.cs", "test");
+
+            var holderTask = await tasks.CreateAsync(new StudioTask(
+                Guid.NewGuid().ToString("N"), holder.WorkUnitId, holder.Goal, "Execute", StudioTaskStatus.Open, null, 0));
+            var waiterTask = await tasks.CreateAsync(new StudioTask(
+                Guid.NewGuid().ToString("N"), waiter.WorkUnitId, waiter.Goal, "Execute", StudioTaskStatus.Open, null, 0));
+
+            fakeHandler.HolderWorkUnitId = holder.WorkUnitId;
+            fakeHandler.HolderBranchId = holder.BranchId;
+            fakeHandler.WaiterWorkUnitId = waiter.WorkUnitId;
+            fakeHandler.WaiterBranchId = waiter.BranchId;
+
+            await scheduler.EnqueueAsync(
+                holder.WorkUnitId, "worker", holderTask.TaskId,
+                model: "fake-model", baseUrl: "http://fake-llm", apiKey: "fake-key", provider: "anthropic",
+                sessionId: sessionId);
+
+            var writeDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+            while (DateTimeOffset.UtcNow < writeDeadline
+                   && await fileWorkspace.ReadAsync(holder.BranchId, path) is null)
+                await Task.Delay(50);
+            Assert.NotNull(await fileWorkspace.ReadAsync(holder.BranchId, path));
+
+            await scheduler.EnqueueAsync(
+                waiter.WorkUnitId, "worker", waiterTask.TaskId,
+                model: "fake-model", baseUrl: "http://fake-llm", apiKey: "fake-key", provider: "anthropic",
+                sessionId: sessionId);
+
+            IReadOnlyList<ExecutionEvent> contendedEvents = [];
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(10);
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                contendedEvents = await events.GetEventsByKindAsync([ExecutionEventKind.FileLeaseContended]);
+                if (contendedEvents.Count > 0) break;
+                await Task.Delay(50);
+            }
+
+            Assert.Single(contendedEvents);
+            Assert.Equal(sessionId, contendedEvents[0].SessionId);
+            Assert.Equal(waiter.WorkUnitId, contendedEvents[0].WorkUnitId);
+
+            var hotSpots = await usageMetrics.GetLeaseContentionHotSpotsAsync();
+            var hotSpot = Assert.Single(hotSpots, h => h.Path == path);
+            Assert.Equal(1, hotSpot.ContentionCount);
+            Assert.Contains(waiter.WorkUnitId, hotSpot.ContendingWorkUnitIds);
+        }
+        finally
+        {
+            await agentRuntime.StopAsync(CancellationToken.None);
+        }
+    }
+
+    /// <summary>
     /// Same collision as above, but instead of the holder's proposal merging, a human rejects it
     /// outright — the realistic "this isn't right, abandon it" case, and the one a human actually
     /// hits often (unlike racing to IAgentControlService.StopAsync a worker mid-network-call,

@@ -485,6 +485,15 @@ internal sealed class OrchestratorAgentLoop(
             new(McpToolNames.WorkspaceSummary, "Get a summary of the current workspace state.",
                 Schema([], new() { ["branchId"] = Str("Branch ID filter (optional)") })),
 
+            new(McpToolNames.WorkspaceStatus, "Get a concise workspace status view with changed files and proposal summaries.",
+                Schema([], new()
+                {
+                    ["branchId"] = Str("Branch ID filter (optional)"),
+                    ["workUnitId"] = Str("Work unit ID to resolve the authoritative branch and current proposal chain (optional)"),
+                    ["limit"] = Str("Maximum changed-file entries to return (optional, default 50)"),
+                    ["offset"] = Str("Changed-file page offset (optional, default 0)"),
+                })),
+
             new(McpToolNames.SnapshotGet, "Get an agent's execution snapshot.",
                 Schema(["agentId", "workUnitId"], new()
                 {

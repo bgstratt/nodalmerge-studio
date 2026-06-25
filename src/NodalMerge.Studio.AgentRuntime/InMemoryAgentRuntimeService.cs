@@ -140,6 +140,12 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 }
             }
             catch (OperationCanceledException) { break; }
+            catch (ObjectDisposedException)
+            {
+                // Host shutdown can dispose the DI root while the poll loop is unwinding.
+                // That's terminal for this runtime instance, not an operational failure.
+                break;
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[Scheduler] Poll iteration failed.");
@@ -152,6 +158,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 if (timerService is not null)
                     await timerService.ProcessExpiredAsync(ct).ConfigureAwait(false);
             }
+            catch (ObjectDisposedException) { break; }
             catch { /* timer processing is best-effort */ }
 
             try { await Task.Delay(_options.SchedulerPollIntervalMs, ct).ConfigureAwait(false); }
@@ -166,6 +173,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         var cts = new CancellationTokenSource();
         var success = false;
         var awaitingFileLease = false;
+        var awaitingClarification = false;
         string? failureReason = null;
 
         try
@@ -272,6 +280,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     success = true;
                 else if (completion == AgentLoopCompletion.AwaitingFileLease)
                     awaitingFileLease = true;
+                else if (completion == AgentLoopCompletion.AwaitingClarification)
+                    awaitingClarification = true;
                 else if (completion == AgentLoopCompletion.MaxIterationsExceeded)
                     failureReason = "Max iterations reached";
                 else if (completion == AgentLoopCompletion.Succeeded && !workerProgressVerified)
@@ -317,6 +327,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 await _scheduler.MarkAwaitingFileLeaseAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                 _logger.LogInformation(
                     "[Scheduler] Parked workUnit={WorkUnitId} awaiting file lease", item.WorkUnitId);
+            }
+            else if (awaitingClarification)
+            {
+                _logger.LogInformation(
+                    "[Scheduler] Parked workUnit={WorkUnitId} awaiting clarification", item.WorkUnitId);
             }
             else
             {
