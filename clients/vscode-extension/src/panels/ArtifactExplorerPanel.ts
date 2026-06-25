@@ -1815,9 +1815,11 @@ const GW_JS = `
       var children = (byParent[wu.workUnitId] || []);
       if (children.length >= 2) {
         var childForkTypes = children.map(function(c) { return c.forkType || ''; }).filter(function(t) { return t && t.toLowerCase() !== 'unknown'; });
-        if (childForkTypes.length >= 2 || children.length >= 2) {
+        // Show "Compare Results" only for experiment forks (children with named fork types),
+        // not for normal Decompose fan-outs where children are dividing work, not competing.
+        if (childForkTypes.length >= 2) {
           html += '<div class="dn-exp-badges">';
-          html += '<span class="badge forks">' + children.length + ' forks</span>';
+          html += '<span class="badge forks">' + childForkTypes.length + ' forks</span>';
           html += '<span class="compare-link" data-exp-parent="' + esc(wu.workUnitId) + '">Compare Results</span>';
           html += '</div>';
         }

@@ -18,6 +18,20 @@ public sealed class InlineReviewerService(
         CancellationToken ct = default)
     {
         var creds = agentControl.GetOrchestratorCredentials(workUnitId);
+
+        // When the work unit is a child worker spawned by fan-out, the orchestrator
+        // credentials are registered on the parent, not the child. Walk up to find them.
+        if (creds is null)
+        {
+            var workUnits = serviceProvider.GetService<IWorkUnitService>();
+            if (workUnits is not null)
+            {
+                var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+                if (wu?.ParentWorkUnitId is { } parentId)
+                    creds = agentControl.GetOrchestratorCredentials(parentId);
+            }
+        }
+
         if (creds is null)
             return new InlineReviewResult(false, "No LLM credentials configured for this work unit.");
 

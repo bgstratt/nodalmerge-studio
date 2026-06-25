@@ -185,6 +185,10 @@ internal sealed class OrchestratorAgentLoop(
         await fanOut.TryFanOutFromPlanAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
         await mergeReconciliation.TryReconcileAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
         await automatedReview.TryEnqueueReviewerAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+
+        // Mark the orchestrator work unit as completed so the decision tree reflects it.
+        await workUnits.UpdateStatusAsync(workUnitId, WorkUnitStatus.Completed, cancellationToken: ct).ConfigureAwait(false);
+
         return AgentLoopCompletion.Succeeded;
     }
 

@@ -96,6 +96,7 @@ public static class WorkUnitTransitions
             (WorkUnitStatus.Queued, WorkUnitStatus.Waiting) => true,
             (WorkUnitStatus.Executing, WorkUnitStatus.Waiting) => true,
             (WorkUnitStatus.Waiting, WorkUnitStatus.Queued) => true,
+            (WorkUnitStatus.Executing, WorkUnitStatus.Completed) => true,
             (WorkUnitStatus.Executing, WorkUnitStatus.Proposed) => true,
             (WorkUnitStatus.Executing, WorkUnitStatus.Retrying) => true,
             (WorkUnitStatus.Retrying, WorkUnitStatus.Executing) => true,
