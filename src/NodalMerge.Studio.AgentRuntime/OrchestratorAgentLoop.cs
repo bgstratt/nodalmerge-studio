@@ -183,11 +183,25 @@ internal sealed class OrchestratorAgentLoop(
             return AgentLoopCompletion.MaxIterationsExceeded;
 
         await fanOut.TryFanOutFromPlanAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
-        await mergeReconciliation.TryReconcileAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+        var reconciliation = await mergeReconciliation.TryReconcileAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
         await automatedReview.TryEnqueueReviewerAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
 
-        // Mark the orchestrator work unit as completed so the decision tree reflects it.
-        await workUnits.UpdateStatusAsync(workUnitId, WorkUnitStatus.Completed, cancellationToken: ct).ConfigureAwait(false);
+        // Only complete the orchestrator work unit when children have actually finished and
+        // reconciliation reached a terminal outcome. On the first pass (no plan yet, or
+        // children that haven't been created / haven't produced proposals yet) the status
+        // check keeps the orchestrator in its current state so later re-invocations can
+        // pick up where it left off without hitting Completed → Completed.
+        if (reconciliation.Outcome is MergeReconciliationOutcome.Reconciled
+                or MergeReconciliationOutcome.AlreadyReconciled
+                or MergeReconciliationOutcome.Conflict)
+        {
+            var orchestrator = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (orchestrator?.Status != WorkUnitStatus.Completed)
+            {
+                await workUnits.UpdateStatusAsync(workUnitId, WorkUnitStatus.Completed, cancellationToken: ct)
+                    .ConfigureAwait(false);
+            }
+        }
 
         return AgentLoopCompletion.Succeeded;
     }

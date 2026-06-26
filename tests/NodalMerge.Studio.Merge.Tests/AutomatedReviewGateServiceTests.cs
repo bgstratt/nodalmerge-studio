@@ -445,6 +445,18 @@ public class AutomatedReviewGateServiceTests
             string workUnitId, string? type = null, string? keywords = null, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
 
+        public Task<ArtifactRef> RecordPlanAsync(string workUnitId, string planContent, CancellationToken ct = default) =>
+            Task.FromResult(new ArtifactRef(
+                $"PLAN-{Guid.NewGuid():N}",
+                ArtifactType.Plan,
+                workUnitId,
+                ArtifactStatus.Active,
+                DateTimeOffset.UtcNow,
+                workUnitId,
+                null,
+                "Plan",
+                planContent));
+
         public Task<IReadOnlyList<ArtifactRef>> ListAsync(
             string workUnitId, bool includeAncestors = true, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);

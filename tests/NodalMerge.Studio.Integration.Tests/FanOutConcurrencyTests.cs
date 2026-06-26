@@ -72,7 +72,7 @@ public class FanOutConcurrencyTests
 
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits    = app.Services.GetRequiredService<IWorkUnitService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts    = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut        = app.Services.GetRequiredService<IFanOutService>();
         var agentControl  = app.Services.GetRequiredService<IAgentControlService>();
 
@@ -91,7 +91,16 @@ public class FanOutConcurrencyTests
               ]
             }
             """;
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, planJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}",
+            ArtifactType.Plan,
+            parent.WorkUnitId,
+            ArtifactStatus.Active,
+            DateTimeOffset.UtcNow,
+            parent.WorkUnitId,
+            null,
+            "Plan",
+            planJson));
 
         // Several concurrent calls racing for the same parent — before the 13g fix, each one
         // independently sees the plan's three slices unmapped (no children created yet) and

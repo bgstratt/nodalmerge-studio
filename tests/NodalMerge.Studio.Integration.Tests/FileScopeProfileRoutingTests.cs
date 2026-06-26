@@ -20,7 +20,7 @@ public class FileScopeProfileRoutingTests
             configureServices: services => services.AddInMemoryStorage());
 
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut = app.Services.GetRequiredService<IFanOutService>();
         var profiles = app.Services.GetRequiredService<IAgentProfileService>();
         var decisionLog = app.Services.GetRequiredService<IOrchestrationDecisionLogService>();
@@ -39,7 +39,9 @@ public class FileScopeProfileRoutingTests
               ]
             }
             """;
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, planJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}", ArtifactType.Plan, parent.WorkUnitId,
+            ArtifactStatus.Active, DateTimeOffset.UtcNow, parent.WorkUnitId, null, "Plan", planJson));
 
         var result = await fanOut.TryFanOutFromPlanAsync(parent.WorkUnitId);
 
@@ -59,7 +61,7 @@ public class FileScopeProfileRoutingTests
             configureServices: services => services.AddInMemoryStorage());
 
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut = app.Services.GetRequiredService<IFanOutService>();
         var profiles = app.Services.GetRequiredService<IAgentProfileService>();
         var decisionLog = app.Services.GetRequiredService<IOrchestrationDecisionLogService>();
@@ -76,7 +78,9 @@ public class FileScopeProfileRoutingTests
               ]
             }
             """;
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, planJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}", ArtifactType.Plan, parent.WorkUnitId,
+            ArtifactStatus.Active, DateTimeOffset.UtcNow, parent.WorkUnitId, null, "Plan", planJson));
 
         var result = await fanOut.TryFanOutFromPlanAsync(parent.WorkUnitId);
 
@@ -96,7 +100,7 @@ public class FileScopeProfileRoutingTests
             configureServices: services => services.AddInMemoryStorage());
 
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut = app.Services.GetRequiredService<IFanOutService>();
         var profiles = app.Services.GetRequiredService<IAgentProfileService>();
         var decisionLog = app.Services.GetRequiredService<IOrchestrationDecisionLogService>();
@@ -115,7 +119,9 @@ public class FileScopeProfileRoutingTests
               ]
             }
             """;
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, planJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}", ArtifactType.Plan, parent.WorkUnitId,
+            ArtifactStatus.Active, DateTimeOffset.UtcNow, parent.WorkUnitId, null, "Plan", planJson));
 
         await fanOut.TryFanOutFromPlanAsync(parent.WorkUnitId);
 
@@ -133,7 +139,7 @@ public class FileScopeProfileRoutingTests
             configureServices: services => services.AddInMemoryStorage());
 
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut = app.Services.GetRequiredService<IFanOutService>();
         var profiles = app.Services.GetRequiredService<IAgentProfileService>();
         var decisionLog = app.Services.GetRequiredService<IOrchestrationDecisionLogService>();
@@ -152,7 +158,9 @@ public class FileScopeProfileRoutingTests
               ]
             }
             """;
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, planJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}", ArtifactType.Plan, parent.WorkUnitId,
+            ArtifactStatus.Active, DateTimeOffset.UtcNow, parent.WorkUnitId, null, "Plan", planJson));
 
         var result = await fanOut.TryFanOutFromPlanAsync(parent.WorkUnitId);
 

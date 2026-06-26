@@ -228,11 +228,11 @@ public sealed class MergeReconciliationService(
 
             // base/{proposalId} is a snapshot of the proposal's TargetBranch (usually "main"), not
             // the immediate parent/sibling branch each child actually forked from. A file the
-            // children only inherited from their common parent (e.g. plan.json, which intentionally
-            // never lands in main) doesn't exist in that snapshot, so the line-diff below would see
-            // "added from nothing" for every sibling and flag a conflict despite nobody having
-            // touched it. Identical content across all flagged proposals is never a real conflict
-            // regardless of what the baseline snapshot does or doesn't contain.
+            // children only inherited from their common parent doesn't exist in that snapshot, so
+            // the line-diff below would see "added from nothing" for every sibling and flag a
+            // conflict despite nobody having touched it. Identical content across all flagged
+            // proposals is never a real conflict regardless of what the baseline snapshot does or
+            // doesn't contain.
             if (afterContents.Values.Distinct().Count() <= 1)
                 continue;
 

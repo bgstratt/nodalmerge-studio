@@ -43,7 +43,7 @@ public class PolicyGateFanOutTests
 
         var orchestrator  = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits     = app.Services.GetRequiredService<IWorkUnitService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts     = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut        = app.Services.GetRequiredService<IFanOutService>();
         var decisionLog   = app.Services.GetRequiredService<IOrchestrationDecisionLogService>();
 
@@ -63,7 +63,9 @@ public class PolicyGateFanOutTests
             }
             """;
 
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, planJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}", ArtifactType.Plan, parent.WorkUnitId,
+            ArtifactStatus.Active, DateTimeOffset.UtcNow, parent.WorkUnitId, null, "Plan", planJson));
 
         var result = await fanOut.TryFanOutFromPlanAsync(parent.WorkUnitId);
 

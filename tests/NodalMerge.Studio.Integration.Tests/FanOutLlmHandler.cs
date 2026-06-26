@@ -3,6 +3,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using NodalMerge.Studio.Contracts.Domain;
+using NodalMerge.Studio.Contracts.Versioning;
 
 namespace NodalMerge.Studio.Integration.Tests;
 
@@ -25,7 +26,7 @@ internal sealed class ImmediateEndTurnLlmHandler : HttpMessageHandler
 
 /// <summary>
 /// Fake LLM handler for Phase 4 slice 11b fan-out: orchestrator enqueues planner,
-/// planner writes plan.json, orchestrator re-invoked for fan-out, parallel workers execute slices.
+/// planner records plan artifact, orchestrator re-invoked for fan-out, parallel workers execute slices.
 /// </summary>
 internal sealed class FanOutLlmHandler : HttpMessageHandler
 {
@@ -132,11 +133,10 @@ internal sealed class FanOutLlmHandler : HttpMessageHandler
         return step switch
         {
             0 => ToolUse("tu-p-1", "nm_v1_workunit_get", new { workUnitId = wuId }),
-            1 => ToolUse("tu-p-2", "nm_v1_workspace_write", new
+             1 => ToolUse("tu-p-2", McpToolNames.ArtifactRecordPlan, new
             {
-                branchId,
-                path = PlanDocumentPaths.FileName,
-                content = planJson
+                workUnitId = wuId,
+                planContent = planJson
             }),
             _ => EndTurn(),
         };

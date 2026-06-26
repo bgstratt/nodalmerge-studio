@@ -56,9 +56,10 @@ public static class McpToolNames
 
     public const string IntentRecord = "nm_v1_intent_record";
 
-    public const string ArtifactRecord = "nm_v1_artifact_record";
-    public const string ArtifactQuery  = "nm_v1_artifact_query";
-    public const string ArtifactList   = "nm_v1_artifact_list";
+    public const string ArtifactRecord     = "nm_v1_artifact_record";
+    public const string ArtifactRecordPlan = "nm_v1_artifact_record_plan";
+    public const string ArtifactQuery      = "nm_v1_artifact_query";
+    public const string ArtifactList       = "nm_v1_artifact_list";
 
     public const string WorkspaceRead    = "nm_v1_workspace_read";
     public const string WorkspaceReadMany = "nm_v1_workspace_read_many";
@@ -144,6 +145,7 @@ public static class McpToolNames
         ClarificationRequest,
         IntentRecord,
         ArtifactRecord,
+        ArtifactRecordPlan,
         ArtifactQuery,
         ArtifactList,
         WorkspaceRead,

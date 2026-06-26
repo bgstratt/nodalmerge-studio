@@ -4,6 +4,8 @@ using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Host;
 using NodalMerge.Studio.Storage;
+using StudioArtifactStatus = NodalMerge.Studio.Contracts.Domain.ArtifactStatus;
+
 
 namespace NodalMerge.Studio.Integration.Tests;
 
@@ -20,7 +22,7 @@ public class FanOutServiceTests
 
         var orchestrator  = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits     = app.Services.GetRequiredService<IWorkUnitService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts     = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut        = app.Services.GetRequiredService<IFanOutService>();
         var agentControl  = app.Services.GetRequiredService<IAgentControlService>();
 
@@ -52,7 +54,16 @@ public class FanOutServiceTests
             }
             """;
 
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, planJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}",
+            ArtifactType.Plan,
+            parent.WorkUnitId,
+            StudioArtifactStatus.Active,
+            DateTimeOffset.UtcNow,
+            parent.WorkUnitId,
+            null,
+            "Plan",
+            planJson));
 
         // FanOutService.TryFanOutFromPlanAsync is idempotent and gated per parent (see
         // FanOutService._parentGates) precisely because the orchestrator loop spawned above also
@@ -102,6 +113,7 @@ public class FanOutServiceTests
         var orchestrator   = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits       = app.Services.GetRequiredService<IWorkUnitService>();
         var fileWorkspace   = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts       = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut          = app.Services.GetRequiredService<IFanOutService>();
         var agentControl    = app.Services.GetRequiredService<IAgentControlService>();
         var mergeCommands   = app.Services.GetRequiredService<IMergeCommandService>();
@@ -145,7 +157,16 @@ public class FanOutServiceTests
             }
             """;
 
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, planJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}",
+            ArtifactType.Plan,
+            parent.WorkUnitId,
+            StudioArtifactStatus.Active,
+            DateTimeOffset.UtcNow,
+            parent.WorkUnitId,
+            null,
+            "Plan",
+            planJson));
 
         await fanOut.TryFanOutFromPlanAsync(parent.WorkUnitId);
 

@@ -88,9 +88,7 @@ public sealed class FanOutService : IFanOutService
         if (parent is null)
             return new FanOutResult(actions, enqueued);
 
-        var planContent = await _fileWorkspace
-            .ReadAsync(parent.BranchId, PlanDocumentPaths.FileName, ct)
-            .ConfigureAwait(false);
+        var planContent = await ReadPlanFromArtifactAsync(parent.WorkUnitId, ct).ConfigureAwait(false);
         if (planContent is null)
             return new FanOutResult(actions, enqueued);
 
@@ -106,9 +104,6 @@ public sealed class FanOutService : IFanOutService
 
         if (plan is null || plan.Slices.Count == 0)
             return new FanOutResult(actions, enqueued);
-
-        if (await EnsurePlanArtifactAsync(parent, planContent, ct).ConfigureAwait(false))
-            actions.Add(FanOutAction.PlanRecorded);
 
         var gate = _parentGates.GetOrAdd(parentWorkUnitId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct).ConfigureAwait(false);
@@ -150,24 +145,29 @@ public sealed class FanOutService : IFanOutService
         return new FanOutResult(actions, enqueued);
     }
 
-    private async Task<bool> EnsurePlanArtifactAsync(WorkUnit parent, string planContent, CancellationToken ct)
+    private async Task<string?> ReadPlanFromArtifactAsync(string workUnitId, CancellationToken ct)
     {
-        var chain = await _artifacts.GetChainAsync(parent.WorkUnitId, ct).ConfigureAwait(false);
-        if (chain.Any(a => a.Type == ArtifactType.Plan))
-            return false;
+        var chain = await _artifacts.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
+        var planArtifact = chain.LastOrDefault(a => a.Type == ArtifactType.Plan);
+        if (planArtifact?.Body is not null)
+            return planArtifact.Body;
 
-        var planId = $"PLAN-{Guid.NewGuid():N}";
-        await _artifacts.RecordAsync(new ArtifactRef(
-            planId,
-            ArtifactType.Plan,
-            parent.WorkUnitId,
-            ArtifactStatus.Active,
-            DateTimeOffset.UtcNow,
-            parent.WorkUnitId,
-            null,
-            "Plan",
-            planContent), ct).ConfigureAwait(false);
-        return true;
+        // Fallback: the planner may have written plan.json directly to the workspace
+        // branch (e.g. if its AllowedTools was missing ArtifactRecordPlan). Read it
+        // from the orchestrator's own branch so fan-out can still proceed.
+        var parent = await _workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+        if (parent is not null)
+        {
+            try
+            {
+                var fileContent = await _fileWorkspace.ReadAsync(parent.BranchId, "plan.json", ct).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(fileContent))
+                    return fileContent;
+            }
+            catch (FileNotFoundException) { }
+        }
+
+        return null;
     }
 
     private async Task<Dictionary<string, string>> BuildSliceMapAsync(string parentWorkUnitId, CancellationToken ct)

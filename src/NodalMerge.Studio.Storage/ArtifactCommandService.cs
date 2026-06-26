@@ -35,6 +35,22 @@ public sealed class ArtifactCommandService(IArtifactLineageService artifacts, IW
         return await artifacts.RecordAsync(artifact, ct).ConfigureAwait(false);
     }
 
+    public async Task<ArtifactRef> RecordPlanAsync(string workUnitId, string planContent, CancellationToken ct = default)
+    {
+        var artifact = new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}",
+            ArtifactType.Plan,
+            workUnitId,
+            StudioArtifactStatus.Active,
+            DateTimeOffset.UtcNow,
+            workUnitId,
+            null,
+            "Plan",
+            planContent);
+
+        return await artifacts.RecordAsync(artifact, ct).ConfigureAwait(false);
+    }
+
     public async Task<IReadOnlyList<ArtifactRef>> QueryAsync(
         string workUnitId,
         string? type = null,

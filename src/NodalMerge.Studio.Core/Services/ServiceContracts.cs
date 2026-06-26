@@ -795,6 +795,13 @@ public interface IArtifactCommandService
         string? parentArtifactId = null,
         CancellationToken ct = default);
 
+    /// <summary>
+    /// Records a Plan artifact in the DAG, attached to the work unit's artifact lineage.
+    /// Replaces the planner's old nm_v1_workspace_write-to-plan.json pattern — the plan
+    /// now lives exclusively in the DAG, not as a physical file on the branch.
+    /// </summary>
+    Task<ArtifactRef> RecordPlanAsync(string workUnitId, string planContent, CancellationToken ct = default);
+
     Task<IReadOnlyList<ArtifactRef>> QueryAsync(
         string workUnitId,
         string? type = null,

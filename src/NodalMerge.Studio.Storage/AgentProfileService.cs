@@ -78,6 +78,7 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                     McpToolNames.WorkspaceSymbolImplementation,
                     McpToolNames.ClarificationRequest,
                     McpToolNames.ArtifactQuery,
+                    McpToolNames.ArtifactRecordPlan,
                 ],
                 15,
                 []),

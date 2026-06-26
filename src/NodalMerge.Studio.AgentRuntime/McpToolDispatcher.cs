@@ -95,9 +95,10 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.SchedulerPending => await SchedulerPendingAsync(ct),
                 McpToolNames.ClarificationRequest => await ClarificationRequestAsync(input, ct, sessionId),
                 McpToolNames.IntentRecord     => await IntentRecordAsync(input, ct),
-                McpToolNames.ArtifactRecord   => await ArtifactRecordAsync(input, ct),
-                McpToolNames.ArtifactQuery    => await ArtifactQueryAsync(input, ct),
-                McpToolNames.ArtifactList     => await ArtifactListAsync(input, ct),
+                McpToolNames.ArtifactRecord     => await ArtifactRecordAsync(input, ct),
+                McpToolNames.ArtifactRecordPlan => await ArtifactRecordPlanAsync(input, ct),
+                McpToolNames.ArtifactQuery      => await ArtifactQueryAsync(input, ct),
+                McpToolNames.ArtifactList       => await ArtifactListAsync(input, ct),
                 McpToolNames.WorkspaceBuild   => await WorkspaceBuildAsync(input, ct),
                 McpToolNames.WorkspaceTest    => await WorkspaceTestAsync(input, ct),
                 McpToolNames.WorkspaceExec    => await WorkspaceExecAsync(input, ct),
@@ -786,6 +787,17 @@ internal sealed class McpToolDispatcher(
         {
             return ToError(ex.Message);
         }
+    }
+
+    private async Task<string> ArtifactRecordPlanAsync(JsonElement input, CancellationToken ct)
+    {
+        var workUnitId = Str(input, "workUnitId");
+        var planContent = Str(input, "planContent");
+        if (workUnitId is null || planContent is null)
+            return ToError("workUnitId and planContent are required.");
+
+        var recorded = await artifactCommands.RecordPlanAsync(workUnitId, planContent, ct).ConfigureAwait(false);
+        return ToJson(new { artifactId = recorded.ArtifactId, workUnitId });
     }
 
     private async Task<string> ArtifactQueryAsync(JsonElement input, CancellationToken ct)

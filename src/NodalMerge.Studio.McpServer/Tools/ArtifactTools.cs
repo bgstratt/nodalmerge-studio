@@ -47,6 +47,16 @@ public sealed class ArtifactTools(IArtifactCommandService artifacts)
         }
     }
 
+    [McpServerTool(Name = McpToolNames.ArtifactRecordPlan), Description("Record a Plan artifact in the DAG for a work unit. Replaces writing plan.json to the workspace.")]
+    public async Task<string> RecordPlanAsync(
+        string workUnitId,
+        string planContent,
+        CancellationToken cancellationToken = default)
+    {
+        var recorded = await artifacts.RecordPlanAsync(workUnitId, planContent, cancellationToken).ConfigureAwait(false);
+        return McpJson.Ok(new { artifactId = recorded.ArtifactId, workUnitId });
+    }
+
     [McpServerTool(Name = McpToolNames.ArtifactList), Description("List the full artifact chain for a work unit, including ancestors' artifacts by default.")]
     public async Task<string> ListAsync(
         string workUnitId,

@@ -57,7 +57,8 @@ internal sealed class PlannerAgentLoop(
            - fileScope: list of file paths this slice may touch (search-verified per step 5)
            - dependsOn: list of sliceIds that must complete first (empty for independent slices)
            - steps: ordered implementation steps for the worker
-        7. Write plan.json to your branch using nm_v1_workspace_write with this exact JSON shape:
+        7. Record the plan using nm_v1_artifact_record_plan with your workUnitId and the plan JSON content.
+           The plan JSON must follow this exact shape:
            { "slices": [ { "sliceId": "...", "goal": "...", "fileScope": [...], "dependsOn": [...], "steps": [...] } ] }
         8. Stop — the orchestrator will fan out child workers from your plan.
           9. If key requirements are ambiguous and slicing would require guessing, call
@@ -350,6 +351,13 @@ internal sealed class PlannerAgentLoop(
                     ["line"]       = Int("1-based line number for location-based lookup (optional)"),
                     ["column"]     = Int("1-based column number for location-based lookup (optional)"),
                     ["maxResults"] = Int("Maximum results to return (optional, default 200)"),
+                })),
+
+            new(McpToolNames.ArtifactRecordPlan, "Record a Plan artifact directly in the DAG artifact lineage for this work unit. Use this to submit a completed plan instead of writing plan.json to the workspace.",
+                Schema(["workUnitId", "planContent"], new()
+                {
+                    ["workUnitId"]  = Str("Your work unit ID"),
+                    ["planContent"] = Str("The plan JSON content exactly as described in step 7"),
                 })),
         ];
     }

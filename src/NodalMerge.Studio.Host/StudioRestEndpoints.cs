@@ -2202,6 +2202,10 @@ public static class StudioRestEndpoints
         string Body,
         string? ParentArtifactId = null);
 
+    private sealed record PlanArtifactBody(
+        string WorkUnitId,
+        string PlanContent);
+
     private static void MapArtifactEndpoints(WebApplication app)
     {
         app.MapGet("/studio/artifacts/{artifactId}", async (
@@ -2249,6 +2253,20 @@ public static class StudioRestEndpoints
             {
                 return Results.BadRequest(new { error = ex.Message });
             }
+        });
+
+        app.MapPost("/studio/artifacts/plan", async (
+            PlanArtifactBody body,
+            IArtifactCommandService artifactCommands,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+            if (string.IsNullOrWhiteSpace(body.PlanContent))
+                return Results.BadRequest(new { error = "planContent is required." });
+
+            var recorded = await artifactCommands.RecordPlanAsync(body.WorkUnitId, body.PlanContent, ct).ConfigureAwait(false);
+            return Results.Ok(recorded);
         });
 
         app.MapGet("/studio/artifacts", async (
