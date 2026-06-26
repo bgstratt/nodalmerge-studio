@@ -2132,7 +2132,7 @@ const GW_JS = `
       }
       (e.toolCalls || []).forEach(function(call) {
         var result = (e.toolResults || []).find(function(r) { return r.toolUseId === call.toolUseId; });
-        html += '<details class="conv-tool">';
+        html += '<details class="conv-tool" data-tool-use-id="' + esc(call.toolUseId || '') + '">';
         html += '<summary>🔧 ' + esc(call.name) + '</summary>';
         html += '<div class="conv-tool-label">Input</div>';
         html += '<pre class="conv-pre">' + esc(call.inputJson) + '</pre>';
@@ -2843,7 +2843,25 @@ const GW_JS = `
       if (msg.workUnitId === state.selectedNodeId) {
         state.selectedNodeConversation = msg.entries || [];
         var convPanel = document.getElementById('gw-panel-conversation');
-        if (convPanel) { convPanel.innerHTML = renderConversationTab(state.selectedNodeConversation); }
+        if (convPanel) {
+          // Polling re-renders this tab by full innerHTML replacement (entries can change shape
+          // mid-run), which would otherwise re-collapse every <details> the user had opened and
+          // reset their scroll position on every 2s tick. Snapshot by toolUseId (stable across
+          // polls) and the scrollable inspector column, then restore after the swap.
+          var openIds = Array.prototype.map.call(
+            convPanel.querySelectorAll('.conv-tool[open]'),
+            function(d) { return d.getAttribute('data-tool-use-id'); },
+          );
+          var scrollEl = document.getElementById('gw-col-inspector');
+          var scrollTop = scrollEl ? scrollEl.scrollTop : 0;
+          convPanel.innerHTML = renderConversationTab(state.selectedNodeConversation);
+          openIds.forEach(function(id) {
+            if (!id) { return; }
+            var d = convPanel.querySelector('.conv-tool[data-tool-use-id="' + CSS.escape(id) + '"]');
+            if (d) { d.setAttribute('open', ''); }
+          });
+          if (scrollEl) { scrollEl.scrollTop = scrollTop; }
+        }
       }
       return;
     }

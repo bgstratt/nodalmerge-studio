@@ -113,6 +113,19 @@ export class StudioShellPanel implements vscode.Disposable {
     void this.panel.webview.postMessage({ type: 'studio.showTab', tab: tabId });
   }
 
+  /** Re-runs each sub-panel's initial load. Each sub-panel's activate() only fetches host-backed
+   * data once at construction (unlike the polling panels), so a panel opened before the host
+   * finished starting — or left open across a host restart — never recovers that data on its
+   * own; this gives RESTART_HOST a way to force them to re-sync against the new host instance. */
+  refresh(): void {
+    this.activityCenter.activate();
+    this.modelAgentStudio.activate();
+    this.pathways.activate();
+    this.goalWorkspace.activate();
+    this.reviewPanel.activate();
+    this.insights.activate();
+  }
+
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
     if (msg.type === 'sessionOverrideChanged') {
       const panelId = msg.panelId as string;

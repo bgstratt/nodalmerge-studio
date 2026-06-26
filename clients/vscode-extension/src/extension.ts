@@ -51,6 +51,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       output.show();
       try {
         await manager.restart();
+        StudioShellPanel.current?.refresh();
         vscode.window.showInformationMessage('NodalMerge Studio Host restarted.');
       } catch (err) {
         vscode.window.showErrorMessage(`Failed to restart host: ${String(err)}`);
