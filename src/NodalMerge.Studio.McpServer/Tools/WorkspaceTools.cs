@@ -17,7 +17,7 @@ public sealed class WorkspaceTools(
 {
     // ── Existing ──────────────────────────────────────────────────────────
 
-    [McpServerTool(Name = McpToolNames.WorkspaceSummary), Description("Get workspace summary for control tower UIs.")]
+    [McpServerTool(Name = McpToolNames.WorkspaceSummary), Description("Get workspace summary for control tower UIs, including the managed root path and seed repository path — call this before assuming a directory exists or attempting any operation outside your current branch.")]
     public async Task<string> SummaryAsync(string? branchId = null, CancellationToken cancellationToken = default)
     {
         var summary = await workspace.GetSummaryAsync(branchId, cancellationToken).ConfigureAwait(false);

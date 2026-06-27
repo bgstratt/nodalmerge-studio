@@ -22,6 +22,7 @@ internal sealed class OrchestratorAgentLoop(
     IFanOutService fanOut,
     IMergeReconciliationService mergeReconciliation,
     IAutomatedReviewGateService automatedReview,
+    IMergeService merge,
     IWorkUnitService workUnits,
     IFindingService findings,
     AgentProfile? profile = null,
@@ -186,20 +187,28 @@ internal sealed class OrchestratorAgentLoop(
         var reconciliation = await mergeReconciliation.TryReconcileAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
         await automatedReview.TryEnqueueReviewerAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
 
-        // Only complete the orchestrator work unit when children have actually finished and
-        // reconciliation reached a terminal outcome. On the first pass (no plan yet, or
-        // children that haven't been created / haven't produced proposals yet) the status
-        // check keeps the orchestrator in its current state so later re-invocations can
-        // pick up where it left off without hitting Completed → Completed.
-        if (reconciliation.Outcome is MergeReconciliationOutcome.Reconciled
-                or MergeReconciliationOutcome.AlreadyReconciled
-                or MergeReconciliationOutcome.Conflict)
+        // Only complete the orchestrator work unit once the reconciled proposal has actually been
+        // approved/merged — Reconciled means a fresh proposal was just created in Draft status
+        // (pending review), and AlreadyReconciled only means a non-Rejected proposal already
+        // exists, which could still be sitting ReadyForReview/UnderReview. Without checking the
+        // proposal's own status, every successful reconciliation marked the orchestrator Completed
+        // immediately, before the automated/human reviewer ever ran — and since Completed is a
+        // terminal status (WorkUnitTransitions.CanTransition has no transition out of it), a later
+        // rejection's retry (Executing) or dead-letter escalation (DeadLettered) write would then
+        // silently fail (UpdateStatusAsync throws InvalidOperationException, swallowed by the
+        // caller), leaving the work unit stuck at Completed forever.
+        if (reconciliation.Outcome is MergeReconciliationOutcome.Reconciled or MergeReconciliationOutcome.AlreadyReconciled
+            && reconciliation.ReconciledProposalId is { } reconciledProposalId)
         {
-            var orchestrator = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
-            if (orchestrator?.Status != WorkUnitStatus.Completed)
+            var reconciledProposal = await merge.GetAsync(reconciledProposalId, ct).ConfigureAwait(false);
+            if (reconciledProposal?.Status is MergeProposalStatus.Approved or MergeProposalStatus.Merged)
             {
-                await workUnits.UpdateStatusAsync(workUnitId, WorkUnitStatus.Completed, cancellationToken: ct)
-                    .ConfigureAwait(false);
+                var orchestrator = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+                if (orchestrator?.Status != WorkUnitStatus.Completed)
+                {
+                    await workUnits.UpdateStatusAsync(workUnitId, WorkUnitStatus.Completed, cancellationToken: ct)
+                        .ConfigureAwait(false);
+                }
             }
         }
 

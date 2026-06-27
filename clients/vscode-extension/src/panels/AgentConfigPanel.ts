@@ -15,6 +15,12 @@ export interface PipelineProfile {
   fileScopePatterns: string[];
 }
 
+export interface DomainAgentInfo {
+  name: string;
+  titlePrefix: string;
+  keywords: string[];
+}
+
 export class ModelAgentStudioPanel {
   static readonly containerId = 'shell-pane-model-agent-studio';
 
@@ -54,12 +60,16 @@ export class ModelAgentStudioPanel {
   private async sendConfig(): Promise<void> {
     let pipelineProfiles: PipelineProfile[] = [];
     let usePromotionBranch = false;
+    let domainAgents: DomainAgentInfo[] = [];
+    let enabledDomainAgents: string[] = [];
     try {
-      [pipelineProfiles] = await Promise.all([
+      [pipelineProfiles, domainAgents] = await Promise.all([
         this.get<PipelineProfile[]>('/studio/agent-profiles'),
+        this.get<DomainAgentInfo[]>('/studio/domain-agents'),
       ]);
-      const opts = await this.get<{ usePromotionBranch?: boolean }>('/studio/options');
+      const opts = await this.get<{ usePromotionBranch?: boolean; enabledDomainAgents?: string[] }>('/studio/options');
       usePromotionBranch = opts.usePromotionBranch ?? false;
+      enabledDomainAgents = opts.enabledDomainAgents ?? [];
     } catch { /* server may not be running yet */ }
     void this.panel.webview.postMessage({
       type:                 'config',
@@ -69,6 +79,8 @@ export class ModelAgentStudioPanel {
       defaultReviewPolicy:  this.configService.getDefaultReviewPolicy(),
       pipelineProfiles,
       usePromotionBranch,
+      domainAgents,
+      enabledDomainAgents,
     });
   }
 
@@ -139,14 +151,15 @@ export class ModelAgentStudioPanel {
       case 'saveSessionDefaults': {
         const policy = msg.defaultReviewPolicy as string;
         const usePromotionBranch = !!(msg.usePromotionBranch as boolean);
+        const enabledDomainAgents = (msg.enabledDomainAgents as string[] | undefined) ?? [];
         if (policy) {
           await this.configService.saveDefaultReviewPolicy(policy);
         }
         try {
           const currentOpts = await this.get<Record<string, unknown>>('/studio/options');
-          await this.post('/studio/options', { ...currentOpts, usePromotionBranch });
+          await this.post('/studio/options', { ...currentOpts, usePromotionBranch, enabledDomainAgents });
         } catch { /* host may not be running */ }
-        void this.panel.webview.postMessage({ type: 'sessionDefaults', defaultReviewPolicy: policy, usePromotionBranch });
+        void this.panel.webview.postMessage({ type: 'sessionDefaults', defaultReviewPolicy: policy, usePromotionBranch, enabledDomainAgents });
         void vscode.window.showInformationMessage('NodalMerge: Session defaults saved.');
         break;
       }
@@ -466,6 +479,11 @@ const MAS_HTML = `
           <input type="checkbox" id="use-promotion-branch">
           Use candidate branch — agents never write to main directly
         </label>
+      </div>
+      <div class="field">
+        <label>Domain Agents</label>
+        <p class="sub">Reactive observers that watch recorded Research/Decision/Constraint artifacts and may propose a Constraint back — they never own task lifecycle. Off by default.</p>
+        <div id="domain-agent-toggles"></div>
       </div>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
         <button id="btn-save-session-defaults">Save Session Defaults</button>
@@ -881,6 +899,20 @@ const MAS_JS = `
 
   // ── Session Defaults ──────────────────────────────────────────────────────
   var usePromotionBranch = false;
+  var domainAgents = [];
+  var enabledDomainAgents = [];
+
+  function renderDomainAgentToggles() {
+    var container = document.getElementById('domain-agent-toggles');
+    if (!container) { return; }
+    container.innerHTML = domainAgents.map(function(d) {
+      var checked = enabledDomainAgents.indexOf(d.name) >= 0 ? ' checked' : '';
+      var keywords = (d.keywords || []).slice(0, 6).join(', ');
+      return '<label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:4px;" title="' + esc(keywords) + '">' +
+        '<input type="checkbox" class="domain-agent-toggle" data-name="' + esc(d.name) + '"' + checked + '> ' + esc(d.name) +
+        '</label>';
+    }).join('');
+  }
 
   document.getElementById('use-promotion-branch').addEventListener('change', function() {
     usePromotionBranch = this.checked;
@@ -893,7 +925,14 @@ const MAS_JS = `
     var reviewPolicy = sel ? sel.value : 'HumanRequired';
     var cb = document.getElementById('use-promotion-branch');
     var promotionEnabled = cb ? cb.checked : false;
-    vscode.postMessage({ type: 'saveSessionDefaults', defaultReviewPolicy: reviewPolicy, usePromotionBranch: promotionEnabled });
+    var checkedAgents = Array.prototype.slice.call(document.querySelectorAll('.domain-agent-toggle:checked'))
+      .map(function(el) { return el.getAttribute('data-name'); });
+    vscode.postMessage({
+      type: 'saveSessionDefaults',
+      defaultReviewPolicy: reviewPolicy,
+      usePromotionBranch: promotionEnabled,
+      enabledDomainAgents: checkedAgents,
+    });
     var statusEl = document.getElementById('session-defaults-status');
     if (statusEl) { statusEl.textContent = 'Saved.'; setTimeout(function() { statusEl.textContent = ''; }, 2000); }
   });
@@ -1019,6 +1058,9 @@ const MAS_JS = `
         var promBtn = document.getElementById('btn-promote-to-main');
         if (promBtn) { promBtn.disabled = !usePromotionBranch; }
       }
+      domainAgents = msg.domainAgents || [];
+      enabledDomainAgents = msg.enabledDomainAgents || [];
+      renderDomainAgentToggles();
       return;
     }
     if (msg.type === 'apiKeySaved') {
@@ -1039,6 +1081,10 @@ const MAS_JS = `
         if (sdCb) { sdCb.checked = usePromotionBranch; }
         var sdPromBtn = document.getElementById('btn-promote-to-main');
         if (sdPromBtn) { sdPromBtn.disabled = !usePromotionBranch; }
+      }
+      if (msg.enabledDomainAgents) {
+        enabledDomainAgents = msg.enabledDomainAgents;
+        renderDomainAgentToggles();
       }
       return;
     }

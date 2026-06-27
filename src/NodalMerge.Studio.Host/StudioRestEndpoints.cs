@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
+using NodalMerge.Studio.AgentRuntime;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Merge;
@@ -24,7 +25,8 @@ public static class StudioRestEndpoints
         ReviewPolicy? ReviewPolicy = null,
         bool BypassPromotionBranch = false,
         string? SeedFromBranchId = null,
-        WorkUnitExpectedOutputKind? ExpectedOutputKind = null);
+        WorkUnitExpectedOutputKind? ExpectedOutputKind = null,
+        string? RepositoryId = null);
 
     private sealed record SpawnAgentBody(
         string AgentType,
@@ -39,7 +41,11 @@ public static class StudioRestEndpoints
         // Agent Topology — per-stage credential overrides, keyed by PipelineStage name ("Plan",
         // "Execute", "Review"). String-keyed rather than PipelineStage-keyed to avoid relying on
         // enum-dictionary-key JSON conventions; parsed via Enum.TryParse below.
-        Dictionary<string, StageCredentialDto>? StageCredentials = null);
+        Dictionary<string, StageCredentialDto>? StageCredentials = null,
+        // Slice 21/22 — per-work-unit override of WorkspaceOptions.EnabledDomainAgents (by domain
+        // agent Name, e.g. "Security"/"Architecture"). Null means "no override" (inherit the
+        // global default).
+        List<string>? EnabledDomainAgents = null);
 
     private sealed record StageCredentialDto(string Provider, string Model, string BaseUrl, string ApiKey);
 
@@ -144,7 +150,10 @@ public static class StudioRestEndpoints
         string? BuildCommand = null,
         string? TestCommand = null,
         bool EnforceExpectedOutputKind = false,
-        bool DocFetchTools = false);
+        bool DocFetchTools = false,
+        // Slice 22 — global default set of enabled domain agents (by DomainAgentRegistry name);
+        // null/omitted on a partial update leaves the existing set untouched.
+        IReadOnlyList<string>? EnabledDomainAgents = null);
 
     private sealed record BuildRequestBody(
         string? BuildCommand = null,
@@ -255,6 +264,7 @@ public static class StudioRestEndpoints
         MapOptionsEndpoints(app);
         MapPolicyEndpoints(app);
         MapProjectionEndpoints(app);
+        MapProjectionSnapshotEndpoints(app);
         MapSnapshotEndpoints(app);
         MapReplayEndpoints(app);
         MapGoalEndpoints(app);
@@ -375,6 +385,7 @@ public static class StudioRestEndpoints
                 candidateBranchId = options.CandidateBranchId,
                 enforceExpectedOutputKind = options.EnforceExpectedOutputKind,
                 docFetchTools = options.DocFetchTools,
+                enabledDomainAgents = options.EnabledDomainAgents,
             }));
 
         app.MapPost("/studio/options", async (
@@ -407,6 +418,8 @@ public static class StudioRestEndpoints
             options.TestCommand = body.TestCommand;
             options.EnforceExpectedOutputKind = body.EnforceExpectedOutputKind;
             options.DocFetchTools = body.DocFetchTools;
+            if (body.EnabledDomainAgents is not null)
+                options.EnabledDomainAgents = [.. body.EnabledDomainAgents];
             await runtimeSettings.PersistAsync(ct).ConfigureAwait(false);
 
             // Slice 21a — ensure candidate branch exists as soon as the toggle is turned on.
@@ -429,6 +442,7 @@ public static class StudioRestEndpoints
                 candidateBranchId = options.CandidateBranchId,
                 enforceExpectedOutputKind = options.EnforceExpectedOutputKind,
                 docFetchTools = options.DocFetchTools,
+                enabledDomainAgents = options.EnabledDomainAgents,
             });
         });
     }
@@ -853,13 +867,21 @@ public static class StudioRestEndpoints
             if (string.IsNullOrWhiteSpace(body.Owner))
                 return Results.BadRequest(new { error = "owner is required." });
 
-            var wu = await workUnitCommands.CreateAsync(
-                new WorkUnitCreateCommand(body.Goal, body.Owner, body.BranchId, body.SuccessCriteria,
-                    body.RepositoryPath, body.ParentWorkUnitId, body.DependsOn, body.FileScope,
-                    ReviewPolicy: body.ReviewPolicy, BypassPromotionBranch: body.BypassPromotionBranch,
-                    SeedFromBranchId: body.SeedFromBranchId, ExpectedOutputKind: body.ExpectedOutputKind),
-                ct).ConfigureAwait(false);
-            return Results.Ok(wu);
+            try
+            {
+                var wu = await workUnitCommands.CreateAsync(
+                    new WorkUnitCreateCommand(body.Goal, body.Owner, body.BranchId, body.SuccessCriteria,
+                        body.RepositoryPath, body.ParentWorkUnitId, body.DependsOn, body.FileScope,
+                        ReviewPolicy: body.ReviewPolicy, BypassPromotionBranch: body.BypassPromotionBranch,
+                        SeedFromBranchId: body.SeedFromBranchId, ExpectedOutputKind: body.ExpectedOutputKind,
+                        RepositoryId: body.RepositoryId),
+                    ct).ConfigureAwait(false);
+                return Results.Ok(wu);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
         });
 
         // Stop controls — cancels one goal's whole subtree (the work unit plus every descendant
@@ -999,6 +1021,16 @@ public static class StudioRestEndpoints
 
     private static void MapAgentEndpoints(WebApplication app)
     {
+        // Slice 22/23 follow-up — lets the UI render a Domain Agents toggle list without
+        // hardcoding DomainAgentRegistry's contents; picks up new agents automatically.
+        app.MapGet("/studio/domain-agents", () =>
+            Results.Ok(DomainAgentRegistry.All.Select(d => new
+            {
+                name = d.Name,
+                titlePrefix = d.TitlePrefix,
+                keywords = d.Keywords,
+            })));
+
         app.MapGet("/studio/agents", async (
             [FromQuery] bool all,
             [FromQuery] string? sessionId,
@@ -1052,7 +1084,8 @@ public static class StudioRestEndpoints
 
             var agentId = await agents.SpawnAsync(
                 body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey,
-                body.Provider, body.ProfileId, body.AutoReviewProfileId, stageCredentials, ct).ConfigureAwait(false);
+                body.Provider, body.ProfileId, body.AutoReviewProfileId, stageCredentials,
+                body.EnabledDomainAgents, ct).ConfigureAwait(false);
             return Results.Ok(new { agentId, agentType = body.AgentType, workUnitId = body.WorkUnitId, branchId = wu.BranchId });
         });
 
@@ -2219,6 +2252,35 @@ public static class StudioRestEndpoints
                 : Results.Ok(artifact);
         });
 
+        // Slice 23 follow-up — convenience read over the ArtifactSurfaced/ArtifactConsideredInDecision
+        // events Slice 23 makes durable, so answering "was this Constraint ever surfaced/acted on"
+        // doesn't require hand-querying the execution event stream.
+        app.MapGet("/studio/artifacts/{artifactId}/feedback", async (
+            string artifactId,
+            IExecutionEventStream events,
+            CancellationToken ct) =>
+        {
+            var feedbackEvents = await events.GetEventsByKindAsync(
+                [ExecutionEventKind.ArtifactSurfaced, ExecutionEventKind.ArtifactConsideredInDecision], ct: ct)
+                .ConfigureAwait(false);
+
+            var surfaced = feedbackEvents
+                .Where(e => e.Kind == ExecutionEventKind.ArtifactSurfaced)
+                .Select(e => (Event: e, Payload: JsonSerializer.Deserialize<ArtifactSurfacedPayload>(e.PayloadJson)))
+                .Where(x => x.Payload?.ArtifactId == artifactId)
+                .Select(x => new { surfacedToAgentId = x.Payload!.SurfacedToAgentId, projectionType = x.Payload.ProjectionType, occurredAt = x.Event.OccurredAt })
+                .ToList();
+
+            var consideredIn = feedbackEvents
+                .Where(e => e.Kind == ExecutionEventKind.ArtifactConsideredInDecision)
+                .Select(e => (Event: e, Payload: JsonSerializer.Deserialize<ArtifactConsideredInDecisionPayload>(e.PayloadJson)))
+                .Where(x => x.Payload?.ArtifactId == artifactId)
+                .Select(x => new { proposalId = x.Payload!.ProposalId, decision = x.Payload.Decision.ToString(), occurredAt = x.Event.OccurredAt })
+                .ToList();
+
+            return Results.Ok(new { artifactId, surfaced, consideredIn });
+        });
+
         app.MapGet("/studio/artifacts/{artifactId}/children", async (
             string artifactId,
             IArtifactLineageService artifacts,
@@ -2359,6 +2421,118 @@ public static class StudioRestEndpoints
             }
         });
     }
+
+    // ── /studio/projections/snapshots — REST parity for nm_v1_projection_snapshot_*/
+    // nm_v1_projection_compare (previously MCP/dispatcher only).
+    private sealed record CaptureProjectionSnapshotBody(string WorkUnitId);
+
+    private static void MapProjectionSnapshotEndpoints(WebApplication app)
+    {
+        app.MapPost("/studio/projections/snapshots", async (
+            CaptureProjectionSnapshotBody body,
+            IProjectionSnapshotService snapshots,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+
+            var snapshot = await snapshots.CaptureAsync(body.WorkUnitId, ct).ConfigureAwait(false);
+            return Results.Ok(snapshot);
+        });
+
+        app.MapGet("/studio/projections/snapshots/{snapshotId}", async (
+            string snapshotId,
+            IProjectionSnapshotService snapshots,
+            CancellationToken ct) =>
+        {
+            var snapshot = await snapshots.GetAsync(snapshotId, ct).ConfigureAwait(false);
+            return snapshot is null
+                ? Results.NotFound(new { error = $"Projection snapshot '{snapshotId}' was not found." })
+                : Results.Ok(snapshot);
+        });
+
+        app.MapGet("/studio/projections/snapshots", async (
+            [FromQuery] string? workUnitId,
+            IProjectionSnapshotService snapshots,
+            CancellationToken ct) =>
+        {
+            var list = await snapshots.ListAsync(workUnitId, ct).ConfigureAwait(false);
+            return Results.Ok(list);
+        });
+
+        app.MapGet("/studio/projections/snapshots/{snapshotId}/stale", async (
+            string snapshotId,
+            IProjectionSnapshotService snapshots,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var staleness = await snapshots.CheckStaleAsync(snapshotId, ct).ConfigureAwait(false);
+                return Results.Ok(staleness);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        app.MapGet("/studio/projections/snapshots/compare", async (
+            [FromQuery] string? a,
+            [FromQuery] string? b,
+            IProjectionSnapshotService snapshots,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(a) || string.IsNullOrWhiteSpace(b))
+                return Results.BadRequest(new { error = "Both a and b snapshot IDs are required." });
+
+            try
+            {
+                var comparison = await snapshots.CompareAsync(a, b, ct).ConfigureAwait(false);
+                return Results.Ok(comparison);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        app.MapPost("/studio/projections/materialize", async (
+            MaterializeProjectionBody body,
+            IProjectionSnapshotService snapshots,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WorkUnitId))
+                return Results.BadRequest(new { error = "workUnitId is required." });
+
+            try
+            {
+                var request = new WorkspaceExecutionRequest(
+                    Build: body.Build,
+                    Test: body.Test,
+                    Lint: body.Lint,
+                    BuildCommand: body.BuildCommand,
+                    TestCommand: body.TestCommand,
+                    LintCommand: body.LintCommand,
+                    TimeoutSeconds: body.TimeoutSeconds);
+                var materialization = await snapshots.MaterializeAsync(body.WorkUnitId, request, ct).ConfigureAwait(false);
+                return Results.Ok(materialization);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+        });
+    }
+
+    private sealed record MaterializeProjectionBody(
+        string WorkUnitId,
+        bool Build = true,
+        bool Test = true,
+        bool Lint = false,
+        string? BuildCommand = null,
+        string? TestCommand = null,
+        string? LintCommand = null,
+        int TimeoutSeconds = 300);
 
     // ── /studio/snapshots — Slice 6.5 deferred: snapshot REST parity ────────
 

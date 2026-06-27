@@ -270,4 +270,32 @@ public class InMemoryAgentRuntimeServiceTests
         // Only the original SpawnAsync's AgentRecord exists — reinvoke found nothing registered.
         Assert.Single(await svc.ListAllAsync());
     }
+
+    // ── GetEnabledDomainAgents ────────────────────────────────────────────────
+
+    [Fact]
+    public void GetEnabledDomainAgents_returns_null_for_unregistered_work_unit()
+    {
+        var svc = Build();
+        Assert.Null(svc.GetEnabledDomainAgents("wu-never-spawned"));
+    }
+
+    [Fact]
+    public async Task GetEnabledDomainAgents_returns_explicit_override_captured_at_spawn()
+    {
+        var svc = Build();
+        await svc.SpawnAsync("orchestrator", "wu-1", model: "m", baseUrl: "http://fake-llm", apiKey: "k",
+            enabledDomainAgents: ["Security"]);
+
+        Assert.Equal(["Security"], svc.GetEnabledDomainAgents("wu-1"));
+    }
+
+    [Fact]
+    public async Task GetEnabledDomainAgents_returns_null_when_orchestrator_spawned_without_override()
+    {
+        var svc = Build();
+        await svc.SpawnAsync("orchestrator", "wu-1", model: "m", baseUrl: "http://fake-llm", apiKey: "k");
+
+        Assert.Null(svc.GetEnabledDomainAgents("wu-1"));
+    }
 }

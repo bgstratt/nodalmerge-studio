@@ -140,6 +140,14 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ISteeringDecisionService>(sp => sp.GetRequiredService<SteeringDecisionService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<SteeringDecisionService>());
 
+        services.AddSingleton<RepositoryRegistryService>();
+        services.AddSingleton<IRepositoryRegistryService>(sp => sp.GetRequiredService<RepositoryRegistryService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<RepositoryRegistryService>());
+
+        services.AddSingleton<ProjectionSnapshotService>();
+        services.AddSingleton<IProjectionSnapshotService>(sp => sp.GetRequiredService<ProjectionSnapshotService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<ProjectionSnapshotService>());
+
         services.AddSingleton<EvidenceNodeService>();
         services.AddSingleton<IEvidenceNodeService>(sp => sp.GetRequiredService<EvidenceNodeService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<EvidenceNodeService>());

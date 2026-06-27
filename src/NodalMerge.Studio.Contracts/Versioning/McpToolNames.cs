@@ -8,11 +8,18 @@ public static class McpToolNames
 {
     public const string ProjectionGet = "nm_v1_projection_get";
     public const string ProjectionList = "nm_v1_projection_list";
+    public const string ProjectionSnapshotCapture = "nm_v1_projection_snapshot_capture";
+    public const string ProjectionSnapshotGet     = "nm_v1_projection_snapshot_get";
+    public const string ProjectionSnapshotList    = "nm_v1_projection_snapshot_list";
+    public const string ProjectionStaleCheck      = "nm_v1_projection_stale_check";
+    public const string ProjectionCompare         = "nm_v1_projection_compare";
+    public const string ProjectionMaterialize     = "nm_v1_projection_materialize";
 
     public const string WorkUnitCreate = "nm_v1_workunit_create";
     public const string WorkUnitGet = "nm_v1_workunit_get";
     public const string WorkUnitUpdate = "nm_v1_workunit_update";
     public const string WorkUnitList = "nm_v1_workunit_list";
+    public const string WorkUnitDependents = "nm_v1_workunit_dependents";
 
     public const string TaskCreate = "nm_v1_task_create";
     public const string TaskUpdate = "nm_v1_task_update";
@@ -60,6 +67,7 @@ public static class McpToolNames
     public const string ArtifactRecordPlan = "nm_v1_artifact_record_plan";
     public const string ArtifactQuery      = "nm_v1_artifact_query";
     public const string ArtifactList       = "nm_v1_artifact_list";
+    public const string ArtifactInvalidate = "nm_v1_artifact_invalidate";
 
     public const string WorkspaceRead    = "nm_v1_workspace_read";
     public const string WorkspaceReadMany = "nm_v1_workspace_read_many";
@@ -104,14 +112,24 @@ public static class McpToolNames
     public const string ModelCompare = "nm_v1_model_compare";
     public const string ModelReplay  = "nm_v1_model_replay";
 
+    public const string RepositoryRegister = "nm_v1_repository_register";
+    public const string RepositoryList     = "nm_v1_repository_list";
+
     public static IReadOnlyList<string> All { get; } =
     [
         ProjectionGet,
         ProjectionList,
+        ProjectionSnapshotCapture,
+        ProjectionSnapshotGet,
+        ProjectionSnapshotList,
+        ProjectionStaleCheck,
+        ProjectionCompare,
+        ProjectionMaterialize,
         WorkUnitCreate,
         WorkUnitGet,
         WorkUnitUpdate,
         WorkUnitList,
+        WorkUnitDependents,
         TaskCreate,
         TaskUpdate,
         TaskList,
@@ -148,6 +166,7 @@ public static class McpToolNames
         ArtifactRecordPlan,
         ArtifactQuery,
         ArtifactList,
+        ArtifactInvalidate,
         WorkspaceRead,
         WorkspaceReadMany,
         WorkspaceWrite,
@@ -181,6 +200,8 @@ public static class McpToolNames
         HypothesisList,
         ReasoningRecord,
         ModelCompare,
-        ModelReplay
+        ModelReplay,
+        RepositoryRegister,
+        RepositoryList
     ];
 }

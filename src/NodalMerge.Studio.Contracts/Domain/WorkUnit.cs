@@ -61,7 +61,12 @@ public sealed record WorkUnit(
     // Slice 21c — per-work-unit override: when true, applies always target the proposal's
     // TargetBranch directly even if WorkspaceOptions.UsePromotionBranch is on session-wide.
     bool BypassPromotionBranch = false,
-    WorkUnitExpectedOutputKind ExpectedOutputKind = WorkUnitExpectedOutputKind.FileChange);
+    WorkUnitExpectedOutputKind ExpectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
+    // Slice 19 — which registered repository (IRepositoryRegistryService) a fresh top-level
+    // goal's "main" content was synced from at creation time. Null for forks/children (they
+    // inherit their seed branch's content, not a repository directly) and for goals created
+    // from an unregistered ad hoc RepositoryPath.
+    string? RepositoryId = null);
 
 /// <summary>Failure/rejection counters, previously stored as parsed strings in Metadata.</summary>
 public sealed record WorkUnitExecutionInfo(

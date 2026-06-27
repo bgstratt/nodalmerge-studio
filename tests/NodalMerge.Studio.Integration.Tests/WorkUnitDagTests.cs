@@ -1,6 +1,8 @@
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Host;
+using NodalMerge.Studio.McpServer.Tools;
 using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Integration.Tests;
@@ -16,6 +18,17 @@ public class WorkUnitDagTests
         return (
             app.Services.GetRequiredService<IOrchestratorService>(),
             app.Services.GetRequiredService<IWorkUnitService>());
+    }
+
+    private static (IOrchestratorService orchestrator, IWorkUnitService workUnits, IServiceProvider services) BuildServicesWithProvider()
+    {
+        var app = StudioWebApplication.Build(
+            [],
+            configureServices: services => services.AddInMemoryStorage());
+        return (
+            app.Services.GetRequiredService<IOrchestratorService>(),
+            app.Services.GetRequiredService<IWorkUnitService>(),
+            app.Services);
     }
 
     // ── Parent/child creation ──────────────────────────────────────────────
@@ -90,6 +103,25 @@ public class WorkUnitDagTests
         Assert.Equal(2, dependentsOfA.Count);
         Assert.Contains(dependentsOfA, w => w.WorkUnitId == b.WorkUnitId);
         Assert.Contains(dependentsOfA, w => w.WorkUnitId == c.WorkUnitId);
+    }
+
+    [Fact]
+    public async Task WorkUnitDependents_mcp_tool_matches_GetDependentsAsync()
+    {
+        var (orchestrator, workUnits, services) = BuildServicesWithProvider();
+        var tools = ActivatorUtilities.CreateInstance<WorkUnitTools>(services);
+
+        var a = await orchestrator.CreateWorkUnitAsync("unit A", "test");
+        var b = await orchestrator.CreateWorkUnitAsync("unit B", "test", dependsOn: [a.WorkUnitId]);
+
+        var json = await tools.DependentsAsync(a.WorkUnitId);
+        var doc = JsonDocument.Parse(json).RootElement;
+        var dependentIds = doc.GetProperty("data").GetProperty("workUnitIds")
+            .EnumerateArray().Select(e => e.GetString()!).ToList();
+
+        var expected = await workUnits.GetDependentsAsync(a.WorkUnitId);
+        Assert.Equal(expected.Select(w => w.WorkUnitId).ToList(), dependentIds);
+        Assert.Contains(b.WorkUnitId, dependentIds);
     }
 
     // ── Single-worker path unchanged ───────────────────────────────────────

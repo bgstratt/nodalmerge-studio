@@ -113,6 +113,8 @@ public class InMemoryMergeServiceTests
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class SingleServiceProvider(object service) : IServiceProvider
@@ -361,6 +363,68 @@ public class InMemoryMergeServiceTests
 
         Assert.Equal(MergeProposalStatus.Rejected, result.Status);
         Assert.Equal("Missing required file.", result.VerificationResults);
+    }
+
+    // ── Slice 23 — considered-artifact citation ──────────────────────────────
+
+    [Fact]
+    public async Task AutomatedReviewAsync_sets_ConsideredArtifactIds_on_the_proposal()
+    {
+        var svc = Build();
+        await svc.ProposeAsync(MakeProposal("MP-considered"));
+        await svc.ValidateAsync("MP-considered");
+
+        var result = await svc.AutomatedReviewAsync(
+            "MP-considered",
+            MergeProposalStatus.Approved,
+            "Scope matches plan.",
+            consideredArtifactIds: ["KA-1", "KA-2"]);
+
+        Assert.Equal(["KA-1", "KA-2"], result.ConsideredArtifactIds);
+    }
+
+    [Fact]
+    public async Task AutomatedReviewAsync_omits_ConsideredArtifactIds_param_defaults_to_empty()
+    {
+        var svc = Build();
+        await svc.ProposeAsync(MakeProposal("MP-no-considered"));
+        await svc.ValidateAsync("MP-no-considered");
+
+        var result = await svc.AutomatedReviewAsync(
+            "MP-no-considered", MergeProposalStatus.Approved, "Scope matches plan.");
+
+        Assert.Empty(result.ConsideredArtifactIds);
+    }
+
+    [Fact]
+    public async Task AutomatedReviewAsync_emits_ArtifactConsideredInDecision_per_considered_id_when_session_present()
+    {
+        var (svc, events, _, _) = BuildWithLifecycle();
+        await svc.ProposeAsync(MakeProposalWithSession("MP-1", "WU-1", "SES-1"));
+        await svc.ValidateAsync("MP-1");
+
+        await svc.AutomatedReviewAsync(
+            "MP-1", MergeProposalStatus.Rejected, "Violates a recorded constraint.",
+            consideredArtifactIds: ["KA-1", "KA-2"]);
+
+        var considered = events.Events.Where(e => e.Kind == ExecutionEventKind.ArtifactConsideredInDecision).ToList();
+        Assert.Equal(2, considered.Count);
+        var artifactIds = considered
+            .Select(e => System.Text.Json.JsonSerializer.Deserialize<ArtifactConsideredInDecisionPayload>(e.PayloadJson)!.ArtifactId)
+            .ToList();
+        Assert.Equal(["KA-1", "KA-2"], artifactIds);
+    }
+
+    [Fact]
+    public async Task AutomatedReviewAsync_emits_no_ArtifactConsideredInDecision_when_list_is_empty()
+    {
+        var (svc, events, _, _) = BuildWithLifecycle();
+        await svc.ProposeAsync(MakeProposalWithSession("MP-1", "WU-1", "SES-1"));
+        await svc.ValidateAsync("MP-1");
+
+        await svc.AutomatedReviewAsync("MP-1", MergeProposalStatus.Approved, "Looks fine.");
+
+        Assert.DoesNotContain(events.Events, e => e.Kind == ExecutionEventKind.ArtifactConsideredInDecision);
     }
 
     // ── ApplyAsync — human gate ──────────────────────────────────────────────

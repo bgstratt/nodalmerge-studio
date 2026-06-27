@@ -161,6 +161,7 @@ public class ReviewTimerServiceTests
             bool automated = false,
             string? reviewerAgentId = null,
             string? notes = null,
+            IReadOnlyList<string>? consideredArtifactIds = null,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
     }

@@ -38,6 +38,7 @@ public class ControlPlaneIdempotencyTests
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     // ── IWorkScheduler.EnqueueAsync — key: SessionId + WorkUnitId ────────────
@@ -219,6 +220,7 @@ public class ControlPlaneIdempotencyTests
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private sealed class RecordingAgentControlService : IAgentControlService
@@ -228,6 +230,7 @@ public class ControlPlaneIdempotencyTests
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
             string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            IReadOnlyList<string>? enabledDomainAgents = null,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
 
         public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default)
@@ -239,6 +242,7 @@ public class ControlPlaneIdempotencyTests
         public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
         public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
         public string? GetAutoReviewProfileId(string workUnitId) => null;
+        public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
 
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task ResumeAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();

@@ -25,6 +25,31 @@ public interface IProjectionManager
     Task<string> BuildInsightScanContextAsync(CancellationToken cancellationToken = default);
 }
 
+// Capability-gap fix — persists ProjectionManager's otherwise-ephemeral AgentWorkspace resolution
+// as an immutable, versioned snapshot keyed off WorkUnitId (no parallel ProjectionId/WorkspaceId
+// identity scheme). Staleness is read directly from the artifact-invalidation cascade
+// (ArtifactLineageService.InvalidateAsync) rather than tracked separately; comparison is a
+// symmetric diff for siblings (different work units), distinct from ProjectionDelta's temporal
+// same-work-unit diff.
+public interface IProjectionSnapshotService
+{
+    Task<ProjectionSnapshot> CaptureAsync(string workUnitId, CancellationToken ct = default);
+
+    Task<ProjectionSnapshot?> GetAsync(string snapshotId, CancellationToken ct = default);
+
+    Task<IReadOnlyList<ProjectionSnapshot>> ListAsync(string? workUnitId = null, CancellationToken ct = default);
+
+    Task<ProjectionStaleness> CheckStaleAsync(string snapshotId, CancellationToken ct = default);
+
+    Task<ProjectionComparison> CompareAsync(string snapshotIdA, string snapshotIdB, CancellationToken ct = default);
+
+    // Slice 20 — runs a build/test/lint execution against the work unit's branch and immediately
+    // captures a snapshot of the result, so callers get one atomic "run it and freeze the result"
+    // operation instead of two independent calls that could race against a concurrent execution.
+    Task<ProjectionMaterializationResult> MaterializeAsync(
+        string workUnitId, WorkspaceExecutionRequest? request = null, CancellationToken ct = default);
+}
+
 public interface ITaskService
 {
     Task<StudioTask> CreateAsync(StudioTask task, CancellationToken cancellationToken = default);
@@ -87,6 +112,8 @@ public interface ITaskService
         MergeProposalStatus decision,
         string verificationResults,
         string? reviewerAgentId = null,
+        // Slice 23 — Constraint/Research artifact IDs the reviewer explicitly says it considered.
+        IReadOnlyList<string>? consideredArtifactIds = null,
         CancellationToken cancellationToken = default);
 
     Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false);
@@ -130,6 +157,9 @@ public interface ITaskService
             bool automated = false,
             string? reviewerAgentId = null,
             string? notes = null,
+            // Slice 23 — Constraint/Research artifact IDs the automated reviewer explicitly says
+            // it considered. Only meaningful when automated=true.
+            IReadOnlyList<string>? consideredArtifactIds = null,
             CancellationToken cancellationToken = default);
 
         Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false);
@@ -164,6 +194,24 @@ public sealed record MergeReconciliationResult(
     string? ReconciledProposalId = null,
     IReadOnlyList<string>? ConstituentProposalIds = null,
     string? ConflictReportPath = null);
+
+// Slice 21/22 — domain/intelligence-plane agents. Unlike the structural agents above
+// (Orchestrator/Worker/Reviewer), domain agents (Security, Architecture, ...) own no lifecycle
+// and are never assigned a task: each reacts to a Research/Decision/Constraint artifact being
+// recorded and, if it judges the artifact relevant to its own definition, proposes a Constraint
+// of its own back into the same lineage. Disabled by default per-agent (see
+// WorkspaceOptions.EnabledDomainAgents / IAgentControlService.GetEnabledDomainAgents) since each
+// is an opt-in reactive LLM call, not a free side effect of recording an artifact.
+public interface IDomainAgentTriggerService
+{
+    /// <summary>
+    /// Fire-and-forget reactive entry point called after an artifact is recorded. No-ops for any
+    /// domain agent that isn't enabled for this work unit, isn't relevant to the artifact, or
+    /// would be reacting to another domain agent's own prior output. Never throws — a failing
+    /// domain agent must never affect the artifact-record call path that triggered it.
+    /// </summary>
+    Task NotifyArtifactRecordedAsync(ArtifactRef artifact, CancellationToken ct = default);
+}
 
 public interface IAutomatedReviewGateService
 {
@@ -312,6 +360,19 @@ public interface IWorkUnitService
         string? blockedReason,
         CancellationToken cancellationToken = default);
 
+    // Capability-gap fix — amends a work unit's FileScope in place. Unlike SteeringService (which
+    // always forks a sibling so the original's decision log stays immutable), this mutates the
+    // original directly for the common case where an agent's findings warrant a narrower/wider
+    // scope and a full fork would be overkill. Throws InvalidOperationException for a work unit
+    // already in a terminal state (Completed/Merged/Cancelled) — amending finished work is
+    // meaningless. Appends WorkUnitFileScopeChanged when sessionId is given, so the change stays
+    // auditable in the event stream rather than being a silent mutation.
+    Task<WorkUnit> SetFileScopeAsync(
+        string workUnitId,
+        IReadOnlyList<string> fileScope,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default);
+
     Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken cancellationToken = default);
@@ -331,6 +392,16 @@ public interface IRuntimeEventBroadcaster
     Task BroadcastWorkUnitStageChangedAsync(
         string workUnitId,
         PipelineStage? stage,
+        CancellationToken cancellationToken = default);
+
+    // Slice 18 — lets live UI clients react to an invalidation cascade (e.g. flip a projection
+    // snapshot's staleness badge) instead of polling. Fired unconditionally, not gated on a
+    // session existing — a watching UI client has no session of its own.
+    Task BroadcastArtifactInvalidatedAsync(
+        string? workUnitId,
+        string artifactId,
+        IReadOnlyList<string> flaggedArtifactIds,
+        string reason,
         CancellationToken cancellationToken = default);
 }
 
@@ -355,6 +426,7 @@ public interface IOrchestratorService
         ReviewPolicy? reviewPolicy = null,
         bool bypassPromotionBranch = false,
         WorkUnitExpectedOutputKind expectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
+        string? repositoryId = null,
         CancellationToken cancellationToken = default);
 
     Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default);
@@ -376,7 +448,11 @@ public sealed record WorkUnitCreateCommand(
     ReviewPolicy? ReviewPolicy = null,
     bool BypassPromotionBranch = false,
     string? SeedFromBranchId = null,
-    WorkUnitExpectedOutputKind? ExpectedOutputKind = null);
+    WorkUnitExpectedOutputKind? ExpectedOutputKind = null,
+    // Slice 19 — references an already-registered IRepositoryRegistryService entry by id.
+    // Resolved to a path by WorkUnitCommandService.CreateAsync, which takes priority over
+    // RepositoryPath when both are given.
+    string? RepositoryId = null);
 
 public interface IWorkUnitCommandService
 {
@@ -473,6 +549,7 @@ public interface IAgentControlService
         string? profileId = null,
         string? autoReviewProfileId = null,
         IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+        IReadOnlyList<string>? enabledDomainAgents = null,
         CancellationToken cancellationToken = default);
 
     // Re-enters the orchestrator loop for a work unit whose orchestrator was previously
@@ -497,6 +574,14 @@ public interface IAgentControlService
     /// Profile ID for the automated reviewer pre-gate, captured at orchestrator spawn time.
     /// </summary>
     string? GetAutoReviewProfileId(string workUnitId);
+
+    /// <summary>
+    /// Per-work-unit override of which domain agents (by name, e.g. "Security"/"Architecture")
+    /// may react to artifacts recorded under this work unit, captured at orchestrator spawn time.
+    /// Null means "no override" — callers fall back to the global
+    /// <c>WorkspaceOptions.EnabledDomainAgents</c> default in that case.
+    /// </summary>
+    IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId);
 
     Task PauseAsync(string agentId, CancellationToken cancellationToken = default);
 
@@ -530,6 +615,14 @@ public interface IArtifactLineageService
     // artifacts an agent records via nm_v1_artifact_record. GetChainAsync intentionally excludes
     // these since it only indexes work-unit-owned artifacts.
     Task<IReadOnlyList<ArtifactRef>> GetGlobalConstraintsAsync(CancellationToken ct = default);
+
+    // Capability-gap fix — marks a Research/Decision/Constraint artifact Invalidated and flags
+    // every artifact in its descendant subtree (via ParentArtifactId/GetChildrenAsync) with
+    // InvalidatedByArtifactId, without touching the descendants' own Status. Throws
+    // ArgumentException if the target's Type isn't Research/Decision/Constraint, KeyNotFoundException
+    // if the artifact doesn't exist.
+    Task<ArtifactRef> InvalidateAsync(
+        string artifactId, string reason, string? sessionId = null, CancellationToken ct = default);
 }
 
 // Slice — Knowledge Promotion. Review lifecycle for Findings detected by either the deterministic
@@ -812,6 +905,9 @@ public interface IArtifactCommandService
         string workUnitId,
         bool includeAncestors = true,
         CancellationToken ct = default);
+
+    Task<ArtifactRef> InvalidateAsync(
+        string artifactId, string reason, string? sessionId = null, CancellationToken ct = default);
 }
 
 public sealed record ExternalDocFetchContent(
@@ -1289,7 +1385,12 @@ public sealed record WorkspaceSummary(
     IReadOnlyList<string> ActiveAgents,
     IReadOnlyList<string> PendingMerges,
     IReadOnlyList<string> Failures,
-    IReadOnlyList<string> KnownGoodStates);
+    IReadOnlyList<string> KnownGoodStates,
+    // Capability-gap fix: lets an agent learn the boundary of what it's actually managing — Studio
+    // has exactly one repository/root per instance — instead of inferring it (or guessing wrong)
+    // from the files it happens to see in its own branch.
+    string? RootPath = null,
+    string? SeedRepositoryPath = null);
 
 public enum WorkspaceChangeKind
 {

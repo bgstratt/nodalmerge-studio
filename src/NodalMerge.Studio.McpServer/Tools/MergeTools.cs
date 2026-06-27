@@ -61,12 +61,14 @@ public sealed class MergeTools(IMergeCommandService mergeCommands)
         bool automated = false,
         string? reviewerAgentId = null,
         string? notes = null,
+        string[]? consideredArtifactIds = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
             var proposal = await mergeCommands.ReviewAsync(
-                proposalId, decision, verificationResults, automated, reviewerAgentId, notes, cancellationToken).ConfigureAwait(false);
+                proposalId, decision, verificationResults, automated, reviewerAgentId, notes,
+                consideredArtifactIds, cancellationToken).ConfigureAwait(false);
             return McpJson.Ok(proposal);
         }
         catch (KeyNotFoundException)

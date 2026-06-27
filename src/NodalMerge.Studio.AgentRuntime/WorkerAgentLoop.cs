@@ -104,6 +104,11 @@ internal sealed class WorkerAgentLoop(
           changes, you described the work without doing it — go back to step 8 and actually call
           nm_v1_workspace_write or nm_v1_workspace_replace, then propose again. Do not proceed to
           nm_v1_merge_validate on a Rejected proposal.
+        - Studio manages exactly one repository per instance, rooted at the path nm_v1_workspace_summary
+          reports as rootPath/seedRepositoryPath. There is no tool to create or check out a separate
+          repository elsewhere — if a task asks you to create or work in "another repository" or a path
+          outside your current branch, call nm_v1_workspace_summary first to confirm the boundary, then
+          call nm_v1_clarification_request rather than guessing or modifying the current repository.
         - Do not approve or apply merges yourself.
         - You are responsible for one task only. Do not create new tasks or spawn other agents.
         - If you cannot complete the task, call nm_v1_task_update with status Blocked and stop.

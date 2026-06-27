@@ -42,10 +42,16 @@ public sealed record MergeProposal(
     // Free-text steering note a human reviewer attaches when approving/rejecting via the review
     // panel — distinct from VerificationResults (which holds automated build/test output), so a
     // human's "why" doesn't get mixed in with or overwritten by the automated reviewer's notes.
-    string? ReviewNotes = null)
+    string? ReviewNotes = null,
+    // Slice 23 — Constraint/Research artifact IDs the automated reviewer explicitly cited as
+    // considered when deciding this proposal (whether or not they were violated). Distinct from
+    // ArtifactSurfacedPayload's "was it returned in a projection" — this is "did the decision-maker
+    // say they looked at it."
+    IReadOnlyList<string>? ConsideredArtifactIds = null)
 {
     public IReadOnlyList<string> FilesTouched { get; init; } = FilesTouched ?? [];
     public IReadOnlyList<string> ReconciledFrom { get; init; } = ReconciledFrom ?? [];
+    public IReadOnlyList<string> ConsideredArtifactIds { get; init; } = ConsideredArtifactIds ?? [];
 }
 
 public static class MergeProposalTransitions

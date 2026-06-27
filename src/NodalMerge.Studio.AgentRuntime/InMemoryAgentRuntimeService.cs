@@ -68,7 +68,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     // needing to remember or re-supply them.
     private sealed record OrchestratorRegistration(
         string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? AutoReviewProfileId,
-        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? StageCredentials = null);
+        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? StageCredentials = null,
+        IReadOnlyList<string>? EnabledDomainAgents = null);
 
     // ── IHostedService ─────────────────────────────────────────────────────
 
@@ -465,6 +466,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? profileId = null,
         string? autoReviewProfileId = null,
         IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+        IReadOnlyList<string>? enabledDomainAgents = null,
         CancellationToken cancellationToken = default)
     {
         var agentId = $"{agentType}-{Guid.NewGuid():N}";
@@ -492,7 +494,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
                 _orchestratorRegistrations[workUnitId] = new OrchestratorRegistration(
-                    resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId, autoReviewProfileId, stageCredentials);
+                    resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId, autoReviewProfileId,
+                    stageCredentials, enabledDomainAgents);
             }
             else if (agentType == "worker" && taskId is not null)
                 StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
@@ -542,6 +545,9 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         return reg.AutoReviewProfileId;
     }
 
+    public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) =>
+        _orchestratorRegistrations.TryGetValue(workUnitId, out var reg) ? reg.EnabledDomainAgents : null;
+
     private void StartOrchestratorLoop(
         string agentId,
         string workUnitId,
@@ -567,13 +573,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var fanOut = _serviceProvider.GetRequiredService<IFanOutService>();
                 var mergeReconciliation = _serviceProvider.GetRequiredService<IMergeReconciliationService>();
                 var automatedReview = _serviceProvider.GetRequiredService<IAutomatedReviewGateService>();
+                var merge = _serviceProvider.GetRequiredService<IMergeService>();
                 var workUnits = _serviceProvider.GetRequiredService<IWorkUnitService>();
                 var workspaceOptions = _serviceProvider.GetRequiredService<WorkspaceOptions>();
                 var findingsService = _serviceProvider.GetRequiredService<IFindingService>();
                 var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var loop = new OrchestratorAgentLoop(
                     agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm,
-                    artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, workUnits,
+                    artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, merge, workUnits,
                     findingsService,
                     profile, sessionId, workspaceOptions.StallDetectionCycles, a => ReportActivity(agentId, a),
                     conversationLog: conversationLog, agentControl: this);
@@ -852,6 +859,8 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IProfileSelectionService, LlmProfileSelectionService>();
         // Slice 20b — inline reviewer for AgentApproval/Hybrid BeforeMerge gate.
         services.AddSingleton<IInlineReviewerService, InlineReviewerService>();
+        // Slice 21/22 — reactive domain agents, disabled by default (WorkspaceOptions.EnabledDomainAgents).
+        services.AddSingleton<IDomainAgentTriggerService, DomainAgentTriggerService>();
         return services;
     }
 }

@@ -7,7 +7,10 @@ namespace NodalMerge.Studio.Storage;
 // Slice 15f — the one implementation of artifact commands shared by the MCP tool, the REST
 // endpoint, and the agent-loop's in-process dispatcher. The CollectChainWithAncestorsAsync walk
 // was previously copy-pasted verbatim between ArtifactTools.cs and McpToolDispatcher.cs.
-public sealed class ArtifactCommandService(IArtifactLineageService artifacts, IWorkUnitService workUnits) : IArtifactCommandService
+public sealed class ArtifactCommandService(
+    IArtifactLineageService artifacts,
+    IWorkUnitService workUnits,
+    IDomainAgentTriggerService? domainAgentTrigger = null) : IArtifactCommandService
 {
     public async Task<ArtifactRef> RecordAsync(
         string workUnitId,
@@ -32,7 +35,12 @@ public sealed class ArtifactCommandService(IArtifactLineageService artifacts, IW
             title,
             body);
 
-        return await artifacts.RecordAsync(artifact, ct).ConfigureAwait(false);
+        var recorded = await artifacts.RecordAsync(artifact, ct).ConfigureAwait(false);
+
+        if (domainAgentTrigger is not null)
+            await domainAgentTrigger.NotifyArtifactRecordedAsync(recorded, ct).ConfigureAwait(false);
+
+        return recorded;
     }
 
     public async Task<ArtifactRef> RecordPlanAsync(string workUnitId, string planContent, CancellationToken ct = default)
@@ -83,6 +91,10 @@ public sealed class ArtifactCommandService(IArtifactLineageService artifacts, IW
             ? await CollectChainWithAncestorsAsync(workUnitId, ct).ConfigureAwait(false)
             : await artifacts.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
     }
+
+    public Task<ArtifactRef> InvalidateAsync(
+        string artifactId, string reason, string? sessionId = null, CancellationToken ct = default) =>
+        artifacts.InvalidateAsync(artifactId, reason, sessionId, ct);
 
     // Walks ParentWorkUnitId root-first, folding in every ancestor's own chain ahead of this
     // work unit's — same inheritance model as ProjectionManager.BuildAgentWorkspaceAsync (10g).

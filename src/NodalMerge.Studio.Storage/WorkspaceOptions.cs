@@ -61,4 +61,14 @@ public sealed class WorkspaceOptions
     public int DocFetchMaxContentBytes { get; set; } = 32 * 1024;
     public int DocFetchTimeoutSeconds  { get; set; } = 15;
     public int DocFetchSummaryMaxChars { get; set; } = 400;
+
+    // ── Slice 21/22 — domain agents ────────────────────────────────────────────
+
+    // Opt-in, default empty (matches DocFetchTools' convention above): holds the Name of each
+    // domain agent (e.g. "Security", "Architecture" — see DomainAgentRegistry in AgentRuntime)
+    // allowed to reactively spawn when a Research/Decision/Constraint artifact it judges relevant
+    // is recorded. A per-work-unit override (IAgentControlService.GetEnabledDomainAgents, captured
+    // at orchestrator spawn time the same way AutoReviewProfileId is) takes priority over this
+    // default when set.
+    public List<string> EnabledDomainAgents { get; set; } = [];
 }

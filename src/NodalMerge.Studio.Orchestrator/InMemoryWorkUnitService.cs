@@ -149,6 +149,46 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return updated;
     }
 
+    private static readonly HashSet<WorkUnitStatus> TerminalStatuses = new()
+    {
+        WorkUnitStatus.Completed, WorkUnitStatus.Merged, WorkUnitStatus.Cancelled,
+    };
+
+    public async Task<WorkUnit> SetFileScopeAsync(
+        string workUnitId,
+        IReadOnlyList<string> fileScope,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        if (TerminalStatuses.Contains(workUnit.Status))
+        {
+            throw new InvalidOperationException(
+                $"Cannot amend FileScope on work unit '{workUnitId}': already {workUnit.Status}.");
+        }
+
+        var previousScope = workUnit.FileScope;
+        var updated = workUnit with { FileScope = fileScope, UpdatedAt = DateTimeOffset.UtcNow };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        if (sessionId is not null)
+        {
+            await _events.AppendAsync(
+                sessionId,
+                workUnitId,
+                ExecutionEventKind.WorkUnitFileScopeChanged,
+                new WorkUnitFileScopeChangedPayload(workUnitId, previousScope, fileScope),
+                ct: cancellationToken).ConfigureAwait(false);
+        }
+
+        return updated;
+    }
+
     public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default)
     {
         _workUnits.TryGetValue(workUnitId, out var workUnit);
@@ -182,6 +222,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         ReviewPolicy? reviewPolicy = null,
         bool bypassPromotionBranch = false,
         WorkUnitExpectedOutputKind expectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
+        string? repositoryId = null,
         CancellationToken cancellationToken = default)
     {
         // First work unit with a repositoryPath seeds the main branch for this session. Setting
@@ -224,7 +265,8 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             ForkType: forkType,
             ReviewPolicy: reviewPolicy ?? ReviewPolicy.HumanRequired,
             BypassPromotionBranch: bypassPromotionBranch,
-            ExpectedOutputKind: expectedOutputKind);
+            ExpectedOutputKind: expectedOutputKind,
+            RepositoryId: repositoryId);
 
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }
@@ -284,7 +326,9 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             activeAgents,
             pendingMerges,
             failures,
-            knownGoodStates);
+            knownGoodStates,
+            _workspaceOptions.RootPath,
+            _workspaceOptions.SeedRepositoryPath);
     }
 
     public async Task<WorkspaceStatus> GetStatusAsync(

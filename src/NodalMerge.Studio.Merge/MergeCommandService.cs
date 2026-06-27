@@ -273,6 +273,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
         bool automated = false,
         string? reviewerAgentId = null,
         string? notes = null,
+        IReadOnlyList<string>? consideredArtifactIds = null,
         CancellationToken cancellationToken = default)
     {
         if (!Enum.TryParse<MergeProposalStatus>(decision, ignoreCase: true, out var status) ||
@@ -290,7 +291,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
         }
 
         return automated
-            ? await merge.AutomatedReviewAsync(proposalId, status, verificationResults ?? string.Empty, reviewerAgentId, cancellationToken).ConfigureAwait(false)
+            ? await merge.AutomatedReviewAsync(proposalId, status, verificationResults ?? string.Empty, reviewerAgentId, consideredArtifactIds, cancellationToken).ConfigureAwait(false)
             : await merge.ReviewAsync(proposalId, status, notes, cancellationToken).ConfigureAwait(false);
     }
 

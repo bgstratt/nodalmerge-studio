@@ -55,6 +55,9 @@ public class FanOutConcurrencyTests
 
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             inner.GetDependentsAsync(workUnitId, cancellationToken);
+
+        public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken cancellationToken = default) =>
+            inner.SetFileScopeAsync(workUnitId, fileScope, sessionId, cancellationToken);
     }
 
     [Fact]

@@ -66,4 +66,26 @@ public sealed class ArtifactTools(IArtifactCommandService artifacts)
         var list = await artifacts.ListAsync(workUnitId, includeAncestors, cancellationToken).ConfigureAwait(false);
         return McpJson.Ok(list);
     }
+
+    [McpServerTool(Name = McpToolNames.ArtifactInvalidate), Description("Mark a Research/Decision/Constraint artifact as invalidated and flag every artifact built on top of it in the lineage chain.")]
+    public async Task<string> InvalidateAsync(
+        string artifactId,
+        string reason,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var invalidated = await artifacts.InvalidateAsync(artifactId, reason, sessionId, cancellationToken).ConfigureAwait(false);
+            return McpJson.Ok(invalidated);
+        }
+        catch (KeyNotFoundException ex)
+        {
+            return McpJson.Error(McpToolNames.ArtifactInvalidate, ex.Message);
+        }
+        catch (ArgumentException ex)
+        {
+            return McpJson.Error(McpToolNames.ArtifactInvalidate, ex.Message);
+        }
+    }
 }

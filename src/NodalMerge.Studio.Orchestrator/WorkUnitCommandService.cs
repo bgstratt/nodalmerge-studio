@@ -15,7 +15,8 @@ public sealed class WorkUnitCommandService(
     IWorkUnitService workUnits,
     IAgentControlService agentControl,
     IReviewTimerService reviewTimers,
-    IRepositorySyncService repositorySync) : IWorkUnitCommandService
+    IRepositorySyncService repositorySync,
+    NodalMerge.Studio.Storage.IRepositoryRegistryService repositories) : IWorkUnitCommandService
 {
     private static readonly HashSet<WorkUnitStatus> TerminalStatuses = new()
     {
@@ -48,6 +49,18 @@ public sealed class WorkUnitCommandService(
             }
         }
 
+        // Slice 19 — RepositoryId references an already-registered repo (IRepositoryRegistryService)
+        // and takes priority over a raw RepositoryPath when both are given: resolve it to a path
+        // once here, so everything below (the sync call and the final repositoryPath argument)
+        // stays exactly as it was for ad hoc paths.
+        var effectiveRepositoryPath = command.RepositoryPath;
+        if (command.RepositoryId is not null)
+        {
+            var repository = await repositories.GetAsync(command.RepositoryId, cancellationToken).ConfigureAwait(false)
+                ?? throw new KeyNotFoundException($"Repository '{command.RepositoryId}' was not found.");
+            effectiveRepositoryPath = repository.Path;
+        }
+
         // Only the implicit "fresh top-level goal" path triggers a live repository sync — forks
         // (explicit SeedFromBranchId) and children (ParentWorkUnitId set) intentionally inherit
         // whatever their seed branch already holds, not a freshly re-synced "main". The sync must
@@ -56,10 +69,10 @@ public sealed class WorkUnitCommandService(
         // sync still needs the generation this goal was planned against — so GetStateAsync is
         // re-read regardless of whether SyncBranchFromRepositoryAsync itself did anything.
         IReadOnlyDictionary<string, string>? metadata = null;
-        if (isFreshTopLevelGoal && !string.IsNullOrWhiteSpace(command.RepositoryPath))
+        if (isFreshTopLevelGoal && !string.IsNullOrWhiteSpace(effectiveRepositoryPath))
         {
             await repositorySync.SyncBranchFromRepositoryAsync(
-                seedFromBranchId!, command.RepositoryPath, SyncTrigger.GoalCreation, cancellationToken)
+                seedFromBranchId!, effectiveRepositoryPath, SyncTrigger.GoalCreation, cancellationToken)
                 .ConfigureAwait(false);
 
             var syncState = await repositorySync.GetStateAsync(seedFromBranchId!, cancellationToken).ConfigureAwait(false);
@@ -77,7 +90,7 @@ public sealed class WorkUnitCommandService(
             command.Owner,
             command.BranchId,
             command.SuccessCriteria,
-            command.RepositoryPath,
+            effectiveRepositoryPath,
             command.ParentWorkUnitId,
             command.DependsOn,
             command.FileScope,
@@ -87,6 +100,7 @@ public sealed class WorkUnitCommandService(
             bypassPromotionBranch: command.BypassPromotionBranch,
             seedFromBranchId: seedFromBranchId,
             expectedOutputKind: command.ExpectedOutputKind ?? WorkUnitExpectedOutputKind.FileChange,
+            repositoryId: command.RepositoryId,
             cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 

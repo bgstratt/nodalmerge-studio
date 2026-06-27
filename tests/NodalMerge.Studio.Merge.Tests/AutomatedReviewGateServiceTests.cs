@@ -201,8 +201,11 @@ public class AutomatedReviewGateServiceTests
             string? profileId = null,
             string? autoReviewProfileId = null,
             IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            IReadOnlyList<string>? enabledDomainAgents = null,
             CancellationToken cancellationToken = default) =>
             Task.FromResult("agent");
+
+        public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
 
         public Task ReinvokeOrchestratorAsync(
             string workUnitId,
@@ -236,6 +239,7 @@ public class AutomatedReviewGateServiceTests
             MergeProposalStatus decision,
             string verificationResults,
             string? reviewerAgentId = null,
+            IReadOnlyList<string>? consideredArtifactIds = null,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
@@ -291,6 +295,9 @@ public class AutomatedReviewGateServiceTests
             throw new NotSupportedException();
 
         public Task<ArtifactRef> ReparentAsync(string artifactId, string newParentArtifactId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<ArtifactRef> InvalidateAsync(string artifactId, string reason, string? sessionId = null, CancellationToken ct = default) =>
             throw new NotSupportedException();
     }
 
@@ -414,6 +421,13 @@ public class AutomatedReviewGateServiceTests
 
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+
+        public Task<WorkUnit> SetFileScopeAsync(
+            string workUnitId,
+            IReadOnlyList<string> fileScope,
+            string? sessionId = null,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class FakeArtifactCommandService : IArtifactCommandService
@@ -460,6 +474,9 @@ public class AutomatedReviewGateServiceTests
         public Task<IReadOnlyList<ArtifactRef>> ListAsync(
             string workUnitId, bool includeAncestors = true, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
+
+        public Task<ArtifactRef> InvalidateAsync(string artifactId, string reason, string? sessionId = null, CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class FakeDeadLetterService : IDeadLetterService

@@ -6,6 +6,7 @@ import { ExecutionTimelinePanel } from './WorkspaceDashboardPanel';
 import { TrajectoryReplayPanel } from './DagReplayPanel';
 import { GoalWorkspacePanel } from './ArtifactExplorerPanel';
 import { InsightsPanel } from './InsightsPanel';
+import { ProjectionComparisonPanel } from './ProjectionComparisonPanel';
 import type { NotificationManager } from '../NotificationManager';
 import type { AgentConfigService } from '../AgentConfigService';
 
@@ -29,6 +30,7 @@ export class StudioShellPanel implements vscode.Disposable {
   readonly pathways: TrajectoryReplayPanel;
   readonly goalWorkspace: GoalWorkspacePanel;
   readonly insights: InsightsPanel;
+  readonly projectionComparison: ProjectionComparisonPanel;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -47,6 +49,7 @@ export class StudioShellPanel implements vscode.Disposable {
     this.pathways    = new TrajectoryReplayPanel(panel, baseUrl, this.getSelectedSessionId);
     this.goalWorkspace       = new GoalWorkspacePanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl, this.onSessionChanged);
     this.insights            = new InsightsPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
+    this.projectionComparison = new ProjectionComparisonPanel(panel, baseUrl);
 
     this.panel.webview.html = this.buildHtml(extensionUri);
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
@@ -62,6 +65,7 @@ export class StudioShellPanel implements vscode.Disposable {
     this.goalWorkspace.activate();
     this.reviewPanel.activate();
     this.insights.activate();
+    this.projectionComparison.activate();
   }
 
   /** Returns the currently-selected session ID from the Goal Workspace. */
@@ -124,6 +128,7 @@ export class StudioShellPanel implements vscode.Disposable {
     this.goalWorkspace.activate();
     this.reviewPanel.activate();
     this.insights.activate();
+    this.projectionComparison.activate();
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
@@ -155,6 +160,7 @@ export class StudioShellPanel implements vscode.Disposable {
       this.pathways.handleMessage(msg),
       this.goalWorkspace.handleMessage(msg),
       this.insights.handleMessage(msg),
+      this.projectionComparison.handleMessage(msg),
     ]);
   }
 
@@ -174,6 +180,7 @@ export class StudioShellPanel implements vscode.Disposable {
     const decisionConvergenceFragment  = DecisionConvergencePanel.getFragment();
     const trajectoryFragment           = TrajectoryReplayPanel.getFragment(webview, extensionUri, nonce);
     const insightsFragment             = InsightsPanel.getFragment();
+    const projectionComparisonFragment = ProjectionComparisonPanel.getFragment();
 
     const tabs: TabDef[] = [
       { id: GoalWorkspacePanel.containerId, label: 'Goal Workspace' },
@@ -182,6 +189,7 @@ export class StudioShellPanel implements vscode.Disposable {
       { id: DecisionConvergencePanel.containerId, label: 'Review' },
       { id: TrajectoryReplayPanel.containerId, label: 'Pathways' },
       { id: InsightsPanel.containerId, label: 'Insights' },
+      { id: ProjectionComparisonPanel.containerId, label: 'Projection Snapshots' },
     ];
     const tabButtonsHtml = tabs
       .map(t => `<button class="nm-shell-tab${t.id === GoalWorkspacePanel.containerId ? ' active' : ''}" data-tab="${t.id}">${t.label}</button>`)
@@ -203,6 +211,7 @@ ${executionTimelineFragment.css}
 ${decisionConvergenceFragment.css}
 ${trajectoryFragment.css}
 ${insightsFragment.css}
+${projectionComparisonFragment.css}
   </style>
 </head>
 <body>
@@ -214,6 +223,7 @@ ${executionTimelineFragment.html}
 ${decisionConvergenceFragment.html}
 ${trajectoryFragment.html}
 ${insightsFragment.html}
+${projectionComparisonFragment.html}
   </div>
   <script nonce="${nonce}">
     (function() {
@@ -249,6 +259,9 @@ ${goalWorkspaceFragment.script}
   <script nonce="${nonce}">
 ${insightsFragment.script}
   </script>
+  <script nonce="${nonce}">
+${projectionComparisonFragment.script}
+  </script>
 ${trajectoryFragment.scriptTag}
 </body>
 </html>`;
@@ -260,6 +273,7 @@ ${trajectoryFragment.scriptTag}
     this.goalWorkspace.dispose();
     this.pathways.dispose();
     this.insights.dispose();
+    this.projectionComparison.dispose();
     this.panel.dispose();
     for (const d of this.disposables) { d.dispose(); }
     this.disposables.length = 0;

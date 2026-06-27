@@ -200,6 +200,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         MergeProposalStatus decision,
         string verificationResults,
         string? reviewerAgentId = null,
+        IReadOnlyList<string>? consideredArtifactIds = null,
         CancellationToken cancellationToken = default)
     {
         if (decision is not (MergeProposalStatus.Approved or MergeProposalStatus.Rejected))
@@ -263,6 +264,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             Status = nextStatus,
             VerificationResults = verificationResults,
             AgentId = reviewerAgentId ?? proposal.AgentId,
+            ConsideredArtifactIds = consideredArtifactIds ?? proposal.ConsideredArtifactIds,
         };
         _proposals[proposalId] = updated;
         await _nodeStore.WriteNodeAsync(
@@ -288,6 +290,19 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                     ExecutionEventKind.ProposalRejected,
                     new ProposalRejectedPayload(proposalId, reviewerAgentId ?? "reviewer", verificationResults),
                     ct: cancellationToken).ConfigureAwait(false);
+            }
+
+            if (consideredArtifactIds is { Count: > 0 })
+            {
+                foreach (var artifactId in consideredArtifactIds)
+                {
+                    await _events.AppendAsync(
+                        proposal.SessionId,
+                        proposal.WorkUnitId,
+                        ExecutionEventKind.ArtifactConsideredInDecision,
+                        new ArtifactConsideredInDecisionPayload(artifactId, proposalId, updated.Status),
+                        ct: cancellationToken).ConfigureAwait(false);
+                }
             }
         }
 

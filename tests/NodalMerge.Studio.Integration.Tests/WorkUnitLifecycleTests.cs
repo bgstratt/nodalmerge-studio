@@ -160,6 +160,10 @@ public class WorkUnitLifecycleTests
             Calls.Add((workUnitId, stage));
             return Task.CompletedTask;
         }
+
+        public Task BroadcastArtifactInvalidatedAsync(
+            string? workUnitId, string artifactId, IReadOnlyList<string> flaggedArtifactIds, string reason,
+            CancellationToken cancellationToken = default) => Task.CompletedTask;
     }
 
     private sealed class NoopBranchService : IBranchService
@@ -177,7 +181,7 @@ public class WorkUnitLifecycleTests
         public Task<MergeProposal?> GetAsync(string proposalId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal> ValidateAsync(string proposalId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus decision, string? notes = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
-        public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, IReadOnlyList<string>? consideredArtifactIds = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false) => throw new NotSupportedException();
         public Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal> SupersedeAsync(string proposalId, string supersededByProposalId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
@@ -196,11 +200,13 @@ public class WorkUnitLifecycleTests
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
             string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            IReadOnlyList<string>? enabledDomainAgents = null,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
         public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
         public string? GetAutoReviewProfileId(string workUnitId) => null;
+        public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task ResumeAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task StopAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();

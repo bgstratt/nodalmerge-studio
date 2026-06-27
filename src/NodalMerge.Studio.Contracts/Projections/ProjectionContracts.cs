@@ -136,6 +136,72 @@ public sealed record ProjectionDelta(
 }
 
 /// <summary>
+/// Capability-gap fix — a persisted, immutable capture of an AgentWorkspace projection at a point
+/// in time. WorkUnitId stays the one identity (no parallel ProjectionId/WorkspaceId scheme);
+/// SnapshotId only identifies this particular capture, the same way KnownGoodState.StateId
+/// identifies a captured branch state without inventing a second "workspace" concept.
+/// </summary>
+public sealed record ProjectionSnapshot(
+    string SnapshotId,
+    string WorkUnitId,
+    AgentWorkspaceProjectionPayload Payload,
+    DateTimeOffset CreatedAt);
+
+/// <summary>
+/// Result of IProjectionSnapshotService.MaterializeAsync — runs a build/test/lint execution
+/// against the work unit's branch, then immediately captures a snapshot, so the two are returned
+/// together as one atomic "run it and freeze the result" operation.
+/// </summary>
+public sealed record ProjectionMaterializationResult(
+    BranchExecutionResult Execution,
+    ProjectionSnapshot Snapshot);
+
+/// <summary>
+/// Result of re-checking a snapshot's referenced artifacts against their current state. Reads the
+/// InvalidatedByArtifactId/Status flags ArtifactLineageService.InvalidateAsync's cascade already
+/// sets — no separate propagation logic, this just surfaces what already happened at the artifact
+/// layer.
+/// </summary>
+public sealed record ProjectionStaleness(
+    string SnapshotId,
+    bool IsStale,
+    IReadOnlyList<string> StaleArtifactIds);
+
+public sealed record ArtifactStatusDivergence(string ArtifactId, ArtifactStatus StatusA, ArtifactStatus StatusB);
+
+/// <summary>
+/// Symmetric diff between two sibling projection snapshots (e.g. a React fork vs a Vue fork) —
+/// deliberately distinct from ProjectionDelta.Compute above, whose "added/removed" semantics are
+/// temporal (cycle N vs N+1 of the *same* work unit, where artifacts are never reported missing,
+/// only status-changed). Comparing two different work units' snapshots needs real set difference:
+/// an artifact only present in one side is OnlyInA/OnlyInB, not "added since previous."
+/// </summary>
+public sealed record ProjectionComparison(
+    string SnapshotIdA,
+    string SnapshotIdB,
+    IReadOnlyList<ArtifactRef> OnlyInA,
+    IReadOnlyList<ArtifactRef> OnlyInB,
+    IReadOnlyList<ArtifactStatusDivergence> DifferingStatus)
+{
+    public static ProjectionComparison Compute(
+        string snapshotIdA, string snapshotIdB,
+        AgentWorkspaceProjectionPayload a, AgentWorkspaceProjectionPayload b)
+    {
+        var allA = a.Artifacts.Artifacts.Concat(a.InheritedConstraints).ToDictionary(x => x.ArtifactId);
+        var allB = b.Artifacts.Artifacts.Concat(b.InheritedConstraints).ToDictionary(x => x.ArtifactId);
+
+        var onlyInA = allA.Where(kv => !allB.ContainsKey(kv.Key)).Select(kv => kv.Value).ToList();
+        var onlyInB = allB.Where(kv => !allA.ContainsKey(kv.Key)).Select(kv => kv.Value).ToList();
+        var differingStatus = allA
+            .Where(kv => allB.TryGetValue(kv.Key, out var other) && other.Status != kv.Value.Status)
+            .Select(kv => new ArtifactStatusDivergence(kv.Key, kv.Value.Status, allB[kv.Key].Status))
+            .ToList();
+
+        return new ProjectionComparison(snapshotIdA, snapshotIdB, onlyInA, onlyInB, differingStatus);
+    }
+}
+
+/// <summary>
 /// GoalGraph projection — DAG of goal nodes for the decision tree.
 /// </summary>
 public sealed record GoalGraphProjectionPayload(

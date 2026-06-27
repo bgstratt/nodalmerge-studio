@@ -30,7 +30,9 @@ internal sealed class McpToolDispatcher(
     IWorkspaceExecutionCommandService executionCommands,
     IWorkspaceProfileService workspaceProfiles,
     IFileLeaseService fileLease,
-    IWorkspaceSemanticNavigationService semanticNavigation)
+    IWorkspaceSemanticNavigationService semanticNavigation,
+    NodalMerge.Studio.Storage.IRepositoryRegistryService repositories,
+    IProjectionSnapshotService projectionSnapshots)
 {
     // Phase 9g — read-before-write enforcement. McpToolDispatcher is registered as a singleton
     // (InMemoryAgentRuntimeService.cs) shared across every agent/run, so this cache lives here
@@ -60,6 +62,7 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.WorkUnitCreate   => await WorkUnitCreateAsync(input, ct),
                 McpToolNames.WorkUnitUpdate   => await WorkUnitUpdateAsync(input, ct, sessionId),
                 McpToolNames.WorkUnitList     => await WorkUnitListAsync(input, ct),
+                McpToolNames.WorkUnitDependents => await WorkUnitDependentsAsync(input, ct),
                 McpToolNames.TaskCreate       => await TaskCreateAsync(input, ct),
                 McpToolNames.TaskList         => await TaskListAsync(input, ct),
                 McpToolNames.TaskUpdate       => await TaskUpdateAsync(input, ct),
@@ -77,7 +80,7 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.WorkspaceStatus  => await WorkspaceStatusAsync(input, ct),
                 McpToolNames.DocFetch         => await DocFetchAsync(input, ct, sessionId),
                 McpToolNames.SnapshotGet      => await SnapshotGetAsync(input, ct),
-                McpToolNames.ProjectionGet    => await ProjectionGetAsync(input, ct),
+                McpToolNames.ProjectionGet    => await ProjectionGetAsync(input, ct, sessionId),
                 McpToolNames.MergeApply       => await MergeApplyAsync(input, ct, sessionId),
                 McpToolNames.WorkspaceRead    => await WorkspaceReadAsync(input, ct, sessionId),
                 McpToolNames.WorkspaceReadMany => await WorkspaceReadManyAsync(input, ct, sessionId),
@@ -99,6 +102,13 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.ArtifactRecordPlan => await ArtifactRecordPlanAsync(input, ct),
                 McpToolNames.ArtifactQuery      => await ArtifactQueryAsync(input, ct),
                 McpToolNames.ArtifactList       => await ArtifactListAsync(input, ct),
+                McpToolNames.ArtifactInvalidate => await ArtifactInvalidateAsync(input, ct, sessionId),
+                McpToolNames.ProjectionSnapshotCapture => await ProjectionSnapshotCaptureAsync(input, ct),
+                McpToolNames.ProjectionSnapshotGet     => await ProjectionSnapshotGetAsync(input, ct),
+                McpToolNames.ProjectionSnapshotList    => await ProjectionSnapshotListAsync(input, ct),
+                McpToolNames.ProjectionStaleCheck      => await ProjectionStaleCheckAsync(input, ct),
+                McpToolNames.ProjectionCompare         => await ProjectionCompareAsync(input, ct),
+                McpToolNames.ProjectionMaterialize     => await ProjectionMaterializeAsync(input, ct),
                 McpToolNames.WorkspaceBuild   => await WorkspaceBuildAsync(input, ct),
                 McpToolNames.WorkspaceTest    => await WorkspaceTestAsync(input, ct),
                 McpToolNames.WorkspaceExec    => await WorkspaceExecAsync(input, ct),
@@ -108,6 +118,8 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.WorkspacePath    => await WorkspacePathAsync(input, ct),
                 McpToolNames.WorkspaceProfileGet    => await WorkspaceProfileGetAsync(input, ct),
                 McpToolNames.WorkspaceProfileRescan => await WorkspaceProfileRescanAsync(input, ct),
+                McpToolNames.RepositoryRegister => await RepositoryRegisterAsync(input, ct),
+                McpToolNames.RepositoryList     => await RepositoryListAsync(ct),
                 _ => ToError($"Tool '{toolName}' is not dispatched by the agent runtime.")
             };
         }
@@ -134,7 +146,8 @@ internal sealed class McpToolDispatcher(
                 RepositoryPath: Str(input, "repositoryPath"),
                 ParentWorkUnitId: Str(input, "parentWorkUnitId"),
                 DependsOn: StrArray(input, "dependsOn"),
-                FileScope: StrArray(input, "fileScope")),
+                FileScope: StrArray(input, "fileScope"),
+                RepositoryId: Str(input, "repositoryId")),
             ct).ConfigureAwait(false);
         return ToJson(new { workUnitId = wu.WorkUnitId, branchId = wu.BranchId });
     }
@@ -148,6 +161,9 @@ internal sealed class McpToolDispatcher(
         var assignedAgent = Str(input, "assignedAgent");
         if (assignedAgent is not null)
             await orchestrator.AssignWorkAsync(workUnitId, assignedAgent, ct).ConfigureAwait(false);
+        var fileScope = StrArray(input, "fileScope");
+        if (fileScope is not null)
+            await workUnits.SetFileScopeAsync(workUnitId, fileScope, sessionId, ct).ConfigureAwait(false);
         var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
         return ToJson(wu);
     }
@@ -156,6 +172,25 @@ internal sealed class McpToolDispatcher(
     {
         var list = await workUnits.ListAsync(Str(input, "branchId"), ct).ConfigureAwait(false);
         return ToJson(list.Select(w => w.WorkUnitId));
+    }
+
+    private async Task<string> WorkUnitDependentsAsync(JsonElement input, CancellationToken ct)
+    {
+        var list = await workUnits.GetDependentsAsync(Str(input, "workUnitId")!, ct).ConfigureAwait(false);
+        return ToJson(list.Select(w => w.WorkUnitId));
+    }
+
+    private async Task<string> RepositoryRegisterAsync(JsonElement input, CancellationToken ct)
+    {
+        var repository = await repositories.RegisterAsync(
+            Str(input, "path")!, Str(input, "label"), ct).ConfigureAwait(false);
+        return ToJson(new { repositoryId = repository.RepositoryId, path = repository.Path });
+    }
+
+    private async Task<string> RepositoryListAsync(CancellationToken ct)
+    {
+        var list = await repositories.ListAsync(ct).ConfigureAwait(false);
+        return ToJson(list);
     }
 
         private async Task<string> TaskCreateAsync(JsonElement input, CancellationToken ct)
@@ -227,6 +262,7 @@ internal sealed class McpToolDispatcher(
             Str(input, "agentType")!, Str(input, "workUnitId")!,
             Str(input, "taskId"), Str(input, "model"), Str(input, "baseUrl"), Str(input, "apiKey"),
             Str(input, "provider"), Str(input, "profileId"), Str(input, "autoReviewProfileId"),
+            enabledDomainAgents: StrArray(input, "enabledDomainAgents"),
             cancellationToken: ct).ConfigureAwait(false);
         return ToJson(new { agentId });
     }
@@ -305,7 +341,9 @@ internal sealed class McpToolDispatcher(
                     return ToError("verificationResults is required for automated review.");
 
                 var proposal = await merge
-                    .AutomatedReviewAsync(proposalId, decision, verificationResults, Str(input, "reviewerAgentId"), ct)
+                    .AutomatedReviewAsync(
+                        proposalId, decision, verificationResults, Str(input, "reviewerAgentId"),
+                        StrArray(input, "consideredArtifactIds"), ct)
                     .ConfigureAwait(false);
                 return ToJson(proposal);
             }
@@ -666,7 +704,7 @@ internal sealed class McpToolDispatcher(
         return ToJson(snap);
     }
 
-    private async Task<string> ProjectionGetAsync(JsonElement input, CancellationToken ct)
+    private async Task<string> ProjectionGetAsync(JsonElement input, CancellationToken ct, string? sessionId)
     {
         var typeStr  = Str(input, "projectionType") ?? Str(input, "type") ?? "WorkUnit";
         var levelStr = Str(input, "projectionLevel") ?? Str(input, "level") ?? "Normal";
@@ -674,10 +712,110 @@ internal sealed class McpToolDispatcher(
             return ToError($"Unknown projectionType '{typeStr}'.");
         if (!Enum.TryParse<ProjectionLevel>(levelStr, ignoreCase: true, out var projLevel))
             return ToError($"Unknown projectionLevel '{levelStr}'.");
+        var workUnitId = Str(input, "workUnitId");
         var result = await projections.GetAsync(
-            new ProjectionRequest(projType, projLevel, Str(input, "workUnitId"), Str(input, "branchId"), Str(input, "agentId")),
+            new ProjectionRequest(projType, projLevel, workUnitId, Str(input, "branchId"), Str(input, "agentId")),
             ct).ConfigureAwait(false);
+
+        if (sessionId is not null && projType == ProjectionType.AgentWorkspace)
+            await RecordSurfacedDomainAgentArtifactsAsync(result.DataJson, workUnitId, Str(input, "agentId"), sessionId, ct)
+                .ConfigureAwait(false);
+
         return result.DataJson;
+    }
+
+    // Slice 23 — durable evidence that a domain-agent-authored Constraint/Research artifact (one
+    // whose title starts with a DomainAgentRegistry prefix) was actually returned to an agent in a
+    // projection it read, not just written into the DAG. Gated on sessionId like every other
+    // execution-event append in this dispatcher (e.g. WorkspaceSearchExecuted above) — UI/REST
+    // projection reads have no sessionId and intentionally don't count as "surfaced to an agent."
+    private async Task RecordSurfacedDomainAgentArtifactsAsync(
+        string dataJson, string? workUnitId, string? agentId, string sessionId, CancellationToken ct)
+    {
+        AgentWorkspaceProjectionPayload? payload;
+        try
+        {
+            // ProjectionManager serializes with JsonSerializerOptions.Web (camelCase) — match that
+            // here so deserialization actually binds the properties instead of silently leaving
+            // them at their default values.
+            payload = JsonSerializer.Deserialize<AgentWorkspaceProjectionPayload>(dataJson, JsonSerializerOptions.Web);
+        }
+        catch (JsonException)
+        {
+            return;
+        }
+        if (payload is null) return;
+
+        var seen = new HashSet<string>();
+        foreach (var artifact in payload.Artifacts.Artifacts.Concat(payload.InheritedConstraints))
+        {
+            if (artifact.Title is not { } title) continue;
+            if (!DomainAgentRegistry.All.Any(d => title.StartsWith(d.TitlePrefix, StringComparison.Ordinal))) continue;
+            if (!seen.Add(artifact.ArtifactId)) continue;
+
+            await events.AppendAsync(
+                sessionId, workUnitId, ExecutionEventKind.ArtifactSurfaced,
+                new ArtifactSurfacedPayload(artifact.ArtifactId, agentId, ProjectionType.AgentWorkspace.ToString()),
+                ct: ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<string> ProjectionSnapshotCaptureAsync(JsonElement input, CancellationToken ct)
+    {
+        var snapshot = await projectionSnapshots.CaptureAsync(Str(input, "workUnitId")!, ct).ConfigureAwait(false);
+        return ToJson(new { snapshotId = snapshot.SnapshotId, workUnitId = snapshot.WorkUnitId, createdAt = snapshot.CreatedAt });
+    }
+
+    private async Task<string> ProjectionSnapshotGetAsync(JsonElement input, CancellationToken ct)
+    {
+        var snapshot = await projectionSnapshots.GetAsync(Str(input, "snapshotId")!, ct).ConfigureAwait(false);
+        return snapshot is null ? ToError("Projection snapshot was not found.") : ToJson(snapshot);
+    }
+
+    private async Task<string> ProjectionSnapshotListAsync(JsonElement input, CancellationToken ct)
+    {
+        var list = await projectionSnapshots.ListAsync(Str(input, "workUnitId"), ct).ConfigureAwait(false);
+        return ToJson(list);
+    }
+
+    private async Task<string> ProjectionStaleCheckAsync(JsonElement input, CancellationToken ct)
+    {
+        try
+        {
+            var staleness = await projectionSnapshots.CheckStaleAsync(Str(input, "snapshotId")!, ct).ConfigureAwait(false);
+            return ToJson(staleness);
+        }
+        catch (KeyNotFoundException ex) { return ToError(ex.Message); }
+    }
+
+    private async Task<string> ProjectionCompareAsync(JsonElement input, CancellationToken ct)
+    {
+        try
+        {
+            var comparison = await projectionSnapshots.CompareAsync(
+                Str(input, "snapshotIdA")!, Str(input, "snapshotIdB")!, ct).ConfigureAwait(false);
+            return ToJson(comparison);
+        }
+        catch (KeyNotFoundException ex) { return ToError(ex.Message); }
+    }
+
+    private async Task<string> ProjectionMaterializeAsync(JsonElement input, CancellationToken ct)
+    {
+        try
+        {
+            var request = new WorkspaceExecutionRequest(
+                Build: Bool(input, "build") ?? true,
+                Test: Bool(input, "test") ?? true,
+                Lint: Bool(input, "lint") ?? false,
+                BuildCommand: Str(input, "buildCommand"),
+                TestCommand: Str(input, "testCommand"),
+                LintCommand: Str(input, "lintCommand"),
+                TimeoutSeconds: Int(input, "timeoutSeconds") ?? 300);
+            var materialization = await projectionSnapshots.MaterializeAsync(
+                Str(input, "workUnitId")!, request, ct).ConfigureAwait(false);
+            return ToJson(materialization);
+        }
+        catch (KeyNotFoundException ex) { return ToError(ex.Message); }
     }
 
     private async Task<string> MergeApplyAsync(JsonElement input, CancellationToken ct, string? sessionId)
@@ -827,6 +965,13 @@ internal sealed class McpToolDispatcher(
         var includeAncestors = Bool(input, "includeAncestors") ?? true;
         var list = await artifactCommands.ListAsync(unitId, includeAncestors, ct).ConfigureAwait(false);
         return ToJson(list);
+    }
+
+    private async Task<string> ArtifactInvalidateAsync(JsonElement input, CancellationToken ct, string? sessionId)
+    {
+        var invalidated = await artifactCommands.InvalidateAsync(
+            Str(input, "artifactId")!, Str(input, "reason")!, sessionId, ct).ConfigureAwait(false);
+        return ToJson(invalidated);
     }
 
     // ── Slice 16d — workspace execution tool handlers ─────────────────────

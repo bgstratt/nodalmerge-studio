@@ -31,7 +31,9 @@ internal sealed class ReviewerAgentLoop(
         1. Call nm_v1_projection_get with projectionType="AgentWorkspace" and the work unit ID to see artifacts.
         2. Call nm_v1_artifact_query for the work unit (ancestors included by default) and check the
            proposal's changes against any recorded Constraints — a change that violates a recorded
-           constraint is grounds for rejection even if the diff otherwise looks reasonable.
+           constraint is grounds for rejection even if the diff otherwise looks reasonable. Note the
+           artifact ID of every Constraint/Research artifact you actually weigh here, whether or not
+           it ends up mattering to your decision — you'll cite them in step 7.
         3. Call nm_v1_merge_validate if the proposal is still Draft (usually already ReadyForReview).
         4. Read changed files with nm_v1_workspace_read from the proposal's source branch — or
            nm_v1_workspace_read_many in one call if filesTouched has several entries.
@@ -54,8 +56,10 @@ internal sealed class ReviewerAgentLoop(
            - Leave timeoutSeconds at its default; do not raise it to force a slow suite through.
            - Skip this step entirely if filesTouched contains nothing buildable/testable (e.g. only
              docs or config the detected roots don't cover).
-        7. Call nm_v1_merge_review with automated=true, decision Approved or Rejected, and verificationResults
-           explaining your findings. Approved means the proposal may proceed to human review; Rejected blocks it.
+        7. Call nm_v1_merge_review with automated=true, decision Approved or Rejected, verificationResults
+           explaining your findings, and consideredArtifactIds listing every Constraint/Research
+           artifact ID you weighed in step 2 (omit if you found none worth weighing). Approved means
+           the proposal may proceed to human review; Rejected blocks it.
           8. If review intent is ambiguous and would require guessing policy/scope, call
               nm_v1_clarification_request and stop immediately.
 
@@ -232,10 +236,11 @@ internal sealed class ReviewerAgentLoop(
             new(McpToolNames.MergeReview, "Submit automated pre-gate review (set automated=true).",
                 Schema(["proposalId", "decision", "verificationResults"], new()
                 {
-                    ["proposalId"]          = Str("Merge proposal ID"),
-                    ["decision"]            = Str("Approved or Rejected"),
-                    ["verificationResults"] = Str("Concise review notes"),
-                    ["automated"]           = Str("Must be true for automated pre-gate review"),
+                    ["proposalId"]            = Str("Merge proposal ID"),
+                    ["decision"]              = Str("Approved or Rejected"),
+                    ["verificationResults"]   = Str("Concise review notes"),
+                    ["automated"]             = Str("Must be true for automated pre-gate review"),
+                    ["consideredArtifactIds"] = StrArray("IDs of any recorded Constraint/Research artifacts you explicitly checked the proposal against in step 2, whether or not they were violated (optional)"),
                 })),
 
             new(McpToolNames.ProjectionGet, "Get a projection of workspace state.",
