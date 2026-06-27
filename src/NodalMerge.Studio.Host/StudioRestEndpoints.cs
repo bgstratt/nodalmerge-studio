@@ -156,6 +156,8 @@ public static class StudioRestEndpoints
         // null/omitted on a partial update leaves the existing set untouched.
         IReadOnlyList<string>? EnabledDomainAgents = null);
 
+    private sealed record SyncDiffBody(string[] PeerNodeIdsHex);
+
     private sealed record BuildRequestBody(
         string? BuildCommand = null,
         int TimeoutSeconds = 300,
@@ -3834,6 +3836,49 @@ public static class StudioRestEndpoints
             }
 
             return Results.Ok(created);
+        });
+
+        // ── Causal graph queries ───────────────────────────────────────────
+
+        app.MapGet("/studio/causal/frontier", (IStudioCausalGraphService causal, CancellationToken ct) =>
+            causal.GetFrontierAsync(ct)
+                  .ContinueWith(t => Results.Ok(new { frontierHeads = t.Result }), TaskScheduler.Default));
+
+        app.MapGet("/studio/causal/parents/{nodeIdHex}", async (
+            string nodeIdHex,
+            IStudioCausalGraphService causal,
+            CancellationToken ct) =>
+        {
+            var result = await causal.GetCausalParentsAsync(nodeIdHex, ct).ConfigureAwait(false);
+            return Results.Ok(new
+            {
+                nodeIdHex,
+                parentIds = result.ParentIdsHex,
+                nodeFound = result.NodeFound
+            });
+        });
+
+        app.MapGet("/studio/causal/resolution", async (IStudioCausalGraphService causal, CancellationToken ct) =>
+        {
+            var result = await causal.GetCanonicalResolutionAsync(ct).ConfigureAwait(false);
+            return Results.Ok(new
+            {
+                entries = result.Entries.Select(e => new { key = e.Key, valueBytesB64 = e.ValueBytesB64 }),
+                entryCount = result.Entries.Count
+            });
+        });
+
+        app.MapPost("/studio/causal/sync-diff", async (
+            SyncDiffBody body,
+            IStudioCausalGraphService causal,
+            CancellationToken ct) =>
+        {
+            var result = await causal.ComputeSyncDiffAsync(body.PeerNodeIdsHex, ct).ConfigureAwait(false);
+            return Results.Ok(new
+            {
+                onlyInServer = result.OnlyInServer,
+                onlyInPeer = result.OnlyInPeer
+            });
         });
     }
 }

@@ -121,6 +121,11 @@ public static class McpToolNames
     public const string RepositoryReadFile  = "nm_v1_repository_read_file";
     public const string RepositoryListFiles = "nm_v1_repository_list_files";
 
+    public const string CausalGetFrontier         = "nm_v1_causal_get_frontier";
+    public const string CausalGetParents          = "nm_v1_causal_get_parents";
+    public const string CausalGetResolution       = "nm_v1_causal_get_resolution";
+    public const string CausalComputeSyncDiff     = "nm_v1_causal_compute_sync_diff";
+
     public static IReadOnlyList<string> All { get; } =
     [
         ProjectionGet,
@@ -214,6 +219,10 @@ public static class McpToolNames
         RepositoryCreate,
         RepositoryClone,
         RepositoryReadFile,
-        RepositoryListFiles
+        RepositoryListFiles,
+        CausalGetFrontier,
+        CausalGetParents,
+        CausalGetResolution,
+        CausalComputeSyncDiff
     ];
 }

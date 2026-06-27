@@ -425,6 +425,22 @@ public interface IStudioGraphPromoter
     void TryPromoteStudioCheckpoint();
 }
 
+public sealed record CausalParentsResult(string[] ParentIdsHex, bool NodeFound);
+public sealed record CanonicalResolutionEntry(string Key, string ValueBytesB64);
+public sealed record CanonicalResolutionResult(IReadOnlyList<CanonicalResolutionEntry> Entries);
+public sealed record SyncDiffResult(string[] OnlyInServer, string[] OnlyInPeer);
+
+// Exposes read-only causal/CRDT graph queries for the studio room. Backed by the real
+// StateGraph that PromoteCheckpointToGraph populates. Optional because the runtime bridge
+// only exists in the Studio Host process.
+public interface IStudioCausalGraphService
+{
+    Task<string[]> GetFrontierAsync(CancellationToken cancellationToken = default);
+    Task<CausalParentsResult> GetCausalParentsAsync(string nodeIdHex, CancellationToken cancellationToken = default);
+    Task<CanonicalResolutionResult> GetCanonicalResolutionAsync(CancellationToken cancellationToken = default);
+    Task<SyncDiffResult> ComputeSyncDiffAsync(string[] peerNodeIdsHex, CancellationToken cancellationToken = default);
+}
+
 // see stage badges move. Optional collaborator (resolved via IServiceProvider.GetService, never
 // constructor-required) because the room broker only exists in the Studio Host process — unit
 // and integration tests that build services directly never register an implementation.

@@ -200,11 +200,13 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
         this.get<{ usePromotionBranch?: boolean; candidateBranchId?: string }>('/studio/options'),
         this.get<FindingSignal[]>('/studio/findings?status=Open'),
       ]);
+      const syncGraph = await this.get<{ frontierHeads: string[] }>('/studio/causal/frontier').catch(() => null);
       this.usePromotionBranch = opts.usePromotionBranch ?? false;
       void this.panel.webview.postMessage({
         type: 'data', summary, workUnits, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases,
         usePromotionBranch: this.usePromotionBranch,
         candidateBranchId: opts.candidateBranchId ?? 'candidate',
+        syncGraph: syncGraph ?? { frontierHeads: [] },
       });
       this.notifications?.update(merges, workUnits, findings);
     } catch {
@@ -561,6 +563,38 @@ const ET_CSS = `
     border-radius: 3px;
   }
   .add-btn:hover { opacity: 1; }
+  .sync-graph-card {
+    background: var(--nm-section-bg);
+    border: 1px solid var(--nm-border);
+    border-radius: 4px;
+    padding: 8px 12px;
+    margin-bottom: 6px;
+  }
+  .sync-graph-card .sg-label {
+    font-size: 0.78em;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    opacity: 0.55;
+    margin-bottom: 4px;
+  }
+  .sync-graph-card .sg-badge {
+    display: inline-block;
+    background: var(--nm-badge);
+    color: var(--nm-badge-fg);
+    border-radius: 3px;
+    padding: 1px 6px;
+    font-size: 0.75em;
+    margin-right: 4px;
+  }
+  .sync-graph-card .sg-heads {
+    font-family: var(--nm-mono);
+    font-size: 0.72em;
+    opacity: 0.7;
+    margin-top: 4px;
+    word-break: break-all;
+  }
+  .sg-promoted { color: var(--nm-success); font-weight: 600; }
+  .sg-empty    { color: var(--nm-warn); }
 `;
 
 const ET_HTML = `
@@ -595,6 +629,9 @@ const ET_HTML = `
 
   <h2>File Lease Conflicts</h2>
   <div id="file-leases"><p class="empty">No file lease conflicts.</p></div>
+
+  <h2>Sync Graph</h2>
+  <div id="sync-graph"><p class="empty">Loading…</p></div>
 `;
 
 const ET_JS = `
@@ -1015,7 +1052,27 @@ const ET_JS = `
     renderPendingDecisions(msg.merges);
     renderBlockedExplorations(msg.deadLetters || [], msg.workUnits);
     renderFileLeases(msg.fileLeases || [], msg.workUnits);
+    renderSyncGraph(msg.syncGraph || { frontierHeads: [] });
     var ts = document.getElementById('last-updated');
     if (ts) { ts.textContent = 'updated ' + new Date().toLocaleTimeString(); }
   });
+
+  function renderSyncGraph(data) {
+    var el = document.getElementById('sync-graph');
+    if (!el) { return; }
+    var heads = (data && data.frontierHeads) ? data.frontierHeads : [];
+    if (heads.length === 0) {
+      el.innerHTML = '<div class="sync-graph-card"><div class="sg-label">CRDT Causal Graph</div>' +
+        '<span class="sg-empty">No promoted checkpoints — frontier is empty.</span></div>';
+      return;
+    }
+    var headsHtml = heads.map(function(h) {
+      return '<span class="sg-badge">' + h.slice(0, 8) + '…' + h.slice(-4) + '</span>';
+    }).join('');
+    el.innerHTML = '<div class="sync-graph-card">' +
+      '<div class="sg-label">CRDT Causal Graph</div>' +
+      '<span class="sg-promoted">&#x25CF; ' + heads.length + ' frontier head' + (heads.length === 1 ? '' : 's') + '</span>' +
+      '<div class="sg-heads">' + headsHtml + '</div>' +
+      '</div>';
+  }
 `;
