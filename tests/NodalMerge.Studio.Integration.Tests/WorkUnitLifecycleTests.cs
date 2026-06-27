@@ -14,7 +14,8 @@ namespace NodalMerge.Studio.Integration.Tests;
 public class WorkUnitLifecycleTests
 {
     private static (InMemoryWorkUnitService Svc, ExecutionEventStreamService Events) Build(
-        IRuntimeEventBroadcaster? broadcaster = null)
+        IRuntimeEventBroadcaster? broadcaster = null,
+        IStudioGraphPromoter? graphPromoter = null)
     {
         var store = new InMemoryStudioNodeStore();
         var events = new ExecutionEventStreamService(store);
@@ -27,7 +28,8 @@ public class WorkUnitLifecycleTests
             new ArtifactLineageService(store),
             new WorkspaceOptions(),
             events,
-            broadcaster);
+            broadcaster,
+            graphPromoter);
         return (svc, events);
     }
 
@@ -148,6 +150,64 @@ public class WorkUnitLifecycleTests
         var updated = await svc.SetCurrentStageAsync("WU-1", PipelineStage.Plan);
 
         Assert.Equal(PipelineStage.Plan, updated.CurrentStage);
+    }
+
+    [Fact]
+    public async Task UpdateStatusAsync_triggers_graph_promotion_on_Completed()
+    {
+        var promoter = new RecordingGraphPromoter();
+        var (svc, _) = Build(graphPromoter: promoter);
+        await svc.CreateAsync(MakeWorkUnit("WU-comp"));
+        await svc.UpdateStatusAsync("WU-comp", WorkUnitStatus.Queued);
+        await svc.UpdateStatusAsync("WU-comp", WorkUnitStatus.Executing);
+        await svc.UpdateStatusAsync("WU-comp", WorkUnitStatus.Completed);
+
+        Assert.Equal(1, promoter.CallCount);
+    }
+
+    [Fact]
+    public async Task UpdateStatusAsync_triggers_graph_promotion_on_Merged()
+    {
+        var promoter = new RecordingGraphPromoter();
+        var (svc, _) = Build(graphPromoter: promoter);
+        await svc.CreateAsync(MakeWorkUnit("WU-merged"));
+        await svc.UpdateStatusAsync("WU-merged", WorkUnitStatus.Queued);
+        await svc.UpdateStatusAsync("WU-merged", WorkUnitStatus.Executing);
+        await svc.UpdateStatusAsync("WU-merged", WorkUnitStatus.Proposed);
+        await svc.UpdateStatusAsync("WU-merged", WorkUnitStatus.Merged);
+
+        Assert.Equal(1, promoter.CallCount);
+    }
+
+    [Fact]
+    public async Task UpdateStatusAsync_does_not_trigger_promotion_on_non_terminal_transitions()
+    {
+        var promoter = new RecordingGraphPromoter();
+        var (svc, _) = Build(graphPromoter: promoter);
+        await svc.CreateAsync(MakeWorkUnit("WU-active"));
+        await svc.UpdateStatusAsync("WU-active", WorkUnitStatus.Queued);
+        await svc.UpdateStatusAsync("WU-active", WorkUnitStatus.Executing);
+
+        Assert.Equal(0, promoter.CallCount);
+    }
+
+    [Fact]
+    public async Task UpdateStatusAsync_does_not_throw_when_no_promoter_configured()
+    {
+        var (svc, _) = Build();
+        await svc.CreateAsync(MakeWorkUnit("WU-no-promoter"));
+        await svc.UpdateStatusAsync("WU-no-promoter", WorkUnitStatus.Queued);
+        await svc.UpdateStatusAsync("WU-no-promoter", WorkUnitStatus.Executing);
+        var final = await svc.UpdateStatusAsync("WU-no-promoter", WorkUnitStatus.Completed);
+
+        Assert.Equal(WorkUnitStatus.Completed, final.Status);
+    }
+
+    private sealed class RecordingGraphPromoter : IStudioGraphPromoter
+    {
+        public int CallCount { get; private set; }
+
+        public void TryPromoteStudioCheckpoint() => CallCount++;
     }
 
     private sealed class RecordingRuntimeEventBroadcaster : IRuntimeEventBroadcaster

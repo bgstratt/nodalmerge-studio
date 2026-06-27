@@ -19,6 +19,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
     private readonly WorkspaceOptions _workspaceOptions;
     private readonly IExecutionEventStream _events;
     private readonly IRuntimeEventBroadcaster? _broadcaster;
+    private readonly IStudioGraphPromoter? _graphPromoter;
 
     public InMemoryWorkUnitService(
         IBranchService branchService,
@@ -29,7 +30,8 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IArtifactLineageService artifactLineage,
         WorkspaceOptions workspaceOptions,
         IExecutionEventStream events,
-        IRuntimeEventBroadcaster? broadcaster = null)
+        IRuntimeEventBroadcaster? broadcaster = null,
+        IStudioGraphPromoter? graphPromoter = null)
     {
         _branchService         = branchService;
         _mergeService          = mergeService;
@@ -40,6 +42,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         _workspaceOptions      = workspaceOptions;
         _events                = events;
         _broadcaster           = broadcaster;
+        _graphPromoter         = graphPromoter;
     }
 
     public async Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken cancellationToken = default)
@@ -100,6 +103,11 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
                 ExecutionEventKind.WorkUnitStatusChanged,
                 new WorkUnitStatusChangedPayload(workUnitId, previousStatus, status),
                 ct: cancellationToken).ConfigureAwait(false);
+        }
+
+        if (status is WorkUnitStatus.Completed or WorkUnitStatus.Merged)
+        {
+            _graphPromoter?.TryPromoteStudioCheckpoint();
         }
 
         return updated;

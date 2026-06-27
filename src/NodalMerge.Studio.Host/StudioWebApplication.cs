@@ -24,6 +24,7 @@ public static class StudioWebApplication
             {
                 services.AddStudioServices(llmHttpClient);
                 services.AddSingleton<IRuntimeEventBroadcaster, RuntimeRoomEventBroadcaster>();
+                services.AddSingleton<IStudioGraphPromoter, RuntimeGraphPromoter>();
                 configureServices?.Invoke(services);
             });
 

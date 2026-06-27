@@ -416,6 +416,15 @@ public interface IWorkUnitService
 
 // Slice 12c — pushes live pipeline-stage updates to connected extension clients over the
 // embedded NodalMerge runtime WebSocket room, so the Artifact Explorer doesn't have to poll to
+// Optional collaborator — materializes the current canonical checkpoint into the Studio CRDT
+// sync graph after a meaningful state-change boundary (WorkUnit completed / merged). Optional
+// because the underlying runtime bridge only exists in the Studio Host process; unit tests and
+// integration tests that build services directly never register an implementation.
+public interface IStudioGraphPromoter
+{
+    void TryPromoteStudioCheckpoint();
+}
+
 // see stage badges move. Optional collaborator (resolved via IServiceProvider.GetService, never
 // constructor-required) because the room broker only exists in the Studio Host process — unit
 // and integration tests that build services directly never register an implementation.
