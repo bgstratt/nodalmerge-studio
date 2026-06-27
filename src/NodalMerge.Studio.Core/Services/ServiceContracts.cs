@@ -360,6 +360,18 @@ public interface IWorkUnitService
         string? blockedReason,
         CancellationToken cancellationToken = default);
 
+    // Race-safety fix — increments one of the two ExecutionInfo rejection counters via a fresh
+    // internal read-merge-write, the same convention every other setter here uses. Replaces the
+    // old AutomatedReviewGateService pattern of reading the whole WorkUnit, computing a new
+    // ExecutionInfo, and calling CreateAsync(parent with {...}) — CreateAsync is an unconditional
+    // upsert, so that pattern silently reverted any Status/CurrentStage/etc. change a concurrent
+    // writer (e.g. OrchestratorAgentLoop, WorkUnitCommandService.CancelAsync) made to the same
+    // WorkUnit in the gap between the read and the write.
+    Task<WorkUnit> IncrementReviewRejectionCountAsync(
+        string workUnitId,
+        bool automated,
+        CancellationToken cancellationToken = default);
+
     // Capability-gap fix — amends a work unit's FileScope in place. Unlike SteeringService (which
     // always forks a sibling so the original's decision log stays immutable), this mutates the
     // original directly for the common case where an agent's findings warrant a narrower/wider

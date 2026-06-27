@@ -409,6 +409,20 @@ public class AutomatedReviewGateServiceTests
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
+        public Task<WorkUnit> IncrementReviewRejectionCountAsync(
+            string workUnitId,
+            bool automated,
+            CancellationToken cancellationToken = default)
+        {
+            var unit = Units[workUnitId];
+            var executionInfo = unit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0);
+            executionInfo = automated
+                ? executionInfo with { AutomatedReviewRejectionCount = executionInfo.AutomatedReviewRejectionCount + 1 }
+                : executionInfo with { HumanReviewRejectionCount = executionInfo.HumanReviewRejectionCount + 1 };
+            Units[workUnitId] = unit with { ExecutionInfo = executionInfo };
+            return Task.FromResult(Units[workUnitId]);
+        }
+
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             Task.FromResult(Units.TryGetValue(workUnitId, out var unit) ? unit : null);
 

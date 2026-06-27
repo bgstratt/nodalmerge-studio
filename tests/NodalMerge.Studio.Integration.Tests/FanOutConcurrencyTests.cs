@@ -41,6 +41,9 @@ public class FanOutConcurrencyTests
         public Task<WorkUnit> SetFanOutBlockedReasonAsync(string workUnitId, string? blockedReason, CancellationToken cancellationToken = default) =>
             inner.SetFanOutBlockedReasonAsync(workUnitId, blockedReason, cancellationToken);
 
+        public Task<WorkUnit> IncrementReviewRejectionCountAsync(string workUnitId, bool automated, CancellationToken cancellationToken = default) =>
+            inner.IncrementReviewRejectionCountAsync(workUnitId, automated, cancellationToken);
+
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             inner.GetAsync(workUnitId, cancellationToken);
 

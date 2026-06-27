@@ -149,6 +149,28 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return updated;
     }
 
+    public async Task<WorkUnit> IncrementReviewRejectionCountAsync(
+        string workUnitId,
+        bool automated,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        var executionInfo = workUnit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0);
+        executionInfo = automated
+            ? executionInfo with { AutomatedReviewRejectionCount = executionInfo.AutomatedReviewRejectionCount + 1 }
+            : executionInfo with { HumanReviewRejectionCount = executionInfo.HumanReviewRejectionCount + 1 };
+
+        var updated = workUnit with { ExecutionInfo = executionInfo, UpdatedAt = DateTimeOffset.UtcNow };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
     private static readonly HashSet<WorkUnitStatus> TerminalStatuses = new()
     {
         WorkUnitStatus.Completed, WorkUnitStatus.Merged, WorkUnitStatus.Cancelled,

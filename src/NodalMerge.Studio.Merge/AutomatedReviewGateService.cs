@@ -77,13 +77,10 @@ public sealed class AutomatedReviewGateService(
         if (parent is null)
             return new AutomatedRejectionResult(AutomatedRejectionOutcome.RetriedWorkers);
 
-        var previousCount = parent.ExecutionInfo?.AutomatedReviewRejectionCount ?? 0;
-        var rejectionCount = previousCount + 1;
-        var executionInfo = (parent.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with
-        {
-            AutomatedReviewRejectionCount = rejectionCount,
-        };
-        await workUnits.CreateAsync(parent with { ExecutionInfo = executionInfo }, cancellationToken).ConfigureAwait(false);
+        var updatedParent = await workUnits
+            .IncrementReviewRejectionCountAsync(parentWorkUnitId, automated: true, cancellationToken)
+            .ConfigureAwait(false);
+        var rejectionCount = updatedParent.ExecutionInfo!.AutomatedReviewRejectionCount;
 
         if (rejectionCount >= InMemoryDeadLetterService.MaxFailureAttempts)
         {
@@ -172,13 +169,10 @@ public sealed class AutomatedReviewGateService(
         if (workUnit is null)
             return new AutomatedRejectionResult(AutomatedRejectionOutcome.RetriedWorkers);
 
-        var previousCount = workUnit.ExecutionInfo?.HumanReviewRejectionCount ?? 0;
-        var rejectionCount = previousCount + 1;
-        var executionInfo = (workUnit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with
-        {
-            HumanReviewRejectionCount = rejectionCount,
-        };
-        await workUnits.CreateAsync(workUnit with { ExecutionInfo = executionInfo }, cancellationToken).ConfigureAwait(false);
+        var updatedWorkUnit = await workUnits
+            .IncrementReviewRejectionCountAsync(workUnitId, automated: false, cancellationToken)
+            .ConfigureAwait(false);
+        var rejectionCount = updatedWorkUnit.ExecutionInfo!.HumanReviewRejectionCount;
 
         var creds = agentControl.GetCredentialsForStage(workUnitId, PipelineStage.Execute)
             ?? agentControl.GetOrchestratorCredentials(workUnitId)

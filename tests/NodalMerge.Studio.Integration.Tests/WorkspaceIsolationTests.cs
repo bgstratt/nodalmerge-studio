@@ -35,6 +35,9 @@ public class WorkspaceIsolationTests
         public Task<WorkUnit> SetFanOutBlockedReasonAsync(string workUnitId, string? blockedReason, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
+        public Task<WorkUnit> IncrementReviewRejectionCountAsync(string workUnitId, bool automated, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default)
         {
             _units.TryGetValue(workUnitId, out var wu);
