@@ -21,6 +21,7 @@ public enum ProjectionType
     DecisionContext,
     CounterfactualComparison,
     RunRetrospective,
+    HypothesisComparison,
 }
 
 public enum ProjectionLevel
@@ -343,6 +344,31 @@ public sealed record CounterfactualComparisonProposal(
     double? Confidence,
     IReadOnlyList<string> FilesTouched,
     string? DiffSummary);
+
+/// <summary>
+/// HypothesisComparison projection — deterministic, evidence-based aggregation across N sibling
+/// forks of an experiment (HypothesisForkType.Model/Architecture/Library/Product). Unlike
+/// ModelDivergenceView/CounterfactualComparison (which compare exactly 2 proposals' raw fields),
+/// this aggregates EvidenceNode/proposal data into a score per sibling and a recommendation. It
+/// recommends; it does not decide — convergence still requires an explicit ConvergeAsync call.
+/// </summary>
+public sealed record HypothesisComparisonProjectionPayload(
+    string ParentWorkUnitId,
+    IReadOnlyList<HypothesisComparisonSibling> Siblings,
+    string? RecommendedWorkUnitId,
+    DateTimeOffset ComparedAt);
+
+public sealed record HypothesisComparisonSibling(
+    string WorkUnitId,
+    string? HypothesisId,
+    string ForkType,
+    string HypothesisStatus,
+    string? LatestProposalId,
+    string? ProposalStatus,
+    double? Confidence,
+    int EvidenceCount,
+    IReadOnlyList<string> EvidenceSummaries,
+    double Score);
 
 /// <summary>
 /// RunRetrospective projection — analytics dashboard for the Insights tab. Aggregates outcomes

@@ -26,7 +26,8 @@ public static class StudioRestEndpoints
         bool BypassPromotionBranch = false,
         string? SeedFromBranchId = null,
         WorkUnitExpectedOutputKind? ExpectedOutputKind = null,
-        string? RepositoryId = null);
+        string? RepositoryId = null,
+        IReadOnlyList<FileReferenceV1>? ReferenceFiles = null);
 
     private sealed record SpawnAgentBody(
         string AgentType,
@@ -191,7 +192,14 @@ public static class StudioRestEndpoints
 
     private sealed record CreateGoalBody(
         string Goal,
-        string? WorkUnitId = null);
+        string? WorkUnitId = null,
+        string? RepositoryId = null,
+        string? RepositoryPath = null,
+        // When set, a fresh repository (git init) is created at this path and used as the goal's
+        // repository — takes priority over RepositoryId/RepositoryPath when given.
+        string? NewRepositoryPath = null,
+        string? NewRepositoryLabel = null,
+        IReadOnlyList<FileReferenceV1>? ReferenceFiles = null);
 
     private sealed record RecordDecisionBody(
         string ProposalId,
@@ -274,6 +282,7 @@ public static class StudioRestEndpoints
         MapHypothesisEndpoints(app);
         MapReasoningEndpoints(app);
         MapModelEndpoints(app);
+        MapRepositoryEndpoints(app);
         MapExperimentEndpoints(app);
         MapSteeringEndpoints(app);
         MapCounterfactualEndpoints(app);
@@ -471,6 +480,38 @@ public static class StudioRestEndpoints
             var status = await workspace.GetStatusAsync(
                 branchId, workUnitId, limit is null or <= 0 ? 50 : limit.Value, offset ?? 0, ct).ConfigureAwait(false);
             return Results.Ok(status);
+        });
+
+        // Phase 16 — structured "what can I do here" snapshot, resolved fresh per call (never
+        // persisted), mirrors nm_v1_workspace_capabilities.
+        app.MapGet("/studio/workspace/capabilities", (WorkspaceOptions workspaceOptions) =>
+            Results.Ok(WorkspaceCapabilityResolver.Resolve(workspaceOptions)));
+
+        // Multi-repo Phase 2 — deliberate workspace switch (mirrors nm_v1_workspace_switch).
+        app.MapPost("/studio/workspace/switch", async (
+            SwitchWorkspaceBody body,
+            IRepositorySyncService repositorySync,
+            IRepositoryRegistryService repositories,
+            WorkspaceOptions workspaceOptions,
+            CancellationToken ct) =>
+        {
+            var path = body.RepositoryPath;
+            if (body.RepositoryId is not null)
+            {
+                var repository = await repositories.GetAsync(body.RepositoryId, ct).ConfigureAwait(false);
+                if (repository is null)
+                    return Results.NotFound(new { error = $"Repository '{body.RepositoryId}' was not found." });
+                path = repository.Path;
+            }
+            if (string.IsNullOrWhiteSpace(path))
+                return Results.BadRequest(new { error = "Either repositoryId or repositoryPath is required." });
+
+            var branchId = body.BranchId ?? "main";
+            var pending = await repositorySync.SyncBranchFromRepositoryAsync(
+                branchId, path, SyncTrigger.ManualRefresh, ct).ConfigureAwait(false);
+            workspaceOptions.SeedRepositoryPath = path;
+
+            return Results.Ok(new { branchId, repositoryPath = path, sync = pending });
         });
 
         // ── Slice 16d — workspace execution REST endpoints (MCP parity) ────
@@ -874,7 +915,7 @@ public static class StudioRestEndpoints
                         body.RepositoryPath, body.ParentWorkUnitId, body.DependsOn, body.FileScope,
                         ReviewPolicy: body.ReviewPolicy, BypassPromotionBranch: body.BypassPromotionBranch,
                         SeedFromBranchId: body.SeedFromBranchId, ExpectedOutputKind: body.ExpectedOutputKind,
-                        RepositoryId: body.RepositoryId),
+                        RepositoryId: body.RepositoryId, ReferenceFiles: body.ReferenceFiles),
                     ct).ConfigureAwait(false);
                 return Results.Ok(wu);
             }
@@ -1279,6 +1320,7 @@ public static class StudioRestEndpoints
             ReviewBody body,
             IMergeCommandService mergeCommands,
             IAutomatedReviewGateService reviewGate,
+            IEvidenceNodeService evidenceNodes,
             CancellationToken ct) =>
         {
             if (!Enum.TryParse<MergeProposalStatus>(body.Decision, ignoreCase: true, out var status) ||
@@ -1298,6 +1340,21 @@ public static class StudioRestEndpoints
                 {
                     await reviewGate.HandleHumanRejectionAsync(
                         proposalId, body.Notes, body.SessionId, ct).ConfigureAwait(false);
+                }
+
+                if (result.WorkUnitId is { Length: > 0 } reviewedWorkUnitId)
+                {
+                    await evidenceNodes.RecordAsync(new EvidenceNode(
+                        EvidenceId: $"ev-{Guid.NewGuid():N}",
+                        WorkUnitId: reviewedWorkUnitId,
+                        ProposalId: proposalId,
+                        Kind: EvidenceKind.PolicyEvaluation,
+                        Summary: string.IsNullOrWhiteSpace(body.Notes)
+                            ? $"Human review: {body.Decision}"
+                            : $"Human review: {body.Decision} — {body.Notes}",
+                        DetailJson: null,
+                        AttachedAt: DateTimeOffset.UtcNow,
+                        SessionId: body.SessionId), ct).ConfigureAwait(false);
                 }
 
                 return Results.Ok(result);
@@ -2728,6 +2785,7 @@ public static class StudioRestEndpoints
             IWorkUnitService workUnits,
             IWorkUnitCommandService workUnitCommands,
             IGoalNodeService goalNodes,
+            IRepositoryRegistryService repositories,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(body.Goal))
@@ -2743,8 +2801,19 @@ public static class StudioRestEndpoints
             }
             else
             {
+                var repositoryId = body.RepositoryId;
+                if (body.NewRepositoryPath is not null)
+                {
+                    var created = await repositories.CreateAsync(
+                        body.NewRepositoryPath, body.NewRepositoryLabel, ct).ConfigureAwait(false);
+                    repositoryId = created.RepositoryId;
+                }
+
                 workUnit = await workUnitCommands.CreateAsync(
-                    new WorkUnitCreateCommand(body.Goal, "studio"), ct).ConfigureAwait(false);
+                    new WorkUnitCreateCommand(
+                        body.Goal, "studio", RepositoryId: repositoryId, RepositoryPath: body.RepositoryPath,
+                        ReferenceFiles: body.ReferenceFiles),
+                    ct).ConfigureAwait(false);
             }
 
             var goalNode = new GoalNode(
@@ -3373,6 +3442,104 @@ public static class StudioRestEndpoints
         });
     }
 
+    // ── /studio/repositories — multi-repo Phase 1 ──────────────────────────
+
+    private sealed record CreateRepositoryBody(string Path, string? Label = null);
+
+    private sealed record CloneRepositoryBody(string Url, string TargetPath, string? Label = null);
+
+    private sealed record SwitchWorkspaceBody(string? RepositoryId = null, string? RepositoryPath = null, string? BranchId = null);
+
+    private static void MapRepositoryEndpoints(WebApplication app)
+    {
+        // List known repositories (mirrors nm_v1_repository_list) — used by the VS Code extension's
+        // cross-repo file reference picker, which can't call MCP tools directly.
+        app.MapGet("/studio/repositories", async (
+            IRepositoryRegistryService repositories,
+            CancellationToken ct) =>
+        {
+            var all = await repositories.ListAsync(ct).ConfigureAwait(false);
+            return Results.Ok(all);
+        });
+
+        // List files in a registered repository (mirrors nm_v1_repository_list_files).
+        app.MapGet("/studio/repositories/{repositoryId}/files", async (
+            string repositoryId,
+            [FromQuery] string? subPath,
+            [FromQuery] string? pattern,
+            IRepositoryRegistryService repositories,
+            CancellationToken ct) =>
+        {
+            var files = await repositories.ListFilesAsync(repositoryId, subPath, pattern, ct).ConfigureAwait(false);
+            return Results.Ok(new { files });
+        });
+
+        // Read a file's content from a registered repository (mirrors nm_v1_repository_read_file).
+        app.MapGet("/studio/repositories/{repositoryId}/file", async (
+            string repositoryId,
+            [FromQuery] string path,
+            IRepositoryRegistryService repositories,
+            CancellationToken ct) =>
+        {
+            var content = await repositories.ReadFileAsync(repositoryId, path, ct).ConfigureAwait(false);
+            return content is null
+                ? Results.NotFound(new { error = $"File '{path}' not found in repository '{repositoryId}'." })
+                : Results.Ok(new { content });
+        });
+
+        // Which of these candidate paths are NOT yet registered — used by the VS Code extension's
+        // cross-repo reference picker to decide which open folders to offer as "not yet
+        // registered" without re-implementing the registry's own path normalization client-side.
+        app.MapGet("/studio/repositories/unregistered", async (
+            [FromQuery] string[] paths,
+            IRepositoryRegistryService repositories,
+            CancellationToken ct) =>
+        {
+            var unregistered = await repositories.FilterUnregisteredAsync(paths, ct).ConfigureAwait(false);
+            return Results.Ok(new { unregistered });
+        });
+
+        // Create a fresh repository (mirrors nm_v1_repository_create)
+        app.MapPost("/studio/repositories", async (
+            CreateRepositoryBody body,
+            IRepositoryRegistryService repositories,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.Path))
+                return Results.BadRequest(new { error = "path is required." });
+
+            try
+            {
+                var repository = await repositories.CreateAsync(body.Path, body.Label, ct).ConfigureAwait(false);
+                return Results.Ok(new { repositoryId = repository.RepositoryId, path = repository.Path });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        // Clone a repository (mirrors nm_v1_repository_clone)
+        app.MapPost("/studio/repositories/clone", async (
+            CloneRepositoryBody body,
+            IRepositoryRegistryService repositories,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.Url) || string.IsNullOrWhiteSpace(body.TargetPath))
+                return Results.BadRequest(new { error = "url and targetPath are required." });
+
+            try
+            {
+                var repository = await repositories.CloneAsync(body.Url, body.TargetPath, body.Label, ct).ConfigureAwait(false);
+                return Results.Ok(new { repositoryId = repository.RepositoryId, path = repository.Path });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+    }
+
     // ── /studio/experiments — Slice 22a ───────────────────────────────────
 
     private static void MapExperimentEndpoints(WebApplication app)
@@ -3432,7 +3599,34 @@ public static class StudioRestEndpoints
             var node = await experiments.GetAsync(experimentId, ct).ConfigureAwait(false);
             return node is null ? Results.NotFound() : Results.Ok(node);
         });
+
+        // Comparison engine — converges competing forks under an experiment parent. The caller
+        // (human via Pick Winner, or a future autonomous reviewer) decides the winner; this makes
+        // that decision durable: approves the winner, rejects every other dangling proposal, and
+        // writes DecisionNode/HypothesisNode convergence state for every sibling.
+        app.MapPost("/studio/experiments/{parentWorkUnitId}/converge", async (
+            string parentWorkUnitId,
+            ConvergeExperimentBody body,
+            IExperimentService experiments,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.WinnerId))
+                return Results.BadRequest(new { error = "winnerId is required." });
+
+            try
+            {
+                var result = await experiments.ConvergeAsync(
+                    parentWorkUnitId, body.WinnerId, body.Rationale, ct).ConfigureAwait(false);
+                return Results.Ok(result);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
     }
+
+    private sealed record ConvergeExperimentBody(string WinnerId, string? Rationale = null);
 
     // ── /studio/counterfactuals — Slice 25a ───────────────────────────────
 

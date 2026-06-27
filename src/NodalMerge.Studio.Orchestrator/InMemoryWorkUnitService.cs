@@ -171,6 +171,58 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return updated;
     }
 
+    public async Task<WorkUnit> IncrementFailureAttemptCountAsync(
+        string workUnitId,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        var executionInfo = (workUnit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with
+        {
+            FailureAttemptCount = (workUnit.ExecutionInfo?.FailureAttemptCount ?? 0) + 1,
+        };
+
+        var updated = workUnit with { ExecutionInfo = executionInfo, UpdatedAt = DateTimeOffset.UtcNow };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
+    public async Task<WorkUnit> AmendGoalForSteeredRetryAsync(
+        string workUnitId,
+        string amendedGoal,
+        string steeringContext,
+        string deadLetterEntryId,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        var amendedMetadata = new Dictionary<string, string>(workUnit.Metadata ?? new Dictionary<string, string>())
+        {
+            ["lastSteeringContext"] = steeringContext,
+            ["steeredFromDeadLetterEntryId"] = deadLetterEntryId,
+        };
+
+        var updated = workUnit with
+        {
+            Goal = amendedGoal,
+            Metadata = amendedMetadata,
+            ExecutionInfo = (workUnit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with { FailureAttemptCount = 0 },
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
     private static readonly HashSet<WorkUnitStatus> TerminalStatuses = new()
     {
         WorkUnitStatus.Completed, WorkUnitStatus.Merged, WorkUnitStatus.Cancelled,
@@ -245,20 +297,10 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         bool bypassPromotionBranch = false,
         WorkUnitExpectedOutputKind expectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
         string? repositoryId = null,
+        IReadOnlyList<FileReferenceV1>? referenceFiles = null,
+        string? workspaceId = null,
         CancellationToken cancellationToken = default)
     {
-        // First work unit with a repositoryPath seeds the main branch for this session. Setting
-        // the option alone doesn't move any files — InitBranchAsync only copies from
-        // SeedRepositoryPath the moment branchId "main" is actually initialized, and it no-ops on
-        // every call after that (see its own comment). So trigger that initialization here, now
-        // that the option is set, rather than leaving "main" to be discovered empty later.
-        if (!string.IsNullOrWhiteSpace(repositoryPath) &&
-            string.IsNullOrWhiteSpace(_workspaceOptions.SeedRepositoryPath))
-        {
-            _workspaceOptions.SeedRepositoryPath = repositoryPath;
-            await _branchService.CreateBranchAsync("main", null, cancellationToken).ConfigureAwait(false);
-        }
-
         var resolvedBranchId = await _branchService
             .CreateBranchAsync(branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, cancellationToken)
             .ConfigureAwait(false);
@@ -288,7 +330,9 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             ReviewPolicy: reviewPolicy ?? ReviewPolicy.HumanRequired,
             BypassPromotionBranch: bypassPromotionBranch,
             ExpectedOutputKind: expectedOutputKind,
-            RepositoryId: repositoryId);
+            RepositoryId: repositoryId,
+            ReferenceFiles: referenceFiles,
+            WorkspaceId: workspaceId ?? "workspace-default");
 
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }

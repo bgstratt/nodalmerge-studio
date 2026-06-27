@@ -16,7 +16,8 @@ public sealed class WorkUnitCommandService(
     IAgentControlService agentControl,
     IReviewTimerService reviewTimers,
     IRepositorySyncService repositorySync,
-    NodalMerge.Studio.Storage.IRepositoryRegistryService repositories) : IWorkUnitCommandService
+    NodalMerge.Studio.Storage.IRepositoryRegistryService repositories,
+    NodalMerge.Studio.Storage.IWorkspaceRegistryService workspaces) : IWorkUnitCommandService
 {
     private static readonly HashSet<WorkUnitStatus> TerminalStatuses = new()
     {
@@ -54,11 +55,32 @@ public sealed class WorkUnitCommandService(
         // once here, so everything below (the sync call and the final repositoryPath argument)
         // stays exactly as it was for ad hoc paths.
         var effectiveRepositoryPath = command.RepositoryPath;
-        if (command.RepositoryId is not null)
+        var effectiveRepositoryId = command.RepositoryId;
+        if (effectiveRepositoryId is not null)
         {
-            var repository = await repositories.GetAsync(command.RepositoryId, cancellationToken).ConfigureAwait(false)
-                ?? throw new KeyNotFoundException($"Repository '{command.RepositoryId}' was not found.");
+            var repository = await repositories.GetAsync(effectiveRepositoryId, cancellationToken).ConfigureAwait(false)
+                ?? throw new KeyNotFoundException($"Repository '{effectiveRepositoryId}' was not found.");
             effectiveRepositoryPath = repository.Path;
+        }
+        else if (!string.IsNullOrWhiteSpace(effectiveRepositoryPath))
+        {
+            // Multi-repo write-back correctness (InMemoryMergeService.ApplyAsync) resolves the
+            // repository to write merged changes back to via WorkUnit.RepositoryId — auto-register
+            // a raw path so every goal with any repository association ends up with a durable id,
+            // not just ones that already went through RegisterAsync explicitly.
+            var registered = await repositories.RegisterAsync(effectiveRepositoryPath, label: null, cancellationToken).ConfigureAwait(false);
+            effectiveRepositoryId = registered.RepositoryId;
+        }
+
+        // Cross-repo file reference — fail fast on an unknown RepositoryId rather than silently
+        // attaching a reference agents can never resolve later.
+        if (command.ReferenceFiles is not null)
+        {
+            foreach (var reference in command.ReferenceFiles)
+            {
+                _ = await repositories.GetAsync(reference.RepositoryId, cancellationToken).ConfigureAwait(false)
+                    ?? throw new KeyNotFoundException($"Repository '{reference.RepositoryId}' was not found.");
+            }
         }
 
         // Only the implicit "fresh top-level goal" path triggers a live repository sync — forks
@@ -85,6 +107,11 @@ public sealed class WorkUnitCommandService(
             }
         }
 
+        // Phase 16 — every work unit created through this shared entry point belongs to the
+        // (currently singleton) workspace. Resolved here, never caller-supplied — there's nothing
+        // to choose while cardinality is 1.
+        var workspace = await workspaces.GetOrCreateDefaultAsync(cancellationToken).ConfigureAwait(false);
+
         return await orchestrator.CreateWorkUnitAsync(
             command.Goal,
             command.Owner,
@@ -100,7 +127,9 @@ public sealed class WorkUnitCommandService(
             bypassPromotionBranch: command.BypassPromotionBranch,
             seedFromBranchId: seedFromBranchId,
             expectedOutputKind: command.ExpectedOutputKind ?? WorkUnitExpectedOutputKind.FileChange,
-            repositoryId: command.RepositoryId,
+            repositoryId: effectiveRepositoryId,
+            referenceFiles: command.ReferenceFiles,
+            workspaceId: workspace.WorkspaceId,
             cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 

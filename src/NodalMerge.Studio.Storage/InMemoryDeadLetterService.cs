@@ -35,18 +35,9 @@ public sealed class InMemoryDeadLetterService(
         string? provider = null,
         CancellationToken cancellationToken = default)
     {
-        var unit = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false)
-            ?? throw new KeyNotFoundException($"Work unit '{workUnitId}' was not found.");
-
-        var previousCount = unit.ExecutionInfo?.FailureAttemptCount ?? 0;
-        var attemptCount = previousCount + 1;
-        var executionInfo = (unit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with
-        {
-            FailureAttemptCount = attemptCount,
-        };
-
-        var updatedUnit = unit with { ExecutionInfo = executionInfo };
-        await workUnits.CreateAsync(updatedUnit, cancellationToken).ConfigureAwait(false);
+        var updatedUnit = await workUnits.IncrementFailureAttemptCountAsync(workUnitId, cancellationToken)
+            .ConfigureAwait(false);
+        var attemptCount = updatedUnit.ExecutionInfo!.FailureAttemptCount;
 
         var snapshot = lastProjectionSnapshot ?? await TryCaptureProjectionAsync(workUnitId, cancellationToken)
             .ConfigureAwait(false);
@@ -288,18 +279,8 @@ public sealed class InMemoryDeadLetterService(
         // Fold the correction into Goal — projections only ever surface Goal/SuccessCriteria to
         // the agent, never Metadata, so a constraint stashed only in Metadata would never be seen.
         var amendedGoal = $"{unit.Goal}\n\n[Correction after dead-letter retry]: {steeringContext}";
-        var amendedMetadata = new Dictionary<string, string>(unit.Metadata ?? new Dictionary<string, string>())
-        {
-            ["lastSteeringContext"] = steeringContext,
-            ["steeredFromDeadLetterEntryId"] = entryId,
-        };
-        var amendedUnit = unit with
-        {
-            Goal = amendedGoal,
-            Metadata = amendedMetadata,
-            ExecutionInfo = (unit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with { FailureAttemptCount = 0 },
-        };
-        await workUnits.CreateAsync(amendedUnit, cancellationToken).ConfigureAwait(false);
+        await workUnits.AmendGoalForSteeredRetryAsync(
+            entry.WorkUnitId, amendedGoal, steeringContext, entryId, cancellationToken).ConfigureAwait(false);
 
         var profileId = overrideProfileId ?? entry.ProfileId;
         var creds = ResolveRetryCredentials(entry, unit, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider);

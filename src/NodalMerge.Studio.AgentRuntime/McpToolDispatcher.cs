@@ -32,7 +32,9 @@ internal sealed class McpToolDispatcher(
     IFileLeaseService fileLease,
     IWorkspaceSemanticNavigationService semanticNavigation,
     NodalMerge.Studio.Storage.IRepositoryRegistryService repositories,
-    IProjectionSnapshotService projectionSnapshots)
+    IProjectionSnapshotService projectionSnapshots,
+    IRepositorySyncService repositorySync,
+    NodalMerge.Studio.Storage.WorkspaceOptions workspaceOptions)
 {
     // Phase 9g — read-before-write enforcement. McpToolDispatcher is registered as a singleton
     // (InMemoryAgentRuntimeService.cs) shared across every agent/run, so this cache lives here
@@ -118,8 +120,14 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.WorkspacePath    => await WorkspacePathAsync(input, ct),
                 McpToolNames.WorkspaceProfileGet    => await WorkspaceProfileGetAsync(input, ct),
                 McpToolNames.WorkspaceProfileRescan => await WorkspaceProfileRescanAsync(input, ct),
+                McpToolNames.WorkspaceSwitch  => await WorkspaceSwitchAsync(input, ct),
+                McpToolNames.WorkspaceCapabilities => WorkspaceCapabilities(),
                 McpToolNames.RepositoryRegister => await RepositoryRegisterAsync(input, ct),
                 McpToolNames.RepositoryList     => await RepositoryListAsync(ct),
+                McpToolNames.RepositoryCreate   => await RepositoryCreateAsync(input, ct),
+                McpToolNames.RepositoryClone    => await RepositoryCloneAsync(input, ct),
+                McpToolNames.RepositoryReadFile  => await RepositoryReadFileAsync(input, ct),
+                McpToolNames.RepositoryListFiles => await RepositoryListFilesAsync(input, ct),
                 _ => ToError($"Tool '{toolName}' is not dispatched by the agent runtime.")
             };
         }
@@ -147,7 +155,8 @@ internal sealed class McpToolDispatcher(
                 ParentWorkUnitId: Str(input, "parentWorkUnitId"),
                 DependsOn: StrArray(input, "dependsOn"),
                 FileScope: StrArray(input, "fileScope"),
-                RepositoryId: Str(input, "repositoryId")),
+                RepositoryId: Str(input, "repositoryId"),
+                ReferenceFiles: FileReferenceArray(input, "referenceFiles")),
             ct).ConfigureAwait(false);
         return ToJson(new { workUnitId = wu.WorkUnitId, branchId = wu.BranchId });
     }
@@ -191,6 +200,37 @@ internal sealed class McpToolDispatcher(
     {
         var list = await repositories.ListAsync(ct).ConfigureAwait(false);
         return ToJson(list);
+    }
+
+    private async Task<string> RepositoryCreateAsync(JsonElement input, CancellationToken ct)
+    {
+        var repository = await repositories.CreateAsync(
+            Str(input, "path")!, Str(input, "label"), ct).ConfigureAwait(false);
+        return ToJson(new { repositoryId = repository.RepositoryId, path = repository.Path });
+    }
+
+    private async Task<string> RepositoryCloneAsync(JsonElement input, CancellationToken ct)
+    {
+        var repository = await repositories.CloneAsync(
+            Str(input, "url")!, Str(input, "targetPath")!, Str(input, "label"), ct).ConfigureAwait(false);
+        return ToJson(new { repositoryId = repository.RepositoryId, path = repository.Path });
+    }
+
+    private async Task<string> RepositoryReadFileAsync(JsonElement input, CancellationToken ct)
+    {
+        var repositoryId = Str(input, "repositoryId")!;
+        var path = Str(input, "path")!;
+        var content = await repositories.ReadFileAsync(repositoryId, path, ct).ConfigureAwait(false);
+        return content is null
+            ? ToError($"File '{path}' not found in repository '{repositoryId}'.")
+            : ToJson(new { content });
+    }
+
+    private async Task<string> RepositoryListFilesAsync(JsonElement input, CancellationToken ct)
+    {
+        var files = await repositories.ListFilesAsync(
+            Str(input, "repositoryId")!, Str(input, "subPath"), Str(input, "pattern"), ct).ConfigureAwait(false);
+        return ToJson(new { files });
     }
 
         private async Task<string> TaskCreateAsync(JsonElement input, CancellationToken ct)
@@ -1062,6 +1102,30 @@ internal sealed class McpToolDispatcher(
         return ToJson(profile);
     }
 
+    private async Task<string> WorkspaceSwitchAsync(JsonElement input, CancellationToken ct)
+    {
+        var repositoryId = Str(input, "repositoryId");
+        var path = Str(input, "repositoryPath");
+        if (repositoryId is not null)
+        {
+            var repository = await repositories.GetAsync(repositoryId, ct).ConfigureAwait(false);
+            if (repository is null) return ToError($"Repository '{repositoryId}' was not found.");
+            path = repository.Path;
+        }
+        if (string.IsNullOrWhiteSpace(path))
+            return ToError("Either repositoryId or repositoryPath is required.");
+
+        var branchId = Str(input, "branchId") ?? "main";
+        var pending = await repositorySync.SyncBranchFromRepositoryAsync(
+            branchId, path, SyncTrigger.ManualRefresh, ct).ConfigureAwait(false);
+        workspaceOptions.SeedRepositoryPath = path;
+
+        return ToJson(new { branchId, repositoryPath = path, sync = pending });
+    }
+
+    private string WorkspaceCapabilities() =>
+        ToJson(NodalMerge.Studio.Storage.WorkspaceCapabilityResolver.Resolve(workspaceOptions));
+
     private static string? Str(JsonElement input, string key) =>
         input.TryGetProperty(key, out var p) && p.ValueKind == JsonValueKind.String
             ? p.GetString() : null;
@@ -1069,6 +1133,14 @@ internal sealed class McpToolDispatcher(
     private static IReadOnlyList<string>? StrArray(JsonElement input, string key) =>
         input.TryGetProperty(key, out var p) && p.ValueKind == JsonValueKind.Array
             ? p.EnumerateArray().Select(e => e.GetString() ?? string.Empty).ToList()
+            : null;
+
+    private static IReadOnlyList<FileReferenceV1>? FileReferenceArray(JsonElement input, string key) =>
+        input.TryGetProperty(key, out var p) && p.ValueKind == JsonValueKind.Array
+            ? p.EnumerateArray().Select(e => new FileReferenceV1(
+                e.GetProperty("repositoryId").GetString()!,
+                e.GetProperty("path").GetString()!,
+                e.TryGetProperty("note", out var n) ? n.GetString() : null)).ToList()
             : null;
 
     private static int? Int(JsonElement input, string key) =>

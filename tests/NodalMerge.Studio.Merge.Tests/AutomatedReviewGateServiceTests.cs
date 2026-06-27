@@ -423,6 +423,27 @@ public class AutomatedReviewGateServiceTests
             return Task.FromResult(Units[workUnitId]);
         }
 
+        public Task<WorkUnit> IncrementFailureAttemptCountAsync(
+            string workUnitId,
+            CancellationToken cancellationToken = default)
+        {
+            var unit = Units[workUnitId];
+            var executionInfo = (unit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with
+            {
+                FailureAttemptCount = (unit.ExecutionInfo?.FailureAttemptCount ?? 0) + 1,
+            };
+            Units[workUnitId] = unit with { ExecutionInfo = executionInfo };
+            return Task.FromResult(Units[workUnitId]);
+        }
+
+        public Task<WorkUnit> AmendGoalForSteeredRetryAsync(
+            string workUnitId,
+            string amendedGoal,
+            string steeringContext,
+            string deadLetterEntryId,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             Task.FromResult(Units.TryGetValue(workUnitId, out var unit) ? unit : null);
 

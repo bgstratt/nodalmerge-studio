@@ -4,6 +4,7 @@ using ModelContextProtocol.Server;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Versioning;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
@@ -13,7 +14,10 @@ public sealed class WorkspaceTools(
     IWorkspaceExecutionCommandService executionCommand,
     IFileWorkspaceService fileWorkspace,
     IWorkspaceProfileService workspaceProfiles,
-    IWorkspaceSemanticNavigationService semanticNavigation)
+    IWorkspaceSemanticNavigationService semanticNavigation,
+    IRepositorySyncService repositorySync,
+    IRepositoryRegistryService repositories,
+    WorkspaceOptions workspaceOptions)
 {
     // ── Existing ──────────────────────────────────────────────────────────
 
@@ -34,6 +38,39 @@ public sealed class WorkspaceTools(
     {
         var status = await workspace.GetStatusAsync(branchId, workUnitId, limit, offset, cancellationToken).ConfigureAwait(false);
         return McpJson.Ok(status);
+    }
+
+    // ── Phase 16 — structured capabilities snapshot ───────────────────────
+
+    [McpServerTool(Name = McpToolNames.WorkspaceCapabilities), Description("Get a structured snapshot of what this workspace can do (build/test/run/git/create-repository/import-repository/doc-fetch/enabled domain agents) — resolved fresh, never persisted.")]
+    public string Capabilities() => McpJson.Ok(WorkspaceCapabilityResolver.Resolve(workspaceOptions));
+
+    // ── Multi-repo Phase 2 — deliberate workspace switch ──────────────────
+
+    [McpServerTool(Name = McpToolNames.WorkspaceSwitch), Description("Explicitly switch the active workspace to a different repository — re-syncs the branch (default \"main\") from the given repository and sets it as the new default for goals that don't specify their own repository. Either repositoryId or repositoryPath is required.")]
+    public async Task<string> SwitchAsync(
+        [Description("A previously registered repository's id. Takes priority over repositoryPath when both are given.")] string? repositoryId = null,
+        [Description("A filesystem path to switch to. Ignored if repositoryId is given.")] string? repositoryPath = null,
+        [Description("The branch to re-sync. Defaults to \"main\".")] string? branchId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var path = repositoryPath;
+        if (repositoryId is not null)
+        {
+            var repository = await repositories.GetAsync(repositoryId, cancellationToken).ConfigureAwait(false)
+                ?? throw new KeyNotFoundException($"Repository '{repositoryId}' was not found.");
+            path = repository.Path;
+        }
+
+        if (string.IsNullOrWhiteSpace(path))
+            return McpJson.Error(McpToolNames.WorkspaceSwitch, "Either repositoryId or repositoryPath is required.");
+
+        var effectiveBranchId = branchId ?? "main";
+        var pending = await repositorySync.SyncBranchFromRepositoryAsync(
+            effectiveBranchId, path, SyncTrigger.ManualRefresh, cancellationToken).ConfigureAwait(false);
+        workspaceOptions.SeedRepositoryPath = path;
+
+        return McpJson.Ok(new { branchId = effectiveBranchId, repositoryPath = path, sync = pending });
     }
 
     // ── Slice 16d — workspace execution tools ─────────────────────────────

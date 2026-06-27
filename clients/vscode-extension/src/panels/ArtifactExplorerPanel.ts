@@ -307,6 +307,88 @@ export class GoalWorkspacePanel {
     void this.panel.webview.postMessage({ type: 'explorerSettings', ...this.getRepositoryPathSettings() });
   }
 
+  // Cross-repo file reference — "+ Add reference" in the goal box. Scoped to repos already known
+  // to the backend registry (IRepositoryRegistryService), per the user's decision to keep a single
+  // trust boundary rather than a free-form "any file on disk" picker. Open-but-unregistered VS Code
+  // workspace folders are offered as a convenience, and a "Browse for a folder…" entry covers repos
+  // that are neither registered nor open — both register the folder (reusing the registry's
+  // idempotent CreateAsync) before moving on to the file picker.
+  private async handleAddReference(): Promise<void> {
+    const known = await this.get<Array<{ repositoryId: string; path: string; label?: string }>>('/studio/repositories');
+
+    type RepoPickItem = vscode.QuickPickItem & { repositoryId?: string; folderPath?: string; browse?: boolean };
+    const items: RepoPickItem[] = known.map(r => ({
+      label: r.label || r.path,
+      description: r.path,
+      repositoryId: r.repositoryId,
+    }));
+
+    // Path-identity matching is registry logic (RepositoryRegistryService.NormalizePath) — ask
+    // the server which open folders aren't registered yet rather than re-normalizing here.
+    const openFolders = vscode.workspace.workspaceFolders ?? [];
+    if (openFolders.length > 0) {
+      const query = openFolders.map(f => `paths=${encodeURIComponent(f.uri.fsPath)}`).join('&');
+      const { unregistered } = await this.get<{ unregistered: string[] }>(`/studio/repositories/unregistered?${query}`);
+      const unregisteredSet = new Set(unregistered);
+      for (const folder of openFolders) {
+        if (unregisteredSet.has(folder.uri.fsPath)) {
+          items.push({
+            label: `$(folder) ${folder.name}`,
+            description: `${folder.uri.fsPath} (open, not yet registered)`,
+            folderPath: folder.uri.fsPath,
+          });
+        }
+      }
+    }
+    items.push({ label: '$(folder-opened) Browse for a folder…', description: 'Register a repository that is not open in this VS Code window', browse: true });
+
+    const repoPick = await vscode.window.showQuickPick(items, { placeHolder: 'Reference a file from which repository?' });
+    if (!repoPick) { return; }
+
+    let repositoryId = repoPick.repositoryId;
+    let repositoryLabel = repoPick.label;
+    let folderToRegister = repoPick.folderPath;
+    if (repoPick.browse) {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectFolders: true, canSelectFiles: false, canSelectMany: false,
+        openLabel: 'Register for Reference',
+      });
+      if (!picked || picked.length === 0) { return; }
+      folderToRegister = picked[0].fsPath;
+      repositoryLabel = picked[0].fsPath.split(/[\\/]/).pop() || picked[0].fsPath;
+    }
+    if (!repositoryId && folderToRegister) {
+      try {
+        const registered = await this.post<{ repositoryId: string; path: string }>('/studio/repositories', { path: folderToRegister });
+        repositoryId = registered.repositoryId;
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: failed to register repository — ' + String(err));
+        return;
+      }
+    }
+    if (!repositoryId) { return; }
+
+    let files: string[];
+    try {
+      const result = await this.get<{ files: string[] }>(`/studio/repositories/${encodeURIComponent(repositoryId)}/files`);
+      files = result.files;
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: failed to list files — ' + String(err));
+      return;
+    }
+    if (files.length === 0) {
+      void vscode.window.showInformationMessage('NodalMerge: that repository has no files to reference.');
+      return;
+    }
+
+    const filePick = await vscode.window.showQuickPick(files, { placeHolder: 'Reference which file?' });
+    if (!filePick) { return; }
+
+    void this.panel.webview.postMessage({
+      type: 'explorerReferenceAdded', repositoryId, repositoryLabel, path: filePick,
+    });
+  }
+
   private async updateOptions(patch: Partial<StudioOptions>): Promise<void> {
     const current = await this.get<StudioOptions>('/studio/options');
     const updated = await this.post<StudioOptions>('/studio/options', { ...current, ...patch });
@@ -490,16 +572,23 @@ export class GoalWorkspacePanel {
             (msg.reviewPolicy as string) || undefined,
             !!msg.bypassPromotionBranch,
             (msg.forkConfig as Array<{ profileId: string; constraintHint?: string }>) || [],
+            (msg.referenceFiles as Array<{ repositoryId: string; path: string }>) || [],
           );
+          break;
+        case 'explorerAddReference':
+          await this.handleAddReference();
           break;
         case 'explorerPickWinner':
           await this.handlePickWinner(
+            msg.parentId as string,
             msg.winnerId as string,
-            (msg.loserIds as string[]) ?? [],
           );
           break;
         case 'explorerSelectWorkUnit':
           await this.loadTimeline(msg.workUnitId as string);
+          break;
+        case 'explorerLoadComparison':
+          await this.loadHypothesisComparison(msg.parentId as string);
           break;
         case 'explorerSelectProposal':
           await this.loadProposal(msg.proposalId as string);
@@ -755,7 +844,9 @@ export class GoalWorkspacePanel {
   private async handleRun(
     strategy: string, goal: string, reviewPolicy?: string, bypassPromotionBranch?: boolean,
     forkConfig?: Array<{ profileId: string; constraintHint?: string }>,
+    referenceFiles?: Array<{ repositoryId: string; path: string }>,
   ): Promise<void> {
+    const referenceFilesPatch = referenceFiles && referenceFiles.length ? { referenceFiles } : {};
     if (!goal || !goal.trim()) {
       void vscode.window.showWarningMessage('NodalMerge: enter a goal before running.');
       return;
@@ -849,6 +940,7 @@ export class GoalWorkspacePanel {
           owner: 'user',
           ...reviewAndTarget,
           ...(repositoryPath ? { repositoryPath } : {}),
+          ...referenceFilesPatch,
         });
 
         // Create two child work units — one per model
@@ -954,6 +1046,7 @@ export class GoalWorkspacePanel {
         ...(reviewPolicy ? { reviewPolicy } : {}),
         bypassPromotionBranch: !!bypassPromotionBranch,
         ...(repositoryPath ? { repositoryPath } : {}),
+        ...referenceFilesPatch,
       });
 
       const session = await this.post<ExecutionSession>('/studio/sessions', {
@@ -1087,32 +1180,30 @@ export class GoalWorkspacePanel {
     }
   }
 
-  private async handlePickWinner(winnerId: string, loserIds: string[]): Promise<void> {
+  private async loadHypothesisComparison(parentId: string): Promise<void> {
     try {
-      // Accept the winner's latest proposal
-      const artifacts = await this.get<ArtifactRef[]>('/studio/workunits/' + winnerId + '/artifacts');
-      const proposals = artifacts.filter(a => a.type === 'MergeProposal');
-      if (proposals.length > 0) {
-        const latest = proposals[proposals.length - 1];
-        await this.post('/studio/merges/' + latest.artifactId + '/review', { decision: 'Approved' });
-      }
+      const result = await this.get<{ dataJson: string }>(
+        '/studio/projections/HypothesisComparison?workUnitId=' + encodeURIComponent(parentId));
+      const payload = JSON.parse(result.dataJson);
+      void this.panel.webview.postMessage({ type: 'comparisonData', parentId, payload });
+    } catch {
+      // Evidence/score display is a bonus on top of the raw side-by-side compare view — if the
+      // projection fails for any reason, the compare view still works without it.
+    }
+  }
 
-      // Reject each loser's latest proposal
-      for (const loserId of loserIds) {
-        try {
-          const losArtifacts = await this.get<ArtifactRef[]>('/studio/workunits/' + loserId + '/artifacts');
-          const losProposals = losArtifacts.filter(a => a.type === 'MergeProposal');
-          if (losProposals.length > 0) {
-            const latestLoser = losProposals[losProposals.length - 1];
-            await this.post('/studio/merges/' + latestLoser.artifactId + '/review', { decision: 'Rejected' });
-          }
-        } catch {
-          // each rejection is best-effort
-        }
-      }
+  private async handlePickWinner(parentId: string, winnerId: string): Promise<void> {
+    try {
+      // Comparison engine — single call converges the experiment server-side: approves the
+      // winner's latest proposal, rejects every other sibling's dangling proposal, and writes
+      // DecisionNode/HypothesisNode convergence state for all of them. Replaces the old
+      // client-driven approve-one/reject-each-loser REST dance.
+      const result = await this.post<{ rejectedWorkUnitIds: string[] }>(
+        '/studio/experiments/' + parentId + '/converge',
+        { winnerId });
 
       void vscode.window.showInformationMessage(
-        'NodalMerge: Winner accepted, ' + loserIds.length + ' rejected.'
+        'NodalMerge: Winner accepted, ' + result.rejectedWorkUnitIds.length + ' rejected.'
       );
       if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
     } catch (err) {
@@ -1331,6 +1422,20 @@ const GW_CSS = `
     padding: 6px 10px; background: var(--nm-section-bg);
     display: flex; flex-direction: column; gap: 4px; min-width: 180px;
   }
+
+  /* Cross-repo file reference chips, below the goal options row */
+  .gw-reference-row {
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    padding: 4px 14px 8px; border-bottom: 1px solid var(--nm-border);
+  }
+  .gw-reference-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .gw-reference-chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    border: 1px solid var(--nm-border); border-radius: 12px;
+    padding: 2px 8px; font-size: 0.76em; background: var(--nm-section-bg);
+  }
+  .gw-reference-chip .gw-reference-chip-remove { cursor: pointer; opacity: 0.6; }
+  .gw-reference-chip .gw-reference-chip-remove:hover { opacity: 1; }
   .gw-fork-entry-title { font-size: 0.78em; font-weight: 600; }
   .gw-fork-entry select { font-size: 0.82em; }
 
@@ -1438,6 +1543,11 @@ const GW_HTML = `
       <label class="gw-radio-option"><input type="radio" name="gw-target" value="direct"/> Direct</label>
     </div>
   </div>
+  <div class="gw-reference-row">
+    <span class="gw-radio-group-label">References</span>
+    <div id="gw-reference-chips" class="gw-reference-chips"></div>
+    <button id="gw-add-reference-btn" class="ghost" style="padding:3px 10px;font-size:0.78em">+ Add reference</button>
+  </div>
   <div id="gw-fork-config" class="gw-fork-config">
     <div id="gw-fork-entries" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end"></div>
   </div>
@@ -1501,6 +1611,7 @@ const GW_JS = `
   var state = {
     decisionNodes: [], selectedNodeId: null, timelineArtifacts: [], timelineEvents: [], selectedSessionId: '',
     selectedNodeConversation: null, conversationPollTimer: null,
+    referenceFiles: [],
   };
 
   function esc(s) {
@@ -1567,7 +1678,29 @@ const GW_JS = `
       type: 'explorerRun', strategy: strategy, goal: goal, forkConfig: forkConfig,
       reviewPolicy: reviewPolicyEl ? reviewPolicyEl.value : 'HumanRequired',
       bypassPromotionBranch: targetEl ? targetEl.value === 'direct' : false,
+      referenceFiles: (state.referenceFiles || []).map(function(r) { return { repositoryId: r.repositoryId, path: r.path }; }),
     });
+  });
+
+  // ── Cross-repo file reference chips ─────────────────────────────────────
+  function renderReferenceChips() {
+    var el = document.getElementById('gw-reference-chips');
+    if (!el) { return; }
+    el.innerHTML = (state.referenceFiles || []).map(function(r, i) {
+      return '<span class="gw-reference-chip" title="' + esc(r.repositoryLabel || r.repositoryId) + '">' +
+        esc((r.repositoryLabel || r.repositoryId) + ' / ' + r.path) +
+        '<span class="gw-reference-chip-remove" data-index="' + i + '">&times;</span></span>';
+    }).join('');
+    el.querySelectorAll('.gw-reference-chip-remove').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        state.referenceFiles.splice(parseInt(this.getAttribute('data-index'), 10), 1);
+        renderReferenceChips();
+      });
+    });
+  }
+
+  document.getElementById('gw-add-reference-btn').addEventListener('click', function() {
+    vscode.postMessage({ type: 'explorerAddReference' });
   });
 
   // ── Slice 22c — Strategy dropdown change reveals fork config panel ─────
@@ -2501,10 +2634,24 @@ const GW_JS = `
 
   function renderCompareResults(children, parentId) {
     var profiles = state.agentProfiles || [];
+    // Comparison engine — deterministic evidence/score per sibling, fetched async via the
+    // HypothesisComparison projection. May not have arrived yet on first render; that's fine,
+    // the raw side-by-side view above still works without it.
+    var comparison = (state.__comparisonParentId === parentId) ? state.__comparisonData : null;
+    var siblingsByWu = {};
+    if (comparison && comparison.siblings) {
+      comparison.siblings.forEach(function(s) { siblingsByWu[s.workUnitId] = s; });
+    } else {
+      vscode.postMessage({ type: 'explorerLoadComparison', parentId: parentId });
+    }
     var html = '<div class="cmp-results"><div class="cmp-header">';
     html += '<h2>Fork Comparison</h2>';
     html += '<span class="mono" style="font-size:0.72em">' + children.length + ' forks</span>';
     html += '</div>';
+    if (comparison && comparison.recommendedWorkUnitId) {
+      html += '<p style="font-size:0.78em;opacity:0.75">Evidence-based recommendation: <strong>' +
+        esc(comparison.recommendedWorkUnitId) + '</strong> (deterministic score, not a decision — pick the winner yourself below)</p>';
+    }
     html += '<div class="cmp-fork-cards">';
     children.forEach(function(child, i) {
       var profile = profiles.find(function(p) { return p.id === child.owner; }) || {};
@@ -2512,6 +2659,7 @@ const GW_JS = `
       var won = state.__compareWinner === child.workUnitId;
       var lost = state.__compareLosers && state.__compareLosers.indexOf(child.workUnitId) >= 0;
       var cls = won ? ' selected' : (lost ? ' rejected' : '');
+      var sibling = siblingsByWu[child.workUnitId];
       html += '<div class="cmp-fork-card' + cls + '" data-cmp-wu="' + esc(child.workUnitId) + '">';
       html += '<div class="cmp-fk-model">🔀 ' + esc(modelLabel) + '</div>';
       html += '<div class="cmp-fk-goal">' + esc((child.goal || '').substring(0, 120)) + '</div>';
@@ -2521,6 +2669,10 @@ const GW_JS = `
         html += '<span class="badge fork-type">' + esc(child.forkType) + '</span>';
       }
       html += '<span class="mono">' + (child.proposalCount || 0) + ' proposals</span>';
+      if (sibling) {
+        html += '<span class="mono" title="' + esc((sibling.evidenceSummaries || []).join(' | ')) + '">score: ' +
+          sibling.score.toFixed(1) + ' (' + sibling.evidenceCount + ' evidence)</span>';
+      }
       if (won) { html += '<span class="badge completed">★ Winner</span>'; }
       html += '</div></div>';
     });
@@ -2614,7 +2766,6 @@ const GW_JS = `
         vscode.postMessage({
           type: 'explorerPickWinner',
           winnerId: winnerId,
-          loserIds: state.__compareLosers,
           parentId: state.__compareParentId || '',
         });
         // Re-render
@@ -2711,6 +2862,12 @@ const GW_JS = `
       connectStageSocket(msg.wsUrl);
       return;
     }
+    if (msg.type === 'explorerReferenceAdded') {
+      state.referenceFiles = state.referenceFiles || [];
+      state.referenceFiles.push({ repositoryId: msg.repositoryId, repositoryLabel: msg.repositoryLabel, path: msg.path });
+      renderReferenceChips();
+      return;
+    }
     if (msg.type === 'strategies') {
       // Slice 22c — store profiles for fork config
       if (msg.profiles) { state.agentProfiles = msg.profiles || []; }
@@ -2742,6 +2899,15 @@ const GW_JS = `
       sel2.innerHTML = options;
       sel2.value = msg.selectedSessionId || '';
       state.selectedSessionId = msg.selectedSessionId || '';
+      return;
+    }
+    if (msg.type === 'comparisonData') {
+      state.__comparisonData = msg.payload;
+      state.__comparisonParentId = msg.parentId;
+      if (state.__compareParentId === msg.parentId) {
+        document.getElementById('gw-inspector').innerHTML = renderCompareResults(state.__compareChildren, msg.parentId);
+        bindCompareResultsButtons();
+      }
       return;
     }
     if (msg.type === 'tree') {

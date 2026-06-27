@@ -10,3 +10,8 @@ public sealed record RepositoryV1(
     string Path,
     string? Label,
     DateTimeOffset RegisteredAt);
+
+// Cross-repo file reference — a pointer to a file in a *different* registered repository than the
+// one a work unit is actually seeded from, used for read-only context (style/examples) during a
+// run. Distinct from WorkUnit.FileScope, which gates which files an agent may write to.
+public sealed record FileReferenceV1(string RepositoryId, string Path, string? Note = null);

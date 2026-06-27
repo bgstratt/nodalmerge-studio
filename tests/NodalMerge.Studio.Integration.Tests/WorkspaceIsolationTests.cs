@@ -38,6 +38,12 @@ public class WorkspaceIsolationTests
         public Task<WorkUnit> IncrementReviewRejectionCountAsync(string workUnitId, bool automated, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
+        public Task<WorkUnit> IncrementFailureAttemptCountAsync(string workUnitId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<WorkUnit> AmendGoalForSteeredRetryAsync(string workUnitId, string amendedGoal, string steeringContext, string deadLetterEntryId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default)
         {
             _units.TryGetValue(workUnitId, out var wu);

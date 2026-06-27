@@ -12,6 +12,11 @@ namespace NodalMerge.Studio.Orchestrator;
 public sealed class ExperimentService(
     IOrchestratorService orchestrator,
     ISchedulerCommandService scheduler,
+    IHypothesisNodeService hypotheses,
+    IWorkUnitService workUnits,
+    IMergeService merges,
+    IMergeCommandService mergeCommands,
+    IDecisionNodeService decisions,
     IStudioNodeStore nodeStore) : IExperimentService
 {
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNameCaseInsensitive = true };
@@ -57,6 +62,18 @@ public sealed class ExperimentService(
                 cancellationToken: ct).ConfigureAwait(false);
 
             forkIds.Add(forkWu.WorkUnitId);
+
+            await hypotheses.RecordAsync(new HypothesisNode(
+                HypothesisId:     $"hyp-{Guid.NewGuid():N}",
+                WorkUnitId:       forkWu.WorkUnitId,
+                Goal:             forkGoal,
+                ForkType:         spec.ForkType,
+                Status:           HypothesisStatus.Active,
+                ParentWorkUnitId: parent.WorkUnitId,
+                BranchedFromProposalId: null,
+                Rationale:        null,
+                CreatedAt:        DateTimeOffset.UtcNow,
+                SessionId:        spec.SessionId), ct).ConfigureAwait(false);
 
             // Auto-enqueue when a profile is supplied — the scheduler runs forks in parallel
             // up to MaxConcurrentWorkers without any further caller action.
@@ -104,6 +121,95 @@ public sealed class ExperimentService(
             .Select(n => n!)
             .OrderByDescending(n => n.CreatedAt)
             .ToList();
+    }
+
+    // Comparison engine — converges an experiment: approve the winner's latest proposal, reject
+    // every other sibling's non-terminal latest proposal, record a DecisionNode per sibling, and
+    // transition each sibling's HypothesisNode status. Today this is always human/caller-driven
+    // (no autonomous winner selection); the caller decides who won, this just makes that decision
+    // durable and propagates it to every loser instead of leaving them dangling.
+    public async Task<ConvergenceResult> ConvergeAsync(
+        string parentWorkUnitId, string winnerWorkUnitId, string? rationale, CancellationToken ct = default)
+    {
+        var siblings = await workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
+        if (siblings.Count == 0)
+            throw new InvalidOperationException($"No fork children found under parent '{parentWorkUnitId}'.");
+        if (!siblings.Any(s => s.WorkUnitId == winnerWorkUnitId))
+            throw new InvalidOperationException($"Winner '{winnerWorkUnitId}' is not a fork of experiment parent '{parentWorkUnitId}'.");
+
+        var allProposals = await merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+        var hypothesisNodes = await hypotheses.ListByParentWorkUnitIdAsync(parentWorkUnitId, ct).ConfigureAwait(false);
+
+        var rejected = new List<string>();
+
+        foreach (var sibling in siblings)
+        {
+            var isWinner = sibling.WorkUnitId == winnerWorkUnitId;
+            var latestProposal = allProposals.Where(p => p.WorkUnitId == sibling.WorkUnitId).LastOrDefault();
+
+            if (latestProposal is not null)
+            {
+                var isTerminal = latestProposal.Status is MergeProposalStatus.Approved
+                    or MergeProposalStatus.Merged or MergeProposalStatus.Rejected;
+
+                // Best-effort: a proposal may still be Draft (not yet validated to ReadyForReview),
+                // in which case ReviewAsync's transition check throws. Convergence state (decision +
+                // hypothesis status) below is still recorded regardless — the proposal transition is
+                // a bonus, not a precondition.
+                if (isWinner && latestProposal.Status is not (MergeProposalStatus.Approved or MergeProposalStatus.Merged))
+                {
+                    try
+                    {
+                        await mergeCommands.ReviewAsync(
+                            latestProposal.ProposalId, "Approved", notes: rationale, cancellationToken: ct).ConfigureAwait(false);
+                    }
+                    catch (InvalidOperationException) { /* proposal not yet reviewable — best-effort */ }
+                }
+                else if (!isWinner && !isTerminal)
+                {
+                    try
+                    {
+                        await mergeCommands.ReviewAsync(
+                            latestProposal.ProposalId, "Rejected",
+                            notes: rationale ?? $"Superseded by winning fork '{winnerWorkUnitId}'.",
+                            cancellationToken: ct).ConfigureAwait(false);
+                    }
+                    catch (InvalidOperationException) { /* proposal not yet reviewable — best-effort */ }
+                    rejected.Add(sibling.WorkUnitId);
+                }
+                else if (!isWinner)
+                {
+                    rejected.Add(sibling.WorkUnitId);
+                }
+            }
+            else if (!isWinner)
+            {
+                rejected.Add(sibling.WorkUnitId);
+            }
+
+            await decisions.RecordAsync(new DecisionNode(
+                DecisionId:       $"dec-{Guid.NewGuid():N}",
+                WorkUnitId:       sibling.WorkUnitId,
+                ProposalId:       latestProposal?.ProposalId,
+                Outcome:          isWinner ? DecisionOutcome.Accepted : DecisionOutcome.Rejected,
+                ReviewerAgentId:  null,
+                ReviewerModel:    null,
+                ReviewerProvider: null,
+                Confidence:       latestProposal?.Confidence,
+                Rationale:        rationale,
+                DecidedAt:        DateTimeOffset.UtcNow), ct).ConfigureAwait(false);
+
+            var hypothesis = hypothesisNodes.FirstOrDefault(h => h.WorkUnitId == sibling.WorkUnitId);
+            if (hypothesis is not null)
+            {
+                await hypotheses.UpdateStatusAsync(
+                    hypothesis.HypothesisId,
+                    isWinner ? HypothesisStatus.Converged : HypothesisStatus.Rejected,
+                    ct).ConfigureAwait(false);
+            }
+        }
+
+        return new ConvergenceResult(parentWorkUnitId, winnerWorkUnitId, rejected, rationale);
     }
 
     // Slice 22b — Architecture/Library/Product require ConstraintText; Model requires ProfileId.

@@ -91,6 +91,8 @@ public static class McpToolNames
     public const string WorkspacePath   = "nm_v1_workspace_path";
     public const string WorkspaceProfileGet    = "nm_v1_workspace_profile_get";
     public const string WorkspaceProfileRescan = "nm_v1_workspace_profile_rescan";
+    public const string WorkspaceSwitch = "nm_v1_workspace_switch";
+    public const string WorkspaceCapabilities = "nm_v1_workspace_capabilities";
 
     public const string GoalCreate = "nm_v1_goal_create";
     public const string GoalList   = "nm_v1_goal_list";
@@ -114,6 +116,10 @@ public static class McpToolNames
 
     public const string RepositoryRegister = "nm_v1_repository_register";
     public const string RepositoryList     = "nm_v1_repository_list";
+    public const string RepositoryCreate   = "nm_v1_repository_create";
+    public const string RepositoryClone    = "nm_v1_repository_clone";
+    public const string RepositoryReadFile  = "nm_v1_repository_read_file";
+    public const string RepositoryListFiles = "nm_v1_repository_list_files";
 
     public static IReadOnlyList<string> All { get; } =
     [
@@ -188,6 +194,8 @@ public static class McpToolNames
         WorkspacePath,
         WorkspaceProfileGet,
         WorkspaceProfileRescan,
+        WorkspaceSwitch,
+        WorkspaceCapabilities,
         GoalCreate,
         GoalList,
         DecisionRecord,
@@ -202,6 +210,10 @@ public static class McpToolNames
         ModelCompare,
         ModelReplay,
         RepositoryRegister,
-        RepositoryList
+        RepositoryList,
+        RepositoryCreate,
+        RepositoryClone,
+        RepositoryReadFile,
+        RepositoryListFiles
     ];
 }

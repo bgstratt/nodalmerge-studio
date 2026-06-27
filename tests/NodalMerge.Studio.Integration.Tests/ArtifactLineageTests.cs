@@ -141,6 +141,8 @@ public class ArtifactLineageTests
             return Task.FromResult(updated);
         }
         public Task<WorkUnit> IncrementReviewRejectionCountAsync(string id, bool automated, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> IncrementFailureAttemptCountAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> AmendGoalForSteeredRetryAsync(string id, string amendedGoal, string steeringContext, string deadLetterEntryId, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) =>
             Task.FromResult(_units.GetValueOrDefault(workUnitId));
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) =>

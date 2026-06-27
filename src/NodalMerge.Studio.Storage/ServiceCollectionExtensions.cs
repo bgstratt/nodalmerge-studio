@@ -140,6 +140,12 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ISteeringDecisionService>(sp => sp.GetRequiredService<SteeringDecisionService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<SteeringDecisionService>());
 
+        // Phase 16 — registered ahead of RepositoryRegistryService, which depends on it to attach
+        // every newly registered repository to the (currently singleton) workspace.
+        services.AddSingleton<WorkspaceRegistryService>();
+        services.AddSingleton<IWorkspaceRegistryService>(sp => sp.GetRequiredService<WorkspaceRegistryService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<WorkspaceRegistryService>());
+
         services.AddSingleton<RepositoryRegistryService>();
         services.AddSingleton<IRepositoryRegistryService>(sp => sp.GetRequiredService<RepositoryRegistryService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<RepositoryRegistryService>());
@@ -151,6 +157,10 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<EvidenceNodeService>();
         services.AddSingleton<IEvidenceNodeService>(sp => sp.GetRequiredService<EvidenceNodeService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<EvidenceNodeService>());
+
+        services.AddSingleton<HypothesisNodeService>();
+        services.AddSingleton<IHypothesisNodeService>(sp => sp.GetRequiredService<HypothesisNodeService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<HypothesisNodeService>());
 
         services.AddSingleton<FindingService>();
         services.AddSingleton<IFindingService>(sp => sp.GetRequiredService<FindingService>());

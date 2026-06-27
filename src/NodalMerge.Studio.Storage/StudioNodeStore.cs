@@ -36,6 +36,7 @@ public static class StudioNodeKind
     public const string RepositorySyncStateV1 = "studio/repository-sync-state/v1";
     public const string RepositoryV1          = "studio/repository/v1";
     public const string ProjectionSnapshotV1  = "studio/projection-snapshot/v1";
+    public const string WorkspaceV1            = "studio/workspace/v1";
 }
 
 public interface IStudioNodeStore

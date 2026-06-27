@@ -66,7 +66,18 @@ public sealed record WorkUnit(
     // goal's "main" content was synced from at creation time. Null for forks/children (they
     // inherit their seed branch's content, not a repository directly) and for goals created
     // from an unregistered ad hoc RepositoryPath.
-    string? RepositoryId = null);
+    string? RepositoryId = null,
+    // Cross-repo file reference — read-only pointers into *other* registered repos for context
+    // (style/examples), resolved lazily via IRepositoryRegistryService.ReadFileAsync during a run.
+    // Not write-gating like FileScope; just where to look. Nullable (not "= []") to match the
+    // DependsOn/FileScope-on-WorkUnitCreateCommand convention elsewhere in this codebase — callers
+    // normalize with "?? []" rather than every record defaulting a literal empty collection.
+    IReadOnlyList<FileReferenceV1>? ReferenceFiles = null,
+    // Phase 16 — the (currently singleton) workspace this work unit belongs to. Resolved
+    // server-side (IWorkspaceRegistryService.GetOrCreateDefaultAsync) by WorkUnitCommandService,
+    // never caller-supplied — there's nothing to choose while cardinality is 1. Defaulted here so
+    // every existing call site keeps compiling unchanged. See plans/phase-16-workspace-aggregate.md.
+    string WorkspaceId = "workspace-default");
 
 /// <summary>Failure/rejection counters, previously stored as parsed strings in Metadata.</summary>
 public sealed record WorkUnitExecutionInfo(

@@ -13,7 +13,8 @@ public class ExperimentServiceTests
     private static async Task<(
         IExperimentService Experiments,
         IWorkUnitService WorkUnits,
-        IWorkScheduler Scheduler)> BuildAsync()
+        IWorkScheduler Scheduler,
+        IHypothesisNodeService Hypotheses)> BuildAsync()
     {
         var app = StudioWebApplication.Build(
             [], configureServices: services => services.AddInMemoryStorage());
@@ -21,13 +22,14 @@ public class ExperimentServiceTests
         return (
             app.Services.GetRequiredService<IExperimentService>(),
             app.Services.GetRequiredService<IWorkUnitService>(),
-            app.Services.GetRequiredService<IWorkScheduler>());
+            app.Services.GetRequiredService<IWorkScheduler>(),
+            app.Services.GetRequiredService<IHypothesisNodeService>());
     }
 
     [Fact]
     public async Task CreateAsync_requires_at_least_two_forks()
     {
-        var (experiments, _, _) = await BuildAsync();
+        var (experiments, _, _, _) = await BuildAsync();
 
         await Assert.ThrowsAsync<ArgumentException>(() => experiments.CreateAsync(new ExperimentSpec(
             "Pick a caching layer", "test", HypothesisForkType.Code,
@@ -37,7 +39,7 @@ public class ExperimentServiceTests
     [Fact]
     public async Task CreateAsync_model_experiments_require_every_fork_to_have_a_profile()
     {
-        var (experiments, _, _) = await BuildAsync();
+        var (experiments, _, _, _) = await BuildAsync();
 
         await Assert.ThrowsAsync<ArgumentException>(() => experiments.CreateAsync(new ExperimentSpec(
             "Compare models", "test", HypothesisForkType.Model,
@@ -47,7 +49,7 @@ public class ExperimentServiceTests
     [Fact]
     public async Task CreateAsync_architecture_experiments_require_every_fork_to_have_constraint_text()
     {
-        var (experiments, _, _) = await BuildAsync();
+        var (experiments, _, _, _) = await BuildAsync();
 
         await Assert.ThrowsAsync<ArgumentException>(() => experiments.CreateAsync(new ExperimentSpec(
             "Pick an architecture", "test", HypothesisForkType.Architecture,
@@ -57,7 +59,7 @@ public class ExperimentServiceTests
     [Fact]
     public async Task CreateAsync_creates_a_parent_container_and_one_child_per_fork()
     {
-        var (experiments, workUnits, _) = await BuildAsync();
+        var (experiments, workUnits, _, _) = await BuildAsync();
 
         var result = await experiments.CreateAsync(new ExperimentSpec(
             "Pick a caching layer", "test", HypothesisForkType.Library,
@@ -82,7 +84,7 @@ public class ExperimentServiceTests
     [Fact]
     public async Task CreateAsync_auto_enqueues_forks_that_have_a_profileId()
     {
-        var (experiments, _, scheduler) = await BuildAsync();
+        var (experiments, _, scheduler, _) = await BuildAsync();
 
         var result = await experiments.CreateAsync(new ExperimentSpec(
             "Compare models", "test", HypothesisForkType.Model,
@@ -98,7 +100,7 @@ public class ExperimentServiceTests
     [Fact]
     public async Task CreateAsync_persists_the_experiment_node_and_GetAsync_returns_it()
     {
-        var (experiments, _, _) = await BuildAsync();
+        var (experiments, _, _, _) = await BuildAsync();
 
         var result = await experiments.CreateAsync(new ExperimentSpec(
             "Pick a strategy", "test", HypothesisForkType.Product,
@@ -118,9 +120,30 @@ public class ExperimentServiceTests
     }
 
     [Fact]
+    public async Task CreateAsync_records_an_active_HypothesisNode_per_fork()
+    {
+        var (experiments, _, _, hypotheses) = await BuildAsync();
+
+        var result = await experiments.CreateAsync(new ExperimentSpec(
+            "Pick a caching layer", "test", HypothesisForkType.Library,
+            [
+                new ExperimentForkSpec(null, "Redis"),
+                new ExperimentForkSpec(null, "Memcached"),
+            ]));
+
+        var nodes = await hypotheses.ListByParentWorkUnitIdAsync(result.ParentWorkUnitId);
+        Assert.Equal(2, nodes.Count);
+        Assert.All(nodes, n => Assert.Equal(HypothesisStatus.Active, n.Status));
+        Assert.All(nodes, n => Assert.Equal(HypothesisForkType.Library, n.ForkType));
+        Assert.Equal(
+            result.ForkWorkUnitIds.OrderBy(x => x),
+            nodes.Select(n => n.WorkUnitId).OrderBy(x => x));
+    }
+
+    [Fact]
     public async Task ListAsync_returns_newest_first()
     {
-        var (experiments, _, _) = await BuildAsync();
+        var (experiments, _, _, _) = await BuildAsync();
 
         var first = await experiments.CreateAsync(new ExperimentSpec(
             "Experiment A", "test", HypothesisForkType.Code,

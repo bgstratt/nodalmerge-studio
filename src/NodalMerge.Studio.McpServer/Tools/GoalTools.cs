@@ -8,12 +8,23 @@ using NodalMerge.Studio.Storage;
 namespace NodalMerge.Studio.McpServer.Tools;
 
 [McpServerToolType]
-public sealed class GoalTools(IWorkUnitService workUnits, IWorkUnitCommandService workUnitCommands, IGoalNodeService goalNodes)
+public sealed class GoalTools(
+    IWorkUnitService workUnits,
+    IWorkUnitCommandService workUnitCommands,
+    IGoalNodeService goalNodes,
+    IRepositoryRegistryService repositories)
 {
     [McpServerTool(Name = McpToolNames.GoalCreate), Description("Create a decision-centric goal from a work unit.")]
     public async Task<string> CreateAsync(
         string goal,
         string? workUnitId = null,
+        string? repositoryId = null,
+        string? repositoryPath = null,
+        // When set, a fresh repository (git init) is created at this path and used as the goal's
+        // repository — takes priority over repositoryId/repositoryPath when given.
+        string? newRepositoryPath = null,
+        string? newRepositoryLabel = null,
+        [Description("Read-only pointers into other registered repositories for context (style/examples) — only used when creating a fresh work unit (workUnitId is null).")] IReadOnlyList<FileReferenceV1>? referenceFiles = null,
         CancellationToken cancellationToken = default)
     {
         // If an existing work unit is referenced, look it up; otherwise create a new one.
@@ -26,8 +37,15 @@ public sealed class GoalTools(IWorkUnitService workUnits, IWorkUnitCommandServic
         }
         else
         {
+            if (newRepositoryPath is not null)
+            {
+                var created = await repositories.CreateAsync(
+                    newRepositoryPath, newRepositoryLabel, cancellationToken).ConfigureAwait(false);
+                repositoryId = created.RepositoryId;
+            }
+
             workUnit = await workUnitCommands.CreateAsync(
-                new WorkUnitCreateCommand(goal, "studio"),
+                new WorkUnitCreateCommand(goal, "studio", RepositoryId: repositoryId, RepositoryPath: repositoryPath, ReferenceFiles: referenceFiles),
                 cancellationToken).ConfigureAwait(false);
         }
 

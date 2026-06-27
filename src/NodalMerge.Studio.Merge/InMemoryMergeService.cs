@@ -17,6 +17,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     private readonly IArtifactLineageService _artifacts;
     private readonly IServiceProvider? _serviceProvider;
     private readonly IFileLeaseService? _fileLease;
+    private readonly IRepositoryRegistryService? _repositories;
 
     // IWorkUnitService is resolved lazily (via IServiceProvider) rather than constructor-injected:
     // its production implementation (InMemoryWorkUnitService) already depends on IMergeService
@@ -34,7 +35,8 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         IExecutionEventStream events,
         IArtifactLineageService artifacts,
         IServiceProvider? serviceProvider = null,
-        IFileLeaseService? fileLease = null)
+        IFileLeaseService? fileLease = null,
+        IRepositoryRegistryService? repositories = null)
     {
         _nodeStore        = nodeStore;
         _fileWorkspace    = fileWorkspace;
@@ -43,6 +45,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         _artifacts        = artifacts;
         _serviceProvider  = serviceProvider;
         _fileLease        = fileLease;
+        _repositories     = repositories;
     }
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
@@ -323,13 +326,16 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // work unit's parent branch so the canonical workspace is never touched directly.
         // Slice 21c — a work unit can opt out of the session-wide promotion branch via
         // BypassPromotionBranch, applying directly to the proposal's target branch.
+        // Also resolved here (rather than only inline) so the write-back step below can use the
+        // same owning work unit's RepositoryId instead of always falling back to the global default.
         var bypassPromotionBranch = false;
+        WorkUnit? owningWorkUnit = null;
         if (proposal.WorkUnitId is not null)
         {
             var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
             if (workUnits is not null)
             {
-                var owningWorkUnit = await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false);
+                owningWorkUnit = await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false);
                 bypassPromotionBranch = owningWorkUnit?.BypassPromotionBranch ?? false;
             }
         }
@@ -374,10 +380,21 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             }
         }
 
-        // Write changed files back to disk whenever a repository path is configured
-        if (!string.IsNullOrWhiteSpace(_workspaceOptions.SeedRepositoryPath))
+        // Write changed files back to disk whenever a repository path is configured. Prefer the
+        // owning work unit's own repository — so a multi-repo goal writes back to the repo it
+        // actually came from — falling back to the global default only when the work unit has no
+        // RepositoryId (preserves today's single-repo behavior unchanged).
+        var writeBackPath = _workspaceOptions.SeedRepositoryPath;
+        if (owningWorkUnit?.RepositoryId is { } repositoryId && _repositories is not null)
         {
-            await WriteBackToRepositoryAsync(proposal.SourceBranch, cancellationToken).ConfigureAwait(false);
+            var repository = await _repositories.GetAsync(repositoryId, cancellationToken).ConfigureAwait(false);
+            if (repository is not null)
+                writeBackPath = repository.Path;
+        }
+
+        if (!string.IsNullOrWhiteSpace(writeBackPath))
+        {
+            await WriteBackToRepositoryAsync(proposal.SourceBranch, writeBackPath, cancellationToken).ConfigureAwait(false);
         }
 
         var updated = proposal with { Status = MergeProposalStatus.Merged, AutoApplied = autoApplied };
@@ -543,9 +560,8 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         return updated;
     }
 
-    private async Task WriteBackToRepositoryAsync(string sourceBranchId, CancellationToken ct)
+    private async Task WriteBackToRepositoryAsync(string sourceBranchId, string repoPath, CancellationToken ct)
     {
-        var repoPath = _workspaceOptions.SeedRepositoryPath!;
         var files = await _fileWorkspace.ListAsync(sourceBranchId, ct: ct).ConfigureAwait(false);
         foreach (var relativePath in files)
         {

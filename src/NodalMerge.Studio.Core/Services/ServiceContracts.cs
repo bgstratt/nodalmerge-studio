@@ -372,6 +372,26 @@ public interface IWorkUnitService
         bool automated,
         CancellationToken cancellationToken = default);
 
+    // Race-safety fix — same convention as IncrementReviewRejectionCountAsync above. Replaces
+    // InMemoryDeadLetterService.RecordFailureAsync's old pattern of reading the whole WorkUnit,
+    // computing a new ExecutionInfo, and calling CreateAsync(unit with {...}), which silently
+    // reverted any concurrent writer's Status/CurrentStage/etc. change made in the read/write gap.
+    Task<WorkUnit> IncrementFailureAttemptCountAsync(
+        string workUnitId,
+        CancellationToken cancellationToken = default);
+
+    // Race-safety fix — same convention. Replaces InMemoryDeadLetterService.RetryWithContextAsync's
+    // old CreateAsync(unit with { Goal, Metadata, ExecutionInfo }) upsert. Folds the steering
+    // correction into Goal (projections only ever surface Goal/SuccessCriteria to agents, never
+    // Metadata), records the steering metadata keys, and resets FailureAttemptCount to 0 so the
+    // freshly-steered retry starts with a clean failure budget.
+    Task<WorkUnit> AmendGoalForSteeredRetryAsync(
+        string workUnitId,
+        string amendedGoal,
+        string steeringContext,
+        string deadLetterEntryId,
+        CancellationToken cancellationToken = default);
+
     // Capability-gap fix — amends a work unit's FileScope in place. Unlike SteeringService (which
     // always forks a sibling so the original's decision log stays immutable), this mutates the
     // original directly for the common case where an agent's findings warrant a narrower/wider
@@ -439,6 +459,11 @@ public interface IOrchestratorService
         bool bypassPromotionBranch = false,
         WorkUnitExpectedOutputKind expectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
         string? repositoryId = null,
+        IReadOnlyList<FileReferenceV1>? referenceFiles = null,
+        // Phase 16 — resolved by WorkUnitCommandService via IWorkspaceRegistryService, never
+        // caller-supplied. Null keeps today's default ("workspace-default") for callers that
+        // bypass WorkUnitCommandService (fan-out, steering, fork-from-node).
+        string? workspaceId = null,
         CancellationToken cancellationToken = default);
 
     Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default);
@@ -464,7 +489,10 @@ public sealed record WorkUnitCreateCommand(
     // Slice 19 — references an already-registered IRepositoryRegistryService entry by id.
     // Resolved to a path by WorkUnitCommandService.CreateAsync, which takes priority over
     // RepositoryPath when both are given.
-    string? RepositoryId = null);
+    string? RepositoryId = null,
+    // Cross-repo file reference — see WorkUnit.ReferenceFiles. Each entry's RepositoryId is
+    // validated against IRepositoryRegistryService by WorkUnitCommandService.CreateAsync.
+    IReadOnlyList<FileReferenceV1>? ReferenceFiles = null);
 
 public interface IWorkUnitCommandService
 {
@@ -1584,9 +1612,23 @@ public sealed record ExperimentNode(
     DateTimeOffset CreatedAt,
     string? SessionId = null);
 
+public sealed record ConvergenceResult(
+    string ParentWorkUnitId,
+    string WinnerWorkUnitId,
+    IReadOnlyList<string> RejectedWorkUnitIds,
+    string? Rationale);
+
 public interface IExperimentService
 {
     Task<ExperimentResult> CreateAsync(ExperimentSpec spec, CancellationToken ct = default);
     Task<ExperimentNode?> GetAsync(string experimentId, CancellationToken ct = default);
     Task<IReadOnlyList<ExperimentNode>> ListAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Converges an experiment: approves the winner's latest proposal, rejects every other
+    /// sibling's non-terminal latest proposal, writes a DecisionNode per sibling (Accepted/
+    /// Rejected), and transitions each sibling's HypothesisNode status (Converged/Rejected).
+    /// </summary>
+    Task<ConvergenceResult> ConvergeAsync(
+        string parentWorkUnitId, string winnerWorkUnitId, string? rationale, CancellationToken ct = default);
 }

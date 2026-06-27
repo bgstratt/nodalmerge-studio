@@ -22,12 +22,13 @@ public sealed class WorkUnitTools(IWorkUnitService workUnits, IOrchestratorServi
         IReadOnlyList<string>? dependsOn = null,
         IReadOnlyList<string>? fileScope = null,
         string? repositoryId = null,
+        [Description("Read-only pointers into other registered repositories for context (style/examples) — e.g. [{ \"repositoryId\": \"repo-abc\", \"path\": \"src/Foo.cs\" }]. Fetch content on demand via nm_v1_repository_read_file.")] IReadOnlyList<FileReferenceV1>? referenceFiles = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
             var workUnit = await workUnitCommands.CreateAsync(
-                new WorkUnitCreateCommand(goal, owner ?? "studio", branchId, successCriteria, repositoryPath, parentWorkUnitId, dependsOn, fileScope, RepositoryId: repositoryId),
+                new WorkUnitCreateCommand(goal, owner ?? "studio", branchId, successCriteria, repositoryPath, parentWorkUnitId, dependsOn, fileScope, RepositoryId: repositoryId, ReferenceFiles: referenceFiles),
                 cancellationToken).ConfigureAwait(false);
             return McpJson.Ok(new { workUnitId = workUnit.WorkUnitId, branchId = workUnit.BranchId });
         }

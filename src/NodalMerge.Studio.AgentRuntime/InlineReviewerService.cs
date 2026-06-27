@@ -1,5 +1,6 @@
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace NodalMerge.Studio.AgentRuntime;
@@ -10,6 +11,7 @@ namespace NodalMerge.Studio.AgentRuntime;
 public sealed class InlineReviewerService(
     IAgentControlService agentControl,
     IMergeService merge,
+    IEvidenceNodeService evidenceNodes,
     IServiceProvider serviceProvider) : IInlineReviewerService
 {
     public async Task<InlineReviewResult> ReviewAsync(
@@ -57,6 +59,16 @@ public sealed class InlineReviewerService(
 
         var proposal = await merge.GetAsync(proposalId, ct).ConfigureAwait(false);
         var approved = proposal?.Status is MergeProposalStatus.Approved or MergeProposalStatus.Merged;
+
+        await evidenceNodes.RecordAsync(new EvidenceNode(
+            EvidenceId: $"ev-{Guid.NewGuid():N}",
+            WorkUnitId: workUnitId,
+            ProposalId: proposalId,
+            Kind: EvidenceKind.AutomatedReview,
+            Summary: proposal?.VerificationResults ?? (approved ? "Approved" : "Rejected"),
+            DetailJson: null,
+            AttachedAt: DateTimeOffset.UtcNow), ct).ConfigureAwait(false);
+
         return new InlineReviewResult(approved, proposal?.VerificationResults);
     }
 }

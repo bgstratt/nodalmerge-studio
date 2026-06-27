@@ -21,6 +21,7 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly IOrchestrationDecisionLogService? _decisionLog;
     private readonly IDecisionNodeService? _decisionNodes;
     private readonly IEvidenceNodeService? _evidenceNodes;
+    private readonly IHypothesisNodeService? _hypothesisNodes;
     private readonly IAgentProfileService? _agentProfiles;
     private readonly ISteeringDecisionService? _steeringDecisions;
     private readonly IFileWorkspaceService? _fileWorkspace;
@@ -38,6 +39,7 @@ public sealed class ProjectionManager : IProjectionManager
         IOrchestrationDecisionLogService? decisionLog = null,
         IDecisionNodeService? decisionNodes = null,
         IEvidenceNodeService? evidenceNodes = null,
+        IHypothesisNodeService? hypothesisNodes = null,
         IAgentProfileService? agentProfiles = null,
         ISteeringDecisionService? steeringDecisions = null,
         IFileWorkspaceService? fileWorkspace = null,
@@ -54,6 +56,7 @@ public sealed class ProjectionManager : IProjectionManager
         _decisionLog        = decisionLog;
         _decisionNodes      = decisionNodes;
         _evidenceNodes      = evidenceNodes;
+        _hypothesisNodes    = hypothesisNodes;
         _agentProfiles      = agentProfiles;
         _steeringDecisions  = steeringDecisions;
         _fileWorkspace      = fileWorkspace;
@@ -80,6 +83,7 @@ public sealed class ProjectionManager : IProjectionManager
             ProjectionType.DecisionContext => await BuildDecisionContextAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.CounterfactualComparison => await BuildCounterfactualComparisonAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.RunRetrospective => await BuildRunRetrospectiveAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.HypothesisComparison => await BuildHypothesisComparisonAsync(request, cancellationToken).ConfigureAwait(false),
             _ => throw new ArgumentOutOfRangeException(nameof(request), request.Type, "Unknown projection type.")
         };
 
@@ -941,6 +945,74 @@ public sealed class ProjectionManager : IProjectionManager
             DateTimeOffset.UtcNow);
 
         return Serialize(payload);
+    }
+
+    // ── HypothesisComparison projection — deterministic evidence aggregation across N competing
+    // experiment forks. Pure read: recommends a winner, never writes convergence state itself.
+    private async Task<string> BuildHypothesisComparisonAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new { error = "HypothesisComparison requires workUnitId to identify the experiment parent." });
+
+        var siblings = await _workUnits.GetChildrenAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+        if (siblings.Count == 0)
+            return Serialize(new { error = $"No fork children found under parent '{request.WorkUnitId}'." });
+
+        var allProposals = await _merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+        var hypotheses = _hypothesisNodes is not null
+            ? await _hypothesisNodes.ListByParentWorkUnitIdAsync(request.WorkUnitId, ct).ConfigureAwait(false)
+            : [];
+
+        var rows = new List<HypothesisComparisonSibling>();
+        foreach (var sibling in siblings)
+        {
+            var hypothesis = hypotheses.FirstOrDefault(h => h.WorkUnitId == sibling.WorkUnitId);
+            var latestProposal = allProposals.Where(p => p.WorkUnitId == sibling.WorkUnitId).LastOrDefault();
+            var evidence = _evidenceNodes is not null
+                ? await _evidenceNodes.ListByWorkUnitAsync(sibling.WorkUnitId, ct).ConfigureAwait(false)
+                : [];
+
+            rows.Add(new HypothesisComparisonSibling(
+                WorkUnitId: sibling.WorkUnitId,
+                HypothesisId: hypothesis?.HypothesisId,
+                ForkType: (sibling.ForkType ?? hypothesis?.ForkType)?.ToString() ?? "Unknown",
+                HypothesisStatus: (hypothesis?.Status ?? HypothesisStatus.Active).ToString(),
+                LatestProposalId: latestProposal?.ProposalId,
+                ProposalStatus: latestProposal?.Status.ToString(),
+                Confidence: latestProposal?.Confidence,
+                EvidenceCount: evidence.Count,
+                EvidenceSummaries: evidence.Select(e => e.Summary).ToList(),
+                Score: ScoreSibling(latestProposal, evidence)));
+        }
+
+        var ranked = rows.OrderByDescending(r => r.Score).ToList();
+        var recommended = ranked.Count > 0 && ranked[0].Score > 0 ? ranked[0].WorkUnitId : null;
+
+        return Serialize(new HypothesisComparisonProjectionPayload(
+            request.WorkUnitId, rows, recommended, DateTimeOffset.UtcNow));
+    }
+
+    // Deterministic, auditable scoring — no LLM call. +1 per evidence entry whose summary reads as
+    // an approval, -1 per rejection-flavored entry, +confidence as a tiebreaker weight, -1 if the
+    // latest proposal itself is Rejected/Superseded outright.
+    private static double ScoreSibling(MergeProposal? latestProposal, IReadOnlyList<EvidenceNode> evidence)
+    {
+        double score = 0;
+        foreach (var e in evidence)
+        {
+            if (e.Summary.Contains("approved", StringComparison.OrdinalIgnoreCase) ||
+                e.Summary.Contains("approve", StringComparison.OrdinalIgnoreCase))
+                score += 1;
+            else if (e.Summary.Contains("rejected", StringComparison.OrdinalIgnoreCase))
+                score -= 1;
+        }
+
+        score += latestProposal?.Confidence ?? 0;
+
+        if (latestProposal?.Status is MergeProposalStatus.Rejected or MergeProposalStatus.Superseded)
+            score -= 1;
+
+        return score;
     }
 
     // Manual-only analytics dashboard for the Insights tab — computed fresh from the full DAG
