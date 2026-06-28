@@ -14,7 +14,7 @@ namespace NodalMerge.Studio.Host;
 
 public static class StudioServiceCollectionExtensions
 {
-    public static IServiceCollection AddStudioServices(this IServiceCollection services, HttpClient? llmHttpClient = null)
+    public static IServiceCollection AddStudioServices(this IServiceCollection services, HttpClient? llmHttpClient = null, bool includeMcpServer = true)
     {
         services.ConfigureHttpJsonOptions(options =>
         {
@@ -51,7 +51,8 @@ public static class StudioServiceCollectionExtensions
         services.AddStudioAgentRuntime(llmHttpClient);
         services.AddStudioOrchestrator();
         services.AddSingleton<ICounterfactualService, NodalMerge.Studio.Orchestrator.CounterfactualService>();
-        services.AddStudioMcpServer();
+        if (includeMcpServer)
+            services.AddStudioMcpServer();
         return services;
     }
 }
