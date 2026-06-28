@@ -92,6 +92,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
       shell.showTab(InsightsPanel.containerId);
     }),
+
+    vscode.commands.registerCommand(COMMANDS.START_LOCAL_RUNTIME, async () => {
+      output.show();
+      try {
+        await manager.startLocal();
+        StudioShellPanel.current?.refresh();
+        vscode.window.showInformationMessage('NodalMerge Studio local runtime started.');
+      } catch (err) {
+        vscode.window.showErrorMessage(`Failed to start local runtime: ${String(err)}`);
+      }
+    }),
   );
 
   const notificationManager = new NotificationManager(
@@ -106,15 +117,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   try {
     await manager.start();
   } catch (err) {
+    const actions = manager.isRemote
+      ? ['Show Output']
+      : ['Show Output', 'Retry'];
     const action = await vscode.window.showErrorMessage(
-      `NodalMerge Studio Host failed to start: ${String(err)}`,
-      'Show Output',
-      'Retry'
+      `NodalMerge Studio failed to connect: ${String(err)}`,
+      ...actions
     );
     if (action === 'Show Output') {
       output.show();
     } else if (action === 'Retry') {
-      vscode.commands.executeCommand(COMMANDS.RESTART_HOST);
+      void vscode.commands.executeCommand(COMMANDS.RESTART_HOST);
     }
   }
 }

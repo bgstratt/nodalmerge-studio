@@ -16,7 +16,7 @@ export class WsClient {
   private ws: WebSocket | null = null;
 
   constructor(
-    private readonly port: number,
+    private readonly wsUrl: string,
     private readonly roomId: string,
     private readonly onAction: (action: ReplayAction) => void,
     private readonly onStatus: (status: WsStatus) => void,
@@ -30,7 +30,7 @@ export class WsClient {
 
   connect(): void {
     this.onStatus('connecting');
-    const ws = new WebSocket('ws://127.0.0.1:' + this.port + '/ws/runtime');
+    const ws = new WebSocket(this.wsUrl);
     this.ws = ws;
 
     ws.onopen = () => {

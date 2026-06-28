@@ -392,7 +392,7 @@ window.addEventListener('message', (event: MessageEvent) => {
   const msg = event.data as Record<string, unknown>;
 
   if (msg.type === 'init') {
-    const port   = (msg.port   as number)  ?? 5080;
+    const wsUrl  = (msg.wsUrl  as string)  ?? 'ws://127.0.0.1:5080/ws/runtime';
     const roomId = (msg.roomId as string)  ?? 'studio-main';
     const wus    = (msg.workUnits as WorkUnitRef[]) ?? [];
 
@@ -441,7 +441,7 @@ window.addEventListener('message', (event: MessageEvent) => {
     }
 
     ws?.close();
-    ws = new WsClient(port, roomId,
+    ws = new WsClient(wsUrl, roomId,
       (action) => { replayState = replayReducer(replayState, action); render(); },
       (status) => { setStatus(status); },
       applyStageChange,

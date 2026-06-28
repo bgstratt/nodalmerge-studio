@@ -6,10 +6,13 @@ import * as vscode from 'vscode';
 import {
   COMMANDS,
   DEFAULT_HOST_PORT,
+  DEFAULT_RUNTIME_URI,
   HOST_BINARY_NAME,
   HOST_HEALTH_POLL_INTERVAL_MS,
   HOST_STARTUP_TIMEOUT_MS,
   getRid,
+  isLocalUri,
+  toWebSocketUrl,
 } from './constants';
 
 type HostStatus = 'idle' | 'starting' | 'ready' | 'stopped' | 'error';
@@ -31,18 +34,32 @@ function directoryHasContent(dir: string): boolean {
   }
 }
 
+/** Reads the configured runtime URI from settings, honouring the legacy hostPort setting
+ *  so existing configs keep working without any user action. */
+function resolveConfiguredUri(): string {
+  const cfg = vscode.workspace.getConfiguration('nodalmerge');
+  const explicit = cfg.get<string>('runtimeUri', '').trim();
+  if (explicit) { return explicit.replace(/\/$/, ''); }
+  // Migrate legacy hostPort: if user changed it from the default, honour it.
+  const legacyPort = cfg.get<number>('hostPort', DEFAULT_HOST_PORT);
+  if (legacyPort !== DEFAULT_HOST_PORT) {
+    return `http://127.0.0.1:${legacyPort}`;
+  }
+  return DEFAULT_RUNTIME_URI;
+}
+
 export class HostManager implements vscode.Disposable {
   private readonly output: vscode.OutputChannel;
   private readonly context: vscode.ExtensionContext;
   private readonly statusBar: vscode.StatusBarItem;
   private process: cp.ChildProcess | undefined;
-  private port: number;
+  private uri: string;
   private _ready = false;
 
   constructor(output: vscode.OutputChannel, context: vscode.ExtensionContext) {
     this.output = output;
     this.context = context;
-    this.port = vscode.workspace.getConfiguration('nodalmerge').get<number>('hostPort', DEFAULT_HOST_PORT);
+    this.uri = resolveConfiguredUri();
 
     this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     this.statusBar.command = COMMANDS.SHOW_OUTPUT;
@@ -51,27 +68,56 @@ export class HostManager implements vscode.Disposable {
   }
 
   get isReady(): boolean { return this._ready; }
-  get hostPort(): number { return this.port; }
-  get hostBaseUrl(): string { return `http://127.0.0.1:${this.port}`; }
+  get hostBaseUrl(): string { return this.uri; }
+  get hostWsUrl(): string { return toWebSocketUrl(this.uri); }
+  get isRemote(): boolean { return !isLocalUri(this.uri); }
 
+  /** Start the runtime. If the configured URI is remote, just health-check and adopt it.
+   *  If local, check first (adopt if already running), then spawn. */
   async start(): Promise<void> {
+    // Re-read config on every start so a settings change takes effect without reloading the window.
+    this.uri = resolveConfiguredUri();
+
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-    if (wsRoot) {
+    if (wsRoot && !this.isRemote) {
       await this.maybePromptLegacyMigration(wsRoot);
     }
 
-    // If the port is already healthy (e.g. manually started host), just adopt it.
     if (await this.checkHealth()) {
       this._ready = true;
       this.applyStatus('ready');
-      this.output.appendLine(`[NodalMerge] Adopted running host on port ${this.port}.`);
-      this.output.appendLine(
-        '[NodalMerge] Host logs will not appear here. Stop the process on that port, then run ' +
-        '"NodalMerge: Restart Studio Host" so the extension owns the host and streams logs.',
-      );
+      const label = this.isRemote ? this.uri : `port ${this.extractPort()}`;
+      this.output.appendLine(`[NodalMerge] Connected to running runtime at ${label}.`);
+      if (!this.isRemote) {
+        this.output.appendLine(
+          '[NodalMerge] Host logs will not appear here. Stop the process on that port, then run ' +
+          '"NodalMerge: Restart Studio Host" so the extension owns the host and streams logs.',
+        );
+      }
       return;
     }
 
+    if (this.isRemote) {
+      this.applyStatus('error');
+      throw new Error(
+        `NodalMerge Studio: could not reach runtime at ${this.uri}. ` +
+        'Make sure the remote runtime is running and accessible.'
+      );
+    }
+
+    this.applyStatus('starting');
+    this.spawnProcess();
+    await this.waitForHealth();
+  }
+
+  /** Explicitly starts the local runtime regardless of the configured URI.
+   *  Used by the "Start Local Runtime" command when the user wants a local instance
+   *  alongside a remote URI they normally point at. */
+  async startLocal(): Promise<void> {
+    if (this.process) {
+      this.output.appendLine('[NodalMerge] Local runtime already running.');
+      return;
+    }
     this.applyStatus('starting');
     this.spawnProcess();
     await this.waitForHealth();
@@ -91,7 +137,6 @@ export class HostManager implements vscode.Disposable {
       env: { ...process.env, ...env },
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      // On Windows, spawn without a window
       windowsHide: true,
     });
 
@@ -117,16 +162,16 @@ export class HostManager implements vscode.Disposable {
   }
 
   private resolveHostCommand(): { cmd: string; args: string[]; env: Record<string, string>; cwd?: string } {
+    // For a local spawn we always bind to 127.0.0.1. If the runtimeUri is also local, use its
+    // port; otherwise fall back to the default port so the explicit local spawn has a stable address.
+    const bindPort = isLocalUri(this.uri) ? this.extractPort() : DEFAULT_HOST_PORT;
+    const bindAddr = `http://127.0.0.1:${bindPort}`;
+
     const hostEnv: Record<string, string> = {
-      Studio__Urls: `http://127.0.0.1:${this.port}`,
-      ASPNETCORE_URLS: `http://127.0.0.1:${this.port}`,
+      Studio__Urls:    bindAddr,
+      ASPNETCORE_URLS: bindAddr,
     };
 
-    // Anchor durable storage (DAG node store, file blobs, branch workspace files) somewhere that
-    // survives a restart, instead of the Host's process CWD / OS temp dir — but never inside the
-    // opened repo by default; that's the user's working tree, not Studio's scratch space. No
-    // folder open (single-file mode) — leave the Host's own defaults (temp dir) alone, there's no
-    // workspace to anchor to either way.
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
     if (wsRoot) {
       const dataRoot = this.resolveDataRoot(wsRoot);
@@ -137,9 +182,6 @@ export class HostManager implements vscode.Disposable {
       }
     }
 
-    // In extension development mode use `dotnet run` so there's no need to
-    // pre-publish a binary. The extension path is clients/vscode-extension/ so
-    // the repo root is two levels up.
     if (this.context.extensionMode === vscode.ExtensionMode.Development) {
       const repoRoot = path.join(this.context.extensionPath, '..', '..');
       const hostProject = path.join(
@@ -154,7 +196,6 @@ export class HostManager implements vscode.Disposable {
       };
     }
 
-    // Production: use the self-contained binary bundled under bin/{rid}/
     const rid = getRid();
     const binaryName = HOST_BINARY_NAME[process.platform as keyof typeof HOST_BINARY_NAME]
       ?? 'NodalMerge.Studio.Host';
@@ -162,10 +203,6 @@ export class HostManager implements vscode.Disposable {
     return { cmd: binaryPath, args: [], env: hostEnv, cwd: wsRoot };
   }
 
-  // Empty (default) = VS Code's own per-workspace extension storage, which already lives outside
-  // any repo. A non-empty override is the user's explicit choice — relative paths resolve against
-  // the workspace folder (e.g. ".nodalmerge", if they actually want it versioned), absolute paths
-  // let them point anywhere (e.g. another drive).
   private resolveDataRoot(wsRoot: string): string | undefined {
     const override = vscode.workspace.getConfiguration('nodalmerge').get<string>('workspaceDataPath', '');
     if (override) {
@@ -174,14 +211,10 @@ export class HostManager implements vscode.Disposable {
     return this.context.storageUri?.fsPath ?? this.context.globalStorageUri.fsPath;
   }
 
-  // Repos that ran under the old default already have real branch history sitting in
-  // <repo>/.nodalmerge. Don't switch the default out from under them silently, and don't leave
-  // it there silently either — ask once per workspace (re-asking next time it's opened if the
-  // user picks "ask me later", but not on every restart within the same session).
   private async maybePromptLegacyMigration(wsRoot: string): Promise<void> {
     const config = vscode.workspace.getConfiguration('nodalmerge');
     if (config.get<string>('workspaceDataPath', '')) {
-      return; // already an explicit choice on record
+      return;
     }
 
     const legacyDir = path.join(wsRoot, LEGACY_DATA_DIRNAME);
@@ -213,8 +246,6 @@ export class HostManager implements vscode.Disposable {
 
   private async migrateLegacyData(legacyDir: string): Promise<void> {
     const target = this.context.storageUri?.fsPath ?? this.context.globalStorageUri.fsPath;
-
-    // Make sure nothing has the old directory open before moving it out from under the process.
     this.killProcess();
 
     try {
@@ -248,9 +279,7 @@ export class HostManager implements vscode.Disposable {
     const alreadyIgnored = existing
       .split(/\r?\n/)
       .some(line => line.trim() === entry || line.trim() === LEGACY_DATA_DIRNAME);
-    if (alreadyIgnored) {
-      return;
-    }
+    if (alreadyIgnored) { return; }
 
     const choice = await vscode.window.showInformationMessage(
       `Add "${entry}" to .gitignore so Studio's data directory isn't committed?`,
@@ -269,7 +298,7 @@ export class HostManager implements vscode.Disposable {
       if (await this.checkHealth()) {
         this._ready = true;
         this.applyStatus('ready');
-        this.output.appendLine(`[NodalMerge] Host healthy on port ${this.port}.`);
+        this.output.appendLine(`[NodalMerge] Host healthy at ${this.uri}.`);
         return;
       }
       await sleep(HOST_HEALTH_POLL_INTERVAL_MS);
@@ -283,17 +312,23 @@ export class HostManager implements vscode.Disposable {
 
   private checkHealth(): Promise<boolean> {
     return new Promise(resolve => {
-      const req = http.get(
-        `http://127.0.0.1:${this.port}/studio/health`,
-        { timeout: 1000 },
-        res => resolve(res.statusCode === 200)
-      );
+      const url = `${this.uri}/studio/health`;
+      const req = http.get(url, { timeout: 1000 }, res => resolve(res.statusCode === 200));
       req.on('error', () => resolve(false));
       req.on('timeout', () => { req.destroy(); resolve(false); });
     });
   }
 
+  private extractPort(): number {
+    try {
+      return parseInt(new URL(this.uri).port || '5080', 10) || DEFAULT_HOST_PORT;
+    } catch {
+      return DEFAULT_HOST_PORT;
+    }
+  }
+
   private applyStatus(status: HostStatus): void {
+    const uriLabel = this.isRemote ? this.uri : `:${this.extractPort()}`;
     switch (status) {
       case 'idle':
         this.statusBar.text    = '$(circle-outline) NodalMerge';
@@ -302,22 +337,22 @@ export class HostManager implements vscode.Disposable {
         break;
       case 'starting':
         this.statusBar.text    = '$(loading~spin) NodalMerge';
-        this.statusBar.tooltip = 'NodalMerge Studio Host starting…';
+        this.statusBar.tooltip = `NodalMerge Studio starting… (${this.uri})`;
         this.statusBar.color   = undefined;
         break;
       case 'ready':
-        this.statusBar.text    = `$(check) NodalMerge :${this.port}`;
-        this.statusBar.tooltip = `NodalMerge Studio Host running on port ${this.port}`;
+        this.statusBar.text    = `$(check) NodalMerge ${uriLabel}`;
+        this.statusBar.tooltip = `NodalMerge Studio connected — ${this.uri}`;
         this.statusBar.color   = new vscode.ThemeColor('statusBarItem.prominentForeground');
         break;
       case 'stopped':
         this.statusBar.text    = '$(debug-stop) NodalMerge';
-        this.statusBar.tooltip = 'NodalMerge Studio Host stopped — click to see output';
+        this.statusBar.tooltip = 'NodalMerge Studio stopped — click to see output';
         this.statusBar.color   = new vscode.ThemeColor('statusBarItem.warningForeground');
         break;
       case 'error':
         this.statusBar.text    = '$(error) NodalMerge';
-        this.statusBar.tooltip = 'NodalMerge Studio Host failed to start — click to see output';
+        this.statusBar.tooltip = `NodalMerge Studio failed to connect (${this.uri}) — click to see output`;
         this.statusBar.color   = new vscode.ThemeColor('statusBarItem.errorForeground');
         break;
     }
@@ -327,12 +362,9 @@ export class HostManager implements vscode.Disposable {
     if (!this.process) { return; }
     this.output.appendLine('[NodalMerge] Stopping host…');
     this.process.kill('SIGTERM');
-    // Give it 3s to exit gracefully, then SIGKILL
     const proc = this.process;
     setTimeout(() => {
-      if (!proc.exitCode && !proc.killed) {
-        proc.kill('SIGKILL');
-      }
+      if (!proc.exitCode && !proc.killed) { proc.kill('SIGKILL'); }
     }, 3000);
     this.process = undefined;
   }

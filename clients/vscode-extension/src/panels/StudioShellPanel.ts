@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { toWebSocketUrl } from '../constants';
 import { buildNonce, SHELL_CSS_VARS } from './sharedWebviewChrome';
 import { DecisionConvergencePanel } from './MergeReviewPanel';
 import { ModelAgentStudioPanel } from './AgentConfigPanel';
@@ -22,6 +23,7 @@ export class StudioShellPanel implements vscode.Disposable {
   private static readonly viewType = 'nodalmerge.studio';
 
   private readonly panel: vscode.WebviewPanel;
+  private readonly baseUrl: string;
   private readonly disposables: vscode.Disposable[] = [];
 
   readonly activityCenter: ExecutionTimelinePanel;
@@ -41,7 +43,8 @@ export class StudioShellPanel implements vscode.Disposable {
     lmProxyBaseUrl: string,
     notifications?: NotificationManager,
   ) {
-    this.panel = panel;
+    this.panel   = panel;
+    this.baseUrl = baseUrl;
 
     this.activityCenter   = new ExecutionTimelinePanel(panel, baseUrl, notifications, configService, secrets, lmProxyBaseUrl, this.getSelectedSessionId);
     this.reviewPanel = new DecisionConvergencePanel(panel, baseUrl, configService, this.getSelectedSessionId);
@@ -171,8 +174,9 @@ export class StudioShellPanel implements vscode.Disposable {
   // a document.write() SyntaxError that aborted parsing the rest of the page, silently preventing
   // every script tag after the failure point (including Decision Convergence's) from ever running.
   private buildHtml(extensionUri: vscode.Uri): string {
-    const nonce  = buildNonce();
+    const nonce   = buildNonce();
     const webview = this.panel.webview;
+    const wsOrigin = toWebSocketUrl(this.baseUrl);
 
     const goalWorkspaceFragment        = GoalWorkspacePanel.getFragment();
     const modelAgentStudioFragment     = ModelAgentStudioPanel.getFragment();
@@ -200,7 +204,7 @@ export class StudioShellPanel implements vscode.Disposable {
 <head>
   <meta charset="UTF-8">
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src ws://127.0.0.1:*;">
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src ${wsOrigin} ${wsOrigin}/*;">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
    <title>NodalMerge Studio</title>
   <style nonce="${nonce}">

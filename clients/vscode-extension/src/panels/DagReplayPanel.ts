@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { toWebSocketUrl } from '../constants';
 import { resolveRepositoryPath } from '../repositoryPath';
 import { scopeViewCss } from './sharedWebviewChrome';
 
@@ -116,10 +117,9 @@ export class TrajectoryReplayPanel {
         this.get<WorkUnit[]>('/studio/workunits' + params),
         this.get<TimelineResponse>('/studio/replay/timeline' + params),
       ]);
-      const port = this.extractPort();
       void this.panel.webview.postMessage({
         type:      'init',
-        port,
+        wsUrl:     this.buildWsUrl(),
         roomId:    'studio-main',
         workUnits: workUnits.map(wu => ({
           workUnitId:   wu.workUnitId,
@@ -283,9 +283,8 @@ export class TrajectoryReplayPanel {
     }
   }
 
-  private extractPort(): number {
-    const match = this.baseUrl.match(/:(\d+)/);
-    return match ? parseInt(match[1], 10) : 5080;
+  private buildWsUrl(): string {
+    return toWebSocketUrl(this.baseUrl) + '/ws/runtime';
   }
 
   private async get<T>(path: string): Promise<T> {
