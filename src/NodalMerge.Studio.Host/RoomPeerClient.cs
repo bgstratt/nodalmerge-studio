@@ -4,6 +4,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Storage;
+using IHostApplicationLifetime = Microsoft.Extensions.Hosting.IHostApplicationLifetime;
 
 namespace NodalMerge.Studio.Host;
 
@@ -15,6 +16,7 @@ namespace NodalMerge.Studio.Host;
 public sealed class RoomPeerClient(
     HeadlessPeerOptions options,
     WorkspaceOptions workspaceOptions,
+    IHostApplicationLifetime appLifetime,
     ILogger<RoomPeerClient> logger) : IHostedService, IAsyncDisposable
 {
     private CancellationTokenSource? _cts;
@@ -151,6 +153,19 @@ public sealed class RoomPeerClient(
                     break;
                 case "catch-up-pack":
                     logger.LogInformation("[RoomPeerClient] Received catch-up pack from server");
+                    break;
+                case "participant.stop":
+                    try
+                    {
+                        using var doc2 = JsonDocument.Parse(json);
+                        if (doc2.RootElement.TryGetProperty("peer_id", out var pidProp)
+                            && pidProp.GetString() == peerId)
+                        {
+                            logger.LogInformation("[RoomPeerClient] Received stop signal — requesting application shutdown");
+                            appLifetime.StopApplication();
+                        }
+                    }
+                    catch { /* malformed — ignore */ }
                     break;
                 default:
                     logger.LogDebug("[RoomPeerClient] Received message type={Type}", msgType ?? "(unknown)");

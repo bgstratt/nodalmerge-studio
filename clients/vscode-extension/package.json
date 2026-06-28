@@ -76,13 +76,16 @@
             "properties": {
               "id":               { "type": "string", "description": "Agent type identifier (used as agentType when spawning)." },
               "label":            { "type": "string", "description": "Display name shown in UI." },
-              "domain":           { "type": "string", "description": "Task domain this agent handles (e.g. 'docs', 'code', 'demo')." },
-              "provider":         { "type": "string", "enum": ["anthropic", "openai", "vscode-lm"], "description": "LLM provider for this profile." },
+              "domain":           { "type": "string", "description": "Task domain this agent handles (e.g. 'docs', 'code', 'security')." },
+              "deploymentMode":   { "type": "string", "enum": ["inline", "headless"], "default": "inline", "description": "How this agent is deployed. 'inline' = in-process managed by the runtime (default). 'headless' = standalone peer process; vscode-lm provider is not available in this mode." },
+              "provider":         { "type": "string", "enum": ["anthropic", "openai", "vscode-lm"], "description": "LLM provider. vscode-lm is only valid for inline deploymentMode." },
               "model":            { "type": "string", "description": "Model identifier (e.g. claude-sonnet-4-6, gpt-4o)." },
               "baseUrl":          { "type": "string", "description": "API base URL (not used for vscode-lm)." },
-              "apiKeyRef":        { "type": "string", "description": "Secret storage key for the API key." },
-              "modelHint":        { "type": "string", "description": "Deprecated — use model instead." },
-              "systemPromptHint": { "type": "string", "description": "Optional context passed to the agent when spawned." }
+              "apiKeyRef":        { "type": "string", "description": "Secret storage key for the API key (inline agents). Headless agents manage their own credentials." },
+              "systemPrompt":     { "type": "string", "description": "System prompt passed to the agent when spawned. Overrides any runtime default for this domain." },
+              "tools":            { "type": "array", "items": { "type": "string" }, "description": "Allowlist of MCP tool names this agent may call. Empty array means all tools are permitted." },
+              "modelHint":        { "type": "string", "deprecationMessage": "Deprecated — use model instead.", "description": "Deprecated — use model instead." },
+              "systemPromptHint": { "type": "string", "deprecationMessage": "Deprecated — use systemPrompt instead.", "description": "Deprecated — use systemPrompt instead." }
             }
           }
         },

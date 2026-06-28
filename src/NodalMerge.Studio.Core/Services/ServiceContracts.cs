@@ -1,3 +1,5 @@
+using NodalMerge.Studio.Contracts.Domain;
+
 namespace NodalMerge.Studio.Core.Services;
 
 // Slice 0a — implemented by every in-memory storage service that owns a node-store-backed
@@ -593,6 +595,72 @@ public interface ISnapshotService
 }
 
 public sealed record AgentInfo(string AgentId, string WorkUnitId, string Status, string? CurrentActivity = null);
+
+/// <summary>
+/// Unified view of a runtime participant — either an in-process agent loop ("agent") or a
+/// connected WebSocket peer ("peer"). Fields not applicable to a kind are null.
+/// </summary>
+public sealed record ParticipantDto(
+    string Id,
+    string Kind,
+    string Status,
+    string? WorkUnitId = null,
+    string? CurrentActivity = null,
+    string? PeerType = null);
+
+public interface IStudioParticipantService
+{
+    Task<IReadOnlyList<ParticipantDto>> ListAsync(CancellationToken ct = default);
+    Task StopAsync(string id, CancellationToken ct = default);
+}
+
+// ─── Track 7 — Projection Materialization ────────────────────────────────────
+
+/// <summary>
+/// Result of writing a work unit's branch files to a local filesystem target.
+/// </summary>
+public sealed record MaterializationResult(
+    string WorkUnitId,
+    string SnapshotId,
+    string TargetKind,
+    string TargetPath,
+    int FileCount,
+    long DurationMs,
+    bool Succeeded,
+    string? Error = null);
+
+/// <summary>
+/// Writes the current state of a work unit's branch to a named materialization target
+/// (LocalFilesystem initially; ContainerLayer / RemoteWorkspace are future targets).
+/// After writing, captures a ProjectionSnapshot and publishes ProjectionMaterializedEvent.
+/// </summary>
+public interface IProjectionMaterializer
+{
+    /// <summary>
+    /// Materialize the branch files of <paramref name="workUnitId"/> to <paramref name="targetPath"/>
+    /// (defaults to the configured SeedRepositoryPath when null).
+    /// </summary>
+    Task<MaterializationResult> MaterializeAsync(
+        string workUnitId,
+        string? targetPath = null,
+        CancellationToken ct = default);
+}
+
+/// <summary>
+/// In-process pub/sub bus for domain events. Handlers are fire-and-forget from the
+/// publisher's perspective; the bus catches and swallows handler exceptions individually
+/// so one bad subscriber never blocks event delivery to others.
+/// </summary>
+public interface IParticipantEventBus
+{
+    void Publish(IDomainEvent domainEvent);
+    /// <summary>Subscribe to events of a specific type. Dispose the returned token to unsubscribe.</summary>
+    IDisposable Subscribe(string eventType, Func<IDomainEvent, Task> handler);
+    /// <summary>Returns the most recent events (globally, all types), newest-last.</summary>
+    IReadOnlyList<IDomainEvent> GetRecentEvents(int limit = 50);
+    /// <summary>Returns all known event type names emitted by built-in participants.</summary>
+    IReadOnlyList<string> GetRegisteredEventTypes();
+}
 
 public sealed record OrchestratorCredentials(
     string Provider,

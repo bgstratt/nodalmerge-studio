@@ -188,6 +188,15 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
             NoFileChangesJustification: noFileChangesJustification);
         var created = await merge.ProposeAsync(proposal, cancellationToken).ConfigureAwait(false);
 
+        // ── Domain event ──────────────────────────────────────────────────────────
+        var eventBus = serviceProvider.GetService(typeof(IParticipantEventBus)) as IParticipantEventBus;
+        eventBus?.Publish(new ProposalCreatedEvent(
+            created.ProposalId,
+            workUnitId,
+            created.SourceBranch,
+            created.TargetBranch,
+            DateTimeOffset.UtcNow));
+
         // ── Artifact lineage + execution event + status transition ─────────────────
         if (workUnitId is not null)
         {

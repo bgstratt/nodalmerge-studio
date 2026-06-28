@@ -126,6 +126,9 @@ public static class McpToolNames
     public const string CausalGetResolution       = "nm_v1_causal_get_resolution";
     public const string CausalComputeSyncDiff     = "nm_v1_causal_compute_sync_diff";
 
+    public const string ParticipantList = "nm_v1_participant_list";
+    public const string ParticipantStop = "nm_v1_participant_stop";
+
     public static IReadOnlyList<string> All { get; } =
     [
         ProjectionGet,
@@ -223,6 +226,8 @@ public static class McpToolNames
         CausalGetFrontier,
         CausalGetParents,
         CausalGetResolution,
-        CausalComputeSyncDiff
+        CausalComputeSyncDiff,
+        ParticipantList,
+        ParticipantStop,
     ];
 }

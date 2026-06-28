@@ -2,14 +2,20 @@ import * as vscode from 'vscode';
 
 export type LlmProvider = 'anthropic' | 'openai' | 'vscode-lm';
 
+export type DeploymentMode = 'inline' | 'headless';
+
 export interface AgentProfile {
   id:               string;
   label:            string;
   domain:           string;
+  deploymentMode?:  DeploymentMode;   // defaults to 'inline'
   provider?:        LlmProvider;
   model?:           string;
   baseUrl?:         string;
   apiKeyRef?:       string;
+  systemPrompt?:    string;
+  tools?:           string[];         // MCP tool allowlist; empty = all permitted
+  /** @deprecated Use systemPrompt */
   systemPromptHint?: string;
 }
 
@@ -21,6 +27,16 @@ export interface TopologyTemplate {
   planner?:     string;
   worker?:      string;
   reviewer?:    string;
+}
+
+/** Runtime participant from GET /studio/participants — covers both in-process agents and room peers. */
+export interface ParticipantStatus {
+  id:              string;
+  kind:            'agent' | 'peer';
+  status:          string;
+  workUnitId?:     string | null;
+  currentActivity?: string | null;
+  peerType?:       string | null;
 }
 
 /** LLM connection fields passed to POST /studio/agents/spawn. */
@@ -135,6 +151,16 @@ export class AgentConfigService {
       baseUrl,
       apiKey,
     };
+  }
+
+  /** Returns the effective system prompt, preferring the new field over the deprecated hint. */
+  resolveSystemPrompt(profile: AgentProfile): string | undefined {
+    return profile.systemPrompt || profile.systemPromptHint || undefined;
+  }
+
+  /** Returns 'inline' by default when deploymentMode is unset. */
+  getEffectiveDeploymentMode(profile: AgentProfile): DeploymentMode {
+    return profile.deploymentMode ?? 'inline';
   }
 
   async pickProfile(placeHolder = 'Select an agent profile'): Promise<AgentProfile | undefined> {

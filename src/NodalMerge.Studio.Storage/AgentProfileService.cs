@@ -54,7 +54,7 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 "orchestrator",
                 "Orchestrator",
                 PipelineStage.Orchestrate,
-                string.Empty,
+                AgentLoopPrompts.Orchestrator,
                 [],
                 25,
                 []),
@@ -62,7 +62,7 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 "planner",
                 "Planner",
                 PipelineStage.Plan,
-                string.Empty,
+                AgentLoopPrompts.Planner,
                 [
                     McpToolNames.WorkUnitGet,
                     McpToolNames.WorkspaceSummary,
@@ -86,7 +86,7 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 "worker",
                 "Worker",
                 PipelineStage.Execute,
-                string.Empty,
+                AgentLoopPrompts.Worker,
                 [
                     McpToolNames.WorkUnitGet,
                     McpToolNames.TaskUpdate,
@@ -121,14 +121,18 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 "merger",
                 "Merger",
                 PipelineStage.Merge,
-                string.Empty,
+                AgentLoopPrompts.Merger,
                 [
+                    McpToolNames.WorkUnitGet,
+                    McpToolNames.ProjectionGet,
+                    McpToolNames.WorkspaceRead,
+                    McpToolNames.WorkspaceReadMany,
+                    McpToolNames.WorkspaceWrite,
+                    McpToolNames.WorkspaceList,
+                    McpToolNames.WorkspaceDiff,
                     McpToolNames.MergePropose,
                     McpToolNames.MergeValidate,
-                    McpToolNames.WorkspaceRead,
-                    McpToolNames.WorkspaceWrite,
-                    McpToolNames.WorkspaceDiff,
-                    McpToolNames.ProjectionGet,
+                    McpToolNames.ClarificationRequest,
                 ],
                 15,
                 []),
@@ -136,7 +140,7 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 "reviewer",
                 "Reviewer",
                 PipelineStage.Review,
-                string.Empty,
+                AgentLoopPrompts.Reviewer,
                 [
                     McpToolNames.WorkUnitGet,
                     McpToolNames.MergeValidate,
@@ -203,8 +207,19 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
         foreach (var (entityId, payloadJson) in records)
         {
             var profile = JsonSerializer.Deserialize<AgentProfile>(payloadJson);
-            if (profile is not null)
-                _profiles[entityId] = EnsureRequiredTools(profile);
+            if (profile is null) continue;
+
+            // If a previously-persisted profile has a blank system prompt but the seed now carries
+            // a real default, inherit the seed prompt so the user sees it in the UI rather than
+            // an empty textarea. An explicitly non-empty persisted prompt always wins.
+            if (string.IsNullOrWhiteSpace(profile.SystemPrompt)
+                && _profiles.TryGetValue(entityId, out var seeded)
+                && !string.IsNullOrWhiteSpace(seeded.SystemPrompt))
+            {
+                profile = profile with { SystemPrompt = seeded.SystemPrompt };
+            }
+
+            _profiles[entityId] = EnsureRequiredTools(profile);
         }
     }
 

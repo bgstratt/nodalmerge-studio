@@ -6,6 +6,7 @@ using NodalMerge.DotNetHost.Runtime;
 using NodalMerge.Host.Composition;
 using NodalMerge.Studio.Core;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Orchestrator;
 
 namespace NodalMerge.Studio.Host;
 
@@ -65,6 +66,9 @@ public static class StudioWebApplication
                 services.AddSingleton<IRuntimeEventBroadcaster, RuntimeRoomEventBroadcaster>();
                 services.AddSingleton<IStudioGraphPromoter, RuntimeGraphPromoter>();
                 services.AddSingleton<IStudioCausalGraphService, RuntimeCausalGraphService>();
+                services.AddSingleton<IParticipantEventBus, InMemoryParticipantEventBus>();
+                services.AddSingleton<IProjectionMaterializer, LocalFilesystemProjectionMaterializer>();
+                services.AddSingleton<IStudioParticipantService, StudioParticipantService>();
                 services.AddHostedService<StudioCrdtSyncBackgroundService>();
                 configureServices?.Invoke(services);
             });

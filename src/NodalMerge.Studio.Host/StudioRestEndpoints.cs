@@ -1190,6 +1190,56 @@ public static class StudioRestEndpoints
                 return Results.NotFound(new { error = $"Agent '{agentId}' not found." });
             }
         });
+
+        app.MapGet("/studio/participants", async (
+            IStudioParticipantService participants,
+            CancellationToken ct) =>
+        {
+            var list = await participants.ListAsync(ct).ConfigureAwait(false);
+            return Results.Ok(list);
+        });
+
+        app.MapPost("/studio/participants/{id}/stop", async (
+            string id,
+            IStudioParticipantService participants,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                await participants.StopAsync(id, ct).ConfigureAwait(false);
+                return Results.Ok(new { id, stopped = true });
+            }
+            catch (KeyNotFoundException)
+            {
+                return Results.NotFound(new { error = $"Participant '{id}' not found." });
+            }
+        });
+
+        app.MapGet("/studio/participants/{id}/events", async (
+            string id,
+            IParticipantEventBus eventBus,
+            IStudioParticipantService participants,
+            [FromQuery] int limit,
+            CancellationToken ct) =>
+        {
+            if (limit <= 0) limit = 50;
+            var participant = (await participants.ListAsync(ct).ConfigureAwait(false))
+                .FirstOrDefault(p => p.Id == id);
+            if (participant is null)
+                return Results.NotFound(new { error = $"Participant '{id}' not found." });
+
+            var all = eventBus.GetRecentEvents(200);
+            var filtered = all
+                .Where(e => e.WorkUnitId is not null && e.WorkUnitId == participant.WorkUnitId
+                         || e.EventType == "WorkUnitStatusChanged" && e.WorkUnitId == participant.WorkUnitId)
+                .TakeLast(limit)
+                .ToList();
+
+            return Results.Ok(new { participantId = id, events = filtered, count = filtered.Count });
+        });
+
+        app.MapGet("/studio/event-types", (IParticipantEventBus eventBus) =>
+            Results.Ok(new { eventTypes = eventBus.GetRegisteredEventTypes() }));
     }
 
     // ── /studio/merges ─────────────────────────────────────────────────────
@@ -2552,6 +2602,27 @@ public static class StudioRestEndpoints
             catch (KeyNotFoundException ex)
             {
                 return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        app.MapPost("/studio/projections/{workUnitId}/materialize", async (
+            string workUnitId,
+            [FromQuery] string? targetPath,
+            IProjectionMaterializer materializer,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var result = await materializer.MaterializeAsync(workUnitId, targetPath, ct).ConfigureAwait(false);
+                return Results.Ok(result);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
             }
         });
 

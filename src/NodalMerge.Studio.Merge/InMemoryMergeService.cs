@@ -28,6 +28,9 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     // be the same cycle. IFileLeaseService has no such cycle, so it's constructor-injected
     // directly — but kept optional (default null) so the existing direct (non-DI) test
     // constructions don't all need updating; when null, the release-and-resume hook is skipped.
+    private IParticipantEventBus? EventBus =>
+        _serviceProvider?.GetService(typeof(IParticipantEventBus)) as IParticipantEventBus;
+
     public InMemoryMergeService(
         IStudioNodeStore nodeStore,
         IFileWorkspaceService fileWorkspace,
@@ -129,6 +132,11 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             proposalId,
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
+
+        EventBus?.Publish(new ReviewCompletedEvent(
+            proposalId, proposal.WorkUnitId,
+            decision.ToString(), Automated: false, ReviewerAgentId: null,
+            DateTimeOffset.UtcNow));
 
         if (proposal.WorkUnitId is not null)
         {
@@ -276,6 +284,11 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
 
+        EventBus?.Publish(new ReviewCompletedEvent(
+            proposalId, proposal.WorkUnitId,
+            decision.ToString(), Automated: true, ReviewerAgentId: reviewerAgentId,
+            DateTimeOffset.UtcNow));
+
         if (proposal.SessionId is not null)
         {
             await _events.AppendAsync(
@@ -404,6 +417,11 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             proposalId,
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
+
+        EventBus?.Publish(new MergeAcceptedEvent(
+            proposalId, proposal.WorkUnitId,
+            proposal.SourceBranch, effectiveTarget,
+            DateTimeOffset.UtcNow));
 
         if (proposal.WorkUnitId is not null)
         {

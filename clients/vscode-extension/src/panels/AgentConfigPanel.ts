@@ -47,6 +47,10 @@ export class ModelAgentStudioPanel {
   /** Called once by the shell right after construction — was the tail of createOrShow(). */
   activate(): void {
     void this.sendConfig();
+    void this.sendParticipants();
+    // Poll participants every 10 s while the panel is visible.
+    const timer = setInterval(() => void this.sendParticipants(), 10_000);
+    this.panel.onDidDispose(() => clearInterval(timer));
   }
 
   static getFragment(): { css: string; html: string; script: string } {
@@ -82,6 +86,13 @@ export class ModelAgentStudioPanel {
       domainAgents,
       enabledDomainAgents,
     });
+  }
+
+  private async sendParticipants(): Promise<void> {
+    try {
+      const participants = await this.get<unknown[]>('/studio/participants');
+      void this.panel.webview.postMessage({ type: 'participants', participants });
+    } catch { /* server may not be running yet */ }
   }
 
   async handleMessage(msg: Record<string, unknown>): Promise<void> {
@@ -161,6 +172,19 @@ export class ModelAgentStudioPanel {
         } catch { /* host may not be running */ }
         void this.panel.webview.postMessage({ type: 'sessionDefaults', defaultReviewPolicy: policy, usePromotionBranch, enabledDomainAgents });
         void vscode.window.showInformationMessage('NodalMerge: Session defaults saved.');
+        break;
+      }
+
+      case 'refreshParticipants':
+        void this.sendParticipants();
+        break;
+
+      case 'stopParticipant': {
+        const id = msg.id as string;
+        try {
+          await fetch(this.baseUrl + '/studio/participants/' + encodeURIComponent(id), { method: 'POST' });
+        } catch { /* host may not be running */ }
+        setTimeout(() => void this.sendParticipants(), 1000);
         break;
       }
 
@@ -398,6 +422,12 @@ const MAS_CSS = `
     background: #2d5016; color: #8fc96a;
     border-radius: 10px; font-size: 0.74em; padding: 1px 7px; margin-left: 5px;
   }
+  .chip {
+    border-radius: 10px; font-size: 0.75em; padding: 1px 7px; display: inline-block;
+  }
+  .chip-running   { background: #1e3a1e; color: #7ec87e; }
+  .chip-connected { background: #1e2d3a; color: #6eaef0; }
+  .chip-idle      { background: #2a2a2a; color: #888; }
 `;
 
 const MAS_HTML = `
@@ -411,6 +441,7 @@ const MAS_HTML = `
     <button class="tab-btn" data-tab="explore">Quick Explore</button>
     <button class="tab-btn" data-tab="pipeline-profiles">Pipeline Profiles</button>
     <button class="tab-btn" data-tab="session-defaults">Session Defaults</button>
+    <button class="tab-btn" data-tab="participants">Participants</button>
   </div>
 
   <div id="pane-profiles" class="tab-pane visible">
@@ -491,6 +522,19 @@ const MAS_HTML = `
       </div>
       <span id="session-defaults-status" class="status"></span>
     </div>
+  </div>
+
+  <div id="pane-participants" class="tab-pane">
+    <div class="header-row" style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+      <h3 style="margin:0;flex:1">Live Participants</h3>
+      <button class="ghost" id="btn-refresh-participants" style="font-size:0.8em">&#x21BB; Refresh</button>
+    </div>
+    <p class="sub">In-process agents and connected room peers. Agents show work-unit context; peers show their declared type.</p>
+    <table>
+      <thead><tr><th>ID</th><th>Kind</th><th>Status</th><th>Work Unit</th><th>Activity / Type</th><th></th></tr></thead>
+      <tbody id="participant-tbody"></tbody>
+    </table>
+    <div id="participants-empty" class="muted" style="padding:8px 0">No participants — runtime may not be running.</div>
   </div>
 
   <div class="save-bar">
@@ -576,7 +620,7 @@ const MAS_JS = `
   function showProfileForm(idx) {
     const isNew = idx === -1;
     const p = isNew
-      ? { id: '', label: '', domain: '', provider: 'vscode-lm', model: '', baseUrl: '', systemPromptHint: '', apiKeyRef: '' }
+      ? { id: '', label: '', domain: '', deploymentMode: 'inline', provider: 'vscode-lm', model: '', baseUrl: '', systemPrompt: '', apiKeyRef: '' }
       : profiles[idx];
     const curProvider = p.provider || 'anthropic';
     const isVsLm = curProvider === 'vscode-lm';
@@ -626,9 +670,14 @@ const MAS_JS = `
           (p.apiKeyRef ? 'Key stored (' + esc(p.apiKeyRef) + ')' : 'No key stored') +
         '</div>' +
       '</div>' +
+      '<div class="field"><label>Deployment Mode</label>' +
+        '<select id="pf-deploy-mode">' +
+          '<option value="inline"'   + ((p.deploymentMode || 'inline') === 'inline'   ? ' selected' : '') + '>inline — managed by this runtime (default)</option>' +
+          '<option value="headless"' + ((p.deploymentMode || 'inline') === 'headless' ? ' selected' : '') + '>headless — standalone peer process (no vscode-lm)</option>' +
+        '</select></div>' +
       (isVsLm ? '<div class="field muted">Uses your VS Code Copilot or Cursor subscription — no API key required.</div>' : '') +
-      '<div class="field"><label>System Prompt Hint (optional)</label>' +
-        '<textarea id="pf-prompt">' + esc(p.systemPromptHint || '') + '</textarea></div>' +
+      '<div class="field"><label>System Prompt (optional)</label>' +
+        '<textarea id="pf-prompt">' + esc(p.systemPrompt || p.systemPromptHint || '') + '</textarea></div>' +
       '<div class="form-actions">' +
         '<button id="pf-save">Save</button>' +
         '<button class="ghost" id="pf-cancel">Cancel</button>' +
@@ -706,13 +755,14 @@ const MAS_JS = `
     });
 
     document.getElementById('pf-save').addEventListener('click', function() {
-      const id       = document.getElementById('pf-id').value.trim();
-      const label    = document.getElementById('pf-label').value.trim();
-      const domain   = document.getElementById('pf-domain').value.trim();
-      const provider = document.getElementById('pf-provider').value;
-      const model    = getModelValue();
-      const baseUrl  = provider === 'vscode-lm' ? '' : document.getElementById('pf-baseurl').value.trim();
-      const prompt   = document.getElementById('pf-prompt').value.trim();
+      const id           = document.getElementById('pf-id').value.trim();
+      const label        = document.getElementById('pf-label').value.trim();
+      const domain       = document.getElementById('pf-domain').value.trim();
+      const provider     = document.getElementById('pf-provider').value;
+      const deployMode   = document.getElementById('pf-deploy-mode').value;
+      const model        = getModelValue();
+      const baseUrl      = provider === 'vscode-lm' ? '' : document.getElementById('pf-baseurl').value.trim();
+      const prompt       = document.getElementById('pf-prompt').value.trim();
       if (!id || !label || !domain) { alert('ID, Label, and Domain are required.'); return; }
       const keyEl     = document.getElementById('pf-apikey');
       const pendingKey = (keyEl && provider !== 'vscode-lm') ? keyEl.value.trim() : '';
@@ -722,10 +772,11 @@ const MAS_JS = `
         : (pendingKey ? ('nodalmerge.apikey.' + id) : existingRef);
       const profile = {
         id, label, domain, provider,
+        deploymentMode:   deployMode === 'headless' ? 'headless' : undefined,
         model:            model   || undefined,
         baseUrl:          baseUrl || undefined,
         apiKeyRef:        apiKeyRef,
-        systemPromptHint: prompt  || undefined,
+        systemPrompt:     prompt  || undefined,
       };
       if (isNew) { profiles.push(profile); }
       else       { profiles[idx] = profile; }
@@ -1034,6 +1085,45 @@ const MAS_JS = `
   });
 
   // ── Extension host messages ────────────────────────────────────────────────
+  // ── Participants ──────────────────────────────────────────────────────────
+  function renderParticipants(participants) {
+    const tbody = document.getElementById('participant-tbody');
+    const empty = document.getElementById('participants-empty');
+    if (!tbody) { return; }
+    tbody.innerHTML = '';
+    if (!participants || participants.length === 0) {
+      if (empty) { empty.style.display = ''; }
+      return;
+    }
+    if (empty) { empty.style.display = 'none'; }
+    participants.forEach(function(p) {
+      const tr = document.createElement('tr');
+      const statusClass = p.status === 'running' ? 'chip-running' : p.status === 'connected' ? 'chip-connected' : 'chip-idle';
+      tr.innerHTML =
+        '<td class="mono" style="max-width:120px;overflow:hidden;text-overflow:ellipsis" title="' + esc(p.id) + '">' + esc(p.id.substring(0, 12)) + (p.id.length > 12 ? '…' : '') + '</td>' +
+        '<td><span class="chip ' + statusClass + '">' + esc(p.kind) + '</span></td>' +
+        '<td><span class="chip ' + statusClass + '">' + esc(p.status) + '</span></td>' +
+        '<td class="mono">' + esc(p.workUnitId || '—') + '</td>' +
+        '<td class="mono">' + esc(p.currentActivity || p.peerType || '—') + '</td>' +
+        '<td><button class="danger" data-stop-id="' + esc(p.id) + '">Stop</button></td>';
+      tbody.appendChild(tr);
+    });
+  }
+
+  document.getElementById('participant-tbody').addEventListener('click', function(e) {
+    const btn = e.target.closest('button[data-stop-id]');
+    if (!btn) { return; }
+    const id = btn.getAttribute('data-stop-id');
+    if (id && confirm('Stop participant ' + id + '?')) {
+      btn.disabled = true;
+      vscode.postMessage({ type: 'stopParticipant', id: id });
+    }
+  });
+
+  document.getElementById('btn-refresh-participants').addEventListener('click', function() {
+    vscode.postMessage({ type: 'refreshParticipants' });
+  });
+
   window.addEventListener('message', function(event) {
     const msg = event.data;
     if (msg.type === 'models') {
@@ -1096,6 +1186,10 @@ const MAS_JS = `
         sdStatus.textContent = msg.success ? 'Promoted to main.' : 'Promotion failed.';
         setTimeout(function() { sdStatus.textContent = ''; }, 3000);
       }
+      return;
+    }
+    if (msg.type === 'participants') {
+      renderParticipants(msg.participants || []);
       return;
     }
     if (msg.type === 'spawnResult') {
