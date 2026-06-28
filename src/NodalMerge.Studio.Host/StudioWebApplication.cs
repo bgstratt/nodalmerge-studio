@@ -26,6 +26,7 @@ public static class StudioWebApplication
                 services.AddSingleton<IRuntimeEventBroadcaster, RuntimeRoomEventBroadcaster>();
                 services.AddSingleton<IStudioGraphPromoter, RuntimeGraphPromoter>();
                 services.AddSingleton<IStudioCausalGraphService, RuntimeCausalGraphService>();
+                services.AddHostedService<StudioCrdtSyncBackgroundService>();
                 configureServices?.Invoke(services);
             });
 

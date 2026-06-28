@@ -422,7 +422,7 @@ public interface IWorkUnitService
 // integration tests that build services directly never register an implementation.
 public interface IStudioGraphPromoter
 {
-    void TryPromoteStudioCheckpoint();
+    Task TryPromoteStudioCheckpointAsync();
 }
 
 public sealed record CausalParentsResult(string[] ParentIdsHex, bool NodeFound);

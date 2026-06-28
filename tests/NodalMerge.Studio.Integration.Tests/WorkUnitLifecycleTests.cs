@@ -207,7 +207,11 @@ public class WorkUnitLifecycleTests
     {
         public int CallCount { get; private set; }
 
-        public void TryPromoteStudioCheckpoint() => CallCount++;
+        public Task TryPromoteStudioCheckpointAsync()
+        {
+            CallCount++;
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class RecordingRuntimeEventBroadcaster : IRuntimeEventBroadcaster

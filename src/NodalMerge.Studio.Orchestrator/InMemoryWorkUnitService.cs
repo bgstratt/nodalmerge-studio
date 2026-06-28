@@ -107,7 +107,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
 
         if (status is WorkUnitStatus.Completed or WorkUnitStatus.Merged)
         {
-            _graphPromoter?.TryPromoteStudioCheckpoint();
+            _ = _graphPromoter?.TryPromoteStudioCheckpointAsync();
         }
 
         return updated;
