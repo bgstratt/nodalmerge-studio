@@ -641,7 +641,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IArtifactLineageService>(),
             sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions(),
             sp.GetRequiredService<IExecutionEventStream>(),
-            sp.GetService<IRuntimeEventBroadcaster>()));
+            sp.GetService<IRuntimeEventBroadcaster>(),
+            sp.GetService<IStudioGraphPromoter>()));
         services.AddSingleton<IWorkUnitService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IOrchestratorService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IWorkspaceService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
