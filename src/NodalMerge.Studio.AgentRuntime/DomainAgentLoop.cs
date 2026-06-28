@@ -16,12 +16,7 @@ internal sealed class DomainAgentLoop(
     string agentId,
     string workUnitId,
     string triggeringArtifactId,
-    string provider,
-    string model,
-    string baseUrl,
-    string apiKey,
-    McpToolDispatcher dispatcher,
-    LlmClient llm,
+    IAgentToolClient client,
     string? sessionId = null,
     Action<string?>? onActivity = null,
     IConversationLogService? conversationLog = null)
@@ -49,7 +44,7 @@ internal sealed class DomainAgentLoop(
         for (var i = 0; i < definition.MaxIterations && !ct.IsCancellationRequested; i++)
         {
             onActivity?.Invoke("Thinking...");
-            var response = await llm.SendAsync(provider, model, baseUrl, apiKey, messages, Tools, definition.SystemPrompt, ct)
+            var response = await client.SendAsync(messages, Tools, definition.SystemPrompt, ct)
                 .ConfigureAwait(false);
 
             messages.Add(new NmMessage("assistant", response.Content));
@@ -58,7 +53,7 @@ internal sealed class DomainAgentLoop(
             {
                 await ConversationLogRecorder.RecordTurnAsync(
                     conversationLog, workUnitId, agentId, definition.Name, null, i, response, [], sessionId, ct,
-                    provider, model).ConfigureAwait(false);
+                    client.Provider, client.Model).ConfigureAwait(false);
                 completedNaturally = true;
                 break;
             }
@@ -72,7 +67,7 @@ internal sealed class DomainAgentLoop(
                 if (block is not NmToolUse toolUse) continue;
 
                 onActivity?.Invoke(ActivityLabeler.Describe(toolUse.Name, toolUse.Input));
-                var result = await dispatcher
+                var result = await client
                     .DispatchAsync(toolUse.Name, toolUse.Input, AllowedToolNames, ct, sessionId)
                     .ConfigureAwait(false);
 
@@ -81,7 +76,7 @@ internal sealed class DomainAgentLoop(
 
             await ConversationLogRecorder.RecordTurnAsync(
                 conversationLog, workUnitId, agentId, definition.Name, null, i, response, toolResults, sessionId, ct,
-                provider, model).ConfigureAwait(false);
+                client.Provider, client.Model).ConfigureAwait(false);
 
             if (toolResults.Count == 0)
                 break;

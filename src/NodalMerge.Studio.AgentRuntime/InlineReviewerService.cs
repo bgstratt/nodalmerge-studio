@@ -47,10 +47,9 @@ public sealed class InlineReviewerService(
         // it previously had no tool that could (see ReviewerAgentLoop kickoff message).
         var proposalForReview = await merge.GetAsync(proposalId, ct).ConfigureAwait(false);
 
+        var agentClient = new DefaultAgentToolClient(creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey, llm, dispatcher);
         var loop = new ReviewerAgentLoop(
-            agentId, workUnitId, proposalId,
-            creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey,
-            dispatcher, llm,
+            agentId, workUnitId, proposalId, agentClient,
             filesTouched: proposalForReview?.FilesTouched,
             noFileChangesJustification: proposalForReview?.NoFileChangesJustification,
             conversationLog: conversationLog);

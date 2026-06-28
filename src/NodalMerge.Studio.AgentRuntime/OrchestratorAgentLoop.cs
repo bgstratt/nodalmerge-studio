@@ -10,12 +10,7 @@ namespace NodalMerge.Studio.AgentRuntime;
 internal sealed class OrchestratorAgentLoop(
     string agentId,
     string workUnitId,
-    string provider,
-    string model,
-    string baseUrl,
-    string apiKey,
-    McpToolDispatcher dispatcher,
-    LlmClient llm,
+    IAgentToolClient client,
     IArtifactLineageService artifactLineage,
     IProjectionManager projections,
     IOrchestrationDecisionLogService decisionLog,
@@ -123,7 +118,7 @@ internal sealed class OrchestratorAgentLoop(
             AppendDeltaToOutgoingMessage(messages, delta);
 
             onActivity?.Invoke("Thinking...");
-            var response = await llm.SendAsync(provider, model, baseUrl, apiKey, messages, _tools, _systemPrompt, ct)
+            var response = await client.SendAsync(messages, _tools, _systemPrompt, ct)
                 .ConfigureAwait(false);
 
             messages.Add(new NmMessage("assistant", response.Content));
@@ -137,7 +132,7 @@ internal sealed class OrchestratorAgentLoop(
                 await RecordDecisionAsync(action, [], text, ct).ConfigureAwait(false);
                 await ConversationLogRecorder.RecordTurnAsync(
                     conversationLog, workUnitId, agentId, "Orchestrator", null, i, response, [], sessionId, ct,
-                    provider, model).ConfigureAwait(false);
+                    client.Provider, client.Model).ConfigureAwait(false);
                 completedNaturally = true;
                 break;
             }
@@ -155,7 +150,7 @@ internal sealed class OrchestratorAgentLoop(
                     : toolUse.Input;
 
                 onActivity?.Invoke(ActivityLabeler.Describe(toolUse.Name, toolUse.Input));
-                var result = await dispatcher
+                var result = await client
                     .DispatchAsync(toolUse.Name, input, _allowedTools, ct, sessionId)
                     .ConfigureAwait(false);
 
@@ -167,7 +162,7 @@ internal sealed class OrchestratorAgentLoop(
 
             await ConversationLogRecorder.RecordTurnAsync(
                 conversationLog, workUnitId, agentId, "Orchestrator", null, i, response, toolResults, sessionId, ct,
-                provider, model).ConfigureAwait(false);
+                client.Provider, client.Model).ConfigureAwait(false);
 
             if (toolResults.Count == 0)
                 break;
@@ -361,10 +356,10 @@ internal sealed class OrchestratorAgentLoop(
         // (configured on the run's Agent Topology) take precedence over this loop's own
         // credentials, so e.g. Planning can use a different model than Orchestration/Execution.
         var stageCreds = agentControl?.GetCredentialsForStage(workUnitId, StageForProfileId(profileId));
-        dict["model"]    = JsonSerializer.SerializeToElement(stageCreds?.Model ?? model);
-        dict["baseUrl"]  = JsonSerializer.SerializeToElement(stageCreds?.BaseUrl ?? baseUrl);
-        dict["apiKey"]   = JsonSerializer.SerializeToElement(stageCreds?.ApiKey ?? apiKey);
-        dict["provider"] = JsonSerializer.SerializeToElement(stageCreds?.Provider ?? provider);
+        dict["model"]    = JsonSerializer.SerializeToElement(stageCreds?.Model ?? client.Model);
+        dict["baseUrl"]  = JsonSerializer.SerializeToElement(stageCreds?.BaseUrl ?? client.BaseUrl);
+        dict["apiKey"]   = JsonSerializer.SerializeToElement(stageCreds?.ApiKey ?? client.ApiKey);
+        dict["provider"] = JsonSerializer.SerializeToElement(stageCreds?.Provider ?? client.Provider);
         return JsonSerializer.SerializeToElement(dict);
     }
 

@@ -9,12 +9,7 @@ internal sealed class WorkerAgentLoop(
     string agentId,
     string workUnitId,
     string taskId,
-    string provider,
-    string model,
-    string baseUrl,
-    string apiKey,
-    McpToolDispatcher dispatcher,
-    LlmClient llm,
+    IAgentToolClient client,
     AgentProfile? profile = null,
     string? sessionId = null,
     Action<string?>? onActivity = null,
@@ -153,7 +148,7 @@ internal sealed class WorkerAgentLoop(
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
             onActivity?.Invoke("Thinking...");
-            var response = await llm.SendAsync(provider, model, baseUrl, apiKey, messages, _tools, _systemPrompt, ct)
+            var response = await client.SendAsync(messages, _tools, _systemPrompt, ct)
                 .ConfigureAwait(false);
 
             messages.Add(new NmMessage("assistant", response.Content));
@@ -162,7 +157,7 @@ internal sealed class WorkerAgentLoop(
             {
                 await ConversationLogRecorder.RecordTurnAsync(
                     conversationLog, workUnitId, agentId, "Worker", taskId, i, response, [], sessionId, ct,
-                    provider, model).ConfigureAwait(false);
+                    client.Provider, client.Model).ConfigureAwait(false);
                 completedNaturally = true;
                 break;
             }
@@ -178,7 +173,7 @@ internal sealed class WorkerAgentLoop(
                 if (block is not NmToolUse toolUse) continue;
 
                 onActivity?.Invoke(ActivityLabeler.Describe(toolUse.Name, toolUse.Input));
-                var result = await dispatcher
+                var result = await client
                     .DispatchAsync(toolUse.Name, toolUse.Input, _allowedTools, ct, sessionId)
                     .ConfigureAwait(false);
 
@@ -192,7 +187,7 @@ internal sealed class WorkerAgentLoop(
 
             await ConversationLogRecorder.RecordTurnAsync(
                 conversationLog, workUnitId, agentId, "Worker", taskId, i, response, toolResults, sessionId, ct,
-                provider, model).ConfigureAwait(false);
+                client.Provider, client.Model).ConfigureAwait(false);
 
             // Phase 12 — a write hit a file another active sibling currently holds the lease on.
             // Exit now, on this same turn: don't send the conflict back to the LLM for "please

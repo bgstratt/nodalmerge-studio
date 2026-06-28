@@ -75,12 +75,12 @@ public sealed class DomainAgentTriggerService(
             var agentId = $"{definition.Name.ToLowerInvariant()}-{Guid.NewGuid():N}";
             var dispatcher = serviceProvider.GetRequiredService<McpToolDispatcher>();
             var llm = serviceProvider.GetRequiredService<LlmClient>();
+            var agentClient = new DefaultAgentToolClient(creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey, llm, dispatcher);
             var conversationLog = serviceProvider.GetRequiredService<IConversationLogService>();
 
             var loop = new DomainAgentLoop(
                 definition, agentId, workUnitId, triggeringArtifact.ArtifactId,
-                creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey,
-                dispatcher, llm, conversationLog: conversationLog);
+                agentClient, conversationLog: conversationLog);
 
             await loop.RunAsync(ct).ConfigureAwait(false);
         }

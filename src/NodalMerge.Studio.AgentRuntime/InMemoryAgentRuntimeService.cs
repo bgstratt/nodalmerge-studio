@@ -214,6 +214,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey, llm, dispatcher);
                 var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var ruleFileContext = await BuildRuleFileContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
 
@@ -225,8 +226,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var promptGuidanceContext = await BuildPromptGuidanceContextAsync(PipelineStage.Plan, ct).ConfigureAwait(false);
                     var combinedContext = string.Join("\n\n", new[] { constraintsContext, promptGuidanceContext }.Where(s => s is not null));
                     var plannerLoop = new PlannerAgentLoop(
-                        agentId, item.WorkUnitId, provider, model, baseUrl, apiKey!,
-                        dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a),
+                        agentId, item.WorkUnitId, agentClient,
+                        profile, item.SessionId, a => ReportActivity(agentId, a),
                         ruleFileContext, combinedContext.Length == 0 ? null : combinedContext,
                         conversationLog: conversationLog);
                     completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
@@ -235,8 +236,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 {
                     var proposalId = string.IsNullOrWhiteSpace(taskId) ? string.Empty : taskId;
                     var reviewerLoop = new ReviewerAgentLoop(
-                        agentId, item.WorkUnitId, proposalId, provider, model, baseUrl, apiKey!,
-                        dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a),
+                        agentId, item.WorkUnitId, proposalId, agentClient,
+                        profile, item.SessionId, a => ReportActivity(agentId, a),
                         conversationLog: conversationLog);
                     completion = await reviewerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
@@ -261,8 +262,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         ? (await taskServiceForVerify.GetAsync(taskId, ct).ConfigureAwait(false))?.Status
                         : null;
                     var loop = new WorkerAgentLoop(
-                        agentId, item.WorkUnitId, taskId, provider, model, baseUrl, apiKey!,
-                        dispatcher, llm, profile, item.SessionId, a => ReportActivity(agentId, a),
+                        agentId, item.WorkUnitId, taskId, agentClient,
+                        profile, item.SessionId, a => ReportActivity(agentId, a),
                         isResume: item.AttemptCount > 0, ruleFileContext: ruleFileContext,
                         selfVerifyBuild: _options.RequireBuildBeforeProposal,
                         selfVerifyTest: _options.RequireTestBeforeProposal,
@@ -567,6 +568,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey, llm, dispatcher);
                 var artifactLineage = _serviceProvider.GetRequiredService<IArtifactLineageService>();
                 var projections = _serviceProvider.GetRequiredService<IProjectionManager>();
                 var decisionLog = _serviceProvider.GetRequiredService<IOrchestrationDecisionLogService>();
@@ -579,7 +581,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var findingsService = _serviceProvider.GetRequiredService<IFindingService>();
                 var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var loop = new OrchestratorAgentLoop(
-                    agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm,
+                    agentId, workUnitId, agentClient,
                     artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, merge, workUnits,
                     findingsService,
                     profile, sessionId, workspaceOptions.StallDetectionCycles, a => ReportActivity(agentId, a),
@@ -663,13 +665,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey, llm, dispatcher);
                 var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var ruleFileContext = await BuildRuleFileContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerConstraintsContext = await BuildConstraintsContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, cts.Token).ConfigureAwait(false);
                 var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
                 var loop = new WorkerAgentLoop(
-                    agentId, workUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm, profile,
+                    agentId, workUnitId, taskId, agentClient, profile,
                     onActivity: a => ReportActivity(agentId, a), ruleFileContext: ruleFileContext,
                     selfVerifyBuild: _options.RequireBuildBeforeProposal,
                     selfVerifyTest: _options.RequireTestBeforeProposal,
