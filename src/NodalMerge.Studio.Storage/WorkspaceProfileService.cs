@@ -80,11 +80,35 @@ internal sealed class WorkspaceProfileService(IFileWorkspaceService fileWorkspac
         var claimed = new HashSet<string>();
 
         // 1. dotnet anchors — a .sln/.slnx directory owns every .csproj nested under it, so build/
-        //    test run once at the solution root instead of once per project.
+        //    test run once at the solution root instead of once per project. When the anchor has
+        //    more than one runnable nested project (Phase 2), add a run-only row per project so
+        //    every entry point gets its own Run button without collapsing build/test onto it.
         foreach (var dir in slnDirs.OrderBy(d => d.Length))
         {
             if (!claimed.Add(dir)) continue;
-            roots.Add(BuildDotnetRoot(workDir, dir));
+            var anchorRoot = BuildDotnetRoot(workDir, dir);
+            roots.Add(anchorRoot);
+
+            if (anchorRoot.RunCommand is null)
+            {
+                var absAnchorDir = AbsDir(workDir, dir);
+                var runnableProjects = Directory.Exists(absAnchorDir)
+                    ? Directory.GetFiles(absAnchorDir, "*.csproj", SearchOption.AllDirectories)
+                        .Where(p => IsAspNetWebProject(p) || IsExeProject(p))
+                        .ToList()
+                    : [];
+
+                foreach (var csprojPath in runnableProjects)
+                {
+                    var projRelDir = RelDir(workDir, Path.GetDirectoryName(csprojPath)!);
+                    if (!claimed.Add(projRelDir)) continue;
+                    roots.Add(new ProjectRoot(
+                        projRelDir, "dotnet",
+                        BuildCommand: null, TestCommand: null,
+                        RunCommand: "dotnet run",
+                        IsLongRunning: IsAspNetWebProject(csprojPath)));
+                }
+            }
         }
 
         // 2. remaining .csproj directories not already covered by an anchor above.
@@ -179,6 +203,25 @@ internal sealed class WorkspaceProfileService(IFileWorkspaceService fileWorkspac
             runCommand = "dotnet run";
             isLongRunning = IsAspNetWebProject(topLevelCsproj[0]);
         }
+        else
+        {
+            // Common layout: .sln at root, runnable project(s) in subfolders. Scan nested
+            // .csproj files for exactly one runnable entry point (ASP.NET Web SDK or Exe
+            // OutputType) so the solution anchor still gets a Run button without the caller
+            // having to know the project name up front.
+            var runnableProjects = Directory.Exists(absDir)
+                ? Directory.GetFiles(absDir, "*.csproj", SearchOption.AllDirectories)
+                    .Where(p => IsAspNetWebProject(p) || IsExeProject(p))
+                    .ToList()
+                : [];
+
+            if (runnableProjects.Count == 1)
+            {
+                var rel = Path.GetRelativePath(absDir, runnableProjects[0]).Replace('\\', '/');
+                runCommand = $"dotnet run --project {rel}";
+                isLongRunning = IsAspNetWebProject(runnableProjects[0]);
+            }
+        }
 
         return new ProjectRoot(relDir, "dotnet", "dotnet build", "dotnet test", runCommand, isLongRunning);
     }
@@ -190,6 +233,20 @@ internal sealed class WorkspaceProfileService(IFileWorkspaceService fileWorkspac
             var doc = XDocument.Load(csprojPath);
             var sdk = doc.Root?.Attribute("Sdk")?.Value;
             return sdk is not null && sdk.Contains("Sdk.Web", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsExeProject(string csprojPath)
+    {
+        try
+        {
+            var doc = XDocument.Load(csprojPath);
+            return doc.Descendants("OutputType")
+                .Any(e => string.Equals(e.Value.Trim(), "Exe", StringComparison.OrdinalIgnoreCase));
         }
         catch
         {

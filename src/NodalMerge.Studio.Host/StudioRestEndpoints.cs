@@ -574,6 +574,20 @@ public static class StudioRestEndpoints
             return Results.Ok(new { stopped });
         });
 
+        // Returns the current stdout/stderr buffer for a live long-running process started via
+        // /studio/workspace/run. 404 when no matching process is active (exited or never started).
+        app.MapGet("/studio/workspace/run/output", async (
+            [FromQuery] string branchId,
+            [FromQuery] string? rootPath,
+            IWorkspaceExecutionCommandService cmd,
+            CancellationToken ct) =>
+        {
+            var output = await cmd.GetRunOutputAsync(branchId, rootPath, ct).ConfigureAwait(false);
+            return output is not null
+                ? Results.Ok(new { branchId, rootPath, output })
+                : Results.NotFound(new { error = "No running process found for this branch/root." });
+        });
+
         app.MapGet("/studio/workspace/exec/latest", async (
             [FromQuery] string branchId,
             IWorkspaceExecutionCommandService cmd,

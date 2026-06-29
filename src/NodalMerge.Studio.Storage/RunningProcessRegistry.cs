@@ -123,6 +123,13 @@ internal sealed class RunningProcessRegistry
             buildSystem, command, startedAt, DateTimeOffset.UtcNow, ProjectRoot: projectRoot);
     }
 
+    public string? GetRunOutput(string branchId, string projectRoot)
+    {
+        var entry = _running.Values
+            .FirstOrDefault(e => e.BranchId == branchId && e.ProjectRoot == projectRoot);
+        return entry is null ? null : Snapshot(entry);
+    }
+
     /// <summary>Stops tracked processes for a branch. Narrows by pid and/or projectRoot when given; stops all matches otherwise. Returns the count stopped.</summary>
     public int Stop(string branchId, int? pid = null, string? projectRoot = null)
     {

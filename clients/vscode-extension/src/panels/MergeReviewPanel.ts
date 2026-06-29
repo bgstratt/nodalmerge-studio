@@ -396,6 +396,36 @@ export class DecisionConvergencePanel {
           }
           break;
         }
+        case 'pollRunOutput': {
+          const rootPath = typeof msg.rootPath === 'string' ? msg.rootPath : undefined;
+          const branchId = this.lastProposal?.sourceBranch;
+          if (!branchId) { return; }
+          try {
+            const params = '/studio/workspace/run/output?branchId=' + encodeURIComponent(branchId)
+              + (rootPath !== undefined ? '&rootPath=' + encodeURIComponent(rootPath) : '');
+            const result = await this.get<{ output: string }>(params);
+            void this.panel.webview.postMessage({ type: 'runOutputUpdate', rootPath, output: result.output });
+          } catch {
+            // Process likely exited — the webview will stop polling when stop is clicked.
+          }
+          return;
+        }
+        case 'openRootFolder': {
+          const rootPath = typeof msg.rootPath === 'string' ? msg.rootPath : '';
+          const branchId = this.lastProposal?.sourceBranch;
+          if (!branchId) { return; }
+          try {
+            const result = await this.get<{ workingDirectory: string | null }>(
+              '/studio/workspace/path?branchId=' + encodeURIComponent(branchId));
+            if (!result.workingDirectory) { return; }
+            const baseUri = vscode.Uri.file(result.workingDirectory);
+            const folderUri = rootPath ? vscode.Uri.joinPath(baseUri, rootPath) : baseUri;
+            await vscode.env.openExternal(folderUri);
+          } catch (err) {
+            void vscode.window.showErrorMessage('NodalMerge: could not reveal folder — ' + String(err));
+          }
+          return;
+        }
         default:
           return;
       }
@@ -1017,13 +1047,12 @@ const DC_JS = `
         + '<span class="root-run-status" id="status-' + id + '"></span>'
         + '</div>'
         + '<div class="root-row-actions">'
-        + '<button class="ghost" data-action="build" id="btn-build-' + id + '"'
-          + (caps.build ? '' : ' disabled title="No build command detected for this root"') + '>Build</button>'
-        + '<button class="ghost" data-action="test" id="btn-test-' + id + '"'
-          + (caps.test ? '' : ' disabled title="No test command detected for this root"') + '>Test</button>'
+        + (caps.build ? '<button class="ghost" data-action="build" id="btn-build-' + id + '">Build</button>' : '')
+        + (caps.test  ? '<button class="ghost" data-action="test"  id="btn-test-'  + id + '">Test</button>'  : '')
         + '<button class="ghost" data-action="run" id="btn-run-' + id + '"'
           + (caps.run ? '' : ' disabled title="No run command detected for this root"') + '>Run</button>'
         + '<button class="ghost" data-action="stop" id="btn-stop-' + id + '" style="display:none">Stop</button>'
+        + '<button class="ghost" data-action="openFolder" id="btn-folder-' + id + '" title="Open folder in Explorer">Open Folder</button>'
         + '</div>'
         + '<div class="root-row-results" id="results-' + id + '"></div>'
         + '</div>';
@@ -1075,6 +1104,10 @@ const DC_JS = `
       if (!row) return;
       var rootPath = row.getAttribute('data-root') || '';
       var action = btn.getAttribute('data-action');
+      if (action === 'openFolder') {
+        vscode.postMessage({ type: 'openRootFolder', rootPath: rootPath });
+        return;
+      }
       setRootBusy(rootPath, true);
       if (action === 'stop') {
         vscode.postMessage({ type: 'stopWorkspaceRun', rootPath: rootPath });
@@ -1326,10 +1359,18 @@ const DC_JS = `
         var runResults = msg.result || [];
         var first = runResults[0];
         if (first && first.running) {
-          rootRunState[rootPath] = { running: true, pid: first.pid };
+          var prevState = rootRunState[rootPath];
+          if (prevState && prevState.pollId) clearInterval(prevState.pollId);
+          var pollId = setInterval(function() {
+            vscode.postMessage({ type: 'pollRunOutput', rootPath: rootPath });
+          }, 2000);
+          rootRunState[rootPath] = { running: true, pid: first.pid, pollId: pollId };
           updateRunStatusUi(rootPath);
-          resultsEl.innerHTML = '<div class="exec-row">▶ <span class="cmd">' + esc(first.command || '') + '</span></div>';
+          resultsEl.innerHTML = '<div class="exec-row">&#9654; <span class="cmd">' + esc(first.command || '') + '</span>'
+            + '<pre class="run-output" id="run-output-' + rootRowId(rootPath) + '" style="margin:4px 0 0;white-space:pre-wrap;max-height:240px;overflow-y:auto;font-size:0.8em;opacity:0.85">Starting…</pre></div>';
         } else {
+          var prevState2 = rootRunState[rootPath];
+          if (prevState2 && prevState2.pollId) clearInterval(prevState2.pollId);
           rootRunState[rootPath] = { running: false };
           updateRunStatusUi(rootPath);
           resultsEl.innerHTML = runResults.length
@@ -1349,8 +1390,19 @@ const DC_JS = `
       return;
     }
 
+    if (msg.type === 'runOutputUpdate') {
+      var outputEl = document.getElementById('run-output-' + rootRowId(typeof msg.rootPath === 'string' ? msg.rootPath : ''));
+      if (outputEl && typeof msg.output === 'string') {
+        outputEl.textContent = msg.output || '(no output yet)';
+        outputEl.scrollTop = outputEl.scrollHeight;
+      }
+      return;
+    }
+
     if (msg.type === 'runStopResult') {
       var stopRootPath = typeof msg.rootPath === 'string' ? msg.rootPath : '';
+      var stoppedState = rootRunState[stopRootPath];
+      if (stoppedState && stoppedState.pollId) clearInterval(stoppedState.pollId);
       setRootBusy(stopRootPath, false);
       var stopResultsEl = document.getElementById('results-' + rootRowId(stopRootPath));
       if (msg.error) {

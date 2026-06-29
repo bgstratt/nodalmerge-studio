@@ -107,6 +107,9 @@ internal sealed class WorkspaceExecutionCommandService(
         return results;
     }
 
+    public Task<string?> GetRunOutputAsync(string branchId, string? rootPath = null, CancellationToken ct = default) =>
+        Task.FromResult(runningProcesses.GetRunOutput(branchId, rootPath ?? ""));
+
     public Task<int> StopAsync(
         string branchId,
         int? pid = null,

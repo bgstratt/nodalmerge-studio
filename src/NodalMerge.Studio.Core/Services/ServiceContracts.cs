@@ -1709,6 +1709,8 @@ public interface IWorkspaceExecutionCommandService
         string branchId,
         string resultId,
         CancellationToken ct = default);
+
+    Task<string?> GetRunOutputAsync(string branchId, string? rootPath = null, CancellationToken ct = default);
 }
 
 // ── Slice 22a — Experiment runner ─────────────────────────────────────────
