@@ -4,6 +4,7 @@ Slice-based delivery for NodalMerge Studio. Each slice should land as a focused 
 
 **Strategic context:**
 * [VISION.md](./VISION.md) — the "why" and differentiator test: every feature decision should pass "Can I inspect, branch, replay, review, and audit this artifact?"
+* [repository-virtualization.md](./repository-virtualization.md) — next major architectural direction: the repository becomes a room in the DAG; filesystem is a disposable materialization cache
 
 **Canonical references:**
 * [v1 architecture spec](../docs/architecture/v1-architecture-spec.md) — the "what"
