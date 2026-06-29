@@ -63,14 +63,14 @@ export class TrajectoryReplayPanel {
 
   /** Immediately re-polls — used by the shell when the selected session changes. */
   async triggerPoll(): Promise<void> {
-    await this.refreshWorkUnits();
+    await this.init();
     void this.sendSessionPicker();
   }
 
   setSessionOverride(sessionId: string | undefined): void {
     this.localSessionOverride = sessionId;
     void this.sendSessionPicker();
-    void this.refreshWorkUnits();
+    void this.init();
   }
 
   private getEffectiveSessionId(): string | undefined {

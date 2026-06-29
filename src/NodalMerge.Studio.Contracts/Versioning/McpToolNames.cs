@@ -13,7 +13,9 @@ public static class McpToolNames
     public const string ProjectionSnapshotList    = "nm_v1_projection_snapshot_list";
     public const string ProjectionStaleCheck      = "nm_v1_projection_stale_check";
     public const string ProjectionCompare         = "nm_v1_projection_compare";
-    public const string ProjectionMaterialize     = "nm_v1_projection_materialize";
+    public const string ProjectionMaterialize          = "nm_v1_projection_materialize";
+    public const string ProjectionMaterializeKnownGood = "nm_v1_projection_materialize_known_good";
+    public const string ProjectionDiffKnownGood        = "nm_v1_projection_diff_known_good";
 
     public const string WorkUnitCreate = "nm_v1_workunit_create";
     public const string WorkUnitGet = "nm_v1_workunit_get";
@@ -126,8 +128,10 @@ public static class McpToolNames
     public const string CausalGetResolution       = "nm_v1_causal_get_resolution";
     public const string CausalComputeSyncDiff     = "nm_v1_causal_compute_sync_diff";
 
-    public const string ParticipantList = "nm_v1_participant_list";
-    public const string ParticipantStop = "nm_v1_participant_stop";
+    public const string ParticipantList   = "nm_v1_participant_list";
+    public const string ParticipantStop   = "nm_v1_participant_stop";
+    public const string ParticipantEvents = "nm_v1_participant_events";
+    public const string EventTypes        = "nm_v1_event_types";
 
     public static IReadOnlyList<string> All { get; } =
     [
@@ -139,6 +143,8 @@ public static class McpToolNames
         ProjectionStaleCheck,
         ProjectionCompare,
         ProjectionMaterialize,
+        ProjectionMaterializeKnownGood,
+        ProjectionDiffKnownGood,
         WorkUnitCreate,
         WorkUnitGet,
         WorkUnitUpdate,
@@ -229,5 +235,7 @@ public static class McpToolNames
         CausalComputeSyncDiff,
         ParticipantList,
         ParticipantStop,
+        ParticipantEvents,
+        EventTypes,
     ];
 }

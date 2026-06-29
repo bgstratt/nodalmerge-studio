@@ -630,8 +630,25 @@ public sealed record MaterializationResult(
     string? Error = null);
 
 /// <summary>
+/// A single file entry in a branch-level file diff.
+/// Status: "Added" | "Removed" | "Modified" | "Unchanged"
+/// </summary>
+public sealed record FileDiffEntry(string RelativePath, string Status);
+
+/// <summary>
+/// Result of comparing files between two KnownGoodState snapshot branches.
+/// </summary>
+public sealed record KnownGoodDiffResult(
+    string StateIdA,
+    string StateIdB,
+    IReadOnlyList<FileDiffEntry> Differences,
+    int AddedCount,
+    int RemovedCount,
+    int ModifiedCount);
+
+/// <summary>
 /// Writes the current state of a work unit's branch to a named materialization target
-/// (LocalFilesystem initially; ContainerLayer / RemoteWorkspace are future targets).
+/// (LocalFilesystem — the single canonical output; CI/CD/deploy happen outside Studio).
 /// After writing, captures a ProjectionSnapshot and publishes ProjectionMaterializedEvent.
 /// </summary>
 public interface IProjectionMaterializer
@@ -643,6 +660,24 @@ public interface IProjectionMaterializer
     Task<MaterializationResult> MaterializeAsync(
         string workUnitId,
         string? targetPath = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Materialize the filesystem from a KnownGoodState's immutable snapshot branch — no live
+    /// branch state is changed, unlike CheckoutKnownGoodAsync which restores in-memory branch state.
+    /// </summary>
+    Task<MaterializationResult> MaterializeFromKnownGoodAsync(
+        string stateId,
+        string? targetPath = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Compare the files of two KnownGoodState snapshot branches, returning a file-level diff.
+    /// Distinct from ProjectionComparison.Compute which is artifact-metadata-level.
+    /// </summary>
+    Task<KnownGoodDiffResult> DiffKnownGoodStatesAsync(
+        string stateIdA,
+        string stateIdB,
         CancellationToken ct = default);
 }
 

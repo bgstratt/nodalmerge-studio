@@ -51,6 +51,42 @@ interface ProjectionComparison {
   differingStatus: ArtifactStatusDivergence[];
 }
 
+interface KnownGoodState {
+  stateId: string;
+  branchId: string;
+  description: string;
+  verificationResults?: string | null;
+  createdAt: string;
+  createdBy: string;
+  snapshotBranchId?: string | null;
+}
+
+interface FileDiffEntry {
+  relativePath: string;
+  status: string; // "Added" | "Removed" | "Modified"
+}
+
+interface KnownGoodDiffResult {
+  stateIdA: string;
+  stateIdB: string;
+  differences: FileDiffEntry[];
+  addedCount: number;
+  removedCount: number;
+  modifiedCount: number;
+
+}
+
+interface MaterializationResult {
+  workUnitId: string;
+  snapshotId: string;
+  targetKind: string;
+  targetPath: string;
+  fileCount: number;
+  durationMs: number;
+  succeeded: boolean;
+  error?: string | null;
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 // Slice 17b — on-demand inspection tool for the persisted Projection snapshot capability
@@ -146,6 +182,54 @@ export class ProjectionComparisonPanel {
         }
         return;
       }
+      case 'pcFindKgs': {
+        try {
+          const branchId = msg.branchId as string;
+          const states = await this.get<KnownGoodState[]>(
+            `/studio/state/knownGood/${encodeURIComponent(branchId)}`,
+          );
+          void this.panel.webview.postMessage({ type: 'pcKgsList', states });
+        } catch (err) {
+          void this.panel.webview.postMessage({ type: 'pcKgsError', message: String(err) });
+        }
+        return;
+      }
+      case 'pcRestoreKgs': {
+        try {
+          const stateId = msg.stateId as string;
+          const result = await this.post<MaterializationResult>(
+            `/studio/projections/known-good/${encodeURIComponent(stateId)}/materialize`,
+            {},
+          );
+          void this.panel.webview.postMessage({ type: 'pcKgsRestored', result });
+          if (result.succeeded) {
+            void vscode.window.showInformationMessage(
+              `NodalMerge: Restored ${result.fileCount} file(s) to ${result.targetPath}. Reload editors if needed.`,
+              'OK',
+            );
+          } else {
+            void vscode.window.showWarningMessage(
+              `NodalMerge: Restore completed with errors — ${result.error ?? 'unknown error'}.`,
+            );
+          }
+        } catch (err) {
+          void this.panel.webview.postMessage({ type: 'pcKgsError', message: String(err) });
+        }
+        return;
+      }
+      case 'pcDiffKgs': {
+        try {
+          const a = encodeURIComponent(msg.stateIdA as string);
+          const b = encodeURIComponent(msg.stateIdB as string);
+          const diff = await this.get<KnownGoodDiffResult>(
+            `/studio/projections/known-good/${a}/diff/${b}`,
+          );
+          void this.panel.webview.postMessage({ type: 'pcKgsDiffResult', diff });
+        } catch (err) {
+          void this.panel.webview.postMessage({ type: 'pcKgsError', message: String(err) });
+        }
+        return;
+      }
       default:
         return;
     }
@@ -209,6 +293,17 @@ const PC_CSS = `
   .pc-compare-bar select { min-width: 220px; }
   .pc-compare-results { display: flex; gap: 14px; flex-wrap: wrap; }
   .pc-compare-results > div { flex: 1; min-width: 240px; }
+  .pc-divider { border: none; border-top: 1px solid var(--nm-border); margin: 18px 0 10px; }
+  .pc-kgs-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--nm-border); flex-wrap: wrap; }
+  .pc-kgs-row:last-child { border-bottom: none; }
+  .pc-kgs-desc { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pc-kgs-meta { font-size: 0.78em; opacity: 0.6; white-space: nowrap; }
+  .pc-kgs-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .pc-diff-file { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 0.85em; }
+  .pc-diff-added   { color: var(--nm-success); }
+  .pc-diff-removed { color: var(--nm-error); }
+  .pc-diff-modified { color: var(--nm-warn); }
+  .pc-diff-summary { font-size: 0.85em; margin-bottom: 6px; opacity: 0.75; }
 `;
 
 const PC_HTML = `
@@ -233,6 +328,28 @@ const PC_HTML = `
       <button id="pc-compare-btn">Compare</button>
     </div>
     <div id="pc-compare-results"></div>
+  </div>
+
+  <hr class="pc-divider"/>
+
+  <div class="pc-section">
+    <h3>Known Good States</h3>
+    <div class="pc-compare-bar">
+      <input id="pc-kgs-branch-input" type="text" placeholder="Branch ID">
+      <button id="pc-kgs-find-btn">Find</button>
+    </div>
+    <p id="pc-kgs-status" class="pc-empty"></p>
+    <div id="pc-kgs-list"></div>
+  </div>
+
+  <div class="pc-section" id="pc-kgs-diff-section" style="display:none">
+    <h3>Diff Two Known Good States</h3>
+    <div class="pc-compare-bar">
+      <select id="pc-kgs-diff-a"><option value="">(select state A)</option></select>
+      <select id="pc-kgs-diff-b"><option value="">(select state B)</option></select>
+      <button id="pc-kgs-diff-btn">Diff Files</button>
+    </div>
+    <div id="pc-kgs-diff-results"></div>
   </div>
 `;
 
@@ -390,5 +507,111 @@ const PC_JS = `
       setStatus(msg.message, true);
       return;
     }
+    if (msg.type === 'pcKgsList') {
+      renderKgsList(msg.states || []);
+      return;
+    }
+    if (msg.type === 'pcKgsRestored') {
+      var r = msg.result;
+      setKgsStatus(r.succeeded
+        ? 'Restored ' + r.fileCount + ' file(s) to ' + r.targetPath + ' (' + r.durationMs + 'ms).'
+        : 'Restore failed: ' + (r.error || 'unknown error'), !r.succeeded);
+      return;
+    }
+    if (msg.type === 'pcKgsDiffResult') {
+      renderKgsDiff(msg.diff);
+      return;
+    }
+    if (msg.type === 'pcKgsError') {
+      setKgsStatus(msg.message, true);
+      return;
+    }
   });
+
+  // ── Known Good States ────────────────────────────────────────────────────
+
+  var kgsStates = [];
+
+  function setKgsStatus(text, isError) {
+    var el = document.getElementById('pc-kgs-status');
+    el.textContent = text || '';
+    el.className = isError ? 'pc-error' : 'pc-empty';
+  }
+
+  document.getElementById('pc-kgs-find-btn').addEventListener('click', function() {
+    var branchId = document.getElementById('pc-kgs-branch-input').value.trim();
+    if (!branchId) { setKgsStatus('Enter a branch ID first.', true); return; }
+    setKgsStatus('Loading…');
+    vscode.postMessage({ type: 'pcFindKgs', branchId: branchId });
+  });
+
+  document.getElementById('pc-kgs-diff-btn').addEventListener('click', function() {
+    var a = document.getElementById('pc-kgs-diff-a').value;
+    var b = document.getElementById('pc-kgs-diff-b').value;
+    if (!a || !b) { setKgsStatus('Select two states to diff.', true); return; }
+    if (a === b) { setKgsStatus('Select two different states.', true); return; }
+    setKgsStatus('Diffing…');
+    vscode.postMessage({ type: 'pcDiffKgs', stateIdA: a, stateIdB: b });
+  });
+
+  function renderKgsList(states) {
+    kgsStates = states;
+    var el = document.getElementById('pc-kgs-list');
+    var diffSection = document.getElementById('pc-kgs-diff-section');
+    if (!states || !states.length) {
+      el.innerHTML = '<p class="pc-empty">No known good states for this branch.</p>';
+      diffSection.style.display = 'none';
+      setKgsStatus('');
+      return;
+    }
+    setKgsStatus('');
+    diffSection.style.display = '';
+    var html = '';
+    for (var i = 0; i < states.length; i++) {
+      var s = states[i];
+      html += '<div class="pc-kgs-row">';
+      html += '<span class="pc-kgs-desc" title="' + esc(s.stateId) + '">' + esc(s.description) + '</span>';
+      html += '<span class="pc-kgs-meta">' + new Date(s.createdAt).toLocaleString() + ' · ' + esc(s.createdBy) + '</span>';
+      html += '<div class="pc-kgs-actions">';
+      html += '<button class="ghost pc-kgs-restore" data-id="' + esc(s.stateId) + '" title="Write known-good files to the configured working tree">Restore</button>';
+      html += '</div>';
+      html += '</div>';
+    }
+    el.innerHTML = html;
+    el.querySelectorAll('.pc-kgs-restore').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        setKgsStatus('Restoring…');
+        vscode.postMessage({ type: 'pcRestoreKgs', stateId: btn.getAttribute('data-id') });
+      });
+    });
+
+    var options = '<option value="">(select state A)</option>' +
+      states.map(function(s) { return '<option value="' + esc(s.stateId) + '">' + esc(s.description) + ' (' + new Date(s.createdAt).toLocaleDateString() + ')</option>'; }).join('');
+    var optionsB = options.replace('(select state A)', '(select state B)');
+    document.getElementById('pc-kgs-diff-a').innerHTML = options;
+    document.getElementById('pc-kgs-diff-b').innerHTML = optionsB;
+  }
+
+  var DIFF_STATUS_CLASS = { Added: 'pc-diff-added', Removed: 'pc-diff-removed', Modified: 'pc-diff-modified' };
+  var DIFF_STATUS_ICON  = { Added: '+', Removed: '−', Modified: '~' };
+
+  function renderKgsDiff(diff) {
+    setKgsStatus('');
+    var el = document.getElementById('pc-kgs-diff-results');
+    if (!diff || !diff.differences || !diff.differences.length) {
+      el.innerHTML = '<p class="pc-empty">No file differences.</p>';
+      return;
+    }
+    var summary = '<div class="pc-diff-summary">' +
+      '<span class="pc-diff-added">+' + diff.addedCount + ' added</span>  ' +
+      '<span class="pc-diff-removed">−' + diff.removedCount + ' removed</span>  ' +
+      '<span class="pc-diff-modified">~' + diff.modifiedCount + ' modified</span>' +
+      '</div>';
+    var rows = diff.differences.map(function(d) {
+      var cls = DIFF_STATUS_CLASS[d.status] || '';
+      var icon = DIFF_STATUS_ICON[d.status] || '?';
+      return '<div class="pc-diff-file ' + cls + '"><span>' + icon + '</span><span>' + esc(d.relativePath) + '</span></div>';
+    }).join('');
+    el.innerHTML = summary + rows;
+  }
 `;

@@ -9,7 +9,10 @@ using NodalMerge.Studio.Core.Services;
 namespace NodalMerge.Studio.McpServer.Tools;
 
 [McpServerToolType]
-public sealed class ProjectionTools(IProjectionManager projections, IProjectionSnapshotService snapshots)
+public sealed class ProjectionTools(
+    IProjectionManager projections,
+    IProjectionSnapshotService snapshots,
+    IProjectionMaterializer materializer)
 {
     [McpServerTool(Name = McpToolNames.ProjectionGet), Description("Get a projection by type and compression level.")]
     public async Task<string> GetAsync(
@@ -95,6 +98,53 @@ public sealed class ProjectionTools(IProjectionManager projections, IProjectionS
         catch (KeyNotFoundException ex)
         {
             return McpJson.Error(McpToolNames.ProjectionCompare, ex.Message);
+        }
+    }
+
+    [McpServerTool(Name = McpToolNames.ProjectionMaterializeKnownGood)]
+    [Description("Materialize the filesystem from a KnownGoodState's immutable snapshot branch. " +
+                 "Unlike nm_v1_state_checkoutKnownGood (which restores in-memory branch state), " +
+                 "this writes the known-good files directly to the local filesystem target without " +
+                 "modifying any branch. Use to restore a verified baseline to the working tree.")]
+    public async Task<string> MaterializeKnownGoodAsync(
+        [Description("ID of the KnownGoodState to materialize (KGS-...)")] string stateId,
+        [Description("Optional override path; defaults to configured SeedRepositoryPath")] string? targetPath = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await materializer.MaterializeFromKnownGoodAsync(stateId, targetPath, cancellationToken)
+                .ConfigureAwait(false);
+            return McpJson.Ok(result);
+        }
+        catch (KeyNotFoundException ex)
+        {
+            return McpJson.Error(McpToolNames.ProjectionMaterializeKnownGood, ex.Message);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return McpJson.Error(McpToolNames.ProjectionMaterializeKnownGood, ex.Message);
+        }
+    }
+
+    [McpServerTool(Name = McpToolNames.ProjectionDiffKnownGood)]
+    [Description("Compare the files of two KnownGoodState snapshot branches and return a file-level diff " +
+                 "(Added / Removed / Modified). Distinct from nm_v1_projection_compare which compares " +
+                 "artifact metadata, not raw file content.")]
+    public async Task<string> DiffKnownGoodAsync(
+        [Description("ID of the first KnownGoodState (KGS-...)")] string stateIdA,
+        [Description("ID of the second KnownGoodState (KGS-...)")] string stateIdB,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var diff = await materializer.DiffKnownGoodStatesAsync(stateIdA, stateIdB, cancellationToken)
+                .ConfigureAwait(false);
+            return McpJson.Ok(diff);
+        }
+        catch (KeyNotFoundException ex)
+        {
+            return McpJson.Error(McpToolNames.ProjectionDiffKnownGood, ex.Message);
         }
     }
 

@@ -187,18 +187,20 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
     try {
       const sessionId = this.getEffectiveSessionId();
       const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
+      const emptySummary: WorkspaceSummary = { activeWorkUnits: [], activeAgents: [], pendingMerges: [], failures: [], knownGoodStates: [] };
+      const emptyMetrics: ClarificationMetrics = { requests: 0, answered: 0, abandoned: 0, perGoal: [] };
       const [summary, workUnits, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases, opts, findings] = await Promise.all([
-        this.get<WorkspaceSummary>('/studio/workspace-summary' + params),
-        this.get<WorkUnit[]>('/studio/workunits' + params),
-        this.get<AgentInfo[]>('/studio/agents?all=true' + (sessionId ? '&sessionId=' + encodeURIComponent(sessionId) : '')),
-        this.get<ScheduledItem[]>('/studio/scheduler/awaiting-resume'),
-        this.get<ClarificationInboxItem[]>('/studio/clarifications'),
-        this.get<ClarificationMetrics>('/studio/clarifications/metrics'),
-        this.get<MergeProposal[]>('/studio/merges' + params),
-        this.get<DeadLetterEntry[]>('/studio/dead-letter' + params),
-        this.get<FileLeaseInfo[]>('/studio/file-leases'),
-        this.get<{ usePromotionBranch?: boolean; candidateBranchId?: string }>('/studio/options'),
-        this.get<FindingSignal[]>('/studio/findings?status=Open'),
+        this.get<WorkspaceSummary>('/studio/workspace-summary' + params).catch(() => emptySummary),
+        this.get<WorkUnit[]>('/studio/workunits' + params).catch(() => [] as WorkUnit[]),
+        this.get<AgentInfo[]>('/studio/agents?all=true' + (sessionId ? '&sessionId=' + encodeURIComponent(sessionId) : '')).catch(() => [] as AgentInfo[]),
+        this.get<ScheduledItem[]>('/studio/scheduler/awaiting-resume').catch(() => [] as ScheduledItem[]),
+        this.get<ClarificationInboxItem[]>('/studio/clarifications').catch(() => [] as ClarificationInboxItem[]),
+        this.get<ClarificationMetrics>('/studio/clarifications/metrics').catch(() => emptyMetrics),
+        this.get<MergeProposal[]>('/studio/merges' + params).catch(() => [] as MergeProposal[]),
+        this.get<DeadLetterEntry[]>('/studio/dead-letter' + params).catch(() => [] as DeadLetterEntry[]),
+        this.get<FileLeaseInfo[]>('/studio/file-leases').catch(() => [] as FileLeaseInfo[]),
+        this.get<{ usePromotionBranch?: boolean; candidateBranchId?: string }>('/studio/options').catch(() => ({} as { usePromotionBranch?: boolean; candidateBranchId?: string })),
+        this.get<FindingSignal[]>('/studio/findings?status=Open').catch(() => [] as FindingSignal[]),
       ]);
       const syncGraph = await this.get<{ frontierHeads: string[] }>('/studio/causal/frontier').catch(() => null);
       this.usePromotionBranch = opts.usePromotionBranch ?? false;
@@ -209,6 +211,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
         syncGraph: syncGraph ?? { frontierHeads: [] },
       });
       this.notifications?.update(merges, workUnits, findings);
+      void this.sendSessionPicker();
     } catch {
       // host not yet ready — suppress until healthy
     }
@@ -376,6 +379,21 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
             respondedBy: 'vscode-user',
           });
           void this.poll();
+          break;
+        }
+        case 'markKnownGood': {
+          const description = await vscode.window.showInputBox({
+            prompt: 'Description for this Known Good State',
+            placeHolder: 'e.g. post-review-clean, before-refactor',
+            ignoreFocusOut: true,
+          });
+          if (!description) { return; }
+          await this.post('/studio/state/markKnownGood', {
+            branchId: msg.branchId as string,
+            description,
+            createdBy: 'vscode-user',
+          });
+          void vscode.window.showInformationMessage(`NodalMerge: Tagged "${description}" as a Known Good State.`);
           break;
         }
         case 'openMergeReview':
@@ -694,6 +712,7 @@ const ET_JS = `
         html += '<button class="ghost" data-action="openConflictReview" data-wu="' + esc(wu.workUnitId) + '">View Conflict →</button>';
       }
       html += '<button class="ghost" data-action="spawnAgent" data-wu="' + esc(wu.workUnitId) + '">Spawn</button>';
+      html += '<button class="ghost" data-action="markKnownGood" data-wu="' + esc(wu.workUnitId) + '" data-branch="' + esc(wu.branchId) + '" title="Tag this work unit\\'s current branch as a Known Good State">Tag KGS</button>';
       if (isStoppable) {
         html += '<button class="danger" data-action="cancelWorkUnit" data-wu="' + esc(wu.workUnitId) + '">Stop</button>';
       }
@@ -727,6 +746,11 @@ const ET_JS = `
     el.querySelectorAll('[data-action="cancelWorkUnit"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: 'cancelWorkUnit', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+    el.querySelectorAll('[data-action="markKnownGood"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'markKnownGood', workUnitId: btn.getAttribute('data-wu'), branchId: btn.getAttribute('data-branch') });
       });
     });
   }

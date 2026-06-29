@@ -2626,6 +2626,35 @@ public static class StudioRestEndpoints
             }
         });
 
+        app.MapPost("/studio/projections/known-good/{stateId}/materialize", async (
+            string stateId,
+            [FromQuery] string? targetPath,
+            IProjectionMaterializer materializer,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var result = await materializer.MaterializeFromKnownGoodAsync(stateId, targetPath, ct).ConfigureAwait(false);
+                return Results.Ok(result);
+            }
+            catch (KeyNotFoundException ex) { return Results.NotFound(new { error = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        app.MapGet("/studio/projections/known-good/{stateIdA}/diff/{stateIdB}", async (
+            string stateIdA,
+            string stateIdB,
+            IProjectionMaterializer materializer,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var diff = await materializer.DiffKnownGoodStatesAsync(stateIdA, stateIdB, ct).ConfigureAwait(false);
+                return Results.Ok(diff);
+            }
+            catch (KeyNotFoundException ex) { return Results.NotFound(new { error = ex.Message }); }
+        });
+
         app.MapPost("/studio/projections/materialize", async (
             MaterializeProjectionBody body,
             IProjectionSnapshotService snapshots,
