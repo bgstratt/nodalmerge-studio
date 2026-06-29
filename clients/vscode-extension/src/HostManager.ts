@@ -75,15 +75,23 @@ export class HostManager implements vscode.Disposable {
   /** Start the runtime. If the configured URI is remote, just health-check and adopt it.
    *  If local, check first (adopt if already running), then spawn. */
   async start(): Promise<void> {
+    const t0 = performance.now();
+    const elapsed = () => `+${(performance.now() - t0).toFixed(0)}ms`;
+
     // Re-read config on every start so a settings change takes effect without reloading the window.
     this.uri = resolveConfiguredUri();
+    this.output.appendLine(`[startup] extension start() at ${elapsed()}`);
 
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
     if (wsRoot && !this.isRemote) {
+      const t1 = performance.now();
       await this.maybePromptLegacyMigration(wsRoot);
+      this.output.appendLine(`[startup] legacy migration check: ${(performance.now() - t1).toFixed(0)}ms`);
     }
 
+    const t2 = performance.now();
     if (await this.checkHealth()) {
+      this.output.appendLine(`[startup] initial health check (already running): ${(performance.now() - t2).toFixed(0)}ms`);
       this._ready = true;
       this.applyStatus('ready');
       const label = this.isRemote ? this.uri : `port ${this.extractPort()}`;
@@ -96,6 +104,7 @@ export class HostManager implements vscode.Disposable {
       }
       return;
     }
+    this.output.appendLine(`[startup] initial health check (not running): ${(performance.now() - t2).toFixed(0)}ms`);
 
     if (this.isRemote) {
       this.applyStatus('error');
@@ -106,8 +115,10 @@ export class HostManager implements vscode.Disposable {
     }
 
     this.applyStatus('starting');
+    this.output.appendLine(`[startup] spawning process at ${elapsed()}`);
     this.spawnProcess();
-    await this.waitForHealth();
+    await this.waitForHealth(t0);
+    this.output.appendLine(`[startup] total extension-side startup: ${elapsed()}`);
   }
 
   /** Explicitly starts the local runtime regardless of the configured URI.
@@ -119,8 +130,9 @@ export class HostManager implements vscode.Disposable {
       return;
     }
     this.applyStatus('starting');
+    const t0 = performance.now();
     this.spawnProcess();
-    await this.waitForHealth();
+    await this.waitForHealth(t0);
   }
 
   async restart(): Promise<void> {
@@ -292,12 +304,18 @@ export class HostManager implements vscode.Disposable {
     }
   }
 
-  private async waitForHealth(): Promise<void> {
+  private async waitForHealth(spawnT0?: number): Promise<void> {
     const deadline = Date.now() + HOST_STARTUP_TIMEOUT_MS;
+    let pollCount = 0;
     while (Date.now() < deadline) {
+      pollCount++;
+      const pollStart = performance.now();
       if (await this.checkHealth()) {
+        const sincePoll = (performance.now() - pollStart).toFixed(0);
+        const sinceSpawn = spawnT0 !== undefined ? ` (${(performance.now() - spawnT0).toFixed(0)}ms since spawn)` : '';
         this._ready = true;
         this.applyStatus('ready');
+        this.output.appendLine(`[startup] health ok on poll #${pollCount} (check took ${sincePoll}ms)${sinceSpawn}`);
         this.output.appendLine(`[NodalMerge] Host healthy at ${this.uri}.`);
         return;
       }
