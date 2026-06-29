@@ -227,15 +227,15 @@ export function renderDag(
         if (colors) {
           const bx = pos.x + r;
           const by = pos.y - r - STAGE_BADGE_H;
-          const badge = el('rect', {
+          const badgeGroup = document.createElementNS(SVG_NS, 'g') as SVGGElement;
+          badgeGroup.appendChild(svgTitle('Stage: ' + stage));
+          badgeGroup.appendChild(el('rect', {
             x: bx, y: by,
             width: STAGE_BADGE_W, height: STAGE_BADGE_H,
             rx: 3, ry: 3,
             fill: colors.fill,
-          });
-          badge.appendChild(svgTitle('Stage: ' + stage));
-          root.appendChild(badge);
-          root.appendChild(text(stage!.charAt(0).toUpperCase(), {
+          }));
+          badgeGroup.appendChild(text(stage!.charAt(0).toUpperCase(), {
             x: bx + STAGE_BADGE_W / 2, y: by + STAGE_BADGE_H - 3,
             'text-anchor': 'middle',
             fill: colors.text,
@@ -243,6 +243,7 @@ export function renderDag(
             'font-weight': '700',
             'font-family': 'var(--nm-font, sans-serif)',
           }));
+          root.appendChild(badgeGroup);
         }
       }
     });
