@@ -50,4 +50,4 @@ The MCP contract is the stable operating-system API for Studio:
 
 ## Implementation status
 
-Contracts and MCP stubs are in place. Persistence-backed behavior lands in subsequent slices (see `plans/`).
+Contracts and MCP stubs are in place. Persistence-backed behavior lands in subsequent implementation phases.
