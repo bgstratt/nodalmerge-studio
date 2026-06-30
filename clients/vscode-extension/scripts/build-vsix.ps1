@@ -39,7 +39,8 @@ param(
     [ValidateSet('patch', 'minor', 'major', '')]
     [string]$BumpVersion = '',
     [string[]]$Platforms = @('win-x64'),
-    [switch]$SkipDotnet
+    [switch]$SkipDotnet,
+    [string]$NodalMergePackageVersion = '0.1.1'
 )
 
 Set-StrictMode -Version Latest
@@ -77,7 +78,7 @@ try {
                 --self-contained false `
                 --configfile $NuGetConfig `
                 -o $outDir `
-                /p:NodalMergePackageVersion=0.1.0-local
+                /p:NodalMergePackageVersion=$NodalMergePackageVersion
             if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for $rid" }
         }
     } else {
