@@ -62,28 +62,31 @@ public static class StudioWebApplication
         Action<IServiceCollection>? configureServices = null,
         Action<ConfigurationManager>? configureConfiguration = null)
     {
-        var app = HostApplication.Build(
-            args,
-            configureWebHost: configureWebHost,
-            configureConfiguration: config =>
-            {
-                configureConfiguration?.Invoke(config);
-                ApplyCasRootPath(config, config);
-            },
-            configureServices: services =>
-            {
-                services.AddStudioServices(llmHttpClient);
-                services.AddSingleton<IRuntimeEventBroadcaster, RuntimeRoomEventBroadcaster>();
-                services.AddSingleton<IStudioGraphPromoter, RuntimeGraphPromoter>();
-                services.AddSingleton<IStudioCausalGraphService, RuntimeCausalGraphService>();
-                services.AddSingleton<IParticipantEventBus, InMemoryParticipantEventBus>();
-                services.AddSingleton<IProjectionMaterializer, LocalFilesystemProjectionMaterializer>();
-                services.AddSingleton<IStudioParticipantService, StudioParticipantService>();
-                services.AddHostedService<StudioCrdtSyncBackgroundService>();
-                configureServices?.Invoke(services);
-            });
+        var builder = WebApplication.CreateBuilder(args);
+
+        configureWebHost?.Invoke(builder.WebHost);
+
+        builder.Configuration.AddInMemoryCollection([]);
+        configureConfiguration?.Invoke(builder.Configuration);
+        ApplyCasRootPath(builder.Configuration, builder.Configuration);
+
+        builder.Services.AddNodalMergeHostProviders(builder.Configuration);
+        builder.Services.AddNodalMergeRuntimeCore(builder.Configuration);
+        builder.Services.AddStudioServices(llmHttpClient);
+        builder.Services.AddSingleton<IRuntimeEventBroadcaster, RuntimeRoomEventBroadcaster>();
+        builder.Services.AddSingleton<IStudioGraphPromoter, RuntimeGraphPromoter>();
+        builder.Services.AddSingleton<IStudioCausalGraphService, RuntimeCausalGraphService>();
+        builder.Services.AddSingleton<IParticipantEventBus, InMemoryParticipantEventBus>();
+        builder.Services.AddSingleton<IProjectionMaterializer, LocalFilesystemProjectionMaterializer>();
+        builder.Services.AddSingleton<IStudioParticipantService, StudioParticipantService>();
+        builder.Services.AddHostedService<StudioCrdtSyncBackgroundService>();
+
+        configureServices?.Invoke(builder.Services);
+
+        var app = builder.Build();
 
         app.UseCors();
+        app.MapNodalMergeEndpoints();
 
         app.MapGet("/health", () => Results.Ok(new
         {

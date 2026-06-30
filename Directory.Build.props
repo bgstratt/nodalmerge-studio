@@ -6,7 +6,7 @@
     <LangVersion>latest</LangVersion>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <NodalMergeUseNuGetPackages Condition="'$(NodalMergeUseNuGetPackages)' == ''">true</NodalMergeUseNuGetPackages>
-    <NodalMergePackageVersion Condition="'$(NodalMergePackageVersion)' == ''">0.1.0-local</NodalMergePackageVersion>
+    <NodalMergePackageVersion Condition="'$(NodalMergePackageVersion)' == ''">0.1.1</NodalMergePackageVersion>
     <NodalMergeDotNetHostProject Condition="'$(NodalMergeDotNetHostProject)' == ''">$(MSBuildThisFileDirectory)..\nodalmerge\nodalmerge-host\src\NodalMerge.DotNetHost\NodalMerge.DotNetHost.csproj</NodalMergeDotNetHostProject>
   </PropertyGroup>
 </Project>
