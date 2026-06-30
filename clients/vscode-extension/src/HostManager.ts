@@ -379,12 +379,25 @@ export class HostManager implements vscode.Disposable {
   private killProcess(): void {
     if (!this.process) { return; }
     this.output.appendLine('[NodalMerge] Stopping host…');
-    this.process.kill('SIGTERM');
     const proc = this.process;
-    setTimeout(() => {
-      if (!proc.exitCode && !proc.killed) { proc.kill('SIGKILL'); }
-    }, 3000);
     this.process = undefined;
+
+    if (process.platform === 'win32' && proc.pid) {
+      // On Windows, `dotnet run` spawns the actual app as a child process. Killing the parent
+      // with SIGTERM leaves the child alive, which eventually holds the SQLite DB lock and
+      // prevents the next server from starting. /T kills the entire process tree; /F forces.
+      try {
+        cp.execSync(`taskkill /pid ${proc.pid} /T /F`, { stdio: 'ignore' });
+      } catch {
+        // If taskkill fails (process already gone), fall back to a direct kill.
+        try { proc.kill('SIGKILL'); } catch { /* already dead */ }
+      }
+    } else {
+      proc.kill('SIGTERM');
+      setTimeout(() => {
+        if (!proc.exitCode && !proc.killed) { proc.kill('SIGKILL'); }
+      }, 3000);
+    }
   }
 
   dispose(): void {

@@ -1,5 +1,8 @@
 using System.Text.Json;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using NodalMerge.Host.Composition;
 using NodalMerge.Studio.AgentRuntime;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -152,9 +155,54 @@ public static class StudioRestEndpoints
         string? TestCommand = null,
         bool EnforceExpectedOutputKind = false,
         bool DocFetchTools = false,
+        IReadOnlyList<string>? DocFetchAllowedDomains = null,
+        IReadOnlyList<string>? DocFetchDeniedDomains = null,
         // Slice 22 — global default set of enabled domain agents (by DomainAgentRegistry name);
         // null/omitted on a partial update leaves the existing set untouched.
-        IReadOnlyList<string>? EnabledDomainAgents = null);
+        IReadOnlyList<string>? EnabledDomainAgents = null,
+        // Phase 9 — conflict blocking
+        bool BlockConflictingOps = false,
+        // Phase 7 — CAS materialization concurrency
+        int MaterializerConcurrency = 4,
+        // Phase 2/6 — snapshot policy
+        bool SnapshotOnSync = true,
+        int? OpsPerSnapshot = null,
+        // Phase 14 — git commit/push gating (opt-in, dangerous)
+        bool AllowAgentGitCommits = false,
+        bool AllowAgentGitPush = false,
+        // Force rebase — auto-requeue losing work unit when all merge strategies fail
+        bool AllowAutoRequeue = false);
+
+    private static object BuildOptionsResponse(WorkspaceOptions o) => new
+    {
+        useLlmProfileSelection    = o.UseLlmProfileSelection,
+        blockOverlappingFileScope = o.BlockOverlappingFileScope,
+        maxConcurrentWorkers      = o.MaxConcurrentWorkers,
+        schedulerPollIntervalMs   = o.SchedulerPollIntervalMs,
+        requireBuildBeforeProposal = o.RequireBuildBeforeProposal,
+        requireTestBeforeProposal  = o.RequireTestBeforeProposal,
+        buildCommand              = o.BuildCommand,
+        testCommand               = o.TestCommand,
+        executionTimeoutSeconds   = o.ExecutionTimeoutSeconds,
+        postMergeExecutionMode    = o.PostMergeExecutionMode,
+        usePromotionBranch        = o.UsePromotionBranch,
+        candidateBranchId         = o.CandidateBranchId,
+        enforceExpectedOutputKind = o.EnforceExpectedOutputKind,
+        docFetchTools             = o.DocFetchTools,
+        docFetchAllowedDomains    = o.DocFetchAllowedDomains,
+        docFetchDeniedDomains     = o.DocFetchDeniedDomains,
+        enabledDomainAgents       = o.EnabledDomainAgents,
+        blockConflictingOps       = o.BlockConflictingOps,
+        materializerConcurrency   = o.MaterializerConcurrency,
+        snapshots = new
+        {
+            snapshotOnSync  = o.Snapshots.SnapshotOnSync,
+            opsPerSnapshot  = o.Snapshots.OpsPerSnapshot,
+        },
+        allowAgentGitCommits = o.AllowAgentGitCommits,
+        allowAgentGitPush    = o.AllowAgentGitPush,
+        allowAutoRequeue     = o.AllowAutoRequeue,
+    };
 
     private sealed record SyncDiffBody(string[] PeerNodeIdsHex);
 
@@ -285,6 +333,7 @@ public static class StudioRestEndpoints
         MapReasoningEndpoints(app);
         MapModelEndpoints(app);
         MapRepositoryEndpoints(app);
+        MapGitAdapterEndpoints(app);
         MapExperimentEndpoints(app);
         MapSteeringEndpoints(app);
         MapCounterfactualEndpoints(app);
@@ -380,24 +429,7 @@ public static class StudioRestEndpoints
     private static void MapOptionsEndpoints(WebApplication app)
     {
         app.MapGet("/studio/options", (WorkspaceOptions options) =>
-            Results.Ok(new
-            {
-                useLlmProfileSelection = options.UseLlmProfileSelection,
-                blockOverlappingFileScope = options.BlockOverlappingFileScope,
-                maxConcurrentWorkers = options.MaxConcurrentWorkers,
-                schedulerPollIntervalMs = options.SchedulerPollIntervalMs,
-                requireBuildBeforeProposal = options.RequireBuildBeforeProposal,
-                requireTestBeforeProposal = options.RequireTestBeforeProposal,
-                buildCommand = options.BuildCommand,
-                testCommand = options.TestCommand,
-                executionTimeoutSeconds = options.ExecutionTimeoutSeconds,
-                postMergeExecutionMode = options.PostMergeExecutionMode,
-                usePromotionBranch = options.UsePromotionBranch,
-                candidateBranchId = options.CandidateBranchId,
-                enforceExpectedOutputKind = options.EnforceExpectedOutputKind,
-                docFetchTools = options.DocFetchTools,
-                enabledDomainAgents = options.EnabledDomainAgents,
-            }));
+            Results.Ok(BuildOptionsResponse(options)));
 
         app.MapPost("/studio/options", async (
             UpdateOptionsBody body,
@@ -417,18 +449,29 @@ public static class StudioRestEndpoints
             if (string.IsNullOrWhiteSpace(body.CandidateBranchId))
                 return Results.BadRequest(new { error = "candidateBranchId must not be empty." });
 
-            options.UseLlmProfileSelection = body.UseLlmProfileSelection;
+            options.UseLlmProfileSelection   = body.UseLlmProfileSelection;
             options.BlockOverlappingFileScope = body.BlockOverlappingFileScope;
-            options.MaxConcurrentWorkers = body.MaxConcurrentWorkers;
-            options.SchedulerPollIntervalMs = body.SchedulerPollIntervalMs;
-            options.UsePromotionBranch = body.UsePromotionBranch;
-            options.CandidateBranchId = body.CandidateBranchId;
+            options.MaxConcurrentWorkers      = body.MaxConcurrentWorkers;
+            options.SchedulerPollIntervalMs   = body.SchedulerPollIntervalMs;
+            options.UsePromotionBranch        = body.UsePromotionBranch;
+            options.CandidateBranchId         = body.CandidateBranchId;
             options.RequireBuildBeforeProposal = body.RequireBuildBeforeProposal;
-            options.RequireTestBeforeProposal = body.RequireTestBeforeProposal;
-            options.BuildCommand = body.BuildCommand;
-            options.TestCommand = body.TestCommand;
+            options.RequireTestBeforeProposal  = body.RequireTestBeforeProposal;
+            options.BuildCommand              = body.BuildCommand;
+            options.TestCommand               = body.TestCommand;
             options.EnforceExpectedOutputKind = body.EnforceExpectedOutputKind;
-            options.DocFetchTools = body.DocFetchTools;
+            options.DocFetchTools             = body.DocFetchTools;
+            options.BlockConflictingOps       = body.BlockConflictingOps;
+            options.MaterializerConcurrency   = body.MaterializerConcurrency;
+            options.Snapshots.SnapshotOnSync  = body.SnapshotOnSync;
+            options.Snapshots.OpsPerSnapshot  = body.OpsPerSnapshot;
+            options.AllowAgentGitCommits      = body.AllowAgentGitCommits;
+            options.AllowAgentGitPush         = body.AllowAgentGitPush;
+            options.AllowAutoRequeue          = body.AllowAutoRequeue;
+            if (body.DocFetchAllowedDomains is not null)
+                options.DocFetchAllowedDomains = [.. body.DocFetchAllowedDomains];
+            if (body.DocFetchDeniedDomains is not null)
+                options.DocFetchDeniedDomains = [.. body.DocFetchDeniedDomains];
             if (body.EnabledDomainAgents is not null)
                 options.EnabledDomainAgents = [.. body.EnabledDomainAgents];
             await runtimeSettings.PersistAsync(ct).ConfigureAwait(false);
@@ -437,23 +480,68 @@ public static class StudioRestEndpoints
             if (options.UsePromotionBranch)
                 await candidateBranch.EnsureAsync(ct).ConfigureAwait(false);
 
+            return Results.Ok(BuildOptionsResponse(options));
+        });
+
+        // Returns the effective startup-only config values (CAS path, blob backend) alongside
+        // the path to the appsettings.json file and instructions for changing them.
+        // These values require a restart to take effect and cannot be changed at runtime.
+        app.MapGet("/studio/startup-config", (
+            IConfiguration configuration,
+            IWebHostEnvironment env,
+            WorkspaceOptions options) =>
+        {
+            var configFilePath = Path.Combine(env.ContentRootPath, "appsettings.json");
+            var effectiveCasRoot  = options.CasRootPath
+                ?? (options.SeedRepositoryPath is not null
+                    ? Path.Combine(options.SeedRepositoryPath, ".nodalmerge", "cas")
+                    : null);
+            var blobProvider = configuration["NodalMerge:Providers:BlobStorage"] ?? "WsOnly";
+
             return Results.Ok(new
             {
-                useLlmProfileSelection = options.UseLlmProfileSelection,
-                blockOverlappingFileScope = options.BlockOverlappingFileScope,
-                maxConcurrentWorkers = options.MaxConcurrentWorkers,
-                schedulerPollIntervalMs = options.SchedulerPollIntervalMs,
-                requireBuildBeforeProposal = options.RequireBuildBeforeProposal,
-                requireTestBeforeProposal = options.RequireTestBeforeProposal,
-                buildCommand = options.BuildCommand,
-                testCommand = options.TestCommand,
-                executionTimeoutSeconds = options.ExecutionTimeoutSeconds,
-                postMergeExecutionMode = options.PostMergeExecutionMode,
-                usePromotionBranch = options.UsePromotionBranch,
-                candidateBranchId = options.CandidateBranchId,
-                enforceExpectedOutputKind = options.EnforceExpectedOutputKind,
-                docFetchTools = options.DocFetchTools,
-                enabledDomainAgents = options.EnabledDomainAgents,
+                configFilePath,
+                restartRequired = true,
+                effectiveValues = new
+                {
+                    casRootPath         = effectiveCasRoot,
+                    blobStorageProvider = blobProvider,
+                },
+                instructions = new
+                {
+                    summary = "Edit appsettings.json (or appsettings.{Environment}.json) then restart the extension host for changes to take effect.",
+                    casRootPath = new
+                    {
+                        configKey   = "Workspace:CasRootPath",
+                        description = "Override the directory where local blob files are stored. Defaults to {SeedRepositoryPath}/.nodalmerge/cas when unset.",
+                        example     = new { Workspace = new { CasRootPath = "/path/to/your/.nodalmerge/cas" } },
+                    },
+                    blobStorageProvider = new
+                    {
+                        configKey   = "NodalMerge:Providers:BlobStorage",
+                        validValues = new[] { "WsOnly", "File", "S3Delegated" },
+                        description = "WsOnly = in-memory only (no persistence). File = local disk at CasRootPath. S3Delegated = presigned S3-compatible URLs (requires additional S3 config below).",
+                        s3Config = new
+                        {
+                            note    = "Required when BlobStorage = S3Delegated",
+                            example = new
+                            {
+                                NodalMerge = new
+                                {
+                                    Storage = new
+                                    {
+                                        S3Delegated = new
+                                        {
+                                            BaseUrl = "https://your-api.example.com",
+                                            PutPath = "/blobs/put",
+                                            GetPath = "/blobs/get"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                }
             });
         });
     }
@@ -625,6 +713,155 @@ public static class StudioRestEndpoints
         {
             var profile = await profiles.RescanAsync(branchId, ct).ConfigureAwait(false);
             return Results.Ok(profile);
+        });
+
+        // ── Phase 9 — conflict inspection ─────────────────────────────────────
+
+        app.MapGet("/studio/conflicts", async (
+            [FromQuery] string? repositoryId,
+            IConflictService conflicts,
+            WorkspaceOptions opts,
+            CancellationToken ct) =>
+        {
+            var repoId = repositoryId ?? Path.GetFullPath(opts.SeedRepositoryPath ?? Directory.GetCurrentDirectory());
+            var active = await conflicts.GetActiveAsync(repoId, ct).ConfigureAwait(false);
+            return Results.Ok(new { repositoryId = repoId, conflicts = active, count = active.Count });
+        });
+
+        app.MapGet("/studio/conflicts/{conflictId}", async (
+            string conflictId,
+            IConflictService conflicts,
+            CancellationToken ct) =>
+        {
+            var conflict = await conflicts.GetAsync(conflictId, ct).ConfigureAwait(false);
+            return conflict is not null ? Results.Ok(conflict) : Results.NotFound();
+        });
+
+        app.MapPost("/studio/conflicts/{conflictId}/dismiss", async (
+            string conflictId,
+            IConflictService conflicts,
+            CancellationToken ct) =>
+        {
+            var updated = await conflicts.DismissAsync(conflictId, ct).ConfigureAwait(false);
+            return updated is not null
+                ? Results.Ok(updated)
+                : Results.NotFound(new { error = "Conflict not found." });
+        });
+
+        // ── Phase 10 — intelligent merge / conflict resolution ────────────────
+
+        // Resolve a conflict by running the strategy chain. `strategy` may be:
+        //   null / omitted   → auto (ThreeWay → AST → LLM → HumanReview)
+        //   "threeway"       → three-way line merge only
+        //   "ast"            → ThreeWay + Roslyn syntax validation (.cs only)
+        //   "llm"            → LLM-assisted merge (requires LLM credentials in body)
+        //   "human"          → forces the human-review outcome (always returns failure)
+        app.MapPost("/studio/conflicts/{conflictId}/resolve", async (
+            string conflictId,
+            [FromQuery] string? strategy,
+            ConflictResolveBody? body,
+            IConflictResolutionService resolution,
+            IConflictService conflicts,
+            IWorkUnitService? workUnits,
+            WorkspaceOptions options,
+            CancellationToken ct) =>
+        {
+            LlmMergeCredentials? creds = body?.Provider is not null
+                ? new LlmMergeCredentials(body.Provider, body.Model ?? string.Empty,
+                    body.BaseUrl ?? string.Empty, body.ApiKey ?? string.Empty)
+                : null;
+            var result = await resolution.ResolveAsync(conflictId, strategy, creds, ct)
+                .ConfigureAwait(false);
+
+            if (!result.Success && result.RequeueLosingWorkUnit && options.AllowAutoRequeue && workUnits is not null)
+            {
+                // Re-queue the losing work unit (WorkUnitIdB — the second/conflicting op).
+                // New work unit inherits the original goal + file scope so the agent starts fresh
+                // with full op-log context about its prior attempt.
+                var conflict = await conflicts.GetAsync(conflictId, ct).ConfigureAwait(false);
+                if (conflict?.WorkUnitIdB is string losingId)
+                {
+                    var losingWu = await workUnits.GetAsync(losingId, ct).ConfigureAwait(false);
+                    if (losingWu is not null)
+                    {
+                        var now = DateTimeOffset.UtcNow;
+                        var requeued = await workUnits.CreateAsync(new WorkUnit(
+                            WorkUnitId:       $"wu-{Guid.NewGuid():N}",
+                            Goal:             losingWu.Goal,
+                            BranchId:         losingWu.BranchId,
+                            Status:           WorkUnitStatus.Created,
+                            CreatedAt:        now,
+                            UpdatedAt:        now,
+                            Owner:            losingWu.Owner,
+                            AssignedAgent:    null,
+                            SuccessCriteria:  losingWu.SuccessCriteria,
+                            Metadata:         null,
+                            ParentWorkUnitId: losingId,
+                            DependsOn:        [],
+                            FileScope:        losingWu.FileScope,
+                            RepositoryId:     losingWu.RepositoryId,
+                            WorkspaceId:      losingWu.WorkspaceId), ct).ConfigureAwait(false);
+                        result = result with { RequeuedWorkUnitId = requeued.WorkUnitId };
+                    }
+                }
+            }
+
+            return result.Success
+                ? Results.Ok(result)
+                : Results.UnprocessableEntity(result);
+        });
+
+        // ── Phase 8 — workspace cache management ──────────────────────────────
+
+        // Reconstruct a work unit's branch directory from the repository snapshot + CAS.
+        app.MapPost("/studio/cache/materialize", async (
+            [FromQuery] string workUnitId,
+            IWorkspaceCacheManager cache,
+            CancellationToken ct) =>
+        {
+            var ok = await cache.MaterializeAsync(workUnitId, ct).ConfigureAwait(false);
+            return ok ? Results.Ok(new { workUnitId, materialized = true })
+                      : Results.NotFound(new { error = "No snapshot with TreeEntries found; cannot materialize." });
+        });
+
+        // Evict a specific work unit's branch directory.
+        app.MapPost("/studio/cache/evict", async (
+            [FromQuery] string workUnitId,
+            IWorkspaceCacheManager cache,
+            CancellationToken ct) =>
+        {
+            var ok = await cache.EvictAsync(workUnitId, ct).ConfigureAwait(false);
+            return ok ? Results.Ok(new { workUnitId, evicted = true })
+                      : Results.Ok(new { workUnitId, evicted = false, reason = "Safe eviction invariant violated or directory does not exist." });
+        });
+
+        // Evict all branch directories for terminal work units.
+        app.MapPost("/studio/cache/evict/orphaned", async (
+            IWorkspaceCacheManager cache,
+            CancellationToken ct) =>
+        {
+            var count = await cache.EvictOrphanedAsync(ct).ConfigureAwait(false);
+            return Results.Ok(new { evicted = count });
+        });
+
+        // Run blob GC: collect live hashes from all snapshots and feed to FileBlobGcCoordinator.
+        // dryRun=true (default) only marks/reports candidates; dryRun=false deletes after grace window.
+        app.MapPost("/studio/cache/gc", async (
+            [FromQuery] bool dryRun,
+            IWorkspaceCacheManager cache,
+            WorkspaceOptions opts,
+            CancellationToken ct) =>
+        {
+            var casRoot = opts.CasRootPath;
+            if (string.IsNullOrEmpty(casRoot))
+                return Results.BadRequest(new { error = "CAS storage is not configured (WorkspaceOptions.CasRootPath is null)." });
+
+            var liveHashes = await cache.GetLiveBlobHashesAsync(ct).ConfigureAwait(false);
+            var coordinator = new FileBlobGcCoordinator(casRoot);
+            var report = dryRun
+                ? coordinator.DryRun(liveHashes, DateTimeOffset.UtcNow)
+                : coordinator.LiveRun(liveHashes, DateTimeOffset.UtcNow);
+            return Results.Ok(report);
         });
 
         app.MapPost("/studio/workspace/symbol/definition", async (
@@ -1535,7 +1772,7 @@ public static class StudioRestEndpoints
             var branchId = await branches.CreateBranchAsync(
                 $"restore/{proposalId}-{DateTimeOffset.UtcNow:yyyyMMddHHmmss}",
                 fromBranchId: $"base/{proposalId}",
-                ct).ConfigureAwait(false);
+                cancellationToken: ct).ConfigureAwait(false);
 
             return Results.Ok(new { branchId, proposalId });
         });
@@ -1561,7 +1798,7 @@ public static class StudioRestEndpoints
             if (string.IsNullOrWhiteSpace(body.Name))
                 return Results.BadRequest(new { error = "name is required." });
 
-            var branchId = await branches.CreateBranchAsync(body.Name, body.FromBranchId, ct)
+            var branchId = await branches.CreateBranchAsync(body.Name, body.FromBranchId, cancellationToken: ct)
                 .ConfigureAwait(false);
             return Results.Ok(new { branchId, name = body.Name, fromBranchId = body.FromBranchId });
         });
@@ -1583,6 +1820,22 @@ public static class StudioRestEndpoints
         {
             var status = await branches.GetStatusAsync(branchId, ct).ConfigureAwait(false);
             return Results.Ok(status);
+        });
+
+        // Phase 11 — on-demand CAS fetch for a single file into a branch dir.
+        app.MapPost("/studio/branches/{branchId}/materialize-file", async (
+            string branchId,
+            [Microsoft.AspNetCore.Mvc.FromQuery] string path,
+            IFileWorkspaceService fileWorkspace,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return Results.BadRequest(new { error = "path query parameter is required." });
+            var found = await fileWorkspace.MaterializeFileAsync(branchId, path, ct).ConfigureAwait(false);
+            return found
+                ? Results.Ok(new { branchId, path, materialized = true })
+                : Results.NotFound(new { branchId, path, materialized = false,
+                    reason = "Path does not exist in the latest repository snapshot." });
         });
 
         // Slice 21b — explicit human action to promote candidate → main. Never automatic.
@@ -3656,6 +3909,88 @@ public static class StudioRestEndpoints
         });
     }
 
+    // ── Phase 14 — Git import/export adapter ─────────────────────────────────
+
+    private static void MapGitAdapterEndpoints(WebApplication app)
+    {
+        // Import a git commit (or HEAD) into CAS, producing a RepositorySnapshot.
+        // Body: { gitRepoPath, commitSha? }
+        app.MapPost("/studio/repositories/{repositoryId}/git/import", async (
+            string repositoryId,
+            GitImportBody body,
+            IGitAdapter gitAdapter,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var snapshotId = await gitAdapter.ImportAsync(
+                    body.GitRepoPath, body.CommitSha, repositoryId, ct).ConfigureAwait(false);
+                return Results.Ok(new { repositoryId, snapshotId });
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        // Export a snapshot (or latest) as a git commit on the specified branch.
+        // Body: { targetGitRepoPath, branchName, snapshotId? }
+        app.MapPost("/studio/repositories/{repositoryId}/git/export", async (
+            string repositoryId,
+            GitExportBody body,
+            IGitAdapter gitAdapter,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var result = await gitAdapter.ExportAsync(
+                    repositoryId, body.SnapshotId, body.TargetGitRepoPath, body.BranchName, ct)
+                    .ConfigureAwait(false);
+                return Results.Ok(new
+                {
+                    repositoryId = result.RepositoryId,
+                    snapshotId   = result.SnapshotId,
+                    targetPath   = result.TargetPath,
+                    branchName   = result.BranchName,
+                    committed    = result.Committed,
+                    commitSha    = result.CommitSha,
+                    pushed       = result.Pushed,
+                    pushOutput   = result.PushOutput,
+                    message      = result.Message
+                });
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        // Create a git branch in an existing local repository (not a Studio workspace branch).
+        // Body: { gitRepoPath, branchName, fromRef?, checkout? }
+        app.MapPost("/studio/repositories/{repositoryId}/git/branch", async (
+            string repositoryId,
+            GitBranchBody body,
+            IGitAdapter gitAdapter,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var sha = await gitAdapter.CreateGitBranchAsync(
+                    body.GitRepoPath, body.BranchName, body.FromRef, body.Checkout ?? false, ct)
+                    .ConfigureAwait(false);
+                return Results.Ok(new { repositoryId, gitRepoPath = body.GitRepoPath, branchName = body.BranchName, commitSha = sha });
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+    }
+
+    private sealed record GitImportBody(string GitRepoPath, string? CommitSha = null);
+    private sealed record GitExportBody(string TargetGitRepoPath, string BranchName, string? SnapshotId = null);
+    private sealed record GitBranchBody(string GitRepoPath, string BranchName, string? FromRef = null, bool? Checkout = null);
+
     // ── /studio/experiments — Slice 22a ───────────────────────────────────
 
     private static void MapExperimentEndpoints(WebApplication app)
@@ -3895,6 +4230,14 @@ public static class StudioRestEndpoints
 
     private sealed record LlmScanBody(string Provider, string Model, string BaseUrl, string ApiKey);
 
+    // Phase 10 — optional LLM credentials for the conflict resolve endpoint. Omit when not
+    // using the LLM strategy (threeway / ast / human don't need credentials).
+    private sealed record ConflictResolveBody(
+        string? Provider = null,
+        string? Model = null,
+        string? BaseUrl = null,
+        string? ApiKey = null);
+
     private static void MapInsightEndpoints(WebApplication app)
     {
         // Deterministic detector — re-runs the heuristic rules over the current RunRetrospective
@@ -3906,7 +4249,39 @@ public static class StudioRestEndpoints
         {
             var knowledgeFindings = await detector.DetectDeterministicAsync(ct).ConfigureAwait(false);
             var promptFindings = await detector.DetectPromptImprovementsAsync(ct).ConfigureAwait(false);
-            return Results.Ok(knowledgeFindings.Concat(promptFindings).ToList());
+            var coModFindings = await detector.DetectCoModPatternsAsync(ct).ConfigureAwait(false);
+            return Results.Ok(knowledgeFindings.Concat(promptFindings).Concat(coModFindings).ToList());
+        });
+
+        // Phase 11.5 — on-demand co-modification pattern computation. Call after enough work units
+        // have completed to have meaningful signal. Results persist as CoModPatternV1 nodes and are
+        // returned in AgentWorkspace projections automatically.
+        app.MapPost("/studio/comod/compute", async (
+            ICoModService coMod,
+            WorkspaceOptions workspaceOptions,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrEmpty(workspaceOptions.SeedRepositoryPath))
+                return Results.BadRequest(new { error = "SeedRepositoryPath is not configured." });
+            var repositoryId = Path.GetFullPath(workspaceOptions.SeedRepositoryPath);
+            var patterns = await coMod.ComputeAsync(repositoryId, ct).ConfigureAwait(false);
+            return Results.Ok(new { repositoryId, patternCount = patterns.Count, patterns });
+        });
+
+        app.MapGet("/studio/comod", async (
+            ICoModService coMod,
+            WorkspaceOptions workspaceOptions,
+            [Microsoft.AspNetCore.Mvc.FromQuery] double minConfidence = 0.0,
+            CancellationToken ct = default) =>
+        {
+            if (string.IsNullOrEmpty(workspaceOptions.SeedRepositoryPath))
+                return Results.BadRequest(new { error = "SeedRepositoryPath is not configured." });
+            var repositoryId = Path.GetFullPath(workspaceOptions.SeedRepositoryPath);
+            var all = await coMod.GetAsync(repositoryId, ct).ConfigureAwait(false);
+            var filtered = minConfidence > 0
+                ? all.Where(p => p.Confidence >= minConfidence).ToList()
+                : all;
+            return Results.Ok(new { repositoryId, patternCount = filtered.Count(), patterns = filtered });
         });
 
         // LLM scan — calls a real model using the caller's own credentials (same shape as spawning

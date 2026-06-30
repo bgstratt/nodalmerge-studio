@@ -36,7 +36,8 @@ public class InMemoryMergeServiceTests
 
     private sealed class NoopFileWorkspaceService : NodalMerge.Studio.Core.Services.IFileWorkspaceService
     {
-        public Task InitBranchAsync(string b, string? s = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task InitBranchAsync(string b, string? s = null, IReadOnlyList<string>? fileScope = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<bool> MaterializeFileAsync(string b, string path, CancellationToken ct = default) => Task.FromResult(false);
         public Task<string?> ReadAsync(string b, string p, CancellationToken ct = default) => Task.FromResult<string?>(null);
         public Task<IReadOnlyList<NodalMerge.Studio.Core.Services.WorkspaceFileRead>> ReadManyAsync(string b, IReadOnlyList<string> paths, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<NodalMerge.Studio.Core.Services.WorkspaceFileRead>>(

@@ -1,23 +1,49 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
-internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFileWorkspaceService
+internal sealed class FileSystemWorkspaceService(
+    WorkspaceOptions options,
+    IBlobStoreProvider? blobStore = null,
+    IRepositoryOpService? repoOpService = null,
+    IMaterializationEngine? materializer = null,
+    IRepositorySnapshotService? snapshotService = null) : IFileWorkspaceService
 {
-    public Task InitBranchAsync(string branchId, string? seedFromBranchId = null, CancellationToken ct = default)
+    public async Task InitBranchAsync(string branchId, string? seedFromBranchId = null,
+        IReadOnlyList<string>? fileScope = null, CancellationToken ct = default)
     {
         var branchDir = BranchDir(branchId);
         // Directory.Exists alone isn't enough: a branch dir can be created empty (e.g. main,
         // before any SeedRepositoryPath was ever supplied) and would otherwise never become
         // eligible for seeding again, since this method no-ops on every subsequent call.
         if (Directory.Exists(branchDir) && Directory.EnumerateFileSystemEntries(branchDir).Any())
-            return Task.CompletedTask;
+            return;
 
         Directory.CreateDirectory(branchDir);
+
+        // Phase 11 — scoped materialization: when a work unit declares FileScope and CAS is
+        // available, materialize only the matching paths from the latest snapshot instead of
+        // copying the full seed branch directory. This keeps work unit branch dirs small.
+        if (fileScope is { Count: > 0 } && materializer is not null && snapshotService is not null
+            && options.SeedRepositoryPath is { Length: > 0 } seedForScope)
+        {
+            var repositoryId = Path.GetFullPath(seedForScope);
+            var snapshot = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
+            if (snapshot?.TreeEntries is not null)
+            {
+                // Expand work unit glob patterns to materializer prefix paths, and always include
+                // project structure files so WorkspaceProfileService can detect project roots.
+                var materializationScope = ExpandScopeForMaterializer(fileScope);
+                await materializer.MaterializeAsync(snapshot, branchDir, materializationScope, ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+        }
 
         if (seedFromBranchId is not null)
         {
@@ -25,18 +51,55 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
             if (Directory.Exists(seedDir) && Directory.EnumerateFileSystemEntries(seedDir).Any())
             {
                 CopyDirectory(seedDir, branchDir);
-                return Task.CompletedTask;
+                return;
             }
         }
 
         if (string.Equals(branchId, "main", StringComparison.OrdinalIgnoreCase)
-            && options.SeedRepositoryPath is { Length: > 0 } seed
-            && Directory.Exists(seed))
+            && options.SeedRepositoryPath is { Length: > 0 } seed)
         {
-            CopyDirectory(seed, branchDir);
-        }
+            // Phase 7 — prefer CAS reconstruction over directory copy so that "main" can always
+            // be rebuilt even when SeedRepositoryPath is absent or has been modified.
+            if (materializer is not null && snapshotService is not null)
+            {
+                var repositoryId = Path.GetFullPath(seed);
+                var snapshot = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
+                if (snapshot?.TreeEntries is not null)
+                {
+                    await materializer.MaterializeAsync(snapshot, branchDir, ct: ct).ConfigureAwait(false);
+                    return;
+                }
+            }
 
-        return Task.CompletedTask;
+            // Fallback: direct copy from seed repo (pre-Phase-7 behavior, or when CAS is absent).
+            if (Directory.Exists(seed))
+                CopyDirectory(seed, branchDir);
+        }
+    }
+
+    // Converts WorkUnit.FileScope glob patterns (e.g. "src/Auth/**") to prefix paths the
+    // materializer's IsInScope understands (e.g. "src/Auth"). Also injects project structure
+    // file patterns so WorkspaceProfileService can always detect project roots.
+    private static readonly string[] ProjectStructureFiles =
+    [
+        ".csproj", ".sln", ".slnx", "package.json", "Cargo.toml",
+        "go.mod", "pyproject.toml", "Makefile", "CMakeLists.txt",
+    ];
+
+    private static IReadOnlyList<string> ExpandScopeForMaterializer(IReadOnlyList<string> fileScope)
+    {
+        var expanded = new List<string>();
+        foreach (var pattern in fileScope)
+        {
+            // Strip trailing glob segments to get a directory prefix.
+            // "src/Auth/**" → "src/Auth"
+            // "src/Auth/*.cs" → "src/Auth"
+            // "src/Auth/UserService.cs" → kept as-is (exact file match)
+            var trimmed = pattern.TrimEnd('/').TrimEnd('*').TrimEnd('/');
+            if (trimmed.Length > 0)
+                expanded.Add(trimmed);
+        }
+        return expanded;
     }
 
     public async Task<string?> ReadAsync(string branchId, string relativePath, CancellationToken ct = default)
@@ -67,17 +130,18 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
 
     public async Task WriteAsync(string branchId, string relativePath, string content, CancellationToken ct = default)
     {
-        var bytes = Encoding.UTF8.GetByteCount(content);
-        if (bytes > options.MaxWriteBytes)
+        var contentBytes = Encoding.UTF8.GetBytes(content);
+        if (contentBytes.Length > options.MaxWriteBytes)
             throw new InvalidOperationException(
-                $"Content is {bytes:N0} bytes, which exceeds the write limit of {options.MaxWriteBytes:N0} bytes.");
+                $"Content is {contentBytes.Length:N0} bytes, which exceeds the write limit of {options.MaxWriteBytes:N0} bytes.");
 
         var fullPath = SafePath(branchId, relativePath);
         var dir = Path.GetDirectoryName(fullPath)!;
         if (!Directory.Exists(dir))
             Directory.CreateDirectory(dir);
 
-        await File.WriteAllTextAsync(fullPath, content, ct).ConfigureAwait(false);
+        await EmitWriteOpAsync(fullPath, relativePath, contentBytes, ct).ConfigureAwait(false);
+        await File.WriteAllBytesAsync(fullPath, contentBytes, ct).ConfigureAwait(false);
     }
 
     public async Task<WorkspaceReplaceResult> ReplaceAsync(
@@ -135,12 +199,12 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         return sb.ToString().TrimEnd();
     }
 
-    public Task DeleteAsync(string branchId, string relativePath, CancellationToken ct = default)
+    public async Task DeleteAsync(string branchId, string relativePath, CancellationToken ct = default)
     {
         var fullPath = SafePath(branchId, relativePath);
+        await EmitDeleteOpAsync(fullPath, relativePath, ct).ConfigureAwait(false);
         if (File.Exists(fullPath))
             File.Delete(fullPath);
-        return Task.CompletedTask;
     }
 
     public Task<bool> ExistsAsync(string branchId, string relativePath, CancellationToken ct = default)
@@ -465,6 +529,61 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
         return Task.CompletedTask;
     }
 
+    // ── Repository op emission (Phase 4 dual-write) ───────────────────────────
+
+    // Guard: skip silently if CAS or op service is unwired, or no repository is configured.
+    private bool CanEmitOps([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? repositoryId)
+    {
+        repositoryId = null;
+        if (blobStore is null || repoOpService is null || string.IsNullOrEmpty(options.SeedRepositoryPath))
+            return false;
+        repositoryId = Path.GetFullPath(options.SeedRepositoryPath);
+        return true;
+    }
+
+    private async Task EmitWriteOpAsync(string fullPath, string relativePath, byte[] newBytes, CancellationToken ct)
+    {
+        if (!CanEmitOps(out var repositoryId) || IsStudioInternalPath(relativePath))
+            return;
+
+        var newBlobId = BlobId(newBytes);
+        byte[]? oldBytes = File.Exists(fullPath) ? await File.ReadAllBytesAsync(fullPath, ct).ConfigureAwait(false) : null;
+        var oldBlobId = oldBytes is not null ? BlobId(oldBytes) : null;
+
+        await blobStore!.PutBlobAsync(newBlobId, newBytes, "text/plain", ct).ConfigureAwait(false);
+        await repoOpService.EmitAsync(new RepositoryOperation(
+            OperationId: Guid.NewGuid().ToString("N"),
+            RepositoryId: repositoryId,
+            ParentSnapshotId: null,
+            Kind: oldBlobId is null ? OperationType.Add : OperationType.Replace,
+            Path: relativePath.Replace('\\', '/'),
+            Timestamp: DateTimeOffset.UtcNow,
+            OldBlobId: oldBlobId,
+            NewBlobId: newBlobId), ct).ConfigureAwait(false);
+    }
+
+    private async Task EmitDeleteOpAsync(string fullPath, string relativePath, CancellationToken ct)
+    {
+        if (!CanEmitOps(out var repositoryId) || IsStudioInternalPath(relativePath) || !File.Exists(fullPath))
+            return;
+
+        var oldBytes = await File.ReadAllBytesAsync(fullPath, ct).ConfigureAwait(false);
+        var oldBlobId = BlobId(oldBytes);
+
+        await repoOpService.EmitAsync(new RepositoryOperation(
+            OperationId: Guid.NewGuid().ToString("N"),
+            RepositoryId: repositoryId,
+            ParentSnapshotId: null,
+            Kind: OperationType.Delete,
+            Path: relativePath.Replace('\\', '/'),
+            Timestamp: DateTimeOffset.UtcNow,
+            OldBlobId: oldBlobId,
+            NewBlobId: null), ct).ConfigureAwait(false);
+    }
+
+    // Phase 11.75 — Blake3 to match the host engine's CAS blob ID format.
+    private static string BlobId(byte[] bytes) => BlobHasher.ComputeHash(bytes);
+
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     private string BranchDir(string branchId) =>
@@ -496,20 +615,12 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
     // layout for repo-local workspaces) — every file under every branch would then contain that
     // ancestor segment and get treated as hidden, silently emptying every diff/list/copy. Only the
     // portion of the path *inside* the branch (i.e. relative to RootPath) should count.
-    // Mirrors WorkspaceProfileService.IgnoredDirNames — dependency/build directories are
-    // reinstallable or regenerable, not actual merge content. Without this, ApplyBranchAsync
-    // copies every file under e.g. node_modules one at a time (tens of thousands of File.Copy
-    // calls for a typical npm project), which is both pointless and slow enough to blow past
-    // the webview's apply request timeout.
-    private static readonly string[] IgnoredDirNames =
-        ["node_modules", "bin", "obj", "dist", "build", "target", "__pycache__", "venv", ".git"];
-
     private bool IsHidden(string path)
     {
         var relative = Path.GetRelativePath(options.RootPath, path);
         return relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             .Any(segment => segment.Length > 0 &&
-                (segment[0] == '.' || IgnoredDirNames.Contains(segment, StringComparer.OrdinalIgnoreCase)));
+                (segment[0] == '.' || WorkspacePathFilter.IgnoredDirNames.Contains(segment, StringComparer.OrdinalIgnoreCase)));
     }
 
     // Dotfiles (e.g. .env) are deliberately NOT excluded here, unlike IsHidden above — seeding a
@@ -517,8 +628,7 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
     // often required for it to run at all), whereas IsHidden's callers are list/diff/apply, where
     // dotfiles are conventionally treated as not-part-of-the-tracked-diff.
     private static bool IsIgnoredDirSegment(string relative) =>
-        relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            .Any(segment => IgnoredDirNames.Contains(segment, StringComparer.OrdinalIgnoreCase));
+        WorkspacePathFilter.IsIgnoredDirSegment(relative);
 
     // plan.json is an internal planning artifact (PlanDocumentPaths.FileName) written explicitly by
     // the Planner via WriteAsync and read explicitly by FanOutService — never meant to travel via a
@@ -531,6 +641,11 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
     // which goal wrote it) blindly fans out from it instead of the target's own current goal.
     private static bool IsPlanArtifact(string relativeToRoot) =>
         relativeToRoot.Replace('\\', '/') == PlanDocumentPaths.FileName;
+
+    // Paths that flow through WriteAsync but must not produce RepositoryOperation nodes because
+    // they are Studio-internal artifacts, not source files in the tracked repository.
+    private static bool IsStudioInternalPath(string relativePath) =>
+        IsPlanArtifact(relativePath);
 
     // Used by DiffExternalPathAsync/ApplyExternalPathAsync — externalPath has no relationship to
     // RootPath at all, so (unlike IsHidden) this enumerates and excludes purely relative to its own
@@ -579,6 +694,26 @@ internal sealed class FileSystemWorkspaceService(WorkspaceOptions options) : IFi
             if (IsIgnoredDirSegment(relative) || IsPlanArtifact(relative)) continue;
             File.Copy(file, Path.Combine(destination, relative), overwrite: true);
         }
+    }
+
+    // Phase 11 on-demand fetch: materializes a single path from the latest snapshot into the branch
+    // dir so agents can access files that weren't in their initial FileScope. Returns true when the
+    // file was found in the snapshot and written to disk, false when it genuinely doesn't exist.
+    public async Task<bool> MaterializeFileAsync(string branchId, string path, CancellationToken ct = default)
+    {
+        if (materializer is null || snapshotService is null
+            || options.SeedRepositoryPath is not { Length: > 0 } seed)
+            return false;
+
+        var repositoryId = Path.GetFullPath(seed);
+        var snapshot = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
+        if (snapshot?.TreeEntries is null || !snapshot.TreeEntries.ContainsKey(path))
+            return false;
+
+        var branchDir = BranchDir(branchId);
+        Directory.CreateDirectory(branchDir);
+        await materializer.MaterializeAsync(snapshot, branchDir, [path], ct).ConfigureAwait(false);
+        return true;
     }
 
     private static async Task<IReadOnlyList<string>> TryReadLimitedAsync(string fullPath, CancellationToken ct)

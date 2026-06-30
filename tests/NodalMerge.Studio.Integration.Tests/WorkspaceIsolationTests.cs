@@ -67,11 +67,14 @@ public class WorkspaceIsolationTests
     {
         private readonly Dictionary<string, Dictionary<string, string>> _branches = new();
 
-        public Task InitBranchAsync(string branchId, string? seedFromBranchId = null, CancellationToken ct = default)
+        public Task InitBranchAsync(string branchId, string? seedFromBranchId = null, IReadOnlyList<string>? fileScope = null, CancellationToken ct = default)
         {
             _branches.TryAdd(branchId, new Dictionary<string, string>());
             return Task.CompletedTask;
         }
+
+        public Task<bool> MaterializeFileAsync(string branchId, string path, CancellationToken ct = default) =>
+            Task.FromResult(false);
 
         public Task<string?> ReadAsync(string branchId, string relativePath, CancellationToken ct = default) =>
             Task.FromResult(_branches.TryGetValue(branchId, out var files) && files.TryGetValue(relativePath, out var c) ? c : null);

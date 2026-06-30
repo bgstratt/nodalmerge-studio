@@ -68,7 +68,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // Taken now rather than at apply time so it stays correct regardless of whether the
         // proposal later gets approved, rejected, or applied — none of those touch this copy.
         await _fileWorkspace.InitBranchAsync(
-            $"base/{proposal.ProposalId}", proposal.TargetBranch, cancellationToken).ConfigureAwait(false);
+            $"base/{proposal.ProposalId}", proposal.TargetBranch, ct: cancellationToken).ConfigureAwait(false);
 
         return stored;
     }
@@ -678,6 +678,17 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IPolicyRule, AutoReviewRule>();
         // Slice 20c — Hybrid countdown timer.
         services.AddSingleton<IReviewTimerService, ReviewTimerService>();
+
+        // Phase 10 — merge strategy chain. Strategies are tried in registration order.
+        services.AddSingleton<ThreeWayMergeStrategy>();
+        services.AddSingleton<AstMergeStrategy>();
+        services.AddSingleton<LlmAssistedMergeStrategy>();
+        services.AddSingleton<HumanReviewStrategy>();
+        services.AddSingleton<IMergeStrategy>(sp => sp.GetRequiredService<ThreeWayMergeStrategy>());
+        services.AddSingleton<IMergeStrategy>(sp => sp.GetRequiredService<AstMergeStrategy>());
+        services.AddSingleton<IMergeStrategy>(sp => sp.GetRequiredService<LlmAssistedMergeStrategy>());
+        services.AddSingleton<IMergeStrategy>(sp => sp.GetRequiredService<HumanReviewStrategy>());
+        services.AddSingleton<IConflictResolutionService, ConflictResolutionService>();
         return services;
     }
 }

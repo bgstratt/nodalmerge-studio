@@ -85,7 +85,7 @@ public sealed class MergeReconciliationService(
 
         var ordered = OrderByDependencies(children, childProposals);
         var mergeBranch = $"merge/{parentWorkUnitId}";
-        await fileWorkspace.InitBranchAsync(mergeBranch, "main", cancellationToken).ConfigureAwait(false);
+        await fileWorkspace.InitBranchAsync(mergeBranch, "main", ct: cancellationToken).ConfigureAwait(false);
 
         foreach (var (_, proposal) in ordered)
         {

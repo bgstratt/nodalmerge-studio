@@ -563,7 +563,8 @@ public interface IKnownGoodStateService
 
 public interface IBranchService
 {
-    Task<string> CreateBranchAsync(string name, string? fromBranchId = null, CancellationToken cancellationToken = default);
+    Task<string> CreateBranchAsync(string name, string? fromBranchId = null,
+        IReadOnlyList<string>? fileScope = null, CancellationToken cancellationToken = default);
 
     Task CheckoutBranchAsync(string branchId, CancellationToken cancellationToken = default);
 
@@ -1413,7 +1414,10 @@ public sealed record SessionStateSnapshot(
 
 public interface IFileWorkspaceService
 {
-    Task InitBranchAsync(string branchId, string? seedFromBranchId = null, CancellationToken ct = default);
+    // Phase 11: fileScope narrows materialization to matching paths only (+ project structure files).
+    // Null/empty = full materialization (existing behavior).
+    Task InitBranchAsync(string branchId, string? seedFromBranchId = null,
+        IReadOnlyList<string>? fileScope = null, CancellationToken ct = default);
     Task<string?> ReadAsync(string branchId, string relativePath, CancellationToken ct = default);
     Task WriteAsync(string branchId, string relativePath, string content, CancellationToken ct = default);
     Task DeleteAsync(string branchId, string relativePath, CancellationToken ct = default);
@@ -1451,6 +1455,12 @@ public interface IFileWorkspaceService
     // clamp paths to a sane count (e.g. [1,50]); this method itself does not reject an oversized list.
     Task<IReadOnlyList<WorkspaceFileRead>> ReadManyAsync(
         string branchId, IReadOnlyList<string> paths, CancellationToken ct = default);
+
+    // Phase 11 on-demand fetch: pulls a single path from the latest repository snapshot into the
+    // branch directory. Returns true if the path was found in the snapshot and materialized,
+    // false if the path does not exist in the snapshot (genuinely new/absent file).
+    // No-ops gracefully (returns false) when CAS or snapshot is unavailable.
+    Task<bool> MaterializeFileAsync(string branchId, string path, CancellationToken ct = default);
 
     Task<string> DiffAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default);
     Task ApplyBranchAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default);
@@ -1566,6 +1576,186 @@ public enum WorkspaceChangeKind
     Modified,
     Deleted,
     Changed,
+}
+
+// Repository virtualization — Phase 3.
+// Immutable op log for file transitions. EmitAsync persists each op durably and indexes
+// it for fast path queries. Snapshot validation (OldBlobId consistency) is deferred to
+// Phase 9 once snapshots exist.
+public interface IRepositoryOpService
+{
+    Task EmitAsync(RepositoryOperation op, CancellationToken ct = default);
+
+    Task<IReadOnlyList<RepositoryOperation>> GetRecentOpsForPathsAsync(
+        string repositoryId, IReadOnlyList<string> paths, int limit = 5, CancellationToken ct = default);
+
+    // Phase 6 — all ops for a repository after the given timestamp, chronologically ordered.
+    // Used by snapshot compaction to replay ops onto a base snapshot's TreeEntries.
+    Task<IReadOnlyList<RepositoryOperation>> GetOpsSinceAsync(
+        string repositoryId, DateTimeOffset since, CancellationToken ct = default);
+}
+
+// Phase 7 — reconstructs workspace directories from a snapshot's TreeEntries + CAS.
+// Enables safe eviction of any workspace directory: the materializer can always rebuild it
+// from the node store + blob store without touching the seed repository.
+public interface IMaterializationEngine
+{
+    // Reconstruct targetPath from snapshot.TreeEntries + CAS. Files already on disk whose
+    // Blake3 hash matches the expected blobId are skipped (no CAS fetch). Files not in the
+    // snapshot (within fileScope) are deleted. Returns count of files written.
+    // Returns 0 without error when snapshot.TreeEntries is null (pre-Phase-2 node).
+    Task<int> MaterializeAsync(
+        RepositorySnapshot snapshot,
+        string targetPath,
+        IReadOnlyList<string>? fileScope = null,
+        CancellationToken ct = default);
+
+    // Incremental update: diff two snapshots and only touch changed/added/removed paths.
+    // Used by Phase 8 cache manager to refresh a workspace without full reconstruction.
+    Task<int> RematerializeAsync(
+        RepositorySnapshot snapshot,
+        RepositorySnapshot previousSnapshot,
+        string targetPath,
+        IReadOnlyList<string>? fileScope = null,
+        CancellationToken ct = default);
+}
+
+// Phase 2 — snapshot checkpoint service for the repository op log. One snapshot per goal cycle
+// (created by between-run sync) serves as the replay base; replaying 10–30 ops from the latest
+// snapshot is intentionally fast. SnapshotOnWorkUnitCompletion (Phase 7) and compaction (Phase 6)
+// build on this foundation.
+public interface IRepositorySnapshotService
+{
+    // Latest snapshot for this repository, or null if none exists yet.
+    Task<RepositorySnapshot?> GetLatestAsync(string repositoryId, CancellationToken ct = default);
+
+    // Phase 14 — look up a specific snapshot by ID. Returns null if not found.
+    Task<RepositorySnapshot?> GetAsync(string snapshotId, CancellationToken ct = default);
+
+    // Create a new snapshot. Increments Generation, computes TreeHash, writes to node store.
+    Task<RepositorySnapshot> CreateAsync(
+        string repositoryId,
+        IReadOnlyDictionary<string, string> treeEntries,
+        string? baseSnapshotId = null,
+        string? workUnitId = null,
+        string? gitCommit = null,
+        string? source = null,
+        CancellationToken ct = default);
+
+    // Phase 6 — mid-goal compaction: if ops accumulated since the last snapshot meet or exceed
+    // the threshold, replay them onto the snapshot's TreeEntries and write a new "Compaction"
+    // snapshot. Returns the new snapshot if one was created, null otherwise (including when
+    // threshold is null or the op count is below it).
+    Task<RepositorySnapshot?> ConsiderCompactionAsync(
+        string repositoryId, int? threshold, CancellationToken ct = default);
+}
+
+// Phase 5 — one-time CAS bootstrap for a repository. Walk every importable file in the repo root,
+// write blobs to CAS, emit Import RepositoryOps, and record a Generation-0 RepositorySnapshot node.
+// No-op if the bootstrap snapshot already exists (checked via node store on first call, then cached).
+// No-op if blobStore or repoOpService is unavailable (e.g. in-memory test environments without CAS).
+public interface IRepositoryImportService
+{
+    Task EnsureBootstrappedAsync(string repositoryId, string repositoryPath, CancellationToken ct = default);
+}
+
+// Phase 9 — structural conflict detection. A conflict is two RepositoryOps that share the same
+// OldBlobId (started from the same parent blob) but produced different NewBlobIds — a DAG fork.
+// Detection happens at op-emit time; the op service calls RecordAsync when a fork is found.
+// Resolution (Phase 10) calls MarkResolvedAsync after producing a ConflictResolutionOp.
+public interface IConflictService
+{
+    // Persist a detected conflict. Idempotent on ConflictId.
+    Task<RepositoryConflict> RecordAsync(RepositoryConflict conflict, CancellationToken ct = default);
+
+    // All open (unresolved, un-dismissed) conflicts for a repository.
+    Task<IReadOnlyList<RepositoryConflict>> GetActiveAsync(string repositoryId, CancellationToken ct = default);
+
+    Task<RepositoryConflict?> GetAsync(string conflictId, CancellationToken ct = default);
+
+    // Human or UI dismissal — removes from active list without resolution.
+    Task<RepositoryConflict?> DismissAsync(string conflictId, CancellationToken ct = default);
+
+    // Phase 10 hook — called by the merge resolution path once a ConflictResolutionOp lands.
+    Task<RepositoryConflict?> MarkResolvedAsync(string conflictId, string resolutionOpId, CancellationToken ct = default);
+}
+
+// Phase 8 — workspace cache management. Branch workspace directories are ephemeral cache entries;
+// any evicted directory can be reconstructed from the latest repository snapshot + CAS.
+// Safe eviction invariant: a non-cancelled work unit's branch dir may only be deleted if a
+// repository snapshot with TreeEntries exists (guarantees the materializer can rebuild it).
+public interface IWorkspaceCacheManager
+{
+    // Reconstruct a work unit's branch directory from the repository's latest snapshot + CAS.
+    // Returns false if no snapshot with TreeEntries exists or the work unit is not found.
+    Task<bool> MaterializeAsync(string workUnitId, CancellationToken ct = default);
+
+    // Delete a work unit's branch workspace directory.
+    // For Cancelled work units: always succeeds (files were never merged, no recovery needed).
+    // For Completed/Merged work units: only evicts when snapshot.CreatedAt > wu.UpdatedAt,
+    // ensuring the between-run sync captured those changes before the directory is removed.
+    // Returns false when the invariant is violated (would lose work).
+    Task<bool> EvictAsync(string workUnitId, CancellationToken ct = default);
+
+    // Scan all work units and evict branch directories for terminal work units that satisfy
+    // the safe eviction invariant. Failed/DeadLettered dirs are preserved for inspection.
+    // Returns count of directories evicted.
+    Task<int> EvictOrphanedAsync(CancellationToken ct = default);
+
+    // Returns all blob hashes currently referenced by any repository snapshot or pending op.
+    // Used by the host-layer blob GC coordinator (FileBlobGcCoordinator) to determine which
+    // blobs in the CAS store are safe to tombstone/delete.
+    Task<IReadOnlySet<string>> GetLiveBlobHashesAsync(CancellationToken ct = default);
+}
+
+// Phase 10 — pluggable merge strategy. Strategies are tried in registration order by
+// IConflictResolutionService; each returns Success=false to hand off to the next.
+public interface IMergeStrategy
+{
+    string Name { get; }
+    Task<MergeStrategyResult> MergeAsync(MergeContext context, CancellationToken ct = default);
+}
+
+// Phase 10 — LLM-backed merge content generation. Defined in Core so Merge project can
+// depend on it; implemented in AgentRuntime where LlmClient lives.
+public interface ILlmMergeProvider
+{
+    Task<string?> MergeAsync(MergeContext context, CancellationToken ct = default);
+}
+
+// Phase 10 — syntax validation for the merged output. Defined in Core; implemented in
+// Storage (which already has Roslyn) so the AstMergeStrategy in Merge can inject it.
+public interface ISourceValidator
+{
+    bool IsValidSyntax(string content, string path);
+}
+
+// Phase 10 — orchestrates the strategy chain. Reads blob content, tries strategies in
+// order, emits a RepositoryOperation for the merged result, marks the conflict Resolved.
+public interface IConflictResolutionService
+{
+    // preferredStrategy: null = auto (try all in order), or strategy Name to try only that one.
+    // llmCredentials: required only when the LLM strategy will run (auto or preferredStrategy="llm").
+    Task<ConflictResolutionResult> ResolveAsync(
+        string conflictId, string? preferredStrategy = null,
+        LlmMergeCredentials? llmCredentials = null, CancellationToken ct = default);
+}
+
+// Phase 11.5 — co-modification frequency analysis over the RepositoryOp log.
+public interface ICoModService
+{
+    // Recompute pairwise co-modification frequencies for all work units in the repository,
+    // persist results as CoModPatternV1 nodes, and return the full pattern set.
+    Task<IReadOnlyList<CoModificationPattern>> ComputeAsync(string repositoryId, CancellationToken ct = default);
+
+    // Return the last-computed pattern set without recomputing.
+    Task<IReadOnlyList<CoModificationPattern>> GetAsync(string repositoryId, CancellationToken ct = default);
+
+    // Return patterns where PathA or PathB matches any of the provided prefix-expanded paths
+    // at or above minConfidence. Paths here are exact file paths (callers must expand globs).
+    Task<IReadOnlyList<CoModificationPattern>> GetForPathsAsync(
+        string repositoryId, IReadOnlyList<string> paths,
+        double minConfidence = 0.6, CancellationToken ct = default);
 }
 
 public sealed record WorkspaceStatusFileChange(
@@ -1762,3 +1952,43 @@ public interface IExperimentService
     Task<ConvergenceResult> ConvergeAsync(
         string parentWorkUnitId, string winnerWorkUnitId, string? rationale, CancellationToken ct = default);
 }
+
+// Phase 14 — Git as Import/Export Adapter.
+// Import: walks the git tree at a specific commit (or HEAD), writes blobs to CAS, emits
+//   Import RepositoryOps, and returns the SnapshotId of the resulting RepositorySnapshot.
+// Export: materializes a RepositorySnapshot to the target working tree. Whether an actual git
+//   commit is created depends on WorkspaceOptions.AllowAgentGitCommits (default: false).
+public interface IGitAdapter
+{
+    // gitRepoPath: the local path to the .git directory or working tree root.
+    // commitSha: the commit to import; null = HEAD.
+    // repositoryId: the studio repository ID to associate ops and the snapshot with.
+    // Returns the SnapshotId created from the import.
+    Task<string> ImportAsync(
+        string gitRepoPath, string? commitSha, string repositoryId, CancellationToken ct = default);
+
+    // Materializes a snapshot to targetGitRepoPath. When AllowAgentGitCommits = false (default),
+    // files are written to disk but no git commit is created (CommitSha = null on result).
+    // When true, a commit is created on branchName and CommitSha is set.
+    // When AllowAgentGitPush is also true, shells out `git push origin {branchName}`.
+    Task<GitExportResult> ExportAsync(
+        string repositoryId, string? snapshotId, string targetGitRepoPath,
+        string branchName, CancellationToken ct = default);
+
+    // Create a git branch in an existing local repository. fromRef defaults to HEAD.
+    // Returns the full SHA of the commit the new branch points to.
+    Task<string> CreateGitBranchAsync(
+        string gitRepoPath, string branchName, string? fromRef = null,
+        bool checkout = false, CancellationToken ct = default);
+}
+
+public sealed record GitExportResult(
+    string RepositoryId,
+    string SnapshotId,
+    string TargetPath,
+    string BranchName,
+    bool Committed,
+    string? CommitSha,
+    bool Pushed = false,
+    string? PushOutput = null,
+    string? Message = null);

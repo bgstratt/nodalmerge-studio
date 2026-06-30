@@ -864,6 +864,8 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IInlineReviewerService, InlineReviewerService>();
         // Slice 21/22 — reactive domain agents, disabled by default (WorkspaceOptions.EnabledDomainAgents).
         services.AddSingleton<IDomainAgentTriggerService, DomainAgentTriggerService>();
+        // Phase 10 — LLM-backed merge provider (sits inside AgentRuntime where LlmClient lives).
+        services.AddSingleton<ILlmMergeProvider, LlmMergeProvider>();
         return services;
     }
 }

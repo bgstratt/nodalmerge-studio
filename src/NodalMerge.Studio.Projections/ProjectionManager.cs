@@ -28,6 +28,9 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly IWorkspaceProfileService? _workspaceProfiles;
     private readonly IExecutionSessionService? _sessions;
     private readonly IStudioNodeStore? _nodeStore;
+    private readonly IRepositoryOpService? _repositoryOps;
+    private readonly WorkspaceOptions? _workspaceOptions;
+    private readonly ICoModService? _coMod;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
@@ -45,7 +48,10 @@ public sealed class ProjectionManager : IProjectionManager
         IFileWorkspaceService? fileWorkspace = null,
         IWorkspaceProfileService? workspaceProfiles = null,
         IExecutionSessionService? sessions = null,
-        IStudioNodeStore? nodeStore = null)
+        IStudioNodeStore? nodeStore = null,
+        IRepositoryOpService? repositoryOps = null,
+        WorkspaceOptions? workspaceOptions = null,
+        ICoModService? coMod = null)
     {
         _workUnits          = workUnits;
         _tasks              = tasks;
@@ -63,6 +69,9 @@ public sealed class ProjectionManager : IProjectionManager
         _workspaceProfiles  = workspaceProfiles;
         _sessions           = sessions;
         _nodeStore          = nodeStore;
+        _repositoryOps      = repositoryOps;
+        _workspaceOptions   = workspaceOptions;
+        _coMod              = coMod;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -383,13 +392,80 @@ public sealed class ProjectionManager : IProjectionManager
             catch { /* best-effort — never fail a projection for profile data */ }
         }
 
+        // ── Phase 4.5 — recent op history for the work unit's file scope ────────
+        IReadOnlyList<FileOpHistory>? recentFileOps = null;
+        if (_repositoryOps is not null && wu is not null && wu.FileScope.Count > 0
+            && !string.IsNullOrEmpty(_workspaceOptions?.SeedRepositoryPath))
+        {
+            try
+            {
+                var repositoryId = Path.GetFullPath(_workspaceOptions.SeedRepositoryPath);
+                var ops = await _repositoryOps
+                    .GetRecentOpsForPathsAsync(repositoryId, wu.FileScope, limit: 5, ct)
+                    .ConfigureAwait(false);
+
+                if (ops.Count > 0)
+                {
+                    // Denormalize WorkUnitGoal per distinct WorkUnitId (one lookup each).
+                    var goalCache = new Dictionary<string, string?>(StringComparer.Ordinal);
+                    foreach (var op in ops.Where(o => o.WorkUnitId is not null))
+                    {
+                        if (!goalCache.ContainsKey(op.WorkUnitId!))
+                        {
+                            var ownerWu = await _workUnits.GetAsync(op.WorkUnitId!, ct).ConfigureAwait(false);
+                            goalCache[op.WorkUnitId!] = ownerWu?.Goal;
+                        }
+                    }
+
+                    recentFileOps = ops
+                        .GroupBy(o => o.Path)
+                        .Select(g => new FileOpHistory(
+                            g.Key,
+                            g.Select(o => new FileOpSummary(
+                                o.OperationId,
+                                o.WorkUnitId,
+                                o.WorkUnitId is not null ? goalCache.GetValueOrDefault(o.WorkUnitId) : null,
+                                o.AgentId,
+                                o.Kind.ToString(),
+                                o.Reason,
+                                o.Timestamp))
+                             .ToList()))
+                        .ToList();
+                }
+            }
+            catch { /* best-effort — never fail a projection for op history */ }
+        }
+
+        // ── Phase 11.5 — co-modification hints for the work unit's file scope ────
+        IReadOnlyList<CoModHint>? coModHints = null;
+        if (_coMod is not null && wu is not null && wu.FileScope.Count > 0
+            && !string.IsNullOrEmpty(_workspaceOptions?.SeedRepositoryPath))
+        {
+            try
+            {
+                var repositoryId = Path.GetFullPath(_workspaceOptions.SeedRepositoryPath);
+                // Expand glob patterns (e.g. "src/Auth/**") to snapshot-level exact paths by
+                // prefix-matching the scope against co-mod pattern paths. We pass the expanded
+                // scope prefixes rather than raw globs so GetForPathsAsync can do exact matching.
+                var scopePrefixes = ExpandGlobsToPathPrefixes(wu.FileScope);
+                var patterns = await _coMod
+                    .GetForPathsAsync(repositoryId, scopePrefixes, minConfidence: 0.6, ct)
+                    .ConfigureAwait(false);
+                if (patterns.Count > 0)
+                    coModHints = patterns.Select(p => new CoModHint(p.PathA, p.PathB, p.Confidence)).ToList();
+            }
+            catch { /* best-effort */ }
+        }
+
         var payload = new AgentWorkspaceProjectionPayload(
             request.AgentId,
             workUnitId,
             new ArtifactChain(combined),
             inheritedConstraints,
             execution,
-            roots);
+            roots,
+            recentFileOps,
+            coModHints);
 
         return Serialize(payload);
     }
@@ -1268,6 +1344,20 @@ public sealed class ProjectionManager : IProjectionManager
     }
 
     private static string Serialize(object data) => JsonSerializer.Serialize(data, JsonOptions);
+
+    // Converts FileScope glob patterns to path prefixes for co-mod hint lookup.
+    // "src/Auth/**" and "src/Auth/*.cs" → "src/Auth"; "src/Auth/User.cs" → "src/Auth/User.cs".
+    private static IReadOnlyList<string> ExpandGlobsToPathPrefixes(IReadOnlyList<string> fileScope)
+    {
+        var result = new List<string>(fileScope.Count);
+        foreach (var pattern in fileScope)
+        {
+            var prefix = pattern.TrimEnd('/').TrimEnd('*').TrimEnd('/');
+            if (prefix.Length > 0)
+                result.Add(prefix);
+        }
+        return result;
+    }
 }
 
 public static class ServiceCollectionExtensions

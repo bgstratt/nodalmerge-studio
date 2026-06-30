@@ -48,8 +48,13 @@ export class ModelAgentStudioPanel {
   activate(): void {
     void this.sendConfig();
     void this.sendParticipants();
-    // Poll participants every 10 s while the panel is visible.
-    const timer = setInterval(() => void this.sendParticipants(), 10_000);
+    // Poll participants every 10 s and re-send config every 30 s so domain agents and pipeline
+    // profiles always appear even if the server wasn't ready on the initial activate() call.
+    let tick = 0;
+    const timer = setInterval(() => {
+      void this.sendParticipants();
+      if (++tick % 3 === 0) { void this.sendConfig(); }
+    }, 10_000);
     this.panel.onDidDispose(() => clearInterval(timer));
   }
 
@@ -63,7 +68,6 @@ export class ModelAgentStudioPanel {
 
   private async sendConfig(): Promise<void> {
     let pipelineProfiles: PipelineProfile[] = [];
-    let usePromotionBranch = false;
     let domainAgents: DomainAgentInfo[] = [];
     let enabledDomainAgents: string[] = [];
     try {
@@ -71,8 +75,7 @@ export class ModelAgentStudioPanel {
         this.get<PipelineProfile[]>('/studio/agent-profiles'),
         this.get<DomainAgentInfo[]>('/studio/domain-agents'),
       ]);
-      const opts = await this.get<{ usePromotionBranch?: boolean; enabledDomainAgents?: string[] }>('/studio/options');
-      usePromotionBranch = opts.usePromotionBranch ?? false;
+      const opts = await this.get<{ enabledDomainAgents?: string[] }>('/studio/options');
       enabledDomainAgents = opts.enabledDomainAgents ?? [];
     } catch { /* server may not be running yet */ }
     void this.panel.webview.postMessage({
@@ -82,7 +85,6 @@ export class ModelAgentStudioPanel {
       defaultTopology:      this.configService.getDefaultTopology(),
       defaultReviewPolicy:  this.configService.getDefaultReviewPolicy(),
       pipelineProfiles,
-      usePromotionBranch,
       domainAgents,
       enabledDomainAgents,
     });
@@ -161,16 +163,15 @@ export class ModelAgentStudioPanel {
 
       case 'saveSessionDefaults': {
         const policy = msg.defaultReviewPolicy as string;
-        const usePromotionBranch = !!(msg.usePromotionBranch as boolean);
         const enabledDomainAgents = (msg.enabledDomainAgents as string[] | undefined) ?? [];
         if (policy) {
           await this.configService.saveDefaultReviewPolicy(policy);
         }
         try {
           const currentOpts = await this.get<Record<string, unknown>>('/studio/options');
-          await this.post('/studio/options', { ...currentOpts, usePromotionBranch, enabledDomainAgents });
+          await this.post('/studio/options', { ...currentOpts, enabledDomainAgents });
         } catch { /* host may not be running */ }
-        void this.panel.webview.postMessage({ type: 'sessionDefaults', defaultReviewPolicy: policy, usePromotionBranch, enabledDomainAgents });
+        void this.panel.webview.postMessage({ type: 'sessionDefaults', defaultReviewPolicy: policy, enabledDomainAgents });
         void vscode.window.showInformationMessage('NodalMerge: Session defaults saved.');
         break;
       }
@@ -188,17 +189,6 @@ export class ModelAgentStudioPanel {
         break;
       }
 
-      case 'promoteToMain': {
-        try {
-          await this.post('/studio/branches/candidate/promote', {});
-          void vscode.window.showInformationMessage('NodalMerge: Candidate branch promoted to main.');
-          void this.panel.webview.postMessage({ type: 'promoteDone', success: true });
-        } catch (err) {
-          void vscode.window.showErrorMessage('NodalMerge: Promotion failed — ' + String(err));
-          void this.panel.webview.postMessage({ type: 'promoteDone', success: false });
-        }
-        break;
-      }
     }
   }
 
@@ -505,20 +495,12 @@ const MAS_HTML = `
         </select>
       </div>
       <div class="field">
-        <label>Promotion Branch</label>
-        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-          <input type="checkbox" id="use-promotion-branch">
-          Use candidate branch — agents never write to main directly
-        </label>
-      </div>
-      <div class="field">
         <label>Domain Agents</label>
         <p class="sub">Reactive observers that watch recorded Research/Decision/Constraint artifacts and may propose a Constraint back — they never own task lifecycle. Off by default.</p>
         <div id="domain-agent-toggles"></div>
       </div>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
         <button id="btn-save-session-defaults">Save Session Defaults</button>
-        <button id="btn-promote-to-main" disabled>↑ Promote to Main</button>
       </div>
       <span id="session-defaults-status" class="status"></span>
     </div>
@@ -949,7 +931,6 @@ const MAS_JS = `
   });
 
   // ── Session Defaults ──────────────────────────────────────────────────────
-  var usePromotionBranch = false;
   var domainAgents = [];
   var enabledDomainAgents = [];
 
@@ -965,33 +946,18 @@ const MAS_JS = `
     }).join('');
   }
 
-  document.getElementById('use-promotion-branch').addEventListener('change', function() {
-    usePromotionBranch = this.checked;
-    var promBtn = document.getElementById('btn-promote-to-main');
-    if (promBtn) { promBtn.disabled = !usePromotionBranch; }
-  });
-
   document.getElementById('btn-save-session-defaults').addEventListener('click', function() {
     var sel = document.getElementById('default-review-policy');
     var reviewPolicy = sel ? sel.value : 'HumanRequired';
-    var cb = document.getElementById('use-promotion-branch');
-    var promotionEnabled = cb ? cb.checked : false;
     var checkedAgents = Array.prototype.slice.call(document.querySelectorAll('.domain-agent-toggle:checked'))
       .map(function(el) { return el.getAttribute('data-name'); });
     vscode.postMessage({
       type: 'saveSessionDefaults',
       defaultReviewPolicy: reviewPolicy,
-      usePromotionBranch: promotionEnabled,
       enabledDomainAgents: checkedAgents,
     });
     var statusEl = document.getElementById('session-defaults-status');
     if (statusEl) { statusEl.textContent = 'Saved.'; setTimeout(function() { statusEl.textContent = ''; }, 2000); }
-  });
-
-  document.getElementById('btn-promote-to-main').addEventListener('click', function() {
-    this.disabled = true;
-    this.textContent = 'Promoting…';
-    vscode.postMessage({ type: 'promoteToMain' });
   });
 
   // ── Pipeline Profiles ─────────────────────────────────────────────────────
@@ -1141,13 +1107,6 @@ const MAS_JS = `
       renderPipelineProfiles();
       var rpSel = document.getElementById('default-review-policy');
       if (rpSel && msg.defaultReviewPolicy) { rpSel.value = msg.defaultReviewPolicy; }
-      if (typeof msg.usePromotionBranch !== 'undefined') {
-        usePromotionBranch = !!msg.usePromotionBranch;
-        var cb = document.getElementById('use-promotion-branch');
-        if (cb) { cb.checked = usePromotionBranch; }
-        var promBtn = document.getElementById('btn-promote-to-main');
-        if (promBtn) { promBtn.disabled = !usePromotionBranch; }
-      }
       domainAgents = msg.domainAgents || [];
       enabledDomainAgents = msg.enabledDomainAgents || [];
       renderDomainAgentToggles();
@@ -1165,26 +1124,9 @@ const MAS_JS = `
     if (msg.type === 'sessionDefaults') {
       var sel = document.getElementById('default-review-policy');
       if (sel && msg.defaultReviewPolicy) { sel.value = msg.defaultReviewPolicy; }
-      if (typeof msg.usePromotionBranch !== 'undefined') {
-        usePromotionBranch = !!msg.usePromotionBranch;
-        var sdCb = document.getElementById('use-promotion-branch');
-        if (sdCb) { sdCb.checked = usePromotionBranch; }
-        var sdPromBtn = document.getElementById('btn-promote-to-main');
-        if (sdPromBtn) { sdPromBtn.disabled = !usePromotionBranch; }
-      }
       if (msg.enabledDomainAgents) {
         enabledDomainAgents = msg.enabledDomainAgents;
         renderDomainAgentToggles();
-      }
-      return;
-    }
-    if (msg.type === 'promoteDone') {
-      var promBtn2 = document.getElementById('btn-promote-to-main');
-      if (promBtn2) { promBtn2.disabled = !usePromotionBranch; promBtn2.textContent = '\\u2191 Promote to Main'; }
-      var sdStatus = document.getElementById('session-defaults-status');
-      if (sdStatus) {
-        sdStatus.textContent = msg.success ? 'Promoted to main.' : 'Promotion failed.';
-        setTimeout(function() { sdStatus.textContent = ''; }, 3000);
       }
       return;
     }

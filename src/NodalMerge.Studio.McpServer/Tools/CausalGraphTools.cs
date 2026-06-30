@@ -1,19 +1,27 @@
 using System.ComponentModel;
 using System.Text.Json;
+using Microsoft.Extensions.DependencyInjection;
 using ModelContextProtocol.Server;
 using NodalMerge.Studio.Contracts.Versioning;
 using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
+// Deferred FFI init: IStudioCausalGraphService resolves RuntimeCausalGraphService which resolves
+// IRuntimeCommandBridge → FfiBridgeProcessor → HostFfiClient → native P/Invoke. Injecting
+// IServiceProvider instead of the service directly prevents the FFI DLL from being loaded at
+// MCP tool-class construction time (which happens eagerly during app startup).
 [McpServerToolType]
-public sealed class CausalGraphTools(IStudioCausalGraphService causal)
+public sealed class CausalGraphTools(IServiceProvider services)
 {
+    private IStudioCausalGraphService Causal =>
+        services.GetRequiredService<IStudioCausalGraphService>();
+
     [McpServerTool(Name = McpToolNames.CausalGetFrontier)]
     [Description("Get the current CRDT frontier heads for the studio room. Returns the set of tip node IDs that represent the leading edge of the causal graph after checkpoint promotion.")]
     public async Task<string> GetFrontierAsync(CancellationToken cancellationToken = default)
     {
-        var heads = await causal.GetFrontierAsync(cancellationToken).ConfigureAwait(false);
+        var heads = await Causal.GetFrontierAsync(cancellationToken).ConfigureAwait(false);
         return JsonSerializer.Serialize(new
         {
             frontierHeads = heads,
@@ -32,7 +40,7 @@ public sealed class CausalGraphTools(IStudioCausalGraphService causal)
             return McpJson.Error(McpToolNames.CausalGetParents, "nodeIdHex must be a 64-character lowercase hex string.");
         }
 
-        var result = await causal.GetCausalParentsAsync(nodeIdHex, cancellationToken).ConfigureAwait(false);
+        var result = await Causal.GetCausalParentsAsync(nodeIdHex, cancellationToken).ConfigureAwait(false);
         return JsonSerializer.Serialize(new
         {
             nodeIdHex,
@@ -45,7 +53,7 @@ public sealed class CausalGraphTools(IStudioCausalGraphService causal)
     [Description("Get the canonical resolution of the studio CRDT graph — the merged key/value state after resolving all causal conflicts. Values are base64-encoded bytes.")]
     public async Task<string> GetCanonicalResolutionAsync(CancellationToken cancellationToken = default)
     {
-        var result = await causal.GetCanonicalResolutionAsync(cancellationToken).ConfigureAwait(false);
+        var result = await Causal.GetCanonicalResolutionAsync(cancellationToken).ConfigureAwait(false);
         return JsonSerializer.Serialize(new
         {
             entries = result.Entries.Select(e => new { key = e.Key, valueBytesB64 = e.ValueBytesB64 }),
@@ -59,7 +67,7 @@ public sealed class CausalGraphTools(IStudioCausalGraphService causal)
         [Description("Array of node ID hex strings the peer already has.")] string[] peerNodeIdsHex,
         CancellationToken cancellationToken = default)
     {
-        var result = await causal.ComputeSyncDiffAsync(peerNodeIdsHex, cancellationToken).ConfigureAwait(false);
+        var result = await Causal.ComputeSyncDiffAsync(peerNodeIdsHex, cancellationToken).ConfigureAwait(false);
         return JsonSerializer.Serialize(new
         {
             onlyInServer = result.OnlyInServer,

@@ -19,7 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" />
+    <PackageReference Include="SourceGear.SQLite3" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('$(NodalMergeDotNetHostProject)')">

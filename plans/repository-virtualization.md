@@ -110,22 +110,20 @@ WorkUnitId       string?   // which work unit produced this snapshot, if any
 `TreeHash` gives O(1) repository equality. Two snapshots with the same TreeHash are identical
 regardless of which op chains produced them.
 
-### BlobIndex
+### BlobIndex — DROPPED
 
-```
-BlobHash         string
-SizeBytes        long
-ReferenceCount   int
-RepositoryIds    string[]
-SnapshotIds      string[]
-WorkUnitIds      string[]
-LastAccessedAt   DateTimeOffset
-Pinned           bool      // never evict (approved/merged proposals set this)
-```
+Reference counting was planned but not built. Phase 8 implements scan-based GC instead: collect
+all blob hashes across every `RepositorySnapshotV1` node's `TreeEntries` plus every
+`RepositoryOpV1` node's `NewBlobId`/`OldBlobId`, then delete anything not in that set.
 
-The CAS intentionally knows nothing beyond hash → bytes. The BlobIndex is the reference-tracking
-layer that makes safe garbage collection possible. It lives in the studio node store alongside
-other entity metadata.
+This is provably correct: if a blob has no referrer in any snapshot or op, it is truly orphaned
+regardless of how it got there. The crash case (blob written, process dies before op is recorded)
+is also correct — the op that would have pointed to it doesn't exist, so the data is unrecoverable
+anyway; GC'ing the orphaned blob is the right outcome.
+
+Reference counting buys O(1) GC lookup instead of O(snapshots × entries). At the scale this
+system operates, the scan is fast enough. The feature is formally dropped; the scan-based approach
+in `WorkspaceCacheManager.GetLiveBlobHashesAsync` is the permanent implementation.
 
 ### Repository Room
 
@@ -151,18 +149,25 @@ would pollute the studio room's snapshot load if co-located. The studio room ret
 
 ## Milestones
 
-### Milestone 1 — Record (non-breaking)
+### Milestone 1 — Record (non-breaking) ✅ COMPLETE
 
 Introduce the CAS and RepositoryOp infrastructure. All existing file writes continue to work.
 Nothing breaks. The system begins building an immutable history as a side effect of normal operation.
 
 **Phases:**
-- [Phase 0](#phase-0--model-and-bounded-context) — Define the Repository bounded context
-- [Phase 1](#phase-1--content-addressable-storage) — CAS abstraction + local implementation
-- [Phase 3](#phase-3--repository-operations) — RepositoryOperation nodes
-- [Phase 4](#phase-4--filesystem-compatibility-layer) — Dual-write (file + op)
-- [Phase 4.5](#phase-45--op-history-in-agent-projections) — Op history surfaced in `AgentWorkspaceProjectionPayload`
-- [Phase 5](#phase-5--user-workspace-import) — User edits become imported RepositoryOps
+- ✅ [Phase 0](#phase-0--model-and-bounded-context) — Define the Repository bounded context
+- ✅ [Phase 1](#phase-1--content-addressable-storage) — CAS abstraction + local implementation
+- ✅ [Phase 3](#phase-3--repository-operations) — RepositoryOperation nodes
+- ✅ [Phase 4](#phase-4--filesystem-compatibility-layer) — Dual-write (file + op)
+- ✅ [Phase 4.5](#phase-45--op-history-in-agent-projections) — Op history surfaced in `AgentWorkspaceProjectionPayload`
+- ✅ [Phase 5](#phase-5--user-workspace-import) — User edits become imported RepositoryOps
+
+**Implementation notes:**
+- SHA256 used throughout C# layer instead of Blake3 (Blake3 is Rust-only; not exposed to C#)
+- Phase 5 Case 2 (between-run sync) moved to Milestone 2 — requires Phase 2 snapshot infrastructure
+- `RepositoryId` is `Path.GetFullPath(SeedRepositoryPath)` — single active repo per Studio instance
+  until real multi-repo support is built (see `Repository.cs` doc comment)
+- `WorkspacePathFilter` extracted as internal shared utility; `.nodalmerge` added to `IgnoredDirNames`
 
 **Exit criteria:** Every file write produces a RepositoryOp node. The full op log is replayable.
 An agent assigned to a file scope receives the recent op history for those paths — who changed
@@ -177,13 +182,14 @@ Introduce snapshots and the materializer. Workspace directories become cache ent
 safely evicted and rebuilt on demand. The BlobIndex enables safe garbage collection.
 
 **Phases:**
-- [Phase 2](#phase-2--repository-snapshot-model) — Snapshot nodes + TreeHash
-- [Phase 6](#phase-6--snapshot-compaction) — Compaction (event-sourcing pattern)
-- [Phase 7](#phase-7--materialization-engine) — Materializer (snapshots + CAS → filesystem)
-- [Phase 8](#phase-8--workspace-cache-manager) — Eviction policies + BlobIndex GC
+- ✅ [Phase 2](#phase-2--repository-snapshot-model) — Snapshot nodes + TreeHash + Phase 5 Case 2 (between-run sync)
+- ✅ [Phase 6](#phase-6--snapshot-compaction) — Compaction (event-sourcing pattern)
+- ✅ [Phase 7](#phase-7--materialization-engine) — Materializer (snapshots + CAS → filesystem)
+- ✅ [Phase 8](#phase-8--workspace-cache-manager) — Eviction policies + BlobIndex GC
 
 **Exit criteria:** `rm -rf` on any workspace directory is safe at any time. Materializer
-reconstructs it from snapshot + CAS. Disk accumulation problem is solved.
+reconstructs it from snapshot + CAS. Disk accumulation problem is solved. Between-run user edits
+are detected and emitted as RepositoryOps before each goal run (Phase 5 Case 2).
 
 ---
 
@@ -192,11 +198,17 @@ reconstructs it from snapshot + CAS. Disk accumulation problem is solved.
 Workspace directories stop being the source of truth. Conflicts are structural. Materialization
 is scoped to the agent's owned paths.
 
-**Phases:**
-- [Phase 9](#phase-9--conflict-engine) — Structural conflict detection via blob ancestry
-- [Phase 10](#phase-10--intelligent-merge) — Merge strategies as RepositoryOps
-- [Phase 11](#phase-11--projection-aware-materialization) — Partial materialization by file scope
-- [Phase 11.5](#phase-115--co-modification-intelligence) — Co-modification patterns as planner hints and Findings
+**Phases (implementation order):**
+- ✅ [Phase 9](#phase-9--conflict-engine) — Structural conflict detection via blob ancestry
+- ✅ [Phase 11](#phase-11--projection-aware-materialization) — Partial materialization by file scope
+- ✅ [Phase 11.5](#phase-115--co-modification-intelligence) — Co-modification patterns as planner hints and Findings
+- ✅ [Phase 10](#phase-10--intelligent-merge) — Merge strategies as RepositoryOps (last: most complex, depends on 9 being stable)
+
+**Implementation order rationale:** Phase 11 (partial materialization) and 11.5 (co-mod intel)
+have zero dependency on conflict detection and deliver independent value. Phase 10's merge
+strategies — especially AST merge via Roslyn — are Milestone 3's most complex work and benefit
+from everything else being stable. `NonOverlappingFileScopeRule` is kept alive through Phase 9
+and deprecated only once Phase 10's resolution path is end-to-end.
 
 **Exit criteria:** Two agents writing to overlapping paths produce a detectable DAG fork at
 emit time, not at merge time. `FileLeaseService` is deprecated. Agents never materialize more
@@ -210,12 +222,23 @@ accumulated op log, and the Finding system surfaces anomalous patterns.
 CAS is pluggable. Agents can operate without a materialized filesystem. Git is an adapter.
 
 **Phases:**
-- [Phase 12](#phase-12--tool-virtualization) — Repository-aware agent tools without filesystem dependency
-- [Phase 13](#phase-13--remote-repository-rooms) — CAS backends (S3, Azure Blob, cloud cache)
-- [Phase 14](#phase-14--git-as-importexport-adapter) — Git becomes boundary adapter only
+- ✅ [Phase 12](#phase-12--tool-virtualization) — Repository-aware agent tools without filesystem dependency
+- ✅ [Phase 13](#phase-13--remote-repository-rooms) — CAS backends (S3, Azure Blob, cloud cache)
+- ✅ [Phase 14](#phase-14--git-as-importexport-adapter) — Git becomes boundary adapter only
 
 **Exit criteria:** A worker agent can read and write files entirely through CAS-backed tools
 without a materialized directory. Git is used only on import and export.
+
+**Post-M4 additions (same session):**
+- MCP HTTP server tool parity: `McpServer/Tools/RepositoryBlobTools.cs` exposes all four
+  Phase 12 blob tools (`nm_v1_repository_blob_*`) to external harnesses (Copilot, Cline, etc.)
+  with the same semantics as the internal dispatcher.
+- `GET /studio/startup-config` — returns settings file path, effective CAS/blob backend values,
+  and copy-paste JSON snippets for all startup-only config (CasRootPath, BlobStorageProvider).
+- `GET /POST /studio/options` expanded: now includes `blockConflictingOps`,
+  `materializerConcurrency`, `snapshots.{snapshotOnSync, opsPerSnapshot}`,
+  `docFetchAllowedDomains`, `docFetchDeniedDomains`, `allowAgentGitCommits`, `allowAgentGitPush`.
+- Git commit/push opt-in flags added to `WorkspaceOptions` and persisted via `RuntimeSettingsService`.
 
 ---
 
@@ -409,313 +432,470 @@ human edits imported in Phase 5 also appear in the projection history, not just 
 
 ### Phase 5 — User Workspace Import
 
-This phase handles two distinct cases: **initial bootstrap** (first ever goal run for this
-repository) and **between-run sync** (user edits made directly to the repo between goal runs).
-Both paths run at the same trigger point — goal start — before any agent is assigned a branch.
+This phase handles the **initial bootstrap** — the first ever goal run for this repository, when
+no `RepositorySnapshot` exists. It runs at goal start (inside `RepositorySyncService`), before
+any agent is assigned a branch.
 
 **Case 1 — Bootstrap (no prior `RepositorySnapshot` exists for this repository):**
 
-1. Walk every non-ignored file in `SeedRepositoryPath`
-2. Write each file's content to CAS via `IBlobStoreProvider.PutBlobAsync(Blake3(content), ...)`
+1. Walk every non-ignored file in `SeedRepositoryPath` (skip `.git/`, `node_modules/`, `bin/`,
+   `obj/`, `.nodalmerge/`, and Studio-internal paths)
+2. For each file: write content to CAS via `IBlobStoreProvider.PutBlobAsync(SHA256(content), ...)`
+   (SHA256 — Blake3 is Rust-only; C# layer uses SHA256 throughout)
 3. Emit a `RepositoryOp` of type `Import` for each file (`OldBlobId = null`, `NewBlobId = hash`)
-4. Record a `GitImportSnapshot` node with `BaseSnapshotId = null`, `Generation = 0`, and
-   `GitCommit` set to the current HEAD (if available). This is the root of the entire op lineage.
+4. Compute a `TreeHash` from a sorted list of `"{path}:{blobId}\n"` pairs (SHA256 of concatenated
+   entries), then record a `RepositorySnapshotV1` node with `BaseSnapshotId = null`,
+   `Generation = 0`, and `GitCommit` set to the current HEAD (if available). This is the root of
+   the entire op lineage.
 
-This runs once per repository, the first time `InitBranchAsync` is called. Subsequent goal runs
-skip to Case 2.
+Bootstrap runs exactly once per repository lifetime — checked via "does any `RepositorySnapshotV1`
+node exist for this `repositoryId`?" in the node store. Once the snapshot node is written,
+subsequent goal runs see the snapshot and skip to Case 2.
 
 **Case 2 — Between-run sync (snapshot exists, user may have edited files directly):**
 
-`RepositorySyncService` (currently diffs filesystem against repo for sync-state tracking) evolves
-to compare each file in `SeedRepositoryPath` against its expected `blobId` in the latest
-`RepositorySnapshot`:
+*Moved to Milestone 2.* This case requires the Phase 2 snapshot infrastructure (stored path→blobId
+map) to efficiently diff the filesystem against the snapshot. It is implemented as part of Phase 2
+once that infrastructure exists.
 
-1. Files whose content hash matches the snapshot: skip
-2. Files added since the snapshot: emit `Add` op, write blob to CAS
-3. Files modified since the snapshot: emit `Replace` op (`OldBlobId = snapshot's hash`), write new blob
-4. Files deleted since the snapshot: emit `Delete` op (`NewBlobId = null`)
-5. After all ops: emit a new `RepositorySnapshot` tagged `source: ImportedFromFilesystem`
-
-Agents only start after this sync completes. The diff their projection shows is relative to this
-freshly-created snapshot, not the stale one.
-
-**Watcher integration (longer term):** A filesystem watcher on `SeedRepositoryPath` emits ops
-as the user saves files, rather than only at goal start. The snapshot advances incrementally.
-This is the point at which the user's filesystem is truly just another client of the DAG.
+**Out of scope for this plan — Continuous watcher:** A filesystem watcher on `SeedRepositoryPath`
+could emit ops as the user saves files, rather than only at goal start, advancing the snapshot
+incrementally between goals. This is a natural follow-on but is not part of any phase here.
 
 ---
 
-### Phase 6 — Snapshot Compaction
+### Phase 6 — Snapshot Compaction ✅ COMPLETE
 
 Replaying 50,000 ops from the git import baseline is impractical. Snapshots are the compaction
 boundary — the same pattern as event-sourcing's checkpoint.
 
-**Policy:** Emit a snapshot after every N ops (configurable; default 500) or after every work
-unit that produces at least one op. Neither is exact — the trigger is "ops since last snapshot
-exceeds threshold at work unit completion."
+**Policy:** `OpsPerSnapshot` threshold in `WorkspaceOptions.Snapshots` (null by default — opt-in).
+When set, `IRepositorySnapshotService.ConsiderCompactionAsync` checks op count since the last
+snapshot and creates a `"Compaction"` snapshot if the threshold is met. Called at the start of
+`RepositoryImportService.EnsureBootstrappedAsync` so mid-goal agent writes are compacted before
+the between-run filesystem sync runs. Per-work-unit-completion trigger deferred to Phase 7.
 
-**Replay from snapshot:** Load the snapshot's TreeHash (the `path → blobId` map is stored in
-the snapshot node), then apply only the ops since that snapshot. Fast startup; bounded replay.
+**Replay via `ApplyOps`:** `InMemoryRepositorySnapshotService.ApplyOps` replays a chronologically
+ordered op list onto a base `TreeEntries` dict. Add/Replace/Import → set path. Delete → remove.
+Rename/Move reserved for Phase 10.
 
-**Retention:** Snapshots corresponding to approved or merged proposals are pinned
-(`BlobIndex.Pinned = true`). Intermediate snapshots are eligible for compaction once a newer
-snapshot in the same lineage exists and the intermediate one is not pinned.
+**`GetOpsSinceAsync`:** `InMemoryRepositoryOpService` maintains a second `_byRepository` index
+alongside the path-keyed index. O(n) filter by Timestamp — fast in practice (n ≤ OpsPerSnapshot).
 
----
-
-### Phase 7 — Materialization Engine
-
-```
-IMaterializationEngine
-
-MaterializeAsync(snapshotId, targetPath, fileScope?)
-RematerializeAsync(snapshotId, previousSnapshotId, targetPath, fileScope?)
-```
-
-**Algorithm:**
-1. Load snapshot's `path → blobId` map
-2. If `fileScope` provided, filter to matching paths only
-3. For each path: check if file at `targetPath` already matches `blobId` (skip if so)
-4. For mismatched/missing files: fetch blob via `IBlobStoreProvider.TryGetBlobAsync`, write to `targetPath`
-5. Delete files in `targetPath` not present in the snapshot (and in scope)
-
-**Optimizations (in order of impact):**
-- Skip files already matching the expected blob hash (cheap hash check vs. full read)
-- Parallel blob reads (bounded concurrency; CAS reads are independent)
-- Hardlinks or reflinks where the OS supports them (Windows: reflinks on ReFS, symlinks as fallback)
-- `RematerializeAsync` diffs two snapshots and only touches changed paths
+**Retention/pinning:** Deferred to Phase 8 (BlobIndex GC). Intermediate snapshots are not yet
+pruned; all snapshot nodes accumulate in the node store until Phase 8 implements eviction.
 
 ---
 
-### Phase 8 — Workspace Cache Manager
+### Phase 7 — Materialization Engine ✅ COMPLETE
 
-Workspace directories become cache entries. The `WorkspaceOptions.RootPath` directory is the
-cache root. Nothing in it is authoritative.
+**`IMaterializationEngine`** — `MaterializeAsync(snapshot, targetPath, fileScope?)` and
+`RematerializeAsync(snapshot, previousSnapshot, targetPath, fileScope?)`.
 
-**`IWorkspaceCacheManager`:**
+**Algorithm:** Filter entries by fileScope → delete files absent from snapshot (within scope) →
+fetch missing/changed blobs from CAS in parallel (bounded by `WorkspaceOptions.MaterializerConcurrency`,
+default 4) → skip files already on disk whose SHA256 matches the expected blobId.
+`RematerializeAsync` diffs two snapshots and only touches changed/added/removed paths.
 
-```csharp
-MaterializeAsync(workUnitId, snapshotId)
-EvictAsync(workUnitId)
-EvictAllIdleAsync(idleThreshold)
-EvictOrphanedAsync()   // branch dirs with no matching node-store entry
-```
+**Integration:** `FileSystemWorkspaceService.InitBranchAsync` uses the materializer for "main"
+when a snapshot with `TreeEntries` exists, falling back to `CopyDirectory` from `SeedRepositoryPath`
+when CAS is unavailable. Child branches continue to copy from their seed branch directory, which
+is itself now reconstructable. `NullMaterializationEngine` (null-object) used in test environments
+where `IBlobStoreProvider` is absent — no null checks in `FileSystemWorkspaceService`.
 
-**Eviction triggers:**
-- Build/test complete → evict after configurable delay (default: evict immediately on success)
-- Agent idle for N minutes (default: 15)
-- LRU under disk pressure (BlobIndex.LastAccessedAt drives ordering)
-- Manual: "Clean Up Workspaces" panel action
-- Startup: scan for orphaned directories whose work unit is in terminal state
-
-**Blob GC:** When a workspace is evicted, the BlobIndex `ReferenceCount` for every blob in its
-snapshot decrements. When `ReferenceCount` reaches zero and `Pinned = false`, the blob becomes
-a GC candidate. The host's `FileBlobGcCoordinator` (already implemented, with tombstone-based
-grace window and `DryRun`/`LiveRun` modes) performs the actual deletion. Studio calls it with
-the set of live hashes derived from the BlobIndex.
-
-**Safe eviction invariant:** A workspace can be evicted if and only if its snapshot exists in
-the node store. The materializer can always reconstruct it.
+**Hardlinks/reflinks:** Skipped — premature optimization. File copy via `WriteAllBytesAsync` is
+sufficient for Milestone 2. Phase 11 (partial materialization) can revisit if needed.
 
 ---
 
-### Phase 9 — Conflict Engine
+### Phase 8 — Workspace Cache Manager ✅ COMPLETE
 
-Conflicts are now detectable at op-emit time, not merge time.
+**`IWorkspaceCacheManager`:** `MaterializeAsync(workUnitId)`, `EvictAsync(workUnitId)`,
+`EvictOrphanedAsync()`, `GetLiveBlobHashesAsync()`.
 
-**Definition:** Two RepositoryOps targeting the same `(repositoryId, path)` that share the same
-`OldBlobId` but produce different `NewBlobId` values are a conflict. They fork from the same
-parent blob.
+**Safe eviction invariant:**
+- `Cancelled` work units: always evict (their changes were never merged; no snapshot needed).
+- `Completed`/`Merged` work units: only evict when `snapshot.CreatedAt > wu.UpdatedAt`, ensuring
+  the between-run sync captured their changes before the branch directory is deleted.
+- `Failed`/`DeadLettered` work units: never auto-evicted (files stay inspectable).
 
-**Detection in `RepositoryOpService.EmitAsync`:**
-1. Resolve the current blob at `path` in the parent snapshot
-2. If `op.OldBlobId != currentBlobId` → conflict; block or flag based on policy
+**Blob GC:** `GetLiveBlobHashesAsync` collects all blob hashes from every `RepositorySnapshotV1`
+node's `TreeEntries` plus all `RepositoryOpV1` node `NewBlobId`/`OldBlobId` values. The host-layer
+REST endpoint `POST /studio/cache/gc` calls `FileBlobGcCoordinator` (already implemented in
+`NodalMerge.Host.Composition` with tombstone grace window + `DryRun`/`LiveRun` modes) with this
+live hash set. Blob GC stays in the host layer to avoid adding a `Host.Composition` reference to
+`Studio.Storage`.
 
-**`NonOverlappingFileScopeRule` is deprecated** in this phase. Structural ancestry detection
-is strictly more precise: it catches conflicts that scope declaration misses (two agents declare
-non-overlapping scopes but happen to modify a shared utility file) and eliminates false positives
-(two agents declare overlapping scope for a file neither actually touches).
+**BlobIndex reference counting** (original plan): deferred. Scanning all snapshot nodes for live
+hashes is safe and sufficient for Milestone 2; reference counting is a Phase 11+ optimization.
 
-**Conflict resolution as a DAG node:**
+**Idle/LRU eviction triggers**: deferred to Phase 11+ (requires idle-time tracking infrastructure).
 
-```
-ConflictResolutionOp
-  ConflictId
-  RepositoryId
-  Path
-  OpIdA            // the two divergent ops
-  OpIdB
-  ResolutionBlobId // the merged result
-  Strategy         // ThreeWay | Ast | LlmAssisted | Human
-  ResolvedBy       // agentId or "human"
-```
+**Startup:** `WorkspaceCacheManager` implements `IHostedService`; `StartAsync` fires-and-forgets
+`EvictOrphanedAsync` as a best-effort background sweep without blocking the startup chain.
 
-Resolution is just another RepositoryOp. Nothing special.
+**REST endpoints:** `POST /studio/cache/materialize`, `POST /studio/cache/evict`,
+`POST /studio/cache/evict/orphaned`, `POST /studio/cache/gc?dryRun=true|false`.
 
 ---
 
-### Phase 10 — Intelligent Merge
+### Phase 9 — Conflict Engine ✅ COMPLETE
 
-Merge strategies are pluggable and all produce a `ConflictResolutionOp`:
+**Detection:** `InMemoryRepositoryOpService.EmitAsync` calls `FindForkingOpsAsync` before writing
+each `Add`/`Replace`/`Delete` op. A fork is any existing op for the same `(repositoryId, path)`
+(scoped to ops since the latest snapshot) that shares `OldBlobId` but has a different `NewBlobId`.
+Two concurrent `Add` ops both have `OldBlobId = null` — the null == null comparison catches that
+case naturally. `Import` ops are excluded from conflict detection (system-level bootstraps).
 
-```csharp
-public interface IMergeStrategy
-{
-    string Name { get; }
-    Task<MergeResult> MergeAsync(string blobIdA, string blobIdB, string blobIdBase,
-        string path, CancellationToken ct);
-}
-```
+**Conflict record:** `RepositoryConflict` in Contracts captures `OpIdA`/`OpIdB`, shared
+`OldBlobId`, divergent `BlobIdA`/`BlobIdB`, `WorkUnitIdA`/`WorkUnitIdB`, `DetectedAt`, and
+`Status` (`Open` | `Resolved` | `Dismissed`).
 
-**Implementations (in order of precedence):**
+**Policy:** `WorkspaceOptions.BlockConflictingOps` (default `false`). When false, both ops land
+and the conflict is recorded for Phase 10 resolution. When true, `ConflictingOpException` is
+thrown and the second op does not land.
 
-1. `ThreeWayMergeStrategy` — standard three-way merge using base blob. No LLM.
-2. `AstMergeStrategy` — structure-aware merge for supported file types (C#, TypeScript).
-   Uses Roslyn/TypeScript AST to merge at the declaration level, not line level.
-3. `LlmAssistedMergeStrategy` — LLM receives both versions + base + surrounding context;
-   produces merged content. Runs only when ThreeWay/AST fail.
-4. `HumanReviewStrategy` — presents the conflict in the merge review panel and waits.
+**`IConflictService`:** `RecordAsync`, `GetActiveAsync(repositoryId)`, `GetAsync(conflictId)`,
+`DismissAsync`, `MarkResolvedAsync` (Phase 10 hook). `InMemoryConflictService` is rehydratable.
+
+**`NonOverlappingFileScopeRule`:** kept active — structural conflict detection is strictly more
+precise but `FileLeaseService` and scope rules remain as belt-and-suspenders until Phase 10's
+resolution path is end-to-end and proven in production.
+
+**REST:** `GET /studio/conflicts`, `GET /studio/conflicts/{id}`, `POST /studio/conflicts/{id}/dismiss`.
+`POST /studio/conflicts/{id}/resolve` ships in Phase 10.
+
+**ConflictResolutionOp** (original plan's named node): deferred to Phase 10 — modeled as
+`OperationType.Resolve` on `RepositoryOperation` so replay stays uniform.
 
 ---
 
-### Phase 11 — Projection-Aware Materialization
+### Phase 10 — Intelligent Merge ✅ COMPLETE
+
+**New contracts (`Contracts/Domain/MergeStrategyContracts.cs`):**
+- `LlmMergeCredentials(Provider, Model, BaseUrl, ApiKey)` — optional, passed per-request
+- `MergeContext(ConflictId, RepositoryId, Path, BaseContent?, ContentA?, ContentB?, LlmCredentials?)` — inputs
+- `MergeStrategyResult(Success, MergedContent?, StrategyName, FailureReason?)` — per-strategy output
+- `ConflictResolutionResult(Success, ConflictId, StrategyUsed, ResolutionOpId?, FailureReason?)` — service output
+
+**New interfaces (`Core/Services/ServiceContracts.cs`):**
+- `IMergeStrategy` — pluggable strategy: `Name` + `MergeAsync(MergeContext, ct)` → `MergeStrategyResult`
+- `ILlmMergeProvider` — LLM bridge (defined in Core, implemented in AgentRuntime)
+- `ISourceValidator` — Roslyn syntax check (defined in Core, implemented in Storage)
+- `IConflictResolutionService.ResolveAsync(conflictId, strategy?, llmCredentials?, ct)` — orchestrator
+
+**New `LineDiffer.DiffRaw(before, after)` in Merge:**
+Returns raw `IReadOnlyList<DiffLine>` (no hunk grouping) — used by ThreeWayMergeStrategy.
+
+**Implementations (in strategy chain order):**
+
+1. `ThreeWayMergeStrategy` (Merge project):
+   - Converts `DiffRaw(base→A)` and `DiffRaw(base→B)` into `Edit(BaseStart, BaseEnd, NewLines[])` lists
+   - Walks base applying both edit scripts; succeeds when edit regions don't overlap or overlap identically
+   - Returns null (falls through) when same base region is changed differently by A and B
+
+2. `AstMergeStrategy` (Merge project):
+   - C# files only — ThreeWay + `ISourceValidator` Roslyn parse validation
+   - Falls through to LLM if ThreeWay fails OR merged output doesn't parse
+   - **Full AST-level declaration merging is permanently dropped.** The case it solves (two agents
+     each adding a distinct method to the same class) is already handled by `LlmAssistedMergeStrategy`,
+     which understands semantic intent rather than line positions. Building a hand-coded AST merger
+     for every C# member kind buys determinism at high complexity cost; the LLM fallback is already
+     correct for these cases.
+
+3. `LlmAssistedMergeStrategy` (Merge project):
+   - Calls `ILlmMergeProvider.MergeAsync(context, ct)` — needs `LlmCredentials` in `MergeContext`
+   - Falls through when provider is null or model returns "CONFLICT"
+
+4. `HumanReviewStrategy` (Merge project):
+   - Always returns `Success=false` — terminal, surfaces in UI merge review panel
+
+**`ConflictResolutionService` (Merge project):**
+- Reads blobs via `IBlobStoreProvider.TryGetBlobAsync` → `Encoding.UTF8.GetString`
+- Tries strategies in order (or specific strategy if named)
+- On success: SHA256 new blob, `PutBlobAsync`, emit `RepositoryOperation(Kind=Replace, OldBlobId=conflict.OldBlobId, NewBlobId=mergedHash)`, `MarkResolvedAsync`
+
+**`RoslynSourceValidator` (Storage project):** Uses `CSharpSyntaxTree.ParseText` to check for error-level diagnostics.
+
+**`LlmMergeProvider` (AgentRuntime project):** Calls `LlmClient.SendAsync` with a concise system prompt. Returns null if the LLM responds with "CONFLICT".
+
+**DI registration:**
+- `AddStudioMerge()` in Merge: registers all 4 strategies as `IEnumerable<IMergeStrategy>` + `IConflictResolutionService`
+- `AddStudioStorage()`: adds `ISourceValidator → RoslynSourceValidator`
+- `AddStudioAgentRuntime()`: adds `ILlmMergeProvider → LlmMergeProvider`
+
+**REST endpoint:**
+- `POST /studio/conflicts/{conflictId}/resolve?strategy=` with optional `ConflictResolveBody(Provider?, Model?, BaseUrl?, ApiKey?)`
+- Returns `ConflictResolutionResult` (200 = resolved, 422 = all strategies failed)
+
+**`NonOverlappingFileScopeRule` status:** Kept active permanently (not deprecated by Phase 10).
+Proactive blocking is better UX than reactive conflict resolution for same-file concurrent edits:
+the agent whose work unit is blocked gets a clear planning-time signal rather than discovering
+the conflict only after completing its work. The scope rule and Phase 10's resolution path are
+complementary — the rule prevents new conflicts, the resolution path handles conflicts that do
+slip through (e.g. under-declared scopes).
+
+**`FileLeaseService` status:** Kept as belt-and-suspenders. `NonOverlappingFileScopeRule`
+(`BlockOverlappingFileScope = true`) is the preferred proactive mechanism. When that option is
+`false` (the current default), `FileLeaseService` remains the only active runtime protection.
+Deprecation path: flip `BlockOverlappingFileScope` default to `true`, validate in production,
+then remove `FileLeaseService`. Not done yet — behavioral default change warrants its own
+decision.
+
+**"Force Rebase" as 5th conflict outcome — ✅ IMPLEMENTED** (see post-Phase-10 additions below):
+When all four merge strategies fail, `ConflictResolutionResult.RequeueLosingWorkUnit = true` is
+set. The REST resolve endpoint reads this flag: when `WorkspaceOptions.AllowAutoRequeue = true`,
+it looks up `conflict.WorkUnitIdB` (the losing work unit — the second op that detected the
+conflict), creates a new work unit with the original goal + `parentWorkUnitId = losingWuId` +
+original file scope, and returns the new `WorkUnitId`. The losing agent's prior attempt is
+visible in the projection as prior-attempt history. Convention: `WorkUnitIdB` is the loser
+(its op arrived second). `AllowAutoRequeue` defaults to `false`; opt-in for automated pipelines.
+
+---
+
+### Phase 11 — Projection-Aware Materialization ✅ COMPLETE
 
 Instead of materializing the entire repository for each work unit, materialize only the paths
-the work unit's file scope covers, plus their dependency closure.
+the work unit's file scope covers, plus project structure files needed by `WorkspaceProfileService`.
 
-**File scope → materialization scope:**
+**Implementation (actual):**
 
-```
-WorkUnit.FileScope: ["src/Auth/**"]
-Dependency closure: ["src/Auth/**", "src/Shared/Extensions.cs"] // resolved by Roslyn
-Materialized paths: only those two sets
-```
-
-The `WorkspaceProfileService` already computes sub-project roots and dependency information.
-The materializer reads this to determine the minimum set of blobs required.
-
-**Impact:** A work unit touching 8 files in `src/Auth/` materializes 8–20 files instead of
-the entire 4,000-file repository. Disk impact per work unit drops to kilobytes for typical tasks.
-
----
-
-### Phase 11.5 — Co-Modification Intelligence
-
-By Milestone 3, the op log has accumulated across many work units and captures which files are
-changed together. This phase mines that signal and routes it into two existing systems without
-modifying their contracts.
-
-**Co-modification pattern record:**
-
+`IFileWorkspaceService.InitBranchAsync` gained an optional `fileScope` parameter:
 ```csharp
-// Stored in the node store as studio/comod-pattern/v1
-public sealed record CoModificationPattern(
-    string PatternId,
-    string RepositoryId,
-    string PathA,
-    string PathB,
-    int CoModificationCount,   // number of work units that touched both
-    int TotalWorkUnitsScanned,
-    double Confidence,         // CoModificationCount / TotalWorkUnitsScanned
-    DateTimeOffset ComputedAt);
+Task InitBranchAsync(string branchId, string? seedFromBranchId = null,
+    IReadOnlyList<string>? fileScope = null, CancellationToken ct = default);
 ```
 
-Patterns are recomputed periodically (not on every op write — batched, e.g. nightly or on
-demand from the Insights tab). The computation is a simple pairwise frequency analysis over
-`RepositoryOp` nodes grouped by `WorkUnitId`.
+`IBranchService.CreateBranchAsync` gained the same `fileScope` parameter and threads it
+through to `InitBranchAsync`.
 
-**Integration 1 — Planner projection hints:**
+`InMemoryWorkUnitService.CreateWorkUnitAsync` now passes `fileScope` into `CreateBranchAsync`
+so the work unit's declared file scope reaches `FileSystemWorkspaceService`.
 
-Add `IReadOnlyList<CoModPattern>? CoModHints` to `AgentWorkspaceProjectionPayload` (same
-additive pattern as Phase 4.5's `RecentFileOps`). When a planner assigns file scope to a child
-work unit, the projection includes pairs that historically co-appear with scope files above a
-confidence threshold (default 0.6).
+**Scoped materialization path (in `FileSystemWorkspaceService.InitBranchAsync`):**
+When `fileScope` is non-null AND snapshot + materializer are available:
+1. Strips trailing glob segments (`"src/Auth/**"` → `"src/Auth"`) via `ExpandScopeForMaterializer`
+2. Calls `materializer.MaterializeAsync(snapshot, branchDir, materializationScope, ct)` — only matching tree entries are written
+3. Falls back to `CopyDirectory` (seed copy) if CAS/snapshot unavailable
 
-Prompt surface:
-```
-## Likely related files (based on past work patterns)
-When modifying src/Auth/UserService.cs, these files were co-modified in 73% of past work units:
-- src/Auth/TokenService.cs
-- src/Auth/AuthMiddleware.cs
-Consider whether your changes require updates there too.
-```
+**Callers that use null fileScope (full materialization — unchanged behavior):**
+- Merge branches (`InMemoryMergeService`, `MergeReconciliationService`) — always full copy
+- Known-good snapshot branches (`InMemoryKnownGoodStateService`) — always full copy
+- Composite branches (`WorkspaceExecutionService`) — always full copy
+- Candidate branch, "main" branch — unchanged
 
-**Integration 2 — Finding detectors:**
+**Design decision — Roslyn dependency closure deferred:**
+Roslyn closure requires materialized files before you know what to materialize (chicken-and-egg).
+Practical approach: glob-prefix scope from `WorkUnit.FileScope` is sufficient for Phase 11.
+Full dependency analysis is a Phase 11+ enhancement. Project structure files (`.csproj`, etc.)
+are always injected so `WorkspaceProfileService` can still detect project roots.
 
-Two new `IFindingDetector` implementations registered in the existing `FindingService` pipeline:
+**Files changed:**
+- `NodalMerge.Studio.Core/Services/ServiceContracts.cs` — `IFileWorkspaceService.InitBranchAsync` + `IBranchService.CreateBranchAsync` signatures
+- `NodalMerge.Studio.Storage/FileSystemWorkspaceService.cs` — scoped materialization path + `ExpandScopeForMaterializer`
+- `NodalMerge.Studio.Storage/InMemoryBranchService.cs` + `NodalMergeBranchService.cs` — pass through
+- `NodalMerge.Studio.Orchestrator/InMemoryWorkUnitService.cs` — pass `fileScope` to `CreateBranchAsync`
+- All other callers — named `ct:` / `cancellationToken:` argument to preserve default behavior
 
-- **`CoModificationMissDetector`** — after a work unit completes, checks if any high-confidence
-  co-modification partner was not touched. Emits a `Finding` of type `PromptImprovement` with
-  the suggestion text. Human can Promote (adds to planner context) or Dismiss.
+**Phase 11 addendum — On-Demand File Materialization:**
 
-- **`BoundaryViolationDetector`** — emits a `Finding` when files in logically separate layers
-  (e.g., UI and Domain) appear in the same co-modification cluster more than N times. Suggests
-  that an architectural boundary may be eroding.
+`IFileWorkspaceService.MaterializeFileAsync(branchId, path, ct)` → `Task<bool>` fetches a single
+path from the latest snapshot into the branch dir. Returns `false` when the path doesn't exist in
+the snapshot (file is genuinely absent). Implemented in `FileSystemWorkspaceService` by checking
+`snapshot.TreeEntries[path]` and calling `materializer.MaterializeAsync(snapshot, branchDir, [path])`.
 
-Both detectors implement the existing `IFindingDetector` interface; no changes to `FindingService`
-or its review pipeline.
+`McpToolDispatcher.WorkspaceReadAsync` transparently tries materialization when `ReadAsync` returns
+null — if it materializes, the agent gets the content; if not, the error is explicit:
+*"File does not exist in this branch or in the repository snapshot. If this is a new file, use
+nm_v1_workspace_write to create it."* This prevents agents from hallucinating files that don't exist.
+`WorkspaceReadManyAsync` applies the same batch fetch for any `Found=false` slots.
 
-**No rework risk:** All changes are additive — new node kind, new optional projection fields, new
-detector registrations. Nothing in Phase 4.5 or earlier phases needs modification.
+REST endpoint: `POST /studio/branches/{branchId}/materialize-file?path=` for external/debug use.
 
 ---
 
-### Phase 12 — Tool Virtualization
+### Phase 11.5 — Co-Modification Intelligence ✅ COMPLETE
 
-Agent tools evolve to operate against CAS directly, without requiring a materialized filesystem:
+Mines the RepositoryOp log for pairwise co-modification frequency and routes the signal into
+the projection payload (agent hints) and the finding detector pipeline.
 
-```
-nm_v1_repository_read_blob(path)   → resolves blobId from current snapshot, returns content
-nm_v1_repository_apply_op(...)     → emits RepositoryOp, updates in-memory projection
-nm_v1_repository_search(query)     → full-text search over current snapshot's blobs
-nm_v1_repository_list(scope)       → lists paths in scope from snapshot's path→blob map
-```
+**Implementation (actual):**
 
-The existing `nm_v1_workspace_write` etc. remain as the compatibility path for agents that
-still expect a filesystem. New profiles can opt into repository-native tools.
+`CoModificationPattern` record in `Contracts/Domain/` (exact as planned). Stored as `CoModPatternV1`
+nodes. `InMemoryCoModService` computes pairwise frequency by grouping ops by `WorkUnitId`,
+collecting unique paths per WU, then counting co-occurrences. Confidence = count / totalWUsScanned.
+Deterministic PatternId so recomputes overwrite rather than duplicate. Rehydratable from node store.
 
-Materialization becomes optional, not mandatory. The "level 2 agent" described in the vision
-(works in-memory, no filesystem) is achievable at this milestone.
+**`ICoModService`** (3 methods):
+- `ComputeAsync(repositoryId)` — recomputes + persists all patterns for the repo
+- `GetAsync(repositoryId)` — returns last-computed patterns without recomputing
+- `GetForPathsAsync(repositoryId, prefixes, minConfidence)` — prefix-match against PathA/PathB
+
+**Integration 1 — Projection hints:**
+`CoModHint(PathA, PathB, Confidence)` added to `ProjectionContracts.cs`. `AgentWorkspaceProjectionPayload`
+gains `IReadOnlyList<CoModHint>? CoModHints = null`. `ProjectionManager` injects `ICoModService?`
+and populates `CoModHints` for WUs with non-empty FileScope at confidence ≥ 0.6. FileScope glob
+patterns are expanded to directory prefixes via `ExpandGlobsToPathPrefixes` before the lookup.
+Agents receive the hints as JSON fields in their AgentWorkspace projection response.
+
+**Integration 2 — Finding detectors (both in `FindingDetectorService.DetectCoModPatternsAsync`):**
+- **Boundary violation** (`confidence ≥ 0.4`, `count ≥ 3`): flags pairs where PathA and PathB
+  map to different architectural layers (prefix heuristic: ui/web/frontend/domain/core/data/infra/api).
+  Emits `KnowledgeGuideline` finding.
+- **Co-mod miss** (`confidence ≥ 0.6`): for each completed WU with FileScope, finds high-confidence
+  partners NOT in scope. Emits `PromptImprovement` targeting `PipelineStage.Plan`.
+
+Both are included in `POST /studio/insights/detect-findings` response automatically.
+
+**New REST endpoints:**
+- `POST /studio/comod/compute` — triggers full recompute for the configured repository
+- `GET /studio/comod?minConfidence=` — returns current pattern set
+
+**Files changed:**
+- `Contracts/Domain/CoModificationPattern.cs` — new record
+- `Contracts/Projections/ProjectionContracts.cs` — `CoModHint` record + `CoModHints` field
+- `Core/Services/ServiceContracts.cs` — `ICoModService` interface
+- `Storage/StudioNodeStore.cs` — `CoModPatternV1` constant
+- `Storage/InMemoryCoModService.cs` — new implementation
+- `Storage/ServiceCollectionExtensions.cs` — registration
+- `Projections/ProjectionManager.cs` — `ICoModService?` param + hint population
+- `Host/FindingDetectorService.cs` — `DetectCoModPatternsAsync` + ctor params
+- `Host/StudioRestEndpoints.cs` — comod endpoints + detect-findings includes comod
 
 ---
 
-### Phase 13 — Remote Repository Rooms
+### Phase 11.75 — Blake3 CAS Hash Alignment ✅ COMPLETE
 
-The CAS backend switches from local filesystem to cloud object store. The CRDT room for the
-repository runs on a remote node. Distributed workers read from and write to the same
-repository state.
+**Problem:** nodalmerge-studio was computing blob IDs with SHA256 while the host engine
+(`nodalmerge_core`) computes them with Blake3 (32 bytes, 64-char lowercase hex). The host's
+`IBlobStoreProvider` uses the caller-supplied hash string as the file key — it does not
+re-verify the content. Any blob written by the studio under a SHA256 ID would be invisible to
+the engine looking for the Blake3 ID of the same content, and vice versa.
 
-**The S3 backend is already built in the host.** The `nodalmerge-s3-blobs` crate implements
-`BlobPersistence` against any S3-compatible store (AWS, Cloudflare R2, MinIO, GCS). On the C#
-side, `S3DelegatedBlobUrlResolverProvider` already exists in `NodalMerge.Host.Composition`.
-Phase 13 is primarily a **configuration and Studio wiring** task — not a build task.
+**Investigation confirmed:**
+- `core/src/hash.rs`: `blake3::hash(data).to_hex()` — 64-char lowercase hex
+- `FileBlobStoreProvider.cs`: stores as `{root}/{first2}/{fullHash}.blob` — opaque key
+- `is_hex64()` validator enforces exactly 64 hex chars — compatible with Blake3 output
+- SHA256 in `RuntimeDagPersistenceService.cs` is node-pack deduplication only — not blob IDs
 
-What Phase 13 adds on the Studio side:
-- Surface the CAS backend choice in `WorkspaceOptions` / extension settings
-- Pass the configured backend through to `IBlobStoreProvider` at startup
-- Update `WorkspaceCacheManager` to pre-fetch only scope-relevant blobs when materializing from a remote store
+**NuGet package added:** `Blake3` 2.2.1 (xoofx) → `NodalMerge.Studio.Storage.csproj`
 
-**Content distribution:** Workers pre-fetch only the blobs they need (their materialization scope).
-Blobs are immutable, so CDN caching works without invalidation.
-
----
-
-### Phase 14 — Git as Import/Export Adapter
-
-Git stops being a storage mechanism.
-
-**`IGitAdapter`:**
-
+**New helper** `Storage/BlobHasher.cs`:
 ```csharp
-Task<GitImportSnapshot> ImportAsync(string gitRepoPath, string? commitSha, CancellationToken ct);
-Task<string> ExportAsync(string snapshotId, string targetGitRepoPath, string branchName, CancellationToken ct);
+public static string ComputeHash(byte[] bytes) => Hasher.Hash(bytes).ToString();
+public static string ComputeHash(ReadOnlySpan<byte> bytes) => Hasher.Hash(bytes).ToString();
 ```
 
-**Import:** Walk the git tree at the given commit, write each blob to CAS, record RepositoryOps
-of type `Import`, produce a `GitImportSnapshot` node.
+**Call sites switched to Blake3 (cross-boundary blob IDs):**
+- `FileSystemWorkspaceService.BlobId(bytes)` — blob written when agent edits a workspace file
+- `MaterializationEngine.FileMatchesBlob(path, blobId)` — skip-if-matches check during materialization
+- `RepositoryImportService.BlobId(bytes)` — blob IDs assigned during git import
+- `ConflictResolutionService.CommitMergeAsync` — blob ID for merged content (uses `BlobHasher` via Storage project reference)
 
-**Export:** Reconstruct the workspace from a snapshot (via materializer), then `git add` + `git commit`.
-The commit message includes the `SnapshotId` and `WorkUnitId` for traceability.
+**SHA256 intentionally kept for:**
+- `FileSystemWorkspaceService.ComputeFingerprint()` — internal workspace diff structural fingerprint (16-char prefix, not a blob ID, not cross-boundary)
+- `InMemoryRepositorySnapshotService` snapshot IDs — internal studio-only identifiers
+- `DocFetchCommandService` content checksum — document protocol header, not blob CAS
+
+---
+
+### Phase 12 — Tool Virtualization ✅ COMPLETE
+
+Four new MCP tools added to `McpToolDispatcher` (additive alongside filesystem-backed tools):
+
+| Tool | Inputs | Behavior |
+|------|--------|----------|
+| `nm_v1_repository_blob_list` | `repositoryId`, `scope?` | Lists paths from latest snapshot's TreeEntries, filtered by prefix |
+| `nm_v1_repository_blob_read` | `repositoryId`, `path` | Resolves blobId from snapshot → `TryGetBlobAsync` → returns UTF-8 content |
+| `nm_v1_repository_blob_write` | `repositoryId`, `path`, `content`, `reason?`, `workUnitId?` | Blake3-hashes content → `PutBlobAsync` → emits `RepositoryOperation` (Add or Replace) |
+| `nm_v1_repository_blob_search` | `repositoryId`, `query`, `scope?`, `maxResults?` | O(n blobs) full-text scan across snapshot entries; returns `{path, lineNumber, snippet}` matches |
+
+**Services added to `McpToolDispatcher` constructor (all optional/nullable):**
+- `IRepositorySnapshotService? repoSnapshots` — for latest snapshot lookup
+- `IBlobStoreProvider? repoBlobStore` — for blob read/write
+- `IRepositoryOpService? repoOpEmitter` — for emitting RepositoryOperation on blob_write
+
+All tools return a helpful error if the required service isn't configured (graceful degradation
+when CAS is not wired up). Tools are added to `McpToolNames.All` for profile allowlist use.
+
+**Existing tools unchanged:** `nm_v1_workspace_*` and `nm_v1_repository_read_file` /
+`nm_v1_repository_list_files` (filesystem-backed via `IRepositoryRegistryService`) remain as
+the compatibility path. Agents on older profiles are unaffected.
+
+**`FileLeaseService` + blob tools:** No lease is acquired for `nm_v1_repository_blob_write`.
+`NonOverlappingFileScopeRule` handles planning-time scope protection. Agents using
+repository-native tools operate entirely through the op log, which is already the authoritative
+write path; the lease system (designed for filesystem-level lock coordination) is orthogonal.
+
+**Future enhancement:** `nm_v1_repository_blob_search` is O(n) over all blobs. A future
+phase can add an inverted index over snapshot content for sub-millisecond search.
+
+---
+
+### Phase 13 — Remote Repository Rooms ✅ COMPLETE (host-configuration-only)
+
+No Studio code changes required. The full S3 backend already exists:
+
+- **Rust:** `nodalmerge-s3-blobs` crate implements `BlobPersistence` against any S3-compatible
+  store (AWS, Cloudflare R2, MinIO, GCS).
+- **C#:** `S3DelegatedBlobUrlResolverProvider` in `NodalMerge.Host.Composition` handles
+  presigned URL generation. Host `ServiceCollectionExtensions` switches backend based on
+  `BlobStorageProvider` config string: `"File"` / `"WsOnly"` / `"S3Delegated"`.
+- **Studio:** `WorkspaceOptions.CasRootPath` already exists for local path override. Studio
+  consumes whatever `IBlobStoreProvider` the host registers — no Studio-side switch needed.
+
+**Cross-repository deduplication** falls out of content-addressing automatically: two
+repositories containing the same file share a single blob in CAS regardless of which
+repository wrote it first. No additional work required.
+
+**To enable S3:** configure `NodalMerge:BlobStorageProvider = "S3Delegated"` and the
+corresponding S3 settings in the host's `appsettings.json`. Studio picks it up at next startup.
+
+---
+
+### Phase 14 — Git as Import/Export Adapter ✅ COMPLETE
+
+**NuGet added:** `LibGit2Sharp` 0.31.0 → `NodalMerge.Studio.Storage.csproj`
+
+**`IGitAdapter` interface** (in `Core/Services/ServiceContracts.cs`):
+```csharp
+Task<string> ImportAsync(string gitRepoPath, string? commitSha, string repositoryId, ct);
+Task<GitExportResult> ExportAsync(string repositoryId, string? snapshotId, string targetGitRepoPath, string branchName, ct);
+```
+
+**`GitExportResult` record:** `(RepositoryId, SnapshotId, TargetPath, BranchName, Committed, CommitSha?, Message?)`
+
+**`GitAdapter` implementation** (in `Storage/GitAdapter.cs`):
+- **Import:** Opens the git repo with `LibGit2Sharp.Repository`, resolves the commit (or HEAD),
+  recursively walks `FlattenTree(commit.Tree)` → `(path, blob)` pairs, writes each blob to CAS
+  via `BlobHasher.ComputeHash` + `PutBlobAsync`, emits `RepositoryOperation(Kind=Import)` for
+  each file, then calls `IRepositorySnapshotService.CreateAsync` with the `path→blobId` map.
+  Returns the new `SnapshotId`. Import is always read-only relative to the git object store.
+- **Export (gated):** Materializes the snapshot directly into `targetGitRepoPath` via
+  `IMaterializationEngine`. Whether a git commit is created depends on
+  `WorkspaceOptions.AllowAgentGitCommits` (default: `false`). When false, `Committed = false`
+  and `CommitSha = null` — files are on disk for the user/CI to commit. When true, stages all
+  and commits via LibGit2Sharp, returning the new SHA.
+
+**Git commit/push gating** (`WorkspaceOptions`):
+- `AllowAgentGitCommits` (default `false`) — opt-in for agent-created git commits. Dangerous;
+  only enable for headless CI pipelines with deliberate oversight.
+- `AllowAgentGitPush` (default `false`) — stub for future push support; shape is stable now.
+- Both are surfaced in `GET`/`POST /studio/options`.
+
+**`IRepositorySnapshotService.GetAsync(snapshotId, ct)`** added. Backed by a `_byId` dictionary in
+`InMemoryRepositorySnapshotService` populated at `RehydrateAsync` and `CreateAsync`.
+
+**DI:** `GitAdapter` registered in `AddStudioStorage()` with `WorkspaceOptions` and optional
+`IBlobStoreProvider` / `IMaterializationEngine`.
+
+**REST endpoints:**
+- `POST /studio/repositories/{repositoryId}/git/import` — body: `{ gitRepoPath, commitSha? }`
+- `POST /studio/repositories/{repositoryId}/git/export` — body: `{ targetGitRepoPath, branchName, snapshotId? }`
+
+**MCP HTTP server tools** (in `McpServer/Tools/GitAdapterTools.cs`):
+- `nm_v1_repository_git_import` — calls `ImportAsync`, available to external harnesses
+- `nm_v1_repository_git_export` — calls `ExportAsync`, reflects committed/not-committed result
 
 Git is now equivalent to JSON or CSV — an interchange format, not the authoritative store.
 

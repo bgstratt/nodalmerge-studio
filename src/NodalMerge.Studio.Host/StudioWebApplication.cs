@@ -28,6 +28,12 @@ public static class StudioWebApplication
         if (configureConfiguration is not null)
             builder.ConfigureAppConfiguration(configureConfiguration);
 
+        builder.ConfigureAppConfiguration((_, cfg) =>
+        {
+            var snap = cfg.Build();
+            ApplyCasRootPath(snap, cfg);
+        });
+
         builder.ConfigureServices((ctx, services) =>
         {
             var config = ctx.Configuration;
@@ -59,7 +65,11 @@ public static class StudioWebApplication
         var app = HostApplication.Build(
             args,
             configureWebHost: configureWebHost,
-            configureConfiguration: configureConfiguration,
+            configureConfiguration: config =>
+            {
+                configureConfiguration?.Invoke(config);
+                ApplyCasRootPath(config, config);
+            },
             configureServices: services =>
             {
                 services.AddStudioServices(llmHttpClient);
@@ -94,5 +104,25 @@ public static class StudioWebApplication
         app.MapStudioRestEndpoints();
         app.MapMcp();
         return app;
+    }
+
+    // Computes the effective CAS root from Workspace config and injects it into
+    // NodalMerge:Storage:FileBlobs:RootPath before AddNodalMergeHostProviders reads it.
+    // Priority: explicit CasRootPath > {SeedRepositoryPath}/.nodalmerge/cas > no override.
+    private static void ApplyCasRootPath(IConfiguration config, IConfigurationBuilder builder)
+    {
+        var casRootPath = config["Workspace:CasRootPath"];
+        if (string.IsNullOrWhiteSpace(casRootPath))
+        {
+            var seedPath = config["Workspace:SeedRepositoryPath"];
+            if (!string.IsNullOrWhiteSpace(seedPath))
+                casRootPath = Path.Combine(seedPath, ".nodalmerge", "cas");
+        }
+
+        if (!string.IsNullOrWhiteSpace(casRootPath))
+            builder.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["NodalMerge:Storage:FileBlobs:RootPath"] = casRootPath
+            });
     }
 }

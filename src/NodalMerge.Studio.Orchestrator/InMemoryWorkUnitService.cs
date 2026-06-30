@@ -21,6 +21,12 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
     private readonly IRuntimeEventBroadcaster? _broadcaster;
     private readonly IStudioGraphPromoter? _graphPromoter;
     private readonly IParticipantEventBus? _eventBus;
+    private readonly IServiceProvider? _serviceProvider;
+
+    // IStudioGraphPromoter resolves RuntimeGraphPromoter → IRuntimeCommandBridge → FfiBridgeProcessor
+    // → HostFfiClient → native P/Invoke. Defer until first use to avoid blocking startup.
+    private IStudioGraphPromoter? GraphPromoter =>
+        _graphPromoter ?? _serviceProvider?.GetService<IStudioGraphPromoter>();
 
     public InMemoryWorkUnitService(
         IBranchService branchService,
@@ -33,7 +39,8 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IExecutionEventStream events,
         IRuntimeEventBroadcaster? broadcaster = null,
         IStudioGraphPromoter? graphPromoter = null,
-        IParticipantEventBus? eventBus = null)
+        IParticipantEventBus? eventBus = null,
+        IServiceProvider? serviceProvider = null)
     {
         _branchService         = branchService;
         _mergeService          = mergeService;
@@ -46,6 +53,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         _broadcaster           = broadcaster;
         _graphPromoter         = graphPromoter;
         _eventBus              = eventBus;
+        _serviceProvider       = serviceProvider;
     }
 
     public async Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken cancellationToken = default)
@@ -110,7 +118,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
 
         if (status is WorkUnitStatus.Completed or WorkUnitStatus.Merged)
         {
-            _ = _graphPromoter?.TryPromoteStudioCheckpointAsync();
+            _ = GraphPromoter?.TryPromoteStudioCheckpointAsync();
         }
 
         _eventBus?.Publish(new WorkUnitStatusChangedEvent(workUnitId, previousStatus, status, DateTimeOffset.UtcNow));
@@ -315,7 +323,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         CancellationToken cancellationToken = default)
     {
         var resolvedBranchId = await _branchService
-            .CreateBranchAsync(branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, cancellationToken)
+            .CreateBranchAsync(branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, fileScope, cancellationToken)
             .ConfigureAwait(false);
 
         var fanOutInfo = sliceId is not null || seedFromBranchId is not null
@@ -647,7 +655,9 @@ public static class ServiceCollectionExtensions
             sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions(),
             sp.GetRequiredService<IExecutionEventStream>(),
             sp.GetService<IRuntimeEventBroadcaster>(),
-            sp.GetService<IStudioGraphPromoter>()));
+            graphPromoter: null,       // deferred — IStudioGraphPromoter chains to native FFI
+            eventBus: sp.GetService<IParticipantEventBus>(),
+            serviceProvider: sp));
         services.AddSingleton<IWorkUnitService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IOrchestratorService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IWorkspaceService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());

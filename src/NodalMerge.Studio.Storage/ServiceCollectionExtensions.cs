@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
@@ -184,14 +185,67 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<CandidateBranchService>();
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<CandidateBranchService>());
 
+        // Repository virtualization — Phase 2/6: snapshot service registered before import service.
+        // Phase 6: snapshot service receives IRepositoryOpService for ConsiderCompactionAsync.
+        services.AddSingleton<InMemoryRepositorySnapshotService>(sp =>
+            new InMemoryRepositorySnapshotService(
+                sp.GetRequiredService<IStudioNodeStore>(),
+                sp));
+        services.AddSingleton<IRepositorySnapshotService>(sp => sp.GetRequiredService<InMemoryRepositorySnapshotService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryRepositorySnapshotService>());
+
+        // Phase 5/6: import service receives WorkspaceOptions for threshold-based compaction trigger.
+        services.AddSingleton<RepositoryImportService>(sp => new RepositoryImportService(
+            sp.GetService<IRepositorySnapshotService>(),
+            sp.GetService<IBlobStoreProvider>(),
+            sp.GetService<IRepositoryOpService>(),
+            sp.GetService<WorkspaceOptions>()));
+        services.AddSingleton<IRepositoryImportService>(sp => sp.GetRequiredService<RepositoryImportService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<RepositoryImportService>());
+
+        // Phase 8 — workspace cache manager: eviction, startup orphan sweep, live blob hash enumeration.
+        // IHostedService StartAsync fires EvictOrphanedAsync as a best-effort background task so that
+        // stale branch dirs from prior runs are cleaned up without blocking the startup chain.
+        services.AddSingleton<WorkspaceCacheManager>(sp => new WorkspaceCacheManager(
+            sp.GetRequiredService<IFileWorkspaceService>(),
+            sp,
+            sp.GetRequiredService<IRepositorySnapshotService>(),
+            sp.GetRequiredService<IMaterializationEngine>(),
+            sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetService<WorkspaceOptions>()));
+        services.AddSingleton<IWorkspaceCacheManager>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
+        services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
+
         services.AddSingleton<RepositorySyncService>();
         services.AddSingleton<IRepositorySyncService>(sp => sp.GetRequiredService<RepositorySyncService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<RepositorySyncService>());
 
+        // Phase 9 — conflict service registered before op service (op service injects it).
+        services.AddSingleton<InMemoryConflictService>();
+        services.AddSingleton<IConflictService>(sp => sp.GetRequiredService<InMemoryConflictService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryConflictService>());
+
+        // Phase 11.5 — co-modification pattern service. On-demand compute; rehydrates last
+        // computed patterns from node store on startup so projection hints are available immediately.
+        services.AddSingleton<InMemoryCoModService>();
+        services.AddSingleton<ICoModService>(sp => sp.GetRequiredService<InMemoryCoModService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryCoModService>());
+
+        // Repository virtualization — Phase 3. Phase 9: receives conflict + snapshot services
+        // so EmitAsync can detect forks at write time.
+        services.AddSingleton<InMemoryRepositoryOpService>(sp => new InMemoryRepositoryOpService(
+            sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetService<IConflictService>(),
+            sp.GetService<IRepositorySnapshotService>(),
+            sp.GetService<WorkspaceOptions>()));
+        services.AddSingleton<IRepositoryOpService>(sp => sp.GetRequiredService<InMemoryRepositoryOpService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryRepositoryOpService>());
+
         // Registered last and ahead of AddStudioAgentRuntime in AddStudioServices, so its
         // StartAsync (which awaits every IRehydratable above) completes before the scheduler
         // poll loop's StartAsync begins.
-        services.AddSingleton<IHostedService, StudioStateRehydrationService>();
+        services.AddSingleton<StudioStateRehydrationService>();
+        services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<StudioStateRehydrationService>());
     }
 
     // Slice 14a — no state to rehydrate (rules are resolved fresh from DI each time), so this
@@ -212,7 +266,34 @@ public static class ServiceCollectionExtensions
 
     private static void AddFileWorkspaceService(IServiceCollection services)
     {
-        services.AddSingleton<IFileWorkspaceService>(sp =>
-            new FileSystemWorkspaceService(sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions()));
+        // Phase 7 — materializer registered here so it's available to both AddNodalMergeStorage
+        // and AddInMemoryStorage; it has no state to rehydrate so it doesn't go through
+        // AddRehydratableServices.
+        services.AddSingleton<IMaterializationEngine>(sp =>
+        {
+            var blobStore = sp.GetService<IBlobStoreProvider>();
+            var opts      = sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions();
+            return blobStore is not null
+                ? new MaterializationEngine(blobStore, opts)
+                : NullMaterializationEngine.Instance;
+        });
+
+        services.AddSingleton<IFileWorkspaceService>(sp => new FileSystemWorkspaceService(
+            sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions(),
+            sp.GetService<IBlobStoreProvider>(),
+            sp.GetService<IRepositoryOpService>(),
+            sp.GetService<IMaterializationEngine>(),
+            sp.GetService<IRepositorySnapshotService>()));
+
+        // Phase 10 — Roslyn C# syntax validator for AstMergeStrategy.
+        services.AddSingleton<ISourceValidator, RoslynSourceValidator>();
+
+        // Phase 14 — Git import/export adapter.
+        services.AddSingleton<IGitAdapter>(sp => new GitAdapter(
+            sp.GetRequiredService<IRepositorySnapshotService>(),
+            sp.GetRequiredService<IRepositoryOpService>(),
+            sp.GetService<WorkspaceOptions>(),
+            sp.GetService<IBlobStoreProvider>(),
+            sp.GetService<IMaterializationEngine>()));
     }
 }

@@ -88,13 +88,33 @@ public sealed record ArtifactChain(
 /// <summary>Phase 9e — compact per-root summary (path + stack) for agent context; the full WorkspaceProfile (commands, run state) is available via nm_v1_workspace_profile_get. Phase 9h adds RuleFileContent so the projection delta carries a root's AGENTS.md-equivalent without a separate call.</summary>
 public sealed record ProjectRootSummary(string RelativePath, string Stack, string? RuleFileContent = null);
 
+// Phase 4.5 — recent op history per file, surfaced in the AgentWorkspace projection.
+public sealed record FileOpSummary(
+    string OperationId,
+    string? WorkUnitId,
+    string? WorkUnitGoal,
+    string? AgentId,
+    string OperationType,
+    string? Reason,
+    DateTimeOffset OccurredAt);
+
+public sealed record FileOpHistory(
+    string Path,
+    IReadOnlyList<FileOpSummary> RecentOps);
+
+// Phase 11.5 — slim co-modification hint included in agent workspace projections.
+// PathA/PathB are the co-modified pair; Confidence is CoModCount/TotalWorkUnitsScanned.
+public sealed record CoModHint(string PathA, string PathB, double Confidence);
+
 public sealed record AgentWorkspaceProjectionPayload(
     string? AgentId,
     string? WorkUnitId,
     ArtifactChain Artifacts,
     IReadOnlyList<ArtifactRef> InheritedConstraints,
     WorkspaceExecutionSummary? Execution = null,
-    IReadOnlyList<ProjectRootSummary>? Roots = null);
+    IReadOnlyList<ProjectRootSummary>? Roots = null,
+    IReadOnlyList<FileOpHistory>? RecentFileOps = null,
+    IReadOnlyList<CoModHint>? CoModHints = null);
 
 /// <summary>
 /// What changed in a work unit's artifact chain since the last cycle. Lets an orchestrator

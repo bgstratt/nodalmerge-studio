@@ -37,6 +37,11 @@ public static class StudioNodeKind
     public const string RepositoryV1          = "studio/repository/v1";
     public const string ProjectionSnapshotV1  = "studio/projection-snapshot/v1";
     public const string WorkspaceV1            = "studio/workspace/v1";
+    public const string RepositoryOpV1         = "studio/repository-op/v1";
+    public const string RepositorySnapshotV1   = "studio/repository-snapshot/v1";
+    public const string RepositoryConflictV1   = "studio/repository-conflict/v1";
+    public const string CoModPatternV1         = "studio/comod-pattern/v1";
+    public const string BlobIndexEntryV1       = "studio/blob-index-entry/v1";
 }
 
 public interface IStudioNodeStore

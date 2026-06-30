@@ -122,6 +122,15 @@ public static class McpToolNames
     public const string RepositoryClone    = "nm_v1_repository_clone";
     public const string RepositoryReadFile  = "nm_v1_repository_read_file";
     public const string RepositoryListFiles = "nm_v1_repository_list_files";
+    // Phase 12 — CAS-backed repository tools (operate against snapshot+blob store, no filesystem)
+    public const string RepositoryBlobList   = "nm_v1_repository_blob_list";
+    public const string RepositoryBlobRead   = "nm_v1_repository_blob_read";
+    public const string RepositoryBlobWrite  = "nm_v1_repository_blob_write";
+    public const string RepositoryBlobSearch = "nm_v1_repository_blob_search";
+    // Phase 14 — git import/export/branch adapter
+    public const string RepositoryGitImport       = "nm_v1_repository_git_import";
+    public const string RepositoryGitExport       = "nm_v1_repository_git_export";
+    public const string RepositoryGitBranchCreate = "nm_v1_repository_git_branch_create";
 
     public const string CausalGetFrontier         = "nm_v1_causal_get_frontier";
     public const string CausalGetParents          = "nm_v1_causal_get_parents";
@@ -237,5 +246,14 @@ public static class McpToolNames
         ParticipantStop,
         ParticipantEvents,
         EventTypes,
+        // Phase 12 — CAS-backed repository tools (additive, complement filesystem-backed tools)
+        RepositoryBlobList,
+        RepositoryBlobRead,
+        RepositoryBlobWrite,
+        RepositoryBlobSearch,
+        // Phase 14 — git import/export/branch adapter
+        RepositoryGitImport,
+        RepositoryGitExport,
+        RepositoryGitBranchCreate,
     ];
 }

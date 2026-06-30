@@ -34,7 +34,11 @@ internal sealed class McpToolDispatcher(
     NodalMerge.Studio.Storage.IRepositoryRegistryService repositories,
     IProjectionSnapshotService projectionSnapshots,
     IRepositorySyncService repositorySync,
-    NodalMerge.Studio.Storage.WorkspaceOptions workspaceOptions)
+    NodalMerge.Studio.Storage.WorkspaceOptions workspaceOptions,
+    // Phase 12 — optional CAS-backed repository tools
+    IRepositorySnapshotService? repoSnapshots = null,
+    NodalMerge.Host.Abstractions.Providers.IBlobStoreProvider? repoBlobStore = null,
+    IRepositoryOpService? repoOpEmitter = null)
 {
     // Phase 9g — read-before-write enforcement. McpToolDispatcher is registered as a singleton
     // (InMemoryAgentRuntimeService.cs) shared across every agent/run, so this cache lives here
@@ -128,6 +132,11 @@ internal sealed class McpToolDispatcher(
                 McpToolNames.RepositoryClone    => await RepositoryCloneAsync(input, ct),
                 McpToolNames.RepositoryReadFile  => await RepositoryReadFileAsync(input, ct),
                 McpToolNames.RepositoryListFiles => await RepositoryListFilesAsync(input, ct),
+                // Phase 12 — CAS-backed repository tools
+                McpToolNames.RepositoryBlobList   => await RepositoryBlobListAsync(input, ct),
+                McpToolNames.RepositoryBlobRead   => await RepositoryBlobReadAsync(input, ct),
+                McpToolNames.RepositoryBlobWrite  => await RepositoryBlobWriteAsync(input, ct),
+                McpToolNames.RepositoryBlobSearch => await RepositoryBlobSearchAsync(input, ct),
                 _ => ToError($"Tool '{toolName}' is not dispatched by the agent runtime.")
             };
         }
@@ -233,7 +242,109 @@ internal sealed class McpToolDispatcher(
         return ToJson(new { files });
     }
 
-        private async Task<string> TaskCreateAsync(JsonElement input, CancellationToken ct)
+    // ── Phase 12 — CAS-backed repository tools ───────────────────────────────
+    // These tools operate against the snapshot's TreeEntries + IBlobStoreProvider directly,
+    // with no filesystem materialization. They are additive alongside the existing
+    // nm_v1_repository_read_file / nm_v1_repository_list_files (filesystem-backed) tools.
+
+    private async Task<string> RepositoryBlobListAsync(JsonElement input, CancellationToken ct)
+    {
+        if (repoSnapshots is null) return ToError("Repository snapshot service is not configured.");
+        var repositoryId = Str(input, "repositoryId")!;
+        var scope = Str(input, "scope");
+        var snapshot = await repoSnapshots.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
+        if (snapshot?.TreeEntries is null)
+            return ToError("No snapshot with tree entries found for this repository.");
+        var paths = snapshot.TreeEntries.Keys
+            .Where(p => scope is null || p.StartsWith(scope, StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal)
+            .ToList();
+        return ToJson(new { paths, count = paths.Count, snapshotId = snapshot.SnapshotId });
+    }
+
+    private async Task<string> RepositoryBlobReadAsync(JsonElement input, CancellationToken ct)
+    {
+        if (repoSnapshots is null) return ToError("Repository snapshot service is not configured.");
+        if (repoBlobStore is null) return ToError("Blob store is not configured.");
+        var repositoryId = Str(input, "repositoryId")!;
+        var path = Str(input, "path")!;
+        var snapshot = await repoSnapshots.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
+        if (snapshot?.TreeEntries is null)
+            return ToError("No snapshot with tree entries found for this repository.");
+        if (!snapshot.TreeEntries.TryGetValue(path, out var blobId))
+            return ToError($"Path '{path}' not found in the latest snapshot.");
+        var result = await repoBlobStore.TryGetBlobAsync(blobId, ct).ConfigureAwait(false);
+        if (!result.Found || result.Bytes is null)
+            return ToError($"Blob {blobId} is referenced in the snapshot but not found in CAS.");
+        return ToJson(new
+        {
+            path, blobId,
+            content = System.Text.Encoding.UTF8.GetString(result.Bytes),
+            contentType = result.ContentType
+        });
+    }
+
+    private async Task<string> RepositoryBlobWriteAsync(JsonElement input, CancellationToken ct)
+    {
+        if (repoSnapshots is null) return ToError("Repository snapshot service is not configured.");
+        if (repoBlobStore is null) return ToError("Blob store is not configured.");
+        if (repoOpEmitter is null) return ToError("Repository op service is not configured.");
+        var repositoryId = Str(input, "repositoryId")!;
+        var path = Str(input, "path")!;
+        var content = Str(input, "content")!;
+        var bytes = System.Text.Encoding.UTF8.GetBytes(content);
+        var newBlobId = NodalMerge.Studio.Storage.BlobHasher.ComputeHash(bytes);
+        await repoBlobStore.PutBlobAsync(newBlobId, bytes, "text/plain", ct).ConfigureAwait(false);
+        var snapshot = await repoSnapshots.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
+        var oldBlobId = snapshot?.TreeEntries?.GetValueOrDefault(path);
+        var kind = oldBlobId is null ? OperationType.Add : OperationType.Replace;
+        var op = new RepositoryOperation(
+            OperationId:      $"op-{Guid.NewGuid():N}",
+            RepositoryId:     repositoryId,
+            ParentSnapshotId: snapshot?.SnapshotId,
+            Kind:             kind,
+            Path:             path,
+            Timestamp:        DateTimeOffset.UtcNow,
+            WorkUnitId:       Str(input, "workUnitId"),
+            OldBlobId:        oldBlobId,
+            NewBlobId:        newBlobId,
+            Reason:           Str(input, "reason"));
+        await repoOpEmitter.EmitAsync(op, ct).ConfigureAwait(false);
+        return ToJson(new { path, blobId = newBlobId, kind = kind.ToString() });
+    }
+
+    private async Task<string> RepositoryBlobSearchAsync(JsonElement input, CancellationToken ct)
+    {
+        if (repoSnapshots is null) return ToError("Repository snapshot service is not configured.");
+        if (repoBlobStore is null) return ToError("Blob store is not configured.");
+        var repositoryId = Str(input, "repositoryId")!;
+        var query = Str(input, "query")!;
+        var scope = Str(input, "scope");
+        var maxResults = Int(input, "maxResults") ?? 20;
+        var snapshot = await repoSnapshots.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
+        if (snapshot?.TreeEntries is null)
+            return ToError("No snapshot with tree entries found for this repository.");
+        var matches = new List<object>();
+        foreach (var (path, blobId) in snapshot.TreeEntries)
+        {
+            if (matches.Count >= maxResults) break;
+            if (scope is not null && !path.StartsWith(scope, StringComparison.Ordinal)) continue;
+            var result = await repoBlobStore.TryGetBlobAsync(blobId, ct).ConfigureAwait(false);
+            if (!result.Found || result.Bytes is null) continue;
+            string text;
+            try { text = System.Text.Encoding.UTF8.GetString(result.Bytes); }
+            catch { continue; }
+            var lines = text.Split('\n');
+            for (var i = 0; i < lines.Length && matches.Count < maxResults; i++)
+            {
+                if (!lines[i].Contains(query, StringComparison.OrdinalIgnoreCase)) continue;
+                matches.Add(new { path, lineNumber = i + 1, snippet = lines[i].Trim() });
+            }
+        }
+        return ToJson(new { query, matches, count = matches.Count });
+    }
+
+    private async Task<string> TaskCreateAsync(JsonElement input, CancellationToken ct)
     {
         var task = await taskCommands.CreateAsync(
             new TaskCreateCommand(
@@ -280,7 +391,7 @@ internal sealed class McpToolDispatcher(
     private async Task<string> BranchCreateAsync(JsonElement input, CancellationToken ct)
     {
         var branchId = await branches.CreateBranchAsync(
-            Str(input, "name")!, Str(input, "fromBranch"), ct).ConfigureAwait(false);
+            Str(input, "name")!, Str(input, "fromBranch"), cancellationToken: ct).ConfigureAwait(false);
         return ToJson(new { branchId });
     }
 
@@ -468,7 +579,14 @@ internal sealed class McpToolDispatcher(
         {
             var content = await fileWorkspace.ReadAsync(branchId, path, ct).ConfigureAwait(false);
             if (content is null)
-                return ToError($"File '{path}' not found in branch '{branchId}'.");
+            {
+                // Phase 11 on-demand fetch: file may exist in the repository snapshot but wasn't
+                // in the work unit's initial FileScope. Try to pull it from CAS before giving up.
+                var materialized = await fileWorkspace.MaterializeFileAsync(branchId, path, ct).ConfigureAwait(false);
+                if (!materialized)
+                    return ToError($"File '{path}' does not exist in this branch or in the repository snapshot. If this is a new file, use nm_v1_workspace_write to create it.");
+                content = await fileWorkspace.ReadAsync(branchId, path, ct).ConfigureAwait(false) ?? string.Empty;
+            }
             _readPaths[ReadCacheKey(branchId, path)] = 0;
             await RecordWorkspaceReadAsync(sessionId, Str(input, "workUnitId"), [path], ct).ConfigureAwait(false);
             return ToJson(new { content });
@@ -487,6 +605,24 @@ internal sealed class McpToolDispatcher(
         try
         {
             var files = await fileWorkspace.ReadManyAsync(branchId, paths, ct).ConfigureAwait(false);
+
+            // Phase 11 on-demand fetch: for any missing files, try CAS materialization then re-read.
+            var missing = files.Where(f => !f.Found).Select(f => f.Path).ToList();
+            if (missing.Count > 0)
+            {
+                var reMaterialize = new List<string>();
+                foreach (var p in missing)
+                    if (await fileWorkspace.MaterializeFileAsync(branchId, p, ct).ConfigureAwait(false))
+                        reMaterialize.Add(p);
+
+                if (reMaterialize.Count > 0)
+                {
+                    var reRead = await fileWorkspace.ReadManyAsync(branchId, reMaterialize, ct).ConfigureAwait(false);
+                    var reReadMap = reRead.ToDictionary(f => f.Path, StringComparer.Ordinal);
+                    files = files.Select(f => reReadMap.TryGetValue(f.Path, out var fresh) ? fresh : f).ToList();
+                }
+            }
+
             foreach (var file in files.Where(f => f.Found))
                 _readPaths[ReadCacheKey(branchId, file.Path)] = 0;
             await RecordWorkspaceReadAsync(sessionId, Str(input, "workUnitId"), paths, ct).ConfigureAwait(false);

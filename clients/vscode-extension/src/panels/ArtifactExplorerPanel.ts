@@ -47,6 +47,11 @@ interface StudioOptions {
   testCommand: string;
   enforceExpectedOutputKind?: boolean;
   usePromotionBranch?: boolean;
+  allowAgentGitCommits?: boolean;
+  allowAgentGitPush?: boolean;
+  allowAutoRequeue?: boolean;
+  blockConflictingOps?: boolean;
+  materializerConcurrency?: number;
 }
 
 interface ExecutionSession {
@@ -216,9 +221,13 @@ export class GoalWorkspacePanel {
     void this.sendWsInit();
     void this.sendSettings();
     void this.refreshSessions();
+    let pollCount = 0;
     this.pollTimer = setInterval(() => {
       void this.refreshSessions();
       if (this.selectedSessionId) { void this.refreshDecisionTree(this.selectedSessionId); }
+      // Re-fetch settings every ~30 s (every 15 ticks at 2 s each) so that values always
+      // appear even if the server wasn't ready on the first activate() call.
+      if (++pollCount % 15 === 0) { void this.sendSettings(); }
     }, POLL_INTERVAL_MS);
   }
 
@@ -622,6 +631,21 @@ export class GoalWorkspacePanel {
           break;
         case 'explorerSetEnforceExpectedOutputKind':
           await this.updateOptions({ enforceExpectedOutputKind: msg.value as boolean });
+          break;
+        case 'explorerSetBlockConflictingOps':
+          await this.updateOptions({ blockConflictingOps: msg.value as boolean });
+          break;
+        case 'explorerSetAllowAutoRequeue':
+          await this.updateOptions({ allowAutoRequeue: msg.value as boolean });
+          break;
+        case 'explorerSetAllowAgentGitCommits':
+          await this.updateOptions({ allowAgentGitCommits: msg.value as boolean });
+          break;
+        case 'explorerSetAllowAgentGitPush':
+          await this.updateOptions({ allowAgentGitPush: msg.value as boolean });
+          break;
+        case 'explorerSetMaterializerConcurrency':
+          await this.updateOptions({ materializerConcurrency: msg.value as number });
           break;
         case 'explorerBrowseRepositoryPath':
           await this.handleBrowseRepositoryPath();
@@ -1587,6 +1611,35 @@ const GW_HTML = `
       <input type="checkbox" id="gw-enforce-output-kind-checkbox"/>
       Reject worker proposals with no file changes
     </label>
+    <label class="gw-settings-row" style="margin-top:8px;border-top:1px solid var(--nm-border);padding-top:8px">
+      Merge &amp; Conflict
+    </label>
+    <label class="gw-settings-row">
+      <input type="checkbox" id="gw-block-conflicting-ops-checkbox"/>
+      Block conflicting ops (reject second op on conflict)
+    </label>
+    <label class="gw-settings-row">
+      <input type="checkbox" id="gw-allow-auto-requeue-checkbox"/>
+      Auto-requeue losing work unit when all merge strategies fail
+    </label>
+    <label class="gw-settings-row" style="margin-top:8px;border-top:1px solid var(--nm-border);padding-top:8px">
+      Git Integration <span style="font-size:0.8em;color:var(--nm-text-muted)">(opt-in, use with care)</span>
+    </label>
+    <label class="gw-settings-row">
+      <input type="checkbox" id="gw-allow-agent-git-commits-checkbox"/>
+      Allow agents to create git commits on export
+    </label>
+    <label class="gw-settings-row">
+      <input type="checkbox" id="gw-allow-agent-git-push-checkbox"/>
+      Allow agents to push git branches on export
+    </label>
+    <label class="gw-settings-row" style="margin-top:8px;border-top:1px solid var(--nm-border);padding-top:8px">
+      Repository
+    </label>
+    <label class="gw-settings-row">
+      Materializer concurrency
+      <input type="number" id="gw-materializer-concurrency" min="1" max="16" step="1" style="width:60px"/>
+    </label>
   </div>
   <div class="gw-body">
     <div class="gw-col gw-decision-tree" id="gw-col-tree">
@@ -1813,6 +1866,28 @@ const GW_JS = `
     var value = parseInt(ev.target.value, 10);
     if (!value || value < 100) { return; }
     vscode.postMessage({ type: 'explorerSetSchedulerPollIntervalMs', value: value });
+  });
+
+  document.getElementById('gw-block-conflicting-ops-checkbox').addEventListener('change', function(ev) {
+    vscode.postMessage({ type: 'explorerSetBlockConflictingOps', value: ev.target.checked });
+  });
+
+  document.getElementById('gw-allow-auto-requeue-checkbox').addEventListener('change', function(ev) {
+    vscode.postMessage({ type: 'explorerSetAllowAutoRequeue', value: ev.target.checked });
+  });
+
+  document.getElementById('gw-allow-agent-git-commits-checkbox').addEventListener('change', function(ev) {
+    vscode.postMessage({ type: 'explorerSetAllowAgentGitCommits', value: ev.target.checked });
+  });
+
+  document.getElementById('gw-allow-agent-git-push-checkbox').addEventListener('change', function(ev) {
+    vscode.postMessage({ type: 'explorerSetAllowAgentGitPush', value: ev.target.checked });
+  });
+
+  document.getElementById('gw-materializer-concurrency').addEventListener('change', function(ev) {
+    var value = parseInt(ev.target.value, 10);
+    if (!value || value < 1) { return; }
+    vscode.postMessage({ type: 'explorerSetMaterializerConcurrency', value: value });
   });
 
   // Phase Y — Steer & Retry profile toggle
@@ -2964,6 +3039,13 @@ const GW_JS = `
       document.getElementById('gw-require-build-checkbox').checked = !!msg.requireBuildBeforeProposal;
       document.getElementById('gw-require-test-checkbox').checked = !!msg.requireTestBeforeProposal;
       document.getElementById('gw-enforce-output-kind-checkbox').checked = !!msg.enforceExpectedOutputKind;
+      document.getElementById('gw-block-conflicting-ops-checkbox').checked = !!msg.blockConflictingOps;
+      document.getElementById('gw-allow-auto-requeue-checkbox').checked = !!msg.allowAutoRequeue;
+      document.getElementById('gw-allow-agent-git-commits-checkbox').checked = !!msg.allowAgentGitCommits;
+      document.getElementById('gw-allow-agent-git-push-checkbox').checked = !!msg.allowAgentGitPush;
+      if (msg.materializerConcurrency !== undefined) {
+        document.getElementById('gw-materializer-concurrency').value = msg.materializerConcurrency;
+      }
       // Slice 21c — Target (Direct/Candidate) only makes sense when promotion branch is on.
       document.getElementById('gw-target-row').classList.toggle('visible', !!msg.usePromotionBranch);
       return;

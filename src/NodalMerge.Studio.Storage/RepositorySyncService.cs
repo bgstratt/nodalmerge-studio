@@ -18,19 +18,22 @@ internal sealed class RepositorySyncService : IRepositorySyncService, IRehydrata
     private readonly IArtifactLineageService _artifactLineage;
     private readonly IWorkspaceProfileService _workspaceProfiles;
     private readonly IStudioNodeStore _nodeStore;
+    private readonly IRepositoryImportService? _repositoryImport;
 
     public RepositorySyncService(
         IFileWorkspaceService fileWorkspace,
         IKnownGoodStateService knownGoodState,
         IArtifactLineageService artifactLineage,
         IWorkspaceProfileService workspaceProfiles,
-        IStudioNodeStore nodeStore)
+        IStudioNodeStore nodeStore,
+        IRepositoryImportService? repositoryImport = null)
     {
         _fileWorkspace = fileWorkspace;
         _knownGoodState = knownGoodState;
         _artifactLineage = artifactLineage;
         _workspaceProfiles = workspaceProfiles;
         _nodeStore = nodeStore;
+        _repositoryImport = repositoryImport;
     }
 
     public async Task<PendingExternalSync?> SyncBranchFromRepositoryAsync(
@@ -51,6 +54,15 @@ internal sealed class RepositorySyncService : IRepositorySyncService, IRehydrata
     private async Task<PendingExternalSync?> SyncCoreAsync(
         string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct)
     {
+        // Phase 5 — one-time CAS bootstrap: walk the repo, put every file to CAS, emit Import ops,
+        // and record the Generation-0 RepositorySnapshot. Fast no-op on all subsequent calls.
+        if (_repositoryImport is not null)
+        {
+            var repositoryId = Path.GetFullPath(repositoryPath);
+            await _repositoryImport.EnsureBootstrappedAsync(repositoryId, repositoryPath, ct)
+                .ConfigureAwait(false);
+        }
+
         // No-op if main is already populated (today's existing one-time seed mechanism, untouched).
         await _fileWorkspace.InitBranchAsync(branchId, ct: ct).ConfigureAwait(false);
 

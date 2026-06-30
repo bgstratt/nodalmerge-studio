@@ -16,13 +16,19 @@ public sealed class FindingDetectorService(
     IFindingService findings,
     IMergeService merges,
     IEvidenceNodeService evidenceNodes,
-    IStudioNodeStore nodeStore)
+    IStudioNodeStore nodeStore,
+    ICoModService? coMod = null,
+    IWorkUnitService? workUnits = null,
+    WorkspaceOptions? workspaceOptions = null)
 {
     private const int MinSampleSize = 5;
     private const double WinRateThreshold = 0.70;
     private const int MinRejectedProposals = 5;
     private const double MissingEvidenceThreshold = 0.50;
     private const int MinDistinctWorkUnitsForSteeringKeyword = 3;
+    private const double CoModMissConfidenceThreshold = 0.6;
+    private const double BoundaryViolationConfidenceThreshold = 0.4;
+    private const int BoundaryViolationMinCount = 3;
 
     public async Task<IReadOnlyList<Finding>> DetectDeterministicAsync(CancellationToken ct = default)
     {
@@ -190,5 +196,110 @@ public sealed class FindingDetectorService(
         }
 
         return created;
+    }
+
+    // Phase 11.5 — two co-modification detectors:
+    // 1. CoModMiss: a completed WU's FileScope touched pathA but not its high-confidence partner pathB.
+    // 2. BoundaryViolation: a co-mod pair crosses architectural layer prefixes (e.g. src/UI + src/Domain).
+    public async Task<IReadOnlyList<Finding>> DetectCoModPatternsAsync(CancellationToken ct = default)
+    {
+        if (coMod is null || string.IsNullOrEmpty(workspaceOptions?.SeedRepositoryPath))
+            return [];
+
+        var repositoryId = Path.GetFullPath(workspaceOptions.SeedRepositoryPath);
+        var all = await coMod.GetAsync(repositoryId, ct).ConfigureAwait(false);
+        if (all.Count == 0) return [];
+
+        var existing = await findings.ListAsync(ct).ConfigureAwait(false);
+        var openTitles = existing
+            .Where(f => f.Source == FindingSource.Deterministic && f.Status == FindingStatus.Open)
+            .Select(f => f.Title)
+            .ToHashSet();
+
+        var created = new List<Finding>();
+
+        // ── Boundary violation detector ────────────────────────────────────────
+        // Flag pairs where PathA and PathB appear to live in different architectural layers.
+        foreach (var pattern in all.Where(p => p.Confidence >= BoundaryViolationConfidenceThreshold
+                                               && p.CoModificationCount >= BoundaryViolationMinCount))
+        {
+            var layerA = DetectLayer(pattern.PathA);
+            var layerB = DetectLayer(pattern.PathB);
+            if (layerA is null || layerB is null || layerA == layerB) continue;
+
+            var title = $"Cross-layer co-modification: {layerA} ↔ {layerB} ({pattern.CoModificationCount}× in {Math.Round(pattern.Confidence * 100)}% of WUs)";
+            if (openTitles.Contains(title)) continue;
+
+            created.Add(await findings.ProposeAsync(new Finding(
+                FindingId: $"finding-{Guid.NewGuid():N}",
+                Kind: FindingKind.KnowledgeGuideline,
+                Source: FindingSource.Deterministic,
+                Title: title,
+                Summary: $"'{pattern.PathA}' ({layerA}) and '{pattern.PathB}' ({layerB}) were co-modified in " +
+                    $"{pattern.CoModificationCount} work units ({Math.Round(pattern.Confidence * 100)}% confidence). " +
+                    "Frequent cross-layer co-modification may indicate an eroding architectural boundary. " +
+                    "Consider whether these files should be coupled or the boundary should be made explicit.",
+                SupportingDataJson: JsonSerializer.Serialize(pattern, JsonSerializerOptions.Web),
+                Status: FindingStatus.Open,
+                CreatedAt: DateTimeOffset.UtcNow), ct).ConfigureAwait(false));
+        }
+
+        // ── Co-modification miss detector ─────────────────────────────────────
+        // For each completed work unit with FileScope, check if a high-confidence co-mod partner
+        // is absent from the scope — suggesting the planner under-specified the scope.
+        if (workUnits is not null)
+        {
+            var completed = await workUnits.ListAsync(cancellationToken: ct).ConfigureAwait(false);
+            foreach (var wu in completed.Where(w => w.Status == WorkUnitStatus.Completed
+                                                    && w.FileScope.Count > 0))
+            {
+                var scopeSet = new HashSet<string>(wu.FileScope, StringComparer.Ordinal);
+                var hints = all.Where(p => p.Confidence >= CoModMissConfidenceThreshold
+                    && (scopeSet.Any(s => p.PathA.StartsWith(s, StringComparison.Ordinal))
+                     || scopeSet.Any(s => p.PathB.StartsWith(s, StringComparison.Ordinal))));
+
+                foreach (var hint in hints)
+                {
+                    // Determine which path is the partner (the one NOT in scope).
+                    var inScope  = scopeSet.Any(s => hint.PathA.StartsWith(s, StringComparison.Ordinal)) ? hint.PathA : hint.PathB;
+                    var partner  = inScope == hint.PathA ? hint.PathB : hint.PathA;
+                    if (scopeSet.Any(s => partner.StartsWith(s, StringComparison.Ordinal))) continue;
+
+                    var title = $"Likely missed co-modification: '{partner}' (WU {wu.WorkUnitId[..8]})";
+                    if (openTitles.Contains(title)) continue;
+
+                    created.Add(await findings.ProposeAsync(new Finding(
+                        FindingId: $"finding-{Guid.NewGuid():N}",
+                        Kind: FindingKind.PromptImprovement,
+                        Source: FindingSource.Deterministic,
+                        Title: title,
+                        Summary: $"Work unit '{wu.WorkUnitId}' (goal: {wu.Goal}) included '{inScope}' in its scope " +
+                            $"but not '{partner}', which is co-modified with it in {Math.Round(hint.Confidence * 100)}% " +
+                            "of past work units. Consider whether the planner should include the partner in FileScope.",
+                        SupportingDataJson: JsonSerializer.Serialize(new { wu.WorkUnitId, inScope, partner, hint.Confidence }, JsonSerializerOptions.Web),
+                        Status: FindingStatus.Open,
+                        CreatedAt: DateTimeOffset.UtcNow,
+                        TargetStage: PipelineStage.Plan), ct).ConfigureAwait(false));
+                }
+            }
+        }
+
+        return created;
+    }
+
+    // Heuristic: infer architectural layer from the first path segment after "src/" or the
+    // top-level directory. Returns null when the layer is ambiguous or single-segment.
+    private static readonly string[] LayerNames =
+        ["ui", "web", "frontend", "domain", "core", "data", "infrastructure", "infra", "api", "shared", "common"];
+
+    private static string? DetectLayer(string path)
+    {
+        var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var part in parts)
+        {
+            var lower = part.ToLowerInvariant();
+            if (LayerNames.Contains(lower)) return lower;
+        }
+        return parts.Length > 1 ? parts[0].ToLowerInvariant() : null;
     }
 }

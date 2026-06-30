@@ -5,11 +5,12 @@ namespace NodalMerge.Studio.Storage;
 
 internal sealed class NodalMergeBranchService(IStudioNodeStore nodeStore, IFileWorkspaceService fileWorkspace) : IBranchService
 {
-    public async Task<string> CreateBranchAsync(string name, string? fromBranchId = null, CancellationToken cancellationToken = default)
+    public async Task<string> CreateBranchAsync(string name, string? fromBranchId = null,
+        IReadOnlyList<string>? fileScope = null, CancellationToken cancellationToken = default)
     {
         var json = JsonSerializer.Serialize(new { id = name, parentId = fromBranchId, createdAt = DateTimeOffset.UtcNow });
         await nodeStore.WriteNodeAsync(StudioNodeKind.BranchV1, name, json, cancellationToken).ConfigureAwait(false);
-        await fileWorkspace.InitBranchAsync(name, fromBranchId, cancellationToken).ConfigureAwait(false);
+        await fileWorkspace.InitBranchAsync(name, fromBranchId, fileScope, cancellationToken).ConfigureAwait(false);
         return name;
     }
 

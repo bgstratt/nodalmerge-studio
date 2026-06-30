@@ -109,7 +109,7 @@ internal sealed class WorkspaceExecutionService(
                 return await ExecuteAsync(sourceBranchIds[0], request, ct);
 
             // Seed from first branch, then apply subsequent ones on top
-            await fileWorkspace.InitBranchAsync(compositeId, sourceBranchIds[0], ct).ConfigureAwait(false);
+            await fileWorkspace.InitBranchAsync(compositeId, sourceBranchIds[0], ct: ct).ConfigureAwait(false);
 
             var conflicts = new List<string>();
             for (int i = 1; i < sourceBranchIds.Count; i++)
