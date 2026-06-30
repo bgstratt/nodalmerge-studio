@@ -12,7 +12,6 @@ namespace NodalMerge.Studio.McpServer.Tools;
 // Phase 12 — CAS-backed repository tools for the HTTP MCP server.
 // Mirrors the McpToolDispatcher blob handlers so external harnesses (Copilot, Cline, etc.)
 // have parity with internally spawned agents.
-[McpServerToolType]
 public sealed class RepositoryBlobTools(
     IRepositorySnapshotService repoSnapshots,
     IBlobStoreProvider? repoBlobStore = null,

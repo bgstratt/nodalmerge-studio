@@ -6,7 +6,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class EvidenceTools(IWorkspaceExecutionCommandService execCommands, IWorkUnitService workUnits)
 {
     [McpServerTool(Name = McpToolNames.EvidenceAttach), Description("Attach build/test evidence to a work unit.")]

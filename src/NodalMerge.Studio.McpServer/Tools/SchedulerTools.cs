@@ -5,7 +5,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class SchedulerTools(ISchedulerCommandService scheduler, IClarificationCommandService clarifications)
 {
     [McpServerTool(Name = McpToolNames.SchedulerEnqueue)]
@@ -42,7 +41,7 @@ public sealed class SchedulerTools(ISchedulerCommandService scheduler, IClarific
     }
 
     [McpServerTool(Name = McpToolNames.ClarificationRequest)]
-    [Description("Request a human clarification for a work unit. With blocking=true, the scheduler entry is paused awaiting resume.")]
+    [Description("Request a human clarification for a work unit. With blocking=true, the scheduler entry is paused awaiting resume. Optionally set timeoutSeconds so the system auto-responds if no human replies in time.")]
     public async Task<string> ClarificationRequestAsync(
         string workUnitId,
         string question,
@@ -51,6 +50,9 @@ public sealed class SchedulerTools(ISchedulerCommandService scheduler, IClarific
         string[]? options = null,
         string? requestedByAgentId = null,
         string? sessionId = null,
+        [Description("Seconds before auto-responding. Null means wait indefinitely.")] int? timeoutSeconds = null,
+        [Description("What to do on timeout: 'auto_continue' (default), 'auto_abandon', or 'use_default'.")] string? timeoutBehavior = null,
+        [Description("Response text to use when auto-responding on timeout.")] string? defaultResponse = null,
         CancellationToken cancellationToken = default)
     {
         try
@@ -63,6 +65,9 @@ public sealed class SchedulerTools(ISchedulerCommandService scheduler, IClarific
                 options,
                 requestedByAgentId,
                 sessionId,
+                timeoutSeconds,
+                timeoutBehavior,
+                defaultResponse,
                 cancellationToken).ConfigureAwait(false);
             return McpJson.Ok(new
             {

@@ -5,7 +5,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class ParticipantTools(IStudioParticipantService participants, IParticipantEventBus eventBus)
 {
     [McpServerTool(Name = McpToolNames.ParticipantList),

@@ -9,7 +9,8 @@ namespace NodalMerge.Studio.Storage;
 public sealed class ClarificationCommandService(
     IWorkScheduler scheduler,
     IWorkUnitService workUnits,
-    IExecutionEventStream events) : IClarificationCommandService
+    IExecutionEventStream events,
+    WorkspaceOptions? workspaceOptions = null) : IClarificationCommandService
 {
     private static readonly HashSet<WorkUnitStatus> AbandonedStatuses =
     [
@@ -28,6 +29,9 @@ public sealed class ClarificationCommandService(
         IReadOnlyList<string>? options = null,
         string? requestedByAgentId = null,
         string? sessionId = null,
+        int? timeoutSeconds = null,
+        string? timeoutBehavior = null,
+        string? defaultResponse = null,
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(workUnitId))
@@ -39,6 +43,13 @@ public sealed class ClarificationCommandService(
         var now = DateTimeOffset.UtcNow;
         var resolvedSessionId = await ResolveSessionIdAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
         var optionsList = options?.Where(o => !string.IsNullOrWhiteSpace(o)).ToList() ?? [];
+
+        // Apply workspace-level timeout defaults when the agent doesn't specify one.
+        if (timeoutSeconds is null && workspaceOptions?.DefaultClarificationTimeoutSeconds > 0)
+        {
+            timeoutSeconds = workspaceOptions.DefaultClarificationTimeoutSeconds;
+            timeoutBehavior ??= workspaceOptions.DefaultClarificationTimeoutBehavior;
+        }
 
         if (blocking)
         {
@@ -60,7 +71,10 @@ public sealed class ClarificationCommandService(
                     blocking,
                     optionsList,
                     requestedByAgentId,
-                    now),
+                    now,
+                    timeoutSeconds,
+                    timeoutBehavior,
+                    defaultResponse),
                 ct: ct).ConfigureAwait(false);
         }
 
@@ -130,7 +144,10 @@ public sealed class ClarificationCommandService(
                     ResponseNote: null,
                     RespondedBy: null,
                     RespondedAt: null,
-                    AwaitingResume: awaitingSet.Contains(r.WorkUnitId));
+                    AwaitingResume: awaitingSet.Contains(r.WorkUnitId),
+                    TimeoutSeconds: r.TimeoutSeconds,
+                    TimeoutAt: r.TimeoutSeconds.HasValue ? r.RequestedAt.AddSeconds(r.TimeoutSeconds.Value) : null,
+                    TimeoutBehavior: r.TimeoutBehavior);
             })
             .OrderByDescending(i => i.RequestedAt)
             .ToList();
@@ -318,7 +335,10 @@ public sealed class ClarificationCommandService(
                     ResponseNote: null,
                     RespondedBy: null,
                     RespondedAt: null,
-                    AwaitingResume: false);
+                    AwaitingResume: false,
+                    TimeoutSeconds: payload.TimeoutSeconds,
+                    TimeoutAt: payload.TimeoutSeconds.HasValue ? payload.RequestedAt.AddSeconds(payload.TimeoutSeconds.Value) : null,
+                    TimeoutBehavior: payload.TimeoutBehavior);
                 continue;
             }
 

@@ -124,6 +124,10 @@ public static class ServiceCollectionExtensions
         // dev server into.
         services.AddSingleton<RunningProcessRegistry>();
 
+        // Phase 1 — goal-level pause/resume and clarification timeout
+        services.AddSingleton<IGoalControlService, GoalControlService>();
+        services.AddSingleton<IClarificationTimerService, ClarificationTimerService>();
+
         // Phase 6.7b — decision-centric persistent node services
         services.AddSingleton<GoalNodeService>();
         services.AddSingleton<IGoalNodeService>(sp => sp.GetRequiredService<GoalNodeService>());

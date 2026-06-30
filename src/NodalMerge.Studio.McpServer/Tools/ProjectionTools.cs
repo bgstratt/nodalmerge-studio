@@ -8,7 +8,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class ProjectionTools(
     IProjectionManager projections,
     IProjectionSnapshotService snapshots,

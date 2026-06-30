@@ -5,7 +5,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class BranchTools(IBranchService branches)
 {
     [McpServerTool(Name = McpToolNames.BranchCreate), Description("Create a branch.")]

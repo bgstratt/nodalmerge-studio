@@ -52,6 +52,8 @@ interface StudioOptions {
   allowAutoRequeue?: boolean;
   blockConflictingOps?: boolean;
   materializerConcurrency?: number;
+  defaultClarificationTimeoutSeconds?: number | null;
+  defaultClarificationTimeoutBehavior?: string;
 }
 
 interface ExecutionSession {
@@ -647,6 +649,12 @@ export class GoalWorkspacePanel {
         case 'explorerSetMaterializerConcurrency':
           await this.updateOptions({ materializerConcurrency: msg.value as number });
           break;
+        case 'explorerSetClarificationTimeoutSeconds':
+          await this.updateOptions({ defaultClarificationTimeoutSeconds: msg.value as number });
+          break;
+        case 'explorerSetClarificationTimeoutBehavior':
+          await this.updateOptions({ defaultClarificationTimeoutBehavior: msg.value as string });
+          break;
         case 'explorerBrowseRepositoryPath':
           await this.handleBrowseRepositoryPath();
           break;
@@ -665,6 +673,12 @@ export class GoalWorkspacePanel {
               (msg.agentId as string) ?? '',
             );
           }
+          break;
+        case 'explorerGoalPause':
+          await this.handleGoalPause(msg.goalId as string);
+          break;
+        case 'explorerGoalResume':
+          await this.handleGoalResume(msg.goalId as string);
           break;
         case 'explorerCounterfactualAction':
           await this.handleCounterfactualAction(
@@ -685,6 +699,35 @@ export class GoalWorkspacePanel {
       }
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: ' + String(err));
+    }
+  }
+
+  private async handleGoalPause(goalId: string): Promise<void> {
+    try {
+      await this.post(`/studio/goals/${goalId}/pause`, { pausedBy: 'user' });
+      void vscode.window.showInformationMessage('NodalMerge: Goal paused.');
+      await this.refreshSessions();
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: Pause failed — ' + String(err));
+    }
+  }
+
+  private async handleGoalResume(goalId: string): Promise<void> {
+    const steering = await vscode.window.showInputBox({
+      prompt: 'Optional: add steering message for the agent (leave blank to resume as-is)',
+      placeHolder: 'e.g. Focus on the auth module first',
+      ignoreFocusOut: true,
+    });
+    if (steering === undefined) { return; } // user cancelled
+    try {
+      await this.post(`/studio/goals/${goalId}/resume`, {
+        steering: steering.trim() || undefined,
+        resumedBy: 'user',
+      });
+      void vscode.window.showInformationMessage('NodalMerge: Goal resumed.');
+      await this.refreshSessions();
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: Resume failed — ' + String(err));
     }
   }
 
@@ -1541,7 +1584,11 @@ const GW_HTML = `
   <div class="gw-topbar">
     <div class="gw-field">
       <label>Active Exploration</label>
-      <select id="gw-session"><option value="">(no exploration)</option></select>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="gw-session"><option value="">(no exploration)</option></select>
+        <button id="gw-session-pause" class="ghost" title="Pause this exploration" style="display:none;color:var(--nm-warn);border-color:var(--nm-warn);padding:3px 8px;font-size:0.78em">&#x23F8; Pause</button>
+        <button id="gw-session-resume" class="ghost" title="Resume this exploration" style="display:none;padding:3px 8px;font-size:0.78em">&#x25B6; Resume</button>
+      </div>
     </div>
     <div class="gw-field">
       <label>Investigation Strategy</label>
@@ -1640,6 +1687,21 @@ const GW_HTML = `
       Materializer concurrency
       <input type="number" id="gw-materializer-concurrency" min="1" max="16" step="1" style="width:60px"/>
     </label>
+    <label class="gw-settings-row" style="margin-top:8px;border-top:1px solid var(--nm-border);padding-top:8px">
+      Clarification Timeout <span style="font-size:0.8em;opacity:0.6">— if an agent asks and you don't reply in time</span>
+    </label>
+    <label class="gw-settings-row">
+      Auto-respond after
+      <input type="number" id="gw-clarification-timeout-seconds" min="0" step="10" style="width:70px" title="Seconds before auto-responding (0 = wait indefinitely)"/>
+      seconds&ensp;(0 = wait forever)
+    </label>
+    <label class="gw-settings-row">
+      Timeout behavior
+      <select id="gw-clarification-timeout-behavior" style="font-size:0.85em">
+        <option value="auto_continue">auto_continue — let the agent decide</option>
+        <option value="auto_abandon">auto_abandon — stop the work unit</option>
+      </select>
+    </label>
   </div>
   <div class="gw-body">
     <div class="gw-col gw-decision-tree" id="gw-col-tree">
@@ -1715,6 +1777,33 @@ const GW_JS = `
     state.selectedSessionId = ev.target.value;
     vscode.postMessage({ type: 'explorerSelectSession', sessionId: ev.target.value });
     document.getElementById('gw-tree').innerHTML = '<p class="empty">Loading…</p>';
+    updateSessionControls(ev.target.value, state.__sessions || []);
+  });
+
+  function updateSessionControls(sessionId, sessions) {
+    var pauseBtn = document.getElementById('gw-session-pause');
+    var resumeBtn = document.getElementById('gw-session-resume');
+    if (!sessionId) {
+      pauseBtn.style.display = 'none';
+      resumeBtn.style.display = 'none';
+      return;
+    }
+    var session = (sessions || []).find(function(s) { return s.sessionId === sessionId; });
+    var isPaused = session && session.status === 'Paused';
+    pauseBtn.style.display = (!isPaused && session) ? '' : 'none';
+    resumeBtn.style.display = isPaused ? '' : 'none';
+  }
+
+  document.getElementById('gw-session-pause').addEventListener('click', function() {
+    var session = (state.__sessions || []).find(function(s) { return s.sessionId === state.selectedSessionId; });
+    if (!session) { return; }
+    vscode.postMessage({ type: 'explorerGoalPause', goalId: session.rootWorkUnitId });
+  });
+
+  document.getElementById('gw-session-resume').addEventListener('click', function() {
+    var session = (state.__sessions || []).find(function(s) { return s.sessionId === state.selectedSessionId; });
+    if (!session) { return; }
+    vscode.postMessage({ type: 'explorerGoalResume', goalId: session.rootWorkUnitId });
   });
 
   document.getElementById('gw-run').addEventListener('click', function() {
@@ -1888,6 +1977,15 @@ const GW_JS = `
     var value = parseInt(ev.target.value, 10);
     if (!value || value < 1) { return; }
     vscode.postMessage({ type: 'explorerSetMaterializerConcurrency', value: value });
+  });
+
+  document.getElementById('gw-clarification-timeout-seconds').addEventListener('change', function(ev) {
+    var value = parseInt(ev.target.value, 10);
+    vscode.postMessage({ type: 'explorerSetClarificationTimeoutSeconds', value: isNaN(value) || value < 0 ? 0 : value });
+  });
+
+  document.getElementById('gw-clarification-timeout-behavior').addEventListener('change', function(ev) {
+    vscode.postMessage({ type: 'explorerSetClarificationTimeoutBehavior', value: ev.target.value });
   });
 
   // Phase Y — Steer & Retry profile toggle
@@ -2968,12 +3066,15 @@ const GW_JS = `
     }
     if (msg.type === 'sessions') {
       var sel2 = document.getElementById('gw-session');
-      var options = '<option value="">(no exploration)</option>' + (msg.sessions || []).map(function(s) {
-        return '<option value="' + esc(s.sessionId) + '">' + esc(s.sessionId) + ' — ' + esc(s.status) + '</option>';
+      state.__sessions = msg.sessions || [];
+      var options = '<option value="">(no exploration)</option>' + state.__sessions.map(function(s) {
+        var paused = s.status === 'Paused' ? ' ⏸' : '';
+        return '<option value="' + esc(s.sessionId) + '">' + esc(s.sessionId) + ' — ' + esc(s.status) + paused + '</option>';
       }).join('');
       sel2.innerHTML = options;
       sel2.value = msg.selectedSessionId || '';
       state.selectedSessionId = msg.selectedSessionId || '';
+      updateSessionControls(state.selectedSessionId, state.__sessions);
       return;
     }
     if (msg.type === 'comparisonData') {
@@ -3045,6 +3146,14 @@ const GW_JS = `
       document.getElementById('gw-allow-agent-git-push-checkbox').checked = !!msg.allowAgentGitPush;
       if (msg.materializerConcurrency !== undefined) {
         document.getElementById('gw-materializer-concurrency').value = msg.materializerConcurrency;
+      }
+      var timeoutSecondsEl = document.getElementById('gw-clarification-timeout-seconds');
+      var timeoutBehaviorEl = document.getElementById('gw-clarification-timeout-behavior');
+      if (timeoutSecondsEl) {
+        timeoutSecondsEl.value = msg.defaultClarificationTimeoutSeconds > 0 ? msg.defaultClarificationTimeoutSeconds : 0;
+      }
+      if (timeoutBehaviorEl) {
+        timeoutBehaviorEl.value = msg.defaultClarificationTimeoutBehavior || 'auto_continue';
       }
       // Slice 21c — Target (Direct/Candidate) only makes sense when promotion branch is on.
       document.getElementById('gw-target-row').classList.toggle('visible', !!msg.usePromotionBranch);

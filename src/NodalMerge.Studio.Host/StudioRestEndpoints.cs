@@ -171,7 +171,11 @@ public static class StudioRestEndpoints
         bool AllowAgentGitCommits = false,
         bool AllowAgentGitPush = false,
         // Force rebase — auto-requeue losing work unit when all merge strategies fail
-        bool AllowAutoRequeue = false);
+        bool AllowAutoRequeue = false,
+        // Clarification timeout defaults — applied when an agent doesn't specify its own timeout.
+        // 0 or null means wait indefinitely.
+        int? DefaultClarificationTimeoutSeconds = null,
+        string DefaultClarificationTimeoutBehavior = "auto_continue");
 
     private static object BuildOptionsResponse(WorkspaceOptions o) => new
     {
@@ -202,6 +206,8 @@ public static class StudioRestEndpoints
         allowAgentGitCommits = o.AllowAgentGitCommits,
         allowAgentGitPush    = o.AllowAgentGitPush,
         allowAutoRequeue     = o.AllowAutoRequeue,
+        defaultClarificationTimeoutSeconds  = o.DefaultClarificationTimeoutSeconds,
+        defaultClarificationTimeoutBehavior = o.DefaultClarificationTimeoutBehavior,
     };
 
     private sealed record SyncDiffBody(string[] PeerNodeIdsHex);
@@ -468,6 +474,8 @@ public static class StudioRestEndpoints
             options.AllowAgentGitCommits      = body.AllowAgentGitCommits;
             options.AllowAgentGitPush         = body.AllowAgentGitPush;
             options.AllowAutoRequeue          = body.AllowAutoRequeue;
+            options.DefaultClarificationTimeoutSeconds  = body.DefaultClarificationTimeoutSeconds > 0 ? body.DefaultClarificationTimeoutSeconds : null;
+            options.DefaultClarificationTimeoutBehavior = body.DefaultClarificationTimeoutBehavior;
             if (body.DocFetchAllowedDomains is not null)
                 options.DocFetchAllowedDomains = [.. body.DocFetchAllowedDomains];
             if (body.DocFetchDeniedDomains is not null)
@@ -2067,7 +2075,7 @@ public static class StudioRestEndpoints
                     body.Options,
                     body.RequestedByAgentId,
                     body.SessionId,
-                    ct).ConfigureAwait(false);
+                    ct: ct).ConfigureAwait(false);
                 return Results.Ok(result);
             }
             catch (KeyNotFoundException)
@@ -3224,8 +3232,10 @@ public static class StudioRestEndpoints
                     workUnitId = g.WorkUnitId,
                     branchId = g.BranchId,
                     status = g.Status.ToString(),
+                    pauseReason = g.PauseReason,
                     parentGoalId = g.ParentGoalId,
-                    createdAt = g.CreatedAt
+                    createdAt = g.CreatedAt,
+                    updatedAt = g.UpdatedAt
                 }).ToList();
                 return Results.Ok(new { goals, source = "goal-store" });
             }
@@ -3238,12 +3248,60 @@ public static class StudioRestEndpoints
                 workUnitId = wu.WorkUnitId,
                 branchId = wu.BranchId,
                 status = wu.Status.ToString(),
+                pauseReason = (string?)null,
                 parentWorkUnitId = wu.ParentWorkUnitId,
-                createdAt = wu.CreatedAt
+                createdAt = wu.CreatedAt,
+                updatedAt = wu.UpdatedAt
             }).ToList();
             return Results.Ok(new { goals = fallback, source = "work-units" });
         });
+
+        // Pause a goal
+        app.MapPost("/studio/goals/{goalId}/pause", async (
+            string goalId,
+            PauseGoalBody? body,
+            IGoalControlService goalControl,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var goal = await goalControl.PauseAsync(goalId, body?.Reason, body?.PausedBy, ct).ConfigureAwait(false);
+                return Results.Ok(new
+                {
+                    goalId = goal.GoalId,
+                    status = goal.Status.ToString(),
+                    pauseReason = goal.PauseReason,
+                    updatedAt = goal.UpdatedAt
+                });
+            }
+            catch (KeyNotFoundException ex) { return Results.NotFound(new { error = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // Resume a goal
+        app.MapPost("/studio/goals/{goalId}/resume", async (
+            string goalId,
+            ResumeGoalBody? body,
+            IGoalControlService goalControl,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var goal = await goalControl.ResumeAsync(goalId, body?.Steering, body?.ResumedBy, body?.ProfileId, ct).ConfigureAwait(false);
+                return Results.Ok(new
+                {
+                    goalId = goal.GoalId,
+                    status = goal.Status.ToString(),
+                    updatedAt = goal.UpdatedAt
+                });
+            }
+            catch (KeyNotFoundException ex) { return Results.NotFound(new { error = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
     }
+
+    private sealed record PauseGoalBody(string? Reason = null, string? PausedBy = null);
+    private sealed record ResumeGoalBody(string? Steering = null, string? ResumedBy = null, string? ProfileId = null);
 
     // ── /studio/decisions — 6.5 deferred: decision REST parity ──────────────
 

@@ -11,7 +11,6 @@ namespace NodalMerge.Studio.McpServer.Tools;
 // IRuntimeCommandBridge → FfiBridgeProcessor → HostFfiClient → native P/Invoke. Injecting
 // IServiceProvider instead of the service directly prevents the FFI DLL from being loaded at
 // MCP tool-class construction time (which happens eagerly during app startup).
-[McpServerToolType]
 public sealed class CausalGraphTools(IServiceProvider services)
 {
     private IStudioCausalGraphService Causal =>

@@ -913,7 +913,10 @@ public sealed record ClarificationInboxItem(
     string? ResponseNote,
     string? RespondedBy,
     DateTimeOffset? RespondedAt,
-    bool AwaitingResume);
+    bool AwaitingResume,
+    int? TimeoutSeconds = null,
+    DateTimeOffset? TimeoutAt = null,
+    string? TimeoutBehavior = null);
 
 public sealed record ClarificationGoalMetric(
     string WorkUnitId,
@@ -1025,6 +1028,9 @@ public interface IClarificationCommandService
         IReadOnlyList<string>? options = null,
         string? requestedByAgentId = null,
         string? sessionId = null,
+        int? timeoutSeconds = null,
+        string? timeoutBehavior = null,
+        string? defaultResponse = null,
         CancellationToken ct = default);
 
     Task<IReadOnlyList<ScheduledItem>> ListAwaitingAsync(CancellationToken ct = default);
@@ -1042,6 +1048,17 @@ public interface IClarificationCommandService
         bool resume = true,
         string? sessionId = null,
         CancellationToken ct = default);
+}
+
+/// <summary>
+/// Goal-level pause/resume for external callers (MCP, REST). Coordinates stopping active agents,
+/// updating session status, and re-enqueueing on resume. Does not affect the internal nm_v1_*
+/// agent tool surface or McpToolDispatcher.
+/// </summary>
+public interface IGoalControlService
+{
+    Task<GoalNode> PauseAsync(string goalId, string? reason = null, string? pausedBy = null, CancellationToken ct = default);
+    Task<GoalNode> ResumeAsync(string goalId, string? steering = null, string? resumedBy = null, string? profileId = null, CancellationToken ct = default);
 }
 
 // Slice 15f — shared artifact command entry point for MCP/REST/the agent-loop dispatcher.

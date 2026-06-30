@@ -54,6 +54,10 @@ public enum ExecutionEventKind
     MergeApproved,
     MergeApplied,
 
+    // Goal lifecycle
+    GoalPaused,
+    GoalResumed,
+
     // Orchestration
     OrchestrationDecision,
     ConflictDetected,

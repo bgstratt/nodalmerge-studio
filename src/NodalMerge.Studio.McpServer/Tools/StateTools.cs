@@ -6,7 +6,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class StateTools(IKnownGoodStateService states)
 {
     [McpServerTool(Name = McpToolNames.StateMarkKnownGood), Description("Mark a branch state as known good.")]

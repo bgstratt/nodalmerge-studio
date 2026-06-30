@@ -6,7 +6,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class ReasoningTools(IOrchestrationDecisionLogService decisionLog)
 {
     [McpServerTool(Name = McpToolNames.ReasoningRecord), Description("Record a reasoning commit from an agent's orchestration step.")]

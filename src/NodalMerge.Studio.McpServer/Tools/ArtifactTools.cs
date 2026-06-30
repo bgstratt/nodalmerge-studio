@@ -6,7 +6,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class ArtifactTools(IArtifactCommandService artifacts)
 {
     [McpServerTool(Name = McpToolNames.ArtifactRecord), Description("Record a durable knowledge note (Research, Decision, or Constraint) so future work units don't have to rediscover it.")]

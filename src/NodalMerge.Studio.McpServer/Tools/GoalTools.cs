@@ -7,7 +7,6 @@ using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class GoalTools(
     IWorkUnitService workUnits,
     IWorkUnitCommandService workUnitCommands,

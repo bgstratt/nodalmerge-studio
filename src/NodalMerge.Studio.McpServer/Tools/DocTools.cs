@@ -6,7 +6,6 @@ using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class DocTools(IDocFetchCommandService docs, WorkspaceOptions options)
 {
     [McpServerTool(Name = McpToolNames.DocFetch), Description("Fetch constrained external documentation with provenance metadata and source artifact recording.")]

@@ -6,7 +6,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class MergeTools(IMergeCommandService mergeCommands)
 {
     [McpServerTool(Name = McpToolNames.MergePropose), Description("Submit a merge proposal with full diff, artifact lineage, execution event, and work-unit status transition.")]

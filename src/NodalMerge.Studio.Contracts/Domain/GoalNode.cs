@@ -14,7 +14,8 @@ public sealed record GoalNode(
     string Owner,
     string? ParentGoalId = null,
     IReadOnlyList<string>? ChildGoalIds = null,
-    string? SessionId = null)
+    string? SessionId = null,
+    string? PauseReason = null)
 {
     public IReadOnlyList<string> ChildGoalIds { get; init; } = ChildGoalIds ?? [];
 }
@@ -25,5 +26,6 @@ public enum GoalStatus
     Converging,
     Converged,
     Blocked,
+    Paused,
     Abandoned
 }

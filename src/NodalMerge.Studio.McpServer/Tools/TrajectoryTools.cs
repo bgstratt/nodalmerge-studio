@@ -6,7 +6,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class TrajectoryTools(IWorkUnitService workUnits, IReplayService replay)
 {
     [McpServerTool(Name = McpToolNames.TrajectoryCreate), Description("Create a trajectory record for a work unit's lifecycle.")]

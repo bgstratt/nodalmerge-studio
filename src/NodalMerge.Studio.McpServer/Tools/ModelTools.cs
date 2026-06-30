@@ -5,7 +5,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class ModelTools(IWorkUnitService workUnits, IMergeService merges, IProposalReviewService proposalReview)
 {
     [McpServerTool(Name = McpToolNames.ModelCompare), Description("Compare outputs from two models across merge proposals.")]

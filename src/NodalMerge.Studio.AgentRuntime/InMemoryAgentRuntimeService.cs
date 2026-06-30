@@ -162,6 +162,16 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             catch (ObjectDisposedException) { break; }
             catch { /* timer processing is best-effort */ }
 
+            // Phase 1 — check clarification timeouts on each scheduler tick.
+            try
+            {
+                var clarificationTimer = _serviceProvider.GetService(typeof(NodalMerge.Studio.Storage.IClarificationTimerService)) as NodalMerge.Studio.Storage.IClarificationTimerService;
+                if (clarificationTimer is not null)
+                    await clarificationTimer.ProcessExpiredAsync(ct).ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException) { break; }
+            catch { /* timer processing is best-effort */ }
+
             try { await Task.Delay(_options.SchedulerPollIntervalMs, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { break; }
         }

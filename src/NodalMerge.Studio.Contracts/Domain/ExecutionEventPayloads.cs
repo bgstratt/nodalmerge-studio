@@ -154,6 +154,19 @@ public sealed record ConflictDetectedPayload(
     IReadOnlyList<string> OverlappingFiles,
     IReadOnlyList<string> ConflictingWorkUnitIds);
 
+// Goal lifecycle
+public sealed record GoalPausedPayload(
+    string GoalId,
+    string WorkUnitId,
+    string? Reason,
+    string? PausedBy);
+
+public sealed record GoalResumedPayload(
+    string GoalId,
+    string WorkUnitId,
+    string? Steering,
+    string? ResumedBy);
+
 public sealed record ClarificationRequestedPayload(
     string RequestId,
     string WorkUnitId,
@@ -162,7 +175,10 @@ public sealed record ClarificationRequestedPayload(
     bool Blocking,
     IReadOnlyList<string> Options,
     string? RequestedByAgentId,
-    DateTimeOffset RequestedAt);
+    DateTimeOffset RequestedAt,
+    int? TimeoutSeconds = null,
+    string? TimeoutBehavior = null,
+    string? DefaultResponse = null);
 
 public sealed record ClarificationRespondedPayload(
     string RequestId,

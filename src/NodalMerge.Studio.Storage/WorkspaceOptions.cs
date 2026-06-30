@@ -101,6 +101,18 @@ public sealed class WorkspaceOptions
     public int DocFetchTimeoutSeconds  { get; set; } = 15;
     public int DocFetchSummaryMaxChars { get; set; } = 400;
 
+    // ── Clarification timeout defaults ───────────────────────────────────────
+
+    // Workspace-wide fallback applied when an agent calls nm_v1_clarification_request without
+    // specifying a timeout. Set by the human before starting a goal so that unattended sessions
+    // don't stall indefinitely waiting for a response that may not come.
+    // 0 or null means "wait indefinitely" (no auto-respond).
+    public int? DefaultClarificationTimeoutSeconds { get; set; } = null;
+
+    // What to do when the default timeout fires: "auto_continue" (default — let the agent decide)
+    // or "auto_abandon" (stop the work unit).
+    public string DefaultClarificationTimeoutBehavior { get; set; } = "auto_continue";
+
     // ── Slice 21/22 — domain agents ──────────────────────────────────────────
 
     // Opt-in, default empty (matches DocFetchTools' convention above): holds the Name of each

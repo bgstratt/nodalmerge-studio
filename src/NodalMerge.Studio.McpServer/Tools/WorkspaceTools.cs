@@ -8,7 +8,6 @@ using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class WorkspaceTools(
     IWorkspaceService workspace,
     IWorkspaceExecutionCommandService executionCommand,

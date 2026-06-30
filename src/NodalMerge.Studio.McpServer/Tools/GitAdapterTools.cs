@@ -8,7 +8,6 @@ namespace NodalMerge.Studio.McpServer.Tools;
 // Phase 14 — Git import/export adapter tools for the HTTP MCP server.
 // Allows external harnesses (Copilot, Cline, Claude Desktop) to trigger git-backed
 // import and export operations against the Studio CAS.
-[McpServerToolType]
 public sealed class GitAdapterTools(IGitAdapter gitAdapter)
 {
     [McpServerTool(Name = McpToolNames.RepositoryGitImport), Description(

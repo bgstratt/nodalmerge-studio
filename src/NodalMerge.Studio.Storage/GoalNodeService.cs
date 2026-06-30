@@ -8,6 +8,7 @@ namespace NodalMerge.Studio.Storage;
 public interface IGoalNodeService
 {
     Task<GoalNode> RecordAsync(GoalNode goal, CancellationToken ct = default);
+    Task<GoalNode?> GetAsync(string goalId, CancellationToken ct = default);
     Task<IReadOnlyList<GoalNode>> ListAsync(CancellationToken ct = default);
 }
 
@@ -38,6 +39,9 @@ public sealed class GoalNodeService : IGoalNodeService, IRehydratable
             if (goal is not null) _goals[goal.GoalId] = goal;
         }
     }
+
+    public Task<GoalNode?> GetAsync(string goalId, CancellationToken ct = default) =>
+        Task.FromResult(_goals.TryGetValue(goalId, out var goal) ? goal : null);
 
     public Task<IReadOnlyList<GoalNode>> ListAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<GoalNode>>(_goals.Values.OrderByDescending(g => g.CreatedAt).ToList());

@@ -64,6 +64,16 @@ interface FileLeaseInfo {
   waitQueue: string[];
 }
 
+interface GoalItem {
+  goalId: string;
+  goal: string;
+  workUnitId: string;
+  branchId: string;
+  status: string;
+  pauseReason?: string | null;
+  updatedAt?: string | null;
+}
+
 interface ClarificationInboxItem {
   requestId: string;
   sessionId?: string | null;
@@ -77,6 +87,9 @@ interface ClarificationInboxItem {
   requestedAt: string;
   status: string;
   awaitingResume: boolean;
+  timeoutSeconds?: number | null;
+  timeoutAt?: string | null;
+  timeoutBehavior?: string | null;
 }
 
 interface ClarificationGoalMetric {
@@ -189,7 +202,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
       const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
       const emptySummary: WorkspaceSummary = { activeWorkUnits: [], activeAgents: [], pendingMerges: [], failures: [], knownGoodStates: [] };
       const emptyMetrics: ClarificationMetrics = { requests: 0, answered: 0, abandoned: 0, perGoal: [] };
-      const [summary, workUnits, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases, opts, findings] = await Promise.all([
+      const [summary, workUnits, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases, opts, findings, goalsResp] = await Promise.all([
         this.get<WorkspaceSummary>('/studio/workspace-summary' + params).catch(() => emptySummary),
         this.get<WorkUnit[]>('/studio/workunits' + params).catch(() => [] as WorkUnit[]),
         this.get<AgentInfo[]>('/studio/agents?all=true' + (sessionId ? '&sessionId=' + encodeURIComponent(sessionId) : '')).catch(() => [] as AgentInfo[]),
@@ -199,13 +212,15 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
         this.get<MergeProposal[]>('/studio/merges' + params).catch(() => [] as MergeProposal[]),
         this.get<DeadLetterEntry[]>('/studio/dead-letter' + params).catch(() => [] as DeadLetterEntry[]),
         this.get<FileLeaseInfo[]>('/studio/file-leases').catch(() => [] as FileLeaseInfo[]),
-        this.get<{ usePromotionBranch?: boolean; candidateBranchId?: string }>('/studio/options').catch(() => ({} as { usePromotionBranch?: boolean; candidateBranchId?: string })),
+        this.get<{ usePromotionBranch?: boolean; candidateBranchId?: string; defaultClarificationTimeoutSeconds?: number | null; defaultClarificationTimeoutBehavior?: string }>('/studio/options').catch(() => ({} as { usePromotionBranch?: boolean; candidateBranchId?: string })),
         this.get<FindingSignal[]>('/studio/findings?status=Open').catch(() => [] as FindingSignal[]),
+        this.get<{ goals: GoalItem[] }>('/studio/goals').catch(() => ({ goals: [] as GoalItem[] })),
       ]);
       const syncGraph = await this.get<{ frontierHeads: string[] }>('/studio/causal/frontier').catch(() => null);
+      const goals = goalsResp?.goals ?? [];
       this.usePromotionBranch = opts.usePromotionBranch ?? false;
       void this.panel.webview.postMessage({
-        type: 'data', summary, workUnits, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases,
+        type: 'data', summary, workUnits, goals, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases,
         usePromotionBranch: this.usePromotionBranch,
         candidateBranchId: opts.candidateBranchId ?? 'candidate',
         syncGraph: syncGraph ?? { frontierHeads: [] },
@@ -414,6 +429,36 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           );
           if (confirmed !== 'Release') { return; }
           await this.post('/studio/file-leases/release', { workUnitId: msg.workUnitId });
+          void this.poll();
+          break;
+        }
+        case 'dashboardGoalPause': {
+          const goalId = String(msg.goalId ?? '');
+          if (!goalId) { return; }
+          const reason = await vscode.window.showInputBox({
+            prompt: 'Reason for pausing (optional)',
+            placeHolder: 'e.g. needs review before continuing',
+            ignoreFocusOut: true,
+          });
+          await this.post('/studio/goals/' + encodeURIComponent(goalId) + '/pause', {
+            reason: reason || null,
+            pausedBy: 'vscode-user',
+          });
+          void this.poll();
+          break;
+        }
+        case 'dashboardGoalResume': {
+          const goalId = String(msg.goalId ?? '');
+          if (!goalId) { return; }
+          const steering = await vscode.window.showInputBox({
+            prompt: 'Steering message (optional) — redirect the agent on resume',
+            placeHolder: 'e.g. focus on the auth module, skip UI changes',
+            ignoreFocusOut: true,
+          });
+          await this.post('/studio/goals/' + encodeURIComponent(goalId) + '/resume', {
+            steering: steering || null,
+            resumedBy: 'vscode-user',
+          });
           void this.poll();
           break;
         }
@@ -691,7 +736,9 @@ const ET_JS = `
     return '<span class="badge ' + s + '">' + esc(status || '—') + '</span>';
   }
 
-  function renderActiveGoals(goals) {
+  // isGoalStore=true when items come from /studio/goals (have goalId + Paused status);
+  // false when falling back to /studio/workunits (no goalId, no goal-level pause support).
+  function renderActiveGoals(goals, isGoalStore) {
     var el = document.getElementById('active-goals');
     if (!goals || !goals.length) {
       el.innerHTML = '<p class="empty">No active goals.</p>';
@@ -699,31 +746,43 @@ const ET_JS = `
     }
     var html = '';
     for (var i = 0; i < goals.length; i++) {
-      var wu = goals[i];
-      var status = (wu.status || '').toLowerCase();
+      var g = goals[i];
+      var goalId = g.goalId || g.workUnitId;
+      var status = (g.status || '').toLowerCase();
+      var isPaused   = status === 'paused';
       var isReviewing = status === 'reviewing';
-      var isStoppable = ['cancelled', 'completed', 'merged'].indexOf(status) === -1;
+      var isTerminal  = ['cancelled', 'completed', 'merged', 'abandoned', 'converged'].indexOf(status) !== -1;
       html += '<div class="card">';
       html += '<div class="row">';
-      html += '<span class="title" title="' + esc(wu.goal) + '">' + esc(wu.goal) + '</span>';
-      html += badge(wu.status);
+      html += '<span class="title" title="' + esc(g.goal) + '">' + esc(g.goal) + '</span>';
+      html += badge(g.status);
       html += '<div class="actions">';
+      if (isGoalStore && isPaused) {
+        html += '<button class="ghost" data-action="resumeGoal" data-gid="' + esc(goalId) + '" style="color:var(--nm-success);border-color:var(--nm-success)">▶ Resume</button>';
+      } else if (isGoalStore && !isTerminal) {
+        html += '<button class="ghost" data-action="pauseGoal" data-gid="' + esc(goalId) + '" style="color:var(--nm-warn);border-color:var(--nm-warn)">⏸ Pause</button>';
+      }
       if (isReviewing) {
-        html += '<button class="ghost" data-action="openConflictReview" data-wu="' + esc(wu.workUnitId) + '">View Conflict →</button>';
+        html += '<button class="ghost" data-action="openConflictReview" data-wu="' + esc(g.workUnitId) + '">View Conflict →</button>';
       }
-      html += '<button class="ghost" data-action="spawnAgent" data-wu="' + esc(wu.workUnitId) + '">Spawn</button>';
-      html += '<button class="ghost" data-action="markKnownGood" data-wu="' + esc(wu.workUnitId) + '" data-branch="' + esc(wu.branchId) + '" title="Tag this work unit\\'s current branch as a Known Good State">Tag KGS</button>';
-      if (isStoppable) {
-        html += '<button class="danger" data-action="cancelWorkUnit" data-wu="' + esc(wu.workUnitId) + '">Stop</button>';
+      if (!isTerminal && !isPaused) {
+        html += '<button class="ghost" data-action="spawnAgent" data-wu="' + esc(g.workUnitId) + '">Spawn</button>';
+      }
+      html += '<button class="ghost" data-action="markKnownGood" data-wu="' + esc(g.workUnitId) + '" data-branch="' + esc(g.branchId) + '" title="Tag this work unit\'s current branch as a Known Good State">Tag KGS</button>';
+      if (!isTerminal) {
+        html += '<button class="danger" data-action="cancelWorkUnit" data-wu="' + esc(g.workUnitId) + '">Stop</button>';
       }
       html += '</div>';
       html += '</div>';
+      if (isPaused && g.pauseReason) {
+        html += '<div class="row"><span class="mono" style="color:var(--nm-warn)">⏸ ' + esc(g.pauseReason) + '</span></div>';
+      }
       html += '<div class="row">';
-      html += '<span class="mono">' + esc(wu.workUnitId) + '</span>';
-      html += '<span class="mono">fork: ' + esc(wu.branchId) + '</span>';
-      html += '<span class="mono">owner: ' + esc(wu.owner) + '</span>';
-      if (wu.reviewPolicy && wu.reviewPolicy !== 'HumanRequired') {
-        var rp = wu.reviewPolicy === 'AgentApproval' ? '🤖 Agent Approval' : '⏱ Hybrid';
+      html += '<span class="mono">' + esc(g.workUnitId) + '</span>';
+      html += '<span class="mono">fork: ' + esc(g.branchId) + '</span>';
+      if (g.owner) { html += '<span class="mono">owner: ' + esc(g.owner) + '</span>'; }
+      if (g.reviewPolicy && g.reviewPolicy !== 'HumanRequired') {
+        var rp = g.reviewPolicy === 'AgentApproval' ? '🤖 Agent Approval' : '⏱ Hybrid';
         html += '<span class="badge reviewing">' + rp + '</span>';
       }
       if (globalUsePromotionBranch) {
@@ -733,6 +792,16 @@ const ET_JS = `
       html += '</div>';
     }
     el.innerHTML = html;
+    el.querySelectorAll('[data-action="pauseGoal"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'dashboardGoalPause', goalId: btn.getAttribute('data-gid') });
+      });
+    });
+    el.querySelectorAll('[data-action="resumeGoal"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'dashboardGoalResume', goalId: btn.getAttribute('data-gid') });
+      });
+    });
     el.querySelectorAll('[data-action="spawnAgent"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: 'spawnAgent', workUnitId: btn.getAttribute('data-wu') });
@@ -865,31 +934,53 @@ const ET_JS = `
     if (!items || !items.length) {
       el.innerHTML = '<p class="empty">No active clarification requests.</p>';
     } else {
-      var html = '';
+      // Group by goal label, preserving insertion order.
+      var groupOrder = [];
+      var groups = {};
       for (var i = 0; i < items.length; i++) {
         var c = items[i];
-        var statusBadge = c.awaitingResume ? 'awaiting' : c.status;
-        html += '<div class="card">';
-        html += '<div class="row">';
-        html += '<span class="title" title="' + esc(c.goal) + '">' + esc(c.goal) + '</span>';
-        html += '<span class="badge ' + (c.awaitingResume ? 'paused' : '') + '">' + esc(statusBadge) + '</span>';
-        html += '<div class="actions">';
-        html += '<button class="ghost" data-action="respondClarification" data-rid="' + esc(c.requestId) + '" data-wu="' + esc(c.workUnitId) + '">Respond</button>';
-        html += '</div>';
-        html += '</div>';
-        html += '<div class="row"><span class="mono">' + esc(c.question) + '</span></div>';
-        if (c.context) {
-          html += '<div class="row"><span class="mono">context: ' + esc(c.context) + '</span></div>';
+        var key = c.goal || c.workUnitId;
+        if (!groups[key]) { groups[key] = []; groupOrder.push(key); }
+        groups[key].push(c);
+      }
+      var html = '';
+      for (var gi = 0; gi < groupOrder.length; gi++) {
+        var groupKey = groupOrder[gi];
+        var groupItems = groups[groupKey];
+        html += '<div style="margin-bottom:10px">';
+        html += '<div style="font-size:0.75em;opacity:0.55;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px;padding:0 2px">' + esc(groupKey) + '</div>';
+        for (var j = 0; j < groupItems.length; j++) {
+          var c = groupItems[j];
+          var statusBadge = c.awaitingResume ? 'awaiting' : c.status;
+          html += '<div class="card">';
+          html += '<div class="row">';
+          html += '<span class="title mono" title="' + esc(c.requestId) + '">' + esc(c.question) + '</span>';
+          html += '<span class="badge ' + (c.awaitingResume ? 'paused' : '') + '">' + esc(statusBadge) + '</span>';
+          html += '<div class="actions">';
+          html += '<button class="ghost" data-action="respondClarification" data-rid="' + esc(c.requestId) + '" data-wu="' + esc(c.workUnitId) + '" style="color:var(--nm-success);border-color:var(--nm-success)">Respond</button>';
+          html += '</div>';
+          html += '</div>';
+          if (c.context) {
+            html += '<div class="row"><span class="mono" style="opacity:0.7">context: ' + esc(c.context) + '</span></div>';
+          }
+          if (c.options && c.options.length) {
+            html += '<div class="row"><span class="mono">options: ' + esc(c.options.join(' | ')) + '</span></div>';
+          }
+          if (c.timeoutAt) {
+            var now = Date.now();
+            var timeoutMs = new Date(c.timeoutAt).getTime() - now;
+            var timeoutLabel = timeoutMs > 0
+              ? 'auto-' + esc(c.timeoutBehavior || 'continue') + ' in ' + Math.ceil(timeoutMs / 1000) + 's'
+              : 'timed out (auto-' + esc(c.timeoutBehavior || 'continue') + ')';
+            html += '<div class="row"><span class="mono" style="color:var(--nm-warn)">⏱ ' + timeoutLabel + '</span></div>';
+          }
+          html += '<div class="row">';
+          html += '<span class="mono">age: ' + esc(relTime(c.requestedAt)) + '</span>';
+          html += '<span class="mono">blocking: ' + esc(String(!!c.blocking)) + '</span>';
+          if (c.sessionId) { html += '<span class="mono">session: ' + esc(c.sessionId) + '</span>'; }
+          html += '</div>';
+          html += '</div>';
         }
-        if (c.options && c.options.length) {
-          html += '<div class="row"><span class="mono">options: ' + esc(c.options.join(' | ')) + '</span></div>';
-        }
-        html += '<div class="row">';
-        html += '<span class="mono">workUnit: ' + esc(c.workUnitId) + '</span>';
-        html += '<span class="mono">session: ' + esc(c.sessionId || 'n/a') + '</span>';
-        html += '<span class="mono">age: ' + esc(relTime(c.requestedAt)) + '</span>';
-        html += '<span class="mono">blocking: ' + esc(String(!!c.blocking)) + '</span>';
-        html += '</div>';
         html += '</div>';
       }
       el.innerHTML = html;
@@ -1069,7 +1160,7 @@ const ET_JS = `
       globalUsePromotionBranch = !!msg.usePromotionBranch;
       globalCandidateBranchId = msg.candidateBranchId || 'candidate';
     }
-    renderActiveGoals(msg.workUnits);
+    renderActiveGoals(msg.goals && msg.goals.length ? msg.goals : msg.workUnits, !!msg.goals);
     renderAgents(msg.agents, msg.workUnits);
     renderAwaitingResume(msg.awaitingResume || []);
     renderClarifications(msg.clarifications || [], msg.clarificationMetrics || null);

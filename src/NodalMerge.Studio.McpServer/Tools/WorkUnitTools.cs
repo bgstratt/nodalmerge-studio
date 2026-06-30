@@ -8,7 +8,6 @@ using StudioTaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class WorkUnitTools(IWorkUnitService workUnits, IOrchestratorService orchestrator, IWorkUnitCommandService workUnitCommands)
 {
     [McpServerTool(Name = McpToolNames.WorkUnitCreate), Description("Create a work unit from goal and branch.")]

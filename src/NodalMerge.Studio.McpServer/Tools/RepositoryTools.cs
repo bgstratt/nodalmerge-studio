@@ -5,7 +5,6 @@ using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class RepositoryTools(IRepositoryRegistryService repositories)
 {
     [McpServerTool(Name = McpToolNames.RepositoryRegister), Description("Register a known repository path (informational only — does not change the currently seeded repository; Studio manages exactly one active repository per instance). Idempotent by path.")]

@@ -6,7 +6,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class HypothesisTools(IWorkUnitService workUnits, IWorkUnitCommandService workUnitCommands)
 {
     [McpServerTool(Name = McpToolNames.HypothesisFork), Description("Fork a hypothesis from a parent work unit or proposal.")]

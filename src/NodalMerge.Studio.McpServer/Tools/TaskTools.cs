@@ -7,7 +7,6 @@ using StudioTaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class TaskTools(ITaskCommandService taskCommands)
 {
     [McpServerTool(Name = McpToolNames.TaskCreate), Description("Create a task for a work unit and record an artifact-lineage entry for it.")]

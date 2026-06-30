@@ -5,7 +5,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class AgentTools(IAgentControlService agents, IWorkUnitService workUnits)
 {
     [McpServerTool(Name = McpToolNames.AgentSpawn), Description("Spawn an agent for a work unit.")]

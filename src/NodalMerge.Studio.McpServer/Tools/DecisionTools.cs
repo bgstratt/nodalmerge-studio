@@ -7,7 +7,6 @@ using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class DecisionTools(IMergeService merges, IDecisionNodeService decisionNodes)
 {
     [McpServerTool(Name = McpToolNames.DecisionRecord), Description("Record a decision against a merge proposal.")]
