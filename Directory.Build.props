@@ -4,7 +4,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
-    <TreatWarningsAsErrors Condition="'$(CI)' == 'true'">true</TreatWarningsAsErrors>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <NodalMergeUseNuGetPackages Condition="'$(NodalMergeUseNuGetPackages)' == ''">true</NodalMergeUseNuGetPackages>
     <NodalMergePackageVersion Condition="'$(NodalMergePackageVersion)' == ''">0.1.0-local</NodalMergePackageVersion>
     <NodalMergeDotNetHostProject Condition="'$(NodalMergeDotNetHostProject)' == ''">$(MSBuildThisFileDirectory)..\nodalmerge\nodalmerge-host\src\NodalMerge.DotNetHost\NodalMerge.DotNetHost.csproj</NodalMergeDotNetHostProject>

@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import type { OutputChannel } from 'vscode';
 import { toWebSocketUrl } from '../constants';
 import { buildNonce, SHELL_CSS_VARS } from './sharedWebviewChrome';
 import { DecisionConvergencePanel } from './MergeReviewPanel';
@@ -24,6 +25,7 @@ export class StudioShellPanel implements vscode.Disposable {
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
+  private readonly output: OutputChannel;
   private readonly disposables: vscode.Disposable[] = [];
 
   readonly activityCenter: ExecutionTimelinePanel;
@@ -41,10 +43,12 @@ export class StudioShellPanel implements vscode.Disposable {
     configService: AgentConfigService,
     secrets: vscode.SecretStorage,
     lmProxyBaseUrl: string,
+    output: OutputChannel,
     notifications?: NotificationManager,
   ) {
     this.panel   = panel;
     this.baseUrl = baseUrl;
+    this.output  = output;
 
     this.activityCenter   = new ExecutionTimelinePanel(panel, baseUrl, notifications, configService, secrets, lmProxyBaseUrl, this.getSelectedSessionId);
     this.reviewPanel = new DecisionConvergencePanel(panel, baseUrl, configService, this.getSelectedSessionId);
@@ -92,6 +96,7 @@ export class StudioShellPanel implements vscode.Disposable {
     configService: AgentConfigService,
     secrets: vscode.SecretStorage,
     lmProxyBaseUrl: string,
+    output: OutputChannel,
     notifications?: NotificationManager,
   ): StudioShellPanel {
     if (StudioShellPanel.current) {
@@ -109,7 +114,7 @@ export class StudioShellPanel implements vscode.Disposable {
       },
     );
     StudioShellPanel.current = new StudioShellPanel(
-      panel, baseUrl, extensionUri, configService, secrets, lmProxyBaseUrl, notifications,
+      panel, baseUrl, extensionUri, configService, secrets, lmProxyBaseUrl, output, notifications,
     );
     return StudioShellPanel.current;
   }
@@ -135,6 +140,13 @@ export class StudioShellPanel implements vscode.Disposable {
   }
 
   private async handleMessage(msg: Record<string, unknown>): Promise<void> {
+    if (msg.type === 'nm-webview-error') {
+      const where = msg.containerId ? `[${String(msg.containerId)}] ` : '';
+      this.output.appendLine(`[NodalMerge] Webview error ${where}${String(msg.message)}`);
+      if (msg.stack) { this.output.appendLine(String(msg.stack)); }
+      this.output.show(true);
+      return;
+    }
     if (msg.type === 'sessionOverrideChanged') {
       const panelId = msg.panelId as string;
       const sessionId = (msg.sessionId as string | undefined) || undefined;
@@ -232,6 +244,15 @@ ${projectionComparisonFragment.html}
   <script nonce="${nonce}">
     (function() {
       window.__nmVscode = acquireVsCodeApi();
+      window.onerror = function(msg, src, line, col, err) {
+        var stack = (err && err.stack) || (src + ':' + line + ':' + col);
+        window.__nmVscode.postMessage({ type: 'nm-webview-error', message: String(msg), stack: stack });
+        return false;
+      };
+      window.onunhandledrejection = function(event) {
+        var r = event.reason;
+        window.__nmVscode.postMessage({ type: 'nm-webview-error', message: String(r), stack: (r && r.stack) || '' });
+      };
       var tabButtons = document.querySelectorAll('.nm-shell-tab');
       var panes = document.querySelectorAll('#nm-shell-content > .nm-shell-pane');
       function showTab(tabId) {

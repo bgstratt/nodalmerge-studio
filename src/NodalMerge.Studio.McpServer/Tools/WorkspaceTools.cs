@@ -12,7 +12,6 @@ namespace NodalMerge.Studio.McpServer.Tools;
 public sealed class WorkspaceTools(
     IWorkspaceService workspace,
     IWorkspaceExecutionCommandService executionCommand,
-    IFileWorkspaceService fileWorkspace,
     IWorkspaceProfileService workspaceProfiles,
     IWorkspaceSemanticNavigationService semanticNavigation,
     IRepositorySyncService repositorySync,

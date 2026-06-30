@@ -551,7 +551,7 @@ internal sealed class FileSystemWorkspaceService(
         var oldBlobId = oldBytes is not null ? BlobId(oldBytes) : null;
 
         await blobStore!.PutBlobAsync(newBlobId, newBytes, "text/plain", ct).ConfigureAwait(false);
-        await repoOpService.EmitAsync(new RepositoryOperation(
+        await repoOpService!.EmitAsync(new RepositoryOperation(
             OperationId: Guid.NewGuid().ToString("N"),
             RepositoryId: repositoryId,
             ParentSnapshotId: null,
@@ -570,7 +570,7 @@ internal sealed class FileSystemWorkspaceService(
         var oldBytes = await File.ReadAllBytesAsync(fullPath, ct).ConfigureAwait(false);
         var oldBlobId = BlobId(oldBytes);
 
-        await repoOpService.EmitAsync(new RepositoryOperation(
+        await repoOpService!.EmitAsync(new RepositoryOperation(
             OperationId: Guid.NewGuid().ToString("N"),
             RepositoryId: repositoryId,
             ParentSnapshotId: null,

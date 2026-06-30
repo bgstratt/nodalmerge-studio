@@ -214,7 +214,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
-                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey, llm, dispatcher);
+                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
                 var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var ruleFileContext = await BuildRuleFileContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
 
@@ -568,7 +568,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
-                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey, llm, dispatcher);
+                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
                 var artifactLineage = _serviceProvider.GetRequiredService<IArtifactLineageService>();
                 var projections = _serviceProvider.GetRequiredService<IProjectionManager>();
                 var decisionLog = _serviceProvider.GetRequiredService<IOrchestrationDecisionLogService>();
@@ -665,7 +665,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
-                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey, llm, dispatcher);
+                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
                 var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var ruleFileContext = await BuildRuleFileContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerConstraintsContext = await BuildConstraintsContextAsync(workUnitId, cts.Token).ConfigureAwait(false);

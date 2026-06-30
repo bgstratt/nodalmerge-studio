@@ -363,9 +363,9 @@ public sealed class ProjectionManager : IProjectionManager
                     var buildSystems = execResult.Builds
                         .Select(b => b.BuildSystem)
                         .Concat(execResult.Tests.Select(t => t.BuildSystem))
-                        .Where(bs => bs is not null)
+                        .OfType<string>()
                         .Distinct()
-                        .ToList()!;
+                        .ToList();
                     var testSummary = execResult.Tests.Count > 0
                         ? $"{execResult.Tests.Sum(t => t.Passed)} passed / {execResult.Tests.Sum(t => t.Failed)} failed"
                         : null;
@@ -880,9 +880,9 @@ public sealed class ProjectionManager : IProjectionManager
                     var buildSystems = execResult.Builds
                         .Select(b => b.BuildSystem)
                         .Concat(execResult.Tests.Select(t => t.BuildSystem))
-                        .Where(bs => bs is not null)
+                        .OfType<string>()
                         .Distinct()
-                        .ToList()!;
+                        .ToList();
                     var testSummary = execResult.Tests.Count > 0
                         ? $"{execResult.Tests.Sum(t => t.Passed)} passed / {execResult.Tests.Sum(t => t.Failed)} failed"
                         : null;

@@ -361,12 +361,22 @@ branches implicitly; it never lists raw branches).
 - **`GET /studio/snapshots/{agentId}` (+ compare)** — `nm_v1_snapshot_compare` isn't dispatched to
   agents either, so this is unused on both sides.
 - **`GET/POST /studio/decisions`, `GET/POST /studio/goals`, `POST /studio/reasoning`,
-  `POST /studio/trajectory`, `GET /studio/models/compare`, `GET /studio/models/replay/{id}`** — these
-  node stores exist and have working REST + (mostly undispatched) MCP tools, but neither the
-  extension nor the in-process agent loops write to them today. They look like scaffolding for a
-  decision-centric UI layer (the `nm_v1_goal_*`/`nm_v1_decision_*` naming suggests a "Goal" surface
-  that doesn't exist yet — the extension's "Active Goals" section is actually built on plain work
-  units, not these goal nodes).
+  `POST /studio/trajectory`, `GET /studio/models/compare`, `GET /studio/models/replay/{id}`** —
+  these node stores are functional with working REST and (mostly undispatched) MCP tools, but have
+  no current caller in the extension or in-process agent loops. They are scaffolding for a future
+  decision-centric audit UI layer.
+  - **Goal injection note:** `POST /studio/goals` is the correct endpoint for programmatic goal
+    creation — it creates a `WorkUnit` first, then records a `GoalNode` (where `GoalId == WorkUnitId`)
+    in one call. The extension's "Active Goals" panel reads work units directly and does not consult
+    `GoalNode` records; goals created this way appear in Activity Center as normal work units.
+    `nm_v1_goal_create` is the MCP tool equivalent but is not dispatched to in-process agents —
+    it is intended for external MCP clients and headless peers. For most automation purposes
+    `POST /studio/workunits` is sufficient; use `POST /studio/goals` when you want the decision-centric
+    `GoalNode` metadata recorded as well. After creation, call `POST /studio/agents/spawn` with the
+    returned `workUnitId` to start execution. See [docs/guides/extending-goals.md](../guides/extending-goals.md)
+    for patterns.
+  - `nm_v1_goal_list` falls back to returning work units when the goal store is empty, so it is safe
+    to call even in workspaces where goals were created via `POST /studio/workunits` alone.
 - **`GET /studio/replay/range/{branchId}`, `GET /studio/replay/inspect/{branchId}`,
   `GET /studio/replay/timeline/{branchId}`** — the Trajectory Replay panel only calls the bare
   (no-branchId) `GET /studio/replay/timeline`; these per-branch read variants are unused by the UI

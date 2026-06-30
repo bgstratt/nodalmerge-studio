@@ -102,7 +102,20 @@ public static class StudioWebApplication
         }));
 
         app.MapStudioRestEndpoints();
-        app.MapMcp();
+        app.MapMcp("/mcp");
+
+        // Diagnostic: list all registered endpoint patterns (remove once MCP route is confirmed)
+        app.MapGet("/debug/routes", (IEnumerable<EndpointDataSource> sources) =>
+        {
+            var routes = sources
+                .SelectMany(s => s.Endpoints)
+                .OfType<RouteEndpoint>()
+                .Select(e => new { pattern = e.RoutePattern.RawText, displayName = e.DisplayName })
+                .OrderBy(r => r.pattern)
+                .ToList();
+            return Results.Ok(routes);
+        });
+
         return app;
     }
 

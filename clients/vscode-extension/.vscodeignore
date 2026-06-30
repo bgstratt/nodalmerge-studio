@@ -2,6 +2,7 @@
 src/**
 node_modules/**
 scripts/**
+dist/**
 *.map
 tsconfig.json
 esbuild.config.mjs

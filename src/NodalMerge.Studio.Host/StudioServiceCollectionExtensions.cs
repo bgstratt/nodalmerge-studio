@@ -1,6 +1,7 @@
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.AgentRuntime;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Merge;
@@ -39,7 +40,14 @@ public static class StudioServiceCollectionExtensions
             config?.GetSection("Workspace").Bind(opts);
             // Config binding replaces C# defaults with empty strings for missing/blank values.
             if (string.IsNullOrWhiteSpace(opts.RootPath))
+            {
                 opts.RootPath = Path.Combine(Path.GetTempPath(), "studio-workspace");
+                var logger = sp.GetService<ILogger<WorkspaceOptions>>();
+                logger?.LogWarning(
+                    "[WorkspaceOptions] Workspace:RootPath is not configured — using temp fallback {Path}. " +
+                    "Set Workspace:RootPath in appsettings.json to persist data across reboots.",
+                    opts.RootPath);
+            }
             return opts;
         });
 

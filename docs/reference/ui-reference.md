@@ -63,6 +63,10 @@ Click any artifact or event to load it into the Decision Lens.
 **Context tab:**
 - Loads the goal, plan, assumptions, constraints, evidence, execution results, allowed tools, and model for this node — the structured decision audit, never raw prompt text
 - **📋 Copy as Markdown** — copies the above to clipboard
+- Constraints proposed by domain observers appear in the Artifacts chain here, identifiable by
+  their title prefix (e.g., `[SecurityAgent] Missing rate-limit on /api/auth`). See
+  [docs/guides/domain-observers.md](../guides/domain-observers.md) for how observers work and
+  how to enable them.
 
 ### Compare Results view (experiments)
 - Click a fork card to select it
@@ -87,6 +91,9 @@ Workspace's Decision Tree.
 - Active Goals: **Spawn** (start an agent) · **View Conflict →** (when Reviewing)
 - Running Agents: **+ Start Agent** · **Pause** · **Resume** · **↺ Resume** (for `Interrupted`
   agents after a host restart) · **Stop**
+  Agents spawned by a connected headless peer appear in this list alongside interactively spawned
+  agents and can be paused, resumed, or stopped from here. The peer process itself is controlled
+  externally. See [docs/guides/headless-peer.md](../guides/headless-peer.md).
 - Pending Decisions: **Review Decision →**
 - Blocked Explorations (dead-letter queue): **Retry** (when attempts remain)
 
@@ -118,6 +125,11 @@ patterns, max iterations, system prompt. **Edit** / **+ Add Pipeline Profile**.
 - **Use candidate branch** checkbox (session-wide promotion branch toggle)
 - **↑ Promote to Main** — applies `candidate` → `main`; enabled only when the toggle above is on
 - **Save Session Defaults**
+
+> **Domain observer enable/disable is config-file only.** There is no toggle in this panel today.
+> Set `Workspace:EnabledDomainAgents` in `appsettings.json` and restart the host. A per-goal
+> override is available at agent spawn time via the `enabledDomainAgents` field on
+> `POST /studio/agents/spawn`. See [docs/guides/domain-observers.md](../guides/domain-observers.md).
 
 ---
 

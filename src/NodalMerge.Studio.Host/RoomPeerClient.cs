@@ -141,7 +141,7 @@ public sealed class RoomPeerClient(
                 doc.RootElement.TryGetProperty("type", out var typeProp);
                 msgType = typeProp.GetString();
             }
-            catch { /* malformed — ignore */ }
+            catch (Exception ex) { logger.LogDebug(ex, "[RoomPeerClient] Malformed JSON message — skipping"); }
 
             switch (msgType)
             {
@@ -165,7 +165,7 @@ public sealed class RoomPeerClient(
                             appLifetime.StopApplication();
                         }
                     }
-                    catch { /* malformed — ignore */ }
+                    catch (Exception ex) { logger.LogDebug(ex, "[RoomPeerClient] Malformed participant.stop payload — skipping"); }
                     break;
                 default:
                     logger.LogDebug("[RoomPeerClient] Received message type={Type}", msgType ?? "(unknown)");

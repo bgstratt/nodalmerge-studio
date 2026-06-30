@@ -170,7 +170,7 @@ The following are explicitly deferred from v1:
 - Autonomous goal generation
 - Enterprise RBAC systems
 - Multi-tenant SaaS architecture
-- Per-work-unit cross-repo execution (single shared repository path per workspace today)
+- Per-work-unit cross-repository execution (a single `SeedRepositoryPath` provides the source repository; agents cannot switch repositories mid-session)
 
 **No longer fully deferred (Phase 7):** Agent-controlled merges without a human in the loop are now possible, but only when a goal explicitly opts into `Agent Approval` or `Hybrid` review policy — `Human Required` remains the default and unchanged behavior. There is still no agent-to-agent approval chain beyond the single configured reviewer agent.
 
@@ -354,37 +354,44 @@ Define reusable orchestrator + worker team compositions:
 
 ---
 
+## Headless Peer
+
+A headless peer runs all Studio agent services (orchestrator, workers, projections, storage) without
+an HTTP server. It is the primary integration point for CI/CD pipelines, autonomous background
+workers, and programmatic goal injection from external systems (monitoring alerts, scheduled tasks,
+webhook triggers). Activate with `--mode peer`, `STUDIO_MODE=peer`, or `Peer:Enabled=true` in
+config. In connected mode (set `Peer:HostUri`), the peer joins a NodalMerge room and its agents
+appear in the extension's Activity Center in real time.
+
+See [docs/guides/headless-peer.md](docs/guides/headless-peer.md) for configuration, use-case
+patterns, and the goal injection API. See [docs/guides/extending-goals.md](docs/guides/extending-goals.md)
+for the full goal creation surface and external trigger patterns.
+
+---
+
+## Repository Virtualization
+
+Each work unit branch gets a physically isolated working directory under `Workspace:RootPath`.
+Branch directories are seeded from `Workspace:SeedRepositoryPath` (via CAS snapshot or directory
+copy) so agents start with a clean, full-fidelity workspace. Agents operating in parallel never
+share a working directory or compete for file locks — the CAS blob store is the shared read layer;
+per-branch directories are the write-isolated layer. The `nm_v1_workspace_path` MCP tool returns
+the effective filesystem path for any branch.
+
+See [docs/guides/repository-virtualization.md](docs/guides/repository-virtualization.md) for
+seeding strategies, scoped materialization (Phase 11), and the full `Workspace` config reference.
+
+---
+
 ## MCP Integration
 
-NodalMerge Studio exposes a frozen MCP v1 tool surface with **66 tools** across 19 namespaces. All tools use the `nm_v1_*` namespace (unchanged since plan slice 1; canonical constants in `McpToolNames`).
+NodalMerge Studio exposes a frozen MCP v1 tool surface with **66 tools** across 19 namespaces. All tools use the `nm_v1_*` namespace (canonical constants in `McpToolNames`). 42 of the 66 tools are dispatched in-process to autonomous agents; the rest are available to external MCP clients and the VS Code extension only.
 
-### Tool Namespaces
+Core namespaces: `nm_v1_projection_*`, `nm_v1_workunit_*`, `nm_v1_task_*`, `nm_v1_branch_*`, `nm_v1_merge_*`, `nm_v1_workspace_*` (file I/O, build/test/run, semantic navigation, profile), `nm_v1_scheduler_*`, `nm_v1_artifact_*`. Phase 6.7+ adds `nm_v1_goal_*`, `nm_v1_decision_*`, `nm_v1_evidence_*`, `nm_v1_trajectory_*`, `nm_v1_hypothesis_*`, `nm_v1_reasoning_*`, `nm_v1_model_*` (none dispatched to agents yet). Phase 7 capabilities (Experiments, Steering, Counterfactuals, Review Policy, Promotion Branches) are REST-only.
 
-| Namespace | Purpose | Key Tools |
-|---|---|---|
-| `nm_v1_projection_*` | Context generation for agents | `get`, `list` |
-| `nm_v1_workunit_*` | Work unit lifecycle | `create`, `get`, `update`, `list` |
-| `nm_v1_task_*` | Task management (intent only) | `create`, `update`, `list`, `assign` |
-| `nm_v1_branch_*` | Branch management | `create`, `checkout`, `list`, `status` |
-| `nm_v1_merge_*` | Merge proposal workflow | `propose`, `validate`, `review`, `apply` |
-| `nm_v1_replay_*` | History inspection | `range`, `rollback`, `inspect` |
-| `nm_v1_state_*` | Known good state | `markKnownGood`, `findKnownGood`, `checkoutKnownGood` |
-| `nm_v1_snapshot_*` | Execution snapshots | `get`, `compare` |
-| `nm_v1_agent_*` | Agent lifecycle | `spawn`, `pause`, `resume`, `status`, `stop` |
-| `nm_v1_workspace_*` | Control tower summary + file I/O + build/test/run execution + workspace profile | `summary`, `read`/`write`, `build`/`test`/`exec`/`run`/`run_stop`, `profile_get`/`profile_rescan` |
-| `nm_v1_scheduler_*` | Work queue | `enqueue`, `pending` |
-| `nm_v1_artifact_*` | Knowledge artifacts | `record`, `query`, `list` |
-| `nm_v1_goal_*` | Decision-centric goal nodes | `create`, `list` |
-| `nm_v1_decision_*` | Decision log against proposals | `record`, `list` |
-| `nm_v1_evidence_*` | Build/test evidence attachment | `attach`, `list` |
-| `nm_v1_trajectory_*` | Lifecycle phase tracking + replay | `create`, `replay` |
-| `nm_v1_hypothesis_*` | Hypothesis forks | `fork`, `list` |
-| `nm_v1_reasoning_*` | Reasoning commit log | `record` |
-| `nm_v1_model_*` | Cross-model comparison | `compare`, `replay` |
-
-**Phase 7 capabilities (Experiments, Steering, Counterfactuals, Review Policy, Promotion Branches) are REST-only** — they don't have dedicated `nm_v1_*` tools yet. See [docs/reference/api-reference.md](docs/reference/api-reference.md) for the full tool-by-tool catalog, which REST endpoints exist for each, and which tools are actually reachable by autonomous agents versus external MCP clients only.
-
-See [docs/contracts/mcp-v1-contract.md](docs/contracts/mcp-v1-contract.md) for the original frozen catalog, request/response schemas, and error envelope format (Goal/Decision/Evidence/Trajectory/Hypothesis/Reasoning/Model namespaces and all Phase 7 REST additions postdate that document — use the reference doc above for those).
+Full documentation:
+- [docs/reference/api-reference.md](docs/reference/api-reference.md) — complete 66-tool catalog with dispatch status, REST endpoint parity, and extension coverage analysis
+- [docs/contracts/mcp-v1-contract.md](docs/contracts/mcp-v1-contract.md) — frozen design principles, request/response schemas, error envelope format, and Phase 6.7+/Phase 7 addendum
 
 ---
 
@@ -393,15 +400,20 @@ See [docs/contracts/mcp-v1-contract.md](docs/contracts/mcp-v1-contract.md) for t
 ### Three-Layer Design
 
 ```
-Layer 3: UX (TypeScript)          — VS Code Extension, Web Dashboard
-        Presentation only. No business rules. No authoritative state.
-            ↕ MCP + REST
+Layer 3: UX + Peers               — VS Code Extension (Control Tower)
+         (TypeScript / .NET)        Web Dashboard
+                                    Headless Peer (no HTTP, optional room presence)
+              ↕ REST / in-process call / WebSocket room
 Layer 2: Studio Services (.NET)   — AgentRuntime, Orchestrator, Projections,
-        MCP Server, Tasks, Merge, Storage
-            ↕ NodalMerge APIs
+                                    MCP Server, Tasks, Merge, Storage
+              ↕ NodalMerge APIs
 Layer 1: NodalMerge Core (Rust)   — DAG storage, CRDT convergence, replication,
-        replay, branching, promotion, sync
+                                    replay, branching, promotion, sync
 ```
+
+The VS Code extension and headless peers both sit at Layer 3 — they use Studio services (Layer 2),
+not NodalMerge APIs directly. The extension exposes an HTTP server and MCP-over-HTTP; a headless
+peer does not. See [docs/guides/headless-peer.md](docs/guides/headless-peer.md).
 
 ### Key Architectural Principles
 
@@ -428,11 +440,14 @@ See [docs/architecture/v1-architecture-spec.md](docs/architecture/v1-architectur
 | `src/NodalMerge.Studio.AgentRuntime` | Agent execution loop |
 | `src/NodalMerge.Studio.Orchestrator` | Work unit and orchestration |
 | `src/NodalMerge.Studio.McpServer` | MCP v1 tool surface |
-| `src/NodalMerge.Studio.Host` | ASP.NET composition root |
+| `src/NodalMerge.Studio.Host` | ASP.NET composition root; `HeadlessPeerOptions.cs` + `RoomPeerClient.cs` for peer mode |
 | `clients/vscode-extension` | VS Code extension (Control Tower) |
 | `clients/web-dashboard` | Web dashboard (placeholder) |
 | `tests/` | Unit and integration tests |
-| `docs/` | Architecture spec, MCP v1 contract, ADRs, [UI](docs/reference/ui-reference.md) and [API](docs/reference/api-reference.md) reference |
+| `docs/architecture/` | Architecture spec, CRDT vs. cognition layer, node schemas, ADRs |
+| `docs/contracts/` | MCP v1 contract (frozen + Phase 6.7+ addendum), projection contract |
+| `docs/reference/` | [UI reference](docs/reference/ui-reference.md), [API reference](docs/reference/api-reference.md) |
+| `docs/guides/` | How-to guides: [headless peer](docs/guides/headless-peer.md), [extending goals](docs/guides/extending-goals.md), [domain observers](docs/guides/domain-observers.md), [repository virtualization](docs/guides/repository-virtualization.md) |
 | `plans/` | Slice-based execution plans |
 | `scripts/` | Build, dev, and verify scripts |
 

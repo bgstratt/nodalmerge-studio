@@ -64,6 +64,7 @@ export function wrapViewScript(js: string, containerId: string): string {
     `  nmErrDiv.style.cssText = 'color:#f14c4c;font-family:monospace;white-space:pre-wrap;padding:12px;';\n` +
     `  nmErrDiv.textContent = 'NM-FATAL[${containerId}]: ' + (nmWrapErr && nmWrapErr.stack || nmWrapErr);\n` +
     `  if (nmErrRoot) { nmErrRoot.prepend(nmErrDiv); } else { document.body.prepend(nmErrDiv); }\n` +
+    `  if (window.__nmVscode) { window.__nmVscode.postMessage({ type: 'nm-webview-error', containerId: '${containerId}', message: String(nmWrapErr), stack: (nmWrapErr && nmWrapErr.stack) || '' }); }\n` +
     `}\n` +
     `})();`;
 }

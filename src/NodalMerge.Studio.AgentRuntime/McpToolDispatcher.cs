@@ -17,7 +17,6 @@ internal sealed class McpToolDispatcher(
     IMergeCommandService mergeCommands,
     IWorkspaceService workspace,
     IFileWorkspaceService fileWorkspace,
-    IAgentWorkspaceService agentWorkspaces,
     ISnapshotService snapshots,
     IAgentControlService agentControl,
     IArtifactCommandService artifactCommands,

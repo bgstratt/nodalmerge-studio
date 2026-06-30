@@ -1,6 +1,7 @@
 import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as http from 'http';
+import * as net from 'net';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
@@ -19,6 +20,21 @@ type HostStatus = 'idle' | 'starting' | 'ready' | 'stopped' | 'error';
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isPortFree(port: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const srv = net.createServer();
+    srv.listen(port, '127.0.0.1', () => srv.close(() => resolve(true)));
+    srv.on('error', () => resolve(false));
+  });
+}
+
+async function findFreePort(startPort: number): Promise<number> {
+  for (let p = startPort; p < startPort + 20; p++) {
+    if (await isPortFree(p)) { return p; }
+  }
+  throw new Error(`No free port found in range ${startPort}–${startPort + 19}`);
 }
 
 // Name Studio used to (and, if a user opts in via workspaceDataPath, still can) store its data
@@ -115,6 +131,12 @@ export class HostManager implements vscode.Disposable {
     }
 
     this.applyStatus('starting');
+    const desiredPort = this.extractPort();
+    if (!await isPortFree(desiredPort)) {
+      const freePort = await findFreePort(desiredPort + 1);
+      this.uri = `http://127.0.0.1:${freePort}`;
+      this.output.appendLine(`[startup] port ${desiredPort} in use — using ${freePort} instead`);
+    }
     this.output.appendLine(`[startup] spawning process at ${elapsed()}`);
     this.spawnProcess();
     await this.waitForHealth(t0);
@@ -160,8 +182,17 @@ export class HostManager implements vscode.Disposable {
       this.output.append(chunk.toString());
     });
 
-    this.process.on('error', (err) => {
-      this.output.appendLine(`[NodalMerge] Spawn error: ${err.message}`);
+    this.process.on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'ENOENT') {
+        this.output.appendLine(`[NodalMerge] Spawn error: host binary not found at ${this.resolveHostCommand().cmd}`);
+        this.output.appendLine('[NodalMerge] Run the build script to publish the host binary into bin/<rid>/.');
+      } else if (err.code === 'EADDRINUSE') {
+        const port = this.extractPort();
+        this.output.appendLine(`[NodalMerge] Port ${port} is already in use.`);
+        this.output.appendLine(`[NodalMerge] Set "nodalmerge.runtimeUri" to adopt an existing host, or stop the process on port ${port}.`);
+      } else {
+        this.output.appendLine(`[NodalMerge] Spawn error: ${err.message}`);
+      }
       this.applyStatus('error');
     });
 

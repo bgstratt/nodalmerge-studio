@@ -24,7 +24,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const reload = () => {
       if (reloading) { return; }
       reloading = true;
-      void vscode.commands.executeCommand('workbench.action.reloadWindow');
+      vscode.commands.executeCommand('workbench.action.reloadWindow')
+        .then(undefined, err => output.appendLine(`[NodalMerge] reloadWindow failed: ${String(err)}`));
     };
     context.subscriptions.push(
       bundleWatcher,
@@ -64,7 +65,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     vscode.commands.registerCommand(COMMANDS.OPEN_STUDIO, () => {
       StudioShellPanel.createOrShow(
-        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
+        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, output, notificationManager,
       );
     }),
 
@@ -72,7 +73,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // if needed) and switch it to the Review tab, instead of a standalone panel.
     vscode.commands.registerCommand(COMMANDS.OPEN_MERGE_REVIEW, (proposalId: string) => {
       const shell = StudioShellPanel.createOrShow(
-        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
+        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, output, notificationManager,
       );
       shell.showTab(DecisionConvergencePanel.containerId);
       shell.reviewPanel.loadProposal(proposalId);
@@ -80,7 +81,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     vscode.commands.registerCommand(COMMANDS.OPEN_MERGE_REVIEW_CONFLICT, (workUnitId: string) => {
       const shell = StudioShellPanel.createOrShow(
-        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
+        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, output, notificationManager,
       );
       shell.showTab(DecisionConvergencePanel.containerId);
       shell.reviewPanel.loadConflict(workUnitId);
@@ -88,7 +89,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     vscode.commands.registerCommand(COMMANDS.OPEN_INSIGHTS, () => {
       const shell = StudioShellPanel.createOrShow(
-        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, notificationManager,
+        manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, output, notificationManager,
       );
       shell.showTab(InsightsPanel.containerId);
     }),
@@ -107,10 +108,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const notificationManager = new NotificationManager(
     (proposalId) => {
-      void vscode.commands.executeCommand(COMMANDS.OPEN_MERGE_REVIEW, proposalId);
+      vscode.commands.executeCommand(COMMANDS.OPEN_MERGE_REVIEW, proposalId)
+        .then(undefined, err => output.appendLine(`[NodalMerge] OPEN_MERGE_REVIEW failed: ${String(err)}`));
     },
     () => {
-      void vscode.commands.executeCommand(COMMANDS.OPEN_INSIGHTS);
+      vscode.commands.executeCommand(COMMANDS.OPEN_INSIGHTS)
+        .then(undefined, err => output.appendLine(`[NodalMerge] OPEN_INSIGHTS failed: ${String(err)}`));
     },
   );
 
@@ -127,7 +130,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (action === 'Show Output') {
       output.show();
     } else if (action === 'Retry') {
-      void vscode.commands.executeCommand(COMMANDS.RESTART_HOST);
+      vscode.commands.executeCommand(COMMANDS.RESTART_HOST)
+        .then(undefined, err => output.appendLine(`[NodalMerge] RESTART_HOST failed: ${String(err)}`));
     }
   }
 }

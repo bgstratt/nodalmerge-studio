@@ -498,6 +498,47 @@ Every MCP tool has a corresponding REST endpoint via the Studio Host. The mappin
 
 ---
 
+---
+
+## Phase 6.7+ Addendum
+
+> **Note:** The design principles (MCP-1 through MCP-5), tool naming conventions, error envelope
+> format, and all tool namespaces through `nm_v1_artifact_*` above remain frozen and accurate.
+> The sections below document tool namespaces and REST-only capabilities added after Phase 6.6.
+> For the complete, authoritative catalog — including dispatch status, REST endpoint parity, and
+> coverage analysis — see [docs/reference/api-reference.md](../reference/api-reference.md).
+
+### New tool namespaces (Phase 6.7+)
+
+None of these are dispatched to in-process orchestrator/worker agents. They are available to
+external MCP clients and headless peers calling via REST.
+
+| Namespace | Tools | Purpose |
+|---|---|---|
+| `nm_v1_goal_*` | `goal_create`, `goal_list` | Create and list decision-centric `GoalNode` records. `goal_create` also creates the underlying work unit in one call (`GoalId == WorkUnitId`). `goal_list` falls back to work units when the goal store is empty. |
+| `nm_v1_decision_*` | `decision_record`, `decision_list` | Record and query Accepted/Rejected/Deferred/Superseded decisions against a proposal. |
+| `nm_v1_evidence_*` | `evidence_attach`, `evidence_list` | Attach build/test evidence from the latest execution result to a work unit; list evidence entries. |
+| `nm_v1_trajectory_*` | `trajectory_create`, `trajectory_replay` | Record lifecycle phase transitions (GoalDefined → Converged/Forked/Abandoned); replay decisions in Linear, BranchExplorer, or Counterfactual mode. |
+| `nm_v1_hypothesis_*` | `hypothesis_fork`, `hypothesis_list` | Fork a work unit or proposal with a typed fork strategy (Code/Reasoning/Model/Research/Architecture/Library/Product); list forks by parent. |
+| `nm_v1_reasoning_*` | `reasoning_record` | Record a reasoning commit from an orchestration step. |
+| `nm_v1_model_*` | `model_compare`, `model_replay` | Compare diverged files between two proposals; list all proposals for a work unit grouped for model comparison. |
+
+### Phase 7 REST-only capabilities
+
+These capabilities have no `nm_v1_*` MCP tool. They are accessible only via REST (from the
+VS Code extension or direct HTTP clients). Autonomous agents cannot trigger them.
+
+| Capability | REST endpoint(s) | Notes |
+|---|---|---|
+| Experiments (create/list/get) | `POST /studio/experiments`, `GET /studio/experiments`, `GET /studio/experiments/{id}` | Multi-fork parallel exploration. An agent or MCP client cannot launch an experiment on its own. |
+| Steering (redirect, fork-from-node) | `POST /studio/steering/redirect`, `POST /studio/steering/fork-from-node` | Pause a running agent and inject a constraint into a new sibling. Human/extension only. |
+| Counterfactuals (create) | `POST /studio/counterfactuals` | Re-run a completed work unit under a different profile. Viewing via `nm_v1_trajectory_replay` (mode=Counterfactual) is available; creating is REST-only. |
+| Review policy on work-unit create | `reviewPolicy` field on `POST /studio/workunits` | `nm_v1_workunit_create` always defaults to `HumanRequired`. To use `AgentApproval` or `Hybrid`, create via REST. |
+| Promotion branches | `usePromotionBranch` on `POST /studio/options`, `POST /studio/branches/candidate/promote` | No MCP tool to toggle or promote. |
+| Fork from Known Good | `POST /studio/state/{stateId}/fork` | Fork a new work unit seeded from a checkpoint. `nm_v1_state_checkoutKnownGood` restores in place; forking requires REST. |
+
+---
+
 ## Out of scope for MCP v1
 
 * Raw DAG node CRUD
