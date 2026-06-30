@@ -768,7 +768,7 @@ const ET_JS = `
       if (!isTerminal && !isPaused) {
         html += '<button class="ghost" data-action="spawnAgent" data-wu="' + esc(g.workUnitId) + '">Spawn</button>';
       }
-      html += '<button class="ghost" data-action="markKnownGood" data-wu="' + esc(g.workUnitId) + '" data-branch="' + esc(g.branchId) + '" title="Tag this work unit\'s current branch as a Known Good State">Tag KGS</button>';
+      html += '<button class="ghost" data-action="markKnownGood" data-wu="' + esc(g.workUnitId) + '" data-branch="' + esc(g.branchId) + '" title="Tag this work unit\\'s current branch as a Known Good State">Tag KGS</button>';
       if (!isTerminal) {
         html += '<button class="danger" data-action="cancelWorkUnit" data-wu="' + esc(g.workUnitId) + '">Stop</button>';
       }
