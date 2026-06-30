@@ -7,9 +7,69 @@ actually reaches each one. It supersedes the tool counts in
 document remains the source of truth for tool-naming design principles and the error envelope
 format.
 
-Ground truth as of this writing: **66 MCP tools** (`McpToolNames.All`), **42 of them** dispatched
-in-process to autonomous agents (`McpToolDispatcher.cs`), and **112 REST routes**
-(`StudioRestEndpoints.cs`).
+Ground truth as of this writing: **66 `nm_v1_*` MCP tools** (`McpToolNames.All`), **42 of them** dispatched
+in-process to autonomous agents (`McpToolDispatcher.cs`), **13 `nms_v1_*` external-caller tools**
+(`McpServerToolNames`), and **112 REST routes** (`StudioRestEndpoints.cs`).
+
+---
+
+## External Caller Surface (`nms_v1_*`)
+
+These 13 tools are the recommended entry point for external MCP clients — Claude Code, Cursor,
+scripts, CI agents. They cover the full human-in-the-loop lifecycle at a goal-centric level,
+without requiring knowledge of work units, branches, or the internal DAG.
+
+> **Naming:** `nms_v1_*` (NodalMerge Studio v1) vs. `nm_v1_*` (NodalMerge v1). The extra `s`
+> marks the Studio-level abstraction layer. Both namespaces share the same host and the same error
+> envelope format.
+
+### Goal management (6)
+| Tool | Purpose |
+|---|---|
+| `nms_v1_goal_run` | Start a new goal — creates a work unit, execution session, and enqueues the orchestrator in one call. Returns `goalId` and `sessionId`. |
+| `nms_v1_goal_list` | List all goals with current status. Use to discover `goalId` values. |
+| `nms_v1_goal_status` | Detailed status for one goal, including pending clarifications and session state. |
+| `nms_v1_goal_cancel` | Cancel a goal and its entire subtree. Completed or merged work units are left untouched. |
+| `nms_v1_goal_pause` | Pause a goal and all its active agents. Agents stop gracefully; goal can be resumed. |
+| `nms_v1_goal_resume` | Resume a paused goal. Optionally inject a steering message to redirect the next agent run. |
+
+### Clarifications (1)
+| Tool | Purpose |
+|---|---|
+| `nms_v1_clarification_respond` | Answer a pending agent clarification request. The agent resumes immediately by default. Use `nms_v1_goal_status` to find pending `clarificationId` values. |
+
+### Results (2)
+| Tool | Purpose |
+|---|---|
+| `nms_v1_results_get` | List merge proposals for a goal with status, summary, confidence, and files touched. |
+| `nms_v1_results_apply` | Apply an approved proposal. Proposal must be `ReadyForReview` or `Approved`. |
+
+### Repository registration (2)
+| Tool | Purpose |
+|---|---|
+| `nms_v1_repo_register` | Register a local git repository path so agents can work in it. Returns a `repositoryId` for use with `nms_v1_goal_run`. Idempotent. |
+| `nms_v1_repo_list` | List all registered repositories and their IDs. |
+
+### Workspace / feedback (2)
+| Tool | Purpose |
+|---|---|
+| `nms_v1_workspace_status` | High-level snapshot: goal counts by status, active agent count, pending clarification count, and which goals need human input right now. |
+| `nms_v1_feedback_record` | Record a human feedback note as a durable `Constraint` artifact. Scope to a specific goal or leave workspace-wide for all future agents to see. |
+
+### Typical external-caller flow
+
+```
+1. nms_v1_repo_register        → repositoryId
+2. nms_v1_goal_run             → goalId, sessionId
+3. poll nms_v1_goal_status     → check status / pendingClarifications
+4. nms_v1_clarification_respond (if needed)
+5. nms_v1_results_get          → proposalId when status = ReadyForReview
+6. nms_v1_results_apply        → done
+```
+
+REST equivalents exist for all these operations under their respective resource paths
+(`/studio/goals`, `/studio/merges`, `/studio/repositories`, `/studio/clarifications`), but the
+`nms_v1_*` MCP surface is the preferred path for MCP-native clients.
 
 ---
 

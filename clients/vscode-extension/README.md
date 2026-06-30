@@ -128,10 +128,24 @@ See the [headless peer guide](../../docs/guides/headless-peer.md) for configurat
 
 ## MCP Integration
 
-The Studio host exposes a frozen **MCP v1 tool surface** — 66 tools across 19 namespaces under `nm_v1_*`. Any MCP-compatible client (Claude Code, Cursor, other agents) can connect directly to the Studio host.
+The Studio host exposes two MCP tool surfaces over the same connection (`http://127.0.0.1:5080` by default):
+
+**`nms_v1_*` — External caller surface (13 tools)**  
+High-level tools designed for external MCP clients — Claude Code, Cursor, scripts, CI agents — to orchestrate the workspace without knowing its internals. These tools cover the full human-in-the-loop lifecycle: register a repo, start a goal, respond to clarifications, inspect results, apply proposals.
+
+| Namespace | Tools |
+|---|---|
+| `nms_v1_goal_*` | `goal_run`, `goal_list`, `goal_status`, `goal_cancel`, `goal_pause`, `goal_resume` |
+| `nms_v1_clarification_*` | `clarification_respond` |
+| `nms_v1_results_*` | `results_get`, `results_apply` |
+| `nms_v1_repo_*` | `repo_register`, `repo_list` |
+| `nms_v1_workspace_*` | `workspace_status`, `feedback_record` |
+
+**`nm_v1_*` — Full internal surface (66 tools)**  
+The complete tool catalog used by autonomous agents in-process. Available to external clients that need low-level workspace access (file I/O, branch ops, artifact records, execution). Frozen by the MCP v1 contract.
 
 - [MCP v1 contract](../../docs/contracts/mcp-v1-contract.md) — frozen tool names, schemas, and error envelope
-- [API reference](../../docs/reference/api-reference.md) — full 66-tool catalog with dispatch status and REST parity
+- [API reference](../../docs/reference/api-reference.md) — complete tool catalog including external surface, dispatch status, and REST parity
 
 ---
 

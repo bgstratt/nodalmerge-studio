@@ -539,6 +539,30 @@ VS Code extension or direct HTTP clients). Autonomous agents cannot trigger them
 
 ---
 
+## External Caller Surface (`nms_v1_*`)
+
+A separate, higher-level MCP tool surface exists under the `nms_v1_*` namespace
+(NodalMerge **Studio** v1, note the `s`). These 13 tools are designed for external MCP clients
+— Claude Code, Cursor, scripts, CI — to orchestrate the workspace at a goal-centric level
+without needing to know work units, branches, or the internal DAG.
+
+The design principles (MCP-1 through MCP-5) and error envelope format apply to `nms_v1_*` as
+well. C# constants live in `McpServerToolNames` (separate from `McpToolNames`).
+
+| Namespace | Tools | Purpose |
+|---|---|---|
+| `nms_v1_goal_*` | `goal_run`, `goal_list`, `goal_status`, `goal_cancel`, `goal_pause`, `goal_resume` | Full goal lifecycle |
+| `nms_v1_clarification_*` | `clarification_respond` | Answer pending agent questions |
+| `nms_v1_results_*` | `results_get`, `results_apply` | Inspect and apply merge proposals |
+| `nms_v1_repo_*` | `repo_register`, `repo_list` | Register repositories for agents to work in |
+| `nms_v1_workspace_*` | `workspace_status`, `feedback_record` | Workspace snapshot and durable feedback injection |
+
+None of these tools are dispatched to in-process orchestrator/worker agents — they are external-caller
+only. See [docs/reference/api-reference.md](../reference/api-reference.md) for full descriptions,
+parameter details, and the recommended call sequence.
+
+---
+
 ## Out of scope for MCP v1
 
 * Raw DAG node CRUD
