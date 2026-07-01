@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  NODALMERGE_PACKAGE_VERSION: 0.1.1
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
@@ -16,27 +19,42 @@ jobs:
         with:
           path: nodalmerge-studio
 
-      # When nodalmerge is available as a sibling repo in CI, add a second checkout
-      # and run pack-local-artifacts.ps1 before restore.
+      - name: Checkout nodalmerge
+        uses: actions/checkout@v4
+        with:
+          repository: bgstratt/nodalmerge
+          ref: main
+          path: nodalmerge
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           global-json-file: nodalmerge-studio/global.json
 
+      # Studio only consumes the managed NodalMerge.DotNetHost package (plus its
+      # Abstractions/Composition deps) at restore/build/unit-test time - no native
+      # RID artifacts, so no Rust toolchain is needed here. See restore-local-nodalmerge.ps1
+      # for the full local-dev flow that also packs native runtimes.
+      - name: Pack local NodalMerge managed NuGet artifacts
+        working-directory: nodalmerge
+        run: |
+          dotnet pack nodalmerge-host/src/NodalMerge.Host.Abstractions/NodalMerge.Host.Abstractions.csproj -c Release -o artifacts/package-local/nuget -p:Version=${{ env.NODALMERGE_PACKAGE_VERSION }}
+          dotnet pack nodalmerge-host/src/NodalMerge.Host.Composition/NodalMerge.Host.Composition.csproj -c Release -o artifacts/package-local/nuget -p:Version=${{ env.NODALMERGE_PACKAGE_VERSION }}
+          dotnet pack nodalmerge-host/src/NodalMerge.DotNetHost/NodalMerge.DotNetHost.csproj -c Release -o artifacts/package-local/nuget -p:Version=${{ env.NODALMERGE_PACKAGE_VERSION }}
+
       - name: Restore
-        run: dotnet restore NodalMerge.Studio.slnx --configfile NuGet.config -p:NodalMergePackageVersion=0.1.0-local
+        run: dotnet restore NodalMerge.Studio.slnx --configfile NuGet.config
 
       - name: Build
-        run: dotnet build NodalMerge.Studio.slnx -c Release -p:CI=true -p:NodalMergePackageVersion=0.1.0-local
+        run: dotnet build NodalMerge.Studio.slnx -c Release -p:CI=true
         env:
           CI: true
 
       - name: Test (unit)
-        run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category!=Integration" -p:NodalMergePackageVersion=0.1.0-local
+        run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category!=Integration"
 
       - name: Test (integration)
         if: env.NODALMERGE_NATIVE_AVAILABLE == 'true'
-        run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category=Integration" -p:NodalMergePackageVersion=0.1.0-local
+        run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category=Integration"
         env:
           NODALMERGE_NATIVE_AVAILABLE: ${{ vars.NODALMERGE_NATIVE_AVAILABLE }}

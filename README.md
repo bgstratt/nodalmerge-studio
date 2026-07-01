@@ -200,7 +200,7 @@ pwsh -File .\scripts\restore-local-nodalmerge.ps1
 ### 2. Restore and build
 
 ```powershell
-dotnet restore NodalMerge.Studio.slnx --configfile NuGet.config -p:NodalMergePackageVersion=0.1.0-local
+dotnet restore NodalMerge.Studio.slnx --configfile NuGet.config
 dotnet build NodalMerge.Studio.slnx
 ```
 
