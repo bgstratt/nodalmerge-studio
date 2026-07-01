@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$Version = "0.1.0-local",
+    [string]$Version = "0.1.1",
     [string]$NodalMergeRepo = "../nodalmerge"
 )
 
