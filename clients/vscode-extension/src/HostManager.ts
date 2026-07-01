@@ -37,6 +37,14 @@ async function findFreePort(startPort: number): Promise<number> {
   throw new Error(`No free port found in range ${startPort}–${startPort + 19}`);
 }
 
+function samePath(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) { return false; }
+  const norm = (p: string) => path.normalize(p).replace(/[/\\]+$/, '');
+  return process.platform === 'win32'
+    ? norm(a).toLowerCase() === norm(b).toLowerCase()
+    : norm(a) === norm(b);
+}
+
 // Name Studio used to (and, if a user opts in via workspaceDataPath, still can) store its data
 // under, directly inside the opened repo.
 const LEGACY_DATA_DIRNAME = '.nodalmerge';
@@ -105,8 +113,13 @@ export class HostManager implements vscode.Disposable {
       this.output.appendLine(`[startup] legacy migration check: ${(performance.now() - t1).toFixed(0)}ms`);
     }
 
+    const expectedWorkspaceRoot = wsRoot && !this.isRemote
+      ? path.join(this.resolveDataRoot(wsRoot) ?? '', 'workspace')
+      : undefined;
+
     const t2 = performance.now();
-    if (await this.checkHealth()) {
+    const health = await this.checkHealth();
+    if (health.ok && (this.isRemote || !expectedWorkspaceRoot || samePath(health.workspaceRootPath, expectedWorkspaceRoot))) {
       this.output.appendLine(`[startup] initial health check (already running): ${(performance.now() - t2).toFixed(0)}ms`);
       this._ready = true;
       this.applyStatus('ready');
@@ -120,7 +133,17 @@ export class HostManager implements vscode.Disposable {
       }
       return;
     }
-    this.output.appendLine(`[startup] initial health check (not running): ${(performance.now() - t2).toFixed(0)}ms`);
+    if (health.ok) {
+      // Something is listening on the configured port, but it was spawned for a different
+      // workspace (e.g. another VSCode window got there first). Don't silently attach this
+      // window's UI to another repo's data — fall through and spawn our own on a free port.
+      this.output.appendLine(
+        `[startup] host on port ${this.extractPort()} belongs to a different workspace ` +
+        `(root="${health.workspaceRootPath ?? '?'}", expected="${expectedWorkspaceRoot}") — spawning a dedicated host instead.`
+      );
+    } else {
+      this.output.appendLine(`[startup] initial health check (not running): ${(performance.now() - t2).toFixed(0)}ms`);
+    }
 
     if (this.isRemote) {
       this.applyStatus('error');
@@ -341,7 +364,7 @@ export class HostManager implements vscode.Disposable {
     while (Date.now() < deadline) {
       pollCount++;
       const pollStart = performance.now();
-      if (await this.checkHealth()) {
+      if ((await this.checkHealth()).ok) {
         const sincePoll = (performance.now() - pollStart).toFixed(0);
         const sinceSpawn = spawnT0 !== undefined ? ` (${(performance.now() - spawnT0).toFixed(0)}ms since spawn)` : '';
         this._ready = true;
@@ -359,12 +382,28 @@ export class HostManager implements vscode.Disposable {
     );
   }
 
-  private checkHealth(): Promise<boolean> {
+  private checkHealth(): Promise<{ ok: boolean; workspaceRootPath?: string }> {
     return new Promise(resolve => {
       const url = `${this.uri}/studio/health`;
-      const req = http.get(url, { timeout: 1000 }, res => resolve(res.statusCode === 200));
-      req.on('error', () => resolve(false));
-      req.on('timeout', () => { req.destroy(); resolve(false); });
+      const req = http.get(url, { timeout: 1000 }, res => {
+        if (res.statusCode !== 200) {
+          res.resume();
+          resolve({ ok: false });
+          return;
+        }
+        let body = '';
+        res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(body);
+            resolve({ ok: true, workspaceRootPath: parsed.workspaceRootPath });
+          } catch {
+            resolve({ ok: true });
+          }
+        });
+      });
+      req.on('error', () => resolve({ ok: false }));
+      req.on('timeout', () => { req.destroy(); resolve({ ok: false }); });
     });
   }
 

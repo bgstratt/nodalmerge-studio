@@ -7,6 +7,7 @@ using NodalMerge.Host.Composition;
 using NodalMerge.Studio.Core;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Orchestrator;
+using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Host;
 
@@ -62,7 +63,17 @@ public static class StudioWebApplication
         Action<IServiceCollection>? configureServices = null,
         Action<ConfigurationManager>? configureConfiguration = null)
     {
-        var builder = WebApplication.CreateBuilder(args);
+        // ContentRootPath must be the directory the exe/dll actually lives in, not the OS process
+        // cwd — the packaged host is spawned with cwd set to the caller's workspace root (so
+        // relative DbPath/RootPath config resolves there), which left WebApplication.CreateBuilder's
+        // default content-root probe unable to find appsettings.json next to the binary. That
+        // silently dropped the whole NodalMerge:Providers section, falling back to NodeStorage=InMemory
+        // regardless of what appsettings.json actually said.
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+        {
+            Args = args,
+            ContentRootPath = AppContext.BaseDirectory,
+        });
 
         configureWebHost?.Invoke(builder.WebHost);
 
@@ -95,13 +106,16 @@ public static class StudioWebApplication
             timestampUtc = DateTimeOffset.UtcNow
         }));
 
-        app.MapGet("/studio/health", () => Results.Ok(new
+        app.MapGet("/studio/health", (WorkspaceOptions workspaceOptions) => Results.Ok(new
         {
             service = StudioConstants.ServiceName,
             layer = "studio-services",
             mcpContractVersion = StudioConstants.McpContractVersion,
             status = "ok",
-            timestampUtc = DateTimeOffset.UtcNow
+            timestampUtc = DateTimeOffset.UtcNow,
+            // Lets a caller confirm this host was actually spawned for their workspace before
+            // adopting it, rather than blindly reusing whatever answers on the configured port.
+            workspaceRootPath = workspaceOptions.RootPath
         }));
 
         app.MapStudioRestEndpoints();

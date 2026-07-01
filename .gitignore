@@ -13,6 +13,9 @@
 .vs/
 .idea/
 
+# Local notes and deferred plans
+*.local.md
+
 # Local secrets and overrides
 appsettings.*.local.json
 **/secrets.json
