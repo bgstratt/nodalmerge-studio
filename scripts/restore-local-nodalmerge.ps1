@@ -30,9 +30,10 @@ finally {
 }
 
 Write-Host "Restoring NodalMerge Studio solution ..."
+$localFeed = Join-Path $nodalMergePath "artifacts/package-local/nuget"
 Push-Location $studioRoot
 try {
-    dotnet restore "NodalMerge.Studio.slnx" --configfile "NuGet.config" -p:NodalMergePackageVersion=$Version
+    dotnet restore "NodalMerge.Studio.slnx" --configfile "NuGet.config" --source $localFeed --source "https://api.nuget.org/v3/index.json"
 }
 finally {
     Pop-Location
