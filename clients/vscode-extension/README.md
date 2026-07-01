@@ -1,8 +1,10 @@
 # NodalMerge Studio
 
-**Agent-native collaborative workspace for VS Code.**
+**A collaborative AI development runtime for VS Code.**
 
-NodalMerge Studio is the human control tower for [NodalMerge](https://github.com/nodalmerge/nodalmerge) — a platform where every step an agent takes produces a durable, branchable, replayable artifact in a DAG. Agents propose; you decide. The durable graph is the product; agents are features of it.
+NodalMerge Studio is where humans, AI agents, headless peers, MCP clients, and automated development workflows converge on a shared workspace. Every goal, decision, conversation, code change, review, and execution becomes part of a persistent graph that can be inspected, replayed, branched, and evolved over time.
+
+Powered by the NodalMerge runtime, Studio enables collaborative software development that spans interactive editing, autonomous agents, background workers, and external tooling—all working against the same durable workspace.
 
 ---
 
