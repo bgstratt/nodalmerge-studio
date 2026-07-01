@@ -22,6 +22,19 @@ public enum WorkUnitStatus
     Retrying
 }
 
+// What a completed task on this work unit should produce, used by the automated reviewer (and
+// optionally MergeCommandService, behind WorkspaceOptions.EnforceExpectedOutputKind) to tell a
+// proposal that only describes work apart from one that actually did it. FileChange is the
+// default — most worker tasks modify files. KnowledgeArtifact covers tasks satisfied by recording
+// a Research/Decision/Constraint artifact (nm.v1.artifact.record) instead, e.g. pure research.
+// Either disables the check for tasks where both are valid outcomes.
+public enum WorkUnitExpectedOutputKind
+{
+    FileChange,
+    KnowledgeArtifact,
+    Either
+}
+
 public sealed record WorkUnit(
     string WorkUnitId,
     string Goal,
@@ -42,10 +55,35 @@ public sealed record WorkUnit(
     PipelineStage? CurrentStage = null,
     WorkUnitExecutionInfo? ExecutionInfo = null,
     WorkUnitFanOutInfo? FanOutInfo = null,
-    string? BranchedFromProposalId = null);
+    string? BranchedFromProposalId = null,
+    HypothesisForkType? ForkType = null,
+    ReviewPolicy ReviewPolicy = ReviewPolicy.HumanRequired,
+    // Slice 21c — per-work-unit override: when true, applies always target the proposal's
+    // TargetBranch directly even if WorkspaceOptions.UsePromotionBranch is on session-wide.
+    bool BypassPromotionBranch = false,
+    WorkUnitExpectedOutputKind ExpectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
+    // Slice 19 — which registered repository (IRepositoryRegistryService) a fresh top-level
+    // goal's "main" content was synced from at creation time. Null for forks/children (they
+    // inherit their seed branch's content, not a repository directly) and for goals created
+    // from an unregistered ad hoc RepositoryPath.
+    string? RepositoryId = null,
+    // Cross-repo file reference — read-only pointers into *other* registered repos for context
+    // (style/examples), resolved lazily via IRepositoryRegistryService.ReadFileAsync during a run.
+    // Not write-gating like FileScope; just where to look. Nullable (not "= []") to match the
+    // DependsOn/FileScope-on-WorkUnitCreateCommand convention elsewhere in this codebase — callers
+    // normalize with "?? []" rather than every record defaulting a literal empty collection.
+    IReadOnlyList<FileReferenceV1>? ReferenceFiles = null,
+    // Phase 16 — the (currently singleton) workspace this work unit belongs to. Resolved
+    // server-side (IWorkspaceRegistryService.GetOrCreateDefaultAsync) by WorkUnitCommandService,
+    // never caller-supplied — there's nothing to choose while cardinality is 1. Defaulted here so
+    // every existing call site keeps compiling unchanged. See plans/phase-16-workspace-aggregate.md.
+    string WorkspaceId = "workspace-default");
 
 /// <summary>Failure/rejection counters, previously stored as parsed strings in Metadata.</summary>
-public sealed record WorkUnitExecutionInfo(int FailureAttemptCount, int AutomatedReviewRejectionCount);
+public sealed record WorkUnitExecutionInfo(
+    int FailureAttemptCount,
+    int AutomatedReviewRejectionCount,
+    int HumanReviewRejectionCount = 0);
 
 /// <summary>Fan-out lineage: which plan slice this work unit fulfills and which branch it was seeded from.</summary>
 // Slice 14b — BlockedReason is set when a BeforeEnqueue policy rule rejects this slice (e.g.
@@ -70,6 +108,11 @@ public static class WorkUnitTransitions
             // Phase 4 slice 11a — queue-driven pipeline.
             (WorkUnitStatus.Created, WorkUnitStatus.Queued) => true,
             (WorkUnitStatus.Queued, WorkUnitStatus.Executing) => true,
+            (WorkUnitStatus.Created, WorkUnitStatus.Waiting) => true,
+            (WorkUnitStatus.Queued, WorkUnitStatus.Waiting) => true,
+            (WorkUnitStatus.Executing, WorkUnitStatus.Waiting) => true,
+            (WorkUnitStatus.Waiting, WorkUnitStatus.Queued) => true,
+            (WorkUnitStatus.Executing, WorkUnitStatus.Completed) => true,
             (WorkUnitStatus.Executing, WorkUnitStatus.Proposed) => true,
             (WorkUnitStatus.Executing, WorkUnitStatus.Retrying) => true,
             (WorkUnitStatus.Retrying, WorkUnitStatus.Executing) => true,

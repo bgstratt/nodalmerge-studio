@@ -6,5 +6,9 @@
             "domain": "orchestration",
             "provider": "vscode-lm"
         }
-    ]
+    ],
+    "chat.tools.terminal.autoApprove": {
+        "dotnet test": true,
+        "dotnet build": true
+    }
 }

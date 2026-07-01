@@ -2,26 +2,41 @@ import * as vscode from 'vscode';
 
 export type LlmProvider = 'anthropic' | 'openai' | 'vscode-lm';
 
+export type DeploymentMode = 'inline' | 'headless';
+
 export interface AgentProfile {
   id:               string;
   label:            string;
   domain:           string;
+  deploymentMode?:  DeploymentMode;   // defaults to 'inline'
   provider?:        LlmProvider;
   model?:           string;
   baseUrl?:         string;
   apiKeyRef?:       string;
+  systemPrompt?:    string;
+  tools?:           string[];         // MCP tool allowlist; empty = all permitted
+  /** @deprecated Use systemPrompt */
   systemPromptHint?: string;
-}
-
-export interface TopologyWorker {
-  profile: string;
-  branch?: string;
 }
 
 export interface TopologyTemplate {
   name:         string;
   orchestrator: string;
-  workers?:     TopologyWorker[];
+  // Optional per-stage credential profile overrides — when unset, that stage inherits the
+  // orchestrator's profile (today's behavior). Profile ids reference entries from getProfiles().
+  planner?:     string;
+  worker?:      string;
+  reviewer?:    string;
+}
+
+/** Runtime participant from GET /studio/participants — covers both in-process agents and room peers. */
+export interface ParticipantStatus {
+  id:              string;
+  kind:            'agent' | 'peer';
+  status:          string;
+  workUnitId?:     string | null;
+  currentActivity?: string | null;
+  peerType?:       string | null;
 }
 
 /** LLM connection fields passed to POST /studio/agents/spawn. */
@@ -38,7 +53,7 @@ const DEFAULT_PROFILES: AgentProfile[] = [
 ];
 
 const DEFAULT_TEMPLATES: TopologyTemplate[] = [
-  { name: 'Default', orchestrator: 'orchestrator', workers: [{ profile: 'worker' }] },
+  { name: 'Default', orchestrator: 'orchestrator', worker: 'worker' },
 ];
 
 export class AgentConfigService {
@@ -71,6 +86,15 @@ export class AgentConfigService {
   async setDefaultTopology(name: string): Promise<void> {
     await vscode.workspace.getConfiguration('nodalmerge')
       .update('defaultTopology', name, vscode.ConfigurationTarget.Workspace);
+  }
+
+  getDefaultReviewPolicy(): string {
+    return vscode.workspace.getConfiguration('nodalmerge').get<string>('defaultReviewPolicy') ?? 'HumanRequired';
+  }
+
+  async saveDefaultReviewPolicy(policy: string): Promise<void> {
+    await vscode.workspace.getConfiguration('nodalmerge')
+      .update('defaultReviewPolicy', policy, vscode.ConfigurationTarget.Workspace);
   }
 
   async resolveApiKey(profile: AgentProfile, secrets: vscode.SecretStorage): Promise<string | undefined> {
@@ -127,6 +151,16 @@ export class AgentConfigService {
       baseUrl,
       apiKey,
     };
+  }
+
+  /** Returns the effective system prompt, preferring the new field over the deprecated hint. */
+  resolveSystemPrompt(profile: AgentProfile): string | undefined {
+    return profile.systemPrompt || profile.systemPromptHint || undefined;
+  }
+
+  /** Returns 'inline' by default when deploymentMode is unset. */
+  getEffectiveDeploymentMode(profile: AgentProfile): DeploymentMode {
+    return profile.deploymentMode ?? 'inline';
   }
 
   async pickProfile(placeHolder = 'Select an agent profile'): Promise<AgentProfile | undefined> {

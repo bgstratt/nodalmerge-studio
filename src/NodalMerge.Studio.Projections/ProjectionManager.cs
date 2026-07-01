@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Projections;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 using TaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.Projections;
@@ -16,19 +17,61 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly IMergeService _merges;
     private readonly IAgentRuntimeService _agentRuntime;
     private readonly IArtifactLineageService _artifactLineage;
+    private readonly IWorkspaceExecutionCommandService? _executionCommands;
+    private readonly IOrchestrationDecisionLogService? _decisionLog;
+    private readonly IDecisionNodeService? _decisionNodes;
+    private readonly IEvidenceNodeService? _evidenceNodes;
+    private readonly IHypothesisNodeService? _hypothesisNodes;
+    private readonly IAgentProfileService? _agentProfiles;
+    private readonly ISteeringDecisionService? _steeringDecisions;
+    private readonly IFileWorkspaceService? _fileWorkspace;
+    private readonly IWorkspaceProfileService? _workspaceProfiles;
+    private readonly IExecutionSessionService? _sessions;
+    private readonly IStudioNodeStore? _nodeStore;
+    private readonly IRepositoryOpService? _repositoryOps;
+    private readonly WorkspaceOptions? _workspaceOptions;
+    private readonly ICoModService? _coMod;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
         ITaskService tasks,
         IMergeService merges,
         IAgentRuntimeService agentRuntime,
-        IArtifactLineageService artifactLineage)
+        IArtifactLineageService artifactLineage,
+        IWorkspaceExecutionCommandService? executionCommands = null,
+        IOrchestrationDecisionLogService? decisionLog = null,
+        IDecisionNodeService? decisionNodes = null,
+        IEvidenceNodeService? evidenceNodes = null,
+        IHypothesisNodeService? hypothesisNodes = null,
+        IAgentProfileService? agentProfiles = null,
+        ISteeringDecisionService? steeringDecisions = null,
+        IFileWorkspaceService? fileWorkspace = null,
+        IWorkspaceProfileService? workspaceProfiles = null,
+        IExecutionSessionService? sessions = null,
+        IStudioNodeStore? nodeStore = null,
+        IRepositoryOpService? repositoryOps = null,
+        WorkspaceOptions? workspaceOptions = null,
+        ICoModService? coMod = null)
     {
-        _workUnits       = workUnits;
-        _tasks           = tasks;
-        _merges          = merges;
-        _agentRuntime    = agentRuntime;
-        _artifactLineage = artifactLineage;
+        _workUnits          = workUnits;
+        _tasks              = tasks;
+        _merges             = merges;
+        _agentRuntime       = agentRuntime;
+        _artifactLineage    = artifactLineage;
+        _executionCommands  = executionCommands;
+        _decisionLog        = decisionLog;
+        _decisionNodes      = decisionNodes;
+        _evidenceNodes      = evidenceNodes;
+        _hypothesisNodes    = hypothesisNodes;
+        _agentProfiles      = agentProfiles;
+        _steeringDecisions  = steeringDecisions;
+        _fileWorkspace      = fileWorkspace;
+        _workspaceProfiles  = workspaceProfiles;
+        _sessions           = sessions;
+        _nodeStore          = nodeStore;
+        _repositoryOps      = repositoryOps;
+        _workspaceOptions   = workspaceOptions;
+        _coMod              = coMod;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -41,6 +84,15 @@ public sealed class ProjectionManager : IProjectionManager
             ProjectionType.ExecutionSnapshot => await BuildExecutionSnapshotAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.AuthoritativeState => await BuildAuthoritativeStateAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.AgentWorkspace => await BuildAgentWorkspaceAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.GoalGraph => await BuildGoalGraphAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.EvidenceLedger => await BuildEvidenceLedgerAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.TrajectoryTimeline => await BuildTrajectoryTimelineAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.ModelDivergenceView => await BuildModelDivergenceViewAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.ReasoningCommitGraph => await BuildReasoningCommitGraphAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.DecisionContext => await BuildDecisionContextAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.CounterfactualComparison => await BuildCounterfactualComparisonAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.RunRetrospective => await BuildRunRetrospectiveAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.HypothesisComparison => await BuildHypothesisComparisonAsync(request, cancellationToken).ConfigureAwait(false),
             _ => throw new ArgumentOutOfRangeException(nameof(request), request.Type, "Unknown projection type.")
         };
 
@@ -52,6 +104,53 @@ public sealed class ProjectionManager : IProjectionManager
         ProjectionLevel targetLevel,
         CancellationToken cancellationToken = default) =>
         GetAsync(new ProjectionRequest(type, targetLevel), cancellationToken);
+
+    // Capped deliberately — this text goes straight into a real, paid LLM call per click, not free
+    // heuristics. ~30 text samples and a fixed overall character ceiling keep token usage bounded
+    // regardless of how much history has accumulated.
+    private const int MaxScanTextSamples = 30;
+    private const int MaxScanContextChars = 6_000;
+
+    public async Task<string> BuildInsightScanContextAsync(CancellationToken cancellationToken = default)
+    {
+        var retroJson = await BuildRunRetrospectiveAsync(
+            new ProjectionRequest(ProjectionType.RunRetrospective, ProjectionLevel.Normal), cancellationToken)
+            .ConfigureAwait(false);
+
+        var samples = new List<string>();
+
+        if (_nodeStore is not null)
+        {
+            var decisionRecords = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.DecisionV1, cancellationToken).ConfigureAwait(false);
+            samples.AddRange(decisionRecords
+                .Select(r => JsonSerializer.Deserialize<DecisionNode>(r.PayloadJson))
+                .Where(d => d is not null && d.Outcome == DecisionOutcome.Rejected && !string.IsNullOrWhiteSpace(d.Rationale))
+                .OrderByDescending(d => d!.DecidedAt)
+                .Take(MaxScanTextSamples)
+                .Select(d => $"[rejection rationale] {d!.Rationale}"));
+
+            var steeringRecords = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.SteeringDecisionV1, cancellationToken).ConfigureAwait(false);
+            samples.AddRange(steeringRecords
+                .Select(r => JsonSerializer.Deserialize<SteeringDecision>(r.PayloadJson))
+                .Where(s => s is not null && !string.IsNullOrWhiteSpace(s.InjectedConstraint))
+                .OrderByDescending(s => s!.SteeredAt)
+                .Take(MaxScanTextSamples)
+                .Select(s => $"[human steering note] {s!.InjectedConstraint}"));
+        }
+
+        var proposals = await _merges.ListAsync(sourceBranch: null, cancellationToken).ConfigureAwait(false);
+        samples.AddRange(proposals
+            .Where(p => p.Status == MergeProposalStatus.Rejected && !string.IsNullOrWhiteSpace(p.ReviewNotes))
+            .Take(MaxScanTextSamples)
+            .Select(p => $"[review note] {p.ReviewNotes}"));
+
+        var contextText = $"[Aggregate statistics]\n{retroJson}\n\n[Sampled history — up to {MaxScanTextSamples} entries per category]\n"
+            + string.Join("\n", samples);
+
+        return contextText.Length > MaxScanContextChars
+            ? contextText[..MaxScanContextChars] + "\n...[truncated]"
+            : contextText;
+    }
 
     private async Task<string> BuildWorkUnitAsync(ProjectionRequest request, CancellationToken ct)
     {
@@ -241,13 +340,132 @@ public sealed class ProjectionManager : IProjectionManager
         combined.AddRange(ancestorChain);
         combined.AddRange(enriched);
 
-        var inheritedConstraints = ancestorChain.Where(a => a.Type == ArtifactType.Constraint).ToList();
+        // Global constraints (promoted Knowledge Findings, no owning work unit) apply to every
+        // work unit regardless of lineage — folded in ahead of the ancestor-chain ones.
+        var globalConstraints = await _artifactLineage.GetGlobalConstraintsAsync(ct).ConfigureAwait(false);
+        var inheritedConstraints = globalConstraints
+            .Concat(ancestorChain.Where(a => a.Type == ArtifactType.Constraint))
+            .ToList();
+
+        WorkUnit? wu = null;
+        if (_executionCommands is not null || _workspaceProfiles is not null)
+            wu = await _workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+
+        // ── Slice 16l — attach latest execution result ───────────────────────
+        WorkspaceExecutionSummary? execution = null;
+        if (_executionCommands is not null && wu is not null)
+        {
+            try
+            {
+                var execResult = await _executionCommands.GetLatestAsync(wu.BranchId, ct).ConfigureAwait(false);
+                if (execResult is not null)
+                {
+                    var buildSystems = execResult.Builds
+                        .Select(b => b.BuildSystem)
+                        .Concat(execResult.Tests.Select(t => t.BuildSystem))
+                        .OfType<string>()
+                        .Distinct()
+                        .ToList();
+                    var testSummary = execResult.Tests.Count > 0
+                        ? $"{execResult.Tests.Sum(t => t.Passed)} passed / {execResult.Tests.Sum(t => t.Failed)} failed"
+                        : null;
+                    execution = new WorkspaceExecutionSummary(
+                        execResult.AllSucceeded,
+                        buildSystems,
+                        testSummary,
+                        execResult.ExecutedAt);
+                }
+            }
+            catch { /* best-effort — never fail a projection for execution data */ }
+        }
+
+        // ── Phase 9e — attach detected project roots, so agents know a repo can hold more
+        // than one project before deciding where a file belongs.
+        IReadOnlyList<ProjectRootSummary>? roots = null;
+        if (_workspaceProfiles is not null && wu is not null)
+        {
+            try
+            {
+                var profile = await _workspaceProfiles.GetOrDetectAsync(wu.BranchId, ct).ConfigureAwait(false);
+                roots = profile.Roots.Select(r => new ProjectRootSummary(r.RelativePath, r.Stack, r.RuleFileContent)).ToList();
+            }
+            catch { /* best-effort — never fail a projection for profile data */ }
+        }
+
+        // ── Phase 4.5 — recent op history for the work unit's file scope ────────
+        IReadOnlyList<FileOpHistory>? recentFileOps = null;
+        if (_repositoryOps is not null && wu is not null && wu.FileScope.Count > 0
+            && !string.IsNullOrEmpty(_workspaceOptions?.SeedRepositoryPath))
+        {
+            try
+            {
+                var repositoryId = Path.GetFullPath(_workspaceOptions.SeedRepositoryPath);
+                var ops = await _repositoryOps
+                    .GetRecentOpsForPathsAsync(repositoryId, wu.FileScope, limit: 5, ct)
+                    .ConfigureAwait(false);
+
+                if (ops.Count > 0)
+                {
+                    // Denormalize WorkUnitGoal per distinct WorkUnitId (one lookup each).
+                    var goalCache = new Dictionary<string, string?>(StringComparer.Ordinal);
+                    foreach (var op in ops.Where(o => o.WorkUnitId is not null))
+                    {
+                        if (!goalCache.ContainsKey(op.WorkUnitId!))
+                        {
+                            var ownerWu = await _workUnits.GetAsync(op.WorkUnitId!, ct).ConfigureAwait(false);
+                            goalCache[op.WorkUnitId!] = ownerWu?.Goal;
+                        }
+                    }
+
+                    recentFileOps = ops
+                        .GroupBy(o => o.Path)
+                        .Select(g => new FileOpHistory(
+                            g.Key,
+                            g.Select(o => new FileOpSummary(
+                                o.OperationId,
+                                o.WorkUnitId,
+                                o.WorkUnitId is not null ? goalCache.GetValueOrDefault(o.WorkUnitId) : null,
+                                o.AgentId,
+                                o.Kind.ToString(),
+                                o.Reason,
+                                o.Timestamp))
+                             .ToList()))
+                        .ToList();
+                }
+            }
+            catch { /* best-effort — never fail a projection for op history */ }
+        }
+
+        // ── Phase 11.5 — co-modification hints for the work unit's file scope ────
+        IReadOnlyList<CoModHint>? coModHints = null;
+        if (_coMod is not null && wu is not null && wu.FileScope.Count > 0
+            && !string.IsNullOrEmpty(_workspaceOptions?.SeedRepositoryPath))
+        {
+            try
+            {
+                var repositoryId = Path.GetFullPath(_workspaceOptions.SeedRepositoryPath);
+                // Expand glob patterns (e.g. "src/Auth/**") to snapshot-level exact paths by
+                // prefix-matching the scope against co-mod pattern paths. We pass the expanded
+                // scope prefixes rather than raw globs so GetForPathsAsync can do exact matching.
+                var scopePrefixes = ExpandGlobsToPathPrefixes(wu.FileScope);
+                var patterns = await _coMod
+                    .GetForPathsAsync(repositoryId, scopePrefixes, minConfidence: 0.6, ct)
+                    .ConfigureAwait(false);
+                if (patterns.Count > 0)
+                    coModHints = patterns.Select(p => new CoModHint(p.PathA, p.PathB, p.Confidence)).ToList();
+            }
+            catch { /* best-effort */ }
+        }
 
         var payload = new AgentWorkspaceProjectionPayload(
             request.AgentId,
             workUnitId,
             new ArtifactChain(combined),
-            inheritedConstraints);
+            inheritedConstraints,
+            execution,
+            roots,
+            recentFileOps,
+            coModHints);
 
         return Serialize(payload);
     }
@@ -278,7 +496,868 @@ public sealed class ProjectionManager : IProjectionManager
         return result;
     }
 
+    private async Task<string> BuildGoalGraphAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        var allWorkUnits = await _workUnits.ListAsync(request.BranchId, ct).ConfigureAwait(false);
+        var nodes = allWorkUnits.Select(wu => new GoalGraphNode(
+            GoalId: wu.WorkUnitId,
+            Goal: wu.Goal,
+            WorkUnitId: wu.WorkUnitId,
+            BranchId: wu.BranchId,
+            Status: wu.Status.ToString(),
+            ParentGoalId: wu.ParentWorkUnitId,
+            ChildGoalIds: allWorkUnits.Where(c => c.ParentWorkUnitId == wu.WorkUnitId).Select(c => c.WorkUnitId).ToList(),
+            Owner: wu.Owner,
+            AssignedAgent: wu.AssignedAgent,
+            ProposalCount: 0,
+            CreatedAt: wu.CreatedAt
+        )).ToList();
+
+        return Serialize(new GoalGraphProjectionPayload(nodes));
+    }
+
+    private async Task<string> BuildEvidenceLedgerAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new EvidenceLedgerProjectionPayload(string.Empty, []));
+
+        var entries = new List<EvidenceEntry>();
+
+        // Pull build/test evidence from workspace execution results.
+        if (_executionCommands is not null)
+        {
+            try
+            {
+                var wu = await _workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+                if (wu is not null)
+                {
+                    var execResult = await _executionCommands.GetLatestAsync(wu.BranchId, ct).ConfigureAwait(false);
+                    if (execResult is not null)
+                    {
+                        foreach (var build in execResult.Builds)
+                        {
+                            var summary = build.Success
+                                ? $"{build.BuildSystem ?? "build"}: passed (exit {build.ExitCode})"
+                                : $"{build.BuildSystem ?? "build"}: failed (exit {build.ExitCode})";
+                            entries.Add(new EvidenceEntry(
+                                $"ev-bld-{Guid.NewGuid():N}",
+                                EvidenceKind.Build,
+                                summary,
+                                null,
+                                execResult.ExecutedAt));
+                        }
+                        foreach (var test in execResult.Tests)
+                        {
+                            var summary = test.Success
+                                ? $"{test.BuildSystem ?? "test"}: passed ({test.Passed}/{test.TotalTests})"
+                                : $"{test.BuildSystem ?? "test"}: failed ({test.Passed}/{test.TotalTests})";
+                            entries.Add(new EvidenceEntry(
+                                $"ev-tst-{Guid.NewGuid():N}",
+                                EvidenceKind.Test,
+                                summary,
+                                null,
+                                execResult.ExecutedAt));
+                        }
+                    }
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        return Serialize(new EvidenceLedgerProjectionPayload(request.WorkUnitId, entries));
+    }
+
+    private async Task<string> BuildTrajectoryTimelineAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        var allWorkUnits = await _workUnits.ListAsync(request.BranchId, ct).ConfigureAwait(false);
+
+        var nodes = allWorkUnits.Select(wu =>
+        {
+            var phase = wu.CurrentStage switch
+            {
+                PipelineStage.Orchestrate => "GoalDefined",
+                PipelineStage.Plan        => "Decomposed",
+                PipelineStage.Execute     => "Executing",
+                PipelineStage.Review      => "Proposed",
+                PipelineStage.Merge       => wu.Status is WorkUnitStatus.Completed or WorkUnitStatus.Merged ? "Converged" : "Converging",
+                _ => wu.Status.ToString()
+            };
+
+            var children = allWorkUnits.Where(c => c.ParentWorkUnitId == wu.WorkUnitId).ToList();
+
+            return new
+            {
+                trajectoryId = wu.WorkUnitId,
+                workUnitId = wu.WorkUnitId,
+                branchId = wu.BranchId,
+                goal = wu.Goal,
+                phase,
+                parentTrajectoryId = wu.ParentWorkUnitId,
+                childTrajectoryIds = children.Select(c => c.WorkUnitId).ToList(),
+                agentId = wu.AssignedAgent,
+                startedAt = wu.CreatedAt,
+                completedAt = wu.Status is WorkUnitStatus.Completed or WorkUnitStatus.Merged ? (DateTimeOffset?)wu.UpdatedAt : null
+            };
+        }).ToList();
+
+        return Serialize(new { nodes, count = nodes.Count });
+    }
+
+    private async Task<string> BuildModelDivergenceViewAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new { error = "ModelDivergenceView requires workUnitId to find associated proposals." });
+
+        var wu = await _workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+        if (wu is null)
+            return Serialize(new { error = $"WorkUnit '{request.WorkUnitId}' not found." });
+
+        // Find proposals for this work unit, grouped by model
+        var allProposals = await _merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+        var relevantProposals = allProposals.Where(p => p.WorkUnitId == request.WorkUnitId).ToList();
+
+        var byModel = relevantProposals
+            .GroupBy(p => p.Model ?? p.AgentId ?? "unknown")
+            .ToList();
+
+        var models = byModel.Select(g => new
+        {
+            model = g.Key,
+            provider = g.First().Provider,
+            proposalIds = g.Select(p => p.ProposalId).ToList(),
+            proposalCount = g.Count(),
+            latestStatus = g.OrderByDescending(p => p.Status).First().Status.ToString()
+        }).ToList();
+
+        return Serialize(new
+        {
+            workUnitId = request.WorkUnitId,
+            goal = wu.Goal,
+            models,
+            comparedAt = DateTimeOffset.UtcNow
+        });
+    }
+
+    private async Task<string> BuildReasoningCommitGraphAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new ReasoningCommitGraphProjectionPayload(string.Empty, [], []));
+
+        var rootWu = await _workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+        if (rootWu is null)
+            return Serialize(new { error = $"WorkUnit '{request.WorkUnitId}' not found." });
+
+        // 1. Collect the entire work unit tree rooted at WorkUnitId.
+        var allWuIds = new HashSet<string> { request.WorkUnitId };
+        await CollectDescendantWorkUnitIdsAsync(request.WorkUnitId, allWuIds, ct).ConfigureAwait(false);
+
+        var nodes = new List<ReasoningCommitGraphNode>();
+        var edges = new List<ReasoningCommitGraphEdge>();
+
+        // Map workUnitId → last event's CommitId for chaining Refine/Decided edges.
+        var lastEventIdByWu = new Dictionary<string, string>();
+
+        // Map workUnitId → first event's CommitId for Fork edges from parent spawns to child roots.
+        var firstEventIdByWu = new Dictionary<string, string>();
+
+        // 2. Query orchestration events for every work unit in the tree.
+        foreach (var wuId in allWuIds)
+        {
+            if (_decisionLog is null) continue;
+            var events = await _decisionLog.GetEventsAsync(wuId, ct).ConfigureAwait(false);
+            var ordered = events.OrderBy(e => e.OccurredAt).ToList();
+
+            string? prevEventId = null;
+            foreach (var evt in ordered)
+            {
+                var node = new ReasoningCommitGraphNode(
+                    CommitId: evt.EventId,
+                    WorkUnitId: evt.WorkUnitId,
+                    AgentId: evt.OrchestratorAgentId,
+                    Stage: evt.InputStage.ToString(),
+                    Action: evt.Action.ToString(),
+                    Reasoning: evt.Reason,
+                    AgentModel: null,
+                    AgentProvider: null,
+                    OccurredAt: evt.OccurredAt);
+                nodes.Add(node);
+
+                // Track first event per work unit for Fork edge resolution.
+                if (!firstEventIdByWu.ContainsKey(wuId))
+                    firstEventIdByWu[wuId] = evt.EventId;
+
+                // Refine edge: sequential events within the same work unit.
+                if (prevEventId is not null)
+                    edges.Add(new ReasoningCommitGraphEdge(prevEventId, evt.EventId, "Refine"));
+
+                prevEventId = evt.EventId;
+
+                // Fork edges: connect this spawn event to the first event of each spawned child.
+                // SpawnedIds contains work unit IDs of children created by SpawnPlanner/SpawnWorker/Enqueue.
+                foreach (var spawnedId in evt.SpawnedIds)
+                {
+                    if (allWuIds.Contains(spawnedId))
+                    {
+                        // The child's first event may not have been processed yet (if ordered by
+                        // creation time but child created after parent). Record a deferred edge
+                        // that will be resolved after all events are collected.
+                        edges.Add(new ReasoningCommitGraphEdge(evt.EventId, spawnedId, "Fork"));
+                    }
+                }
+            }
+
+            if (prevEventId is not null)
+                lastEventIdByWu[wuId] = prevEventId;
+        }
+
+        // 3. Query decision nodes for every work unit — add as decision commit nodes.
+        if (_decisionNodes is not null)
+        {
+            foreach (var wuId in allWuIds)
+            {
+                var decisions = await _decisionNodes.ListByWorkUnitAsync(wuId, ct).ConfigureAwait(false);
+                foreach (var dec in decisions)
+                {
+                    var decisionNode = new ReasoningCommitGraphNode(
+                        CommitId: dec.DecisionId,
+                        WorkUnitId: dec.WorkUnitId,
+                        AgentId: dec.ReviewerAgentId,
+                        Stage: "Review",
+                        Action: dec.Outcome.ToString(),
+                        Reasoning: dec.Rationale,
+                        AgentModel: dec.ReviewerModel,
+                        AgentProvider: dec.ReviewerProvider,
+                        OccurredAt: dec.DecidedAt);
+                    nodes.Add(decisionNode);
+
+                    // Decided edge: last orchestration event → this decision.
+                    if (lastEventIdByWu.TryGetValue(wuId, out var lastEventId))
+                        edges.Add(new ReasoningCommitGraphEdge(lastEventId, dec.DecisionId, "Decided"));
+                }
+            }
+        }
+
+        // 4. Query evidence nodes and add EvidenceAttached edges to their associated decisions.
+        if (_evidenceNodes is not null)
+        {
+            foreach (var wuId in allWuIds)
+            {
+                var evidenceList = await _evidenceNodes.ListByWorkUnitAsync(wuId, ct).ConfigureAwait(false);
+                foreach (var ev in evidenceList)
+                {
+                    if (ev.ProposalId is not null)
+                    {
+                        // Find the decision node that references this proposal.
+                        var matchingDecision = nodes.FirstOrDefault(n =>
+                            n.Stage == "Review" &&
+                            n.WorkUnitId == wuId);
+                        if (matchingDecision is not null)
+                            edges.Add(new ReasoningCommitGraphEdge(matchingDecision.CommitId, ev.EvidenceId, "EvidenceAttached"));
+                    }
+                }
+            }
+        }
+
+        return Serialize(new ReasoningCommitGraphProjectionPayload(request.WorkUnitId, nodes, edges));
+    }
+
+    // ── Slice 24a — DecisionContext projection ─────────────────────────────────────────
+
+    private async Task<string> BuildDecisionContextAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new { error = "DecisionContext projection requires workUnitId." });
+
+        var wu = await _workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+        if (wu is null)
+            return Serialize(new { error = $"WorkUnit '{request.WorkUnitId}' not found." });
+
+        // 1. Plan — try to read plan.json from the work unit's branch.
+        var plan = new List<DecisionContextPlanEntry>();
+        if (_fileWorkspace is not null)
+        {
+            try
+            {
+                var planJson = await _fileWorkspace.ReadAsync(wu.BranchId, "plan.json", ct).ConfigureAwait(false);
+                if (planJson is not null)
+                {
+                    var planDoc = JsonSerializer.Deserialize<PlanDocument>(planJson, JsonOptions);
+                    if (planDoc?.Slices is not null)
+                    {
+                        plan = planDoc.Slices.Select(s => new DecisionContextPlanEntry(
+                            s.SliceId,
+                            s.Goal,
+                            s.FileScope,
+                            s.Steps)).ToList();
+                    }
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        // 2. Assumptions — collect from orchestration events for this work unit.
+        var assumptions = new List<string>();
+        if (_decisionLog is not null)
+        {
+            try
+            {
+                var events = await _decisionLog.GetEventsAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+                foreach (var evt in events.OrderBy(e => e.OccurredAt))
+                {
+                    if (!string.IsNullOrWhiteSpace(evt.Reason))
+                    {
+                        var reason = evt.Reason.Trim();
+                        if (!assumptions.Contains(reason))
+                            assumptions.Add(reason);
+                    }
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        // 3. Constraints — combine inherited constraint artifacts and steering decisions.
+        var constraints = new List<string>();
+        try
+        {
+            var chain = await _artifactLineage.GetChainAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+            foreach (var artifact in chain)
+            {
+                if (artifact.Type == ArtifactType.Constraint && !string.IsNullOrWhiteSpace(artifact.Title))
+                {
+                    if (!constraints.Contains(artifact.Title))
+                        constraints.Add(artifact.Title);
+                }
+            }
+        }
+        catch { /* best-effort */ }
+
+        string? steeredFromDecisionId = null;
+        if (_steeringDecisions is not null)
+        {
+            try
+            {
+                var steeringRecords = await _steeringDecisions.ListByWorkUnitAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+                foreach (var sd in steeringRecords)
+                {
+                    if (!string.IsNullOrWhiteSpace(sd.InjectedConstraint) && !constraints.Contains(sd.InjectedConstraint))
+                        constraints.Add(sd.InjectedConstraint);
+                    if (sd.NewChildWorkUnitId == request.WorkUnitId)
+                        steeredFromDecisionId = sd.SteeringDecisionId;
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        // 4. Evidence — pull build/test results.
+        var evidence = new List<DecisionContextEvidenceEntry>();
+        DecisionContextExecutionSummary? executionSummary = null;
+        if (_executionCommands is not null)
+        {
+            try
+            {
+                var execResult = await _executionCommands.GetLatestAsync(wu.BranchId, ct).ConfigureAwait(false);
+                if (execResult is not null)
+                {
+                    foreach (var build in execResult.Builds)
+                    {
+                        evidence.Add(new DecisionContextEvidenceEntry(
+                            "Build",
+                            build.Success
+                                ? $"{build.BuildSystem ?? "build"}: passed (exit {build.ExitCode})"
+                                : $"{build.BuildSystem ?? "build"}: failed (exit {build.ExitCode})",
+                            build.Success));
+                    }
+                    foreach (var test in execResult.Tests)
+                    {
+                        evidence.Add(new DecisionContextEvidenceEntry(
+                            "Test",
+                            test.Success
+                                ? $"{test.BuildSystem ?? "test"}: {test.Passed}/{test.TotalTests} passed"
+                                : $"{test.BuildSystem ?? "test"}: {test.Failed} failed / {test.TotalTests} total",
+                            test.Success));
+                    }
+
+                    var buildSystems = execResult.Builds
+                        .Select(b => b.BuildSystem)
+                        .Concat(execResult.Tests.Select(t => t.BuildSystem))
+                        .OfType<string>()
+                        .Distinct()
+                        .ToList();
+                    var testSummary = execResult.Tests.Count > 0
+                        ? $"{execResult.Tests.Sum(t => t.Passed)} passed / {execResult.Tests.Sum(t => t.Failed)} failed"
+                        : null;
+                    executionSummary = new DecisionContextExecutionSummary(
+                        execResult.AllSucceeded,
+                        buildSystems,
+                        testSummary,
+                        execResult.ExecutedAt);
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        // 5. Allowed tools — resolve from the agent's profile.
+        var allowedTools = new List<string>();
+        string? agentModel = null;
+        string? agentProvider = null;
+        if (_agentProfiles is not null)
+        {
+            try
+            {
+                var ownerProfile = wu.Owner;
+                var profile = await _agentProfiles.GetAsync(ownerProfile, ct).ConfigureAwait(false);
+                if (profile is not null)
+                {
+                    allowedTools = profile.AllowedTools.ToList();
+                }
+            }
+            catch { /* best-effort */ }
+        }
+
+        var payload = new DecisionContextProjectionPayload(
+            wu.WorkUnitId,
+            wu.Goal,
+            plan,
+            assumptions,
+            constraints,
+            evidence,
+            allowedTools,
+            executionSummary,
+            agentModel,
+            agentProvider,
+            steeredFromDecisionId);
+
+        return Serialize(payload);
+    }
+
+    // ── Slice 25b — CounterfactualComparison projection ──────────────────────────────
+
+    private async Task<string> BuildCounterfactualComparisonAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new { error = "CounterfactualComparison requires workUnitId to identify the original work unit." });
+
+        var originalWu = await _workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+        if (originalWu is null)
+            return Serialize(new { error = $"Original work unit '{request.WorkUnitId}' not found." });
+
+        // Find counterfactual work units — siblings with different profiles that are forked from proposals
+        var counterfactuals = new List<WorkUnit>();
+        if (originalWu.ParentWorkUnitId is not null)
+        {
+            var siblings = await _workUnits.GetChildrenAsync(originalWu.ParentWorkUnitId, ct).ConfigureAwait(false);
+            counterfactuals = siblings
+                .Where(w => w.WorkUnitId != originalWu.WorkUnitId && w.ForkType == HypothesisForkType.Model)
+                .ToList();
+        }
+
+        var counterfactualWu = counterfactuals.FirstOrDefault();
+        if (counterfactualWu is null)
+        {
+            // No counterfactual found — return empty comparison
+            return Serialize(new CounterfactualComparisonProjectionPayload(
+                request.WorkUnitId,
+                string.Empty,
+                string.Empty,
+                [],
+                [],
+                null, null, null, null,
+                "No counterfactual available yet.",
+                DateTimeOffset.UtcNow));
+        }
+
+        var allProposals = await _merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+
+        // Collect proposals for original work unit
+        var originalProposals = allProposals
+            .Where(p => p.WorkUnitId == originalWu.WorkUnitId)
+            .Select(p => new CounterfactualComparisonProposal(
+                p.ProposalId, p.Goal ?? originalWu.Goal, p.Status.ToString(),
+                p.Model, p.Provider, p.Confidence,
+                p.FilesTouched, p.ChangeDescription))
+            .ToList();
+
+        // Collect proposals for counterfactual work unit
+        var counterfactualProposals = allProposals
+            .Where(p => p.WorkUnitId == counterfactualWu.WorkUnitId)
+            .Select(p => new CounterfactualComparisonProposal(
+                p.ProposalId, p.Goal ?? counterfactualWu.Goal, p.Status.ToString(),
+                p.Model, p.Provider, p.Confidence,
+                p.FilesTouched, p.ChangeDescription))
+            .ToList();
+
+        // Determine original proposal ID from original work unit's proposals
+        var originalProposalId = originalProposals.FirstOrDefault()?.ProposalId ?? string.Empty;
+
+        // Determine model/provider from the proposals
+        var origModel = originalProposals.FirstOrDefault()?.Model;
+        var origProvider = originalProposals.FirstOrDefault()?.Provider;
+        var cfModel = counterfactualProposals.FirstOrDefault()?.Model;
+        var cfProvider = counterfactualProposals.FirstOrDefault()?.Provider;
+
+        // Simple "Which was better?" heuristic — compare confidence scores
+        string? whichWasBetter = null;
+        var origMaxConf = originalProposals.Max(p => p.Confidence);
+        var cfMaxConf = counterfactualProposals.Max(p => p.Confidence);
+        if (origMaxConf.HasValue && cfMaxConf.HasValue)
+        {
+            if (origMaxConf > cfMaxConf)
+                whichWasBetter = "Original";
+            else if (cfMaxConf > origMaxConf)
+                whichWasBetter = "Counterfactual";
+            else
+                whichWasBetter = "Equal";
+        }
+
+        var payload = new CounterfactualComparisonProjectionPayload(
+            originalWu.WorkUnitId,
+            counterfactualWu.WorkUnitId,
+            originalProposalId,
+            originalProposals,
+            counterfactualProposals,
+            origModel, origProvider,
+            cfModel, cfProvider,
+            whichWasBetter,
+            DateTimeOffset.UtcNow);
+
+        return Serialize(payload);
+    }
+
+    // ── HypothesisComparison projection — deterministic evidence aggregation across N competing
+    // experiment forks. Pure read: recommends a winner, never writes convergence state itself.
+    private async Task<string> BuildHypothesisComparisonAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        if (request.WorkUnitId is null)
+            return Serialize(new { error = "HypothesisComparison requires workUnitId to identify the experiment parent." });
+
+        var siblings = await _workUnits.GetChildrenAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+        if (siblings.Count == 0)
+            return Serialize(new { error = $"No fork children found under parent '{request.WorkUnitId}'." });
+
+        var allProposals = await _merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+        var hypotheses = _hypothesisNodes is not null
+            ? await _hypothesisNodes.ListByParentWorkUnitIdAsync(request.WorkUnitId, ct).ConfigureAwait(false)
+            : [];
+
+        var rows = new List<HypothesisComparisonSibling>();
+        foreach (var sibling in siblings)
+        {
+            var hypothesis = hypotheses.FirstOrDefault(h => h.WorkUnitId == sibling.WorkUnitId);
+            var latestProposal = allProposals.Where(p => p.WorkUnitId == sibling.WorkUnitId).LastOrDefault();
+            var evidence = _evidenceNodes is not null
+                ? await _evidenceNodes.ListByWorkUnitAsync(sibling.WorkUnitId, ct).ConfigureAwait(false)
+                : [];
+
+            rows.Add(new HypothesisComparisonSibling(
+                WorkUnitId: sibling.WorkUnitId,
+                HypothesisId: hypothesis?.HypothesisId,
+                ForkType: (sibling.ForkType ?? hypothesis?.ForkType)?.ToString() ?? "Unknown",
+                HypothesisStatus: (hypothesis?.Status ?? HypothesisStatus.Active).ToString(),
+                LatestProposalId: latestProposal?.ProposalId,
+                ProposalStatus: latestProposal?.Status.ToString(),
+                Confidence: latestProposal?.Confidence,
+                EvidenceCount: evidence.Count,
+                EvidenceSummaries: evidence.Select(e => e.Summary).ToList(),
+                Score: ScoreSibling(latestProposal, evidence)));
+        }
+
+        var ranked = rows.OrderByDescending(r => r.Score).ToList();
+        var recommended = ranked.Count > 0 && ranked[0].Score > 0 ? ranked[0].WorkUnitId : null;
+
+        return Serialize(new HypothesisComparisonProjectionPayload(
+            request.WorkUnitId, rows, recommended, DateTimeOffset.UtcNow));
+    }
+
+    // Deterministic, auditable scoring — no LLM call. +1 per evidence entry whose summary reads as
+    // an approval, -1 per rejection-flavored entry, +confidence as a tiebreaker weight, -1 if the
+    // latest proposal itself is Rejected/Superseded outright.
+    private static double ScoreSibling(MergeProposal? latestProposal, IReadOnlyList<EvidenceNode> evidence)
+    {
+        double score = 0;
+        foreach (var e in evidence)
+        {
+            if (e.Summary.Contains("approved", StringComparison.OrdinalIgnoreCase) ||
+                e.Summary.Contains("approve", StringComparison.OrdinalIgnoreCase))
+                score += 1;
+            else if (e.Summary.Contains("rejected", StringComparison.OrdinalIgnoreCase))
+                score -= 1;
+        }
+
+        score += latestProposal?.Confidence ?? 0;
+
+        if (latestProposal?.Status is MergeProposalStatus.Rejected or MergeProposalStatus.Superseded)
+            score -= 1;
+
+        return score;
+    }
+
+    // Manual-only analytics dashboard for the Insights tab — computed fresh from the full DAG
+    // history on every request, never on a schedule. Terminal WorkUnitStatus values (Merged,
+    // Failed, DeadLettered, Cancelled) are treated as "decided"; everything else (Created, Active,
+    // Waiting, Queued, Executing, Proposed, Reviewing, Retrying) is still in flight and excluded
+    // from the success-rate denominator.
+    private async Task<string> BuildRunRetrospectiveAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        var allWorkUnits = await _workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+        var allProposals = await _merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+        var allSessions = _sessions is not null
+            ? await _sessions.ListAsync(ct).ConfigureAwait(false)
+            : [];
+
+        var workUnits = allWorkUnits
+            .Where(w => InRange(w.CreatedAt, request.Since, request.Until))
+            .ToList();
+        var workUnitsById = workUnits.ToDictionary(w => w.WorkUnitId);
+
+        // A proposal has no CreatedAt of its own — date-range filtering goes through its work unit.
+        // Unfiltered (the common case) keeps every proposal, including ones with no WorkUnitId.
+        var proposals = (request.Since is null && request.Until is null)
+            ? allProposals
+            : allProposals.Where(p => p.WorkUnitId is not null && workUnitsById.ContainsKey(p.WorkUnitId)).ToList();
+
+        var sessions = allSessions
+            .Where(s => InRange(s.StartedAt, request.Since, request.Until))
+            .ToList();
+
+        var workUnitsByStatus = workUnits
+            .GroupBy(w => w.Status.ToString())
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var mergedCount = workUnitsByStatus.GetValueOrDefault(WorkUnitStatus.Merged.ToString());
+        var failedCount = workUnitsByStatus.GetValueOrDefault(WorkUnitStatus.Failed.ToString());
+        var deadLetteredCount = workUnitsByStatus.GetValueOrDefault(WorkUnitStatus.DeadLettered.ToString());
+        var cancelledCount = workUnitsByStatus.GetValueOrDefault(WorkUnitStatus.Cancelled.ToString());
+        var decidedCount = mergedCount + failedCount + deadLetteredCount + cancelledCount;
+        var overallSuccessRate = decidedCount == 0 ? 0d : (double)mergedCount / decidedCount;
+
+        var sessionsByStatus = sessions
+            .GroupBy(s => s.Status.ToString())
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var modelPerformance = proposals
+            .Where(p => p.Model is not null)
+            .GroupBy(p => (p.Model!, p.Provider))
+            .Select(g =>
+            {
+                var merged = g.Count(p => p.Status == MergeProposalStatus.Merged);
+                var rejected = g.Count(p => p.Status == MergeProposalStatus.Rejected);
+                var decided = merged + rejected;
+                var confidences = g.Where(p => p.Confidence.HasValue).Select(p => p.Confidence!.Value).ToList();
+                return new ModelPerformanceStat(
+                    g.Key.Item1, g.Key.Item2,
+                    g.Count(), merged, rejected,
+                    decided == 0 ? 0d : (double)merged / decided,
+                    confidences.Count == 0 ? null : confidences.Average());
+            })
+            .OrderByDescending(s => s.ProposalCount)
+            .ToList();
+
+        var forkWinRates = workUnits
+            .Where(w => w.ForkType is not null)
+            .GroupBy(w => w.ForkType!.Value)
+            .Select(g =>
+            {
+                var wins = 0;
+                var losses = 0;
+                var pending = 0;
+                foreach (var wu in g)
+                {
+                    var wuProposals = proposals.Where(p => p.WorkUnitId == wu.WorkUnitId).ToList();
+                    if (wuProposals.Any(p => p.Status == MergeProposalStatus.Merged)) { wins++; }
+                    else if (wuProposals.Any(p => p.Status is MergeProposalStatus.Rejected or MergeProposalStatus.Superseded)) { losses++; }
+                    else { pending++; }
+                }
+                var decided = wins + losses;
+                return new ForkWinRateStat(
+                    g.Key.ToString(), g.Count(), wins, losses, pending,
+                    decided == 0 ? 0d : (double)wins / decided);
+            })
+            .OrderByDescending(s => s.TotalForks)
+            .ToList();
+
+        var failureCauses = new List<FailureCauseStat>
+        {
+            new(
+                "ExecutionFailure",
+                workUnits.Sum(w => w.ExecutionInfo?.FailureAttemptCount ?? 0),
+                workUnits.Count(w => (w.ExecutionInfo?.FailureAttemptCount ?? 0) > 0)),
+            new(
+                "AutomatedReviewRejection",
+                workUnits.Sum(w => w.ExecutionInfo?.AutomatedReviewRejectionCount ?? 0),
+                workUnits.Count(w => (w.ExecutionInfo?.AutomatedReviewRejectionCount ?? 0) > 0)),
+            new(
+                "HumanReviewRejection",
+                workUnits.Sum(w => w.ExecutionInfo?.HumanReviewRejectionCount ?? 0),
+                workUnits.Count(w => (w.ExecutionInfo?.HumanReviewRejectionCount ?? 0) > 0)),
+        }.OrderByDescending(f => f.TotalCount).ToList();
+
+        var reviewOutcomes = new List<ReviewOutcomeStat>();
+        if (_nodeStore is not null)
+        {
+            var decisionRecords = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.DecisionV1, ct).ConfigureAwait(false);
+            var decisions = decisionRecords
+                .Select(r => JsonSerializer.Deserialize<DecisionNode>(r.PayloadJson))
+                .Where(d => d is not null && InRange(d.DecidedAt, request.Since, request.Until))
+                .Select(d => d!)
+                .ToList();
+            reviewOutcomes = decisions
+                .GroupBy(d => d.Outcome.ToString())
+                .Select(g =>
+                {
+                    var confidences = g.Where(d => d.Confidence.HasValue).Select(d => d.Confidence!.Value).ToList();
+                    return new ReviewOutcomeStat(g.Key, g.Count(), confidences.Count == 0 ? null : confidences.Average());
+                })
+                .OrderByDescending(s => s.Count)
+                .ToList();
+        }
+
+        // Model performance by pipeline stage — WorkUnit.Owner is the orchestrating AgentProfile's
+        // id when created via a strategy/template (e.g. ArtifactExplorerPanel's "owner: template.
+        // orchestrator"); rows whose Owner doesn't resolve to a known profile (e.g. "user") are
+        // simply excluded rather than mislabeled.
+        var modelPerformanceByStage = new List<ModelStagePerformanceStat>();
+        if (_agentProfiles is not null)
+        {
+            var ownerIds = proposals
+                .Where(p => p.Model is not null && p.WorkUnitId is not null && workUnitsById.ContainsKey(p.WorkUnitId))
+                .Select(p => workUnitsById[p.WorkUnitId!].Owner)
+                .Distinct()
+                .ToList();
+            var profilesByOwner = new Dictionary<string, AgentProfile>();
+            foreach (var ownerId in ownerIds)
+            {
+                var profile = await _agentProfiles.GetAsync(ownerId, ct).ConfigureAwait(false);
+                if (profile is not null) { profilesByOwner[ownerId] = profile; }
+            }
+
+            var stageRows = proposals
+                .Where(p => p.Model is not null && p.WorkUnitId is not null && workUnitsById.ContainsKey(p.WorkUnitId))
+                .Select(p => new { Proposal = p, Owner = workUnitsById[p.WorkUnitId!].Owner })
+                .Where(x => profilesByOwner.ContainsKey(x.Owner))
+                .Select(x => new { x.Proposal, Stage = profilesByOwner[x.Owner].Stage.ToString() })
+                .ToList();
+
+            modelPerformanceByStage = stageRows
+                .GroupBy(x => (x.Proposal.Model!, x.Stage))
+                .Select(g =>
+                {
+                    var merged = g.Count(x => x.Proposal.Status == MergeProposalStatus.Merged);
+                    var rejected = g.Count(x => x.Proposal.Status == MergeProposalStatus.Rejected);
+                    var decided = merged + rejected;
+                    return new ModelStagePerformanceStat(
+                        g.Key.Item1, g.Key.Item2, g.Count(), merged, rejected,
+                        decided == 0 ? 0d : (double)merged / decided);
+                })
+                .OrderByDescending(s => s.ProposalCount)
+                .ToList();
+        }
+
+        // Sub-bucket Architecture/Library/Product forks by the structured constraint metadata key
+        // ExperimentService stores per fork type (architectureConstraint/libraryConstraint/
+        // productStrategy) — exact grouping, not free-text keyword matching.
+        var forkConstraintWinRates = workUnits
+            .Where(w => w.ForkType is HypothesisForkType.Architecture or HypothesisForkType.Library or HypothesisForkType.Product)
+            .Select(w => new { WorkUnit = w, Constraint = w.Metadata?.GetValueOrDefault(ForkConstraintMetadataKey(w.ForkType!.Value)) })
+            .Where(x => !string.IsNullOrWhiteSpace(x.Constraint))
+            .GroupBy(x => (x.WorkUnit.ForkType!.Value.ToString(), x.Constraint!))
+            .Select(g =>
+            {
+                var wins = 0;
+                var losses = 0;
+                var pending = 0;
+                foreach (var x in g)
+                {
+                    var wuProposals = proposals.Where(p => p.WorkUnitId == x.WorkUnit.WorkUnitId).ToList();
+                    if (wuProposals.Any(p => p.Status == MergeProposalStatus.Merged)) { wins++; }
+                    else if (wuProposals.Any(p => p.Status is MergeProposalStatus.Rejected or MergeProposalStatus.Superseded)) { losses++; }
+                    else { pending++; }
+                }
+                var decided = wins + losses;
+                return new ForkConstraintWinRateStat(
+                    g.Key.Item1, g.Key.Item2, g.Count(), wins, losses, pending,
+                    decided == 0 ? 0d : (double)wins / decided);
+            })
+            .OrderByDescending(s => s.TotalForks)
+            .ToList();
+
+        const int minSampleSize = 5;
+        var averageReworkCycles = workUnits.Count == 0
+            ? 0d
+            : workUnits.Average(w => (double)(w.ExecutionInfo?.FailureAttemptCount ?? 0));
+        var topFailureCause = failureCauses.FirstOrDefault(f => f.TotalCount > 0);
+        var mostSuccessfulModel = modelPerformance
+            .Where(s => s.ProposalCount >= minSampleSize)
+            .OrderByDescending(s => s.AcceptanceRate)
+            .FirstOrDefault();
+        var mostSuccessfulStrategy = forkWinRates
+            .Where(s => s.Wins + s.Losses >= minSampleSize)
+            .OrderByDescending(s => s.WinRate)
+            .FirstOrDefault();
+
+        var payload = new RunRetrospectiveProjectionPayload(
+            request.Since,
+            request.Until,
+            sessions.Count,
+            sessionsByStatus,
+            workUnits.Count,
+            workUnitsByStatus,
+            overallSuccessRate,
+            averageReworkCycles,
+            topFailureCause,
+            mostSuccessfulModel,
+            mostSuccessfulStrategy,
+            modelPerformance,
+            modelPerformanceByStage,
+            forkWinRates,
+            forkConstraintWinRates,
+            failureCauses,
+            reviewOutcomes,
+            DateTimeOffset.UtcNow);
+
+        return Serialize(payload);
+    }
+
+    private static bool InRange(DateTimeOffset value, DateTimeOffset? since, DateTimeOffset? until) =>
+        (since is null || value >= since) && (until is null || value <= until);
+
+    private static string ForkConstraintMetadataKey(HypothesisForkType forkType) => forkType switch
+    {
+        HypothesisForkType.Architecture => "architectureConstraint",
+        HypothesisForkType.Library => "libraryConstraint",
+        HypothesisForkType.Product => "productStrategy",
+        _ => "experimentConstraint",
+    };
+
+    /// <summary>
+    /// Recursively collects all descendant work unit IDs starting from <paramref name="parentId"/>.
+    /// Guards against cycles with the <paramref name="collected"/> set.
+    /// </summary>
+    private async Task CollectDescendantWorkUnitIdsAsync(
+        string parentId, HashSet<string> collected, CancellationToken ct)
+    {
+        var children = await _workUnits.GetChildrenAsync(parentId, ct).ConfigureAwait(false);
+        foreach (var child in children)
+        {
+            if (collected.Add(child.WorkUnitId))
+                await CollectDescendantWorkUnitIdsAsync(child.WorkUnitId, collected, ct).ConfigureAwait(false);
+        }
+    }
+
     private static string Serialize(object data) => JsonSerializer.Serialize(data, JsonOptions);
+
+    // Converts FileScope glob patterns to path prefixes for co-mod hint lookup.
+    // "src/Auth/**" and "src/Auth/*.cs" → "src/Auth"; "src/Auth/User.cs" → "src/Auth/User.cs".
+    private static IReadOnlyList<string> ExpandGlobsToPathPrefixes(IReadOnlyList<string> fileScope)
+    {
+        var result = new List<string>(fileScope.Count);
+        foreach (var pattern in fileScope)
+        {
+            var prefix = pattern.TrimEnd('/').TrimEnd('*').TrimEnd('/');
+            if (prefix.Length > 0)
+                result.Add(prefix);
+        }
+        return result;
+    }
 }
 
 public static class ServiceCollectionExtensions

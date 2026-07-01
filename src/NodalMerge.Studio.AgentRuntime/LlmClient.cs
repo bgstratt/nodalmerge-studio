@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging;
 
 namespace NodalMerge.Studio.AgentRuntime;
 
@@ -11,8 +12,28 @@ internal sealed record NmToolUse(string Id, string Name, JsonElement Input) : Nm
 internal sealed record NmToolResult(string ToolUseId, string Result) : NmContent("tool_result");
 internal sealed record NmMessage(string Role, IReadOnlyList<NmContent> Content);
 
-internal sealed class LlmClient(HttpClient http)
+// Thrown when a provider's response (or a tool call's argument JSON inside it) fails to parse —
+// e.g. DeepSeek occasionally emits broken JSON or stray characters in tool-call arguments. Caught
+// by SendAsync's retry loop, which carries RawContent into the reask message so the model can see
+// what it actually sent.
+internal sealed class MalformedLlmResponseException(string rawContent, string reason) : Exception(reason)
 {
+    public string RawContent { get; } = rawContent;
+    public string Reason { get; } = reason;
+}
+
+internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = null)
+{
+    // Appended to every outgoing system prompt — DeepSeek (OpenAI-compatible path) is the main
+    // offender for mixing stray/non-JSON content into tool-call arguments; Anthropic rarely needs
+    // this but it's harmless there too.
+    private const string OutputFormatGuardrail =
+        "\n\nOutput formatting: respond with plain text or one or more tool calls, never both " +
+        "unless asked. Tool call arguments must be syntactically valid JSON with no markdown " +
+        "fences, commentary, or stray/non-JSON characters mixed in.";
+
+    private const int MaxRetries = 2;
+
     private static readonly JsonSerializerOptions SerOpts = new()
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
@@ -23,7 +44,7 @@ internal sealed class LlmClient(HttpClient http)
         PropertyNameCaseInsensitive = true
     };
 
-    public Task<LlmResponse> SendAsync(
+    public async Task<LlmResponse> SendAsync(
         string provider,
         string model,
         string baseUrl,
@@ -33,9 +54,34 @@ internal sealed class LlmClient(HttpClient http)
         string systemPrompt,
         CancellationToken ct = default)
     {
-        return provider.Equals("openai", StringComparison.OrdinalIgnoreCase)
-            ? SendOpenAiAsync(model, baseUrl, apiKey, messages, tools, systemPrompt, ct)
-            : SendAnthropicAsync(model, baseUrl, apiKey, messages, tools, systemPrompt, ct);
+        var attemptMessages = messages;
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return provider.Equals("openai", StringComparison.OrdinalIgnoreCase)
+                    ? await SendOpenAiAsync(model, baseUrl, apiKey, attemptMessages, tools, systemPrompt, ct).ConfigureAwait(false)
+                    : await SendAnthropicAsync(model, baseUrl, apiKey, attemptMessages, tools, systemPrompt, ct).ConfigureAwait(false);
+            }
+            catch (MalformedLlmResponseException ex) when (attempt < MaxRetries)
+            {
+                logger?.LogWarning(
+                    "LLM response malformed (attempt {Attempt}/{Max}): {Reason}",
+                    attempt + 1, MaxRetries + 1, ex.Reason);
+                attemptMessages = [.. messages, BuildReaskMessage(ex.Reason, ex.RawContent)];
+            }
+        }
+    }
+
+    private static NmMessage BuildReaskMessage(string reason, string rawContent)
+    {
+        var snippet = rawContent.Length > 300 ? rawContent[..300] + "…" : rawContent;
+        return new NmMessage("user", [new NmText(
+            $"Your previous response could not be processed: {reason}\n\n" +
+            $"What you sent (truncated): {snippet}\n\n" +
+            "Resend your last turn now. Output must be either plain text, or one or more " +
+            "well-formed tool calls with syntactically valid JSON arguments — no markdown code " +
+            "fences, commentary, or stray/non-JSON characters mixed into the tool arguments.")]);
     }
 
     // ── Anthropic ─────────────────────────────────────────────────────────────
@@ -51,7 +97,7 @@ internal sealed class LlmClient(HttpClient http)
         {
             ["model"]     = model,
             ["max_tokens"] = 8192,
-            ["system"]    = systemPrompt,
+            ["system"]    = systemPrompt + OutputFormatGuardrail,
             ["tools"]     = tools.Select(t => (object)new
             {
                 name         = t.Name,
@@ -77,12 +123,22 @@ internal sealed class LlmClient(HttpClient http)
         }
 
         var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        var raw = JsonSerializer.Deserialize<AnthropicResponse>(json, DeserOpts)
-                  ?? throw new InvalidOperationException("LLM returned null response.");
+        AnthropicResponse raw;
+        try
+        {
+            raw = JsonSerializer.Deserialize<AnthropicResponse>(json, DeserOpts)
+                  ?? throw new MalformedLlmResponseException(json, "Anthropic returned a null response body.");
+        }
+        catch (JsonException ex)
+        {
+            throw new MalformedLlmResponseException(json, $"Response was not valid JSON: {ex.Message}");
+        }
 
         return new LlmResponse(
             raw.Content.Select(ParseAnthropicBlock).OfType<NmContent>().ToList(),
-            raw.StopReason);
+            raw.StopReason,
+            raw.Usage?.InputTokens,
+            raw.Usage?.OutputTokens);
     }
 
     // Single-text messages serialized as string shorthand — keeps ScriptedLlmHandler working
@@ -121,7 +177,7 @@ internal sealed class LlmClient(HttpClient http)
         string systemPrompt,
         CancellationToken ct)
     {
-        var allMessages = new List<object> { new { role = "system", content = systemPrompt } };
+        var allMessages = new List<object> { new { role = "system", content = systemPrompt + OutputFormatGuardrail } };
         foreach (var msg in messages)
             allMessages.AddRange(ToOpenAiMessages(msg));
 
@@ -158,8 +214,16 @@ internal sealed class LlmClient(HttpClient http)
         }
 
         var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-        var raw = JsonSerializer.Deserialize<OpenAiResponse>(json, DeserOpts)
-                  ?? throw new InvalidOperationException("LLM returned null response.");
+        OpenAiResponse raw;
+        try
+        {
+            raw = JsonSerializer.Deserialize<OpenAiResponse>(json, DeserOpts)
+                  ?? throw new MalformedLlmResponseException(json, "OpenAI-compat returned a null response body.");
+        }
+        catch (JsonException ex)
+        {
+            throw new MalformedLlmResponseException(json, $"Response was not valid JSON: {ex.Message}");
+        }
 
         var choice = raw.Choices?.FirstOrDefault();
         if (choice is null) return new LlmResponse([], "end_turn");
@@ -173,8 +237,17 @@ internal sealed class LlmClient(HttpClient http)
             foreach (var tc in toolCalls)
             {
                 if (tc.Function is null) continue;
-                var input = JsonSerializer.Deserialize<JsonElement>(
-                    tc.Function.Arguments ?? "{}", DeserOpts);
+                var argsJson = tc.Function.Arguments ?? "{}";
+                JsonElement input;
+                try
+                {
+                    input = JsonSerializer.Deserialize<JsonElement>(argsJson, DeserOpts);
+                }
+                catch (JsonException ex)
+                {
+                    throw new MalformedLlmResponseException(
+                        argsJson, $"Tool call '{tc.Function.Name}' arguments were not valid JSON: {ex.Message}");
+                }
                 contents.Add(new NmToolUse(
                     tc.Id ?? Guid.NewGuid().ToString("N"),
                     tc.Function.Name ?? "",
@@ -189,7 +262,9 @@ internal sealed class LlmClient(HttpClient http)
             _            => "end_turn"
         };
 
-        return new LlmResponse(contents, stopReason);
+        return new LlmResponse(
+            contents, stopReason, raw.Usage?.PromptTokens, raw.Usage?.CompletionTokens,
+            raw.Usage?.Estimated ?? false);
     }
 
     // OpenAI requires one message per tool result; a NmMessage with tool results expands
@@ -229,7 +304,12 @@ internal sealed class LlmClient(HttpClient http)
 
     private sealed record AnthropicResponse(
         [property: JsonPropertyName("content")]     IReadOnlyList<AnthropicContentBlock> Content,
-        [property: JsonPropertyName("stop_reason")] string StopReason);
+        [property: JsonPropertyName("stop_reason")] string StopReason,
+        [property: JsonPropertyName("usage")]       AnthropicUsage? Usage = null);
+
+    private sealed record AnthropicUsage(
+        [property: JsonPropertyName("input_tokens")]  int? InputTokens,
+        [property: JsonPropertyName("output_tokens")] int? OutputTokens);
 
     private sealed record AnthropicContentBlock(
         [property: JsonPropertyName("type")]  string Type,
@@ -241,7 +321,15 @@ internal sealed class LlmClient(HttpClient http)
     // ── OpenAI response types ─────────────────────────────────────────────────
 
     private sealed record OpenAiResponse(
-        [property: JsonPropertyName("choices")] IReadOnlyList<OpenAiChoice>? Choices);
+        [property: JsonPropertyName("choices")] IReadOnlyList<OpenAiChoice>? Choices,
+        [property: JsonPropertyName("usage")]    OpenAiUsage? Usage = null);
+
+    private sealed record OpenAiUsage(
+        [property: JsonPropertyName("prompt_tokens")]     int? PromptTokens,
+        [property: JsonPropertyName("completion_tokens")] int? CompletionTokens,
+        // Set by LmApiProxy.ts when these counts come from VS Code's countTokens() rather than a
+        // real provider-reported usage block (vscode-lm/Copilot never reports real usage).
+        [property: JsonPropertyName("estimated")]         bool? Estimated = null);
 
     private sealed record OpenAiChoice(
         [property: JsonPropertyName("finish_reason")] string? FinishReason,
@@ -262,7 +350,10 @@ internal sealed class LlmClient(HttpClient http)
 
 internal sealed record LlmResponse(
     IReadOnlyList<NmContent> Content,
-    string StopReason);
+    string StopReason,
+    int? InputTokens = null,
+    int? OutputTokens = null,
+    bool TokensEstimated = false);
 
 internal sealed record LlmToolDef(
     [property: JsonPropertyName("name")]         string Name,

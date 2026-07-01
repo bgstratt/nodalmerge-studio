@@ -9,7 +9,20 @@ namespace NodalMerge.Studio.AgentRuntime.Tests;
 public class InMemoryAgentRuntimeServiceTests
 {
     private static InMemoryAgentRuntimeService Build() =>
-        new(new NoopServiceProvider(), NullLogger<InMemoryAgentRuntimeService>.Instance, new NoopAgentProfileService(), new NoopScheduler(), new NoopEventStream(), new WorkspaceOptions());
+        new(new NoopServiceProvider(), NullLogger<InMemoryAgentRuntimeService>.Instance, new NoopAgentProfileService(), new NoopScheduler(), new NoopEventStream(), new WorkspaceOptions(), new NoopFileLeaseService());
+
+    private sealed class NoopFileLeaseService : IFileLeaseService
+    {
+        public Task<(bool Granted, string? HolderWorkUnitId)> TryAcquireOrEnqueueAsync(
+            string workUnitId, string path, CancellationToken ct = default) =>
+            Task.FromResult<(bool Granted, string? HolderWorkUnitId)>((true, workUnitId));
+        public Task<string?> ReleaseAndAdvanceAsync(string path, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+        public Task<IReadOnlyList<string>> ForceReleaseAllForWorkUnitAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<IReadOnlyList<FileLeaseInfo>> ListAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<FileLeaseInfo>>([]);
+    }
 
     private sealed class NoopScheduler : IWorkScheduler
     {
@@ -19,8 +32,15 @@ public class InMemoryAgentRuntimeServiceTests
         public Task<ScheduledItem?> TryAcquireAsync(string agentId, CancellationToken ct = default) =>
             Task.FromResult<ScheduledItem?>(null);
         public Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default) => Task.CompletedTask;
+        public Task MarkAwaitingResumeAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task MarkAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
         public Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ScheduledItem>>([]);
+        public Task<IReadOnlyList<ScheduledItem>> ListAwaitingResumeAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ScheduledItem>>([]);
+        public Task ApproveResumeAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<int> ApproveResumeAllAsync(CancellationToken ct = default) => Task.FromResult(0);
     }
 
     private sealed class NoopEventStream : IExecutionEventStream
@@ -38,6 +58,10 @@ public class InMemoryAgentRuntimeServiceTests
 
         public Task<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default) =>
             Task.FromResult<NodalMerge.Studio.Contracts.Domain.ExecutionEvent?>(null);
+
+        public Task<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>> GetEventsByKindAsync(
+            IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEventKind> kinds, DateTimeOffset? since = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<NodalMerge.Studio.Contracts.Domain.ExecutionEvent>>([]);
     }
 
     private sealed class NoopServiceProvider : IServiceProvider
@@ -245,5 +269,33 @@ public class InMemoryAgentRuntimeServiceTests
 
         // Only the original SpawnAsync's AgentRecord exists — reinvoke found nothing registered.
         Assert.Single(await svc.ListAllAsync());
+    }
+
+    // ── GetEnabledDomainAgents ────────────────────────────────────────────────
+
+    [Fact]
+    public void GetEnabledDomainAgents_returns_null_for_unregistered_work_unit()
+    {
+        var svc = Build();
+        Assert.Null(svc.GetEnabledDomainAgents("wu-never-spawned"));
+    }
+
+    [Fact]
+    public async Task GetEnabledDomainAgents_returns_explicit_override_captured_at_spawn()
+    {
+        var svc = Build();
+        await svc.SpawnAsync("orchestrator", "wu-1", model: "m", baseUrl: "http://fake-llm", apiKey: "k",
+            enabledDomainAgents: ["Security"]);
+
+        Assert.Equal(["Security"], svc.GetEnabledDomainAgents("wu-1"));
+    }
+
+    [Fact]
+    public async Task GetEnabledDomainAgents_returns_null_when_orchestrator_spawned_without_override()
+    {
+        var svc = Build();
+        await svc.SpawnAsync("orchestrator", "wu-1", model: "m", baseUrl: "http://fake-llm", apiKey: "k");
+
+        Assert.Null(svc.GetEnabledDomainAgents("wu-1"));
     }
 }

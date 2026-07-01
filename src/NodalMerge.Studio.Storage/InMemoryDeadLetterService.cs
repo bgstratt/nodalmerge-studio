@@ -12,7 +12,9 @@ public sealed class InMemoryDeadLetterService(
     IWorkScheduler scheduler,
     IAgentControlService agentControl,
     IOrchestrationDecisionLogService decisionLog,
-    IProjectionManager projections) : IDeadLetterService, IRehydratable
+    IProjectionManager projections,
+    ISteeringDecisionService steeringDecisions,
+    IFileLeaseService fileLease) : IDeadLetterService, IRehydratable
 {
     public const int MaxFailureAttempts = 3;
 
@@ -27,20 +29,15 @@ public sealed class InMemoryDeadLetterService(
         string? taskId = null,
         string? lastProjectionSnapshot = null,
         string? sessionId = null,
+        string? model = null,
+        string? baseUrl = null,
+        string? apiKey = null,
+        string? provider = null,
         CancellationToken cancellationToken = default)
     {
-        var unit = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false)
-            ?? throw new KeyNotFoundException($"Work unit '{workUnitId}' was not found.");
-
-        var previousCount = unit.ExecutionInfo?.FailureAttemptCount ?? 0;
-        var attemptCount = previousCount + 1;
-        var executionInfo = (unit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with
-        {
-            FailureAttemptCount = attemptCount,
-        };
-
-        var updatedUnit = unit with { ExecutionInfo = executionInfo };
-        await workUnits.CreateAsync(updatedUnit, cancellationToken).ConfigureAwait(false);
+        var updatedUnit = await workUnits.IncrementFailureAttemptCountAsync(workUnitId, cancellationToken)
+            .ConfigureAwait(false);
+        var attemptCount = updatedUnit.ExecutionInfo!.FailureAttemptCount;
 
         var snapshot = lastProjectionSnapshot ?? await TryCaptureProjectionAsync(workUnitId, cancellationToken)
             .ConfigureAwait(false);
@@ -56,7 +53,11 @@ public sealed class InMemoryDeadLetterService(
             attemptCount,
             DateTimeOffset.UtcNow,
             taskId,
-            attemptCount >= MaxFailureAttempts);
+            attemptCount >= MaxFailureAttempts,
+            model,
+            baseUrl,
+            apiKey,
+            provider);
 
         _entries[entry.EntryId] = entry;
         await nodeStore.WriteNodeAsync(
@@ -64,6 +65,20 @@ public sealed class InMemoryDeadLetterService(
             entry.EntryId,
             JsonSerializer.Serialize(entry),
             cancellationToken).ConfigureAwait(false);
+
+        // Phase 12 — only on the final, no-more-retries failure (RetryAsync itself refuses once
+        // MaxAttemptsReached is true, so this is genuinely terminal): release every file lease
+        // this work unit held and drop it from any queue it was waiting in, so a holder that will
+        // never merge doesn't strand its waiters forever. Not done on earlier attempts — a unit
+        // that still has retries left may yet succeed and merge, and releasing its lease early
+        // would let a waiter jump in and create exactly the conflict the lease exists to prevent.
+        if (entry.MaxAttemptsReached)
+        {
+            var promoted = await fileLease.ForceReleaseAllForWorkUnitAsync(workUnitId, cancellationToken)
+                .ConfigureAwait(false);
+            foreach (var promotedWorkUnitId in promoted)
+                await scheduler.ClearAwaitingFileLeaseAsync(promotedWorkUnitId, cancellationToken).ConfigureAwait(false);
+        }
 
         try
         {
@@ -125,8 +140,7 @@ public sealed class InMemoryDeadLetterService(
                 $"Work unit is in status {unit.Status}; expected DeadLettered.");
         }
 
-        var orchestratorTarget = unit.ParentWorkUnitId ?? unit.WorkUnitId;
-        var creds = agentControl.GetOrchestratorCredentials(orchestratorTarget);
+        var creds = ResolveRetryCredentials(entry, unit);
 
         try
         {
@@ -141,15 +155,177 @@ public sealed class InMemoryDeadLetterService(
             entry.WorkUnitId,
             entry.ProfileId,
             taskId: entry.TaskId,
-            model: creds?.Model,
-            baseUrl: creds?.BaseUrl,
-            apiKey: creds?.ApiKey,
-            provider: creds?.Provider,
+            model: creds.Model,
+            baseUrl: creds.BaseUrl,
+            apiKey: creds.ApiKey,
+            provider: creds.Provider,
             sessionId: null,
             ct: cancellationToken).ConfigureAwait(false);
 
         return new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried);
     }
+
+    public async Task<DeadLetterRetryResult> RetryWithCredentialOverrideAsync(
+        string entryId,
+        string? overrideModel,
+        string? overrideBaseUrl,
+        string? overrideApiKey,
+        string? overrideProvider,
+        string? overrideProfileId,
+        CancellationToken cancellationToken)
+    {
+        if (!_entries.TryGetValue(entryId, out var entry))
+            return new DeadLetterRetryResult(DeadLetterRetryOutcome.NotFound, "Dead-letter entry not found.");
+
+        if (entry.MaxAttemptsReached || entry.AttemptCount >= MaxFailureAttempts)
+        {
+            return new DeadLetterRetryResult(
+                DeadLetterRetryOutcome.MaxAttemptsReached,
+                "Max attempts reached.");
+        }
+
+        var unit = await workUnits.GetAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
+        if (unit is null)
+            return new DeadLetterRetryResult(DeadLetterRetryOutcome.InvalidState, "Work unit not found.");
+
+        if (unit.Status is not WorkUnitStatus.DeadLettered and not WorkUnitStatus.Retrying)
+        {
+            return new DeadLetterRetryResult(
+                DeadLetterRetryOutcome.InvalidState,
+                $"Work unit is in status {unit.Status}; expected DeadLettered.");
+        }
+
+        var profileId = overrideProfileId ?? entry.ProfileId;
+        var creds = ResolveRetryCredentials(entry, unit, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider);
+
+        try
+        {
+            await workUnits
+                .UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Retrying, null, cancellationToken)
+                .ConfigureAwait(false);
+            await workUnits.SetCurrentStageAsync(entry.WorkUnitId, entry.Stage, cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException) { }
+
+        await scheduler.EnqueueAsync(
+            entry.WorkUnitId,
+            profileId,
+            taskId: entry.TaskId,
+            model: creds.Model,
+            baseUrl: creds.BaseUrl,
+            apiKey: creds.ApiKey,
+            provider: creds.Provider,
+            sessionId: null,
+            ct: cancellationToken).ConfigureAwait(false);
+
+        return new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried);
+    }
+
+    // Prefer whatever credentials were captured directly on the entry at failure time — those are
+    // exactly what the failed run used, regardless of stage. Only entries recorded before this
+    // capture existed (or a run that genuinely had no credentials) fall through to the live
+    // in-memory orchestrator registry, which is best-effort: it doesn't survive a Host restart or
+    // the orchestrator's own loop completing, so by retry time it may simply have nothing for this
+    // work unit anymore.
+    // When credential overrides are supplied, they take top priority — this lets a human retry
+    // with a different model/profile (e.g. switching from vscode-lm to deepseek) without spawning
+    // a new work unit.
+    private (string? Model, string? BaseUrl, string? ApiKey, string? Provider) ResolveRetryCredentials(
+        DeadLetterEntry entry, WorkUnit unit,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null)
+    {
+        // Phase Y — human-chosen credential override takes absolute priority.
+        if (!string.IsNullOrWhiteSpace(overrideModel) || !string.IsNullOrWhiteSpace(overrideBaseUrl))
+            return (overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider);
+
+        if (!string.IsNullOrWhiteSpace(entry.BaseUrl) || !string.IsNullOrWhiteSpace(entry.Model))
+            return (entry.Model, entry.BaseUrl, entry.ApiKey, entry.Provider);
+
+        var creds = agentControl.GetCredentialsForStage(unit.WorkUnitId, entry.Stage)
+            ?? agentControl.GetOrchestratorCredentials(unit.WorkUnitId)
+            ?? (unit.ParentWorkUnitId is { } parentId
+                ? agentControl.GetCredentialsForStage(parentId, entry.Stage) ?? agentControl.GetOrchestratorCredentials(parentId)
+                : null);
+        return (creds?.Model, creds?.BaseUrl, creds?.ApiKey, creds?.Provider);
+    }
+
+    public async Task<DeadLetterRetryResult> RetryWithContextAsync(
+        string entryId,
+        string steeringContext,
+        string? overrideModel,
+        string? overrideBaseUrl,
+        string? overrideApiKey,
+        string? overrideProvider,
+        string? overrideProfileId,
+        CancellationToken cancellationToken)
+    {
+        if (!_entries.TryGetValue(entryId, out var entry))
+            return new DeadLetterRetryResult(DeadLetterRetryOutcome.NotFound, "Dead-letter entry not found.");
+
+        var unit = await workUnits.GetAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
+        if (unit is null)
+            return new DeadLetterRetryResult(DeadLetterRetryOutcome.InvalidState, "Work unit not found.");
+
+        if (unit.Status is not WorkUnitStatus.DeadLettered and not WorkUnitStatus.Retrying)
+        {
+            return new DeadLetterRetryResult(
+                DeadLetterRetryOutcome.InvalidState,
+                $"Work unit is in status {unit.Status}; expected DeadLettered.");
+        }
+
+        // Fold the correction into Goal — projections only ever surface Goal/SuccessCriteria to
+        // the agent, never Metadata, so a constraint stashed only in Metadata would never be seen.
+        var amendedGoal = $"{unit.Goal}\n\n[Correction after dead-letter retry]: {steeringContext}";
+        await workUnits.AmendGoalForSteeredRetryAsync(
+            entry.WorkUnitId, amendedGoal, steeringContext, entryId, cancellationToken).ConfigureAwait(false);
+
+        var profileId = overrideProfileId ?? entry.ProfileId;
+        var creds = ResolveRetryCredentials(entry, unit, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider);
+
+        try
+        {
+            await workUnits
+                .UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Retrying, null, cancellationToken)
+                .ConfigureAwait(false);
+            await workUnits.SetCurrentStageAsync(entry.WorkUnitId, entry.Stage, cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException) { }
+
+        await scheduler.EnqueueAsync(
+            entry.WorkUnitId,
+            profileId,
+            taskId: entry.TaskId,
+            model: creds.Model,
+            baseUrl: creds.BaseUrl,
+            apiKey: creds.ApiKey,
+            provider: creds.Provider,
+            sessionId: null,
+            ct: cancellationToken).ConfigureAwait(false);
+
+        await steeringDecisions.RecordAsync(
+            new SteeringDecision(
+                SteeringDecisionId: $"steer-dl-{Guid.NewGuid():N}",
+                WorkUnitId: entry.WorkUnitId,
+                AgentId: null,
+                InjectedConstraint: steeringContext,
+                NewChildWorkUnitId: null,
+                SteeredAt: DateTimeOffset.UtcNow,
+                SessionId: null),
+            cancellationToken).ConfigureAwait(false);
+
+        return new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried);
+    }
+
+    // Phase Y — obsolete overload kept for backward compat with existing callers that use the
+    // old 3-parameter signature; delegates to the full override-capable overload with null overrides.
+    public Task<DeadLetterRetryResult> RetryWithContextAsync(
+        string entryId,
+        string steeringContext,
+        CancellationToken cancellationToken = default)
+        => RetryWithContextAsync(entryId, steeringContext, null, null, null, null, null, cancellationToken);
 
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {

@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import type { MergeProposal } from './MergeReviewPanel';
 import type { NotificationManager } from '../NotificationManager';
 import type { AgentConfigService } from '../AgentConfigService';
+import { resolveRepositoryPath } from '../repositoryPath';
 import { scopeViewCss, wrapViewScript } from './sharedWebviewChrome';
 
 const POLL_INTERVAL_MS = 2_000;
@@ -15,12 +16,20 @@ interface WorkUnit {
   owner: string;
   status: string;
   successCriteria?: string | null;
+  fanOutInfo?: { blockedReason?: string | null } | null;
 }
 
 interface AgentInfo {
   agentId: string;
   workUnitId: string;
   status: string;
+}
+
+interface ScheduledItem {
+  workUnitId: string;
+  profileId: string;
+  taskId?: string | null;
+  attemptCount: number;
 }
 
 interface WorkspaceSummary {
@@ -43,10 +52,65 @@ interface DeadLetterEntry {
   maxAttemptsReached: boolean;
 }
 
+interface FindingSignal {
+  findingId: string;
+  title: string;
+  status: string;
+}
+
+interface FileLeaseInfo {
+  path: string;
+  holderWorkUnitId: string | null;
+  waitQueue: string[];
+}
+
+interface GoalItem {
+  goalId: string;
+  goal: string;
+  workUnitId: string;
+  branchId: string;
+  status: string;
+  pauseReason?: string | null;
+  updatedAt?: string | null;
+}
+
+interface ClarificationInboxItem {
+  requestId: string;
+  sessionId?: string | null;
+  workUnitId: string;
+  goal: string;
+  question: string;
+  context?: string | null;
+  blocking: boolean;
+  options: string[];
+  requestedByAgentId?: string | null;
+  requestedAt: string;
+  status: string;
+  awaitingResume: boolean;
+  timeoutSeconds?: number | null;
+  timeoutAt?: string | null;
+  timeoutBehavior?: string | null;
+}
+
+interface ClarificationGoalMetric {
+  workUnitId: string;
+  goal: string;
+  requests: number;
+  answered: number;
+  abandoned: number;
+}
+
+interface ClarificationMetrics {
+  requests: number;
+  answered: number;
+  abandoned: number;
+  perGoal: ClarificationGoalMetric[];
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
-export class WorkspaceDashboardPanel implements vscode.Disposable {
-  static readonly containerId = 'shell-pane-workspace';
+export class ExecutionTimelinePanel implements vscode.Disposable {
+  static readonly containerId = 'shell-pane-execution-timeline';
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
@@ -54,7 +118,10 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
   private readonly configService: AgentConfigService | undefined;
   private readonly secrets: vscode.SecretStorage | undefined;
   private readonly lmProxyBaseUrl: string | undefined;
+  private readonly getSelectedSessionId?: () => string | undefined;
+  private localSessionOverride?: string;
   private pollTimer?: ReturnType<typeof setInterval>;
+  private usePromotionBranch = false;
 
   constructor(
     panel: vscode.WebviewPanel,
@@ -63,6 +130,7 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
     configService?: AgentConfigService,
     secrets?: vscode.SecretStorage,
     lmProxyBaseUrl?: string,
+    getSelectedSessionId?: () => string | undefined,
   ) {
     this.panel         = panel;
     this.baseUrl       = baseUrl;
@@ -70,21 +138,49 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
     this.configService = configService;
     this.secrets       = secrets;
     this.lmProxyBaseUrl = lmProxyBaseUrl;
+    this.getSelectedSessionId = getSelectedSessionId;
   }
 
   static getFragment(): { css: string; html: string; script: string } {
     return {
-      css: scopeViewCss(DASHBOARD_CSS, WorkspaceDashboardPanel.containerId),
-      html: `<div id="${WorkspaceDashboardPanel.containerId}" class="nm-shell-pane">${DASHBOARD_HTML}</div>`,
-      script: wrapViewScript(DASHBOARD_JS, WorkspaceDashboardPanel.containerId),
+      css: scopeViewCss(ET_CSS, ExecutionTimelinePanel.containerId),
+      html: `<div id="${ExecutionTimelinePanel.containerId}" class="nm-shell-pane">${ET_HTML}</div>`,
+      script: wrapViewScript(ET_JS, ExecutionTimelinePanel.containerId),
     };
   }
 
-  /** Called once by the shell right after construction — was the tail of createOrShow(). Unlike
-   * before, polling now runs continuously regardless of which shell tab is visible (the shell
-   * has one always-open webview, not a panel that can itself be hidden/shown); see Slice 0 notes. */
   activate(): void {
     this.startPolling();
+    void this.sendSessionPicker();
+  }
+
+  /** Immediately re-polls — used by the shell when the selected session changes. */
+  async triggerPoll(): Promise<void> {
+    await this.poll();
+    void this.sendSessionPicker();
+  }
+
+  setSessionOverride(sessionId: string | undefined): void {
+    this.localSessionOverride = sessionId;
+    void this.sendSessionPicker();
+    void this.poll();
+  }
+
+  private getEffectiveSessionId(): string | undefined {
+    return this.localSessionOverride ?? this.getSelectedSessionId?.();
+  }
+
+  private async sendSessionPicker(): Promise<void> {
+    try {
+      const sessions = await this.get<Array<{ sessionId: string; status: string }>>('/studio/sessions');
+      void this.panel.webview.postMessage({
+        type: 'updateSessionPicker',
+        panelId: ExecutionTimelinePanel.containerId,
+        sessions,
+        shellSessionId: this.getSelectedSessionId?.(),
+        overrideSessionId: this.localSessionOverride,
+      });
+    } catch { /* host not ready */ }
   }
 
   private startPolling(): void {
@@ -102,15 +198,35 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
 
   private async poll(): Promise<void> {
     try {
-      const [summary, workUnits, agents, merges, deadLetters] = await Promise.all([
-        this.get<WorkspaceSummary>('/studio/workspace-summary'),
-        this.get<WorkUnit[]>('/studio/workunits'),
-        this.get<AgentInfo[]>('/studio/agents?all=true'),
-        this.get<MergeProposal[]>('/studio/merges'),
-        this.get<DeadLetterEntry[]>('/studio/dead-letter'),
+      const sessionId = this.getEffectiveSessionId();
+      const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
+      const emptySummary: WorkspaceSummary = { activeWorkUnits: [], activeAgents: [], pendingMerges: [], failures: [], knownGoodStates: [] };
+      const emptyMetrics: ClarificationMetrics = { requests: 0, answered: 0, abandoned: 0, perGoal: [] };
+      const [summary, workUnits, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases, opts, findings, goalsResp] = await Promise.all([
+        this.get<WorkspaceSummary>('/studio/workspace-summary' + params).catch(() => emptySummary),
+        this.get<WorkUnit[]>('/studio/workunits' + params).catch(() => [] as WorkUnit[]),
+        this.get<AgentInfo[]>('/studio/agents?all=true' + (sessionId ? '&sessionId=' + encodeURIComponent(sessionId) : '')).catch(() => [] as AgentInfo[]),
+        this.get<ScheduledItem[]>('/studio/scheduler/awaiting-resume').catch(() => [] as ScheduledItem[]),
+        this.get<ClarificationInboxItem[]>('/studio/clarifications').catch(() => [] as ClarificationInboxItem[]),
+        this.get<ClarificationMetrics>('/studio/clarifications/metrics').catch(() => emptyMetrics),
+        this.get<MergeProposal[]>('/studio/merges' + params).catch(() => [] as MergeProposal[]),
+        this.get<DeadLetterEntry[]>('/studio/dead-letter' + params).catch(() => [] as DeadLetterEntry[]),
+        this.get<FileLeaseInfo[]>('/studio/file-leases').catch(() => [] as FileLeaseInfo[]),
+        this.get<{ usePromotionBranch?: boolean; candidateBranchId?: string; defaultClarificationTimeoutSeconds?: number | null; defaultClarificationTimeoutBehavior?: string }>('/studio/options').catch(() => ({} as { usePromotionBranch?: boolean; candidateBranchId?: string })),
+        this.get<FindingSignal[]>('/studio/findings?status=Open').catch(() => [] as FindingSignal[]),
+        this.get<{ goals: GoalItem[] }>('/studio/goals').catch(() => ({ goals: [] as GoalItem[] })),
       ]);
-      void this.panel.webview.postMessage({ type: 'data', summary, workUnits, agents, merges, deadLetters });
-      this.notifications?.update(merges);
+      const syncGraph = await this.get<{ frontierHeads: string[] }>('/studio/causal/frontier').catch(() => null);
+      const goals = goalsResp?.goals ?? [];
+      this.usePromotionBranch = opts.usePromotionBranch ?? false;
+      void this.panel.webview.postMessage({
+        type: 'data', summary, workUnits, goals, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases,
+        usePromotionBranch: this.usePromotionBranch,
+        candidateBranchId: opts.candidateBranchId ?? 'candidate',
+        syncGraph: syncGraph ?? { frontierHeads: [] },
+      });
+      this.notifications?.update(merges, workUnits, findings);
+      void this.sendSessionPicker();
     } catch {
       // host not yet ready — suppress until healthy
     }
@@ -121,7 +237,7 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
       switch (msg.type as string) {
         case 'createWorkUnit': {
           const goal = await vscode.window.showInputBox({
-            prompt: 'Work unit goal',
+            prompt: 'Goal for the new work unit',
             placeHolder: 'e.g. Build the NodalMerge docs site',
             ignoreFocusOut: true,
           });
@@ -132,8 +248,38 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
             ignoreFocusOut: true,
           });
           if (!owner) { return; }
-          const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-          await this.post('/studio/workunits', { goal, owner, ...(repositoryPath ? { repositoryPath } : {}) });
+          const reviewPolicyPick = await vscode.window.showQuickPick(
+            [
+              { label: '$(person) Human Required', description: 'Proposal waits for manual apply (default)', value: 'HumanRequired' },
+              { label: '$(robot) Agent Approval', description: 'Reviewer agent approves; merges automatically', value: 'AgentApproval' },
+              { label: '$(clock) Hybrid (5 min)', description: 'Agent approves; auto-merges after 5 min unless overridden', value: 'Hybrid' },
+            ],
+            { placeHolder: 'Review policy', ignoreFocusOut: true }
+          );
+          if (!reviewPolicyPick) { return; }
+
+          // Slice 21c — when promotion branch is on, let the user pick the effective target;
+          // "Direct" sets BypassPromotionBranch so this work unit's applies skip candidate.
+          let bypassPromotionBranch = false;
+          if (this.usePromotionBranch) {
+            const targetPick = await vscode.window.showQuickPick(
+              [
+                { label: '$(git-branch) Candidate Branch', description: 'Applies land on candidate; promote to main manually (session default)', value: 'candidate' },
+                { label: '$(arrow-right) Direct', description: 'Bypass candidate — apply goes directly to parent branch', value: 'direct' },
+              ],
+              { placeHolder: 'Apply target', ignoreFocusOut: true },
+            );
+            if (!targetPick) { return; }
+            bypassPromotionBranch = targetPick.value === 'direct';
+          }
+
+          const repositoryPath = resolveRepositoryPath();
+          await this.post('/studio/workunits', {
+            goal, owner,
+            reviewPolicy: reviewPolicyPick.value,
+            bypassPromotionBranch,
+            ...(repositoryPath ? { repositoryPath } : {}),
+          });
           void this.poll();
           break;
         }
@@ -163,14 +309,14 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
             );
             if (!llm) {
               void vscode.window.showErrorMessage(
-                `NodalMerge: Profile "${agentType}" has no LLM credentials — set VS Code LM or an API key in Agent Config.`,
+                `NodalMerge: Profile "${agentType}" has no LLM credentials — set VS Code LM or an API key in Model & Agent Studio.`,
               );
               return;
             }
             spawnBody = { ...spawnBody, ...llm };
           } else {
             void vscode.window.showWarningMessage(
-              'NodalMerge: Spawning without LLM credentials — the agent loop will not start. Use Agent Config → Quick Spawn instead.',
+              'NodalMerge: Spawning without LLM credentials — the agent loop will not start. Use Model & Agent Studio → Quick Explore instead.',
             );
           }
           await this.post('/studio/agents/spawn', spawnBody);
@@ -189,6 +335,82 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
           await this.post('/studio/agents/' + String(msg.agentId) + '/stop', {});
           void this.poll();
           break;
+        case 'cancelWorkUnit':
+          await this.post('/studio/workunits/' + String(msg.workUnitId) + '/cancel', {});
+          void this.poll();
+          break;
+        case 'stopAll': {
+          const confirmed = await vscode.window.showWarningMessage(
+            'Stop all active goals, agents, and pending reviews?',
+            { modal: true },
+            'Stop All',
+          );
+          if (confirmed !== 'Stop All') { return; }
+          await this.post('/studio/stop-all', {});
+          void this.poll();
+          break;
+        }
+        case 'resumeWorker':
+          await this.post('/studio/scheduler/' + String(msg.workUnitId) + '/resume', {});
+          void this.poll();
+          break;
+        case 'resumeAllWorkers':
+          await this.post('/studio/scheduler/resume-all', {});
+          void this.poll();
+          break;
+        case 'respondClarification': {
+          const workUnitId = String(msg.workUnitId ?? '');
+          const requestId = String(msg.requestId ?? '');
+          const options = Array.isArray(msg.options) ? msg.options.map(v => String(v)) : [];
+          if (!workUnitId || !requestId) { return; }
+
+          let response: string | undefined;
+          if (options.length > 0) {
+            const picked = await vscode.window.showQuickPick(
+              options.map(o => ({ label: o, value: o })),
+              { placeHolder: 'Select clarification response', ignoreFocusOut: true },
+            );
+            response = picked?.value;
+          } else {
+            response = await vscode.window.showInputBox({
+              prompt: 'Clarification response',
+              placeHolder: 'Enter response for the agent',
+              ignoreFocusOut: true,
+            });
+          }
+          if (!response) { return; }
+
+          const note = await vscode.window.showInputBox({
+            prompt: 'Optional note',
+            placeHolder: 'Additional context for the response (optional)',
+            ignoreFocusOut: true,
+          });
+
+          await this.post('/studio/clarifications/' + encodeURIComponent(workUnitId) + '/respond', {
+            requestId,
+            response,
+            note: note || null,
+            resume: true,
+            respondedBy: 'vscode-user',
+          });
+          void this.poll();
+          break;
+        }
+        case 'markKnownGood': {
+          const description = await vscode.window.showInputBox({
+            prompt: 'Description for this Known Good State',
+            placeHolder: 'e.g. post-review-clean, before-refactor',
+            ignoreFocusOut: true,
+          });
+          if (!description) { return; }
+          await this.post('/studio/state/markKnownGood', {
+            branchId: msg.branchId as string,
+            description,
+            createdBy: 'vscode-user',
+          });
+          void vscode.window.showInformationMessage(`NodalMerge: Tagged "${description}" as a Known Good State.`);
+          break;
+        }
         case 'openMergeReview':
           void vscode.commands.executeCommand('nodalmerge.openMergeReview', msg.proposalId as string);
           break;
@@ -199,6 +421,47 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
           await this.post('/studio/dead-letter/' + String(msg.entryId) + '/retry', {});
           void this.poll();
           break;
+        case 'releaseFileLease': {
+          const confirmed = await vscode.window.showWarningMessage(
+            'Force-release every file lease held by "' + String(msg.workUnitId) + '"? The next queued worker will be promoted automatically.',
+            { modal: true },
+            'Release',
+          );
+          if (confirmed !== 'Release') { return; }
+          await this.post('/studio/file-leases/release', { workUnitId: msg.workUnitId });
+          void this.poll();
+          break;
+        }
+        case 'dashboardGoalPause': {
+          const goalId = String(msg.goalId ?? '');
+          if (!goalId) { return; }
+          const reason = await vscode.window.showInputBox({
+            prompt: 'Reason for pausing (optional)',
+            placeHolder: 'e.g. needs review before continuing',
+            ignoreFocusOut: true,
+          });
+          await this.post('/studio/goals/' + encodeURIComponent(goalId) + '/pause', {
+            reason: reason || null,
+            pausedBy: 'vscode-user',
+          });
+          void this.poll();
+          break;
+        }
+        case 'dashboardGoalResume': {
+          const goalId = String(msg.goalId ?? '');
+          if (!goalId) { return; }
+          const steering = await vscode.window.showInputBox({
+            prompt: 'Steering message (optional) — redirect the agent on resume',
+            placeHolder: 'e.g. focus on the auth module, skip UI changes',
+            ignoreFocusOut: true,
+          });
+          await this.post('/studio/goals/' + encodeURIComponent(goalId) + '/resume', {
+            steering: steering || null,
+            resumedBy: 'vscode-user',
+          });
+          void this.poll();
+          break;
+        }
       }
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: ' + String(err));
@@ -231,7 +494,7 @@ export class WorkspaceDashboardPanel implements vscode.Disposable {
 
 // ── HTML builder ───────────────────────────────────────────────────────────
 
-const DASHBOARD_CSS = `
+const ET_CSS = `
   :root {
     --nm-bg:         var(--vscode-editor-background);
     --nm-fg:         var(--vscode-editor-foreground);
@@ -277,6 +540,15 @@ const DASHBOARD_CSS = `
     margin-bottom: 4px;
   }
   .header-title { font-size: 1.15em; font-weight: 700; }
+  .session-override-picker {
+    font-size: 0.75em;
+    padding: 1px 4px;
+    border: 1px solid var(--nm-border);
+    border-radius: 3px;
+    background: var(--vscode-input-background, #3c3c3c);
+    color: var(--vscode-input-foreground, #ccc);
+    max-width: 150px;
+  }
   .pulse {
     display: inline-block;
     width: 7px; height: 7px; border-radius: 50%;
@@ -317,8 +589,10 @@ const DASHBOARD_CSS = `
   .badge.active   { background: var(--nm-success); color: #fff; }
   .badge.paused   { background: var(--nm-warn); color: #000; }
   .badge.stopped,
-  .badge.completed { background: #555; color: #ccc; }
+  .badge.completed,
+  .badge.cancelled { background: #555; color: #ccc; }
   .badge.failed   { background: var(--nm-error); color: #fff; }
+  .badge.interrupted { background: #c05020; color: #fff; }
   .actions { display: flex; gap: 4px; flex-shrink: 0; }
   button {
     background: var(--nm-btn);
@@ -352,45 +626,108 @@ const DASHBOARD_CSS = `
     border-radius: 3px;
   }
   .add-btn:hover { opacity: 1; }
+  .sync-graph-card {
+    background: var(--nm-section-bg);
+    border: 1px solid var(--nm-border);
+    border-radius: 4px;
+    padding: 8px 12px;
+    margin-bottom: 6px;
+  }
+  .sync-graph-card .sg-label {
+    font-size: 0.78em;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    opacity: 0.55;
+    margin-bottom: 4px;
+  }
+  .sync-graph-card .sg-badge {
+    display: inline-block;
+    background: var(--nm-badge);
+    color: var(--nm-badge-fg);
+    border-radius: 3px;
+    padding: 1px 6px;
+    font-size: 0.75em;
+    margin-right: 4px;
+  }
+  .sync-graph-card .sg-heads {
+    font-family: var(--nm-mono);
+    font-size: 0.72em;
+    opacity: 0.7;
+    margin-top: 4px;
+    word-break: break-all;
+  }
+  .sg-promoted { color: var(--nm-success); font-weight: 600; }
+  .sg-empty    { color: var(--nm-warn); }
 `;
 
-const DASHBOARD_HTML = `
+const ET_HTML = `
   <div class="header">
-    <span class="header-title">NodalMerge Studio<span class="pulse"></span></span>
+    <span class="header-title">Activity Center<span class="pulse"></span></span>
+    <select id="et-session-override" class="session-override-picker"><option value="">Follow Workspace</option></select>
+    <button class="danger" id="btn-stop-all" title="Cancel every active goal, stop every agent, and cancel pending review timers">🛑 Stop All</button>
     <span id="last-updated"></span>
   </div>
 
-  <h2>Work Units</h2>
-  <div id="work-units"><p class="empty">Loading…</p></div>
-  <button class="add-btn" id="btn-new-wu">+ New Work Unit</button>
+  <h2>Active Goals</h2>
+  <div id="active-goals"><p class="empty">Loading…</p></div>
+  <button class="add-btn" id="btn-new-goal">+ New Goal</button>
 
-  <h2>Agents</h2>
-  <div id="agents"><p class="empty">No agents.</p></div>
-  <button class="add-btn" id="btn-spawn">+ Spawn Agent</button>
+  <h2>Running Agents</h2>
+  <div id="agents"><p class="empty">No running agents.</p></div>
+  <button class="add-btn" id="btn-start-agent">+ Start Agent</button>
 
-  <h2>Pending Merges</h2>
-  <div id="merges"><p class="empty">No pending merges.</p></div>
+  <h2>Awaiting Resume</h2>
+  <div id="awaiting-resume"><p class="empty">Nothing awaiting resume.</p></div>
+  <button class="add-btn" id="btn-resume-all" style="display:none">↺ Resume All</button>
 
-  <h2>Failures</h2>
-  <div id="failures"><p class="empty">No failures.</p></div>
+  <h2>Clarification Inbox</h2>
+  <div id="clarifications"><p class="empty">No active clarification requests.</p></div>
+  <div id="clarification-metrics" class="empty">No clarification metrics yet.</div>
+
+  <h2>Pending Decisions</h2>
+  <div id="decisions"><p class="empty">No pending decisions.</p></div>
+
+  <h2>Blocked Explorations</h2>
+  <div id="blocked"><p class="empty">No blocked explorations.</p></div>
+
+  <h2>File Lease Conflicts</h2>
+  <div id="file-leases"><p class="empty">No file lease conflicts.</p></div>
+
+  <h2>Sync Graph</h2>
+  <div id="sync-graph"><p class="empty">Loading…</p></div>
 `;
 
-const DASHBOARD_JS = `
+const ET_JS = `
   const vscode = acquireVsCodeApi();
+  var globalUsePromotionBranch = false;
+  var globalCandidateBranchId = 'candidate';
 
-  document.getElementById('btn-new-wu').addEventListener('click', function() {
+  document.getElementById('btn-new-goal').addEventListener('click', function() {
     vscode.postMessage({ type: 'createWorkUnit' });
   });
-  document.getElementById('btn-spawn').addEventListener('click', function() {
+  document.getElementById('btn-start-agent').addEventListener('click', function() {
     vscode.postMessage({ type: 'spawnAgent' });
   });
+  document.getElementById('btn-resume-all').addEventListener('click', function() {
+    vscode.postMessage({ type: 'resumeAllWorkers' });
+  });
+  document.getElementById('btn-stop-all').addEventListener('click', function() {
+    vscode.postMessage({ type: 'stopAll' });
+  });
+
+  var etSessionOverride = document.getElementById('et-session-override');
+  if (etSessionOverride) {
+    etSessionOverride.addEventListener('change', function() {
+      vscode.postMessage({ type: 'sessionOverrideChanged', panelId: 'shell-pane-execution-timeline', sessionId: etSessionOverride.value || undefined });
+    });
+  }
 
   function esc(str) {
     return String(str || '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
+      .replace(/&/g, '&')
+      .replace(/</g, '<')
+      .replace(/>/g, '>')
+      .replace(/"/g, '"')
       .replace(/'/g, '&#39;');
   }
 
@@ -399,35 +736,72 @@ const DASHBOARD_JS = `
     return '<span class="badge ' + s + '">' + esc(status || '—') + '</span>';
   }
 
-  function renderWorkUnits(wus) {
-    var el = document.getElementById('work-units');
-    if (!wus || !wus.length) {
-      el.innerHTML = '<p class="empty">No work units yet.</p>';
+  // isGoalStore=true when items come from /studio/goals (have goalId + Paused status);
+  // false when falling back to /studio/workunits (no goalId, no goal-level pause support).
+  function renderActiveGoals(goals, isGoalStore) {
+    var el = document.getElementById('active-goals');
+    if (!goals || !goals.length) {
+      el.innerHTML = '<p class="empty">No active goals.</p>';
       return;
     }
     var html = '';
-    for (var i = 0; i < wus.length; i++) {
-      var wu = wus[i];
-      var isReviewing = (wu.status || '').toLowerCase() === 'reviewing';
+    for (var i = 0; i < goals.length; i++) {
+      var g = goals[i];
+      var goalId = g.goalId || g.workUnitId;
+      var status = (g.status || '').toLowerCase();
+      var isPaused   = status === 'paused';
+      var isReviewing = status === 'reviewing';
+      var isTerminal  = ['cancelled', 'completed', 'merged', 'abandoned', 'converged'].indexOf(status) !== -1;
       html += '<div class="card">';
       html += '<div class="row">';
-      html += '<span class="title" title="' + esc(wu.goal) + '">' + esc(wu.goal) + '</span>';
-      html += badge(wu.status);
+      html += '<span class="title" title="' + esc(g.goal) + '">' + esc(g.goal) + '</span>';
+      html += badge(g.status);
       html += '<div class="actions">';
-      if (isReviewing) {
-        html += '<button class="ghost" data-action="openConflictReview" data-wu="' + esc(wu.workUnitId) + '">View Conflict →</button>';
+      if (isGoalStore && isPaused) {
+        html += '<button class="ghost" data-action="resumeGoal" data-gid="' + esc(goalId) + '" style="color:var(--nm-success);border-color:var(--nm-success)">▶ Resume</button>';
+      } else if (isGoalStore && !isTerminal) {
+        html += '<button class="ghost" data-action="pauseGoal" data-gid="' + esc(goalId) + '" style="color:var(--nm-warn);border-color:var(--nm-warn)">⏸ Pause</button>';
       }
-      html += '<button class="ghost" data-action="spawnAgent" data-wu="' + esc(wu.workUnitId) + '">Spawn</button>';
+      if (isReviewing) {
+        html += '<button class="ghost" data-action="openConflictReview" data-wu="' + esc(g.workUnitId) + '">View Conflict →</button>';
+      }
+      if (!isTerminal && !isPaused) {
+        html += '<button class="ghost" data-action="spawnAgent" data-wu="' + esc(g.workUnitId) + '">Spawn</button>';
+      }
+      html += '<button class="ghost" data-action="markKnownGood" data-wu="' + esc(g.workUnitId) + '" data-branch="' + esc(g.branchId) + '" title="Tag this work unit\\'s current branch as a Known Good State">Tag KGS</button>';
+      if (!isTerminal) {
+        html += '<button class="danger" data-action="cancelWorkUnit" data-wu="' + esc(g.workUnitId) + '">Stop</button>';
+      }
       html += '</div>';
       html += '</div>';
+      if (isPaused && g.pauseReason) {
+        html += '<div class="row"><span class="mono" style="color:var(--nm-warn)">⏸ ' + esc(g.pauseReason) + '</span></div>';
+      }
       html += '<div class="row">';
-      html += '<span class="mono">' + esc(wu.workUnitId) + '</span>';
-      html += '<span class="mono">branch: ' + esc(wu.branchId) + '</span>';
-      html += '<span class="mono">owner: ' + esc(wu.owner) + '</span>';
+      html += '<span class="mono">' + esc(g.workUnitId) + '</span>';
+      html += '<span class="mono">fork: ' + esc(g.branchId) + '</span>';
+      if (g.owner) { html += '<span class="mono">owner: ' + esc(g.owner) + '</span>'; }
+      if (g.reviewPolicy && g.reviewPolicy !== 'HumanRequired') {
+        var rp = g.reviewPolicy === 'AgentApproval' ? '🤖 Agent Approval' : '⏱ Hybrid';
+        html += '<span class="badge reviewing">' + rp + '</span>';
+      }
+      if (globalUsePromotionBranch) {
+        html += '<span class="badge" title="Applies land on ' + esc(globalCandidateBranchId) + '; promote to main manually">→ ' + esc(globalCandidateBranchId) + '</span>';
+      }
       html += '</div>';
       html += '</div>';
     }
     el.innerHTML = html;
+    el.querySelectorAll('[data-action="pauseGoal"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'dashboardGoalPause', goalId: btn.getAttribute('data-gid') });
+      });
+    });
+    el.querySelectorAll('[data-action="resumeGoal"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'dashboardGoalResume', goalId: btn.getAttribute('data-gid') });
+      });
+    });
     el.querySelectorAll('[data-action="spawnAgent"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: 'spawnAgent', workUnitId: btn.getAttribute('data-wu') });
@@ -438,48 +812,209 @@ const DASHBOARD_JS = `
         vscode.postMessage({ type: 'openConflictReview', workUnitId: btn.getAttribute('data-wu') });
       });
     });
+    el.querySelectorAll('[data-action="cancelWorkUnit"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'cancelWorkUnit', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+    el.querySelectorAll('[data-action="markKnownGood"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'markKnownGood', workUnitId: btn.getAttribute('data-wu'), branchId: btn.getAttribute('data-branch') });
+      });
+    });
   }
 
-  function renderAgents(agents, wus) {
+  function renderAgents(agents, goals) {
     var el = document.getElementById('agents');
     if (!agents || !agents.length) {
-      el.innerHTML = '<p class="empty">No agents.</p>';
+      el.innerHTML = '<p class="empty">No running agents.</p>';
       return;
     }
-    var wuMap = {};
-    for (var j = 0; j < (wus || []).length; j++) { wuMap[wus[j].workUnitId] = wus[j]; }
+    var goalMap = {};
+    for (var j = 0; j < (goals || []).length; j++) { goalMap[goals[j].workUnitId] = goals[j]; }
     var html = '';
     for (var i = 0; i < agents.length; i++) {
       var a = agents[i];
-      var wu = wuMap[a.workUnitId];
-      var isPaused = (a.status || '').toLowerCase() === 'paused';
+      var wu = goalMap[a.workUnitId];
+      var statusLower = (a.status || '').toLowerCase();
+      var isPaused = statusLower === 'paused';
+      var isInterrupted = statusLower === 'interrupted';
       html += '<div class="card">';
       html += '<div class="row">';
       html += '<span class="title mono">' + esc(a.agentId) + '</span>';
       html += badge(a.status);
       html += '<div class="actions">';
-      if (isPaused) {
+      // Phase 11 — deep-links into Goal Workspace's Decision Lens Conversation tab; the
+      // transcript is durable, so this is offered regardless of pause/interrupted/active state.
+      html += '<button class="ghost" data-action="viewTranscript" data-wu="' + esc(a.workUnitId) + '">View live transcript</button>';
+      if (isInterrupted) {
+        html += '<button class="ghost" data-action="resumeInterrupted" data-wu="' + esc(a.workUnitId) + '">↺ Resume</button>';
+      } else if (isPaused) {
         html += '<button class="ghost" data-action="resumeAgent" data-id="' + esc(a.agentId) + '">Resume</button>';
+        html += '<button class="danger" data-action="stopAgent" data-id="' + esc(a.agentId) + '">Stop</button>';
       } else {
         html += '<button class="ghost" data-action="pauseAgent" data-id="' + esc(a.agentId) + '">Pause</button>';
+        html += '<button class="danger" data-action="stopAgent" data-id="' + esc(a.agentId) + '">Stop</button>';
       }
-      html += '<button class="danger" data-action="stopAgent" data-id="' + esc(a.agentId) + '">Stop</button>';
       html += '</div>';
       html += '</div>';
+      if (statusLower === 'active' && a.currentActivity) {
+        html += '<div class="row"><span class="pulse"></span><span class="mono">' + esc(a.currentActivity) + '</span></div>';
+      }
       if (wu) {
         html += '<div class="row"><span class="mono">' + esc(wu.goal) + '</span></div>';
       }
       html += '</div>';
     }
     el.innerHTML = html;
-    el.querySelectorAll('[data-action]').forEach(function(btn) {
+    el.querySelectorAll('[data-action="resumeInterrupted"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'spawnAgent', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+    el.querySelectorAll('[data-action="viewTranscript"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'activityViewTranscript', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+    el.querySelectorAll('[data-action="pauseAgent"],[data-action="resumeAgent"],[data-action="stopAgent"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: btn.getAttribute('data-action'), agentId: btn.getAttribute('data-id') });
       });
     });
   }
 
-  var MERGE_STATUS_COLOR = {
+  // Phase 8c — worker-level scheduler items a Host restart interrupted mid-execution. Mirrors
+  // the orchestrator-level "Interrupted" card above: no silent auto-resume, a human must click
+  // Resume (or Resume All for a busy fan-out with many interrupted children).
+  function renderAwaitingResume(items) {
+    var el = document.getElementById('awaiting-resume');
+    var resumeAllBtn = document.getElementById('btn-resume-all');
+    if (!items || !items.length) {
+      el.innerHTML = '<p class="empty">Nothing awaiting resume.</p>';
+      resumeAllBtn.style.display = 'none';
+      return;
+    }
+    resumeAllBtn.style.display = '';
+    var html = '';
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      html += '<div class="card">';
+      html += '<div class="row">';
+      html += '<span class="title mono">' + esc(it.workUnitId) + '</span>';
+      html += '<span class="badge">' + esc(it.profileId) + '</span>';
+      html += '<div class="actions">';
+      html += '<button class="ghost" data-action="resumeWorker" data-wu="' + esc(it.workUnitId) + '">↺ Resume</button>';
+      html += '</div>';
+      html += '</div>';
+      html += '</div>';
+    }
+    el.innerHTML = html;
+    el.querySelectorAll('[data-action="resumeWorker"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'resumeWorker', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+  }
+
+  function relTime(iso) {
+    var ms = Date.now() - Date.parse(iso);
+    if (!isFinite(ms)) { return 'unknown age'; }
+    var mins = Math.floor(ms / 60000);
+    if (mins < 1) { return 'just now'; }
+    if (mins < 60) { return mins + 'm ago'; }
+    var hrs = Math.floor(mins / 60);
+    if (hrs < 24) { return hrs + 'h ago'; }
+    var days = Math.floor(hrs / 24);
+    return days + 'd ago';
+  }
+
+  function renderClarifications(items, metrics) {
+    var el = document.getElementById('clarifications');
+    if (!items || !items.length) {
+      el.innerHTML = '<p class="empty">No active clarification requests.</p>';
+    } else {
+      // Group by goal label, preserving insertion order.
+      var groupOrder = [];
+      var groups = {};
+      for (var i = 0; i < items.length; i++) {
+        var c = items[i];
+        var key = c.goal || c.workUnitId;
+        if (!groups[key]) { groups[key] = []; groupOrder.push(key); }
+        groups[key].push(c);
+      }
+      var html = '';
+      for (var gi = 0; gi < groupOrder.length; gi++) {
+        var groupKey = groupOrder[gi];
+        var groupItems = groups[groupKey];
+        html += '<div style="margin-bottom:10px">';
+        html += '<div style="font-size:0.75em;opacity:0.55;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px;padding:0 2px">' + esc(groupKey) + '</div>';
+        for (var j = 0; j < groupItems.length; j++) {
+          var c = groupItems[j];
+          var statusBadge = c.awaitingResume ? 'awaiting' : c.status;
+          html += '<div class="card">';
+          html += '<div class="row">';
+          html += '<span class="title mono" title="' + esc(c.requestId) + '">' + esc(c.question) + '</span>';
+          html += '<span class="badge ' + (c.awaitingResume ? 'paused' : '') + '">' + esc(statusBadge) + '</span>';
+          html += '<div class="actions">';
+          html += '<button class="ghost" data-action="respondClarification" data-rid="' + esc(c.requestId) + '" data-wu="' + esc(c.workUnitId) + '" style="color:var(--nm-success);border-color:var(--nm-success)">Respond</button>';
+          html += '</div>';
+          html += '</div>';
+          if (c.context) {
+            html += '<div class="row"><span class="mono" style="opacity:0.7">context: ' + esc(c.context) + '</span></div>';
+          }
+          if (c.options && c.options.length) {
+            html += '<div class="row"><span class="mono">options: ' + esc(c.options.join(' | ')) + '</span></div>';
+          }
+          if (c.timeoutAt) {
+            var now = Date.now();
+            var timeoutMs = new Date(c.timeoutAt).getTime() - now;
+            var timeoutLabel = timeoutMs > 0
+              ? 'auto-' + esc(c.timeoutBehavior || 'continue') + ' in ' + Math.ceil(timeoutMs / 1000) + 's'
+              : 'timed out (auto-' + esc(c.timeoutBehavior || 'continue') + ')';
+            html += '<div class="row"><span class="mono" style="color:var(--nm-warn)">⏱ ' + timeoutLabel + '</span></div>';
+          }
+          html += '<div class="row">';
+          html += '<span class="mono">age: ' + esc(relTime(c.requestedAt)) + '</span>';
+          html += '<span class="mono">blocking: ' + esc(String(!!c.blocking)) + '</span>';
+          if (c.sessionId) { html += '<span class="mono">session: ' + esc(c.sessionId) + '</span>'; }
+          html += '</div>';
+          html += '</div>';
+        }
+        html += '</div>';
+      }
+      el.innerHTML = html;
+      el.querySelectorAll('[data-action="respondClarification"]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var rid = btn.getAttribute('data-rid');
+          var wu = btn.getAttribute('data-wu');
+          var found = null;
+          for (var j = 0; j < items.length; j++) {
+            if (String(items[j].requestId) === String(rid)) { found = items[j]; break; }
+          }
+          vscode.postMessage({ type: 'respondClarification', requestId: rid, workUnitId: wu, options: found ? found.options : [] });
+        });
+      });
+    }
+
+    var met = document.getElementById('clarification-metrics');
+    if (!metrics) {
+      met.innerHTML = '<p class="empty">No clarification metrics yet.</p>';
+      return;
+    }
+    var top = (metrics.perGoal || []).slice(0, 5).map(function(g) {
+      return '<span class="mono">' + esc(g.goal) + ': ' + esc(String(g.requests)) + ' req / ' + esc(String(g.answered)) + ' answered / ' + esc(String(g.abandoned)) + ' abandoned</span>';
+    }).join('<br/>');
+    met.innerHTML =
+      '<div class="card">' +
+      '<div class="row"><span class="mono">requests: ' + esc(String(metrics.requests || 0)) + '</span>' +
+      '<span class="mono">answered: ' + esc(String(metrics.answered || 0)) + '</span>' +
+      '<span class="mono">abandoned: ' + esc(String(metrics.abandoned || 0)) + '</span></div>' +
+      (top ? '<div class="row">' + top + '</div>' : '<div class="row"><span class="empty">No per-goal data.</span></div>') +
+      '</div>';
+  }
+
+  var DECISION_STATUS_COLOR = {
     draft:          '',
     readyforreview: 'active',
     approved:       'active',
@@ -487,25 +1022,25 @@ const DASHBOARD_JS = `
     merged:         'stopped',
   };
 
-  function renderMerges(merges) {
-    var el = document.getElementById('merges');
+  function renderPendingDecisions(merges) {
+    var el = document.getElementById('decisions');
     if (!merges || !merges.length) {
-      el.innerHTML = '<p class="empty">No merge proposals.</p>';
+      el.innerHTML = '<p class="empty">No pending decisions.</p>';
       return;
     }
     var html = '';
     for (var i = 0; i < merges.length; i++) {
       var m = merges[i];
       var statusKey = (m.status || '').toLowerCase().replace(/\\s+/g, '');
-      var badgeClass = 'badge ' + (MERGE_STATUS_COLOR[statusKey] || '');
-      var canReview = statusKey === 'readyforreview' || statusKey === 'approved' || statusKey === 'draft';
+      var badgeClass = 'badge ' + (DECISION_STATUS_COLOR[statusKey] || '');
+      var canReview = statusKey === 'readyforreview' || statusKey === 'approved' || statusKey === 'draft' || statusKey === 'proposed' || statusKey === 'executing' || statusKey === 'merge';
       html += '<div class="card">';
       html += '<div class="row">';
       html += '<span class="title" title="' + esc(m.goal) + '">' + esc(m.goal) + '</span>';
       html += '<span class="' + badgeClass + '">' + esc(m.status) + '</span>';
       if (canReview) {
         html += '<div class="actions">';
-        html += '<button class="ghost" data-action="openMergeReview" data-pid="' + esc(m.proposalId) + '">Review →</button>';
+        html += '<button class="ghost" data-action="openMergeReview" data-pid="' + esc(m.proposalId) + '">Review Decision →</button>';
         html += '</div>';
       }
       html += '</div>';
@@ -522,18 +1057,18 @@ const DASHBOARD_JS = `
     });
   }
 
-  function renderFailures(deadLetters, workUnits) {
-    var el = document.getElementById('failures');
+  function renderBlockedExplorations(deadLetters, goals) {
+    var el = document.getElementById('blocked');
     if (!deadLetters || !deadLetters.length) {
-      el.innerHTML = '<p class="empty">No failures.</p>';
+      el.innerHTML = '<p class="empty">No blocked explorations.</p>';
       return;
     }
-    var wuMap = {};
-    for (var j = 0; j < (workUnits || []).length; j++) { wuMap[workUnits[j].workUnitId] = workUnits[j]; }
+    var goalMap = {};
+    for (var j = 0; j < (goals || []).length; j++) { goalMap[goals[j].workUnitId] = goals[j]; }
     var html = '';
     for (var i = 0; i < deadLetters.length; i++) {
       var dl = deadLetters[i];
-      var wu = wuMap[dl.workUnitId];
+      var wu = goalMap[dl.workUnitId];
       var goal = wu ? wu.goal : dl.workUnitId;
       var canRetry = !dl.maxAttemptsReached && dl.attemptCount < 3;
       html += '<div class="card">';
@@ -548,8 +1083,8 @@ const DASHBOARD_JS = `
       }
       html += '</div></div>';
       html += '<div class="row">';
-      html += '<span class="mono">stage: ' + esc(dl.stage) + '</span>';
-      html += '<span class="mono">profile: ' + esc(dl.profileId) + '</span>';
+      html += '<span class="mono">phase: ' + esc(dl.stage) + '</span>';
+      html += '<span class="mono">model: ' + esc(dl.profileId) + '</span>';
       html += '<span class="mono">attempt ' + esc(String(dl.attemptCount)) + '/3</span>';
       html += '</div>';
       html += '<div class="row"><span class="mono">' + esc(dl.reason) + '</span></div>';
@@ -563,14 +1098,96 @@ const DASHBOARD_JS = `
     });
   }
 
+  // Phase 12 — only leases with a non-empty wait queue are actionable (a held lease with no
+  // waiter is just normal in-flight work); "Force Release" is the manual-override path for a
+  // holder that crashed mid-write, leaving no live agent to Stop and no proposal to reject.
+  function renderFileLeases(leases, goals) {
+    var el = document.getElementById('file-leases');
+    var contested = (leases || []).filter(function(l) { return l.waitQueue && l.waitQueue.length > 0; });
+    if (!contested.length) {
+      el.innerHTML = '<p class="empty">No file lease conflicts.</p>';
+      return;
+    }
+    var goalMap = {};
+    for (var j = 0; j < (goals || []).length; j++) { goalMap[goals[j].workUnitId] = goals[j]; }
+    function label(workUnitId) {
+      var wu = goalMap[workUnitId];
+      return wu ? wu.goal : workUnitId;
+    }
+    var html = '';
+    for (var i = 0; i < contested.length; i++) {
+      var l = contested[i];
+      html += '<div class="card">';
+      html += '<div class="row">';
+      html += '<span class="title mono" title="' + esc(l.path) + '">' + esc(l.path) + '</span>';
+      html += '<span class="badge interrupted">' + esc(String(l.waitQueue.length)) + ' waiting</span>';
+      html += '<div class="actions">';
+      html += '<button class="danger" data-action="releaseFileLease" data-wu="' + esc(l.holderWorkUnitId) + '">Force Release</button>';
+      html += '</div>';
+      html += '</div>';
+      html += '<div class="row"><span class="mono">held by: ' + esc(label(l.holderWorkUnitId)) + '</span></div>';
+      html += '<div class="row"><span class="mono">queued: ' + esc(l.waitQueue.map(label).join(', ')) + '</span></div>';
+      html += '</div>';
+    }
+    el.innerHTML = html;
+    el.querySelectorAll('[data-action="releaseFileLease"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'releaseFileLease', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+  }
+
   window.addEventListener('message', function(event) {
     var msg = event.data;
+    if (msg.type === 'updateSessionPicker' && msg.panelId === 'shell-pane-execution-timeline') {
+      var sel = document.getElementById('et-session-override');
+      if (sel) {
+        var shellLabel = msg.shellSessionId ? ' (' + String(msg.shellSessionId).slice(0, 8) + '…)' : '';
+        sel.innerHTML = '<option value="">Follow Workspace' + esc(shellLabel) + '</option>';
+        for (var i = 0; i < (msg.sessions || []).length; i++) {
+          var s = msg.sessions[i];
+          var opt = document.createElement('option');
+          opt.value = s.sessionId;
+          opt.textContent = String(s.sessionId).slice(0, 12) + '… (' + s.status + ')';
+          sel.appendChild(opt);
+        }
+        sel.value = msg.overrideSessionId || '';
+      }
+      return;
+    }
     if (msg.type !== 'data') { return; }
-    renderWorkUnits(msg.workUnits);
+    if (typeof msg.usePromotionBranch !== 'undefined') {
+      globalUsePromotionBranch = !!msg.usePromotionBranch;
+      globalCandidateBranchId = msg.candidateBranchId || 'candidate';
+    }
+    renderActiveGoals(msg.goals && msg.goals.length ? msg.goals : msg.workUnits, !!msg.goals);
     renderAgents(msg.agents, msg.workUnits);
-    renderMerges(msg.merges);
-    renderFailures(msg.deadLetters || [], msg.workUnits);
+    renderAwaitingResume(msg.awaitingResume || []);
+    renderClarifications(msg.clarifications || [], msg.clarificationMetrics || null);
+    renderPendingDecisions(msg.merges);
+    renderBlockedExplorations(msg.deadLetters || [], msg.workUnits);
+    renderFileLeases(msg.fileLeases || [], msg.workUnits);
+    renderSyncGraph(msg.syncGraph || { frontierHeads: [] });
     var ts = document.getElementById('last-updated');
     if (ts) { ts.textContent = 'updated ' + new Date().toLocaleTimeString(); }
   });
+
+  function renderSyncGraph(data) {
+    var el = document.getElementById('sync-graph');
+    if (!el) { return; }
+    var heads = (data && data.frontierHeads) ? data.frontierHeads : [];
+    if (heads.length === 0) {
+      el.innerHTML = '<div class="sync-graph-card"><div class="sg-label">CRDT Causal Graph</div>' +
+        '<span class="sg-empty">No promoted checkpoints — frontier is empty.</span></div>';
+      return;
+    }
+    var headsHtml = heads.map(function(h) {
+      return '<span class="sg-badge">' + h.slice(0, 8) + '…' + h.slice(-4) + '</span>';
+    }).join('');
+    el.innerHTML = '<div class="sync-graph-card">' +
+      '<div class="sg-label">CRDT Causal Graph</div>' +
+      '<span class="sg-promoted">&#x25CF; ' + heads.length + ' frontier head' + (heads.length === 1 ? '' : 's') + '</span>' +
+      '<div class="sg-heads">' + headsHtml + '</div>' +
+      '</div>';
+  }
 `;

@@ -5,6 +5,10 @@
   "publisher": "nodalmerge",
   "version": "0.1.0",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bgstratt/nodalmerge-studio.git"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -27,20 +31,44 @@
       },
       {
         "command": "nodalmerge.openMergeReview",
-        "title": "NodalMerge: Open Merge Review"
+        "title": "NodalMerge: Open Review"
       },
       {
         "command": "nodalmerge.openMergeReviewConflict",
-        "title": "NodalMerge: Open Merge Conflict"
+        "title": "NodalMerge: Open Decision Conflict"
+      },
+      {
+        "command": "nodalmerge.openInsights",
+        "title": "NodalMerge: Open Insights"
+      },
+      {
+        "command": "nodalmerge.startLocalRuntime",
+        "title": "NodalMerge: Start Local Runtime"
       }
     ],
     "configuration": {
       "title": "NodalMerge Studio",
       "properties": {
+        "nodalmerge.runtimeUri": {
+          "type": "string",
+          "default": "",
+          "description": "Base URI of the NodalMerge Studio runtime (e.g. http://192.168.1.10:5080). Empty (default) connects to a locally-managed runtime on 127.0.0.1:5080. Set this to point the extension at a standalone or remote runtime instead."
+        },
         "nodalmerge.hostPort": {
           "type": "number",
           "default": 5080,
+          "deprecationMessage": "Deprecated — use nodalmerge.runtimeUri instead (e.g. \"http://127.0.0.1:5081\").",
           "description": "Port the Studio Host listens on."
+        },
+        "nodalmerge.workspaceDataPath": {
+          "type": "string",
+          "default": "",
+          "description": "Where Studio stores branch files, the node-store database, and blobs. Empty (default) uses VS Code's per-workspace extension storage, outside your repository. Set a relative path (e.g. \".nodalmerge\") to store it inside this repo instead, or an absolute path to use a custom location."
+        },
+        "nodalmerge.repositoryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the repository Studio should operate against (seed branches from, build/test/run in). Empty (default) uses the first folder open in this VS Code window. Set this to point Studio at a different checkout than the one currently open."
         },
         "nodalmerge.agentProfiles": {
           "type": "array",
@@ -52,13 +80,16 @@
             "properties": {
               "id":               { "type": "string", "description": "Agent type identifier (used as agentType when spawning)." },
               "label":            { "type": "string", "description": "Display name shown in UI." },
-              "domain":           { "type": "string", "description": "Task domain this agent handles (e.g. 'docs', 'code', 'demo')." },
-              "provider":         { "type": "string", "enum": ["anthropic", "openai", "vscode-lm"], "description": "LLM provider for this profile." },
+              "domain":           { "type": "string", "description": "Task domain this agent handles (e.g. 'docs', 'code', 'security')." },
+              "deploymentMode":   { "type": "string", "enum": ["inline", "headless"], "default": "inline", "description": "How this agent is deployed. 'inline' = in-process managed by the runtime (default). 'headless' = standalone peer process; vscode-lm provider is not available in this mode." },
+              "provider":         { "type": "string", "enum": ["anthropic", "openai", "vscode-lm"], "description": "LLM provider. vscode-lm is only valid for inline deploymentMode." },
               "model":            { "type": "string", "description": "Model identifier (e.g. claude-sonnet-4-6, gpt-4o)." },
               "baseUrl":          { "type": "string", "description": "API base URL (not used for vscode-lm)." },
-              "apiKeyRef":        { "type": "string", "description": "Secret storage key for the API key." },
-              "modelHint":        { "type": "string", "description": "Deprecated — use model instead." },
-              "systemPromptHint": { "type": "string", "description": "Optional context passed to the agent when spawned." }
+              "apiKeyRef":        { "type": "string", "description": "Secret storage key for the API key (inline agents). Headless agents manage their own credentials." },
+              "systemPrompt":     { "type": "string", "description": "System prompt passed to the agent when spawned. Overrides any runtime default for this domain." },
+              "tools":            { "type": "array", "items": { "type": "string" }, "description": "Allowlist of MCP tool names this agent may call. Empty array means all tools are permitted." },
+              "modelHint":        { "type": "string", "deprecationMessage": "Deprecated — use model instead.", "description": "Deprecated — use model instead." },
+              "systemPromptHint": { "type": "string", "deprecationMessage": "Deprecated — use systemPrompt instead.", "description": "Deprecated — use systemPrompt instead." }
             }
           }
         },
@@ -90,6 +121,38 @@
           "type": "string",
           "default": "",
           "description": "Name of the topology template to use when spawning a new workspace."
+        },
+        "nodalmerge.defaultReviewPolicy": {
+          "type": "string",
+          "enum": ["HumanRequired", "AgentApproval", "Hybrid"],
+          "default": "HumanRequired",
+          "description": "Default review policy applied to new work units created in the Goal Workspace."
+        },
+        "nodalmerge.requireBuildBeforeProposal": {
+          "type": "boolean",
+          "default": false,
+          "description": "Require passing build before proposal submission."
+        },
+        "nodalmerge.requireTestBeforeProposal": {
+          "type": "boolean",
+          "default": false,
+          "description": "Require passing tests before proposal submission."
+        },
+        "nodalmerge.buildCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Global build command (empty = auto-detect per branch)."
+        },
+        "nodalmerge.testCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Global test command (empty = auto-detect per branch)."
+        },
+        "nodalmerge.postMergeExecutionMode": {
+          "type": "string",
+          "default": "Disabled",
+          "enum": ["Disabled", "Async", "Blocking"],
+          "description": "Post-merge execution mode: Disabled (no execution), Async (background fire-and-forget), Blocking (synchronous with rollback on failure)."
         }
       }
     }
@@ -98,11 +161,14 @@
     "compile":   "node esbuild.config.mjs",
     "watch":     "node esbuild.config.mjs --watch",
     "package":   "node esbuild.config.mjs --production && vsce package --no-dependencies",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build-vsix": "pwsh -File scripts/build-vsix.ps1",
+    "publish-vsix": "pwsh -File scripts/build-vsix.ps1 -Publish"
   },
   "devDependencies": {
     "@types/node":   "^22.0.0",
     "@types/vscode": "^1.90.0",
+    "@vscode/vsce":  "^3.0.0",
     "esbuild":       "^0.25.0",
     "typescript":    "^5.6.0"
   }

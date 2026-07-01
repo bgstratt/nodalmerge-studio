@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -7,13 +8,36 @@ using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Integration.Tests;
 
+// FileSystemWorkspaceService's WorkspaceOptions.RootPath defaults to a fixed temp directory
+// shared by every test in the process (and across runs, since nothing cleans it up) — see the
+// note in ProposalBranchingTests. This class writes to the literal "main" branch (not a
+// per-test GUID branch id), so without an isolated root it can race against any other test
+// running concurrently against "main" and intermittently flip Reconciled/Conflict. Give every
+// test instance its own temp workspace root, matching ProductionStorageIntegrationTests.
 [Trait("Category", "Integration")]
-public class MergeReconciliationServiceTests
+public class MergeReconciliationServiceTests : IDisposable
 {
+    private readonly string _tempRoot =
+        Path.Combine(Path.GetTempPath(), $"studio-mergereconciliation-{Guid.NewGuid():N}");
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempRoot))
+            Directory.Delete(_tempRoot, recursive: true);
+    }
+
+    private Microsoft.AspNetCore.Builder.WebApplication BuildApp() => StudioWebApplication.Build(
+        [],
+        configureConfiguration: cfg => cfg.AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Workspace:RootPath"] = _tempRoot,
+        }),
+        configureServices: s => s.AddInMemoryStorage());
+
     [Fact]
     public async Task TryReconcile_combines_non_overlapping_child_proposals()
     {
-        var app = StudioWebApplication.Build([], configureServices: s => s.AddInMemoryStorage());
+        var app = BuildApp();
 
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits    = app.Services.GetRequiredService<IWorkUnitService>();
@@ -75,7 +99,7 @@ public class MergeReconciliationServiceTests
     [Fact]
     public async Task TryReconcile_writes_conflict_report_on_overlapping_files()
     {
-        var app = StudioWebApplication.Build([], configureServices: s => s.AddInMemoryStorage());
+        var app = BuildApp();
 
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits    = app.Services.GetRequiredService<IWorkUnitService>();
@@ -136,7 +160,7 @@ public class MergeReconciliationServiceTests
     {
         // Slice 14d: two proposals touching the same file no longer conflict purely because they
         // both appear in FilesTouched — only an actual changed-line-range overlap escalates.
-        var app = StudioWebApplication.Build([], configureServices: s => s.AddInMemoryStorage());
+        var app = BuildApp();
 
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits    = app.Services.GetRequiredService<IWorkUnitService>();

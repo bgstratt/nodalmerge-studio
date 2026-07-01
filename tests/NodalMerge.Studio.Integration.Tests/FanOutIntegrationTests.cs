@@ -100,7 +100,7 @@ public class FanOutIntegrationTests
     }
 
     [Fact]
-    public async Task Dependent_slice_is_enqueued_after_dependency_reaches_Proposed()
+    public async Task Dependent_slice_is_enqueued_only_after_dependency_is_Merged()
     {
         var fakeHandler = new FanOutLlmHandler(includeDependentSlice: true);
 
@@ -129,21 +129,56 @@ public class FanOutIntegrationTests
                 baseUrl: "http://fake-llm",
                 apiKey: "fake-key");
 
-            // Wait for both slices to complete end-to-end.
+            // s2 dependsOn s1 — Phase 12 requires s1 to be Merged (not just Proposed) before s2
+            // is ever enqueued, so wait for s1's own proposal first and confirm s2 hasn't started.
+            MergeProposal? s1Proposal = null;
+            var s1Deadline = DateTimeOffset.UtcNow.AddSeconds(20);
+            while (DateTimeOffset.UtcNow < s1Deadline)
+            {
+                var children = await workUnits.GetChildrenAsync(parent.WorkUnitId);
+                var s1 = children.FirstOrDefault(c => c.FanOutInfo?.SliceId == "s1");
+                if (s1?.Status == WorkUnitStatus.Proposed)
+                {
+                    s1Proposal = (await merge.ListAsync()).FirstOrDefault(p =>
+                        p.WorkUnitId == s1.WorkUnitId && p.Status == MergeProposalStatus.ReadyForReview);
+                    if (s1Proposal is not null) break;
+                }
+                await Task.Delay(100);
+            }
+            Assert.NotNull(s1Proposal);
+
+            var stillWaitingChildren = await workUnits.GetChildrenAsync(parent.WorkUnitId);
+            var s2BeforeMerge = stillWaitingChildren.FirstOrDefault(c => c.FanOutInfo?.SliceId == "s2");
+            Assert.Equal(WorkUnitStatus.Created, s2BeforeMerge!.Status);
+
+            var approved = await merge.ReviewAsync(s1Proposal!.ProposalId, MergeProposalStatus.Approved);
+            await merge.ApplyAsync(approved.ProposalId);
+
+            // Now s2 should pick up and run all the way through to its own proposal.
             var deadline = DateTimeOffset.UtcNow.AddSeconds(35);
             while (DateTimeOffset.UtcNow < deadline)
             {
                 var children = await workUnits.GetChildrenAsync(parent.WorkUnitId);
                 var s2 = children.FirstOrDefault(c => c.FanOutInfo?.SliceId == "s2");
                 var proposals = (await merge.ListAsync()).Count(p => p.Status == MergeProposalStatus.ReadyForReview);
-                if (children.Count >= 2 && s2?.Status == WorkUnitStatus.Proposed && proposals >= 2)
+                if (children.Count >= 2 && s2?.Status == WorkUnitStatus.Proposed && proposals >= 1)
                     break;
                 await Task.Delay(100);
             }
 
             var finalChildren = await workUnits.GetChildrenAsync(parent.WorkUnitId);
             Assert.Equal(2, finalChildren.Count);
-            Assert.All(finalChildren, c => Assert.Equal(WorkUnitStatus.Proposed, c.Status));
+            var s1Final = finalChildren.Single(c => c.FanOutInfo?.SliceId == "s1");
+            var s2Final = finalChildren.Single(c => c.FanOutInfo?.SliceId == "s2");
+            Assert.Equal(WorkUnitStatus.Merged, s1Final.Status);
+            Assert.Equal(WorkUnitStatus.Proposed, s2Final.Status);
+
+            // s2's branch must contain s1's merged Foo.cs even though s2's own fileScope never
+            // declared an interest in it — only FanOutService's dependsOn-driven branch refresh
+            // puts it there, not anything s2 itself wrote.
+            var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+            var fooInS2Branch = await fileWorkspace.ReadAsync(s2Final.BranchId, "src/Foo.cs");
+            Assert.Equal("class Foo {}", fooInS2Branch);
 
             var reconciled = (await merge.ListAsync()).FirstOrDefault(p =>
                 p.WorkUnitId == parent.WorkUnitId && p.ReconciledFrom.Count >= 2);

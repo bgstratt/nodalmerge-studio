@@ -25,6 +25,7 @@ public enum ExecutionEventKind
     WorkUnitFailed,
     WorkUnitAbandoned,
     WorkUnitStatusChanged,
+    WorkUnitFileScopeChanged,
 
     // Scheduler internals
     SchedulerLeaseAcquired,
@@ -41,6 +42,7 @@ public enum ExecutionEventKind
     ArtifactRecorded,
     ArtifactProposed,
     ArtifactStatusChanged,
+    ArtifactInvalidationCascaded,
 
     // Proposal lifecycle
     ProposalApproved,
@@ -52,7 +54,25 @@ public enum ExecutionEventKind
     MergeApproved,
     MergeApplied,
 
+    // Goal lifecycle
+    GoalPaused,
+    GoalResumed,
+
     // Orchestration
     OrchestrationDecision,
     ConflictDetected,
+    ClarificationRequested,
+    ClarificationResponded,
+
+    // Phase 14 — workspace usage instrumentation
+    WorkspaceSearchExecuted,
+    WorkspaceReadExecuted,
+    FileLeaseContended,
+
+    // Slice 15g — constrained external documentation fetch audit trail
+    ExternalDocFetched,
+
+    // Slice 23 — domain-agent constraint feedback loop
+    ArtifactSurfaced,
+    ArtifactConsideredInDecision,
 }

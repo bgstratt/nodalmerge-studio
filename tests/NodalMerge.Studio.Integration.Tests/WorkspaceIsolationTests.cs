@@ -35,6 +35,15 @@ public class WorkspaceIsolationTests
         public Task<WorkUnit> SetFanOutBlockedReasonAsync(string workUnitId, string? blockedReason, CancellationToken ct = default) =>
             throw new NotSupportedException();
 
+        public Task<WorkUnit> IncrementReviewRejectionCountAsync(string workUnitId, bool automated, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<WorkUnit> IncrementFailureAttemptCountAsync(string workUnitId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<WorkUnit> AmendGoalForSteeredRetryAsync(string workUnitId, string amendedGoal, string steeringContext, string deadLetterEntryId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default)
         {
             _units.TryGetValue(workUnitId, out var wu);
@@ -49,20 +58,37 @@ public class WorkspaceIsolationTests
 
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+
+        public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class FakeFileWorkspaceService : IFileWorkspaceService
     {
         private readonly Dictionary<string, Dictionary<string, string>> _branches = new();
 
-        public Task InitBranchAsync(string branchId, string? seedFromBranchId = null, CancellationToken ct = default)
+        public Task InitBranchAsync(string branchId, string? seedFromBranchId = null, IReadOnlyList<string>? fileScope = null, CancellationToken ct = default)
         {
             _branches.TryAdd(branchId, new Dictionary<string, string>());
             return Task.CompletedTask;
         }
 
+        public Task<bool> MaterializeFileAsync(string branchId, string path, CancellationToken ct = default) =>
+            Task.FromResult(false);
+
         public Task<string?> ReadAsync(string branchId, string relativePath, CancellationToken ct = default) =>
             Task.FromResult(_branches.TryGetValue(branchId, out var files) && files.TryGetValue(relativePath, out var c) ? c : null);
+
+        public Task<IReadOnlyList<WorkspaceFileRead>> ReadManyAsync(string branchId, IReadOnlyList<string> paths, CancellationToken ct = default)
+        {
+            var files = _branches.TryGetValue(branchId, out var b) ? b : null;
+            IReadOnlyList<WorkspaceFileRead> results = paths
+                .Select(p => files is not null && files.TryGetValue(p, out var c)
+                    ? new WorkspaceFileRead(p, c, true)
+                    : new WorkspaceFileRead(p, null, false))
+                .ToList();
+            return Task.FromResult(results);
+        }
 
         public Task WriteAsync(string branchId, string relativePath, string content, CancellationToken ct = default)
         {
@@ -81,8 +107,19 @@ public class WorkspaceIsolationTests
         public Task<bool> ExistsAsync(string branchId, string relativePath, CancellationToken ct = default) =>
             Task.FromResult(_branches.TryGetValue(branchId, out var files) && files.ContainsKey(relativePath));
 
-        public Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, CancellationToken ct = default) =>
+        public Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, string? pattern = null, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<string>>(_branches.TryGetValue(branchId, out var files) ? files.Keys.ToList() : []);
+
+        public Task<(IReadOnlyList<WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(
+            string branchId, string query, string? subPath = null, string? filePattern = null,
+            bool regex = false, bool caseSensitive = false, int contextLines = 3, int maxResults = 200,
+            CancellationToken ct = default) =>
+            Task.FromResult<(IReadOnlyList<WorkspaceSearchMatch>, bool)>(([], false));
+
+        public Task<WorkspaceReplaceResult> ReplaceAsync(
+            string branchId, string relativePath, string oldText, string newText, int expectedMatches = 1,
+            CancellationToken ct = default) =>
+            Task.FromResult(new WorkspaceReplaceResult(0, 0, 0, string.Empty));
 
         public Task<string> DiffAsync(string sourceBranchId, string targetBranchId, CancellationToken ct = default) =>
             Task.FromResult(string.Empty);
@@ -95,6 +132,12 @@ public class WorkspaceIsolationTests
 
         public Task<string?> GetWorkingDirectoryAsync(string branchId, CancellationToken ct = default) =>
             Task.FromResult<string?>(_branches.ContainsKey(branchId) ? $"/fake/{branchId}" : null);
+
+        public Task<WorkspaceDiff> DiffExternalPathAsync(string branchId, string externalPath, CancellationToken ct = default) =>
+            Task.FromResult(new WorkspaceDiff([], [], [], string.Empty));
+
+        public Task ApplyExternalPathAsync(string branchId, string externalPath, CancellationToken ct = default) =>
+            Task.CompletedTask;
     }
 
     private static WorkUnit MakeWorkUnit(string id, string branchId, IReadOnlyList<string>? fileScope = null) =>

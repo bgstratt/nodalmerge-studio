@@ -150,4 +150,86 @@ public class DeadLetterIntegrationTests
             await agentRuntime.StopAsync(CancellationToken.None);
         }
     }
+
+    [Fact]
+    public async Task Retry_with_context_folds_correction_into_goal_and_resets_attempt_count()
+    {
+        var app = StudioWebApplication.Build(
+            [],
+            llmHttpClient: new HttpClient(new ExhaustingLlmHandler()),
+            configureServices: services => services.AddInMemoryStorage());
+
+        var orchestratorSvc = app.Services.GetRequiredService<IOrchestratorService>();
+        var agentRuntime    = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
+        var scheduler       = app.Services.GetRequiredService<IWorkScheduler>();
+        var deadLetter      = app.Services.GetRequiredService<IDeadLetterService>();
+        var profiles        = app.Services.GetRequiredService<IAgentProfileService>();
+        var agentControl    = app.Services.GetRequiredService<IAgentControlService>();
+        var workUnits       = app.Services.GetRequiredService<IWorkUnitService>();
+
+        await profiles.CreateAsync(new AgentProfile(
+            "exhaust-worker",
+            "Exhaust Worker",
+            PipelineStage.Execute,
+            string.Empty,
+            [McpToolNames.WorkUnitGet],
+            MaxIterations: 2,
+            FileScopePatterns: []));
+
+        await agentRuntime.StartAsync(CancellationToken.None);
+        try
+        {
+            var wu = await orchestratorSvc.CreateWorkUnitAsync(
+                goal: "Find the config file",
+                owner: "integration-test");
+
+            await agentControl.SpawnAsync(
+                "orchestrator",
+                wu.WorkUnitId,
+                model: "fake-model",
+                baseUrl: "http://fake-llm",
+                apiKey: "fake-key");
+
+            await scheduler.EnqueueAsync(
+                wu.WorkUnitId,
+                "exhaust-worker",
+                model: "fake-model",
+                baseUrl: "http://fake-llm",
+                apiKey: "fake-key");
+
+            DeadLetterEntry? entry = null;
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                entry = await deadLetter.GetLatestForWorkUnitAsync(wu.WorkUnitId);
+                if (entry is not null) break;
+                await Task.Delay(100);
+            }
+            Assert.NotNull(entry);
+
+            var statusDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
+            while (DateTimeOffset.UtcNow < statusDeadline)
+            {
+                var unit = await workUnits.GetAsync(wu.WorkUnitId);
+                if (unit?.Status == WorkUnitStatus.DeadLettered) break;
+                await Task.Delay(100);
+            }
+
+            var retry = await deadLetter.RetryWithContextAsync(
+                entry!.EntryId, "the config lives at repo root, not under src/ — start the search there");
+            Assert.Equal(DeadLetterRetryOutcome.Retried, retry.Outcome);
+
+            var pending = await scheduler.ListPendingAsync();
+            Assert.Contains(pending, p => p.WorkUnitId == wu.WorkUnitId);
+
+            var updated = await workUnits.GetAsync(wu.WorkUnitId);
+            Assert.NotNull(updated);
+            Assert.Contains("repo root, not under src/", updated!.Goal);
+            Assert.Equal(0, updated.ExecutionInfo?.FailureAttemptCount);
+        }
+        finally
+        {
+            await agentRuntime.StopAsync(CancellationToken.None);
+        }
+    }
 }

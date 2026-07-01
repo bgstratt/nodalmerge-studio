@@ -17,6 +17,15 @@ public static class LineDiffer
         return BuildHunks(diffLines, contextLines);
     }
 
+    // Phase 10 — raw per-line diff for three-way merge. Returns Context/Removed/Added lines
+    // without grouping into hunks, so callers can walk base lines and their fate in each branch.
+    public static IReadOnlyList<DiffLine> DiffRaw(string? beforeText, string? afterText)
+    {
+        var before = SplitLines(beforeText);
+        var after  = SplitLines(afterText);
+        return ComputeDiffLines(before, after);
+    }
+
     private static string[] SplitLines(string? text)
     {
         if (string.IsNullOrEmpty(text))

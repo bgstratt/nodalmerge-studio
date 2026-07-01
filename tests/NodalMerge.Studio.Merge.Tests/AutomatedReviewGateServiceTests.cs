@@ -60,6 +60,73 @@ public class AutomatedReviewGateServiceTests
         Assert.DoesNotContain((childId, WorkUnitStatus.Queued), workUnits.StatusCalls);
     }
 
+    [Fact]
+    public async Task HandleHumanRejectionAsync_retries_the_work_unit_itself_when_no_children()
+    {
+        const string workUnitId = "WU-SOLO";
+        const string proposalId = "MP-1";
+
+        var workUnits = new FakeWorkUnitService(MakeUnit(workUnitId, WorkUnitStatus.Proposed));
+        var merge = new FakeMergeService(MakeRejectedProposal(proposalId, workUnitId: workUnitId));
+        var scheduler = new FakeScheduler();
+        var artifactCommands = new FakeArtifactCommandService();
+        var gate = BuildGate(workUnits, merge, new FakeDeadLetterService(), scheduler, artifactCommands);
+
+        var result = await gate.HandleHumanRejectionAsync(proposalId, "Missing the empty-input edge case.");
+
+        Assert.Equal(AutomatedRejectionOutcome.RetriedWorkers, result.Outcome);
+        Assert.Contains((workUnitId, WorkUnitStatus.Queued), workUnits.StatusCalls);
+        Assert.Contains((workUnitId, "worker"), scheduler.Enqueued);
+        Assert.Equal(1, workUnits.Units[workUnitId].ExecutionInfo!.HumanReviewRejectionCount);
+        Assert.Single(artifactCommands.Recorded, r => r.WorkUnitId == workUnitId && r.Type == "Constraint");
+    }
+
+    [Fact]
+    public async Task HandleHumanRejectionAsync_retries_children_for_a_reconciled_fan_out_proposal()
+    {
+        const string parentId = "WU-PARENT";
+        const string childId = "WU-CHILD";
+        const string proposalId = "MP-1";
+
+        var workUnits = new FakeWorkUnitService(
+            MakeUnit(parentId, WorkUnitStatus.Proposed),
+            MakeUnit(childId, WorkUnitStatus.Proposed, parentId));
+        var merge = new FakeMergeService(MakeRejectedProposal(proposalId, workUnitId: parentId));
+        var scheduler = new FakeScheduler();
+        var gate = BuildGate(workUnits, merge, new FakeDeadLetterService(), scheduler);
+
+        var result = await gate.HandleHumanRejectionAsync(proposalId, reviewNotes: null);
+
+        Assert.Equal(AutomatedRejectionOutcome.RetriedWorkers, result.Outcome);
+        Assert.Contains((childId, WorkUnitStatus.Queued), workUnits.StatusCalls);
+        Assert.Contains((parentId, WorkUnitStatus.Executing), workUnits.StatusCalls);
+        Assert.Contains((childId, "worker"), scheduler.Enqueued);
+    }
+
+    [Fact]
+    public async Task HandleHumanRejectionAsync_escalates_to_dead_letter_after_max_rejections()
+    {
+        const string workUnitId = "WU-SOLO";
+        const string proposalId = "MP-1";
+
+        var workUnits = new FakeWorkUnitService(
+            MakeUnit(
+                workUnitId,
+                WorkUnitStatus.Proposed,
+                executionInfo: new WorkUnitExecutionInfo(FailureAttemptCount: 0, AutomatedReviewRejectionCount: 0, HumanReviewRejectionCount: 2)));
+        var merge = new FakeMergeService(MakeRejectedProposal(proposalId, workUnitId: workUnitId));
+        var deadLetter = new FakeDeadLetterService();
+        var gate = BuildGate(workUnits, merge, deadLetter);
+
+        var result = await gate.HandleHumanRejectionAsync(proposalId, "Still wrong.");
+
+        Assert.Equal(AutomatedRejectionOutcome.EscalatedToDeadLetter, result.Outcome);
+        Assert.Single(deadLetter.Calls);
+        Assert.Equal(workUnitId, deadLetter.Calls[0].WorkUnitId);
+        Assert.Contains("Still wrong", deadLetter.Calls[0].Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain((workUnitId, WorkUnitStatus.Queued), workUnits.StatusCalls);
+    }
+
     private static WorkUnit MakeUnit(
         string id,
         WorkUnitStatus status,
@@ -81,7 +148,8 @@ public class AutomatedReviewGateServiceTests
             [],
             ExecutionInfo: executionInfo);
 
-    private static MergeProposal MakeRejectedProposal(string proposalId, string reason = "Missing required file.") =>
+    private static MergeProposal MakeRejectedProposal(
+        string proposalId, string reason = "Missing required file.", string workUnitId = "WU-PARENT") =>
         new(
             proposalId,
             "feat/x",
@@ -92,13 +160,15 @@ public class AutomatedReviewGateServiceTests
             reason,
             null,
             null,
-            MergeProposalStatus.Rejected);
+            MergeProposalStatus.Rejected,
+            WorkUnitId: workUnitId);
 
     private static AutomatedReviewGateService BuildGate(
         FakeWorkUnitService workUnits,
         FakeMergeService merge,
         FakeDeadLetterService deadLetter,
-        FakeScheduler? scheduler = null)
+        FakeScheduler? scheduler = null,
+        FakeArtifactCommandService? artifactCommands = null)
     {
         scheduler ??= new FakeScheduler();
         return new AutomatedReviewGateService(
@@ -108,7 +178,8 @@ public class AutomatedReviewGateServiceTests
             scheduler,
             workUnits,
             new FakeTaskService(),
-            deadLetter);
+            deadLetter,
+            artifactCommands ?? new FakeArtifactCommandService());
     }
 
     private sealed class FakeAgentControlService(string autoReviewProfileId) : IAgentControlService
@@ -116,6 +187,8 @@ public class AutomatedReviewGateServiceTests
         public string? GetAutoReviewProfileId(string workUnitId) => autoReviewProfileId;
 
         public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
+
+        public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
 
         public Task<string> SpawnAsync(
             string agentType,
@@ -127,8 +200,12 @@ public class AutomatedReviewGateServiceTests
             string? provider = null,
             string? profileId = null,
             string? autoReviewProfileId = null,
+            IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            IReadOnlyList<string>? enabledDomainAgents = null,
             CancellationToken cancellationToken = default) =>
             Task.FromResult("agent");
+
+        public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
 
         public Task ReinvokeOrchestratorAsync(
             string workUnitId,
@@ -162,10 +239,11 @@ public class AutomatedReviewGateServiceTests
             MergeProposalStatus decision,
             string verificationResults,
             string? reviewerAgentId = null,
+            IReadOnlyList<string>? consideredArtifactIds = null,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
-        public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default) =>
+        public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false) =>
             throw new NotSupportedException();
 
         public Task<MergeProposal?> GetAsync(string proposalId, CancellationToken cancellationToken = default) =>
@@ -182,6 +260,7 @@ public class AutomatedReviewGateServiceTests
         public Task<MergeProposal> ReviewAsync(
             string proposalId,
             MergeProposalStatus decision,
+            string? notes = null,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
@@ -206,6 +285,9 @@ public class AutomatedReviewGateServiceTests
         public Task<IReadOnlyList<ArtifactRef>> GetChainAsync(string workUnitId, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
 
+        public Task<IReadOnlyList<ArtifactRef>> GetGlobalConstraintsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
+
         public Task<IReadOnlyList<ArtifactRef>> GetChildrenAsync(string parentArtifactId, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
 
@@ -213,6 +295,9 @@ public class AutomatedReviewGateServiceTests
             throw new NotSupportedException();
 
         public Task<ArtifactRef> ReparentAsync(string artifactId, string newParentArtifactId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<ArtifactRef> InvalidateAsync(string artifactId, string reason, string? sessionId = null, CancellationToken ct = default) =>
             throw new NotSupportedException();
     }
 
@@ -243,6 +328,24 @@ public class AutomatedReviewGateServiceTests
 
         public Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default) =>
             Task.CompletedTask;
+
+        public Task MarkAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task MarkAwaitingResumeAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task<IReadOnlyList<ScheduledItem>> ListAwaitingResumeAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ScheduledItem>>([]);
+
+        public Task ApproveResumeAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task<int> ApproveResumeAllAsync(CancellationToken ct = default) =>
+            Task.FromResult(0);
     }
 
     private sealed class FakeTaskService : ITaskService
@@ -306,6 +409,41 @@ public class AutomatedReviewGateServiceTests
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
+        public Task<WorkUnit> IncrementReviewRejectionCountAsync(
+            string workUnitId,
+            bool automated,
+            CancellationToken cancellationToken = default)
+        {
+            var unit = Units[workUnitId];
+            var executionInfo = unit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0);
+            executionInfo = automated
+                ? executionInfo with { AutomatedReviewRejectionCount = executionInfo.AutomatedReviewRejectionCount + 1 }
+                : executionInfo with { HumanReviewRejectionCount = executionInfo.HumanReviewRejectionCount + 1 };
+            Units[workUnitId] = unit with { ExecutionInfo = executionInfo };
+            return Task.FromResult(Units[workUnitId]);
+        }
+
+        public Task<WorkUnit> IncrementFailureAttemptCountAsync(
+            string workUnitId,
+            CancellationToken cancellationToken = default)
+        {
+            var unit = Units[workUnitId];
+            var executionInfo = (unit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with
+            {
+                FailureAttemptCount = (unit.ExecutionInfo?.FailureAttemptCount ?? 0) + 1,
+            };
+            Units[workUnitId] = unit with { ExecutionInfo = executionInfo };
+            return Task.FromResult(Units[workUnitId]);
+        }
+
+        public Task<WorkUnit> AmendGoalForSteeredRetryAsync(
+            string workUnitId,
+            string amendedGoal,
+            string steeringContext,
+            string deadLetterEntryId,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             Task.FromResult(Units.TryGetValue(workUnitId, out var unit) ? unit : null);
 
@@ -318,6 +456,62 @@ public class AutomatedReviewGateServiceTests
 
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+
+        public Task<WorkUnit> SetFileScopeAsync(
+            string workUnitId,
+            IReadOnlyList<string> fileScope,
+            string? sessionId = null,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+    }
+
+    private sealed class FakeArtifactCommandService : IArtifactCommandService
+    {
+        public List<(string WorkUnitId, string Type, string Title, string Body)> Recorded { get; } = [];
+
+        public Task<ArtifactRef> RecordAsync(
+            string workUnitId,
+            string type,
+            string title,
+            string body,
+            string? parentArtifactId = null,
+            CancellationToken ct = default)
+        {
+            Recorded.Add((workUnitId, type, title, body));
+            return Task.FromResult(new ArtifactRef(
+                $"KA-{Guid.NewGuid():N}",
+                Enum.Parse<ArtifactType>(type),
+                parentArtifactId ?? workUnitId,
+                ArtifactStatus.Active,
+                DateTimeOffset.UtcNow,
+                workUnitId,
+                null,
+                title,
+                body));
+        }
+
+        public Task<IReadOnlyList<ArtifactRef>> QueryAsync(
+            string workUnitId, string? type = null, string? keywords = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
+
+        public Task<ArtifactRef> RecordPlanAsync(string workUnitId, string planContent, CancellationToken ct = default) =>
+            Task.FromResult(new ArtifactRef(
+                $"PLAN-{Guid.NewGuid():N}",
+                ArtifactType.Plan,
+                workUnitId,
+                ArtifactStatus.Active,
+                DateTimeOffset.UtcNow,
+                workUnitId,
+                null,
+                "Plan",
+                planContent));
+
+        public Task<IReadOnlyList<ArtifactRef>> ListAsync(
+            string workUnitId, bool includeAncestors = true, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
+
+        public Task<ArtifactRef> InvalidateAsync(string artifactId, string reason, string? sessionId = null, CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class FakeDeadLetterService : IDeadLetterService
@@ -333,6 +527,10 @@ public class AutomatedReviewGateServiceTests
             string? taskId = null,
             string? lastProjectionSnapshot = null,
             string? sessionId = null,
+            string? model = null,
+            string? baseUrl = null,
+            string? apiKey = null,
+            string? provider = null,
             CancellationToken cancellationToken = default)
         {
             Calls.Add((workUnitId, agentId, stage, profileId, reason));
@@ -362,6 +560,27 @@ public class AutomatedReviewGateServiceTests
             Task.FromResult<IReadOnlyList<DeadLetterEntry>>([]);
 
         public Task<DeadLetterRetryResult> RetryAsync(string entryId, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried));
+
+        public Task<DeadLetterRetryResult> RetryWithCredentialOverrideAsync(
+            string entryId,
+            string? overrideModel,
+            string? overrideBaseUrl,
+            string? overrideApiKey,
+            string? overrideProvider,
+            string? overrideProfileId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried));
+
+        public Task<DeadLetterRetryResult> RetryWithContextAsync(
+            string entryId,
+            string steeringContext,
+            string? overrideModel = null,
+            string? overrideBaseUrl = null,
+            string? overrideApiKey = null,
+            string? overrideProvider = null,
+            string? overrideProfileId = null,
+            CancellationToken cancellationToken = default) =>
             Task.FromResult(new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried));
     }
 }

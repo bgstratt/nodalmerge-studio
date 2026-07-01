@@ -13,15 +13,23 @@
 .vs/
 .idea/
 
+# Local notes and deferred plans
+*.local.md
+
 # Local secrets and overrides
 appsettings.*.local.json
 **/secrets.json
 
 # Local artifacts
 artifacts/
+CoverageReport/
 
 # Studio Host runtime data — Sqlite node store + file blob store (Slice 0a persistence)
 src/NodalMerge.Studio.Host/data/
+
+# VSCode extension build artifacts
+clients/vscode-extension/out/
+clients/vscode-extension/dist/
 
 # OS
 .DS_Store

@@ -33,14 +33,16 @@ public class NonOverlappingFileScopeFanOutTests
 
         var orchestrator  = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits     = app.Services.GetRequiredService<IWorkUnitService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts     = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut        = app.Services.GetRequiredService<IFanOutService>();
         var options       = app.Services.GetRequiredService<WorkspaceOptions>();
 
         Assert.False(options.BlockOverlappingFileScope);
 
         var parent = await orchestrator.CreateWorkUnitAsync("Build Foo", "test");
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, PlanJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}", ArtifactType.Plan, parent.WorkUnitId,
+            ArtifactStatus.Active, DateTimeOffset.UtcNow, parent.WorkUnitId, null, "Plan", PlanJson));
 
         var result = await fanOut.TryFanOutFromPlanAsync(parent.WorkUnitId);
 
@@ -59,7 +61,7 @@ public class NonOverlappingFileScopeFanOutTests
 
         var orchestrator  = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits     = app.Services.GetRequiredService<IWorkUnitService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts     = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut        = app.Services.GetRequiredService<IFanOutService>();
         var options       = app.Services.GetRequiredService<WorkspaceOptions>();
         var decisionLog   = app.Services.GetRequiredService<IOrchestrationDecisionLogService>();
@@ -67,7 +69,9 @@ public class NonOverlappingFileScopeFanOutTests
         options.BlockOverlappingFileScope = true;
 
         var parent = await orchestrator.CreateWorkUnitAsync("Build Foo", "test");
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, PlanJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}", ArtifactType.Plan, parent.WorkUnitId,
+            ArtifactStatus.Active, DateTimeOffset.UtcNow, parent.WorkUnitId, null, "Plan", PlanJson));
 
         var result = await fanOut.TryFanOutFromPlanAsync(parent.WorkUnitId);
 
@@ -97,14 +101,16 @@ public class NonOverlappingFileScopeFanOutTests
 
         var orchestrator  = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits     = app.Services.GetRequiredService<IWorkUnitService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts     = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut        = app.Services.GetRequiredService<IFanOutService>();
         var options       = app.Services.GetRequiredService<WorkspaceOptions>();
 
         options.BlockOverlappingFileScope = true;
 
         var parent = await orchestrator.CreateWorkUnitAsync("Build Foo", "test");
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, PlanJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}", ArtifactType.Plan, parent.WorkUnitId,
+            ArtifactStatus.Active, DateTimeOffset.UtcNow, parent.WorkUnitId, null, "Plan", PlanJson));
 
         await fanOut.TryFanOutFromPlanAsync(parent.WorkUnitId);
 

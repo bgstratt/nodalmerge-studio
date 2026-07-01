@@ -10,56 +10,24 @@ namespace NodalMerge.Studio.AgentRuntime;
 internal sealed class OrchestratorAgentLoop(
     string agentId,
     string workUnitId,
-    string provider,
-    string model,
-    string baseUrl,
-    string apiKey,
-    McpToolDispatcher dispatcher,
-    LlmClient llm,
+    IAgentToolClient client,
     IArtifactLineageService artifactLineage,
     IProjectionManager projections,
     IOrchestrationDecisionLogService decisionLog,
     IFanOutService fanOut,
     IMergeReconciliationService mergeReconciliation,
     IAutomatedReviewGateService automatedReview,
+    IMergeService merge,
     IWorkUnitService workUnits,
+    IFindingService findings,
     AgentProfile? profile = null,
     string? sessionId = null,
-    int stallDetectionCycles = 4)
+    int stallDetectionCycles = 4,
+    Action<string?>? onActivity = null,
+    IConversationLogService? conversationLog = null,
+    IAgentControlService? agentControl = null)
 {
-    private static readonly string DefaultSystemPrompt =
-        """
-        You are an OrchestratorAgent in NodalMerge Studio, a collaborative AI workspace.
-        Your job is to manage a work unit from planning through to validated merge proposals.
-
-        Routing strategy — a projection delta is appended to your context automatically every
-        cycle, showing what changed in the artifact chain since your last turn (added artifacts,
-        artifacts whose status changed, newly completed tasks). Route based on the current delta's
-        Current state:
-        - No Plan artifact and no child work units → enqueue the planner:
-          nm_v1_scheduler_enqueue with workUnitId=<your workUnitId>, profileId="planner".
-        - Plan artifact exists OR child work units exist → stop. Fan-out and child enqueue are handled
-          automatically after your turn — do not create tasks or enqueue workers yourself for slices.
-        - All child work units are Proposed and a reconciled MergeProposal exists on this work unit → stop;
-          if automated review is enabled the reviewer runs first; otherwise a human reviews in the Merge Review panel.
-        - Reconciled MergeProposal with status Approved → call nm_v1_merge_apply; done.
-        If you need the full artifact chain rather than just what changed, call
-        nm_v1_projection_get with projectionType="AgentWorkspace" and your workUnitId.
-
-        Workflow:
-        1. Call nm_v1_workunit_get to understand the goal for your assigned work unit.
-        2. Read the projection delta in your context (or call nm_v1_projection_get for the full chain).
-        3. Route based on artifact state (see above).
-        4. When enqueuing the planner: call nm_v1_scheduler_enqueue with profileId="planner".
-           LLM credentials are injected automatically — do not supply model, baseUrl, apiKey, or provider.
-        5. After enqueuing, stop — the scheduler picks up the work. Do not poll for completion.
-        6. The system will re-invoke you after the planner or workers complete if further orchestration is needed.
-
-        Rules:
-        - Do not approve or apply merges yourself — that requires human approval.
-        - Do not enqueue workers directly on the parent work unit — use planner fan-out instead.
-        - Be efficient: use each tool call purposefully, do not repeat calls unnecessarily.
-        """;
+    internal static readonly string DefaultSystemPrompt = AgentLoopPrompts.Orchestrator;
 
     private readonly int _maxIterations = profile?.MaxIterations ?? 25;
     private readonly int _stallDetectionCycles = stallDetectionCycles;
@@ -97,11 +65,28 @@ internal sealed class OrchestratorAgentLoop(
             lastProjection = currentProjection;
 
             if (stallStreak >= _stallDetectionCycles)
+            {
+                onActivity?.Invoke(null);
                 return AgentLoopCompletion.Stalled;
+            }
+
+            // Inherited constraints (global, promoted via Knowledge Promotion, plus this work
+            // unit's own ancestor chain) rarely change mid-run — fold them into the kickoff message
+            // once rather than repeating them every cycle alongside the delta.
+            if (i == 0 && currentProjection.InheritedConstraints.Count > 0)
+                AppendConstraintsToOutgoingMessage(messages, currentProjection.InheritedConstraints);
+
+            if (i == 0)
+            {
+                var promptGuidance = await findings.ListPromotedPromptGuidanceAsync(PipelineStage.Orchestrate, ct).ConfigureAwait(false);
+                if (promptGuidance.Count > 0)
+                    AppendPromptGuidanceToOutgoingMessage(messages, promptGuidance);
+            }
 
             AppendDeltaToOutgoingMessage(messages, delta);
 
-            var response = await llm.SendAsync(provider, model, baseUrl, apiKey, messages, _tools, _systemPrompt, ct)
+            onActivity?.Invoke("Thinking...");
+            var response = await client.SendAsync(messages, _tools, _systemPrompt, ct)
                 .ConfigureAwait(false);
 
             messages.Add(new NmMessage("assistant", response.Content));
@@ -113,6 +98,9 @@ internal sealed class OrchestratorAgentLoop(
                 var awaitingReview = chain.Any(a => a.Type == ArtifactType.MergeProposal && a.Status == ArtifactStatus.Active);
                 var action = awaitingReview ? OrchestrationAction.AwaitReview : OrchestrationAction.NoOp;
                 await RecordDecisionAsync(action, [], text, ct).ConfigureAwait(false);
+                await ConversationLogRecorder.RecordTurnAsync(
+                    conversationLog, workUnitId, agentId, "Orchestrator", null, i, response, [], sessionId, ct,
+                    client.Provider, client.Model).ConfigureAwait(false);
                 completedNaturally = true;
                 break;
             }
@@ -129,7 +117,8 @@ internal sealed class OrchestratorAgentLoop(
                     ? InjectSpawnCredentials(toolUse.Input)
                     : toolUse.Input;
 
-                var result = await dispatcher
+                onActivity?.Invoke(ActivityLabeler.Describe(toolUse.Name, toolUse.Input));
+                var result = await client
                     .DispatchAsync(toolUse.Name, input, _allowedTools, ct, sessionId)
                     .ConfigureAwait(false);
 
@@ -139,11 +128,17 @@ internal sealed class OrchestratorAgentLoop(
                     madeRoutingDecisionLastCycle = true;
             }
 
+            await ConversationLogRecorder.RecordTurnAsync(
+                conversationLog, workUnitId, agentId, "Orchestrator", null, i, response, toolResults, sessionId, ct,
+                client.Provider, client.Model).ConfigureAwait(false);
+
             if (toolResults.Count == 0)
                 break;
 
             messages.Add(new NmMessage("user", toolResults));
         }
+
+        onActivity?.Invoke(null);
 
         if (ct.IsCancellationRequested)
             return AgentLoopCompletion.Cancelled;
@@ -152,8 +147,34 @@ internal sealed class OrchestratorAgentLoop(
             return AgentLoopCompletion.MaxIterationsExceeded;
 
         await fanOut.TryFanOutFromPlanAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
-        await mergeReconciliation.TryReconcileAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+        var reconciliation = await mergeReconciliation.TryReconcileAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
         await automatedReview.TryEnqueueReviewerAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+
+        // Only complete the orchestrator work unit once the reconciled proposal has actually been
+        // approved/merged — Reconciled means a fresh proposal was just created in Draft status
+        // (pending review), and AlreadyReconciled only means a non-Rejected proposal already
+        // exists, which could still be sitting ReadyForReview/UnderReview. Without checking the
+        // proposal's own status, every successful reconciliation marked the orchestrator Completed
+        // immediately, before the automated/human reviewer ever ran — and since Completed is a
+        // terminal status (WorkUnitTransitions.CanTransition has no transition out of it), a later
+        // rejection's retry (Executing) or dead-letter escalation (DeadLettered) write would then
+        // silently fail (UpdateStatusAsync throws InvalidOperationException, swallowed by the
+        // caller), leaving the work unit stuck at Completed forever.
+        if (reconciliation.Outcome is MergeReconciliationOutcome.Reconciled or MergeReconciliationOutcome.AlreadyReconciled
+            && reconciliation.ReconciledProposalId is { } reconciledProposalId)
+        {
+            var reconciledProposal = await merge.GetAsync(reconciledProposalId, ct).ConfigureAwait(false);
+            if (reconciledProposal?.Status is MergeProposalStatus.Approved or MergeProposalStatus.Merged)
+            {
+                var orchestrator = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+                if (orchestrator?.Status != WorkUnitStatus.Completed)
+                {
+                    await workUnits.UpdateStatusAsync(workUnitId, WorkUnitStatus.Completed, cancellationToken: ct)
+                        .ConfigureAwait(false);
+                }
+            }
+        }
+
         return AgentLoopCompletion.Succeeded;
     }
 
@@ -214,6 +235,34 @@ internal sealed class OrchestratorAgentLoop(
         messages[^1] = last with { Content = newContent };
     }
 
+    // Promoted Knowledge Findings (and any work-unit-lineage Constraint artifacts) reach the model
+    // here — this was previously computed by the projection but never read by any agent loop.
+    private static void AppendConstraintsToOutgoingMessage(List<NmMessage> messages, IReadOnlyList<ArtifactRef> constraints)
+    {
+        var lines = constraints.Select(c => $"- {c.Title ?? c.ArtifactId}: {c.Body ?? ""}");
+        var text = "[Known constraints — durable guidance from prior runs; apply unless this work unit's goal explicitly says otherwise]\n"
+            + string.Join("\n", lines);
+        var last = messages[^1];
+        IReadOnlyList<NmContent> newContent = last.Content is [NmText only]
+            ? [new NmText($"{only.Text}\n\n{text}")]
+            : [.. last.Content, new NmText(text)];
+        messages[^1] = last with { Content = newContent };
+    }
+
+    // Promoted PromptImprovement findings targeting this stage — scoped guidance, unlike the
+    // universal constraints above. Same single-NmText-folding pattern as AppendConstraintsToOutgoingMessage.
+    private static void AppendPromptGuidanceToOutgoingMessage(List<NmMessage> messages, IReadOnlyList<Finding> promptGuidance)
+    {
+        var lines = promptGuidance.Select(f => $"- {f.Title}: {f.Summary}");
+        var text = "[Process guidance — promoted prompt improvements for this stage]\n"
+            + string.Join("\n", lines);
+        var last = messages[^1];
+        IReadOnlyList<NmContent> newContent = last.Content is [NmText only]
+            ? [new NmText($"{only.Text}\n\n{text}")]
+            : [.. last.Content, new NmText(text)];
+        messages[^1] = last with { Content = newContent };
+    }
+
     private async Task RecordDecisionAsync(
         OrchestrationAction action, IReadOnlyList<string> spawnedIds, string? reason, CancellationToken ct)
     {
@@ -266,16 +315,32 @@ internal sealed class OrchestratorAgentLoop(
     private JsonElement InjectSpawnCredentials(JsonElement input)
     {
         var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(input) ?? [];
-        // Always overwrite credentials — the model must not hallucinate them.
-        dict["model"]    = JsonSerializer.SerializeToElement(model);
-        dict["baseUrl"]  = JsonSerializer.SerializeToElement(baseUrl);
-        dict["apiKey"]   = JsonSerializer.SerializeToElement(apiKey);
-        dict["provider"] = JsonSerializer.SerializeToElement(provider);
         // Default profileId to "worker" if the model didn't specify one.
         if (!dict.ContainsKey("profileId"))
             dict["profileId"] = JsonSerializer.SerializeToElement("worker");
+        var profileId = dict["profileId"].ValueKind == JsonValueKind.String ? dict["profileId"].GetString() : null;
+
+        // Always overwrite credentials — the model must not hallucinate them. Per-stage overrides
+        // (configured on the run's Agent Topology) take precedence over this loop's own
+        // credentials, so e.g. Planning can use a different model than Orchestration/Execution.
+        var stageCreds = agentControl?.GetCredentialsForStage(workUnitId, StageForProfileId(profileId));
+        dict["model"]    = JsonSerializer.SerializeToElement(stageCreds?.Model ?? client.Model);
+        dict["baseUrl"]  = JsonSerializer.SerializeToElement(stageCreds?.BaseUrl ?? client.BaseUrl);
+        dict["apiKey"]   = JsonSerializer.SerializeToElement(stageCreds?.ApiKey ?? client.ApiKey);
+        dict["provider"] = JsonSerializer.SerializeToElement(stageCreds?.Provider ?? client.Provider);
         return JsonSerializer.SerializeToElement(dict);
     }
+
+    // The only enqueue/spawn calls this loop ever issues are the Planner (via
+    // nm_v1_scheduler_enqueue, profileId="planner") and, on the legacy direct-spawn path, a Worker
+    // (profileId defaults to "worker" above) — same string convention already used elsewhere in
+    // this codebase (e.g. AutomatedReviewGateService's literal "worker"/"reviewer" checks).
+    private static PipelineStage StageForProfileId(string? profileId) => profileId switch
+    {
+        "planner"  => PipelineStage.Plan,
+        "reviewer" => PipelineStage.Review,
+        _          => PipelineStage.Execute,
+    };
 
     private static IReadOnlyList<LlmToolDef> FilterTools(IReadOnlyList<string>? allowedTools)
     {
@@ -409,6 +474,15 @@ internal sealed class OrchestratorAgentLoop(
 
             new(McpToolNames.WorkspaceSummary, "Get a summary of the current workspace state.",
                 Schema([], new() { ["branchId"] = Str("Branch ID filter (optional)") })),
+
+            new(McpToolNames.WorkspaceStatus, "Get a concise workspace status view with changed files and proposal summaries.",
+                Schema([], new()
+                {
+                    ["branchId"] = Str("Branch ID filter (optional)"),
+                    ["workUnitId"] = Str("Work unit ID to resolve the authoritative branch and current proposal chain (optional)"),
+                    ["limit"] = Str("Maximum changed-file entries to return (optional, default 50)"),
+                    ["offset"] = Str("Changed-file page offset (optional, default 0)"),
+                })),
 
             new(McpToolNames.SnapshotGet, "Get an agent's execution snapshot.",
                 Schema(["agentId", "workUnitId"], new()

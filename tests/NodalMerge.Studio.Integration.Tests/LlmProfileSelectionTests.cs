@@ -105,9 +105,9 @@ public class LlmProfileSelectionTests
         return doc.RootElement.GetProperty("selectedProfileId").GetString();
     }
 
-    // Plan.json is written *before* the orchestrator is spawned, and fan-out is triggered only
-    // once — by the background orchestrator loop itself after it ends its (single, immediate
-    // end_turn) turn, per OrchestratorAgentLoop.RunAsync's unconditional
+    // Plan is recorded as a DAG artifact *before* the orchestrator is spawned, and fan-out is
+    // triggered only once — by the background orchestrator loop itself after it ends its (single,
+    // immediate end_turn) turn, per OrchestratorAgentLoop.RunAsync's unconditional
     // TryFanOutFromPlanAsync call. Calling IFanOutService.TryFanOutFromPlanAsync a second time
     // from the test directly (as FanOutServiceTests.cs does, racing against the very loop this
     // call also spawns) hits a pre-existing FanOutService.EnsureChildWorkUnitsAsync concurrency
@@ -116,14 +116,16 @@ public class LlmProfileSelectionTests
     private static async Task<WorkUnit> SeedPlanAndSpawnOrchestratorAsync(Microsoft.AspNetCore.Builder.WebApplication app)
     {
         var orchestrator  = app.Services.GetRequiredService<IOrchestratorService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts     = app.Services.GetRequiredService<IArtifactLineageService>();
         var agentControl  = app.Services.GetRequiredService<IAgentControlService>();
         var agentRuntime  = app.Services.GetRequiredService<NodalMerge.Studio.AgentRuntime.InMemoryAgentRuntimeService>();
 
         await agentRuntime.StartAsync(CancellationToken.None);
 
         var parent = await orchestrator.CreateWorkUnitAsync("Build Foo", "test");
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, PlanJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}", ArtifactType.Plan, parent.WorkUnitId,
+            ArtifactStatus.Active, DateTimeOffset.UtcNow, parent.WorkUnitId, null, "Plan", PlanJson));
 
         await agentControl.SpawnAsync(
             "orchestrator", parent.WorkUnitId,

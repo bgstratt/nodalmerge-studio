@@ -5,7 +5,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class ReplayTools(IReplayService replay)
 {
     [McpServerTool(Name = McpToolNames.ReplayRange), Description("Replay a range of history for debugging.")]

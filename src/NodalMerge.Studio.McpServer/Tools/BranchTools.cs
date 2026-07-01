@@ -5,13 +5,12 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class BranchTools(IBranchService branches)
 {
     [McpServerTool(Name = McpToolNames.BranchCreate), Description("Create a branch.")]
     public async Task<string> CreateAsync(string name, string? fromBranch = null, CancellationToken cancellationToken = default)
     {
-        var branchId = await branches.CreateBranchAsync(name, fromBranch, cancellationToken).ConfigureAwait(false);
+        var branchId = await branches.CreateBranchAsync(name, fromBranch, cancellationToken: cancellationToken).ConfigureAwait(false);
         return McpJson.Ok(new { branchId });
     }
 

@@ -116,8 +116,9 @@ public static class ServiceCollectionExtensions
     public static IServiceCollection AddStudioTasks(this IServiceCollection services)
     {
         services.AddSingleton<InMemoryTaskService>();
-        services.AddSingleton<ITaskService>(sp => sp.GetRequiredService<InMemoryTaskService>());
-        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryTaskService>());
-        return services;
+                services.AddSingleton<ITaskService>(sp => sp.GetRequiredService<InMemoryTaskService>());
+                services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryTaskService>());
+                services.AddSingleton<ITaskCommandService, TaskCommandService>();
+                return services;
     }
 }

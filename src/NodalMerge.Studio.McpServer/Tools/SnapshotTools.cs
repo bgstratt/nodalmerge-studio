@@ -5,7 +5,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class SnapshotTools(ISnapshotService snapshots)
 {
     [McpServerTool(Name = McpToolNames.SnapshotGet), Description("Get an execution snapshot for an agent.")]

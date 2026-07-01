@@ -41,6 +41,15 @@ public class FanOutConcurrencyTests
         public Task<WorkUnit> SetFanOutBlockedReasonAsync(string workUnitId, string? blockedReason, CancellationToken cancellationToken = default) =>
             inner.SetFanOutBlockedReasonAsync(workUnitId, blockedReason, cancellationToken);
 
+        public Task<WorkUnit> IncrementReviewRejectionCountAsync(string workUnitId, bool automated, CancellationToken cancellationToken = default) =>
+            inner.IncrementReviewRejectionCountAsync(workUnitId, automated, cancellationToken);
+
+        public Task<WorkUnit> IncrementFailureAttemptCountAsync(string workUnitId, CancellationToken cancellationToken = default) =>
+            inner.IncrementFailureAttemptCountAsync(workUnitId, cancellationToken);
+
+        public Task<WorkUnit> AmendGoalForSteeredRetryAsync(string workUnitId, string amendedGoal, string steeringContext, string deadLetterEntryId, CancellationToken cancellationToken = default) =>
+            inner.AmendGoalForSteeredRetryAsync(workUnitId, amendedGoal, steeringContext, deadLetterEntryId, cancellationToken);
+
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             inner.GetAsync(workUnitId, cancellationToken);
 
@@ -55,6 +64,9 @@ public class FanOutConcurrencyTests
 
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken cancellationToken = default) =>
             inner.GetDependentsAsync(workUnitId, cancellationToken);
+
+        public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken cancellationToken = default) =>
+            inner.SetFileScopeAsync(workUnitId, fileScope, sessionId, cancellationToken);
     }
 
     [Fact]
@@ -62,6 +74,7 @@ public class FanOutConcurrencyTests
     {
         var app = StudioWebApplication.Build(
             [],
+            llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services =>
             {
                 services.AddInMemoryStorage();
@@ -71,7 +84,7 @@ public class FanOutConcurrencyTests
 
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits    = app.Services.GetRequiredService<IWorkUnitService>();
-        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var artifacts    = app.Services.GetRequiredService<IArtifactLineageService>();
         var fanOut        = app.Services.GetRequiredService<IFanOutService>();
         var agentControl  = app.Services.GetRequiredService<IAgentControlService>();
 
@@ -90,7 +103,16 @@ public class FanOutConcurrencyTests
               ]
             }
             """;
-        await fileWorkspace.WriteAsync(parent.BranchId, PlanDocumentPaths.FileName, planJson);
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}",
+            ArtifactType.Plan,
+            parent.WorkUnitId,
+            ArtifactStatus.Active,
+            DateTimeOffset.UtcNow,
+            parent.WorkUnitId,
+            null,
+            "Plan",
+            planJson));
 
         // Several concurrent calls racing for the same parent — before the 13g fix, each one
         // independently sees the plan's three slices unmapped (no children created yet) and

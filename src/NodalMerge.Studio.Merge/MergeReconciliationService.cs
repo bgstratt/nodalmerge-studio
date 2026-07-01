@@ -1,6 +1,8 @@
 using System.Text;
+using System.Text.Json;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Merge;
 
@@ -8,7 +10,9 @@ public sealed class MergeReconciliationService(
     IWorkUnitService workUnits,
     IMergeService merge,
     IArtifactLineageService artifacts,
-    IFileWorkspaceService fileWorkspace) : IMergeReconciliationService
+    IFileWorkspaceService fileWorkspace,
+    IWorkspaceExecutionService? execution = null,
+    WorkspaceOptions? options = null) : IMergeReconciliationService
 {
     public const string ConflictReportFileName = "merge-conflict-report.md";
 
@@ -81,7 +85,7 @@ public sealed class MergeReconciliationService(
 
         var ordered = OrderByDependencies(children, childProposals);
         var mergeBranch = $"merge/{parentWorkUnitId}";
-        await fileWorkspace.InitBranchAsync(mergeBranch, "main", cancellationToken).ConfigureAwait(false);
+        await fileWorkspace.InitBranchAsync(mergeBranch, "main", ct: cancellationToken).ConfigureAwait(false);
 
         foreach (var (_, proposal) in ordered)
         {
@@ -95,6 +99,28 @@ public sealed class MergeReconciliationService(
                     .CopyFilesAsync(proposal.SourceBranch, mergeBranch, files, cancellationToken)
                     .ConfigureAwait(false);
             }
+        }
+
+        // Slice 16h — composite execution on the merged branch (opt-in)
+        string? executionVerification = null;
+        if (execution is not null && options is not null &&
+            (options.RequireBuildBeforeProposal || options.RequireTestBeforeProposal))
+        {
+            try
+            {
+                var sourceBranchIds = ordered.Select(cp => cp.Proposal.SourceBranch).ToList();
+                var execResult = await execution.ExecuteCompositeAsync(
+                    sourceBranchIds,
+                    new WorkspaceExecutionRequest(
+                        Build: options.RequireBuildBeforeProposal,
+                        Test: options.RequireTestBeforeProposal,
+                        BuildCommand: options.BuildCommand,
+                        TestCommand: options.TestCommand,
+                        TimeoutSeconds: options.ExecutionTimeoutSeconds),
+                    cancellationToken).ConfigureAwait(false);
+                executionVerification = JsonSerializer.Serialize(execResult);
+            }
+            catch { /* best-effort — execution failure doesn't block reconciliation */ }
         }
 
         var constituentIds = ordered.Select(cp => cp.Proposal.ProposalId).ToList();
@@ -115,7 +141,7 @@ public sealed class MergeReconciliationService(
             parent.Goal,
             $"Reconciled merge from {constituentIds.Count} child proposals",
             $"Combined changes from proposals: {string.Join(", ", constituentIds)}",
-            null, null, null,
+            executionVerification, null, null,
             MergeProposalStatus.Draft,
             WorkspaceChanges: workspaceChanges,
             DiffGeneratedAt: DateTimeOffset.UtcNow,
@@ -193,14 +219,29 @@ public sealed class MergeReconciliationService(
 
         foreach (var (file, proposalIds) in candidates)
         {
+            var afterContents = new Dictionary<string, string?>();
+            foreach (var proposalId in proposalIds)
+            {
+                afterContents[proposalId] = await fileWorkspace
+                    .ReadAsync(byId[proposalId].SourceBranch, file, cancellationToken).ConfigureAwait(false);
+            }
+
+            // base/{proposalId} is a snapshot of the proposal's TargetBranch (usually "main"), not
+            // the immediate parent/sibling branch each child actually forked from. A file the
+            // children only inherited from their common parent doesn't exist in that snapshot, so
+            // the line-diff below would see "added from nothing" for every sibling and flag a
+            // conflict despite nobody having touched it. Identical content across all flagged
+            // proposals is never a real conflict regardless of what the baseline snapshot does or
+            // doesn't contain.
+            if (afterContents.Values.Distinct().Count() <= 1)
+                continue;
+
             var ranges = new List<(string ProposalId, List<(int Start, int End)> Ranges)>();
             foreach (var proposalId in proposalIds)
             {
-                var proposal = byId[proposalId];
                 var before = await fileWorkspace
                     .ReadAsync($"base/{proposalId}", file, cancellationToken).ConfigureAwait(false);
-                var after = await fileWorkspace
-                    .ReadAsync(proposal.SourceBranch, file, cancellationToken).ConfigureAwait(false);
+                var after = afterContents[proposalId];
 
                 var hunks = LineDiffer.Diff(before, after, contextLines: 0);
                 var fileRanges = hunks

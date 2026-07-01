@@ -17,12 +17,16 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
     private readonly IArtifactLineageService? _artifacts;
     private readonly IMergeService? _merge;
     private readonly IIntentGraphService? _intents;
+    private readonly IExecutionSessionService? _sessions;
 
     // IWorkUnitService is resolved lazily (via IServiceProvider) rather than constructor-injected:
     // its production implementation depends on IAgentControlService, which depends on IWorkScheduler
     // (this service) — a direct dependency here would be a circular constructor graph. Same pattern
     // as AgentWorkspaceService. IIntentGraphService has no such cycle (depends only on IStudioNodeStore
-    // and IArtifactLineageService) so it's constructor-injected directly.
+    // and IArtifactLineageService) so it's constructor-injected directly. IExecutionSessionService is
+    // likewise cycle-free, but kept optional (like Artifacts/Merge/Intents below) rather than required
+    // so existing direct (non-DI) constructions in tests don't all need updating — when null, Phase
+    // 8b's pause check in TryAcquireAsync is simply skipped.
     public WorkSchedulerService(
         IStudioNodeStore nodeStore,
         IExecutionEventStream events,
@@ -30,11 +34,13 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
         IServiceProvider? serviceProvider = null,
         IArtifactLineageService? artifacts = null,
         IMergeService? merge = null,
-        IIntentGraphService? intents = null)
+        IIntentGraphService? intents = null,
+        IExecutionSessionService? sessions = null)
     {
         _nodeStore       = nodeStore;
         _events          = events;
         _workspaces      = workspaces;
+        _sessions        = sessions;
         _serviceProvider = serviceProvider;
         _artifacts       = artifacts;
         _merge           = merge;
@@ -187,6 +193,27 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
                 now - item.LeasedAt.Value < LeaseTimeout)
                 continue;
 
+            // Phase 8c — skip items interrupted by a Host restart until a human explicitly
+            // approves via ApproveResumeAsync/ApproveResumeAllAsync.
+            if (item.AwaitingResume)
+                continue;
+
+            // Phase 12 — skip items parked by MarkAwaitingFileLeaseAsync until
+            // IFileLeaseService's release-and-advance hook clears the flag via
+            // ClearAwaitingFileLeaseAsync (on the holder's actual merge).
+            if (item.AwaitingFileLease)
+                continue;
+
+            // Phase 8b — a paused session must actually stop new dispatch under it, not just
+            // record a status flag (ExecutionSessionService.SetStatusAsync previously had no
+            // effect on the scheduler at all).
+            if (_sessions is not null && item.SessionId is not null)
+            {
+                var session = await _sessions.GetAsync(item.SessionId, ct).ConfigureAwait(false);
+                if (session?.Status == ExecutionSessionStatus.Paused)
+                    continue;
+            }
+
             var acquired = item with
             {
                 LeasedBy = agentId,
@@ -328,6 +355,56 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
         }
     }
 
+    public async Task MarkAwaitingResumeAsync(string workUnitId, CancellationToken ct = default)
+    {
+        if (!_queue.TryGetValue(workUnitId, out var item))
+            return;
+
+        var parked = item with { LeasedBy = null, LeasedAt = null, AwaitingResume = true };
+        if (!_queue.TryUpdate(workUnitId, parked, item))
+            return;
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.SchedulerV1, workUnitId,
+            JsonSerializer.Serialize(parked), ct).ConfigureAwait(false);
+    }
+
+    // Phase 12 — called instead of ReleaseAsync when a worker's loop exits with
+    // AgentLoopCompletion.AwaitingFileLease. The item stays in _queue (unlike ReleaseAsync's
+    // TryRemove) so it's still visible/listed, but TryAcquireAsync's AwaitingFileLease skip keeps
+    // it from being picked up again until ClearAwaitingFileLeaseAsync runs.
+    public async Task MarkAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default)
+    {
+        if (!_queue.TryGetValue(workUnitId, out var item))
+            return;
+
+        var parked = item with { LeasedBy = null, LeasedAt = null, AwaitingFileLease = true };
+        if (!_queue.TryUpdate(workUnitId, parked, item))
+            return;
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.SchedulerV1, workUnitId,
+            JsonSerializer.Serialize(parked), ct).ConfigureAwait(false);
+    }
+
+    // Phase 12 — called by IFileLeaseService's release-and-advance hook for the WorkUnitId it
+    // just promoted to holder. The item was never removed from _queue, so clearing the flag alone
+    // is enough to make it eligible for TryAcquireAsync again — its AttemptCount is already > 0
+    // from its prior run, which is what gives the resumed WorkerAgentLoop isResume: true.
+    public async Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default)
+    {
+        if (!_queue.TryGetValue(workUnitId, out var item) || !item.AwaitingFileLease)
+            return;
+
+        var resumed = item with { AwaitingFileLease = false };
+        if (!_queue.TryUpdate(workUnitId, resumed, item))
+            return;
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.SchedulerV1, workUnitId,
+            JsonSerializer.Serialize(resumed), ct).ConfigureAwait(false);
+    }
+
     private async Task<string> ResolveOrchestratorWorkUnitIdAsync(string workUnitId, CancellationToken ct)
     {
         var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
@@ -410,14 +487,61 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
             if (item is null || item.WorkUnitId is null)
                 continue;
 
-            // The agent process that held this lease is gone now that the host restarted — clear
-            // the lease so the item becomes acquirable again. AttemptCount is real retry history,
-            // not lease state, so it's preserved as-is.
-            if (item.LeasedBy is not null || item.LeasedAt is not null)
-                item = item with { LeasedBy = null, LeasedAt = null };
+            // The agent process (if any) that held this lease is gone now that the host
+            // restarted — clear the lease either way. AttemptCount is real retry history, not
+            // lease state, so it's preserved as-is. Phase 8c originally only flagged items that
+            // held a lease at the moment the Host died, on the theory that a never-leased item
+            // was undisturbed backlog. But the scheduler's queue spans every session in the
+            // workspace, not just the one a human is currently looking at — so "undisturbed
+            // backlog" from a session nobody asked to resume would silently start competing with
+            // a fresh goal the moment any agent polls. Every item that survives a restart, leased
+            // or not, is therefore parked behind AwaitingResume and needs an explicit
+            // ApproveResumeAsync/ApproveResumeAllAsync — the same no-auto-resume-on-restart
+            // guarantee InMemoryAgentRuntimeService already gives orchestrator-level work (Slice
+            // 19d). Goals enqueued fresh in the current run go through EnqueueAsync, never this
+            // method, so they stay immediately eligible and can run in parallel with whatever
+            // older sessions are still sitting here awaiting approval.
+            item = item with { LeasedBy = null, LeasedAt = null, AwaitingResume = true };
 
             _queue.TryAdd(entityId, item);
         }
+    }
+
+    public Task<IReadOnlyList<ScheduledItem>> ListAwaitingResumeAsync(CancellationToken ct = default)
+    {
+        IReadOnlyList<ScheduledItem> items = _queue.Values
+            .Where(i => i.AwaitingResume)
+            .OrderBy(i => i.AttemptCount)
+            .ToList();
+        return Task.FromResult(items);
+    }
+
+    public async Task ApproveResumeAsync(string workUnitId, CancellationToken ct = default)
+    {
+        if (!_queue.TryGetValue(workUnitId, out var item) || !item.AwaitingResume)
+            return;
+
+        var approved = item with { AwaitingResume = false };
+        if (!_queue.TryUpdate(workUnitId, approved, item))
+            return;
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.SchedulerV1, workUnitId,
+            JsonSerializer.Serialize(approved), ct).ConfigureAwait(false);
+    }
+
+    public async Task<int> ApproveResumeAllAsync(CancellationToken ct = default)
+    {
+        var count = 0;
+        foreach (var key in _queue.Values.Where(i => i.AwaitingResume).Select(i => i.WorkUnitId).ToList())
+        {
+            if (!_queue.TryGetValue(key, out var before) || !before.AwaitingResume)
+                continue;
+
+            await ApproveResumeAsync(key, ct).ConfigureAwait(false);
+            count++;
+        }
+        return count;
     }
 
     // Lazily resolved — IAgentControlService's production impl (InMemoryAgentRuntimeService)

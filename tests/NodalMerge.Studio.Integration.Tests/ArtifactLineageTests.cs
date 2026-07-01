@@ -140,6 +140,9 @@ public class ArtifactLineageTests
             _units[id] = updated;
             return Task.FromResult(updated);
         }
+        public Task<WorkUnit> IncrementReviewRejectionCountAsync(string id, bool automated, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> IncrementFailureAttemptCountAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> AmendGoalForSteeredRetryAsync(string id, string amendedGoal, string steeringContext, string deadLetterEntryId, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) =>
             Task.FromResult(_units.GetValueOrDefault(workUnitId));
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) =>
@@ -148,6 +151,12 @@ public class ArtifactLineageTests
             Task.FromResult<IReadOnlyList<WorkUnit>>([.. _units.Values.Where(w => w.ParentWorkUnitId == parentId)]);
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken ct = default)
+        {
+            var updated = _units[workUnitId] with { FileScope = fileScope };
+            _units[workUnitId] = updated;
+            return Task.FromResult(updated);
+        }
     }
 
     private sealed class FakeMergeService : IMergeService
@@ -158,9 +167,9 @@ public class ArtifactLineageTests
         public Task<MergeProposal?> GetAsync(string proposalId, CancellationToken ct = default) =>
             Task.FromResult(_proposals.GetValueOrDefault(proposalId));
         public Task<MergeProposal> ValidateAsync(string proposalId, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus d, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus d, string? notes = null, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, IReadOnlyList<string>? consideredArtifactIds = null, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken ct = default, bool autoApplied = false) => throw new NotSupportedException();
         public Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<MergeProposal>>([.. _proposals.Values]);
 

@@ -24,6 +24,11 @@ public class McpToolNamesTests
     [InlineData(McpToolNames.ProjectionGet)]
     [InlineData(McpToolNames.WorkUnitCreate)]
     [InlineData(McpToolNames.WorkspaceSummary)]
+    [InlineData(McpToolNames.WorkspaceStatus)]
+    [InlineData(McpToolNames.CausalGetFrontier)]
+    [InlineData(McpToolNames.CausalGetParents)]
+    [InlineData(McpToolNames.CausalGetResolution)]
+    [InlineData(McpToolNames.CausalComputeSyncDiff)]
     public void Frozen_tool_names_match_contract(string toolName)
     {
         Assert.Contains(toolName, McpToolNames.All);

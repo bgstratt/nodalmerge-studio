@@ -1,0 +1,104 @@
+using System.Text.Json;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.DependencyInjection;
+using NodalMerge.Studio.Contracts.Domain;
+using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Host;
+using NodalMerge.Studio.Storage;
+
+namespace NodalMerge.Studio.Integration.Tests;
+
+[Trait("Category", "Integration")]
+public class ClarificationWorkflowTests : IDisposable
+{
+    private readonly string _rootPath = Path.Combine(Path.GetTempPath(), $"studio-clarify-{Guid.NewGuid():N}");
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_rootPath))
+            Directory.Delete(_rootPath, recursive: true);
+    }
+
+    private WebApplication BuildTestApp() =>
+        StudioWebApplication.Build(
+            [],
+            configureWebHost: webHost => webHost.UseTestServer(),
+            configureServices: services =>
+            {
+                services.AddInMemoryStorage();
+                services.AddSingleton(new WorkspaceOptions { RootPath = _rootPath });
+            });
+
+    [Fact]
+    public async Task Clarification_request_parks_scheduler_item_and_response_resumes_it()
+    {
+        await using var app = BuildTestApp();
+        await app.StartAsync();
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var workUnits = app.Services.GetRequiredService<IWorkUnitService>();
+        var scheduler = app.Services.GetRequiredService<IWorkScheduler>();
+        var clarifications = app.Services.GetRequiredService<IClarificationCommandService>();
+        var events = app.Services.GetRequiredService<IExecutionEventStream>();
+
+        var workUnit = await orchestrator.CreateWorkUnitAsync("Implement feature", "tester");
+
+        await scheduler.EnqueueAsync(
+            workUnit.WorkUnitId,
+            profileId: "worker",
+            sessionId: "sess-clarify");
+
+        var leased = await scheduler.TryAcquireAsync("worker-agent");
+        Assert.NotNull(leased);
+        Assert.Equal(workUnit.WorkUnitId, leased!.WorkUnitId);
+
+        var request = await clarifications.RequestAsync(
+            workUnit.WorkUnitId,
+            "Should validation be enforced at API or DB layer?",
+            context: "Schema currently lacks unique index.",
+            options: ["API only", "DB only", "Both"],
+            requestedByAgentId: "worker-agent",
+            sessionId: "sess-clarify");
+
+        Assert.True(request.ParkedAwaitingResponse);
+
+        var awaiting = await scheduler.ListAwaitingResumeAsync();
+        Assert.Contains(awaiting, i => i.WorkUnitId == workUnit.WorkUnitId && i.AwaitingResume);
+
+        var waitingUnit = await workUnits.GetAsync(workUnit.WorkUnitId);
+        Assert.NotNull(waitingUnit);
+        Assert.Equal(WorkUnitStatus.Waiting, waitingUnit!.Status);
+
+        var response = await clarifications.RespondAsync(
+            workUnit.WorkUnitId,
+            response: "Both",
+            note: "Apply API guard + unique DB index.",
+            respondedBy: "human-reviewer",
+            resume: true,
+            sessionId: "sess-clarify");
+
+        Assert.True(response.Resumed);
+
+        var awaitingAfter = await scheduler.ListAwaitingResumeAsync();
+        Assert.DoesNotContain(awaitingAfter, i => i.WorkUnitId == workUnit.WorkUnitId && i.AwaitingResume);
+
+        var queuedUnit = await workUnits.GetAsync(workUnit.WorkUnitId);
+        Assert.NotNull(queuedUnit);
+        Assert.Equal(WorkUnitStatus.Queued, queuedUnit!.Status);
+
+        var sessionEvents = await events.GetSessionEventsAsync("sess-clarify");
+        var requestedEvent = sessionEvents.LastOrDefault(e => e.Kind == ExecutionEventKind.ClarificationRequested);
+        var respondedEvent = sessionEvents.LastOrDefault(e => e.Kind == ExecutionEventKind.ClarificationResponded);
+        Assert.NotNull(requestedEvent);
+        Assert.NotNull(respondedEvent);
+
+        var requestedPayload = JsonSerializer.Deserialize<ClarificationRequestedPayload>(requestedEvent!.PayloadJson);
+        var respondedPayload = JsonSerializer.Deserialize<ClarificationRespondedPayload>(respondedEvent!.PayloadJson);
+        Assert.NotNull(requestedPayload);
+        Assert.NotNull(respondedPayload);
+        Assert.Equal("Should validation be enforced at API or DB layer?", requestedPayload!.Question);
+        Assert.Equal("Both", respondedPayload!.Response);
+    }
+}

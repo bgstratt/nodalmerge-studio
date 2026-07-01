@@ -27,8 +27,12 @@ public class ProjectionManagerTests
         public Task<WorkUnit> UpdateStatusAsync(string id, WorkUnitStatus s, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit> SetCurrentStageAsync(string id, PipelineStage? stage, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit> SetFanOutBlockedReasonAsync(string id, string? blockedReason, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> IncrementReviewRejectionCountAsync(string id, bool automated, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> IncrementFailureAttemptCountAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> AmendGoalForSteeredRetryAsync(string id, string amendedGoal, string steeringContext, string deadLetterEntryId, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private sealed class FakeTaskService : ITaskService
@@ -64,9 +68,9 @@ public class ProjectionManagerTests
 
         public Task<MergeProposal> ProposeAsync(MergeProposal p, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> ValidateAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<MergeProposal> ReviewAsync(string id, MergeProposalStatus d, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<MergeProposal> ApplyAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> ReviewAsync(string id, MergeProposalStatus d, string? notes = null, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, IReadOnlyList<string>? consideredArtifactIds = null, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> ApplyAsync(string id, CancellationToken ct = default, bool autoApplied = false) => throw new NotSupportedException();
         public Task<MergeProposal> SupersedeAsync(string proposalId, string supersededByProposalId, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
@@ -116,6 +120,10 @@ public class ProjectionManagerTests
             Task.FromResult<IReadOnlyList<ArtifactRef>>(
                 _byWorkUnit.TryGetValue(workUnitId, out var list) ? [.. list.OrderBy(a => a.CreatedAt)] : []);
 
+        public Task<IReadOnlyList<ArtifactRef>> GetGlobalConstraintsAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ArtifactRef>>(
+                [.. _byId.Values.Where(a => a.OwnedByWorkUnitId is null && a.Type == ArtifactType.Constraint).OrderBy(a => a.CreatedAt)]);
+
         public Task<IReadOnlyList<ArtifactRef>> GetChildrenAsync(string parentArtifactId, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
 
@@ -123,6 +131,9 @@ public class ProjectionManagerTests
             throw new NotSupportedException();
 
         public Task<ArtifactRef> ReparentAsync(string artifactId, string newParentArtifactId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<ArtifactRef> InvalidateAsync(string artifactId, string reason, string? sessionId = null, CancellationToken ct = default) =>
             throw new NotSupportedException();
     }
 

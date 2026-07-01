@@ -1,7 +1,9 @@
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.AgentRuntime;
+using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Merge;
 using NodalMerge.Studio.McpServer;
 using NodalMerge.Studio.Orchestrator;
@@ -13,7 +15,7 @@ namespace NodalMerge.Studio.Host;
 
 public static class StudioServiceCollectionExtensions
 {
-    public static IServiceCollection AddStudioServices(this IServiceCollection services, HttpClient? llmHttpClient = null)
+    public static IServiceCollection AddStudioServices(this IServiceCollection services, HttpClient? llmHttpClient = null, bool includeMcpServer = true)
     {
         services.ConfigureHttpJsonOptions(options =>
         {
@@ -38,17 +40,27 @@ public static class StudioServiceCollectionExtensions
             config?.GetSection("Workspace").Bind(opts);
             // Config binding replaces C# defaults with empty strings for missing/blank values.
             if (string.IsNullOrWhiteSpace(opts.RootPath))
+            {
                 opts.RootPath = Path.Combine(Path.GetTempPath(), "studio-workspace");
+                var logger = sp.GetService<ILogger<WorkspaceOptions>>();
+                logger?.LogWarning(
+                    "[WorkspaceOptions] Workspace:RootPath is not configured — using temp fallback {Path}. " +
+                    "Set Workspace:RootPath in appsettings.json to persist data across reboots.",
+                    opts.RootPath);
+            }
             return opts;
         });
 
         services.AddNodalMergeStorage();
         services.AddStudioProjections();
+        services.AddSingleton<FindingDetectorService>();
         services.AddStudioTasks();
         services.AddStudioMerge();
         services.AddStudioAgentRuntime(llmHttpClient);
         services.AddStudioOrchestrator();
-        services.AddStudioMcpServer();
+        services.AddSingleton<ICounterfactualService, NodalMerge.Studio.Orchestrator.CounterfactualService>();
+        if (includeMcpServer)
+            services.AddStudioMcpServer();
         return services;
     }
 }

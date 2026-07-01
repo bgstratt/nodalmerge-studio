@@ -53,23 +53,27 @@ public class WorkUnitCommandConsolidationTests
         var client = app.GetTestClient();
 
         var parentResponse = await client.PostAsJsonAsync("/studio/workunits", new { goal = "parent goal", owner = "test" });
-        var parent = await parentResponse.Content.ReadFromJsonAsync<WorkUnit>();
+        var parentJson = await parentResponse.Content.ReadAsStringAsync();
+        var parent = System.Text.Json.JsonDocument.Parse(parentJson).RootElement;
+
+        var parentId = parent.GetProperty("workUnitId").GetString()!;
 
         var childResponse = await client.PostAsJsonAsync("/studio/workunits", new
         {
             goal = "child goal",
             owner = "test",
             branchId = "child-branch",
-            parentWorkUnitId = parent!.WorkUnitId,
-            dependsOn = new[] { parent.WorkUnitId },
+            parentWorkUnitId = parentId,
+            dependsOn = new[] { parentId },
             fileScope = new[] { "src/Foo.cs" },
         });
-        var child = await childResponse.Content.ReadFromJsonAsync<WorkUnit>();
+        var childJson = await childResponse.Content.ReadAsStringAsync();
+        var child = System.Text.Json.JsonDocument.Parse(childJson).RootElement;
 
-        Assert.Equal("child-branch", child!.BranchId);
-        Assert.Equal(parent.WorkUnitId, child.ParentWorkUnitId);
-        Assert.Equal([parent.WorkUnitId], child.DependsOn);
-        Assert.Equal(["src/Foo.cs"], child.FileScope);
+        Assert.Equal("child-branch", child.GetProperty("branchId").GetString());
+        Assert.Equal(parentId, child.GetProperty("parentWorkUnitId").GetString());
+        Assert.Equal([parentId], child.GetProperty("dependsOn").EnumerateArray().Select(e => e.GetString()).ToList());
+        Assert.Equal(["src/Foo.cs"], child.GetProperty("fileScope").EnumerateArray().Select(e => e.GetString()).ToList());
     }
 
     [Fact]
@@ -82,7 +86,8 @@ public class WorkUnitCommandConsolidationTests
         var branches = app.Services.GetRequiredService<IBranchService>();
 
         var parentJson = await tools.CreateAsync("parent goal");
-        var parentId = System.Text.Json.JsonDocument.Parse(parentJson).RootElement.GetProperty("workUnitId").GetString()!;
+        var parentDoc = System.Text.Json.JsonDocument.Parse(parentJson).RootElement;
+        var parentId = parentDoc.GetProperty("data").GetProperty("workUnitId").GetString()!;
 
         await tools.CreateAsync(
             "child goal",

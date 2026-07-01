@@ -3,20 +3,25 @@
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
   </PropertyGroup>
   <ItemGroup>
-    <PackageVersion Include="coverlet.collector" Version="6.0.4" />
-    <PackageVersion Include="Microsoft.AspNetCore.TestHost" Version="10.0.4" />
-    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.4" />
-    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.7" />
-    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageVersion Include="Blake3" Version="2.2.1" />
+    <PackageVersion Include="coverlet.collector" Version="10.0.1" />
+    <PackageVersion Include="LibGit2Sharp" Version="0.31.0" />
+    <PackageVersion Include="Microsoft.AspNetCore.TestHost" Version="10.0.9" />
+    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.9" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.14.0" />
+    <PackageVersion Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />
+    <PackageVersion Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.9" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.9" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.6.0" />
     <PackageVersion Include="ModelContextProtocol" Version="1.4.0" />
     <PackageVersion Include="ModelContextProtocol.AspNetCore" Version="1.4.0" />
-    <PackageVersion Include="NodalMerge.DotNetHost.Native.linux-x64" Version="0.1.0-local" />
-    <PackageVersion Include="NodalMerge.DotNetHost.Native.win-x64" Version="0.1.0-local" />
-    <PackageVersion Include="NodalMerge.Host.Abstractions" Version="0.1.0-local" />
-    <PackageVersion Include="NodalMerge.Host.Composition" Version="0.1.0-local" />
+    <PackageVersion Include="NodalMerge.DotNetHost" Version="0.1.1" />
+    <PackageVersion Include="NodalMerge.DotNetHost.Native.linux-x64" Version="0.1.1" />
+    <PackageVersion Include="NodalMerge.DotNetHost.Native.win-x64" Version="0.1.1" />
+    <PackageVersion Include="NodalMerge.Host.Abstractions" Version="0.1.1" />
+    <PackageVersion Include="SourceGear.SQLite3" Version="3.50.4.5" />
+    <PackageVersion Include="NodalMerge.Host.Composition" Version="0.1.1" />
     <PackageVersion Include="xunit" Version="2.9.3" />
-    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
   </ItemGroup>
 </Project>

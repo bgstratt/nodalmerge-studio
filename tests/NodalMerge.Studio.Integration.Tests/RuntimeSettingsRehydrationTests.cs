@@ -99,4 +99,25 @@ public class RuntimeSettingsRehydrationTests : IDisposable
         Assert.Equal(7, options2.MaxConcurrentWorkers);
         Assert.Equal(500, options2.SchedulerPollIntervalMs);
     }
+
+    [Fact]
+    public async Task DocFetchTools_toggle_survives_a_restart()
+    {
+        var app1 = BuildApp();
+        var options1 = app1.Services.GetRequiredService<WorkspaceOptions>();
+        var runtimeSettings1 = app1.Services.GetRequiredService<RuntimeSettingsService>();
+
+        Assert.False(options1.DocFetchTools);
+
+        options1.DocFetchTools = true;
+        await runtimeSettings1.PersistAsync();
+
+        await app1.DisposeAsync();
+
+        var app2 = BuildApp();
+        await RehydrateAsync(app2);
+
+        var options2 = app2.Services.GetRequiredService<WorkspaceOptions>();
+        Assert.True(options2.DocFetchTools);
+    }
 }

@@ -9,9 +9,10 @@ internal sealed class InMemoryBranchService(IFileWorkspaceService fileWorkspace)
 
     private readonly ConcurrentDictionary<string, BranchEntry> _branches = new();
 
-    public async Task<string> CreateBranchAsync(string name, string? fromBranchId = null, CancellationToken cancellationToken = default)
+    public async Task<string> CreateBranchAsync(string name, string? fromBranchId = null,
+        IReadOnlyList<string>? fileScope = null, CancellationToken cancellationToken = default)
     {
-        await fileWorkspace.InitBranchAsync(name, fromBranchId, cancellationToken).ConfigureAwait(false);
+        await fileWorkspace.InitBranchAsync(name, fromBranchId, fileScope, cancellationToken).ConfigureAwait(false);
         var workDir = await fileWorkspace.GetWorkingDirectoryAsync(name, cancellationToken).ConfigureAwait(false) ?? string.Empty;
         _branches.TryAdd(name, new BranchEntry(name, fromBranchId, workDir));
         return name;

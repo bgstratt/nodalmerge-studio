@@ -25,7 +25,7 @@ internal sealed class InMemoryKnownGoodStateService : IKnownGoodStateService, IR
         // (CreateBranchAsync calls IFileWorkspaceService.InitBranchAsync internally), so a later
         // edit to state.BranchId can't retroactively change what "known good" looked like.
         var snapshotBranchId = await _branches
-            .CreateBranchAsync($"knowngood/{state.StateId}", state.BranchId, cancellationToken)
+            .CreateBranchAsync($"knowngood/{state.StateId}", state.BranchId, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
         var snapshotted = state with { SnapshotBranchId = snapshotBranchId };
 
@@ -58,6 +58,12 @@ internal sealed class InMemoryKnownGoodStateService : IKnownGoodStateService, IR
                 .ConfigureAwait(false);
 
         return state;
+    }
+
+    public Task<KnownGoodState?> GetAsync(string stateId, CancellationToken cancellationToken = default)
+    {
+        _states.TryGetValue(stateId, out var state);
+        return Task.FromResult(state);
     }
 
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)

@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import type { AgentConfigService, AgentProfile, TopologyTemplate } from '../AgentConfigService';
+import { resolveRepositoryPath } from '../repositoryPath';
 import { scopeViewCss, wrapViewScript } from './sharedWebviewChrome';
 
 export interface PipelineProfile {
@@ -14,8 +15,14 @@ export interface PipelineProfile {
   fileScopePatterns: string[];
 }
 
-export class AgentConfigPanel {
-  static readonly containerId = 'shell-pane-agent-config';
+export interface DomainAgentInfo {
+  name: string;
+  titlePrefix: string;
+  keywords: string[];
+}
+
+export class ModelAgentStudioPanel {
+  static readonly containerId = 'shell-pane-model-agent-studio';
 
   private readonly panel: vscode.WebviewPanel;
   private readonly baseUrl: string;
@@ -40,28 +47,54 @@ export class AgentConfigPanel {
   /** Called once by the shell right after construction — was the tail of createOrShow(). */
   activate(): void {
     void this.sendConfig();
+    void this.sendParticipants();
+    // Poll participants every 10 s and re-send config every 30 s so domain agents and pipeline
+    // profiles always appear even if the server wasn't ready on the initial activate() call.
+    let tick = 0;
+    const timer = setInterval(() => {
+      void this.sendParticipants();
+      if (++tick % 3 === 0) { void this.sendConfig(); }
+    }, 10_000);
+    this.panel.onDidDispose(() => clearInterval(timer));
   }
 
   static getFragment(): { css: string; html: string; script: string } {
     return {
-      css: scopeViewCss(AGENT_CONFIG_CSS, AgentConfigPanel.containerId),
-      html: `<div id="${AgentConfigPanel.containerId}" class="nm-shell-pane">${AGENT_CONFIG_HTML}</div>`,
-      script: wrapViewScript(AGENT_CONFIG_JS, AgentConfigPanel.containerId),
+      css: scopeViewCss(MAS_CSS, ModelAgentStudioPanel.containerId),
+      html: `<div id="${ModelAgentStudioPanel.containerId}" class="nm-shell-pane">${MAS_HTML}</div>`,
+      script: wrapViewScript(MAS_JS, ModelAgentStudioPanel.containerId),
     };
   }
 
   private async sendConfig(): Promise<void> {
     let pipelineProfiles: PipelineProfile[] = [];
+    let domainAgents: DomainAgentInfo[] = [];
+    let enabledDomainAgents: string[] = [];
     try {
-      pipelineProfiles = await this.get<PipelineProfile[]>('/studio/agent-profiles');
+      [pipelineProfiles, domainAgents] = await Promise.all([
+        this.get<PipelineProfile[]>('/studio/agent-profiles'),
+        this.get<DomainAgentInfo[]>('/studio/domain-agents'),
+      ]);
+      const opts = await this.get<{ enabledDomainAgents?: string[] }>('/studio/options');
+      enabledDomainAgents = opts.enabledDomainAgents ?? [];
     } catch { /* server may not be running yet */ }
     void this.panel.webview.postMessage({
-      type:            'config',
-      profiles:        this.configService.getProfiles(),
-      templates:       this.configService.getTemplates(),
-      defaultTopology: this.configService.getDefaultTopology(),
+      type:                 'config',
+      profiles:             this.configService.getProfiles(),
+      templates:            this.configService.getTemplates(),
+      defaultTopology:      this.configService.getDefaultTopology(),
+      defaultReviewPolicy:  this.configService.getDefaultReviewPolicy(),
       pipelineProfiles,
+      domainAgents,
+      enabledDomainAgents,
     });
+  }
+
+  private async sendParticipants(): Promise<void> {
+    try {
+      const participants = await this.get<unknown[]>('/studio/participants');
+      void this.panel.webview.postMessage({ type: 'participants', participants });
+    } catch { /* server may not be running yet */ }
   }
 
   async handleMessage(msg: Record<string, unknown>): Promise<void> {
@@ -110,8 +143,8 @@ export class AgentConfigPanel {
         break;
       }
 
-      case 'quickSpawn':
-        await this.handleQuickSpawn(
+      case 'quickExplore':
+        await this.handleQuickExplore(
           msg.templateName as string,
           msg.goal as string,
           msg.autoReviewProfileId as string | undefined,
@@ -127,15 +160,44 @@ export class AgentConfigPanel {
         void this.panel.webview.postMessage({ type: 'models', models });
         break;
       }
+
+      case 'saveSessionDefaults': {
+        const policy = msg.defaultReviewPolicy as string;
+        const enabledDomainAgents = (msg.enabledDomainAgents as string[] | undefined) ?? [];
+        if (policy) {
+          await this.configService.saveDefaultReviewPolicy(policy);
+        }
+        try {
+          const currentOpts = await this.get<Record<string, unknown>>('/studio/options');
+          await this.post('/studio/options', { ...currentOpts, enabledDomainAgents });
+        } catch { /* host may not be running */ }
+        void this.panel.webview.postMessage({ type: 'sessionDefaults', defaultReviewPolicy: policy, enabledDomainAgents });
+        void vscode.window.showInformationMessage('NodalMerge: Session defaults saved.');
+        break;
+      }
+
+      case 'refreshParticipants':
+        void this.sendParticipants();
+        break;
+
+      case 'stopParticipant': {
+        const id = msg.id as string;
+        try {
+          await fetch(this.baseUrl + '/studio/participants/' + encodeURIComponent(id), { method: 'POST' });
+        } catch { /* host may not be running */ }
+        setTimeout(() => void this.sendParticipants(), 1000);
+        break;
+      }
+
     }
   }
 
-  private async handleQuickSpawn(templateName: string, goal: string, autoReviewProfileId?: string): Promise<void> {
+  private async handleQuickExplore(templateName: string, goal: string, autoReviewProfileId?: string): Promise<void> {
     const templates = this.configService.getTemplates();
     const template  = templates.find(t => t.name === templateName);
     if (!template) {
-      void vscode.window.showErrorMessage(`NodalMerge: Template "${templateName}" not found.`);
-      void this.panel.webview.postMessage({ type: 'spawnResult', success: false, message: 'Template not found.' });
+      void vscode.window.showErrorMessage(`NodalMerge: Exploration strategy "${templateName}" not found.`);
+      void this.panel.webview.postMessage({ type: 'spawnResult', success: false, message: 'Exploration strategy not found.' });
       return;
     }
 
@@ -156,15 +218,12 @@ export class AgentConfigPanel {
         );
       }
 
-      const repositoryPath = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+      const repositoryPath = resolveRepositoryPath();
       const orchWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
         goal,
         owner: template.orchestrator,
         ...(repositoryPath ? { repositoryPath } : {}),
       });
-      // Always use 'orchestrator' as the agentType so the server starts the correct loop,
-      // regardless of what the user named their LLM profile.  Workers are spawned by
-      // the orchestrator via nm.v1.agent.spawn once it has created tasks with taskIds.
       await this.post('/studio/agents/spawn', {
         agentType:  'orchestrator',
         workUnitId: orchWu.workUnitId,
@@ -174,13 +233,13 @@ export class AgentConfigPanel {
 
       void this.panel.webview.postMessage({ type: 'spawnResult', success: true });
       void vscode.window.showInformationMessage(
-        `NodalMerge: Spawned orchestrator for "${templateName}": ${goal}`,
+        `NodalMerge: Started exploration for "${templateName}": ${goal}`,
       );
     } catch (err) {
       void this.panel.webview.postMessage({
         type: 'spawnResult', success: false, message: String(err),
       });
-      void vscode.window.showErrorMessage('NodalMerge: Quick spawn failed — ' + String(err));
+      void vscode.window.showErrorMessage('NodalMerge: Quick explore failed — ' + String(err));
     }
   }
 
@@ -245,7 +304,7 @@ export class AgentConfigPanel {
 
 // ── HTML builder ───────────────────────────────────────────────────────────
 
-const AGENT_CONFIG_CSS = `
+const MAS_CSS = `
   :root {
     --nm-bg:         var(--vscode-editor-background);
     --nm-fg:         var(--vscode-editor-foreground);
@@ -271,6 +330,7 @@ const AGENT_CONFIG_CSS = `
     padding: 13px 16px 8px; border-bottom: 1px solid var(--nm-border); flex-shrink: 0;
   }
   .header h1 { font-size: 1.1em; font-weight: 700; margin: 0; }
+  .header .sub { font-size: 0.82em; opacity: 0.6; margin: 2px 0 0; }
   .tabs {
     display: flex; border-bottom: 1px solid var(--nm-border); flex-shrink: 0;
   }
@@ -341,26 +401,37 @@ const AGENT_CONFIG_CSS = `
   .muted { font-size:0.82em; opacity:0.6; padding:6px 0; }
   .grow { flex: 1; }
   .save-bar .status { font-size: 0.8em; opacity: 0.5; flex: 1; }
-  .spawn-form { max-width: 440px; }
-  .spawn-form .field { margin-bottom: 12px; }
-  .spawn-result {
+  .explore-form { max-width: 440px; }
+  .explore-form .field { margin-bottom: 12px; }
+  .explore-result {
     margin-top: 14px; font-size: 0.88em; padding: 8px 12px; border-radius: 4px;
   }
-  .spawn-result.ok  { background: #1e3a1e; color: #7ec87e; }
-  .spawn-result.err { background: #3a1e1e; color: #f07070; }
+  .explore-result.ok  { background: #1e3a1e; color: #7ec87e; }
+  .explore-result.err { background: #3a1e1e; color: #f07070; }
   .default-badge {
     background: #2d5016; color: #8fc96a;
     border-radius: 10px; font-size: 0.74em; padding: 1px 7px; margin-left: 5px;
   }
+  .chip {
+    border-radius: 10px; font-size: 0.75em; padding: 1px 7px; display: inline-block;
+  }
+  .chip-running   { background: #1e3a1e; color: #7ec87e; }
+  .chip-connected { background: #1e2d3a; color: #6eaef0; }
+  .chip-idle      { background: #2a2a2a; color: #888; }
 `;
 
-const AGENT_CONFIG_HTML = `
-  <div class="header"><h1>Agent Config</h1></div>
+const MAS_HTML = `
+  <div class="header">
+    <h1>Model & Agent Studio</h1>
+    <p class="sub">Configure models, agent profiles, and agent topology.</p>
+  </div>
   <div class="tabs">
     <button class="tab-btn active" data-tab="profiles">Profiles</button>
-    <button class="tab-btn" data-tab="templates">Topology Templates</button>
-    <button class="tab-btn" data-tab="spawn">Quick Spawn</button>
+    <button class="tab-btn" data-tab="strategies">Agent Topology</button>
+    <button class="tab-btn" data-tab="explore">Quick Explore</button>
     <button class="tab-btn" data-tab="pipeline-profiles">Pipeline Profiles</button>
+    <button class="tab-btn" data-tab="session-defaults">Session Defaults</button>
+    <button class="tab-btn" data-tab="participants">Participants</button>
   </div>
 
   <div id="pane-profiles" class="tab-pane visible">
@@ -372,33 +443,33 @@ const AGENT_CONFIG_HTML = `
     <button class="add-btn" id="btn-add-profile">+ Add Profile</button>
   </div>
 
-  <div id="pane-templates" class="tab-pane">
+  <div id="pane-strategies" class="tab-pane">
     <div id="template-form-area"></div>
     <table>
-      <thead><tr><th>Name</th><th>Orchestrator</th><th>Workers</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Orchestrator Profile</th><th>Planner Profile</th><th>Worker Profile</th><th>Reviewer Profile</th><th></th></tr></thead>
       <tbody id="template-tbody"></tbody>
     </table>
-    <button class="add-btn" id="btn-add-template">+ Add Template</button>
+    <button class="add-btn" id="btn-add-template">+ Add Topology</button>
   </div>
 
-  <div id="pane-spawn" class="tab-pane">
-    <div class="spawn-form">
+  <div id="pane-explore" class="tab-pane">
+    <div class="explore-form">
       <div class="field">
-        <label>Topology Template</label>
-        <select id="spawn-template"></select>
+        <label>Agent Topology</label>
+        <select id="explore-strategy"></select>
       </div>
       <div class="field">
         <label>Goal</label>
-        <input type="text" id="spawn-goal" placeholder="e.g. Refactor the auth module">
+        <input type="text" id="explore-goal" placeholder="e.g. Refactor the auth module">
       </div>
       <div class="field">
         <label class="checkbox-label">
-          <input type="checkbox" id="spawn-auto-review" checked>
+          <input type="checkbox" id="explore-auto-review" checked>
           Run automated review before human gate
         </label>
       </div>
-      <button id="btn-spawn">&#x25B6; Quick Spawn</button>
-      <div id="spawn-result" class="spawn-result hidden"></div>
+      <button id="btn-explore">&#x25B6; Quick Explore</button>
+      <div id="explore-result" class="explore-result hidden"></div>
     </div>
   </div>
 
@@ -411,14 +482,51 @@ const AGENT_CONFIG_HTML = `
     <button class="add-btn" id="btn-add-pipeline-profile">+ Add Pipeline Profile</button>
   </div>
 
+  <div id="pane-session-defaults" class="tab-pane">
+    <div class="explore-form">
+      <h3>Session Defaults</h3>
+      <p class="sub">These defaults apply to new goals created in the Goal Workspace.</p>
+      <div class="field">
+        <label>Default Review Policy</label>
+        <select id="default-review-policy">
+          <option value="HumanRequired">Human Required — manual apply (default)</option>
+          <option value="AgentApproval">Agent Approval — reviewer agent auto-merges</option>
+          <option value="Hybrid">Hybrid — agent approves; auto-merges after 5 min</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Domain Agents</label>
+        <p class="sub">Reactive observers that watch recorded Research/Decision/Constraint artifacts and may propose a Constraint back — they never own task lifecycle. Off by default.</p>
+        <div id="domain-agent-toggles"></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <button id="btn-save-session-defaults">Save Session Defaults</button>
+      </div>
+      <span id="session-defaults-status" class="status"></span>
+    </div>
+  </div>
+
+  <div id="pane-participants" class="tab-pane">
+    <div class="header-row" style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+      <h3 style="margin:0;flex:1">Live Participants</h3>
+      <button class="ghost" id="btn-refresh-participants" style="font-size:0.8em">&#x21BB; Refresh</button>
+    </div>
+    <p class="sub">In-process agents and connected room peers. Agents show work-unit context; peers show their declared type.</p>
+    <table>
+      <thead><tr><th>ID</th><th>Kind</th><th>Status</th><th>Work Unit</th><th>Activity / Type</th><th></th></tr></thead>
+      <tbody id="participant-tbody"></tbody>
+    </table>
+    <div id="participants-empty" class="muted" style="padding:8px 0">No participants — runtime may not be running.</div>
+  </div>
+
   <div class="save-bar">
     <span class="status" id="save-status"></span>
     <button id="btn-save-profiles">Save Profiles</button>
-    <button id="btn-save-templates">Save Templates</button>
+    <button id="btn-save-strategies">Save Strategies</button>
   </div>
 `;
 
-const AGENT_CONFIG_JS = `
+const MAS_JS = `
   const vscode = acquireVsCodeApi();
 
   let profiles = [];
@@ -441,8 +549,8 @@ const AGENT_CONFIG_JS = `
   // ── Escape helper ──────────────────────────────────────────────────────────
   function esc(str) {
     return String(str || '')
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      .replace(/&/g, '&').replace(/</g, '<')
+      .replace(/>/g, '>').replace(/"/g, '"').replace(/'/g, '&#39;');
   }
 
   // ── Status flash ──────────────────────────────────────────────────────────
@@ -473,7 +581,7 @@ const AGENT_CONFIG_JS = `
         '</div></td>';
       tbody.appendChild(tr);
     });
-    updateSpawnTemplates();
+    updateExploreStrategySelector();
   }
 
   document.getElementById('profile-tbody').addEventListener('click', function(e) {
@@ -494,12 +602,11 @@ const AGENT_CONFIG_JS = `
   function showProfileForm(idx) {
     const isNew = idx === -1;
     const p = isNew
-      ? { id: '', label: '', domain: '', provider: 'vscode-lm', model: '', baseUrl: '', systemPromptHint: '', apiKeyRef: '' }
+      ? { id: '', label: '', domain: '', deploymentMode: 'inline', provider: 'vscode-lm', model: '', baseUrl: '', systemPrompt: '', apiKeyRef: '' }
       : profiles[idx];
     const curProvider = p.provider || 'anthropic';
     const isVsLm = curProvider === 'vscode-lm';
     const area = document.getElementById('profile-form-area');
-    // Always show the model field so users can supply a model hint for vscode-lm.
     const modelRowClass = 'field';
     const baseUrlRowClass = isVsLm ? 'field hidden' : 'field';
     const apiKeyRowClass = isVsLm ? 'field hidden' : 'field';
@@ -545,9 +652,14 @@ const AGENT_CONFIG_JS = `
           (p.apiKeyRef ? 'Key stored (' + esc(p.apiKeyRef) + ')' : 'No key stored') +
         '</div>' +
       '</div>' +
+      '<div class="field"><label>Deployment Mode</label>' +
+        '<select id="pf-deploy-mode">' +
+          '<option value="inline"'   + ((p.deploymentMode || 'inline') === 'inline'   ? ' selected' : '') + '>inline — managed by this runtime (default)</option>' +
+          '<option value="headless"' + ((p.deploymentMode || 'inline') === 'headless' ? ' selected' : '') + '>headless — standalone peer process (no vscode-lm)</option>' +
+        '</select></div>' +
       (isVsLm ? '<div class="field muted">Uses your VS Code Copilot or Cursor subscription — no API key required.</div>' : '') +
-      '<div class="field"><label>System Prompt Hint (optional)</label>' +
-        '<textarea id="pf-prompt">' + esc(p.systemPromptHint || '') + '</textarea></div>' +
+      '<div class="field"><label>System Prompt (optional)</label>' +
+        '<textarea id="pf-prompt">' + esc(p.systemPrompt || p.systemPromptHint || '') + '</textarea></div>' +
       '<div class="form-actions">' +
         '<button id="pf-save">Save</button>' +
         '<button class="ghost" id="pf-cancel">Cancel</button>' +
@@ -625,29 +737,28 @@ const AGENT_CONFIG_JS = `
     });
 
     document.getElementById('pf-save').addEventListener('click', function() {
-      const id       = document.getElementById('pf-id').value.trim();
-      const label    = document.getElementById('pf-label').value.trim();
-      const domain   = document.getElementById('pf-domain').value.trim();
-      const provider = document.getElementById('pf-provider').value;
-      // Always capture the model field; an empty value will mean "use active VS Code model".
-      const model    = getModelValue();
-      const baseUrl  = provider === 'vscode-lm' ? '' : document.getElementById('pf-baseurl').value.trim();
-      const prompt   = document.getElementById('pf-prompt').value.trim();
+      const id           = document.getElementById('pf-id').value.trim();
+      const label        = document.getElementById('pf-label').value.trim();
+      const domain       = document.getElementById('pf-domain').value.trim();
+      const provider     = document.getElementById('pf-provider').value;
+      const deployMode   = document.getElementById('pf-deploy-mode').value;
+      const model        = getModelValue();
+      const baseUrl      = provider === 'vscode-lm' ? '' : document.getElementById('pf-baseurl').value.trim();
+      const prompt       = document.getElementById('pf-prompt').value.trim();
       if (!id || !label || !domain) { alert('ID, Label, and Domain are required.'); return; }
-      // If a key was typed in the password field, store it when saving — no need for a separate "Store Key" click.
       const keyEl     = document.getElementById('pf-apikey');
       const pendingKey = (keyEl && provider !== 'vscode-lm') ? keyEl.value.trim() : '';
-      // Determine apiKeyRef: use the pending key's deterministic ref, OR carry forward the existing ref from the live profiles array.
       const liveProfile = isNew ? null : profiles.find(function(pr) { return pr.id === p.id; });
       const existingRef = liveProfile ? liveProfile.apiKeyRef : (isNew ? undefined : p.apiKeyRef);
       const apiKeyRef   = provider === 'vscode-lm' ? undefined
         : (pendingKey ? ('nodalmerge.apikey.' + id) : existingRef);
       const profile = {
         id, label, domain, provider,
+        deploymentMode:   deployMode === 'headless' ? 'headless' : undefined,
         model:            model   || undefined,
         baseUrl:          baseUrl || undefined,
         apiKeyRef:        apiKeyRef,
-        systemPromptHint: prompt  || undefined,
+        systemPrompt:     prompt  || undefined,
       };
       if (isNew) { profiles.push(profile); }
       else       { profiles[idx] = profile; }
@@ -655,7 +766,6 @@ const AGENT_CONFIG_JS = `
       document.getElementById('profile-form-area').innerHTML = '';
       renderProfiles();
       vscode.postMessage({ type: 'saveProfiles', profiles: profiles });
-      // Store the key AFTER saving the profile so the ref is already in place.
       if (pendingKey) {
         vscode.postMessage({ type: 'setApiKey', profileId: id, key: pendingKey });
       }
@@ -671,19 +781,26 @@ const AGENT_CONFIG_JS = `
     showProfileForm(-1);
   });
 
-  // ── Templates ─────────────────────────────────────────────────────────────
+  // ── Agent Topology ───────────────────────────────────────────────────────────
+  function profileLabel(profileId) {
+    if (!profileId) { return '— inherit Orchestrator —'; }
+    const p = profiles.find(function(pr) { return pr.id === profileId; });
+    return p ? p.label : profileId;
+  }
+
   function renderTemplates() {
     const tbody = document.getElementById('template-tbody');
     if (!tbody) { return; }
     tbody.innerHTML = '';
     templates.forEach(function(t, i) {
-      const workers   = (t.workers || []).map(function(w) { return w.profile; }).join(', ') || '—';
       const isDefault = t.name === defaultTopology;
       const tr = document.createElement('tr');
       tr.innerHTML =
         '<td>' + esc(t.name) + (isDefault ? '<span class="default-badge">default</span>' : '') + '</td>' +
-        '<td class="mono">' + esc(t.orchestrator) + '</td>' +
-        '<td class="mono">' + esc(workers) + '</td>' +
+        '<td class="mono">' + esc(profileLabel(t.orchestrator)) + '</td>' +
+        '<td class="mono">' + esc(profileLabel(t.planner)) + '</td>' +
+        '<td class="mono">' + esc(profileLabel(t.worker)) + '</td>' +
+        '<td class="mono">' + esc(profileLabel(t.reviewer)) + '</td>' +
         '<td><div class="act-cell">' +
           (isDefault ? '' : '<button class="ghost" data-action="setDefault" data-idx="' + i + '">Set Default</button>') +
           '<button class="ghost" data-action="edit" data-idx="' + i + '">Edit</button>' +
@@ -691,7 +808,7 @@ const AGENT_CONFIG_JS = `
         '</div></td>';
       tbody.appendChild(tr);
     });
-    updateSpawnTemplates();
+    updateExploreStrategySelector();
   }
 
   document.getElementById('template-tbody').addEventListener('click', function(e) {
@@ -714,34 +831,50 @@ const AGENT_CONFIG_JS = `
     renderTemplates();
   }
 
+  function profileOptions(selected, includeInherit) {
+    const lead = includeInherit ? '<option value="">— inherit Orchestrator —</option>' : '';
+    return lead + profiles.map(function(p) {
+      const sel = p.id === selected ? ' selected' : '';
+      return '<option value="' + esc(p.id) + '"' + sel + '>' + esc(p.label) + ' (' + esc(p.domain) + ')</option>';
+    }).join('');
+  }
+
   function showTemplateForm(idx) {
     const isNew = idx === -1;
-    const t = isNew ? { name: '', orchestrator: '', workers: [] } : templates[idx];
-    const workersStr = (t.workers || []).map(function(w) { return w.profile; }).join(', ');
+    const t = isNew ? { name: '', orchestrator: '', planner: '', worker: '', reviewer: '' } : templates[idx];
     const area = document.getElementById('template-form-area');
     area.innerHTML =
       '<div class="form-box">' +
-      '<h3>' + (isNew ? 'Add Template' : 'Edit Template') + '</h3>' +
+      '<h3>' + (isNew ? 'Add Topology' : 'Edit Topology') + '</h3>' +
       '<div class="field"><label>Name</label>' +
         '<input type="text" id="tmpl-name" value="' + esc(t.name) + '" placeholder="e.g. Default"></div>' +
-      '<div class="field"><label>Orchestrator Profile ID</label>' +
-        '<input type="text" id="tmpl-orch" value="' + esc(t.orchestrator) + '" placeholder="e.g. orchestrator"></div>' +
-      '<div class="field"><label>Worker Profile IDs (comma-separated)</label>' +
-        '<input type="text" id="tmpl-workers" value="' + esc(workersStr) + '" placeholder="e.g. worker, docs-agent"></div>' +
+      '<div class="field"><label>Orchestrator Profile</label>' +
+        '<select id="tmpl-orch">' + profileOptions(t.orchestrator, false) + '</select></div>' +
+      '<div class="field"><label>Planner Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+        '<select id="tmpl-planner">' + profileOptions(t.planner, true) + '</select></div>' +
+      '<div class="field"><label>Worker Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+        '<select id="tmpl-worker">' + profileOptions(t.worker, true) + '</select></div>' +
+      '<div class="field"><label>Reviewer Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+        '<select id="tmpl-reviewer">' + profileOptions(t.reviewer, true) + '</select></div>' +
       '<div class="form-actions">' +
         '<button id="tmpl-save">Save</button>' +
         '<button class="ghost" id="tmpl-cancel">Cancel</button>' +
       '</div></div>';
 
     document.getElementById('tmpl-save').addEventListener('click', function() {
-      const name  = document.getElementById('tmpl-name').value.trim();
-      const orch  = document.getElementById('tmpl-orch').value.trim();
-      const wStr  = document.getElementById('tmpl-workers').value.trim();
-      if (!name || !orch) { alert('Name and Orchestrator are required.'); return; }
-      const workers = wStr
-        ? wStr.split(',').map(function(s) { return { profile: s.trim() }; }).filter(function(w) { return w.profile; })
-        : [];
-      const tmpl = { name: name, orchestrator: orch, workers: workers };
+      const name     = document.getElementById('tmpl-name').value.trim();
+      const orch     = document.getElementById('tmpl-orch').value;
+      const planner  = document.getElementById('tmpl-planner').value;
+      const worker   = document.getElementById('tmpl-worker').value;
+      const reviewer = document.getElementById('tmpl-reviewer').value;
+      if (!name || !orch) { alert('Name and Orchestrator Profile are required.'); return; }
+      const tmpl = {
+        name: name,
+        orchestrator: orch,
+        planner: planner || undefined,
+        worker: worker || undefined,
+        reviewer: reviewer || undefined,
+      };
       if (isNew) { templates.push(tmpl); }
       else       { templates[idx] = tmpl; }
       document.getElementById('template-form-area').innerHTML = '';
@@ -756,9 +889,9 @@ const AGENT_CONFIG_JS = `
     showTemplateForm(-1);
   });
 
-  // ── Spawn template selector ────────────────────────────────────────────────
-  function updateSpawnTemplates() {
-    const sel = document.getElementById('spawn-template');
+  // ── Quick Explore strategy selector ────────────────────────────────────────
+  function updateExploreStrategySelector() {
+    const sel = document.getElementById('explore-strategy');
     if (!sel) { return; }
     const current = sel.value;
     sel.innerHTML = templates.map(function(t) {
@@ -771,16 +904,16 @@ const AGENT_CONFIG_JS = `
     }
   }
 
-  // ── Quick Spawn ────────────────────────────────────────────────────────────
-  document.getElementById('btn-spawn').addEventListener('click', function() {
-    const templateName = document.getElementById('spawn-template').value;
-    const goal = document.getElementById('spawn-goal').value.trim();
+  // ── Quick Explore ──────────────────────────────────────────────────────────
+  document.getElementById('btn-explore').addEventListener('click', function() {
+    const templateName = document.getElementById('explore-strategy').value;
+    const goal = document.getElementById('explore-goal').value.trim();
     if (!goal) { alert('Goal is required.'); return; }
-    const autoReview = document.getElementById('spawn-auto-review').checked;
+    const autoReview = document.getElementById('explore-auto-review').checked;
     this.disabled    = true;
-    this.textContent = 'Spawning…';
+    this.textContent = 'Exploring…';
     vscode.postMessage({
-      type: 'quickSpawn',
+      type: 'quickExplore',
       templateName: templateName,
       goal: goal,
       autoReviewProfileId: autoReview ? 'reviewer' : undefined
@@ -792,9 +925,39 @@ const AGENT_CONFIG_JS = `
     vscode.postMessage({ type: 'saveProfiles', profiles: profiles });
     setStatus('Profiles saved.');
   });
-  document.getElementById('btn-save-templates').addEventListener('click', function() {
+  document.getElementById('btn-save-strategies').addEventListener('click', function() {
     vscode.postMessage({ type: 'saveTemplates', templates: templates });
-    setStatus('Templates saved.');
+    setStatus('Strategies saved.');
+  });
+
+  // ── Session Defaults ──────────────────────────────────────────────────────
+  var domainAgents = [];
+  var enabledDomainAgents = [];
+
+  function renderDomainAgentToggles() {
+    var container = document.getElementById('domain-agent-toggles');
+    if (!container) { return; }
+    container.innerHTML = domainAgents.map(function(d) {
+      var checked = enabledDomainAgents.indexOf(d.name) >= 0 ? ' checked' : '';
+      var keywords = (d.keywords || []).slice(0, 6).join(', ');
+      return '<label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-bottom:4px;" title="' + esc(keywords) + '">' +
+        '<input type="checkbox" class="domain-agent-toggle" data-name="' + esc(d.name) + '"' + checked + '> ' + esc(d.name) +
+        '</label>';
+    }).join('');
+  }
+
+  document.getElementById('btn-save-session-defaults').addEventListener('click', function() {
+    var sel = document.getElementById('default-review-policy');
+    var reviewPolicy = sel ? sel.value : 'HumanRequired';
+    var checkedAgents = Array.prototype.slice.call(document.querySelectorAll('.domain-agent-toggle:checked'))
+      .map(function(el) { return el.getAttribute('data-name'); });
+    vscode.postMessage({
+      type: 'saveSessionDefaults',
+      defaultReviewPolicy: reviewPolicy,
+      enabledDomainAgents: checkedAgents,
+    });
+    var statusEl = document.getElementById('session-defaults-status');
+    if (statusEl) { statusEl.textContent = 'Saved.'; setTimeout(function() { statusEl.textContent = ''; }, 2000); }
   });
 
   // ── Pipeline Profiles ─────────────────────────────────────────────────────
@@ -888,6 +1051,45 @@ const AGENT_CONFIG_JS = `
   });
 
   // ── Extension host messages ────────────────────────────────────────────────
+  // ── Participants ──────────────────────────────────────────────────────────
+  function renderParticipants(participants) {
+    const tbody = document.getElementById('participant-tbody');
+    const empty = document.getElementById('participants-empty');
+    if (!tbody) { return; }
+    tbody.innerHTML = '';
+    if (!participants || participants.length === 0) {
+      if (empty) { empty.style.display = ''; }
+      return;
+    }
+    if (empty) { empty.style.display = 'none'; }
+    participants.forEach(function(p) {
+      const tr = document.createElement('tr');
+      const statusClass = p.status === 'running' ? 'chip-running' : p.status === 'connected' ? 'chip-connected' : 'chip-idle';
+      tr.innerHTML =
+        '<td class="mono" style="max-width:120px;overflow:hidden;text-overflow:ellipsis" title="' + esc(p.id) + '">' + esc(p.id.substring(0, 12)) + (p.id.length > 12 ? '…' : '') + '</td>' +
+        '<td><span class="chip ' + statusClass + '">' + esc(p.kind) + '</span></td>' +
+        '<td><span class="chip ' + statusClass + '">' + esc(p.status) + '</span></td>' +
+        '<td class="mono">' + esc(p.workUnitId || '—') + '</td>' +
+        '<td class="mono">' + esc(p.currentActivity || p.peerType || '—') + '</td>' +
+        '<td><button class="danger" data-stop-id="' + esc(p.id) + '">Stop</button></td>';
+      tbody.appendChild(tr);
+    });
+  }
+
+  document.getElementById('participant-tbody').addEventListener('click', function(e) {
+    const btn = e.target.closest('button[data-stop-id]');
+    if (!btn) { return; }
+    const id = btn.getAttribute('data-stop-id');
+    if (id && confirm('Stop participant ' + id + '?')) {
+      btn.disabled = true;
+      vscode.postMessage({ type: 'stopParticipant', id: id });
+    }
+  });
+
+  document.getElementById('btn-refresh-participants').addEventListener('click', function() {
+    vscode.postMessage({ type: 'refreshParticipants' });
+  });
+
   window.addEventListener('message', function(event) {
     const msg = event.data;
     if (msg.type === 'models') {
@@ -901,32 +1103,49 @@ const AGENT_CONFIG_JS = `
       pipelineProfiles = msg.pipelineProfiles || [];
       renderProfiles();
       renderTemplates();
-      updateSpawnTemplates();
+      updateExploreStrategySelector();
       renderPipelineProfiles();
+      var rpSel = document.getElementById('default-review-policy');
+      if (rpSel && msg.defaultReviewPolicy) { rpSel.value = msg.defaultReviewPolicy; }
+      domainAgents = msg.domainAgents || [];
+      enabledDomainAgents = msg.enabledDomainAgents || [];
+      renderDomainAgentToggles();
       return;
     }
     if (msg.type === 'apiKeySaved') {
       const statusEl = document.getElementById('pf-key-status');
       if (statusEl) { statusEl.textContent = 'Key stored (' + esc(msg.apiKeyRef || msg.profileId) + ')'; }
-      // Update the in-memory profiles array so a subsequent Save preserves the apiKeyRef.
       if (msg.apiKeyRef) {
         const pi = profiles.findIndex(function(pr) { return pr.id === msg.profileId; });
         if (pi >= 0) { profiles[pi] = Object.assign({}, profiles[pi], { apiKeyRef: msg.apiKeyRef }); }
       }
       return;
     }
+    if (msg.type === 'sessionDefaults') {
+      var sel = document.getElementById('default-review-policy');
+      if (sel && msg.defaultReviewPolicy) { sel.value = msg.defaultReviewPolicy; }
+      if (msg.enabledDomainAgents) {
+        enabledDomainAgents = msg.enabledDomainAgents;
+        renderDomainAgentToggles();
+      }
+      return;
+    }
+    if (msg.type === 'participants') {
+      renderParticipants(msg.participants || []);
+      return;
+    }
     if (msg.type === 'spawnResult') {
-      const btn = document.getElementById('btn-spawn');
+      const btn = document.getElementById('btn-explore');
       btn.disabled    = false;
-      btn.textContent = '\\u25B6 Quick Spawn';
-      const result = document.getElementById('spawn-result');
+      btn.textContent = '\\u25B6 Quick Explore';
+      const result = document.getElementById('explore-result');
       if (result) {
         result.classList.remove('hidden');
-        result.className     = 'spawn-result ' + (msg.success ? 'ok' : 'err');
-        result.textContent   = msg.success ? 'Spawned successfully!' : ('Error: ' + (msg.message || 'unknown'));
+        result.className     = 'explore-result ' + (msg.success ? 'ok' : 'err');
+        result.textContent   = msg.success ? 'Exploration started successfully!' : ('Error: ' + (msg.message || 'unknown'));
       }
       if (msg.success) {
-        const g = document.getElementById('spawn-goal');
+        const g = document.getElementById('explore-goal');
         if (g && 'value' in g) { g.value = ''; }
         setTimeout(function() { if (result) result.classList.add('hidden'); }, 5000);
       }

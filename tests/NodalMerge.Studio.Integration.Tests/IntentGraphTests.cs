@@ -209,23 +209,35 @@ public class IntentGraphTests
         public Task<WorkUnit> UpdateStatusAsync(string workUnitId, WorkUnitStatus status, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit> SetCurrentStageAsync(string workUnitId, PipelineStage? stage, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit> SetFanOutBlockedReasonAsync(string workUnitId, string? blockedReason, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> IncrementReviewRejectionCountAsync(string workUnitId, bool automated, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> IncrementFailureAttemptCountAsync(string workUnitId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> AmendGoalForSteeredRetryAsync(string workUnitId, string amendedGoal, string steeringContext, string deadLetterEntryId, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<WorkUnit?>(null);
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private sealed class NoopFileWorkspaceService : IFileWorkspaceService
     {
-        public Task InitBranchAsync(string b, string? s = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task InitBranchAsync(string b, string? s = null, IReadOnlyList<string>? fileScope = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<bool> MaterializeFileAsync(string b, string path, CancellationToken ct = default) => Task.FromResult(false);
         public Task<string?> ReadAsync(string b, string p, CancellationToken ct = default) => Task.FromResult<string?>(null);
+        public Task<IReadOnlyList<WorkspaceFileRead>> ReadManyAsync(string b, IReadOnlyList<string> paths, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<WorkspaceFileRead>>(paths.Select(p => new WorkspaceFileRead(p, null, false)).ToList());
         public Task WriteAsync(string b, string p, string c, CancellationToken ct = default) => Task.CompletedTask;
         public Task DeleteAsync(string b, string p, CancellationToken ct = default) => Task.CompletedTask;
         public Task<bool> ExistsAsync(string b, string p, CancellationToken ct = default) => Task.FromResult(false);
-        public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, string? p = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<(IReadOnlyList<WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(string b, string query, string? s = null, string? fp = null, bool regex = false, bool cs = false, int cl = 3, int mr = 200, CancellationToken ct = default) => Task.FromResult<(IReadOnlyList<WorkspaceSearchMatch>, bool)>(([], false));
+        public Task<WorkspaceReplaceResult> ReplaceAsync(string b, string p, string oldText, string newText, int expectedMatches = 1, CancellationToken ct = default) => Task.FromResult(new WorkspaceReplaceResult(0, 0, 0, string.Empty));
         public Task<string> DiffAsync(string s, string t, CancellationToken ct = default) => Task.FromResult(string.Empty);
         public Task ApplyBranchAsync(string s, string t, CancellationToken ct = default) => Task.CompletedTask;
         public Task CopyFilesAsync(string s, string t, IReadOnlyList<string> paths, CancellationToken ct = default) => Task.CompletedTask;
         public Task<string?> GetWorkingDirectoryAsync(string b, CancellationToken ct = default) => Task.FromResult<string?>(null);
+        public Task<WorkspaceDiff> DiffExternalPathAsync(string b, string e, CancellationToken ct = default) =>
+            Task.FromResult(new WorkspaceDiff([], [], [], string.Empty));
+        public Task ApplyExternalPathAsync(string b, string e, CancellationToken ct = default) => Task.CompletedTask;
     }
 }

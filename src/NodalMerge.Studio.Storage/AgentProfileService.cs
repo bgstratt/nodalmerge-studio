@@ -8,6 +8,35 @@ namespace NodalMerge.Studio.Storage;
 
 public sealed class AgentProfileService : IAgentProfileService, IRehydratable
 {
+    // Discovery tools a profile for this stage can't function without, regardless of how its
+    // AllowedTools list was customized — a worker that can't list/profile the workspace is stuck
+    // guessing file paths (see the Program.cs dead-letter this was added to fix). Enforced on
+    // every load/save below so neither a persisted profile from before this list existed, nor a
+    // future hand-edit via the profile editor, can silently drop them.
+    //
+    // WorkspaceSearch is required everywhere ListAsync/ProfileGet are: content search is now the
+    // primary discovery primitive (filename matching alone reproduces the same guessing problem).
+    // ArtifactQuery is required for Plan/Review because recorded Constraints/Decisions are a
+    // governance mechanism — a Planner or Reviewer profile that drops it can silently re-derive or
+    // ignore a constraint an earlier work unit already established.
+    private static readonly IReadOnlyDictionary<PipelineStage, string[]> RequiredToolsByStage = new Dictionary<PipelineStage, string[]>
+    {
+        [PipelineStage.Execute] = [McpToolNames.WorkspaceList, McpToolNames.WorkspaceProfileGet, McpToolNames.WorkspaceSearch],
+        [PipelineStage.Plan]    = [McpToolNames.WorkspaceList, McpToolNames.WorkspaceProfileGet, McpToolNames.WorkspaceSearch, McpToolNames.ArtifactQuery],
+        [PipelineStage.Review]  = [McpToolNames.WorkspaceSearch, McpToolNames.ArtifactQuery],
+    };
+
+    private static AgentProfile EnsureRequiredTools(AgentProfile profile)
+    {
+        if (!RequiredToolsByStage.TryGetValue(profile.Stage, out var required))
+            return profile;
+
+        var missing = required.Where(t => !profile.AllowedTools.Contains(t)).ToArray();
+        return missing.Length == 0
+            ? profile
+            : profile with { AllowedTools = [.. profile.AllowedTools, .. missing] };
+    }
+
     private readonly ConcurrentDictionary<string, AgentProfile> _profiles = new();
     private readonly IStudioNodeStore _nodeStore;
 
@@ -25,7 +54,7 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 "orchestrator",
                 "Orchestrator",
                 PipelineStage.Orchestrate,
-                string.Empty,
+                AgentLoopPrompts.Orchestrator,
                 [],
                 25,
                 []),
@@ -33,13 +62,23 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 "planner",
                 "Planner",
                 PipelineStage.Plan,
-                string.Empty,
+                AgentLoopPrompts.Planner,
                 [
                     McpToolNames.WorkUnitGet,
                     McpToolNames.WorkspaceSummary,
+                    McpToolNames.WorkspaceStatus,
+                    McpToolNames.WorkspaceProfileGet,
                     McpToolNames.WorkspaceRead,
+                    McpToolNames.WorkspaceReadMany,
                     McpToolNames.WorkspaceWrite,
                     McpToolNames.WorkspaceList,
+                    McpToolNames.WorkspaceSearch,
+                    McpToolNames.WorkspaceSymbolDefinition,
+                    McpToolNames.WorkspaceSymbolReferences,
+                    McpToolNames.WorkspaceSymbolImplementation,
+                    McpToolNames.ClarificationRequest,
+                    McpToolNames.ArtifactQuery,
+                    McpToolNames.ArtifactRecordPlan,
                 ],
                 15,
                 []),
@@ -47,19 +86,31 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 "worker",
                 "Worker",
                 PipelineStage.Execute,
-                string.Empty,
+                AgentLoopPrompts.Worker,
                 [
+                    McpToolNames.WorkUnitGet,
                     McpToolNames.TaskUpdate,
-                    McpToolNames.TaskList,
-                    McpToolNames.TaskAssign,
+                    McpToolNames.WorkspaceSummary,
+                    McpToolNames.WorkspaceStatus,
                     McpToolNames.WorkspaceRead,
+                    McpToolNames.WorkspaceReadMany,
                     McpToolNames.WorkspaceWrite,
+                    McpToolNames.WorkspaceReplace,
                     McpToolNames.WorkspaceDelete,
+                    McpToolNames.WorkspaceExists,
+                    McpToolNames.WorkspaceList,
+                    McpToolNames.WorkspaceSearch,
+                    McpToolNames.WorkspaceSymbolDefinition,
+                    McpToolNames.WorkspaceSymbolReferences,
+                    McpToolNames.WorkspaceSymbolImplementation,
+                    McpToolNames.ClarificationRequest,
+                    McpToolNames.WorkspaceProfileGet,
+                    McpToolNames.WorkspaceBuild,
+                    McpToolNames.WorkspaceTest,
+                    McpToolNames.WorkspaceExec,
+                    McpToolNames.WorkspaceDiff,
                     McpToolNames.MergePropose,
                     McpToolNames.MergeValidate,
-                    McpToolNames.BranchCreate,
-                    McpToolNames.BranchStatus,
-                    McpToolNames.SnapshotGet,
                     McpToolNames.ArtifactRecord,
                     McpToolNames.ArtifactQuery,
                     McpToolNames.ArtifactList,
@@ -70,14 +121,18 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 "merger",
                 "Merger",
                 PipelineStage.Merge,
-                string.Empty,
+                AgentLoopPrompts.Merger,
                 [
+                    McpToolNames.WorkUnitGet,
+                    McpToolNames.ProjectionGet,
+                    McpToolNames.WorkspaceRead,
+                    McpToolNames.WorkspaceReadMany,
+                    McpToolNames.WorkspaceWrite,
+                    McpToolNames.WorkspaceList,
+                    McpToolNames.WorkspaceDiff,
                     McpToolNames.MergePropose,
                     McpToolNames.MergeValidate,
-                    McpToolNames.WorkspaceRead,
-                    McpToolNames.WorkspaceWrite,
-                    McpToolNames.WorkspaceDiff,
-                    McpToolNames.ProjectionGet,
+                    McpToolNames.ClarificationRequest,
                 ],
                 15,
                 []),
@@ -85,15 +140,30 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
                 "reviewer",
                 "Reviewer",
                 PipelineStage.Review,
-                string.Empty,
+                AgentLoopPrompts.Reviewer,
                 [
                     McpToolNames.WorkUnitGet,
                     McpToolNames.MergeValidate,
                     McpToolNames.MergeReview,
                     McpToolNames.ProjectionGet,
                     McpToolNames.WorkspaceRead,
+                    McpToolNames.WorkspaceReadMany,
+                    McpToolNames.WorkspaceList,
+                    McpToolNames.WorkspaceSearch,
+                    McpToolNames.WorkspaceSymbolDefinition,
+                    McpToolNames.WorkspaceSymbolReferences,
+                    McpToolNames.WorkspaceSymbolImplementation,
+                    McpToolNames.ClarificationRequest,
+                    McpToolNames.WorkspaceDiff,
+                    McpToolNames.WorkspaceProfileGet,
+                    McpToolNames.WorkspaceBuild,
+                    McpToolNames.WorkspaceTest,
+                    McpToolNames.ArtifactQuery,
                 ],
-                10,
+                // 10 -> 14: the build/test verification step (workspace_profile_get + scoped build +
+                // scoped test) adds 2-3 tool calls on top of the original projection/artifact/diff/
+                // review sequence.
+                14,
                 []),
         };
 
@@ -103,6 +173,7 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
 
     public async Task<AgentProfile> CreateAsync(AgentProfile profile, CancellationToken cancellationToken = default)
     {
+        profile = EnsureRequiredTools(profile);
         _profiles[profile.AgentProfileId] = profile;
         await Persist(profile, cancellationToken).ConfigureAwait(false);
         return profile;
@@ -118,6 +189,7 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
     {
         if (!_profiles.ContainsKey(profile.AgentProfileId))
             throw new KeyNotFoundException($"Agent profile '{profile.AgentProfileId}' was not found.");
+        profile = EnsureRequiredTools(profile);
         _profiles[profile.AgentProfileId] = profile;
         await Persist(profile, cancellationToken).ConfigureAwait(false);
         return profile;
@@ -135,8 +207,19 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
         foreach (var (entityId, payloadJson) in records)
         {
             var profile = JsonSerializer.Deserialize<AgentProfile>(payloadJson);
-            if (profile is not null)
-                _profiles[entityId] = profile;
+            if (profile is null) continue;
+
+            // If a previously-persisted profile has a blank system prompt but the seed now carries
+            // a real default, inherit the seed prompt so the user sees it in the UI rather than
+            // an empty textarea. An explicitly non-empty persisted prompt always wins.
+            if (string.IsNullOrWhiteSpace(profile.SystemPrompt)
+                && _profiles.TryGetValue(entityId, out var seeded)
+                && !string.IsNullOrWhiteSpace(seeded.SystemPrompt))
+            {
+                profile = profile with { SystemPrompt = seeded.SystemPrompt };
+            }
+
+            _profiles[entityId] = EnsureRequiredTools(profile);
         }
     }
 

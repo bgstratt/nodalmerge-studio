@@ -39,7 +39,7 @@ pwsh -File .\scripts\dev.ps1
 - Package prefix: `NodalMerge.Studio.*`
 - MCP contract version: `v1` with frozen tool names in `McpToolNames` (`nm.v1.*`)
 - Node schema paths: `studio/{entity}/v1` (see `docs/architecture/node-schemas.md`)
-- One capability per PR with verification checklist in `plans/`
+- One capability per PR with a verification checklist in the PR description
 
 ## Content boundaries
 

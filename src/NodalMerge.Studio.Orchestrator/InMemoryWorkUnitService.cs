@@ -19,6 +19,14 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
     private readonly WorkspaceOptions _workspaceOptions;
     private readonly IExecutionEventStream _events;
     private readonly IRuntimeEventBroadcaster? _broadcaster;
+    private readonly IStudioGraphPromoter? _graphPromoter;
+    private readonly IParticipantEventBus? _eventBus;
+    private readonly IServiceProvider? _serviceProvider;
+
+    // IStudioGraphPromoter resolves RuntimeGraphPromoter → IRuntimeCommandBridge → FfiBridgeProcessor
+    // → HostFfiClient → native P/Invoke. Defer until first use to avoid blocking startup.
+    private IStudioGraphPromoter? GraphPromoter =>
+        _graphPromoter ?? _serviceProvider?.GetService<IStudioGraphPromoter>();
 
     public InMemoryWorkUnitService(
         IBranchService branchService,
@@ -29,7 +37,10 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IArtifactLineageService artifactLineage,
         WorkspaceOptions workspaceOptions,
         IExecutionEventStream events,
-        IRuntimeEventBroadcaster? broadcaster = null)
+        IRuntimeEventBroadcaster? broadcaster = null,
+        IStudioGraphPromoter? graphPromoter = null,
+        IParticipantEventBus? eventBus = null,
+        IServiceProvider? serviceProvider = null)
     {
         _branchService         = branchService;
         _mergeService          = mergeService;
@@ -40,6 +51,9 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         _workspaceOptions      = workspaceOptions;
         _events                = events;
         _broadcaster           = broadcaster;
+        _graphPromoter         = graphPromoter;
+        _eventBus              = eventBus;
+        _serviceProvider       = serviceProvider;
     }
 
     public async Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken cancellationToken = default)
@@ -102,6 +116,13 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
                 ct: cancellationToken).ConfigureAwait(false);
         }
 
+        if (status is WorkUnitStatus.Completed or WorkUnitStatus.Merged)
+        {
+            _ = GraphPromoter?.TryPromoteStudioCheckpointAsync();
+        }
+
+        _eventBus?.Publish(new WorkUnitStatusChangedEvent(workUnitId, previousStatus, status, DateTimeOffset.UtcNow));
+
         return updated;
     }
 
@@ -149,6 +170,120 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return updated;
     }
 
+    public async Task<WorkUnit> IncrementReviewRejectionCountAsync(
+        string workUnitId,
+        bool automated,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        var executionInfo = workUnit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0);
+        executionInfo = automated
+            ? executionInfo with { AutomatedReviewRejectionCount = executionInfo.AutomatedReviewRejectionCount + 1 }
+            : executionInfo with { HumanReviewRejectionCount = executionInfo.HumanReviewRejectionCount + 1 };
+
+        var updated = workUnit with { ExecutionInfo = executionInfo, UpdatedAt = DateTimeOffset.UtcNow };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
+    public async Task<WorkUnit> IncrementFailureAttemptCountAsync(
+        string workUnitId,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        var executionInfo = (workUnit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with
+        {
+            FailureAttemptCount = (workUnit.ExecutionInfo?.FailureAttemptCount ?? 0) + 1,
+        };
+
+        var updated = workUnit with { ExecutionInfo = executionInfo, UpdatedAt = DateTimeOffset.UtcNow };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
+    public async Task<WorkUnit> AmendGoalForSteeredRetryAsync(
+        string workUnitId,
+        string amendedGoal,
+        string steeringContext,
+        string deadLetterEntryId,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        var amendedMetadata = new Dictionary<string, string>(workUnit.Metadata ?? new Dictionary<string, string>())
+        {
+            ["lastSteeringContext"] = steeringContext,
+            ["steeredFromDeadLetterEntryId"] = deadLetterEntryId,
+        };
+
+        var updated = workUnit with
+        {
+            Goal = amendedGoal,
+            Metadata = amendedMetadata,
+            ExecutionInfo = (workUnit.ExecutionInfo ?? new WorkUnitExecutionInfo(0, 0)) with { FailureAttemptCount = 0 },
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
+    private static readonly HashSet<WorkUnitStatus> TerminalStatuses = new()
+    {
+        WorkUnitStatus.Completed, WorkUnitStatus.Merged, WorkUnitStatus.Cancelled,
+    };
+
+    public async Task<WorkUnit> SetFileScopeAsync(
+        string workUnitId,
+        IReadOnlyList<string> fileScope,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        if (TerminalStatuses.Contains(workUnit.Status))
+        {
+            throw new InvalidOperationException(
+                $"Cannot amend FileScope on work unit '{workUnitId}': already {workUnit.Status}.");
+        }
+
+        var previousScope = workUnit.FileScope;
+        var updated = workUnit with { FileScope = fileScope, UpdatedAt = DateTimeOffset.UtcNow };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        if (sessionId is not null)
+        {
+            await _events.AppendAsync(
+                sessionId,
+                workUnitId,
+                ExecutionEventKind.WorkUnitFileScopeChanged,
+                new WorkUnitFileScopeChangedPayload(workUnitId, previousScope, fileScope),
+                ct: cancellationToken).ConfigureAwait(false);
+        }
+
+        return updated;
+    }
+
     public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken cancellationToken = default)
     {
         _workUnits.TryGetValue(workUnitId, out var workUnit);
@@ -178,23 +313,17 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         string? branchedFromProposalId = null,
         string? sliceId = null,
         IReadOnlyDictionary<string, string>? metadata = null,
+        HypothesisForkType? forkType = null,
+        ReviewPolicy? reviewPolicy = null,
+        bool bypassPromotionBranch = false,
+        WorkUnitExpectedOutputKind expectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
+        string? repositoryId = null,
+        IReadOnlyList<FileReferenceV1>? referenceFiles = null,
+        string? workspaceId = null,
         CancellationToken cancellationToken = default)
     {
-        // First work unit with a repositoryPath seeds the main branch for this session.
-        if (!string.IsNullOrWhiteSpace(repositoryPath) &&
-            string.IsNullOrWhiteSpace(_workspaceOptions.SeedRepositoryPath))
-        {
-            _workspaceOptions.SeedRepositoryPath = repositoryPath;
-        }
-
-        // Slice 15b — branchId used to be patched onto the WorkUnit record *after* this method
-        // returned (by the MCP tool and the agent-loop dispatcher, independently), which left the
-        // real generated "work-{guid}" branch (and any seedFromBranchId content copied into it)
-        // orphaned, and the caller-chosen name never registered with IBranchService at all
-        // (nm_v1_branch_status on it would report "unknown" even though the work unit was "on"
-        // it). Resolving it here means it actually gets created/seeded like any other branch.
         var resolvedBranchId = await _branchService
-            .CreateBranchAsync(branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, cancellationToken)
+            .CreateBranchAsync(branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, fileScope, cancellationToken)
             .ConfigureAwait(false);
 
         var fanOutInfo = sliceId is not null || seedFromBranchId is not null
@@ -217,7 +346,14 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             DependsOn: dependsOn ?? [],
             FileScope: fileScope ?? [],
             FanOutInfo: fanOutInfo,
-            BranchedFromProposalId: branchedFromProposalId);
+            BranchedFromProposalId: branchedFromProposalId,
+            ForkType: forkType,
+            ReviewPolicy: reviewPolicy ?? ReviewPolicy.HumanRequired,
+            BypassPromotionBranch: bypassPromotionBranch,
+            ExpectedOutputKind: expectedOutputKind,
+            RepositoryId: repositoryId,
+            ReferenceFiles: referenceFiles,
+            WorkspaceId: workspaceId ?? "workspace-default");
 
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }
@@ -277,7 +413,109 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             activeAgents,
             pendingMerges,
             failures,
-            knownGoodStates);
+            knownGoodStates,
+            _workspaceOptions.RootPath,
+            _workspaceOptions.SeedRepositoryPath);
+    }
+
+    public async Task<WorkspaceStatus> GetStatusAsync(
+        string? branchId = null,
+        string? workUnitId = null,
+        int limit = 50,
+        int offset = 0,
+        CancellationToken cancellationToken = default)
+    {
+        if (limit <= 0)
+            throw new ArgumentOutOfRangeException(nameof(limit), "Limit must be greater than zero.");
+        if (offset < 0)
+            throw new ArgumentOutOfRangeException(nameof(offset), "Offset cannot be negative.");
+
+        WorkUnit? currentWorkUnit = null;
+        var resolvedBranchId = branchId;
+        if (workUnitId is not null)
+        {
+            currentWorkUnit = GetRequired(workUnitId);
+            resolvedBranchId ??= currentWorkUnit.BranchId;
+        }
+
+        var proposalSnapshots = new List<(DateTimeOffset SortKey, WorkspaceStatusProposalSummary Summary, IReadOnlyList<WorkspaceStatusFileChange> ChangedFiles)>();
+
+        if (workUnitId is not null)
+        {
+            var chain = await _artifactLineage.GetChainAsync(workUnitId, cancellationToken).ConfigureAwait(false);
+            foreach (var proposalRef in chain.Where(a => a.Type == ArtifactType.MergeProposal).OrderBy(a => a.CreatedAt))
+            {
+                var proposal = await _mergeService.GetAsync(proposalRef.ArtifactId, cancellationToken).ConfigureAwait(false);
+                if (proposal is null)
+                    continue;
+
+                var snapshot = BuildProposalSnapshot(proposal, proposalRef.CreatedAt);
+                proposalSnapshots.Add(snapshot);
+            }
+        }
+        else
+        {
+            var proposals = await _mergeService.ListAsync(resolvedBranchId, cancellationToken).ConfigureAwait(false);
+            foreach (var proposal in proposals.OrderBy(p => p.DiffGeneratedAt ?? DateTimeOffset.MinValue))
+            {
+                proposalSnapshots.Add(BuildProposalSnapshot(proposal, proposal.DiffGeneratedAt ?? DateTimeOffset.MinValue));
+            }
+        }
+
+        var mergedFiles = new Dictionary<string, WorkspaceStatusFileChange>(StringComparer.OrdinalIgnoreCase);
+        int addedFiles = 0;
+        int modifiedFiles = 0;
+        int deletedFiles = 0;
+        int? addedLines = 0;
+        int? removedLines = null;
+
+        foreach (var snapshot in proposalSnapshots)
+        {
+            foreach (var fileChange in snapshot.ChangedFiles)
+            {
+                mergedFiles[fileChange.Path] = fileChange;
+            }
+
+            addedFiles += snapshot.Summary.AddedFiles;
+            modifiedFiles += snapshot.Summary.ModifiedFiles;
+            deletedFiles += snapshot.Summary.DeletedFiles;
+            if (snapshot.Summary.AddedLines is not null)
+                addedLines += snapshot.Summary.AddedLines;
+            if (snapshot.Summary.RemovedLines is null)
+                removedLines = null;
+            else
+                removedLines = (removedLines ?? 0) + snapshot.Summary.RemovedLines.Value;
+        }
+
+        var orderedFiles = mergedFiles.Values
+            .OrderBy(f => f.Path, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(f => f.ChangeKind)
+            .ToList();
+
+        var pagedFiles = orderedFiles.Skip(offset).Take(limit).ToList();
+        var nextOffset = Math.Min(offset + pagedFiles.Count, orderedFiles.Count);
+        var truncated = orderedFiles.Count > nextOffset;
+
+        var orderedProposals = proposalSnapshots
+            .OrderByDescending(p => p.SortKey)
+            .ThenByDescending(p => p.Summary.ProposalId, StringComparer.Ordinal)
+            .Select(p => p.Summary)
+            .ToList();
+
+        return new WorkspaceStatus(
+            resolvedBranchId,
+            workUnitId,
+            currentWorkUnit?.Status,
+            pagedFiles,
+            orderedProposals,
+            orderedFiles.Count == 0 && addedFiles == 0 && modifiedFiles == 0 && deletedFiles == 0
+                ? null
+                : new WorkspaceStatusDiffStats(addedFiles, modifiedFiles, deletedFiles, addedLines, removedLines),
+            truncated,
+            limit,
+            offset,
+            nextOffset,
+            DateTimeOffset.UtcNow);
     }
 
     public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken cancellationToken = default)
@@ -296,6 +534,85 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             .OrderBy(w => w.CreatedAt)
             .ToList();
         return Task.FromResult<IReadOnlyList<WorkUnit>>(dependents);
+    }
+
+    private static (DateTimeOffset SortKey, WorkspaceStatusProposalSummary Summary, IReadOnlyList<WorkspaceStatusFileChange> ChangedFiles) BuildProposalSnapshot(MergeProposal proposal, DateTimeOffset sortKey)
+    {
+        var (changedFiles, addedLines, removedLines) = ParseChangedFiles(proposal.ProposalId, proposal.WorkspaceChanges, proposal.FilesTouched);
+        var addedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Added);
+        var modifiedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Modified);
+        var deletedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Deleted);
+
+        return (
+            sortKey,
+            new WorkspaceStatusProposalSummary(
+                proposal.ProposalId,
+                proposal.Status,
+                proposal.FilesTouched,
+                addedFiles,
+                modifiedFiles,
+                deletedFiles,
+                addedLines,
+                removedLines,
+                proposal.Summary,
+                proposal.DiffGeneratedAt),
+            changedFiles);
+    }
+
+    private static (IReadOnlyList<WorkspaceStatusFileChange> ChangedFiles, int? AddedLines, int? RemovedLines) ParseChangedFiles(
+        string proposalId,
+        string? workspaceChanges,
+        IReadOnlyList<string> fallbackFilesTouched)
+    {
+        if (string.IsNullOrWhiteSpace(workspaceChanges))
+        {
+            var fallbackChanges = fallbackFilesTouched
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(path => new WorkspaceStatusFileChange(path, WorkspaceChangeKind.Changed, proposalId))
+                .ToList();
+            return (fallbackChanges, null, null);
+        }
+
+        var changes = new List<WorkspaceStatusFileChange>();
+        WorkspaceChangeKind? currentKind = null;
+        int addedLines = 0;
+
+        foreach (var rawLine in workspaceChanges.Split('\n'))
+        {
+            var line = rawLine.TrimEnd('\r');
+            if (line.StartsWith("+++ ADDED: ", StringComparison.Ordinal))
+            {
+                currentKind = WorkspaceChangeKind.Added;
+                changes.Add(new WorkspaceStatusFileChange(line["+++ ADDED: ".Length..], WorkspaceChangeKind.Added, proposalId));
+                continue;
+            }
+
+            if (line.StartsWith("~~~ MODIFIED: ", StringComparison.Ordinal))
+            {
+                currentKind = WorkspaceChangeKind.Modified;
+                changes.Add(new WorkspaceStatusFileChange(line["~~~ MODIFIED: ".Length..], WorkspaceChangeKind.Modified, proposalId));
+                continue;
+            }
+
+            if (line.StartsWith("--- DELETED: ", StringComparison.Ordinal))
+            {
+                currentKind = WorkspaceChangeKind.Deleted;
+                changes.Add(new WorkspaceStatusFileChange(line["--- DELETED: ".Length..], WorkspaceChangeKind.Deleted, proposalId));
+                continue;
+            }
+
+            if (currentKind is WorkspaceChangeKind.Added or WorkspaceChangeKind.Modified && line.StartsWith("+ ", StringComparison.Ordinal))
+                addedLines++;
+        }
+
+        if (changes.Count == 0)
+        {
+            changes.AddRange(fallbackFilesTouched
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(path => new WorkspaceStatusFileChange(path, WorkspaceChangeKind.Changed, proposalId)));
+        }
+
+        return (changes, addedLines, null);
     }
 
     // Slice 0a — bypasses CreateAsync's parent-existence check (children can be loaded before
@@ -337,13 +654,18 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IArtifactLineageService>(),
             sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions(),
             sp.GetRequiredService<IExecutionEventStream>(),
-            sp.GetService<IRuntimeEventBroadcaster>()));
+            sp.GetService<IRuntimeEventBroadcaster>(),
+            graphPromoter: null,       // deferred — IStudioGraphPromoter chains to native FFI
+            eventBus: sp.GetService<IParticipantEventBus>(),
+            serviceProvider: sp));
         services.AddSingleton<IWorkUnitService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IOrchestratorService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IWorkspaceService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IFanOutService, FanOutService>();
         services.AddSingleton<IWorkUnitCommandService, WorkUnitCommandService>();
+        services.AddSingleton<IExperimentService, ExperimentService>();
+        services.AddSingleton<ISteeringService, SteeringService>();
         return services;
     }
 }

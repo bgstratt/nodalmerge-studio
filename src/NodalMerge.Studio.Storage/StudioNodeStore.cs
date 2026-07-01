@@ -20,6 +20,28 @@ public static class StudioNodeKind
     public const string ChangeIntentV1       = "studio/change-intent/v1";
     public const string DeadLetterV1         = "studio/dead-letter/v1";
     public const string RuntimeSettingsV1    = "studio/runtime-settings/v1";
+    public const string ExecutionResultV1    = "studio/execution-result/v1";
+    public const string GoalV1               = "studio/goal/v1";
+    public const string DecisionV1           = "studio/decision/v1";
+    public const string EvidenceV1           = "studio/evidence/v1";
+    public const string TrajectoryV1         = "studio/trajectory/v1";
+    public const string HypothesisV1         = "studio/hypothesis/v1";
+    public const string ReasoningCommitV1    = "studio/reasoning-commit/v1";
+    public const string ReviewTimerV1        = "studio/review-timer/v1";
+    public const string ExperimentV1         = "studio/experiment/v1";
+    public const string SteeringDecisionV1   = "studio/steering-decision/v1";
+    public const string FindingV1            = "studio/finding/v1";
+    public const string ConversationLogV1    = "studio/conversation-log/v1";
+    public const string FileLeaseV1          = "studio/file-lease/v1";
+    public const string RepositorySyncStateV1 = "studio/repository-sync-state/v1";
+    public const string RepositoryV1          = "studio/repository/v1";
+    public const string ProjectionSnapshotV1  = "studio/projection-snapshot/v1";
+    public const string WorkspaceV1            = "studio/workspace/v1";
+    public const string RepositoryOpV1         = "studio/repository-op/v1";
+    public const string RepositorySnapshotV1   = "studio/repository-snapshot/v1";
+    public const string RepositoryConflictV1   = "studio/repository-conflict/v1";
+    public const string CoModPatternV1         = "studio/comod-pattern/v1";
+    public const string BlobIndexEntryV1       = "studio/blob-index-entry/v1";
 }
 
 public interface IStudioNodeStore

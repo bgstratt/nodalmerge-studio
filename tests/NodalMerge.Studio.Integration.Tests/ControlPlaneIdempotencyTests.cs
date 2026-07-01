@@ -34,10 +34,14 @@ public class ControlPlaneIdempotencyTests
         public Task<WorkUnit> UpdateStatusAsync(string workUnitId, WorkUnitStatus status, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit> SetCurrentStageAsync(string workUnitId, PipelineStage? stage, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit> SetFanOutBlockedReasonAsync(string workUnitId, string? blockedReason, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> IncrementReviewRejectionCountAsync(string workUnitId, bool automated, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> IncrementFailureAttemptCountAsync(string workUnitId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> AmendGoalForSteeredRetryAsync(string workUnitId, string amendedGoal, string steeringContext, string deadLetterEntryId, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<WorkUnit?>(null);
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     // ── IWorkScheduler.EnqueueAsync — key: SessionId + WorkUnitId ────────────
@@ -188,6 +192,11 @@ public class ControlPlaneIdempotencyTests
         public object? GetService(Type serviceType) => services.FirstOrDefault(serviceType.IsInstanceOfType);
     }
 
+    private sealed class NoopServiceProvider : IServiceProvider
+    {
+        public object? GetService(Type serviceType) => null;
+    }
+
     private sealed class RecordingWorkUnitService : IWorkUnitService
     {
         public List<(string WorkUnitId, WorkUnitStatus Status, string? SessionId)> Calls { get; } = [];
@@ -211,9 +220,16 @@ public class ControlPlaneIdempotencyTests
             throw new NotSupportedException();
         public Task<WorkUnit> SetFanOutBlockedReasonAsync(string workUnitId, string? blockedReason, CancellationToken ct = default) =>
             throw new NotSupportedException();
+        public Task<WorkUnit> IncrementReviewRejectionCountAsync(string workUnitId, bool automated, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task<WorkUnit> IncrementFailureAttemptCountAsync(string workUnitId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task<WorkUnit> AmendGoalForSteeredRetryAsync(string workUnitId, string amendedGoal, string steeringContext, string deadLetterEntryId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
+        public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private sealed class RecordingAgentControlService : IAgentControlService
@@ -222,7 +238,9 @@ public class ControlPlaneIdempotencyTests
 
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
-            string? autoReviewProfileId = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+            string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            IReadOnlyList<string>? enabledDomainAgents = null,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
 
         public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default)
         {
@@ -231,7 +249,9 @@ public class ControlPlaneIdempotencyTests
         }
 
         public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
+        public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
         public string? GetAutoReviewProfileId(string workUnitId) => null;
+        public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
 
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task ResumeAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
@@ -283,10 +303,12 @@ public class ControlPlaneIdempotencyTests
     public async Task MergeProposeAsync_called_twice_with_same_CommandId_creates_one_proposal()
     {
         var store = new InMemoryStudioNodeStore();
-        var mergeService = new InMemoryMergeService(
-            store, new NoopFileWorkspaceService(), new WorkspaceOptions(), new NoopEventStream(),
-            new ArtifactLineageService(store));
-        var tools = new MergeTools(mergeService, store);
+        var events = new NoopEventStream();
+        var fileWorkspace = new NoopFileWorkspaceService();
+        var artifacts = new ArtifactLineageService(store);
+        var mergeService = new InMemoryMergeService(store, fileWorkspace, new WorkspaceOptions(), events, artifacts);
+        var mergeCommands = new MergeCommandService(mergeService, fileWorkspace, artifacts, events, store, new NoopServiceProvider());
+        var tools = new MergeTools(mergeCommands);
 
         var commandId = Guid.NewGuid().ToString("N");
         var first = await tools.ProposeAsync("feat/x", "main", "summary", commandId: commandId);
@@ -302,10 +324,12 @@ public class ControlPlaneIdempotencyTests
     public async Task MergeProposeAsync_without_CommandId_creates_separate_proposals()
     {
         var store = new InMemoryStudioNodeStore();
-        var mergeService = new InMemoryMergeService(
-            store, new NoopFileWorkspaceService(), new WorkspaceOptions(), new NoopEventStream(),
-            new ArtifactLineageService(store));
-        var tools = new MergeTools(mergeService, store);
+        var events = new NoopEventStream();
+        var fileWorkspace = new NoopFileWorkspaceService();
+        var artifacts = new ArtifactLineageService(store);
+        var mergeService = new InMemoryMergeService(store, fileWorkspace, new WorkspaceOptions(), events, artifacts);
+        var mergeCommands = new MergeCommandService(mergeService, fileWorkspace, artifacts, events, store, new NoopServiceProvider());
+        var tools = new MergeTools(mergeCommands);
 
         await tools.ProposeAsync("feat/x", "main", "summary");
         await tools.ProposeAsync("feat/x", "main", "summary");
@@ -330,19 +354,31 @@ public class ControlPlaneIdempotencyTests
 
         public Task<ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default) =>
             Task.FromResult<ExecutionEvent?>(null);
+
+        public Task<IReadOnlyList<ExecutionEvent>> GetEventsByKindAsync(
+            IReadOnlyList<ExecutionEventKind> kinds, DateTimeOffset? since = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ExecutionEvent>>([]);
     }
 
     private sealed class NoopFileWorkspaceService : IFileWorkspaceService
     {
-        public Task InitBranchAsync(string b, string? s = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task InitBranchAsync(string b, string? s = null, IReadOnlyList<string>? fileScope = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<bool> MaterializeFileAsync(string b, string path, CancellationToken ct = default) => Task.FromResult(false);
         public Task<string?> ReadAsync(string b, string p, CancellationToken ct = default) => Task.FromResult<string?>(null);
+        public Task<IReadOnlyList<WorkspaceFileRead>> ReadManyAsync(string b, IReadOnlyList<string> paths, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<WorkspaceFileRead>>(paths.Select(p => new WorkspaceFileRead(p, null, false)).ToList());
         public Task WriteAsync(string b, string p, string c, CancellationToken ct = default) => Task.CompletedTask;
         public Task DeleteAsync(string b, string p, CancellationToken ct = default) => Task.CompletedTask;
         public Task<bool> ExistsAsync(string b, string p, CancellationToken ct = default) => Task.FromResult(false);
-        public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, string? p = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<(IReadOnlyList<WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(string b, string query, string? s = null, string? fp = null, bool regex = false, bool cs = false, int cl = 3, int mr = 200, CancellationToken ct = default) => Task.FromResult<(IReadOnlyList<WorkspaceSearchMatch>, bool)>(([], false));
+        public Task<WorkspaceReplaceResult> ReplaceAsync(string b, string p, string oldText, string newText, int expectedMatches = 1, CancellationToken ct = default) => Task.FromResult(new WorkspaceReplaceResult(0, 0, 0, string.Empty));
         public Task<string> DiffAsync(string s, string t, CancellationToken ct = default) => Task.FromResult(string.Empty);
         public Task ApplyBranchAsync(string s, string t, CancellationToken ct = default) => Task.CompletedTask;
         public Task CopyFilesAsync(string s, string t, IReadOnlyList<string> paths, CancellationToken ct = default) => Task.CompletedTask;
         public Task<string?> GetWorkingDirectoryAsync(string b, CancellationToken ct = default) => Task.FromResult<string?>(null);
+        public Task<WorkspaceDiff> DiffExternalPathAsync(string b, string e, CancellationToken ct = default) =>
+            Task.FromResult(new WorkspaceDiff([], [], [], string.Empty));
+        public Task ApplyExternalPathAsync(string b, string e, CancellationToken ct = default) => Task.CompletedTask;
     }
 }

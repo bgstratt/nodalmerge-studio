@@ -5,7 +5,6 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-[McpServerToolType]
 public sealed class AgentTools(IAgentControlService agents, IWorkUnitService workUnits)
 {
     [McpServerTool(Name = McpToolNames.AgentSpawn), Description("Spawn an agent for a work unit.")]
@@ -18,6 +17,8 @@ public sealed class AgentTools(IAgentControlService agents, IWorkUnitService wor
         string? apiKey = null,
         string? provider = null,
         string? profileId = null,
+        string? autoReviewProfileId = null,
+        string[]? enabledDomainAgents = null,
         CancellationToken cancellationToken = default)
     {
         try
@@ -28,6 +29,7 @@ public sealed class AgentTools(IAgentControlService agents, IWorkUnitService wor
 
             var agentId = await agents.SpawnAsync(
                 agentType, workUnitId, taskId, model, baseUrl, apiKey, provider, profileId,
+                autoReviewProfileId, enabledDomainAgents: enabledDomainAgents,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
             return McpJson.Ok(new { agentId, agentType, workUnitId, branchId = wu.BranchId });
         }

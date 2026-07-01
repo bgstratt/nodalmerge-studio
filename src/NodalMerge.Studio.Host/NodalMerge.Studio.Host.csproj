@@ -18,7 +18,15 @@
     <ProjectReference Include="..\NodalMerge.Studio.McpServer\NodalMerge.Studio.McpServer.csproj" />
   </ItemGroup>
 
-  <ItemGroup Condition="Exists('$(NodalMergeDotNetHostProject)')">
+  <ItemGroup>
+    <PackageReference Include="SourceGear.SQLite3" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(NodalMergeUseNuGetPackages)' == 'true'">
+    <PackageReference Include="NodalMerge.DotNetHost" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(NodalMergeUseNuGetPackages)' != 'true' AND Exists('$(NodalMergeDotNetHostProject)')">
     <ProjectReference Include="$(NodalMergeDotNetHostProject)" />
   </ItemGroup>
 

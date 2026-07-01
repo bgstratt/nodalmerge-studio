@@ -53,9 +53,19 @@ export function scopeViewScript(js: string): string {
  * can't collide either. This is the one function each view's getHtmlFragment() needs to call. */
 export function wrapViewScript(js: string, containerId: string): string {
   return `(function(){\n` +
+    `try {\n` +
     `var root = document.getElementById('${containerId}');\n` +
+    `if (!root) { throw new Error('container not found: ${containerId}'); }\n` +
     `function $(id) { return root.querySelector('#' + id); }\n` +
     `${scopeViewScript(js)}\n` +
+    `} catch (nmWrapErr) {\n` +
+    `  var nmErrRoot = document.getElementById('${containerId}');\n` +
+    `  var nmErrDiv = document.createElement('div');\n` +
+    `  nmErrDiv.style.cssText = 'color:#f14c4c;font-family:monospace;white-space:pre-wrap;padding:12px;';\n` +
+    `  nmErrDiv.textContent = 'NM-FATAL[${containerId}]: ' + (nmWrapErr && nmWrapErr.stack || nmWrapErr);\n` +
+    `  if (nmErrRoot) { nmErrRoot.prepend(nmErrDiv); } else { document.body.prepend(nmErrDiv); }\n` +
+    `  if (window.__nmVscode) { window.__nmVscode.postMessage({ type: 'nm-webview-error', containerId: '${containerId}', message: String(nmWrapErr), stack: (nmWrapErr && nmWrapErr.stack) || '' }); }\n` +
+    `}\n` +
     `})();`;
 }
 

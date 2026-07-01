@@ -16,18 +16,30 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     private readonly IExecutionEventStream _events;
     private readonly IArtifactLineageService _artifacts;
     private readonly IServiceProvider? _serviceProvider;
+    private readonly IFileLeaseService? _fileLease;
+    private readonly IRepositoryRegistryService? _repositories;
 
     // IWorkUnitService is resolved lazily (via IServiceProvider) rather than constructor-injected:
     // its production implementation (InMemoryWorkUnitService) already depends on IMergeService
     // (this service), so a direct dependency here would be a circular constructor graph — same
-    // pattern used by WorkSchedulerService for the same interface.
+    // pattern used by WorkSchedulerService for the same interface. IWorkScheduler is resolved the
+    // same lazy way below (Phase 12's release-and-resume hook) for the identical reason —
+    // WorkSchedulerService takes IMergeService directly, so a direct dependency back here would
+    // be the same cycle. IFileLeaseService has no such cycle, so it's constructor-injected
+    // directly — but kept optional (default null) so the existing direct (non-DI) test
+    // constructions don't all need updating; when null, the release-and-resume hook is skipped.
+    private IParticipantEventBus? EventBus =>
+        _serviceProvider?.GetService(typeof(IParticipantEventBus)) as IParticipantEventBus;
+
     public InMemoryMergeService(
         IStudioNodeStore nodeStore,
         IFileWorkspaceService fileWorkspace,
         WorkspaceOptions workspaceOptions,
         IExecutionEventStream events,
         IArtifactLineageService artifacts,
-        IServiceProvider? serviceProvider = null)
+        IServiceProvider? serviceProvider = null,
+        IFileLeaseService? fileLease = null,
+        IRepositoryRegistryService? repositories = null)
     {
         _nodeStore        = nodeStore;
         _fileWorkspace    = fileWorkspace;
@@ -35,11 +47,16 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         _events           = events;
         _artifacts        = artifacts;
         _serviceProvider  = serviceProvider;
+        _fileLease        = fileLease;
+        _repositories     = repositories;
     }
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
     {
-        var stored = proposal with { Status = MergeProposalStatus.Draft };
+        // Status is the caller's to set — normally Draft (MergeCommandService, MergeReconciliationService),
+        // but the policy-gate-blocked path deliberately proposes straight into Rejected. Forcing Draft
+        // here unconditionally used to silently clobber that back to Draft.
+        var stored = proposal;
         _proposals[proposal.ProposalId] = stored;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.MergeProposalV1,
@@ -51,7 +68,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // Taken now rather than at apply time so it stays correct regardless of whether the
         // proposal later gets approved, rejected, or applied — none of those touch this copy.
         await _fileWorkspace.InitBranchAsync(
-            $"base/{proposal.ProposalId}", proposal.TargetBranch, cancellationToken).ConfigureAwait(false);
+            $"base/{proposal.ProposalId}", proposal.TargetBranch, ct: cancellationToken).ConfigureAwait(false);
 
         return stored;
     }
@@ -96,6 +113,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     public async Task<MergeProposal> ReviewAsync(
         string proposalId,
         MergeProposalStatus decision,
+        string? notes = null,
         CancellationToken cancellationToken = default)
     {
         var proposal = GetRequired(proposalId);
@@ -107,13 +125,18 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 $"Proposals must be in ReadyForReview before human review.");
         }
 
-        var updated = proposal with { Status = decision };
+        var updated = proposal with { Status = decision, ReviewNotes = notes ?? proposal.ReviewNotes };
         _proposals[proposalId] = updated;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
+
+        EventBus?.Publish(new ReviewCompletedEvent(
+            proposalId, proposal.WorkUnitId,
+            decision.ToString(), Automated: false, ReviewerAgentId: null,
+            DateTimeOffset.UtcNow));
 
         if (proposal.WorkUnitId is not null)
         {
@@ -160,6 +183,26 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 ct: cancellationToken).ConfigureAwait(false);
         }
 
+        // Phase 12 — a human rejecting a proposal through this (non-automated) path is a
+        // deliberate, final decision with no automatic retry tied to it (unlike
+        // AutomatedReviewGateService's rejection-count retry loop, which already releases leases
+        // itself via IDeadLetterService.RecordFailureAsync only once it gives up for good —
+        // releasing on every one of ITS rejections here too would race an upcoming auto-retry).
+        // Nothing else will ever merge this content, so its leases must be released now or they'd
+        // strand their wait queues with no recovery path — there's no future event for a
+        // human-rejected proposal to hang a release off of otherwise.
+        if (decision == MergeProposalStatus.Rejected && proposal.WorkUnitId is not null && _fileLease is not null)
+        {
+            var promoted = await _fileLease.ForceReleaseAllForWorkUnitAsync(proposal.WorkUnitId, cancellationToken)
+                .ConfigureAwait(false);
+            var scheduler = _serviceProvider?.GetService(typeof(IWorkScheduler)) as IWorkScheduler;
+            if (scheduler is not null)
+            {
+                foreach (var promotedWorkUnitId in promoted)
+                    await scheduler.ClearAwaitingFileLeaseAsync(promotedWorkUnitId, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
         return updated;
     }
 
@@ -168,6 +211,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         MergeProposalStatus decision,
         string verificationResults,
         string? reviewerAgentId = null,
+        IReadOnlyList<string>? consideredArtifactIds = null,
         CancellationToken cancellationToken = default)
     {
         if (decision is not (MergeProposalStatus.Approved or MergeProposalStatus.Rejected))
@@ -204,8 +248,20 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 "Proposal must be ReadyForReview or UnderReview.");
         }
 
+        // Slice 11d's original automated pre-gate hands an Approved verdict back to
+        // ReadyForReview for a human to give final sign-off. Slice 20b/20c's inline reviewer
+        // (AgentApproval/Hybrid) reuses this same method, but for those policies the reviewer's
+        // Approved verdict is terminal — no human ever sees it — so it must land on Approved
+        // directly, or InlineReviewerService's `proposal.Status is Approved or Merged` check
+        // (the signal AutoReviewRule acts on) never becomes true and the proposal stalls forever.
+        var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+        var owningWorkUnit = proposal.WorkUnitId is not null && workUnits is not null
+            ? await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false)
+            : null;
+        var isInlineReviewPolicy = owningWorkUnit?.ReviewPolicy is ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid;
+
         var nextStatus = decision == MergeProposalStatus.Approved
-            ? MergeProposalStatus.ReadyForReview
+            ? (isInlineReviewPolicy ? MergeProposalStatus.Approved : MergeProposalStatus.ReadyForReview)
             : MergeProposalStatus.Rejected;
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, nextStatus))
@@ -219,6 +275,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             Status = nextStatus,
             VerificationResults = verificationResults,
             AgentId = reviewerAgentId ?? proposal.AgentId,
+            ConsideredArtifactIds = consideredArtifactIds ?? proposal.ConsideredArtifactIds,
         };
         _proposals[proposalId] = updated;
         await _nodeStore.WriteNodeAsync(
@@ -226,6 +283,11 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             proposalId,
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
+
+        EventBus?.Publish(new ReviewCompletedEvent(
+            proposalId, proposal.WorkUnitId,
+            decision.ToString(), Automated: true, ReviewerAgentId: reviewerAgentId,
+            DateTimeOffset.UtcNow));
 
         if (proposal.SessionId is not null)
         {
@@ -245,12 +307,25 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                     new ProposalRejectedPayload(proposalId, reviewerAgentId ?? "reviewer", verificationResults),
                     ct: cancellationToken).ConfigureAwait(false);
             }
+
+            if (consideredArtifactIds is { Count: > 0 })
+            {
+                foreach (var artifactId in consideredArtifactIds)
+                {
+                    await _events.AppendAsync(
+                        proposal.SessionId,
+                        proposal.WorkUnitId,
+                        ExecutionEventKind.ArtifactConsideredInDecision,
+                        new ArtifactConsideredInDecisionPayload(artifactId, proposalId, updated.Status),
+                        ct: cancellationToken).ConfigureAwait(false);
+                }
+            }
         }
 
         return updated;
     }
 
-    public async Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default)
+    public async Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false)
     {
         var proposal = GetRequired(proposalId);
 
@@ -260,23 +335,93 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 $"Cannot apply proposal '{proposalId}': only Approved proposals can be merged (current: {proposal.Status}).");
         }
 
-        // Copy workspace files: source branch → target branch
-        await _fileWorkspace.ApplyBranchAsync(proposal.SourceBranch, proposal.TargetBranch, cancellationToken)
-            .ConfigureAwait(false);
-
-        // Write changed files back to disk whenever a repository path is configured
-        if (!string.IsNullOrWhiteSpace(_workspaceOptions.SeedRepositoryPath))
+        // Slice 21b — when promotion branch is on, land on the candidate instead of the
+        // work unit's parent branch so the canonical workspace is never touched directly.
+        // Slice 21c — a work unit can opt out of the session-wide promotion branch via
+        // BypassPromotionBranch, applying directly to the proposal's target branch.
+        // Also resolved here (rather than only inline) so the write-back step below can use the
+        // same owning work unit's RepositoryId instead of always falling back to the global default.
+        var bypassPromotionBranch = false;
+        WorkUnit? owningWorkUnit = null;
+        if (proposal.WorkUnitId is not null)
         {
-            await WriteBackToRepositoryAsync(proposal.SourceBranch, cancellationToken).ConfigureAwait(false);
+            var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+            if (workUnits is not null)
+            {
+                owningWorkUnit = await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false);
+                bypassPromotionBranch = owningWorkUnit?.BypassPromotionBranch ?? false;
+            }
         }
 
-        var updated = proposal with { Status = MergeProposalStatus.Merged };
+        var effectiveTarget = _workspaceOptions.UsePromotionBranch && !bypassPromotionBranch
+            ? _workspaceOptions.CandidateBranchId
+            : proposal.TargetBranch;
+
+        // Copy workspace files: source branch → effective target branch
+        await _fileWorkspace.ApplyBranchAsync(proposal.SourceBranch, effectiveTarget, cancellationToken)
+            .ConfigureAwait(false);
+
+        // Phase 12 — release-and-resume: this proposal's holder kept a write lease on every file
+        // it touched (McpToolDispatcher.CheckFileLeaseAsync) until this exact moment. Now that the
+        // files have actually landed in effectiveTarget, advance each path's FIFO queue; if a
+        // sibling was waiting, copy the just-merged content into its branch and clear its parked
+        // scheduler flag so it resumes (isResume: true, from its own already-elevated AttemptCount)
+        // with current content instead of the stale snapshot it was forked from.
+        if (_fileLease is not null && proposal.FilesTouched is { Count: > 0 } filesTouched)
+        {
+            var scheduler = _serviceProvider?.GetService(typeof(IWorkScheduler)) as IWorkScheduler;
+            var workUnitsForResume = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+
+            foreach (var touchedPath in filesTouched)
+            {
+                var waiterWorkUnitId = await _fileLease.ReleaseAndAdvanceAsync(touchedPath, cancellationToken)
+                    .ConfigureAwait(false);
+                if (waiterWorkUnitId is null)
+                    continue;
+
+                var waiter = workUnitsForResume is not null
+                    ? await workUnitsForResume.GetAsync(waiterWorkUnitId, cancellationToken).ConfigureAwait(false)
+                    : null;
+                if (waiter is not null)
+                {
+                    await _fileWorkspace.CopyFilesAsync(
+                        effectiveTarget, waiter.BranchId, [touchedPath], cancellationToken).ConfigureAwait(false);
+                }
+
+                if (scheduler is not null)
+                    await scheduler.ClearAwaitingFileLeaseAsync(waiterWorkUnitId, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        // Write changed files back to disk whenever a repository path is configured. Prefer the
+        // owning work unit's own repository — so a multi-repo goal writes back to the repo it
+        // actually came from — falling back to the global default only when the work unit has no
+        // RepositoryId (preserves today's single-repo behavior unchanged).
+        var writeBackPath = _workspaceOptions.SeedRepositoryPath;
+        if (owningWorkUnit?.RepositoryId is { } repositoryId && _repositories is not null)
+        {
+            var repository = await _repositories.GetAsync(repositoryId, cancellationToken).ConfigureAwait(false);
+            if (repository is not null)
+                writeBackPath = repository.Path;
+        }
+
+        if (!string.IsNullOrWhiteSpace(writeBackPath))
+        {
+            await WriteBackToRepositoryAsync(proposal.SourceBranch, writeBackPath, cancellationToken).ConfigureAwait(false);
+        }
+
+        var updated = proposal with { Status = MergeProposalStatus.Merged, AutoApplied = autoApplied };
         _proposals[proposalId] = updated;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
             cancellationToken).ConfigureAwait(false);
+
+        EventBus?.Publish(new MergeAcceptedEvent(
+            proposalId, proposal.WorkUnitId,
+            proposal.SourceBranch, effectiveTarget,
+            DateTimeOffset.UtcNow));
 
         if (proposal.WorkUnitId is not null)
         {
@@ -289,6 +434,89 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 DateTimeOffset.UtcNow,
                 proposal.WorkUnitId,
                 proposal.AgentId), cancellationToken).ConfigureAwait(false);
+        }
+
+        // ── Post-merge execution ("system truth" validation) ────────────────
+        var execMode = _workspaceOptions.PostMergeExecutionMode;
+        if (execMode is "Async" or "Blocking")
+        {
+            var execution = _serviceProvider?.GetService(typeof(IWorkspaceExecutionService))
+                as IWorkspaceExecutionService;
+            if (execution is not null)
+            {
+                var execRequest = new WorkspaceExecutionRequest(
+                    Build: true,
+                    Test: true,
+                    BuildCommand: _workspaceOptions.BuildCommand,
+                    TestCommand: _workspaceOptions.TestCommand,
+                    TimeoutSeconds: _workspaceOptions.ExecutionTimeoutSeconds);
+
+                if (execMode == "Async")
+                {
+                    // Fire-and-forget: apply returns immediately, results logged in background.
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var result = await execution.ExecuteAsync(
+                                proposal.TargetBranch, execRequest, CancellationToken.None)
+                                .ConfigureAwait(false);
+                            await _nodeStore.WriteNodeAsync(
+                                StudioNodeKind.ExecutionResultV1,
+                                $"postmerge/{proposalId}",
+                                JsonSerializer.Serialize(result)).ConfigureAwait(false);
+
+                            if (!result.AllSucceeded && proposal.SessionId is not null)
+                            {
+                                await _events.AppendAsync(
+                                    proposal.SessionId,
+                                    proposal.WorkUnitId,
+                                    ExecutionEventKind.MergeProposalStatusChanged,
+                                    new MergeProposalStatusChangedPayload(
+                                        proposalId, MergeProposalStatus.Merged, MergeProposalStatus.Merged),
+                                    ct: CancellationToken.None).ConfigureAwait(false);
+                            }
+                        }
+                        catch { /* best-effort background task */ }
+                    });
+                }
+                else // Blocking
+                {
+                    try
+                    {
+                        var execResult = await execution.ExecuteAsync(
+                            proposal.TargetBranch, execRequest, cancellationToken)
+                            .ConfigureAwait(false);
+
+                        await _nodeStore.WriteNodeAsync(
+                            StudioNodeKind.ExecutionResultV1,
+                            $"postmerge/{proposalId}",
+                            JsonSerializer.Serialize(execResult),
+                            cancellationToken).ConfigureAwait(false);
+
+                        // Blocking mode: failure rolls back the apply.
+                        if (!execResult.AllSucceeded)
+                        {
+                            await _fileWorkspace.ApplyBranchAsync(
+                                $"base/{proposalId}", proposal.TargetBranch, CancellationToken.None)
+                                .ConfigureAwait(false);
+
+                            var rolledBack = updated with { Status = MergeProposalStatus.Rejected };
+                            _proposals[proposalId] = rolledBack;
+                            await _nodeStore.WriteNodeAsync(
+                                StudioNodeKind.MergeProposalV1, proposalId,
+                                JsonSerializer.Serialize(rolledBack),
+                                CancellationToken.None).ConfigureAwait(false);
+
+                            throw new InvalidOperationException(
+                                $"Post-merge execution failed on target branch '{proposal.TargetBranch}'. " +
+                                $"Apply rolled back. Builds: {execResult.Builds.Count(b => !b.Success)} failed. " +
+                                $"Tests: {execResult.Tests.Sum(t => t.Failed)} of {execResult.Tests.Sum(t => t.TotalTests)} failed.");
+                        }
+                    }
+                    catch when (execMode != "Blocking") { /* unreachable */ }
+                }
+            }
         }
 
         if (proposal.SessionId is not null)
@@ -318,9 +546,29 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             {
                 try
                 {
+                    var mergedUnit = await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false);
                     await workUnits.UpdateStatusAsync(
                         proposal.WorkUnitId, WorkUnitStatus.Merged, proposal.SessionId, cancellationToken).ConfigureAwait(false);
                     await workUnits.SetCurrentStageAsync(proposal.WorkUnitId, null, cancellationToken).ConfigureAwait(false);
+
+                    // Phase 12 — IsReadyToEnqueueAsync now gates a dependent on its dependency
+                    // reaching Merged, not Proposed. The existing trigger for
+                    // TryEnqueueReadyDependentsAsync fires at worker-completion time (Proposed),
+                    // which is too early for a dependent under the tighter gate; this is the
+                    // complementary trigger for the gate's later threshold. Reconciliation doesn't
+                    // need an equivalent merge-time call — it already tolerates a Merged child
+                    // (MergeReconciliationService.cs:48) and is re-checked whenever the *other*
+                    // sibling's own worker later completes.
+                    if (mergedUnit?.ParentWorkUnitId is { } parentWorkUnitId)
+                    {
+                        var fanOut = _serviceProvider?.GetService(typeof(IFanOutService)) as IFanOutService;
+                        if (fanOut is not null)
+                        {
+                            await fanOut
+                                .TryEnqueueReadyDependentsAsync(parentWorkUnitId, proposal.SessionId, cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                    }
                 }
                 catch (InvalidOperationException) { }
                 catch (KeyNotFoundException) { }
@@ -330,9 +578,8 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         return updated;
     }
 
-    private async Task WriteBackToRepositoryAsync(string sourceBranchId, CancellationToken ct)
+    private async Task WriteBackToRepositoryAsync(string sourceBranchId, string repoPath, CancellationToken ct)
     {
-        var repoPath = _workspaceOptions.SeedRepositoryPath!;
         var files = await _fileWorkspace.ListAsync(sourceBranchId, ct: ct).ConfigureAwait(false);
         foreach (var relativePath in files)
         {
@@ -423,9 +670,25 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<InMemoryMergeService>();
         services.AddSingleton<IMergeService>(sp => sp.GetRequiredService<InMemoryMergeService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryMergeService>());
+        services.AddSingleton<IMergeCommandService, MergeCommandService>();
         services.AddSingleton<IProposalReviewService, ProposalReviewService>();
         services.AddSingleton<IMergeReconciliationService, MergeReconciliationService>();
         services.AddSingleton<IAutomatedReviewGateService, AutomatedReviewGateService>();
+        // Slice 20b — BeforeMerge policy rule for AgentApproval/Hybrid policies.
+        services.AddSingleton<IPolicyRule, AutoReviewRule>();
+        // Slice 20c — Hybrid countdown timer.
+        services.AddSingleton<IReviewTimerService, ReviewTimerService>();
+
+        // Phase 10 — merge strategy chain. Strategies are tried in registration order.
+        services.AddSingleton<ThreeWayMergeStrategy>();
+        services.AddSingleton<AstMergeStrategy>();
+        services.AddSingleton<LlmAssistedMergeStrategy>();
+        services.AddSingleton<HumanReviewStrategy>();
+        services.AddSingleton<IMergeStrategy>(sp => sp.GetRequiredService<ThreeWayMergeStrategy>());
+        services.AddSingleton<IMergeStrategy>(sp => sp.GetRequiredService<AstMergeStrategy>());
+        services.AddSingleton<IMergeStrategy>(sp => sp.GetRequiredService<LlmAssistedMergeStrategy>());
+        services.AddSingleton<IMergeStrategy>(sp => sp.GetRequiredService<HumanReviewStrategy>());
+        services.AddSingleton<IConflictResolutionService, ConflictResolutionService>();
         return services;
     }
 }

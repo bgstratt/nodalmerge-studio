@@ -1,8 +1,10 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
+using NodalMerge.Studio.Contracts.Projections;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Storage;
 
@@ -19,6 +21,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     private readonly IWorkScheduler _scheduler;
     private readonly IExecutionEventStream _events;
     private readonly WorkspaceOptions _options;
+    private readonly IFileLeaseService _fileLease;
     private int _activeWorkerCount;
     private CancellationTokenSource? _pollCts;
 
@@ -28,7 +31,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         IAgentProfileService profileService,
         IWorkScheduler scheduler,
         IExecutionEventStream events,
-        WorkspaceOptions options)
+        WorkspaceOptions options,
+        IFileLeaseService fileLease)
     {
         _serviceProvider = serviceProvider;
         _logger          = logger;
@@ -36,6 +40,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         _scheduler       = scheduler;
         _events          = events;
         _options         = options;
+        _fileLease       = fileLease;
     }
 
     private sealed record AgentRecord(
@@ -47,21 +52,64 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? BaseUrl = null,
         string? ApiKey = null,
         string? Provider = null,
-        CancellationTokenSource? Cts = null);
+        CancellationTokenSource? Cts = null,
+        string? CurrentActivity = null);
+
+    // Ephemeral UI chrome only — not part of durable DAG history (AP-5), so it's a plain
+    // in-memory update rather than an ExecutionEventStream append.
+    private void ReportActivity(string agentId, string? activity)
+    {
+        if (_agents.TryGetValue(agentId, out var r))
+            _agents[agentId] = r with { CurrentActivity = activity };
+    }
 
     // Captured at SpawnAsync("orchestrator", ...) time so ReinvokeOrchestratorAsync can restart
     // the loop with the same credentials/profile later, without the caller (WorkSchedulerService)
     // needing to remember or re-supply them.
     private sealed record OrchestratorRegistration(
-        string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? AutoReviewProfileId);
+        string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? AutoReviewProfileId,
+        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? StageCredentials = null,
+        IReadOnlyList<string>? EnabledDomainAgents = null);
 
     // ── IHostedService ─────────────────────────────────────────────────────
 
-    public Task StartAsync(CancellationToken cancellationToken)
+    public async Task StartAsync(CancellationToken cancellationToken)
     {
+        await RehydrateInterruptedAgentsAsync(cancellationToken).ConfigureAwait(false);
         _pollCts = new CancellationTokenSource();
         _ = Task.Run(() => PollSchedulerAsync(_pollCts.Token), CancellationToken.None);
-        return Task.CompletedTask;
+    }
+
+    // Slice 19d — on startup, any work unit that was Executing/Active/Retrying when the host
+    // last stopped has no live agent loop. Register a synthetic "interrupted" agent record so
+    // the Execution Timeline shows these as Interrupted instead of silently absent.
+    private async Task RehydrateInterruptedAgentsAsync(CancellationToken ct)
+    {
+        try
+        {
+            var workUnits = _serviceProvider.GetService<IWorkUnitService>();
+            if (workUnits is null) { return; }
+
+            var all = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+            foreach (var wu in all)
+            {
+                var isRunning = wu.Status is WorkUnitStatus.Active or WorkUnitStatus.Executing or WorkUnitStatus.Retrying;
+                if (!isRunning || wu.AssignedAgent is null) { continue; }
+
+                // Only register if no live agent slot already covers this work unit
+                var hasLiveAgent = _agents.Values.Any(a => a.WorkUnitId == wu.WorkUnitId && a.Cts is not null);
+                if (hasLiveAgent) { continue; }
+
+                _agents.TryAdd(wu.AssignedAgent, new AgentRecord(wu.AssignedAgent, wu.WorkUnitId, "interrupted"));
+                _logger.LogInformation(
+                    "[Rehydration] Work unit {WorkUnitId} was interrupted — agent {AgentId} marked as interrupted.",
+                    wu.WorkUnitId, wu.AssignedAgent);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Rehydration] Failed to sweep for interrupted agents.");
+        }
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
@@ -93,10 +141,36 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 }
             }
             catch (OperationCanceledException) { break; }
+            catch (ObjectDisposedException)
+            {
+                // Host shutdown can dispose the DI root while the poll loop is unwinding.
+                // That's terminal for this runtime instance, not an operational failure.
+                break;
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[Scheduler] Poll iteration failed.");
             }
+
+            // Slice 20c — check Hybrid review timers on each scheduler tick.
+            try
+            {
+                var timerService = _serviceProvider.GetService(typeof(IReviewTimerService)) as IReviewTimerService;
+                if (timerService is not null)
+                    await timerService.ProcessExpiredAsync(ct).ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException) { break; }
+            catch { /* timer processing is best-effort */ }
+
+            // Phase 1 — check clarification timeouts on each scheduler tick.
+            try
+            {
+                var clarificationTimer = _serviceProvider.GetService(typeof(NodalMerge.Studio.Storage.IClarificationTimerService)) as NodalMerge.Studio.Storage.IClarificationTimerService;
+                if (clarificationTimer is not null)
+                    await clarificationTimer.ProcessExpiredAsync(ct).ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException) { break; }
+            catch { /* timer processing is best-effort */ }
 
             try { await Task.Delay(_options.SchedulerPollIntervalMs, ct).ConfigureAwait(false); }
             catch (OperationCanceledException) { break; }
@@ -109,6 +183,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         var agentId = $"worker-{Guid.NewGuid():N}";
         var cts = new CancellationTokenSource();
         var success = false;
+        var awaitingFileLease = false;
+        var awaitingClarification = false;
         string? failureReason = null;
 
         try
@@ -148,44 +224,89 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
+                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
+                var ruleFileContext = await BuildRuleFileContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
 
                 AgentLoopCompletion completion;
+                var workerProgressVerified = true;
                 if (profile?.Stage == PipelineStage.Plan)
                 {
+                    var constraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                    var promptGuidanceContext = await BuildPromptGuidanceContextAsync(PipelineStage.Plan, ct).ConfigureAwait(false);
+                    var combinedContext = string.Join("\n\n", new[] { constraintsContext, promptGuidanceContext }.Where(s => s is not null));
                     var plannerLoop = new PlannerAgentLoop(
-                        agentId, item.WorkUnitId, provider, model, baseUrl, apiKey!,
-                        dispatcher, llm, profile, item.SessionId);
+                        agentId, item.WorkUnitId, agentClient,
+                        profile, item.SessionId, a => ReportActivity(agentId, a),
+                        ruleFileContext, combinedContext.Length == 0 ? null : combinedContext,
+                        conversationLog: conversationLog);
                     completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
                 else if (profile?.Stage == PipelineStage.Review)
                 {
                     var proposalId = string.IsNullOrWhiteSpace(taskId) ? string.Empty : taskId;
                     var reviewerLoop = new ReviewerAgentLoop(
-                        agentId, item.WorkUnitId, proposalId, provider, model, baseUrl, apiKey!,
-                        dispatcher, llm, profile, item.SessionId);
+                        agentId, item.WorkUnitId, proposalId, agentClient,
+                        profile, item.SessionId, a => ReportActivity(agentId, a),
+                        conversationLog: conversationLog);
                     completion = await reviewerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
                 else
                 {
+                    // AttemptCount > 0 means this item was leased at least once before — either a
+                    // normal failure-retry or, per Phase 8c, a resume after a Host restart
+                    // interrupted it. Either way the worker should check existing branch/task
+                    // state before assuming a clean start.
+    // promptGuidanceContext below carries both universal KnowledgeGuideline constraints (the
+                    // same feed Orchestrator/Planner already get) and Execute-stage PromptImprovement
+                    // guidance — Worker writes the actual code, so it needs both, not just the latter.
+                    var workerConstraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                    var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, ct).ConfigureAwait(false);
+                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
+                    // Snapshotted before the loop runs: if the task was already Completed coming
+                    // in (e.g. re-queued after a rejection, before the underlying task got reset —
+                    // see AutomatedReviewGateService), the agent can't legitimately transition it
+                    // and a post-run "Completed" check alone would be fooled by that stale state.
+                    var taskServiceForVerify = _serviceProvider.GetService<ITaskService>();
+                    var taskStatusBeforeRun = !string.IsNullOrWhiteSpace(taskId) && taskServiceForVerify is not null
+                        ? (await taskServiceForVerify.GetAsync(taskId, ct).ConfigureAwait(false))?.Status
+                        : null;
                     var loop = new WorkerAgentLoop(
-                        agentId, item.WorkUnitId, taskId, provider, model, baseUrl, apiKey!,
-                        dispatcher, llm, profile, item.SessionId);
+                        agentId, item.WorkUnitId, taskId, agentClient,
+                        profile, item.SessionId, a => ReportActivity(agentId, a),
+                        isResume: item.AttemptCount > 0, ruleFileContext: ruleFileContext,
+                        selfVerifyBuild: _options.RequireBuildBeforeProposal,
+                        selfVerifyTest: _options.RequireTestBeforeProposal,
+                        promptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
+                        conversationLog: conversationLog);
                     completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
+
+                    if (completion == AgentLoopCompletion.Succeeded)
+                    {
+                        workerProgressVerified = await VerifyWorkerProgressAsync(
+                            item.WorkUnitId, taskId, agentId, taskStatusBeforeRun, ct).ConfigureAwait(false);
+                    }
                 }
 
-                if (completion == AgentLoopCompletion.Succeeded)
+                if (completion == AgentLoopCompletion.Succeeded && workerProgressVerified)
                     success = true;
+                else if (completion == AgentLoopCompletion.AwaitingFileLease)
+                    awaitingFileLease = true;
+                else if (completion == AgentLoopCompletion.AwaitingClarification)
+                    awaitingClarification = true;
                 else if (completion == AgentLoopCompletion.MaxIterationsExceeded)
                     failureReason = "Max iterations reached";
+                else if (completion == AgentLoopCompletion.Succeeded && !workerProgressVerified)
+                    failureReason = "Agent ended its turn without completing the task or producing a merge proposal.";
             }
 
             if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
-                _agents[agentId] = r with { Status = "stopped", Cts = null };
+                _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
         }
         catch (OperationCanceledException)
         {
             if (_agents.TryGetValue(agentId, out var r))
-                _agents[agentId] = r with { Status = "stopped", Cts = null };
+                _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
         }
         catch (Exception ex)
         {
@@ -194,7 +315,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             if (_agents.TryGetValue(agentId, out var r))
             {
                 var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
-                _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null };
+                _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null, CurrentActivity = null };
             }
         }
         finally
@@ -209,10 +330,63 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
             cts.Dispose();
             Interlocked.Decrement(ref _activeWorkerCount);
-            await _scheduler.ReleaseAsync(item.WorkUnitId, success).ConfigureAwait(false);
-            _logger.LogInformation(
-                "[Scheduler] Released workUnit={WorkUnitId} success={Success}", item.WorkUnitId, success);
+
+            // Phase 12 — a lease conflict isn't success or failure: park the item (kept queued,
+            // not removed/dead-lettered) instead of calling ReleaseAsync, which would otherwise
+            // treat this as a plain failure and drop it.
+            if (awaitingFileLease)
+            {
+                await _scheduler.MarkAwaitingFileLeaseAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                _logger.LogInformation(
+                    "[Scheduler] Parked workUnit={WorkUnitId} awaiting file lease", item.WorkUnitId);
+            }
+            else if (awaitingClarification)
+            {
+                _logger.LogInformation(
+                    "[Scheduler] Parked workUnit={WorkUnitId} awaiting clarification", item.WorkUnitId);
+            }
+            else
+            {
+                await _scheduler.ReleaseAsync(item.WorkUnitId, success).ConfigureAwait(false);
+                _logger.LogInformation(
+                    "[Scheduler] Released workUnit={WorkUnitId} success={Success}", item.WorkUnitId, success);
+            }
         }
+    }
+
+    // A worker stopping with stopReason "end_turn" only means the model stopped talking — it says
+    // nothing about whether real work happened. WorkerAgentLoop reports that as Succeeded
+    // unconditionally, so this re-checks for an actual outcome before trusting it: either the task
+    // transitioned to Completed during this run (not just already Completed coming in — that's
+    // the stale-state trap a re-queued-after-rejection task can fall into), or this agent's own run
+    // produced a MergeProposal for the work unit.
+    private async Task<bool> VerifyWorkerProgressAsync(
+        string workUnitId,
+        string? taskId,
+        string agentId,
+        NodalMerge.Studio.Contracts.Domain.TaskStatus? taskStatusBeforeRun,
+        CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(taskId) &&
+            taskStatusBeforeRun != NodalMerge.Studio.Contracts.Domain.TaskStatus.Completed)
+        {
+            var taskService = _serviceProvider.GetService<ITaskService>();
+            var task = taskService is not null
+                ? await taskService.GetAsync(taskId, ct).ConfigureAwait(false)
+                : null;
+            if (task?.Status == NodalMerge.Studio.Contracts.Domain.TaskStatus.Completed)
+                return true;
+        }
+
+        var mergeService = _serviceProvider.GetService<IMergeService>();
+        if (mergeService is not null)
+        {
+            var proposals = await mergeService.ListAsync(cancellationToken: ct).ConfigureAwait(false);
+            if (proposals.Any(p => p.WorkUnitId == workUnitId && p.AgentId == agentId))
+                return true;
+        }
+
+        return false;
     }
 
     private async Task RecordDeadLetterAsync(
@@ -234,6 +408,10 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             reason,
             string.IsNullOrWhiteSpace(item.TaskId) ? null : item.TaskId,
             sessionId: item.SessionId,
+            model: item.Model,
+            baseUrl: item.BaseUrl,
+            apiKey: item.ApiKey,
+            provider: item.Provider,
             cancellationToken: ct).ConfigureAwait(false);
     }
 
@@ -298,6 +476,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? provider = null,
         string? profileId = null,
         string? autoReviewProfileId = null,
+        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+        IReadOnlyList<string>? enabledDomainAgents = null,
         CancellationToken cancellationToken = default)
     {
         var agentId = $"{agentType}-{Guid.NewGuid():N}";
@@ -325,7 +505,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
                 _orchestratorRegistrations[workUnitId] = new OrchestratorRegistration(
-                    resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId, autoReviewProfileId);
+                    resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId, autoReviewProfileId,
+                    stageCredentials, enabledDomainAgents);
             }
             else if (agentType == "worker" && taskId is not null)
                 StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
@@ -362,6 +543,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         return new OrchestratorCredentials(reg.Provider, reg.Model, reg.BaseUrl, reg.ApiKey, reg.ProfileId);
     }
 
+    public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) =>
+        _orchestratorRegistrations.TryGetValue(workUnitId, out var reg)
+            ? reg.StageCredentials?.GetValueOrDefault(stage)
+            : null;
+
     public string? GetAutoReviewProfileId(string workUnitId)
     {
         if (!_orchestratorRegistrations.TryGetValue(workUnitId, out var reg))
@@ -369,6 +555,9 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
         return reg.AutoReviewProfileId;
     }
+
+    public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) =>
+        _orchestratorRegistrations.TryGetValue(workUnitId, out var reg) ? reg.EnabledDomainAgents : null;
 
     private void StartOrchestratorLoop(
         string agentId,
@@ -389,18 +578,24 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
                 var artifactLineage = _serviceProvider.GetRequiredService<IArtifactLineageService>();
                 var projections = _serviceProvider.GetRequiredService<IProjectionManager>();
                 var decisionLog = _serviceProvider.GetRequiredService<IOrchestrationDecisionLogService>();
                 var fanOut = _serviceProvider.GetRequiredService<IFanOutService>();
                 var mergeReconciliation = _serviceProvider.GetRequiredService<IMergeReconciliationService>();
                 var automatedReview = _serviceProvider.GetRequiredService<IAutomatedReviewGateService>();
+                var merge = _serviceProvider.GetRequiredService<IMergeService>();
                 var workUnits = _serviceProvider.GetRequiredService<IWorkUnitService>();
                 var workspaceOptions = _serviceProvider.GetRequiredService<WorkspaceOptions>();
+                var findingsService = _serviceProvider.GetRequiredService<IFindingService>();
+                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var loop = new OrchestratorAgentLoop(
-                    agentId, workUnitId, provider, model, baseUrl, apiKey, dispatcher, llm,
-                    artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, workUnits,
-                    profile, sessionId, workspaceOptions.StallDetectionCycles);
+                    agentId, workUnitId, agentClient,
+                    artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, merge, workUnits,
+                    findingsService,
+                    profile, sessionId, workspaceOptions.StallDetectionCycles, a => ReportActivity(agentId, a),
+                    conversationLog: conversationLog, agentControl: this);
                 var completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 if (completion is AgentLoopCompletion.MaxIterationsExceeded or AgentLoopCompletion.Stalled)
                 {
@@ -417,6 +612,10 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                             profile?.AgentProfileId ?? "orchestrator",
                             reason,
                             sessionId: sessionId,
+                            model: model,
+                            baseUrl: baseUrl,
+                            apiKey: apiKey,
+                            provider: provider,
                             cancellationToken: cts.Token).ConfigureAwait(false);
                     }
                 }
@@ -436,18 +635,22 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         profile?.AgentProfileId ?? "orchestrator",
                         ex.Message.Length > 200 ? ex.Message[..200] : ex.Message,
                         sessionId: sessionId,
+                        model: model,
+                        baseUrl: baseUrl,
+                        apiKey: apiKey,
+                        provider: provider,
                         cancellationToken: CancellationToken.None).ConfigureAwait(false);
                 }
                 if (_agents.TryGetValue(agentId, out var r))
                 {
                     var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
-                    _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null };
+                    _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null, CurrentActivity = null };
                 }
             }
             finally
             {
                 if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
-                    _agents[agentId] = r with { Status = "stopped", Cts = null };
+                    _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
                 cts.Dispose();
             }
         }, CancellationToken.None);
@@ -472,8 +675,19 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
                 var llm = _serviceProvider.GetRequiredService<LlmClient>();
+                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
+                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
+                var ruleFileContext = await BuildRuleFileContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
+                var workerConstraintsContext = await BuildConstraintsContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
+                var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, cts.Token).ConfigureAwait(false);
+                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
                 var loop = new WorkerAgentLoop(
-                    agentId, workUnitId, taskId, provider, model, baseUrl, apiKey, dispatcher, llm, profile);
+                    agentId, workUnitId, taskId, agentClient, profile,
+                    onActivity: a => ReportActivity(agentId, a), ruleFileContext: ruleFileContext,
+                    selfVerifyBuild: _options.RequireBuildBeforeProposal,
+                    selfVerifyTest: _options.RequireTestBeforeProposal,
+                    promptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
+                    conversationLog: conversationLog);
                 await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 _logger.LogInformation("[Agent {AgentId}] Worker loop completed.", agentId);
             }
@@ -484,13 +698,13 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 if (_agents.TryGetValue(agentId, out var r))
                 {
                     var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
-                    _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null };
+                    _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null, CurrentActivity = null };
                 }
             }
             finally
             {
                 if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
-                    _agents[agentId] = r with { Status = "stopped", Cts = null };
+                    _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
                 cts.Dispose();
             }
         }, CancellationToken.None);
@@ -510,12 +724,24 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         return Task.CompletedTask;
     }
 
-    public Task StopAsync(string agentId, CancellationToken cancellationToken = default)
+    public async Task StopAsync(string agentId, CancellationToken cancellationToken = default)
     {
         var current = GetRequired(agentId);
         current.Cts?.Cancel();
-        _agents[agentId] = current with { Status = "stopped", Cts = null };
-        return Task.CompletedTask;
+        _agents[agentId] = current with { Status = "stopped", Cts = null, CurrentActivity = null };
+
+        // Phase 12 — an explicit stop is a deliberate "abandon this run," unlike a transient
+        // failure with retries left (where the lease must stay held — see ForceReleaseAll's only
+        // other caller, InMemoryDeadLetterService, gated on MaxAttemptsReached for the same
+        // reason): nothing will automatically retry after a human stops it, so any file lease(s)
+        // it held would otherwise strand their wait queues forever with no recovery path. Does
+        // NOT fire on host-restart cancellation (IHostedService.StopAsync, a different method) —
+        // that path is the existing AwaitingResume rehydrate-and-approve flow, where the lease
+        // staying held across the restart is correct.
+        var promoted = await _fileLease.ForceReleaseAllForWorkUnitAsync(current.WorkUnitId, cancellationToken)
+            .ConfigureAwait(false);
+        foreach (var promotedWorkUnitId in promoted)
+            await _scheduler.ClearAwaitingFileLeaseAsync(promotedWorkUnitId, cancellationToken).ConfigureAwait(false);
     }
 
     public Task<string> GetStatusAsync(string agentId, CancellationToken cancellationToken = default)
@@ -528,7 +754,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     {
         var active = _agents.Values
             .Where(a => a.Status == "active")
-            .Select(a => new AgentInfo(a.AgentId, a.WorkUnitId, a.Status))
+            .Select(a => new AgentInfo(a.AgentId, a.WorkUnitId, a.Status, a.CurrentActivity))
             .ToList();
 
         return Task.FromResult<IReadOnlyList<AgentInfo>>(active);
@@ -537,7 +763,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     public Task<IReadOnlyList<AgentInfo>> ListAllAsync(CancellationToken cancellationToken = default)
     {
         var all = _agents.Values
-            .Select(a => new AgentInfo(a.AgentId, a.WorkUnitId, a.Status))
+            .Select(a => new AgentInfo(a.AgentId, a.WorkUnitId, a.Status, a.CurrentActivity))
             .ToList();
 
         return Task.FromResult<IReadOnlyList<AgentInfo>>(all);
@@ -548,6 +774,85 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         if (!_agents.TryGetValue(agentId, out var record))
             throw new KeyNotFoundException($"Agent '{agentId}' was not found.");
         return record;
+    }
+
+    // Phase 9h — best-effort root-level instruction injection (AGENTS.md/CLAUDE.md/.clinerules/
+    // .cursorrules). Resolved once up front and appended to the kickoff message rather than the
+    // static system prompt, since it's per-branch data, not a constant. Never throws — a missing
+    // work unit, an undetectable profile, or a repo with no rule files at all just means no
+    // context gets appended, not a failed spawn.
+    private async Task<string?> BuildRuleFileContextAsync(string workUnitId, CancellationToken ct)
+    {
+        try
+        {
+            var workUnits = _serviceProvider.GetRequiredService<IWorkUnitService>();
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null) return null;
+
+            var profiles = _serviceProvider.GetRequiredService<IWorkspaceProfileService>();
+            var profile = await profiles.GetOrDetectAsync(wu.BranchId, ct).ConfigureAwait(false);
+
+            var sections = profile.Roots
+                .Where(r => r.RuleFileContent is not null)
+                .Select(r =>
+                {
+                    var label = r.RelativePath.Length == 0 ? "repo root" : $"'{r.RelativePath}'";
+                    return $"Project root {label} ({r.Stack}) has its own instructions — follow them:\n\n{r.RuleFileContent}";
+                })
+                .ToList();
+
+            return sections.Count == 0 ? null : string.Join("\n\n", sections);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // Promoted Knowledge Findings (global Constraint artifacts, no owning work unit) plus this
+    // work unit's own ancestor-chain constraints — previously computed by AgentWorkspace's
+    // InheritedConstraints field but never read by any agent loop. The orchestrator fetches the
+    // live projection every cycle and folds this in itself; the planner has no projection-fetch
+    // loop of its own, so it's resolved once up front here, same shape as ruleFileContext above.
+    private async Task<string?> BuildConstraintsContextAsync(string workUnitId, CancellationToken ct)
+    {
+        try
+        {
+            var projections = _serviceProvider.GetRequiredService<IProjectionManager>();
+            var result = await projections.GetAsync(
+                new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal, WorkUnitId: workUnitId),
+                ct).ConfigureAwait(false);
+            var payload = JsonSerializer.Deserialize<AgentWorkspaceProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+            if (payload is null || payload.InheritedConstraints.Count == 0) return null;
+
+            var lines = payload.InheritedConstraints.Select(c => $"- {c.Title ?? c.ArtifactId}: {c.Body ?? ""}");
+            return "Known constraints — durable guidance from prior runs; apply unless this work unit's goal explicitly says otherwise:\n"
+                + string.Join("\n", lines);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // Promoted PromptImprovement findings targeting this stage — stage-scoped, unlike the
+    // universal constraints above. Used by loops (Planner, Worker) that have no projection-fetch
+    // loop of their own and so resolve this once up front, same shape as the helpers above.
+    private async Task<string?> BuildPromptGuidanceContextAsync(PipelineStage stage, CancellationToken ct)
+    {
+        try
+        {
+            var findings = _serviceProvider.GetRequiredService<IFindingService>();
+            var promptGuidance = await findings.ListPromotedPromptGuidanceAsync(stage, ct).ConfigureAwait(false);
+            if (promptGuidance.Count == 0) return null;
+
+            var lines = promptGuidance.Select(f => $"- {f.Title}: {f.Summary}");
+            return "[Process guidance — promoted prompt improvements for this stage]\n" + string.Join("\n", lines);
+        }
+        catch
+        {
+            return null;
+        }
     }
 }
 
@@ -561,8 +866,16 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IAgentControlService>(sp => sp.GetRequiredService<InMemoryAgentRuntimeService>());
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<InMemoryAgentRuntimeService>());
         services.AddSingleton<McpToolDispatcher>();
-        services.AddSingleton<LlmClient>(_ => new LlmClient(llmHttpClient ?? new HttpClient()));
+        services.AddSingleton<LlmClient>(sp =>
+            new LlmClient(llmHttpClient ?? new HttpClient(), sp.GetRequiredService<ILogger<LlmClient>>()));
+        services.AddSingleton<IInsightLlmAnalyzerService, InsightLlmAnalyzerService>();
         services.AddSingleton<IProfileSelectionService, LlmProfileSelectionService>();
+        // Slice 20b — inline reviewer for AgentApproval/Hybrid BeforeMerge gate.
+        services.AddSingleton<IInlineReviewerService, InlineReviewerService>();
+        // Slice 21/22 — reactive domain agents, disabled by default (WorkspaceOptions.EnabledDomainAgents).
+        services.AddSingleton<IDomainAgentTriggerService, DomainAgentTriggerService>();
+        // Phase 10 — LLM-backed merge provider (sits inside AgentRuntime where LlmClient lives).
+        services.AddSingleton<ILlmMergeProvider, LlmMergeProvider>();
         return services;
     }
 }

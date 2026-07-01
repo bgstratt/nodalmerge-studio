@@ -33,10 +33,25 @@ public sealed record MergeProposal(
     string? WorkUnitId = null,
     IReadOnlyList<string>? FilesTouched = null,
     IReadOnlyList<string>? ReconciledFrom = null,
-    string? SupersededBy = null)
+    string? SupersededBy = null,
+    bool AutoApplied = false,
+    // Set when the proposing agent explicitly asserts no file changes were needed for this task
+    // (e.g. "task asked me to verify X already works"). Surfaced to the automated reviewer and
+    // human review UI instead of letting an empty diff pass silently as if nothing was claimed.
+    string? NoFileChangesJustification = null,
+    // Free-text steering note a human reviewer attaches when approving/rejecting via the review
+    // panel — distinct from VerificationResults (which holds automated build/test output), so a
+    // human's "why" doesn't get mixed in with or overwritten by the automated reviewer's notes.
+    string? ReviewNotes = null,
+    // Slice 23 — Constraint/Research artifact IDs the automated reviewer explicitly cited as
+    // considered when deciding this proposal (whether or not they were violated). Distinct from
+    // ArtifactSurfacedPayload's "was it returned in a projection" — this is "did the decision-maker
+    // say they looked at it."
+    IReadOnlyList<string>? ConsideredArtifactIds = null)
 {
     public IReadOnlyList<string> FilesTouched { get; init; } = FilesTouched ?? [];
     public IReadOnlyList<string> ReconciledFrom { get; init; } = ReconciledFrom ?? [];
+    public IReadOnlyList<string> ConsideredArtifactIds { get; init; } = ConsideredArtifactIds ?? [];
 }
 
 public static class MergeProposalTransitions
@@ -50,6 +65,9 @@ public static class MergeProposalTransitions
             (MergeProposalStatus.ReadyForReview, MergeProposalStatus.UnderReview) => true,
             (MergeProposalStatus.UnderReview, MergeProposalStatus.ReadyForReview) => true,
             (MergeProposalStatus.UnderReview, MergeProposalStatus.Rejected) => true,
+            // Slice 20b — AgentApproval/Hybrid's inline reviewer terminates here directly,
+            // bypassing the ReadyForReview hand-back that Slice 11d's human-facing pre-gate uses.
+            (MergeProposalStatus.UnderReview, MergeProposalStatus.Approved) => true,
             (MergeProposalStatus.Approved, MergeProposalStatus.Merged) => true,
 
             (MergeProposalStatus.ReadyForReview, MergeProposalStatus.Superseded) => true,

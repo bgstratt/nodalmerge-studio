@@ -28,4 +28,22 @@ public sealed class RuntimeRoomEventBroadcaster(RuntimeRoomBroker roomBroker) : 
         });
         return roomBroker.BroadcastAsync(RoomId, json, cancellationToken: cancellationToken);
     }
+
+    public Task BroadcastArtifactInvalidatedAsync(
+        string? workUnitId,
+        string artifactId,
+        IReadOnlyList<string> flaggedArtifactIds,
+        string reason,
+        CancellationToken cancellationToken = default)
+    {
+        var json = JsonSerializer.Serialize(new
+        {
+            type = "artifact-invalidated",
+            workUnitId,
+            artifactId,
+            flaggedArtifactIds,
+            reason,
+        });
+        return roomBroker.BroadcastAsync(RoomId, json, cancellationToken: cancellationToken);
+    }
 }
