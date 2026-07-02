@@ -102,6 +102,50 @@ export class AgentConfigService {
     return secrets.get(profile.apiKeyRef);
   }
 
+  /**
+   * Distinguishes "never configured" from "configured, but the secret is gone" (e.g. after an
+   * extension uninstall/reinstall cleared SecretStorage while nodalmerge.agentProfiles in
+   * settings.json — which isn't extension-owned storage — kept the stale apiKeyRef around).
+   */
+  async getCredentialStatus(
+    profile: AgentProfile,
+    secrets: vscode.SecretStorage,
+  ): Promise<'not-needed' | 'not-configured' | 'secret-missing' | 'ok'> {
+    if (profile.provider === 'vscode-lm') { return 'not-needed'; }
+    if (!profile.apiKeyRef) { return 'not-configured'; }
+    const stored = await secrets.get(profile.apiKeyRef);
+    return stored ? 'ok' : 'secret-missing';
+  }
+
+  /** Human-readable reason resolveSpawnLlmConfig(profileId, ...) returned undefined. */
+  async describeMissingCredentials(
+    profileId: string,
+    secrets: vscode.SecretStorage,
+    lmProxyBaseUrl: string,
+  ): Promise<string> {
+    const p = this.getProfiles().find(pr => pr.id === profileId);
+    if (!p) { return `no profile named "${profileId}" is configured`; }
+
+    if (p.provider === 'vscode-lm') {
+      return (!lmProxyBaseUrl || lmProxyBaseUrl.endsWith(':0'))
+        ? 'the local VS Code LM proxy is not up yet — wait a moment and retry'
+        : 'the VS Code LM proxy configuration is invalid';
+    }
+
+    const status = await this.getCredentialStatus(p, secrets);
+    if (status === 'not-configured') {
+      return 'no API key has ever been entered for this profile — open Model & Agent Studio and store one';
+    }
+    if (status === 'secret-missing') {
+      return 'an API key was stored previously but is no longer in VS Code\'s secret storage ' +
+        '(this happens after the extension is uninstalled and reinstalled) — re-enter it in Model & Agent Studio';
+    }
+
+    const baseUrl = p.provider === 'anthropic' ? (p.baseUrl?.trim() || 'https://api.anthropic.com') : p.baseUrl?.trim();
+    if (!baseUrl) { return 'no base URL is set for this provider'; }
+    return 'an unknown configuration error occurred';
+  }
+
   async storeApiKey(profile: AgentProfile, key: string, secrets: vscode.SecretStorage): Promise<void> {
     const ref = profile.apiKeyRef ?? `nodalmerge.apikey.${profile.id}`;
     await secrets.store(ref, key);

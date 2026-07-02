@@ -993,7 +993,15 @@ export class GoalWorkspacePanel {
           this.configService.resolveSpawnLlmConfig(modelBProfile.id, this.secrets, this.lmProxyBaseUrl),
         ]);
         if (!cfgA || !cfgB) {
-          throw new Error('One or both orchestrator profiles missing LLM credentials.');
+          const [reasonA, reasonB] = await Promise.all([
+            cfgA ? Promise.resolve(undefined) : this.configService.describeMissingCredentials(modelAProfile.id, this.secrets, this.lmProxyBaseUrl),
+            cfgB ? Promise.resolve(undefined) : this.configService.describeMissingCredentials(modelBProfile.id, this.secrets, this.lmProxyBaseUrl),
+          ]);
+          const parts = [
+            reasonA ? `"${modelAProfile.id}": ${reasonA}` : undefined,
+            reasonB ? `"${modelBProfile.id}": ${reasonB}` : undefined,
+          ].filter(Boolean);
+          throw new Error(`Orchestrator profile(s) not ready — ${parts.join('; ')}.`);
         }
 
         const repositoryPath = resolveRepositoryPath();
@@ -1084,9 +1092,8 @@ export class GoalWorkspacePanel {
         template.orchestrator, this.secrets, this.lmProxyBaseUrl,
       );
       if (!orchCfg) {
-        throw new Error(
-          `Profile "${template.orchestrator}" is missing LLM credentials — set it up in Model & Agent Studio.`,
-        );
+        const reason = await this.configService.describeMissingCredentials(template.orchestrator, this.secrets, this.lmProxyBaseUrl);
+        throw new Error(`Profile "${template.orchestrator}" isn't ready — ${reason}.`);
       }
 
       // Agent Topology — resolve credentials for any stage that has its own profile configured;
@@ -1101,7 +1108,8 @@ export class GoalWorkspacePanel {
         if (!profileId) { continue; }
         const cfg = await this.configService.resolveSpawnLlmConfig(profileId, this.secrets, this.lmProxyBaseUrl);
         if (!cfg) {
-          throw new Error(`Profile "${profileId}" is missing LLM credentials — set it up in Model & Agent Studio.`);
+          const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl);
+          throw new Error(`Profile "${profileId}" isn't ready — ${reason}.`);
         }
         stageCredentials[stage] = cfg;
       }

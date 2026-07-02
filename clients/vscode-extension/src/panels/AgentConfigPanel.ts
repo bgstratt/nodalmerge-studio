@@ -78,9 +78,15 @@ export class ModelAgentStudioPanel {
       const opts = await this.get<{ enabledDomainAgents?: string[] }>('/studio/options');
       enabledDomainAgents = opts.enabledDomainAgents ?? [];
     } catch { /* server may not be running yet */ }
+    const profiles = this.configService.getProfiles();
+    const credentialStatus: Record<string, string> = {};
+    await Promise.all(profiles.map(async p => {
+      credentialStatus[p.id] = await this.configService.getCredentialStatus(p, this.secrets);
+    }));
     void this.panel.webview.postMessage({
       type:                 'config',
-      profiles:             this.configService.getProfiles(),
+      profiles,
+      credentialStatus,
       templates:            this.configService.getTemplates(),
       defaultTopology:      this.configService.getDefaultTopology(),
       defaultReviewPolicy:  this.configService.getDefaultReviewPolicy(),
@@ -206,16 +212,8 @@ export class ModelAgentStudioPanel {
         template.orchestrator, this.secrets, this.lmProxyBaseUrl,
       );
       if (!orchCfg) {
-        const orchProfile = this.configService.getProfiles().find(pr => pr.id === template.orchestrator);
-        if (orchProfile?.provider === 'vscode-lm') {
-          throw new Error(
-            `Profile "${template.orchestrator}": VS Code LM proxy is not running. Reload the extension window.`,
-          );
-        }
-        throw new Error(
-          `Profile "${template.orchestrator}" is missing LLM credentials — set Provider to VS Code LM ` +
-          `(Edit → Save on the form → Save Profiles), or configure base URL + API key.`,
-        );
+        const reason = await this.configService.describeMissingCredentials(template.orchestrator, this.secrets, this.lmProxyBaseUrl);
+        throw new Error(`Profile "${template.orchestrator}" isn't ready — ${reason}.`);
       }
 
       const repositoryPath = resolveRepositoryPath();
@@ -530,6 +528,7 @@ const MAS_JS = `
   const vscode = acquireVsCodeApi();
 
   let profiles = [];
+  let credentialStatus = {};
   let templates = [];
   let defaultTopology = '';
   var onModelsLoaded = null;
@@ -569,11 +568,14 @@ const MAS_JS = `
     tbody.innerHTML = '';
     profiles.forEach(function(p, i) {
       const tr = document.createElement('tr');
+      const credWarning = credentialStatus[p.id] === 'secret-missing'
+        ? ' <span title="API key was stored previously but is no longer in VS Code\'s secret storage — re-enter it." style="color:#e5a000">&#9888; key missing</span>'
+        : '';
       tr.innerHTML =
         '<td class="mono">' + esc(p.id) + '</td>' +
         '<td>' + esc(p.label) + '</td>' +
         '<td class="mono">' + esc(p.domain) + '</td>' +
-        '<td class="mono">' + esc(p.provider || 'anthropic') + '</td>' +
+        '<td class="mono">' + esc(p.provider || 'anthropic') + credWarning + '</td>' +
         '<td class="mono">' + esc(p.model || '—') + '</td>' +
         '<td><div class="act-cell">' +
           '<button class="ghost" data-action="edit" data-idx="' + i + '">Edit</button>' +
@@ -606,6 +608,7 @@ const MAS_JS = `
       : profiles[idx];
     const curProvider = p.provider || 'anthropic';
     const isVsLm = curProvider === 'vscode-lm';
+    const secretMissing = !isNew && credentialStatus[p.id] === 'secret-missing';
     const area = document.getElementById('profile-form-area');
     const modelRowClass = 'field';
     const baseUrlRowClass = isVsLm ? 'field hidden' : 'field';
@@ -645,11 +648,13 @@ const MAS_JS = `
       '<div id="pf-apikey-row" class="' + apiKeyRowClass + '">' +
         '<label>API Key</label>' +
         '<div class="flex-row">' +
-          '<input type="password" id="pf-apikey" placeholder="' + (p.apiKeyRef ? '(key stored)' : 'Paste key to store') + '" class="grow">' +
+          '<input type="password" id="pf-apikey" placeholder="' + (secretMissing ? 'Key missing — paste key to re-store' : p.apiKeyRef ? '(key stored)' : 'Paste key to store') + '" class="grow">' +
           '<button id="pf-store-key" class="ghost">Store Key</button>' +
         '</div>' +
-        '<div id="pf-key-status" class="muted">' +
-          (p.apiKeyRef ? 'Key stored (' + esc(p.apiKeyRef) + ')' : 'No key stored') +
+        '<div id="pf-key-status" class="' + (secretMissing ? '' : 'muted') + '"' + (secretMissing ? ' style="color:#e5a000"' : '') + '>' +
+          (secretMissing
+            ? '&#9888; Key not found in secret storage (ref: ' + esc(p.apiKeyRef) + ') — this usually happens after an extension uninstall/reinstall. Paste the key above and click Store Key to fix it.'
+            : (p.apiKeyRef ? 'Key stored (' + esc(p.apiKeyRef) + ')' : 'No key stored')) +
         '</div>' +
       '</div>' +
       '<div class="field"><label>Deployment Mode</label>' +
@@ -1098,6 +1103,7 @@ const MAS_JS = `
     }
     if (msg.type === 'config') {
       profiles         = msg.profiles        || [];
+      credentialStatus = msg.credentialStatus || {};
       templates        = msg.templates       || [];
       defaultTopology  = msg.defaultTopology || '';
       pipelineProfiles = msg.pipelineProfiles || [];
@@ -1114,11 +1120,17 @@ const MAS_JS = `
     }
     if (msg.type === 'apiKeySaved') {
       const statusEl = document.getElementById('pf-key-status');
-      if (statusEl) { statusEl.textContent = 'Key stored (' + esc(msg.apiKeyRef || msg.profileId) + ')'; }
+      if (statusEl) {
+        statusEl.textContent = 'Key stored (' + esc(msg.apiKeyRef || msg.profileId) + ')';
+        statusEl.className = 'muted';
+        statusEl.removeAttribute('style');
+      }
       if (msg.apiKeyRef) {
         const pi = profiles.findIndex(function(pr) { return pr.id === msg.profileId; });
         if (pi >= 0) { profiles[pi] = Object.assign({}, profiles[pi], { apiKeyRef: msg.apiKeyRef }); }
       }
+      credentialStatus[msg.profileId] = 'ok';
+      renderProfiles();
       return;
     }
     if (msg.type === 'sessionDefaults') {

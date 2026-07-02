@@ -3,7 +3,7 @@
   "displayName": "NodalMerge Studio",
   "description": "Agent-native collaborative workspace — branch visualization, merge review, and agent orchestration for NodalMerge.",
   "publisher": "nodalmerge-studio",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "license": "MIT",
   "icon": "media/icon.png",
   "repository": {
@@ -14,8 +14,12 @@
   "engines": {
     "vscode": "^1.90.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "viewsContainers": {
@@ -96,20 +100,75 @@
           "description": "Named agent profiles. Each profile maps an agentType string to a display label, task domain, and optional model hint.",
           "items": {
             "type": "object",
-            "required": ["id", "label", "domain"],
+            "required": [
+              "id",
+              "label",
+              "domain"
+            ],
             "properties": {
-              "id":               { "type": "string", "description": "Agent type identifier (used as agentType when spawning)." },
-              "label":            { "type": "string", "description": "Display name shown in UI." },
-              "domain":           { "type": "string", "description": "Task domain this agent handles (e.g. 'docs', 'code', 'security')." },
-              "deploymentMode":   { "type": "string", "enum": ["inline", "headless"], "default": "inline", "description": "How this agent is deployed. 'inline' = in-process managed by the runtime (default). 'headless' = standalone peer process; vscode-lm provider is not available in this mode." },
-              "provider":         { "type": "string", "enum": ["anthropic", "openai", "vscode-lm"], "description": "LLM provider. vscode-lm is only valid for inline deploymentMode." },
-              "model":            { "type": "string", "description": "Model identifier (e.g. claude-sonnet-4-6, gpt-4o)." },
-              "baseUrl":          { "type": "string", "description": "API base URL (not used for vscode-lm)." },
-              "apiKeyRef":        { "type": "string", "description": "Secret storage key for the API key (inline agents). Headless agents manage their own credentials." },
-              "systemPrompt":     { "type": "string", "description": "System prompt passed to the agent when spawned. Overrides any runtime default for this domain." },
-              "tools":            { "type": "array", "items": { "type": "string" }, "description": "Allowlist of MCP tool names this agent may call. Empty array means all tools are permitted." },
-              "modelHint":        { "type": "string", "deprecationMessage": "Deprecated — use model instead.", "description": "Deprecated — use model instead." },
-              "systemPromptHint": { "type": "string", "deprecationMessage": "Deprecated — use systemPrompt instead.", "description": "Deprecated — use systemPrompt instead." }
+              "id": {
+                "type": "string",
+                "description": "Agent type identifier (used as agentType when spawning)."
+              },
+              "label": {
+                "type": "string",
+                "description": "Display name shown in UI."
+              },
+              "domain": {
+                "type": "string",
+                "description": "Task domain this agent handles (e.g. 'docs', 'code', 'security')."
+              },
+              "deploymentMode": {
+                "type": "string",
+                "enum": [
+                  "inline",
+                  "headless"
+                ],
+                "default": "inline",
+                "description": "How this agent is deployed. 'inline' = in-process managed by the runtime (default). 'headless' = standalone peer process; vscode-lm provider is not available in this mode."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "anthropic",
+                  "openai",
+                  "vscode-lm"
+                ],
+                "description": "LLM provider. vscode-lm is only valid for inline deploymentMode."
+              },
+              "model": {
+                "type": "string",
+                "description": "Model identifier (e.g. claude-sonnet-4-6, gpt-4o)."
+              },
+              "baseUrl": {
+                "type": "string",
+                "description": "API base URL (not used for vscode-lm)."
+              },
+              "apiKeyRef": {
+                "type": "string",
+                "description": "Secret storage key for the API key (inline agents). Headless agents manage their own credentials."
+              },
+              "systemPrompt": {
+                "type": "string",
+                "description": "System prompt passed to the agent when spawned. Overrides any runtime default for this domain."
+              },
+              "tools": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Allowlist of MCP tool names this agent may call. Empty array means all tools are permitted."
+              },
+              "modelHint": {
+                "type": "string",
+                "deprecationMessage": "Deprecated — use model instead.",
+                "description": "Deprecated — use model instead."
+              },
+              "systemPromptHint": {
+                "type": "string",
+                "deprecationMessage": "Deprecated — use systemPrompt instead.",
+                "description": "Deprecated — use systemPrompt instead."
+              }
             }
           }
         },
@@ -119,18 +178,34 @@
           "description": "Named topology templates defining orchestrator + worker role assignments.",
           "items": {
             "type": "object",
-            "required": ["name", "orchestrator"],
+            "required": [
+              "name",
+              "orchestrator"
+            ],
             "properties": {
-              "name":         { "type": "string" },
-              "orchestrator": { "type": "string", "description": "Profile id for the orchestrator agent." },
+              "name": {
+                "type": "string"
+              },
+              "orchestrator": {
+                "type": "string",
+                "description": "Profile id for the orchestrator agent."
+              },
               "workers": {
                 "type": "array",
                 "items": {
                   "type": "object",
-                  "required": ["profile"],
+                  "required": [
+                    "profile"
+                  ],
                   "properties": {
-                    "profile": { "type": "string", "description": "Profile id for this worker." },
-                    "branch":  { "type": "string", "description": "Optional suggested branch name." }
+                    "profile": {
+                      "type": "string",
+                      "description": "Profile id for this worker."
+                    },
+                    "branch": {
+                      "type": "string",
+                      "description": "Optional suggested branch name."
+                    }
                   }
                 }
               }
@@ -144,7 +219,11 @@
         },
         "nodalmerge.defaultReviewPolicy": {
           "type": "string",
-          "enum": ["HumanRequired", "AgentApproval", "Hybrid"],
+          "enum": [
+            "HumanRequired",
+            "AgentApproval",
+            "Hybrid"
+          ],
           "default": "HumanRequired",
           "description": "Default review policy applied to new work units created in the Goal Workspace."
         },
@@ -171,25 +250,29 @@
         "nodalmerge.postMergeExecutionMode": {
           "type": "string",
           "default": "Disabled",
-          "enum": ["Disabled", "Async", "Blocking"],
+          "enum": [
+            "Disabled",
+            "Async",
+            "Blocking"
+          ],
           "description": "Post-merge execution mode: Disabled (no execution), Async (background fire-and-forget), Blocking (synchronous with rollback on failure)."
         }
       }
     }
   },
   "scripts": {
-    "compile":   "node esbuild.config.mjs",
-    "watch":     "node esbuild.config.mjs --watch",
-    "package":   "node esbuild.config.mjs --production && vsce package --no-dependencies",
+    "compile": "node esbuild.config.mjs",
+    "watch": "node esbuild.config.mjs --watch",
+    "package": "node esbuild.config.mjs --production && vsce package --no-dependencies",
     "typecheck": "tsc --noEmit",
     "build-vsix": "pwsh -File scripts/build-vsix.ps1",
     "publish-vsix": "pwsh -File scripts/build-vsix.ps1 -Publish"
   },
   "devDependencies": {
-    "@types/node":   "^22.0.0",
+    "@types/node": "^22.0.0",
     "@types/vscode": "^1.90.0",
-    "@vscode/vsce":  "^3.0.0",
-    "esbuild":       "^0.25.0",
-    "typescript":    "^5.6.0"
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
   }
 }
