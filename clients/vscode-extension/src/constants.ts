@@ -4,6 +4,8 @@ export const DEFAULT_HOST_PORT = 5080;
 export const HOST_STARTUP_TIMEOUT_MS = 15_000;
 export const HOST_HEALTH_POLL_INTERVAL_MS = 500;
 
+export const LAUNCHER_VIEW_ID = 'nodalmerge.launcher';
+
 export const COMMANDS = {
   RESTART_HOST:         'nodalmerge.restartHost',
   SHOW_OUTPUT:          'nodalmerge.showOutput',

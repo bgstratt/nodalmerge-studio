@@ -6,7 +6,8 @@ import { InsightsPanel } from './panels/InsightsPanel';
 import { NotificationManager } from './NotificationManager';
 import { AgentConfigService } from './AgentConfigService';
 import { LmApiProxy } from './LmApiProxy';
-import { COMMANDS } from './constants';
+import { LauncherViewProvider } from './panels/LauncherViewProvider';
+import { COMMANDS, LAUNCHER_VIEW_ID } from './constants';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const output = vscode.window.createOutputChannel('NodalMerge Studio');
@@ -38,6 +39,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const agentConfig = new AgentConfigService();
   const lmProxy     = new LmApiProxy();
   context.subscriptions.push(manager, lmProxy);
+
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(LAUNCHER_VIEW_ID, new LauncherViewProvider()),
+  );
 
   // Start the LM proxy in the background — non-fatal if VS Code LM is unavailable.
   try {

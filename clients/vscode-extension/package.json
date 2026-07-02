@@ -3,7 +3,7 @@
   "displayName": "NodalMerge Studio",
   "description": "Agent-native collaborative workspace — branch visualization, merge review, and agent orchestration for NodalMerge.",
   "publisher": "nodalmerge-studio",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "license": "MIT",
   "icon": "media/icon.png",
   "repository": {
@@ -18,6 +18,24 @@
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "nodalmerge",
+          "title": "NodalMerge Studio",
+          "icon": "media/activitybar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "nodalmerge": [
+        {
+          "id": "nodalmerge.launcher",
+          "name": "Studio",
+          "type": "webview"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "nodalmerge.restartHost",
