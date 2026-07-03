@@ -1,0 +1,4 @@
+src/MiniLedger.Contracts/Orders/Order.cs
+src/MiniLedger.Core/Orders/OrderService.cs
+src/MiniLedger.Host/Endpoints/OrdersEndpoints.cs
+tests/MiniLedger.Storage.Tests/InMemoryOrderRepositoryTests.cs

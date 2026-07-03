@@ -33,6 +33,7 @@ public sealed class InMemoryDeadLetterService(
         string? baseUrl = null,
         string? apiKey = null,
         string? provider = null,
+        FailureKind kind = FailureKind.Exception,
         CancellationToken cancellationToken = default)
     {
         var updatedUnit = await workUnits.IncrementFailureAttemptCountAsync(workUnitId, cancellationToken)
@@ -57,7 +58,8 @@ public sealed class InMemoryDeadLetterService(
             model,
             baseUrl,
             apiKey,
-            provider);
+            provider,
+            kind);
 
         _entries[entry.EntryId] = entry;
         await nodeStore.WriteNodeAsync(
@@ -110,6 +112,15 @@ public sealed class InMemoryDeadLetterService(
             .FirstOrDefault();
         return Task.FromResult(latest);
     }
+
+    public Task<IReadOnlyList<DeadLetterEntry>> GetHistoryForWorkUnitAsync(
+        string workUnitId,
+        CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<DeadLetterEntry>>(
+            _entries.Values
+                .Where(e => e.WorkUnitId == workUnitId)
+                .OrderBy(e => e.OccurredAt)
+                .ToList());
 
     public Task<IReadOnlyList<DeadLetterEntry>> ListAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyList<DeadLetterEntry>>(

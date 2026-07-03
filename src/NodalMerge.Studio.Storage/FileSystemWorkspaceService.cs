@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -12,8 +13,14 @@ internal sealed class FileSystemWorkspaceService(
     IBlobStoreProvider? blobStore = null,
     IRepositoryOpService? repoOpService = null,
     IMaterializationEngine? materializer = null,
-    IRepositorySnapshotService? snapshotService = null) : IFileWorkspaceService
+    IRepositorySnapshotService? snapshotService = null,
+    ILogger<FileSystemWorkspaceService>? logger = null) : IFileWorkspaceService
 {
+    // CAS being unconfigured is a legitimate, common, intentional deployment choice — not a
+    // misconfiguration — so this is logged once per instance (this class is a singleton, so
+    // effectively once per process) at Information, not per-call at Warning. WriteAsync/DeleteAsync
+    // fire on every file op; a per-call log would be spam regardless of level.
+    private bool _loggedMissingCasConfig;
     public async Task InitBranchAsync(string branchId, string? seedFromBranchId = null,
         IReadOnlyList<string>? fileScope = null, CancellationToken ct = default)
     {
@@ -531,14 +538,29 @@ internal sealed class FileSystemWorkspaceService(
 
     // ── Repository op emission (Phase 4 dual-write) ───────────────────────────
 
-    // Guard: skip silently if CAS or op service is unwired, or no repository is configured.
+    // Guard: skip if CAS or op service is unwired, or no repository is configured. Logs once
+    // (not silently) so a future debugging session doesn't have to infer this from stale/missing
+    // CAS state — see the class-level _loggedMissingCasConfig comment for why this is Information,
+    // logged once, not a per-call Warning.
     private bool CanEmitOps([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? repositoryId)
     {
         repositoryId = null;
-        if (blobStore is null || repoOpService is null || string.IsNullOrEmpty(options.SeedRepositoryPath))
-            return false;
-        repositoryId = Path.GetFullPath(options.SeedRepositoryPath);
-        return true;
+        if (blobStore is not null && repoOpService is not null && options.SeedRepositoryPath is { Length: > 0 })
+        {
+            repositoryId = Path.GetFullPath(options.SeedRepositoryPath);
+            return true;
+        }
+
+        if (!_loggedMissingCasConfig)
+        {
+            _loggedMissingCasConfig = true;
+            logger?.LogInformation(
+                "CAS dual-write disabled (blobStore={HasBlobStore}, repoOpService={HasRepoOpService}, " +
+                "seedRepositoryPath={HasSeedPath}). This is expected for deployments that don't need " +
+                "the audit trail; file writes/deletes proceed normally on disk.",
+                blobStore is not null, repoOpService is not null, options.SeedRepositoryPath is { Length: > 0 });
+        }
+        return false;
     }
 
     private async Task EmitWriteOpAsync(string fullPath, string relativePath, byte[] newBytes, CancellationToken ct)

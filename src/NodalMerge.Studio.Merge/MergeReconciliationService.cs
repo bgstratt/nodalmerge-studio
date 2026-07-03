@@ -243,11 +243,7 @@ public sealed class MergeReconciliationService(
                     .ReadAsync($"base/{proposalId}", file, cancellationToken).ConfigureAwait(false);
                 var after = afterContents[proposalId];
 
-                var hunks = LineDiffer.Diff(before, after, contextLines: 0);
-                var fileRanges = hunks
-                    .Select(h => (h.BeforeStart, h.BeforeStart + Math.Max(h.BeforeCount, 1) - 1))
-                    .ToList();
-                ranges.Add((proposalId, fileRanges));
+                ranges.Add((proposalId, LineRangeConflictDetector.ComputeChangedRanges(before, after)));
             }
 
             var overlapping = new HashSet<string>();
@@ -255,7 +251,7 @@ public sealed class MergeReconciliationService(
             {
                 for (var j = i + 1; j < ranges.Count; j++)
                 {
-                    if (!RangesOverlap(ranges[i].Ranges, ranges[j].Ranges))
+                    if (!LineRangeConflictDetector.RangesOverlap(ranges[i].Ranges, ranges[j].Ranges))
                         continue;
                     overlapping.Add(ranges[i].ProposalId);
                     overlapping.Add(ranges[j].ProposalId);
@@ -267,20 +263,6 @@ public sealed class MergeReconciliationService(
         }
 
         return refined;
-    }
-
-    private static bool RangesOverlap(List<(int Start, int End)> a, List<(int Start, int End)> b)
-    {
-        foreach (var ra in a)
-        {
-            foreach (var rb in b)
-            {
-                if (ra.Start <= rb.End && rb.Start <= ra.End)
-                    return true;
-            }
-        }
-
-        return false;
     }
 
     private static Dictionary<string, List<string>> DetectTouchedFileOverlap(IReadOnlyList<MergeProposal> proposals)

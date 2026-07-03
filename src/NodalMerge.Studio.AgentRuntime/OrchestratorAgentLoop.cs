@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Projections;
 using NodalMerge.Studio.Contracts.Versioning;
@@ -25,7 +26,11 @@ internal sealed class OrchestratorAgentLoop(
     int stallDetectionCycles = 4,
     Action<string?>? onActivity = null,
     IConversationLogService? conversationLog = null,
-    IAgentControlService? agentControl = null)
+    IAgentControlService? agentControl = null,
+    IExecutionEventStream? events = null,
+    // Observability-only — see ConversationCompactor. Optional/nullable so call sites and tests
+    // that don't wire a logger keep compiling unchanged.
+    ILogger? logger = null)
 {
     internal static readonly string DefaultSystemPrompt = AgentLoopPrompts.Orchestrator;
 
@@ -38,6 +43,21 @@ internal sealed class OrchestratorAgentLoop(
     private readonly IReadOnlyList<string>? _allowedTools = profile?.AllowedTools is { Count: > 0 }
         ? profile.AllowedTools
         : null;
+
+    // Records each transient-provider-error retry attempt as it happens, not just the terminal
+    // dead-letter reason if every retry is exhausted. No-op when there's no sessionId to attribute
+    // it to (matches the gating other session-scoped events already use in this codebase).
+    private async Task OnTransientRetryAsync(TransientRetryAttempt attempt, CancellationToken ct)
+    {
+        if (events is null || sessionId is null) return;
+        await events.AppendAsync(
+            sessionId, workUnitId, ExecutionEventKind.ProviderRetryAttempted,
+            new ProviderRetryAttemptedPayload(
+                agentId, client.Provider, (int?)attempt.StatusCode,
+                attempt.AttemptNumber, attempt.MaxAttempts,
+                (int)attempt.Delay.TotalMilliseconds, attempt.Reason),
+            ct: ct).ConfigureAwait(false);
+    }
 
     public async Task<AgentLoopCompletion> RunAsync(CancellationToken ct)
     {
@@ -85,8 +105,14 @@ internal sealed class OrchestratorAgentLoop(
 
             AppendDeltaToOutgoingMessage(messages, delta);
 
+            ConversationCompactor.ElideStaleToolResults(messages, logger, agentId, workUnitId);
+            await ConversationCompactor.ApplyRollingSummaryIfDueAsync(messages, client, ct, logger, agentId, workUnitId)
+                .ConfigureAwait(false);
+
             onActivity?.Invoke("Thinking...");
-            var response = await client.SendAsync(messages, _tools, _systemPrompt, ct)
+            var response = await client.SendAsync(
+                    messages, _tools, _systemPrompt, ct,
+                    attempt => OnTransientRetryAsync(attempt, ct))
                 .ConfigureAwait(false);
 
             messages.Add(new NmMessage("assistant", response.Content));

@@ -77,10 +77,11 @@ public sealed class DomainAgentTriggerService(
             var llm = serviceProvider.GetRequiredService<LlmClient>();
             var agentClient = new DefaultAgentToolClient(creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey, llm, dispatcher);
             var conversationLog = serviceProvider.GetRequiredService<IConversationLogService>();
+            var events = serviceProvider.GetService<IExecutionEventStream>();
 
             var loop = new DomainAgentLoop(
                 definition, agentId, workUnitId, triggeringArtifact.ArtifactId,
-                agentClient, conversationLog: conversationLog);
+                agentClient, conversationLog: conversationLog, events: events);
 
             await loop.RunAsync(ct).ConfigureAwait(false);
         }

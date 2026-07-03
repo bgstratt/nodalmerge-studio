@@ -286,11 +286,19 @@ public interface IDeadLetterService
         string? baseUrl = null,
         string? apiKey = null,
         string? provider = null,
+        FailureKind kind = FailureKind.Exception,
         CancellationToken cancellationToken = default);
 
     Task<DeadLetterEntry?> GetAsync(string entryId, CancellationToken cancellationToken = default);
 
     Task<DeadLetterEntry?> GetLatestForWorkUnitAsync(
+        string workUnitId,
+        CancellationToken cancellationToken = default);
+
+    // Every dead-letter entry recorded for this work unit, oldest first — the full failure story
+    // (e.g. "max iterations" -> manually steered retry -> "transient 529") in one call, instead of
+    // a human following steeredFromDeadLetterEntryId across separate GetAsync calls by hand.
+    Task<IReadOnlyList<DeadLetterEntry>> GetHistoryForWorkUnitAsync(
         string workUnitId,
         CancellationToken cancellationToken = default);
 
@@ -337,6 +345,66 @@ public enum DeadLetterRetryOutcome
 public sealed record DeadLetterRetryResult(
     DeadLetterRetryOutcome Outcome,
     string? Message = null);
+
+// Re-plan-the-slice: the mechanism both recovery tracks from
+// plans/orchestrator-reliability-and-observability.md Phase 1.4 use to safely retry a failed
+// slice without touching sibling work — never retries the failed work unit itself, always spawns
+// fresh, independently-budgeted children and marks the original terminal (Cancelled). Distinct
+// from IDeadLetterService.RetryAsync/RetryWithContextAsync, which resume the *same* work unit.
+public interface IReplanService
+{
+    Task<ReplanResult> ReplanFailedSliceAsync(string entryId, CancellationToken cancellationToken = default);
+}
+
+public enum ReplanOutcome
+{
+    Replanned,
+    NotFound,
+    // The failed work unit has no parent to attach new sibling slices to (it's a top-level goal,
+    // not a fanned-out slice) — this mechanism only applies to slices, not whole goals.
+    NotApplicable,
+    // The bounded PlannerAgentLoop ran but didn't end naturally (hit its own iteration cap or was
+    // cancelled) — nothing is changed; the original dead-letter entry and work unit are untouched.
+    PlanningFailed,
+    // The planner claimed success but recorded a Plan artifact that produced no new child work
+    // units (e.g. empty slice list) — again, nothing is changed.
+    NoNewSlicesProduced,
+}
+
+public sealed record ReplanResult(
+    ReplanOutcome Outcome,
+    string? Message = null,
+    IReadOnlyList<string>? NewWorkUnitIds = null);
+
+// Continue-track (Phase 1.4 two-track failure/recovery design): reconstructs a dead-lettered
+// work unit's own prior conversation from ConversationLogEntry rows and resumes the SAME work
+// unit with a fresh iteration budget, instead of spawning fresh siblings (that's ReplanService's
+// job, and the other Continue-track option). Only meaningful for MaxIterationsExceeded — nothing
+// about hitting the iteration ceiling implies the approach was wrong, only that the budget was
+// too small, so continuing the same conversation (not restarting it) is the right recovery.
+public interface IContinueService
+{
+    Task<ContinueResult> ContinueWithPriorContextAsync(string entryId, CancellationToken cancellationToken = default);
+}
+
+public enum ContinueOutcome
+{
+    Continued,
+    NotFound,
+    // Continue only applies to MaxIterationsExceeded — for any other FailureKind, the approach
+    // itself was the problem, so resuming the same conversation isn't the right recovery (that's
+    // Retry-track's job: steer-and-retry, or re-plan from scratch).
+    NotApplicable,
+    // No LLM credentials resolvable, or the reconstructed conversation loop didn't complete
+    // successfully — treated as MaxIterationsExceeded again (a new dead-letter entry is recorded
+    // with the same Kind so Continue can be reached for again, or the human can switch tracks).
+    NotCompleted,
+}
+
+public sealed record ContinueResult(
+    ContinueOutcome Outcome,
+    string? Message = null,
+    AgentLoopCompletion? Completion = null);
 
 public interface IWorkUnitService
 {
@@ -1287,6 +1355,31 @@ public interface IConversationLogService
     Task<IReadOnlyList<ConversationLogEntry>> GetEntriesAsync(string workUnitId, CancellationToken ct = default);
 }
 
+// Phase 2 item 1 (plans/orchestrator-reliability-and-observability.md) — a soft, alert-only cap
+// on a goal's total token usage/wall-clock duration. Deliberately never stops or interrupts
+// in-flight work itself — auto-stopping active agent work is a real, hard-to-reverse action a
+// human should decide on, not something this triggers automatically. Computed on demand (no
+// background poller, no persisted "already alerted" state to go stale) by summing
+// ConversationLogEntry token counts across a goal's entire work-unit subtree.
+public interface IGoalGuardrailService
+{
+    Task<GoalGuardrailStatus?> GetStatusAsync(string goalWorkUnitId, CancellationToken cancellationToken = default);
+
+    // Every non-terminal top-level goal (ParentWorkUnitId is null; Status not in
+    // {Completed, Merged, Cancelled, Failed}) — what the VS Code dashboard polls to badge any
+    // goal that's crossed its cap, without needing to know which goals exist up front.
+    Task<IReadOnlyList<GoalGuardrailStatus>> GetActiveGoalStatusesAsync(CancellationToken cancellationToken = default);
+}
+
+public sealed record GoalGuardrailStatus(
+    string WorkUnitId,
+    long TotalTokens,
+    long? MaxGoalTokens,
+    bool TokensExceeded,
+    double ElapsedMinutes,
+    int? MaxGoalDurationMinutes,
+    bool DurationExceeded);
+
 // Slice 14a — pluggable validation seam checked at defined pipeline checkpoints. Ships with zero
 // registered IPolicyRule implementations; PolicyGateService aggregates whatever rules DI resolves
 // for the requested checkpoint, so adding a new rule later is "register one more class," not
@@ -1673,7 +1766,17 @@ public interface IRepositorySnapshotService
 // No-op if blobStore or repoOpService is unavailable (e.g. in-memory test environments without CAS).
 public interface IRepositoryImportService
 {
+    // Bootstrap-or-skip: only ever runs the CAS walk/diff once per repositoryId per process
+    // (gated by an in-memory "already bootstrapped" set) — right for triggers where a one-time
+    // seed is all that's needed (GoalCreation, StartupRecovery).
     Task EnsureBootstrappedAsync(string repositoryId, string repositoryPath, CancellationToken ct = default);
+
+    // Always re-runs the Case 1/Case 2 diff+snapshot logic, regardless of whether this
+    // repository was already bootstrapped — for triggers whose whole point is "check again
+    // right now" (PostMergeWriteBack, ManualRefresh). Without this, EnsureBootstrappedAsync's
+    // one-time gate means RepositorySnapshot never advances again after a repo's first goal
+    // creation, no matter how many merges land or how many times a resync is requested.
+    Task ForceSyncAsync(string repositoryId, string repositoryPath, CancellationToken ct = default);
 }
 
 // Phase 9 — structural conflict detection. A conflict is two RepositoryOps that share the same

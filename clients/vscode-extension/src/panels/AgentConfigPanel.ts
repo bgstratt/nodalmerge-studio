@@ -569,7 +569,7 @@ const MAS_JS = `
     profiles.forEach(function(p, i) {
       const tr = document.createElement('tr');
       const credWarning = credentialStatus[p.id] === 'secret-missing'
-        ? ' <span title="API key was stored previously but is no longer in VS Code\'s secret storage — re-enter it." style="color:#e5a000">&#9888; key missing</span>'
+        ? ' <span title="API key was stored previously but is no longer in VS Code\\'s secret storage — re-enter it." style="color:#e5a000">&#9888; key missing</span>'
         : '';
       tr.innerHTML =
         '<td class="mono">' + esc(p.id) + '</td>' +

@@ -50,6 +50,43 @@ interface DeadLetterEntry {
   attemptCount: number;
   occurredAt: string;
   maxAttemptsReached: boolean;
+  // Phase 1.4 — NodalMerge.Studio.Contracts.Domain.FailureKind, serialized as its string name.
+  kind: string;
+}
+
+// Matches NodalMerge.Studio.Core.Services.GoalGuardrailStatus — Phase 2 item 1's alert-only
+// per-goal cost/time guardrail. TokensExceeded/DurationExceeded are computed server-side against
+// WorkspaceOptions.MaxGoalTokens/MaxGoalDurationMinutes (both null = disabled by default).
+interface GoalGuardrailStatus {
+  workUnitId: string;
+  totalTokens: number;
+  maxGoalTokens: number | null;
+  tokensExceeded: boolean;
+  elapsedMinutes: number;
+  maxGoalDurationMinutes: number | null;
+  durationExceeded: boolean;
+}
+
+// Matches NodalMerge.Studio.Contracts.Domain.ExecutionEvent — payloadJson is deserialized
+// client-side per-kind (only ProviderRetryAttempted is parsed here today).
+interface ExecutionEventDto {
+  eventId: string;
+  sessionId: string;
+  workUnitId?: string | null;
+  kind: string;
+  payloadJson: string;
+  occurredAt: string;
+}
+
+// Matches NodalMerge.Studio.Contracts.Domain.ProviderRetryAttemptedPayload.
+interface ProviderRetryPayload {
+  agentId: string;
+  provider?: string | null;
+  statusCode?: number | null;
+  attemptNumber: number;
+  maxAttempts: number;
+  delayMs: number;
+  reason: string;
 }
 
 interface FindingSignal {
@@ -202,7 +239,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
       const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
       const emptySummary: WorkspaceSummary = { activeWorkUnits: [], activeAgents: [], pendingMerges: [], failures: [], knownGoodStates: [] };
       const emptyMetrics: ClarificationMetrics = { requests: 0, answered: 0, abandoned: 0, perGoal: [] };
-      const [summary, workUnits, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases, opts, findings, goalsResp] = await Promise.all([
+      const [summary, workUnits, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases, opts, findings, goalsResp, sessionEvents, guardrailStatuses] = await Promise.all([
         this.get<WorkspaceSummary>('/studio/workspace-summary' + params).catch(() => emptySummary),
         this.get<WorkUnit[]>('/studio/workunits' + params).catch(() => [] as WorkUnit[]),
         this.get<AgentInfo[]>('/studio/agents?all=true' + (sessionId ? '&sessionId=' + encodeURIComponent(sessionId) : '')).catch(() => [] as AgentInfo[]),
@@ -215,12 +252,27 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
         this.get<{ usePromotionBranch?: boolean; candidateBranchId?: string; defaultClarificationTimeoutSeconds?: number | null; defaultClarificationTimeoutBehavior?: string }>('/studio/options').catch(() => ({} as { usePromotionBranch?: boolean; candidateBranchId?: string })),
         this.get<FindingSignal[]>('/studio/findings?status=Open').catch(() => [] as FindingSignal[]),
         this.get<{ goals: GoalItem[] }>('/studio/goals').catch(() => ({ goals: [] as GoalItem[] })),
+        // Only meaningful once a specific session is selected — the endpoint is session-scoped,
+        // unlike everything else above which can span all sessions.
+        (sessionId
+          ? this.get<ExecutionEventDto[]>('/studio/sessions/' + encodeURIComponent(sessionId) + '/events').catch(() => [] as ExecutionEventDto[])
+          : Promise.resolve([] as ExecutionEventDto[])),
+        this.get<GoalGuardrailStatus[]>('/studio/goals/guardrail-status').catch(() => [] as GoalGuardrailStatus[]),
       ]);
+      const providerRetries = sessionEvents
+        .filter(e => e.kind === 'ProviderRetryAttempted')
+        .map(e => {
+          try { return { workUnitId: e.workUnitId, occurredAt: e.occurredAt, payload: JSON.parse(e.payloadJson) as ProviderRetryPayload }; }
+          catch { return null; }
+        })
+        .filter((r): r is { workUnitId: string | null | undefined; occurredAt: string; payload: ProviderRetryPayload } => r !== null);
       const syncGraph = await this.get<{ frontierHeads: string[] }>('/studio/causal/frontier').catch(() => null);
       const goals = goalsResp?.goals ?? [];
       this.usePromotionBranch = opts.usePromotionBranch ?? false;
       void this.panel.webview.postMessage({
         type: 'data', summary, workUnits, goals, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases,
+        providerRetries,
+        guardrailStatuses,
         usePromotionBranch: this.usePromotionBranch,
         candidateBranchId: opts.candidateBranchId ?? 'candidate',
         syncGraph: syncGraph ?? { frontierHeads: [] },
@@ -421,6 +473,31 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           await this.post('/studio/dead-letter/' + String(msg.entryId) + '/retry', {});
           void this.poll();
           break;
+        case 'replanDeadLetter': {
+          // Phase 1.4 — re-plan-the-slice: spawns a real bounded planner turn server-side, so this
+          // can take several seconds; the panel just re-polls after, same as retryDeadLetter above.
+          const replanResult = (await this.post(
+            '/studio/dead-letter/' + String(msg.entryId) + '/replan',
+            {},
+          )) as { newWorkUnitIds?: string[] };
+          const count = replanResult.newWorkUnitIds?.length ?? 0;
+          void vscode.window.showInformationMessage(
+            'NodalMerge: Re-plan complete — ' + count + ' new sub-slice' + (count === 1 ? '' : 's') + ' created.',
+          );
+          void this.poll();
+          break;
+        }
+        case 'continueDeadLetter': {
+          // Phase 1.4 Continue-track — resumes the SAME work unit with its own prior
+          // conversation reconstructed, so this also spawns a real bounded worker turn
+          // server-side and can take a while; re-poll after, same pattern as retry/replan.
+          // A non-2xx outcome (NotApplicable/NotCompleted) throws from post() and is
+          // surfaced by this method's own outer catch, same as every other action here.
+          await this.post('/studio/dead-letter/' + String(msg.entryId) + '/continue', {});
+          void vscode.window.showInformationMessage('NodalMerge: Continue completed successfully.');
+          void this.poll();
+          break;
+        }
         case 'releaseFileLease': {
           const confirmed = await vscode.window.showWarningMessage(
             'Force-release every file lease held by "' + String(msg.workUnitId) + '"? The next queued worker will be promoted automatically.',
@@ -738,16 +815,24 @@ const ET_JS = `
 
   // isGoalStore=true when items come from /studio/goals (have goalId + Paused status);
   // false when falling back to /studio/workunits (no goalId, no goal-level pause support).
-  function renderActiveGoals(goals, isGoalStore) {
+  function renderActiveGoals(goals, isGoalStore, guardrailStatuses) {
     var el = document.getElementById('active-goals');
     if (!goals || !goals.length) {
       el.innerHTML = '<p class="empty">No active goals.</p>';
       return;
     }
+    // Phase 2 item 1 — alert-only guardrail badge. Keyed by workUnitId since that's the one ID
+    // both the goal-store and work-unit-fallback shapes always carry (goalId only exists in the
+    // former). Never disables or hides anything else on the card — this is purely informational.
+    var guardrailByWorkUnit = {};
+    for (var gi = 0; gi < (guardrailStatuses || []).length; gi++) {
+      guardrailByWorkUnit[guardrailStatuses[gi].workUnitId] = guardrailStatuses[gi];
+    }
     var html = '';
     for (var i = 0; i < goals.length; i++) {
       var g = goals[i];
       var goalId = g.goalId || g.workUnitId;
+      var gr = guardrailByWorkUnit[g.workUnitId];
       var status = (g.status || '').toLowerCase();
       var isPaused   = status === 'paused';
       var isReviewing = status === 'reviewing';
@@ -776,6 +861,12 @@ const ET_JS = `
       html += '</div>';
       if (isPaused && g.pauseReason) {
         html += '<div class="row"><span class="mono" style="color:var(--nm-warn)">⏸ ' + esc(g.pauseReason) + '</span></div>';
+      }
+      if (gr && (gr.tokensExceeded || gr.durationExceeded)) {
+        var grParts = [];
+        if (gr.tokensExceeded) { grParts.push(gr.totalTokens.toLocaleString() + ' tokens (cap ' + gr.maxGoalTokens.toLocaleString() + ')'); }
+        if (gr.durationExceeded) { grParts.push(Math.round(gr.elapsedMinutes) + ' min (cap ' + gr.maxGoalDurationMinutes + ')'); }
+        html += '<div class="row"><span class="mono" style="color:var(--nm-warn)" title="Alert only — this goal keeps running; guardrails never auto-stop work">⚠ Guardrail exceeded: ' + esc(grParts.join(', ')) + '</span></div>';
       }
       html += '<div class="row">';
       html += '<span class="mono">' + esc(g.workUnitId) + '</span>';
@@ -1057,7 +1148,10 @@ const ET_JS = `
     });
   }
 
-  function renderBlockedExplorations(deadLetters, goals) {
+  // Groups by workUnitId so a work unit that failed more than once (e.g. "max iterations"
+  // then, after a manual retry, a transient provider error) shows as ONE card with a history
+  // trail, instead of one confusing card per attempt with no visible relationship between them.
+  function renderBlockedExplorations(deadLetters, goals, providerRetries) {
     var el = document.getElementById('blocked');
     if (!deadLetters || !deadLetters.length) {
       el.innerHTML = '<p class="empty">No blocked explorations.</p>';
@@ -1065,35 +1159,87 @@ const ET_JS = `
     }
     var goalMap = {};
     for (var j = 0; j < (goals || []).length; j++) { goalMap[goals[j].workUnitId] = goals[j]; }
+
+    var groups = {};
+    for (var g = 0; g < deadLetters.length; g++) {
+      var entry = deadLetters[g];
+      (groups[entry.workUnitId] = groups[entry.workUnitId] || []).push(entry);
+    }
+
+    var retryCounts = {};
+    for (var r = 0; r < (providerRetries || []).length; r++) {
+      var pr = providerRetries[r];
+      if (!pr.workUnitId) { continue; }
+      retryCounts[pr.workUnitId] = (retryCounts[pr.workUnitId] || 0) + 1;
+    }
+
     var html = '';
-    for (var i = 0; i < deadLetters.length; i++) {
-      var dl = deadLetters[i];
-      var wu = goalMap[dl.workUnitId];
-      var goal = wu ? wu.goal : dl.workUnitId;
-      var canRetry = !dl.maxAttemptsReached && dl.attemptCount < 3;
+    Object.keys(groups).forEach(function(workUnitId) {
+      var chain = groups[workUnitId].slice().sort(function(a, b) { return String(a.occurredAt).localeCompare(String(b.occurredAt)); });
+      var latest = chain[chain.length - 1];
+      var earlier = chain.slice(0, -1);
+      var wu = goalMap[workUnitId];
+      var goal = wu ? wu.goal : workUnitId;
+      var canRetry = !latest.maxAttemptsReached && latest.attemptCount < 3;
+      var transientRetries = retryCounts[workUnitId] || 0;
+      // Phase 1.4 two-track design: MaxIterationsExceeded is the Continue track — both of its
+      // options are implemented now: "Continue" (resume the same work unit with reconstructed
+      // prior context) and "Re-plan the slice" (decompose into fresh, independently-budgeted
+      // siblings). Everything else is the Retry track ("re-plan from scratch" alongside plain
+      // Retry). Same replan call either way, label differs only to match how a human would
+      // describe what just happened. Unlike Retry, re-planning is deliberately NOT gated on
+      // attempt count — it never resumes this same work unit; Continue does resume it, so it's
+      // gated on canRetry the same way Retry is.
+      var replanLabel = latest.kind === 'MaxIterationsExceeded' ? 'Re-plan the slice' : 'Re-plan from scratch';
+      var isMaxIterations = latest.kind === 'MaxIterationsExceeded';
+
       html += '<div class="card">';
       html += '<div class="row">';
       html += '<span class="title" title="' + esc(goal) + '">' + esc(goal) + '</span>';
       html += badge('failed');
       html += '<div class="actions">';
       if (canRetry) {
-        html += '<button class="ghost" data-action="retryDeadLetter" data-id="' + esc(dl.entryId) + '">Retry</button>';
+        html += '<button class="ghost" data-action="retryDeadLetter" data-id="' + esc(latest.entryId) + '">Retry</button>';
+        if (isMaxIterations) {
+          html += '<button class="ghost" data-action="continueDeadLetter" data-id="' + esc(latest.entryId) + '">Continue</button>';
+        }
       } else {
         html += '<span class="mono" style="opacity:0.6">Max attempts reached</span>';
       }
+      html += '<button class="ghost" data-action="replanDeadLetter" data-id="' + esc(latest.entryId) + '">' + esc(replanLabel) + '</button>';
       html += '</div></div>';
       html += '<div class="row">';
-      html += '<span class="mono">phase: ' + esc(dl.stage) + '</span>';
-      html += '<span class="mono">model: ' + esc(dl.profileId) + '</span>';
-      html += '<span class="mono">attempt ' + esc(String(dl.attemptCount)) + '/3</span>';
+      html += '<span class="mono">phase: ' + esc(latest.stage) + '</span>';
+      html += '<span class="mono">model: ' + esc(latest.profileId) + '</span>';
+      html += '<span class="mono">attempt ' + esc(String(latest.attemptCount)) + '/3</span>';
+      if (transientRetries > 0) {
+        html += '<span class="mono" title="Transient provider errors (e.g. rate limit/overload) retried automatically before this failure">' + esc(String(transientRetries)) + ' transient retr' + (transientRetries === 1 ? 'y' : 'ies') + '</span>';
+      }
       html += '</div>';
-      html += '<div class="row"><span class="mono">' + esc(dl.reason) + '</span></div>';
+      html += '<div class="row"><span class="mono">' + esc(latest.reason) + '</span></div>';
+      if (earlier.length > 0) {
+        html += '<details><summary class="mono" style="cursor:pointer;opacity:0.7">' + earlier.length + ' earlier attempt' + (earlier.length === 1 ? '' : 's') + '</summary>';
+        for (var e = 0; e < earlier.length; e++) {
+          html += '<div class="row" style="opacity:0.7"><span class="mono">' + esc(new Date(earlier[e].occurredAt).toLocaleString()) + ' — ' + esc(earlier[e].reason) + '</span></div>';
+        }
+        html += '</details>';
+      }
       html += '</div>';
-    }
+    });
     el.innerHTML = html;
     el.querySelectorAll('[data-action="retryDeadLetter"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: 'retryDeadLetter', entryId: btn.getAttribute('data-id') });
+      });
+    });
+    el.querySelectorAll('[data-action="replanDeadLetter"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'replanDeadLetter', entryId: btn.getAttribute('data-id') });
+      });
+    });
+    el.querySelectorAll('[data-action="continueDeadLetter"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'continueDeadLetter', entryId: btn.getAttribute('data-id') });
       });
     });
   }
@@ -1160,12 +1306,12 @@ const ET_JS = `
       globalUsePromotionBranch = !!msg.usePromotionBranch;
       globalCandidateBranchId = msg.candidateBranchId || 'candidate';
     }
-    renderActiveGoals(msg.goals && msg.goals.length ? msg.goals : msg.workUnits, !!msg.goals);
+    renderActiveGoals(msg.goals && msg.goals.length ? msg.goals : msg.workUnits, !!msg.goals, msg.guardrailStatuses || []);
     renderAgents(msg.agents, msg.workUnits);
     renderAwaitingResume(msg.awaitingResume || []);
     renderClarifications(msg.clarifications || [], msg.clarificationMetrics || null);
     renderPendingDecisions(msg.merges);
-    renderBlockedExplorations(msg.deadLetters || [], msg.workUnits);
+    renderBlockedExplorations(msg.deadLetters || [], msg.workUnits, msg.providerRetries || []);
     renderFileLeases(msg.fileLeases || [], msg.workUnits);
     renderSyncGraph(msg.syncGraph || { frontierHeads: [] });
     var ts = document.getElementById('last-updated');

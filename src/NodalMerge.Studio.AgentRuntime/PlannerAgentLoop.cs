@@ -14,7 +14,8 @@ internal sealed class PlannerAgentLoop(
     Action<string?>? onActivity = null,
     string? ruleFileContext = null,
     string? constraintsContext = null,
-    IConversationLogService? conversationLog = null)
+    IConversationLogService? conversationLog = null,
+    IExecutionEventStream? events = null)
 {
     internal static readonly string DefaultSystemPrompt = AgentLoopPrompts.Planner;
 
@@ -26,6 +27,19 @@ internal sealed class PlannerAgentLoop(
     private readonly IReadOnlyList<string>? _allowedTools = profile?.AllowedTools is { Count: > 0 }
         ? profile.AllowedTools
         : null;
+
+    // See OrchestratorAgentLoop.OnTransientRetryAsync for rationale — same pattern.
+    private async Task OnTransientRetryAsync(TransientRetryAttempt attempt, CancellationToken ct)
+    {
+        if (events is null || sessionId is null) return;
+        await events.AppendAsync(
+            sessionId, workUnitId, ExecutionEventKind.ProviderRetryAttempted,
+            new ProviderRetryAttemptedPayload(
+                agentId, client.Provider, (int?)attempt.StatusCode,
+                attempt.AttemptNumber, attempt.MaxAttempts,
+                (int)attempt.Delay.TotalMilliseconds, attempt.Reason),
+            ct: ct).ConfigureAwait(false);
+    }
 
     public async Task<AgentLoopCompletion> RunAsync(CancellationToken ct)
     {
@@ -44,7 +58,9 @@ internal sealed class PlannerAgentLoop(
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
             onActivity?.Invoke("Thinking...");
-            var response = await client.SendAsync(messages, _tools, _systemPrompt, ct)
+            var response = await client.SendAsync(
+                    messages, _tools, _systemPrompt, ct,
+                    attempt => OnTransientRetryAsync(attempt, ct))
                 .ConfigureAwait(false);
 
             messages.Add(new NmMessage("assistant", response.Content));

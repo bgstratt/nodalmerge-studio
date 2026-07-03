@@ -51,26 +51,7 @@ internal sealed class RepositoryImportService(
                 if (_bootstrapped.Contains(repositoryId)) return;
             }
 
-            // Phase 6 — compact mid-goal ops before sync so Case 2 diffs against a current
-            // snapshot, not one that predates a large agent work unit.
-            if (workspaceOptions?.Snapshots.OpsPerSnapshot is int threshold)
-                await snapshotService.ConsiderCompactionAsync(repositoryId, threshold, ct).ConfigureAwait(false);
-
-            var latest = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
-
-            if (latest is null)
-            {
-                // Case 1 — no snapshot at all: walk every file, put to CAS, emit Import ops.
-                await BootstrapAsync(repositoryId, repositoryPath, ct).ConfigureAwait(false);
-            }
-            else if (latest.TreeEntries is not null)
-            {
-                // Case 2 — snapshot exists with stored tree: diff filesystem vs stored map,
-                // emit Add/Replace/Delete for changed files, create a successor snapshot.
-                await SyncFromFilesystemAsync(repositoryId, repositoryPath, latest, ct).ConfigureAwait(false);
-            }
-            // else: pre-Phase-2 bootstrap snapshot (no TreeEntries) — skip sync for now;
-            // the next completed work unit will produce a proper successor via Phase 7.
+            await RunSyncCoreAsync(repositoryId, repositoryPath, ct).ConfigureAwait(false);
 
             lock (_lock) { _bootstrapped.Add(repositoryId); }
         }
@@ -78,6 +59,58 @@ internal sealed class RepositoryImportService(
         {
             gate.Release();
         }
+    }
+
+    // Always re-runs Case 1/Case 2, bypassing the _bootstrapped gate entirely — see the
+    // interface doc comment for why EnsureBootstrappedAsync alone isn't enough for triggers
+    // that need "check again right now" semantics (a merge just wrote back to this repo; a
+    // human clicked "refresh").
+    public async Task ForceSyncAsync(
+        string repositoryId, string repositoryPath, CancellationToken ct = default)
+    {
+        if (blobStore is null || repoOpService is null || snapshotService is null) return;
+        if (!Directory.Exists(repositoryPath)) return;
+
+        var gate = _gates.GetOrAdd(repositoryId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await RunSyncCoreAsync(repositoryId, repositoryPath, ct).ConfigureAwait(false);
+
+            // A forced sync is itself a valid bootstrap — if EnsureBootstrappedAsync (GoalCreation/
+            // StartupRecovery) runs afterward for this same repositoryId, it should see it as
+            // already seeded rather than redundantly re-running Case 1/2 a second time.
+            lock (_lock) { _bootstrapped.Add(repositoryId); }
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    // Shared Case 1/Case 2 dispatch — must be called under this repositoryId's gate.
+    private async Task RunSyncCoreAsync(string repositoryId, string repositoryPath, CancellationToken ct)
+    {
+        // Phase 6 — compact mid-goal ops before sync so Case 2 diffs against a current
+        // snapshot, not one that predates a large agent work unit.
+        if (workspaceOptions?.Snapshots.OpsPerSnapshot is int threshold)
+            await snapshotService!.ConsiderCompactionAsync(repositoryId, threshold, ct).ConfigureAwait(false);
+
+        var latest = await snapshotService!.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
+
+        if (latest is null)
+        {
+            // Case 1 — no snapshot at all: walk every file, put to CAS, emit Import ops.
+            await BootstrapAsync(repositoryId, repositoryPath, ct).ConfigureAwait(false);
+        }
+        else if (latest.TreeEntries is not null)
+        {
+            // Case 2 — snapshot exists with stored tree: diff filesystem vs stored map,
+            // emit Add/Replace/Delete for changed files, create a successor snapshot.
+            await SyncFromFilesystemAsync(repositoryId, repositoryPath, latest, ct).ConfigureAwait(false);
+        }
+        // else: pre-Phase-2 bootstrap snapshot (no TreeEntries) — skip sync for now;
+        // the next completed work unit will produce a proper successor via Phase 7.
     }
 
     // ── Case 1 — Bootstrap ────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Versioning;
 using NodalMerge.Studio.Core.Services;
@@ -18,7 +19,18 @@ internal sealed class WorkerAgentLoop(
     bool selfVerifyBuild = false,
     bool selfVerifyTest = false,
     string? promptGuidanceContext = null,
-    IConversationLogService? conversationLog = null)
+    IConversationLogService? conversationLog = null,
+    IExecutionEventStream? events = null,
+    // Phase 1.4 Continue-track — reconstructed assistant/tool-result turns from a prior attempt's
+    // ConversationLogEntry rows (see ContinueService), inserted after the fresh kickoff message.
+    // Null/empty for a normal fresh run. The existing ConversationCompactor machinery (elision +
+    // rolling summary) applies to this exactly the same as it would to a long single run, which is
+    // what makes resuming with full prior context safe now instead of reproducing the original
+    // cost blowup unbounded.
+    IReadOnlyList<NmMessage>? priorTurns = null,
+    // Observability-only — see ConversationCompactor. Optional/nullable so call sites and tests
+    // that don't wire a logger keep compiling unchanged.
+    ILogger? logger = null)
 {
     internal static readonly string DefaultSystemPrompt = AgentLoopPrompts.Worker;
 
@@ -30,6 +42,19 @@ internal sealed class WorkerAgentLoop(
     private readonly IReadOnlyList<string>? _allowedTools = profile?.AllowedTools is { Count: > 0 }
         ? profile.AllowedTools
         : null;
+
+    // See OrchestratorAgentLoop.OnTransientRetryAsync for rationale — same pattern.
+    private async Task OnTransientRetryAsync(TransientRetryAttempt attempt, CancellationToken ct)
+    {
+        if (events is null || sessionId is null) return;
+        await events.AppendAsync(
+            sessionId, workUnitId, ExecutionEventKind.ProviderRetryAttempted,
+            new ProviderRetryAttemptedPayload(
+                agentId, client.Provider, (int?)attempt.StatusCode,
+                attempt.AttemptNumber, attempt.MaxAttempts,
+                (int)attempt.Delay.TotalMilliseconds, attempt.Reason),
+            ct: ct).ConfigureAwait(false);
+    }
 
     public async Task<AgentLoopCompletion> RunAsync(CancellationToken ct)
     {
@@ -56,11 +81,43 @@ internal sealed class WorkerAgentLoop(
             new("user", [new NmText(kickoff)])
         };
 
+        if (priorTurns is { Count: > 0 })
+        {
+            messages.AddRange(priorTurns);
+
+            const string continuationNotice =
+                "[Continuing after hitting the iteration limit on a previous attempt — the turns " +
+                "above are your own prior work on this task, not a new agent's. You have a fresh " +
+                "iteration budget; pick up exactly where you left off rather than starting over.]";
+
+            // Fold into the last message when it's already "user" (the common case — the prior
+            // attempt's last recorded turn was its own tool results, with no assistant reply yet
+            // since hitting MaxIterations cut it off before the next SendAsync call). Append a new
+            // "user" message instead when the last is "assistant" (the rarer edge case: the prior
+            // attempt's last cycle produced zero tool results and broke out of its loop without a
+            // trailing tool-result turn) — either way, alternation stays valid.
+            var last = messages[^1];
+            if (last.Role == "user")
+            {
+                messages[^1] = last with { Content = [.. last.Content, new NmText(continuationNotice)] };
+            }
+            else
+            {
+                messages.Add(new NmMessage("user", [new NmText(continuationNotice)]));
+            }
+        }
+
         var completedNaturally = false;
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
+            ConversationCompactor.ElideStaleToolResults(messages, logger, agentId, workUnitId);
+            await ConversationCompactor.ApplyRollingSummaryIfDueAsync(messages, client, ct, logger, agentId, workUnitId)
+                .ConfigureAwait(false);
+
             onActivity?.Invoke("Thinking...");
-            var response = await client.SendAsync(messages, _tools, _systemPrompt, ct)
+            var response = await client.SendAsync(
+                    messages, _tools, _systemPrompt, ct,
+                    attempt => OnTransientRetryAsync(attempt, ct))
                 .ConfigureAwait(false);
 
             messages.Add(new NmMessage("assistant", response.Content));

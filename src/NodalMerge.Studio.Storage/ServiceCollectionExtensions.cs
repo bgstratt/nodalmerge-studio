@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Core.Services;
 
@@ -216,6 +217,7 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IRepositorySnapshotService>(),
             sp.GetRequiredService<IMaterializationEngine>(),
             sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetRequiredService<IRepositoryRegistryService>(),
             sp.GetService<WorkspaceOptions>()));
         services.AddSingleton<IWorkspaceCacheManager>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
@@ -287,7 +289,8 @@ public static class ServiceCollectionExtensions
             sp.GetService<IBlobStoreProvider>(),
             sp.GetService<IRepositoryOpService>(),
             sp.GetService<IMaterializationEngine>(),
-            sp.GetService<IRepositorySnapshotService>()));
+            sp.GetService<IRepositorySnapshotService>(),
+            sp.GetService<ILogger<FileSystemWorkspaceService>>()));
 
         // Phase 10 — Roslyn C# syntax validator for AstMergeStrategy.
         services.AddSingleton<ISourceValidator, RoslynSourceValidator>();

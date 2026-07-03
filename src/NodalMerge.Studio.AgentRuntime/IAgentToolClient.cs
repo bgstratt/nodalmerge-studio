@@ -16,7 +16,8 @@ internal interface IAgentToolClient
         IReadOnlyList<NmMessage> messages,
         IReadOnlyList<LlmToolDef> tools,
         string systemPrompt,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        Func<TransientRetryAttempt, Task>? onTransientRetry = null);
 
     Task<string> DispatchAsync(
         string toolName,

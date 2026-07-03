@@ -531,6 +531,7 @@ public class AutomatedReviewGateServiceTests
             string? baseUrl = null,
             string? apiKey = null,
             string? provider = null,
+            FailureKind kind = FailureKind.Exception,
             CancellationToken cancellationToken = default)
         {
             Calls.Add((workUnitId, agentId, stage, profileId, reason));
@@ -555,6 +556,11 @@ public class AutomatedReviewGateServiceTests
             string workUnitId,
             CancellationToken cancellationToken = default) =>
             Task.FromResult<DeadLetterEntry?>(null);
+
+        public Task<IReadOnlyList<DeadLetterEntry>> GetHistoryForWorkUnitAsync(
+            string workUnitId,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<DeadLetterEntry>>([]);
 
         public Task<IReadOnlyList<DeadLetterEntry>> ListAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyList<DeadLetterEntry>>([]);

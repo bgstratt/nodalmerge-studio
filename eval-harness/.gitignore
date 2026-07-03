@@ -1,0 +1,6 @@
+# run-one.ps1 defaults per-run checkouts to a sibling eval-harness-runs/ OUTSIDE this
+# repo entirely (nesting them here broke NuGet Central Package Management inheritance —
+# see run-one.ps1's -RunsDir doc comment). This entry is just a safety net if -RunsDir
+# is ever pointed back in here. results.jsonl (the actual evidence) is NOT excluded —
+# track that.
+runs/

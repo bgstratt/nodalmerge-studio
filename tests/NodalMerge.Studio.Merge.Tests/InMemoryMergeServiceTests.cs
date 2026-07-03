@@ -96,6 +96,10 @@ public class InMemoryMergeServiceTests
     {
         public List<(string WorkUnitId, WorkUnitStatus Status, string? SessionId)> Calls { get; } = [];
 
+        // Phase 2 item 2 follow-up — settable so ApplyAsync's owningWorkUnit lookup (used to
+        // resolve a per-work-unit RepositoryId for multi-repo write-back) can be exercised.
+        public WorkUnit? WorkUnitToReturn { get; set; }
+
         public Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken ct = default) => throw new NotSupportedException();
 
         public Task<WorkUnit> UpdateStatusAsync(string workUnitId, WorkUnitStatus status, string? sessionId = null, CancellationToken ct = default)
@@ -116,7 +120,7 @@ public class InMemoryMergeServiceTests
             throw new NotSupportedException();
         public Task<WorkUnit> AmendGoalForSteeredRetryAsync(string workUnitId, string amendedGoal, string steeringContext, string deadLetterEntryId, CancellationToken ct = default) =>
             throw new NotSupportedException();
-        public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<WorkUnit?>(null);
+        public Task<WorkUnit?> GetAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult(WorkUnitToReturn);
         public Task<IReadOnlyList<WorkUnit>> ListAsync(string? branchId = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<WorkUnit>>([]);
@@ -127,6 +131,50 @@ public class InMemoryMergeServiceTests
     private sealed class SingleServiceProvider(object service) : IServiceProvider
     {
         public object? GetService(Type serviceType) => serviceType.IsInstanceOfType(service) ? service : null;
+    }
+
+    // Phase 2 item 2 follow-up — records SyncBranchFromRepositoryAsync calls so tests can assert
+    // whether the post-merge-write-back auto-resync fired, and can simulate a failure to prove it
+    // never affects the merge itself.
+    private sealed class RecordingRepositorySyncService : NodalMerge.Studio.Core.Services.IRepositorySyncService
+    {
+        public List<(string BranchId, string RepositoryPath, SyncTrigger Trigger)> Calls { get; } = [];
+        public bool ThrowOnSync { get; set; }
+
+        public Task<PendingExternalSync?> SyncBranchFromRepositoryAsync(
+            string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct = default)
+        {
+            Calls.Add((branchId, repositoryPath, trigger));
+            if (ThrowOnSync) throw new InvalidOperationException("simulated resync failure");
+            return Task.FromResult<PendingExternalSync?>(null);
+        }
+
+        public Task<RepositorySyncState?> GetStateAsync(string branchId, CancellationToken ct = default) =>
+            Task.FromResult<RepositorySyncState?>(null);
+    }
+
+    // Phase 2 item 2 follow-up — resolves a single work unit's registered repository to a
+    // caller-supplied path, so tests can prove the multi-repo write-back guard skips the
+    // auto-resync when the resolved writeBackPath isn't the global default.
+    private sealed class FakeRepositoryRegistryService(string repositoryId, string path)
+        : NodalMerge.Studio.Storage.IRepositoryRegistryService
+    {
+        public Task<RepositoryV1> RegisterAsync(string p, string? label, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task<RepositoryV1> CreateAsync(string p, string? label, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task<RepositoryV1> CloneAsync(string url, string targetPath, string? label, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task<string?> ReadFileAsync(string repoId, string relativePath, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task<IReadOnlyList<string>> ListFilesAsync(string repoId, string? subPath = null, string? pattern = null, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task<IReadOnlyList<RepositoryV1>> ListAsync(CancellationToken ct = default) =>
+            throw new NotSupportedException();
+        public Task<RepositoryV1?> GetAsync(string repoId, CancellationToken ct = default) =>
+            Task.FromResult(repoId == repositoryId ? new RepositoryV1(repositoryId, path, null, DateTimeOffset.UtcNow) : null);
+        public Task<IReadOnlyList<string>> FilterUnregisteredAsync(IReadOnlyList<string> paths, CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private static (InMemoryMergeService Svc, RecordingEventStream Events, RecordingWorkUnitService WorkUnits, ArtifactLineageService Artifacts) BuildWithLifecycle()
@@ -473,6 +521,92 @@ public class InMemoryMergeServiceTests
     public async Task ApplyAsync_throws_for_unknown_proposal()
     {
         await Assert.ThrowsAsync<KeyNotFoundException>(() => Build().ApplyAsync("no-such"));
+    }
+
+    // ── ApplyAsync — post-merge write-back resync (Phase 2 item 2 follow-up) ──
+
+    [Fact]
+    public async Task ApplyAsync_triggers_PostMergeWriteBack_resync_when_writeBackPath_matches_seed_default()
+    {
+        var store = new InMemoryStudioNodeStore();
+        var sync = new RecordingRepositorySyncService();
+        var seedPath = Path.Combine(Path.GetTempPath(), "seed-repo");
+        var svc = new InMemoryMergeService(store, new NoopFileWorkspaceService(),
+            new WorkspaceOptions { SeedRepositoryPath = seedPath }, new NoopEventStream(),
+            new ArtifactLineageService(store), repositorySync: sync);
+
+        await svc.ProposeAsync(MakeProposal("MP-1"));
+        await svc.ValidateAsync("MP-1");
+        await svc.ReviewAsync("MP-1", MergeProposalStatus.Approved);
+        await svc.ApplyAsync("MP-1");
+
+        var call = Assert.Single(sync.Calls);
+        Assert.Equal("main", call.BranchId);
+        Assert.Equal(seedPath, call.RepositoryPath);
+        Assert.Equal(SyncTrigger.PostMergeWriteBack, call.Trigger);
+    }
+
+    [Fact]
+    public async Task ApplyAsync_does_not_trigger_resync_when_writeBackPath_is_blank()
+    {
+        var store = new InMemoryStudioNodeStore();
+        var sync = new RecordingRepositorySyncService();
+        var svc = new InMemoryMergeService(store, new NoopFileWorkspaceService(),
+            new WorkspaceOptions(), new NoopEventStream(), new ArtifactLineageService(store),
+            repositorySync: sync);
+
+        await svc.ProposeAsync(MakeProposal("MP-1"));
+        await svc.ValidateAsync("MP-1");
+        await svc.ReviewAsync("MP-1", MergeProposalStatus.Approved);
+        await svc.ApplyAsync("MP-1");
+
+        Assert.Empty(sync.Calls);
+    }
+
+    [Fact]
+    public async Task ApplyAsync_does_not_trigger_resync_for_a_non_default_repository_path()
+    {
+        var store = new InMemoryStudioNodeStore();
+        var sync = new RecordingRepositorySyncService();
+        var workUnits = new RecordingWorkUnitService();
+        var otherRepoPath = Path.Combine(Path.GetTempPath(), "other-repo");
+        workUnits.WorkUnitToReturn = new WorkUnit("wu-1", "goal", "branch-1", WorkUnitStatus.Executing,
+            DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "owner", null, null, null, null, [], [],
+            RepositoryId: "repo-other");
+        var repositories = new FakeRepositoryRegistryService("repo-other", otherRepoPath);
+        var seedPath = Path.Combine(Path.GetTempPath(), "seed-repo");
+        var artifacts = new ArtifactLineageService(store);
+        var svc = new InMemoryMergeService(store, new NoopFileWorkspaceService(),
+            new WorkspaceOptions { SeedRepositoryPath = seedPath }, new NoopEventStream(),
+            artifacts, new SingleServiceProvider(workUnits),
+            repositories: repositories, repositorySync: sync);
+
+        await svc.ProposeAsync(MakeProposal("MP-1") with { WorkUnitId = "wu-1" });
+        await SeedProposalArtifactAsync(artifacts, "MP-1", "wu-1");
+        await svc.ValidateAsync("MP-1");
+        await svc.ReviewAsync("MP-1", MergeProposalStatus.Approved);
+        await svc.ApplyAsync("MP-1");
+
+        Assert.Empty(sync.Calls);
+    }
+
+    [Fact]
+    public async Task ApplyAsync_succeeds_even_when_resync_throws()
+    {
+        var store = new InMemoryStudioNodeStore();
+        var sync = new RecordingRepositorySyncService { ThrowOnSync = true };
+        var seedPath = Path.Combine(Path.GetTempPath(), "seed-repo");
+        var svc = new InMemoryMergeService(store, new NoopFileWorkspaceService(),
+            new WorkspaceOptions { SeedRepositoryPath = seedPath }, new NoopEventStream(),
+            new ArtifactLineageService(store), repositorySync: sync);
+
+        await svc.ProposeAsync(MakeProposal("MP-1"));
+        await svc.ValidateAsync("MP-1");
+        await svc.ReviewAsync("MP-1", MergeProposalStatus.Approved);
+        var result = await svc.ApplyAsync("MP-1");
+
+        Assert.Equal(MergeProposalStatus.Merged, result.Status);
+        Assert.Single(sync.Calls); // it did try
     }
 
     // ── ListAsync ────────────────────────────────────────────────────────────

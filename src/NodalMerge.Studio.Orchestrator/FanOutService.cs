@@ -214,6 +214,12 @@ public sealed class FanOutService : IFanOutService
                     .Select(dep => sliceIdToWorkUnitId[dep])
                     .ToList();
 
+                // Bug fix — a fanned-out child previously always got CreateWorkUnitAsync's own
+                // default (ReviewPolicy.HumanRequired), regardless of what the parent goal's
+                // ReviewPolicy/BypassPromotionBranch were actually set to (e.g. via the Goal
+                // Workspace "Agent Approval" radio button) — reviewPolicy/bypassPromotionBranch
+                // were simply never passed here. A child slice should inherit its parent's chosen
+                // review policy/merge target, not silently revert to the human-required default.
                 var child = await _orchestrator.CreateWorkUnitAsync(
                     slice.Goal,
                     parent.Owner,
@@ -222,6 +228,8 @@ public sealed class FanOutService : IFanOutService
                     fileScope: slice.FileScope,
                     seedFromBranchId: parent.BranchId,
                     sliceId: slice.SliceId,
+                    reviewPolicy: parent.ReviewPolicy,
+                    bypassPromotionBranch: parent.BypassPromotionBranch,
                     cancellationToken: ct).ConfigureAwait(false);
 
                 sliceIdToWorkUnitId[slice.SliceId] = child.WorkUnitId;

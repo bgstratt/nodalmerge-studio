@@ -78,6 +78,14 @@ public static class AgentLoopPrompts
            - fileScope: list of file paths this slice may touch (search-verified per step 5)
            - dependsOn: list of sliceIds that must complete first (empty for independent slices)
            - steps: ordered implementation steps for the worker
+           A slice's worker will only ever see this slice's own goal/steps, not the original
+           work unit's full goal text — so if the original goal specifies a literal contract for
+           this slice (an exact method signature, return type, field/property name, file format,
+           error message, etc.), copy that contract into the slice's own goal or steps VERBATIM.
+           Paraphrasing away an exact technical requirement ("build an atomic claim mechanism"
+           instead of quoting the literal `bool TryClaimForFulfillment(string orderId)` signature
+           the original goal specified) is the single most common way a worker ends up building
+           something that doesn't match what was actually asked for.
         7. Record the plan using nm_v1_artifact_record_plan with your workUnitId and the plan JSON content.
            The plan JSON must follow this exact shape:
            { "slices": [ { "sliceId": "...", "goal": "...", "fileScope": [...], "dependsOn": [...], "steps": [...] } ] }

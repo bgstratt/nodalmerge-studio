@@ -19,8 +19,9 @@ internal sealed class DefaultAgentToolClient(
         IReadOnlyList<NmMessage> messages,
         IReadOnlyList<LlmToolDef> tools,
         string systemPrompt,
-        CancellationToken ct = default)
-        => llm.SendAsync(provider, model, baseUrl, apiKey, messages, tools, systemPrompt, ct);
+        CancellationToken ct = default,
+        Func<TransientRetryAttempt, Task>? onTransientRetry = null)
+        => llm.SendAsync(provider, model, baseUrl, apiKey, messages, tools, systemPrompt, ct, onTransientRetry);
 
     public Task<string> DispatchAsync(
         string toolName,

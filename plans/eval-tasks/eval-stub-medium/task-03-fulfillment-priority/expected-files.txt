@@ -1,0 +1,4 @@
+src/MiniLedger.Contracts/Fulfillment/FulfillmentTask.cs
+src/MiniLedger.Core/Abstractions/IFulfillmentService.cs
+src/MiniLedger.Core/Fulfillment/FulfillmentCoordinator.cs
+src/MiniLedger.Host/Workers/FulfillmentWorker.cs

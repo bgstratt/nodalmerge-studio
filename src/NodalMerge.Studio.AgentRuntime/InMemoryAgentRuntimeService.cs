@@ -186,6 +186,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         var awaitingFileLease = false;
         var awaitingClarification = false;
         string? failureReason = null;
+        var failureKind = FailureKind.Exception;
 
         try
         {
@@ -209,6 +210,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 _logger.LogWarning("[Agent {AgentId}] Scheduled worker will NOT run — missing credentials.", agentId);
                 failureReason = "Missing LLM credentials";
+                failureKind = FailureKind.MissingCredentials;
             }
             else
             {
@@ -239,7 +241,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         agentId, item.WorkUnitId, agentClient,
                         profile, item.SessionId, a => ReportActivity(agentId, a),
                         ruleFileContext, combinedContext.Length == 0 ? null : combinedContext,
-                        conversationLog: conversationLog);
+                        conversationLog: conversationLog, events: _events);
                     completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
                 else if (profile?.Stage == PipelineStage.Review)
@@ -248,7 +250,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var reviewerLoop = new ReviewerAgentLoop(
                         agentId, item.WorkUnitId, proposalId, agentClient,
                         profile, item.SessionId, a => ReportActivity(agentId, a),
-                        conversationLog: conversationLog);
+                        conversationLog: conversationLog, events: _events);
                     completion = await reviewerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
                 else
@@ -257,12 +259,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     // normal failure-retry or, per Phase 8c, a resume after a Host restart
                     // interrupted it. Either way the worker should check existing branch/task
                     // state before assuming a clean start.
-    // promptGuidanceContext below carries both universal KnowledgeGuideline constraints (the
-                    // same feed Orchestrator/Planner already get) and Execute-stage PromptImprovement
-                    // guidance — Worker writes the actual code, so it needs both, not just the latter.
+    // promptGuidanceContext below carries universal KnowledgeGuideline constraints (the same
+                    // feed Orchestrator/Planner already get), Execute-stage PromptImprovement guidance, and
+                    // the original top-level goal text (see BuildOriginalGoalContextAsync) — Worker writes
+                    // the actual code, so it needs all three, not just the slice's own paraphrased goal.
                     var workerConstraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, ct).ConfigureAwait(false);
-                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
+                    var workerOriginalGoal = await BuildOriginalGoalContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerOriginalGoal }.Where(s => s is not null));
                     // Snapshotted before the loop runs: if the task was already Completed coming
                     // in (e.g. re-queued after a rejection, before the underlying task got reset —
                     // see AutomatedReviewGateService), the agent can't legitimately transition it
@@ -278,7 +282,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         selfVerifyBuild: _options.RequireBuildBeforeProposal,
                         selfVerifyTest: _options.RequireTestBeforeProposal,
                         promptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
-                        conversationLog: conversationLog);
+                        conversationLog: conversationLog, events: _events, logger: _logger);
                     completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
 
                     if (completion == AgentLoopCompletion.Succeeded)
@@ -295,9 +299,26 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 else if (completion == AgentLoopCompletion.AwaitingClarification)
                     awaitingClarification = true;
                 else if (completion == AgentLoopCompletion.MaxIterationsExceeded)
-                    failureReason = "Max iterations reached";
+                {
+                    // Phase 1.4 (partial) — surface the decomposition suggestion wherever this
+                    // reason is displayed (dead-letter REST responses, retry UI, execution
+                    // timeline), rather than leaving a human to intuit it, as happened when this
+                    // exact reason showed up during the harness-comparison-eval and got manually
+                    // steered toward "fix the build" instead. Fully automatic re-planning
+                    // (spawning smaller sub-tasks without a human in the loop) is deferred — see
+                    // plans/orchestrator-reliability-and-observability.md Phase 1.4b — since
+                    // RetryWithContextAsync bypasses the normal MaxFailureAttempts cap and an
+                    // automatic retry-on-this-reason loop needs that verified safe first.
+                    failureReason = "Max iterations reached — this task may have been too large " +
+                        "for one execution pass. Consider decomposing it into 2+ smaller sub-tasks " +
+                        "before retrying, rather than retrying the same scope unchanged.";
+                    failureKind = FailureKind.MaxIterationsExceeded;
+                }
                 else if (completion == AgentLoopCompletion.Succeeded && !workerProgressVerified)
+                {
                     failureReason = "Agent ended its turn without completing the task or producing a merge proposal.";
+                    failureKind = FailureKind.ProgressNotVerified;
+                }
             }
 
             if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
@@ -325,7 +346,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var profile = item.ProfileId is not null
                     ? await _profileService.GetAsync(item.ProfileId, ct).ConfigureAwait(false)
                     : null;
-                await RecordDeadLetterAsync(item, agentId, profile, failureReason, ct).ConfigureAwait(false);
+                await RecordDeadLetterAsync(item, agentId, profile, failureReason, failureKind, ct).ConfigureAwait(false);
             }
 
             cts.Dispose();
@@ -394,6 +415,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string agentId,
         AgentProfile? profile,
         string reason,
+        FailureKind kind,
         CancellationToken ct)
     {
         var deadLetter = _serviceProvider.GetService<IDeadLetterService>();
@@ -412,6 +434,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             baseUrl: item.BaseUrl,
             apiKey: item.ApiKey,
             provider: item.Provider,
+            kind: kind,
             cancellationToken: ct).ConfigureAwait(false);
     }
 
@@ -595,7 +618,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, merge, workUnits,
                     findingsService,
                     profile, sessionId, workspaceOptions.StallDetectionCycles, a => ReportActivity(agentId, a),
-                    conversationLog: conversationLog, agentControl: this);
+                    conversationLog: conversationLog, agentControl: this, events: _events, logger: _logger);
                 var completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 if (completion is AgentLoopCompletion.MaxIterationsExceeded or AgentLoopCompletion.Stalled)
                 {
@@ -605,6 +628,9 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         var reason = completion == AgentLoopCompletion.Stalled
                             ? $"Stall: no artifact change after {workspaceOptions.StallDetectionCycles} cycles."
                             : "Max iterations reached";
+                        var kind = completion == AgentLoopCompletion.Stalled
+                            ? FailureKind.Stalled
+                            : FailureKind.MaxIterationsExceeded;
                         await deadLetter.RecordFailureAsync(
                             workUnitId,
                             agentId,
@@ -616,6 +642,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                             baseUrl: baseUrl,
                             apiKey: apiKey,
                             provider: provider,
+                            kind: kind,
                             cancellationToken: cts.Token).ConfigureAwait(false);
                     }
                 }
@@ -680,14 +707,15 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var ruleFileContext = await BuildRuleFileContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerConstraintsContext = await BuildConstraintsContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, cts.Token).ConfigureAwait(false);
-                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
+                var workerOriginalGoal = await BuildOriginalGoalContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
+                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerOriginalGoal }.Where(s => s is not null));
                 var loop = new WorkerAgentLoop(
                     agentId, workUnitId, taskId, agentClient, profile,
                     onActivity: a => ReportActivity(agentId, a), ruleFileContext: ruleFileContext,
                     selfVerifyBuild: _options.RequireBuildBeforeProposal,
                     selfVerifyTest: _options.RequireTestBeforeProposal,
                     promptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
-                    conversationLog: conversationLog);
+                    conversationLog: conversationLog, logger: _logger);
                 await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 _logger.LogInformation("[Agent {AgentId}] Worker loop completed.", agentId);
             }
@@ -854,6 +882,45 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             return null;
         }
     }
+
+    // Found via harness-comparison-eval: a fanned-out worker only ever sees its own slice's Goal
+    // (the planner's own paraphrase of one piece of the original request) — if the planner drops a
+    // literal detail while writing that paraphrase (an exact method signature, return type, field
+    // name), nothing else in the pipeline ever surfaces it again, and the worker has no way to know
+    // it built something that doesn't match what was actually asked for. Folding the true top-level
+    // goal's original text back in as reference material (not a replacement for the slice's own
+    // goal — that still carries the fileScope/steps decomposition) gives the worker something to
+    // cross-check a lossy paraphrase against. Walks to the true root rather than just the immediate
+    // parent, since fan-out can in principle nest more than one level deep.
+    private async Task<string?> BuildOriginalGoalContextAsync(string workUnitId, CancellationToken ct)
+    {
+        try
+        {
+            var workUnits = _serviceProvider.GetRequiredService<IWorkUnitService>();
+            var current = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (current?.ParentWorkUnitId is null) return null; // this work unit IS the root
+
+            var root = current;
+            while (root.ParentWorkUnitId is { } parentId)
+            {
+                var parent = await workUnits.GetAsync(parentId, ct).ConfigureAwait(false);
+                if (parent is null) break;
+                root = parent;
+            }
+
+            if (string.Equals(root.Goal, current.Goal, StringComparison.Ordinal))
+                return null; // slice goal is already the original text verbatim — nothing to add
+
+            return "[Original request, for reference — the slice goal above may only summarize " +
+                "part of it. If they conflict on a literal detail (an exact method signature, " +
+                "return type, field name, file format, etc.), this original request is " +
+                "authoritative]\n" + root.Goal;
+        }
+        catch
+        {
+            return null;
+        }
+    }
 }
 
 public static class ServiceCollectionExtensions
@@ -874,6 +941,12 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IInlineReviewerService, InlineReviewerService>();
         // Slice 21/22 — reactive domain agents, disabled by default (WorkspaceOptions.EnabledDomainAgents).
         services.AddSingleton<IDomainAgentTriggerService, DomainAgentTriggerService>();
+        // Phase 1.4 — re-plan-the-slice mechanism for both failure-recovery tracks.
+        services.AddSingleton<IReplanService, ReplanService>();
+        // Phase 2 item 1 — per-goal cost/time guardrail (alert-only, computed on demand).
+        services.AddSingleton<IGoalGuardrailService, GoalGuardrailService>();
+        // Phase 1.4 Continue-track — resume a dead-lettered work unit with reconstructed prior context.
+        services.AddSingleton<IContinueService, ContinueService>();
         // Phase 10 — LLM-backed merge provider (sits inside AgentRuntime where LlmClient lives).
         services.AddSingleton<ILlmMergeProvider, LlmMergeProvider>();
         return services;
