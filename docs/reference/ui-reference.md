@@ -95,7 +95,12 @@ Workspace's Decision Tree.
   agents and can be paused, resumed, or stopped from here. The peer process itself is controlled
   externally. See [docs/guides/headless-peer.md](../guides/headless-peer.md).
 - Pending Decisions: **Review Decision →**
-- Blocked Explorations (dead-letter queue): **Retry** (when attempts remain)
+- Blocked Explorations (dead-letter queue): **Retry** (when attempts remain) · **Continue**
+  (`MaxIterationsExceeded` only, also gated on attempts remaining — resumes the same work unit
+  with its own prior conversation reconstructed and a fresh iteration budget, instead of starting
+  over) · **Re-plan the slice** / **Re-plan from scratch** (always available regardless of attempt
+  count — decomposes the failed goal into fresh, independently-budgeted sub-slices and marks the
+  original `Cancelled`, rather than resuming it)
 
 ---
 

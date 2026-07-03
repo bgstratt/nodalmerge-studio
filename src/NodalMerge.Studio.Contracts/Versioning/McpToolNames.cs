@@ -142,6 +142,22 @@ public static class McpToolNames
     public const string ParticipantEvents = "nm_v1_participant_events";
     public const string EventTypes        = "nm_v1_event_types";
 
+    // Phase 2 item 2 follow-up — user-initiated dead-letter recovery, mirroring the REST
+    // endpoints (StudioRestEndpoints.MapDeadLetterEndpoints) so an external MCP client (e.g. a
+    // human's own coding assistant) has the same recovery actions the VS Code dashboard's
+    // dead-letter card already exposes. Deliberately NOT wired into McpToolDispatcher (the
+    // internal runtime toolset spawned agents use on themselves mid-loop) — these are
+    // human-initiated actions on an already-failed, already-exited work unit, the same category
+    // as the REST endpoints, not something a running agent would ever call on itself.
+    public const string DeadLetterList             = "nm_v1_dead_letter_list";
+    public const string DeadLetterGet               = "nm_v1_dead_letter_get";
+    public const string DeadLetterByWorkUnit       = "nm_v1_dead_letter_by_work_unit";
+    public const string DeadLetterHistory           = "nm_v1_dead_letter_history";
+    public const string DeadLetterRetry             = "nm_v1_dead_letter_retry";
+    public const string DeadLetterRetryWithContext = "nm_v1_dead_letter_retry_with_context";
+    public const string DeadLetterReplan            = "nm_v1_dead_letter_replan";
+    public const string DeadLetterContinue          = "nm_v1_dead_letter_continue";
+
     public static IReadOnlyList<string> All { get; } =
     [
         ProjectionGet,
@@ -246,6 +262,14 @@ public static class McpToolNames
         ParticipantStop,
         ParticipantEvents,
         EventTypes,
+        DeadLetterList,
+        DeadLetterGet,
+        DeadLetterByWorkUnit,
+        DeadLetterHistory,
+        DeadLetterRetry,
+        DeadLetterRetryWithContext,
+        DeadLetterReplan,
+        DeadLetterContinue,
         // Phase 12 — CAS-backed repository tools (additive, complement filesystem-backed tools)
         RepositoryBlobList,
         RepositoryBlobRead,

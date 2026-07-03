@@ -542,7 +542,7 @@ VS Code extension or direct HTTP clients). Autonomous agents cannot trigger them
 ## External Caller Surface (`nms_v1_*`)
 
 A separate, higher-level MCP tool surface exists under the `nms_v1_*` namespace
-(NodalMerge **Studio** v1, note the `s`). These 13 tools are designed for external MCP clients
+(NodalMerge **Studio** v1, note the `s`). These 14 tools are designed for external MCP clients
 — Claude Code, Cursor, scripts, CI — to orchestrate the workspace at a goal-centric level
 without needing to know work units, branches, or the internal DAG.
 
@@ -551,7 +551,7 @@ well. C# constants live in `McpServerToolNames` (separate from `McpToolNames`).
 
 | Namespace | Tools | Purpose |
 |---|---|---|
-| `nms_v1_goal_*` | `goal_run`, `goal_list`, `goal_status`, `goal_cancel`, `goal_pause`, `goal_resume` | Full goal lifecycle |
+| `nms_v1_goal_*` | `goal_run`, `goal_list`, `goal_status`, `goal_cancel`, `goal_pause`, `goal_resume`, `goal_recover` | Full goal lifecycle, including failure recovery (`goal_status` surfaces an unresolved dead-letter and which recovery actions apply; `goal_recover` resolves the goal's own latest entry internally) |
 | `nms_v1_clarification_*` | `clarification_respond` | Answer pending agent questions |
 | `nms_v1_results_*` | `results_get`, `results_apply` | Inspect and apply merge proposals |
 | `nms_v1_repo_*` | `repo_register`, `repo_list` | Register repositories for agents to work in |

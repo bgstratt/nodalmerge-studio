@@ -15,6 +15,7 @@ public static class McpServerToolNames
     public const string GoalCancel            = "nms_v1_goal_cancel";
     public const string GoalPause             = "nms_v1_goal_pause";
     public const string GoalResume            = "nms_v1_goal_resume";
+    public const string GoalRecover            = "nms_v1_goal_recover";
 
     // ── Human interaction ─────────────────────────────────────────────────────
     public const string ClarificationRespond  = "nms_v1_clarification_respond";
