@@ -48,11 +48,12 @@ public sealed class InlineReviewerService(
         var proposalForReview = await merge.GetAsync(proposalId, ct).ConfigureAwait(false);
 
         var agentClient = new DefaultAgentToolClient(creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey, llm, dispatcher);
+        var events = serviceProvider.GetService<IExecutionEventStream>();
         var loop = new ReviewerAgentLoop(
             agentId, workUnitId, proposalId, agentClient,
             filesTouched: proposalForReview?.FilesTouched,
             noFileChangesJustification: proposalForReview?.NoFileChangesJustification,
-            conversationLog: conversationLog);
+            conversationLog: conversationLog, events: events);
 
         await loop.RunAsync(ct).ConfigureAwait(false);
 

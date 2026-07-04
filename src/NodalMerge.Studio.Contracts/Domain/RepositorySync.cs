@@ -2,7 +2,7 @@ namespace NodalMerge.Studio.Contracts.Domain;
 
 public enum SyncReason { InitialBootstrap, RepositoryDrift, RepositorySwitch }
 
-public enum SyncTrigger { GoalCreation, ManualRefresh, StartupRecovery }
+public enum SyncTrigger { GoalCreation, ManualRefresh, StartupRecovery, PostMergeWriteBack }
 
 // Persisted, one per synced branch (today only ever "main"). Generation/LatestExternalChangesetId/
 // RepositoryIdentityEstablishedAt are scoped to RepositoryPath's *current* identity — a

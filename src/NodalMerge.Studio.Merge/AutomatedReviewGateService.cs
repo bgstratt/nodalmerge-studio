@@ -103,6 +103,7 @@ public sealed class AutomatedReviewGateService(
                 baseUrl: failedCreds?.BaseUrl,
                 apiKey: failedCreds?.ApiKey,
                 provider: failedCreds?.Provider,
+                kind: FailureKind.ReviewRejected,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
 
             return new AutomatedRejectionResult(AutomatedRejectionOutcome.EscalatedToDeadLetter);
@@ -198,6 +199,7 @@ public sealed class AutomatedReviewGateService(
                 baseUrl: creds?.BaseUrl,
                 apiKey: creds?.ApiKey,
                 provider: creds?.Provider,
+                kind: FailureKind.ReviewRejected,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
 
             return new AutomatedRejectionResult(AutomatedRejectionOutcome.EscalatedToDeadLetter);

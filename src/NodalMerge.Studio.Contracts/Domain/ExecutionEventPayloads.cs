@@ -226,3 +226,15 @@ public sealed record ArtifactConsideredInDecisionPayload(
     string ArtifactId,
     string ProposalId,
     MergeProposalStatus Decision);
+
+// Orchestrator reliability — one of these per transient-provider-error retry attempt inside
+// LlmClient.SendAsync (see AgentId's caller — OrchestratorAgentLoop/WorkerAgentLoop — for where
+// this gets appended). AgentId is who was mid-call when the provider rejected the request.
+public sealed record ProviderRetryAttemptedPayload(
+    string AgentId,
+    string? Provider,
+    int? StatusCode,
+    int AttemptNumber,
+    int MaxAttempts,
+    int DelayMs,
+    string Reason);

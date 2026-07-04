@@ -122,6 +122,20 @@ public sealed class WorkspaceOptions
     // at orchestrator spawn time the same way AutoReviewProfileId is) takes priority over this
     // default when set.
     public List<string> EnabledDomainAgents { get; set; } = [];
+
+    // ── Phase 2 — per-goal cost/time guardrail ───────────────────────────────
+
+    // Soft cap only — alert, never auto-stop (see IGoalGuardrailService). Null (default) disables
+    // the check. Measured in tokens, not USD: exact (already recorded per
+    // ConversationLogEntry cycle) and immune to per-model pricing drift, unlike a dollar figure
+    // that would need to be kept current by hand. Summed across a goal's entire work-unit
+    // subtree (the goal plus every fanned-out descendant), the same shape of blowup the
+    // harness-comparison-eval's 1.59M-token session actually was.
+    public long? MaxGoalTokens { get; set; } = null;
+
+    // Soft cap only, same alert-not-stop semantics as MaxGoalTokens. Null (default) disables the
+    // check. Measured from the goal work unit's CreatedAt to now.
+    public int? MaxGoalDurationMinutes { get; set; } = null;
 }
 
 // Phase 2 — configurable snapshot policy for the repository op log.

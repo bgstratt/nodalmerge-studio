@@ -14,7 +14,10 @@ public sealed class ExternalGoalTools(
     IWorkUnitCommandService workUnitCommands,
     IExecutionSessionService sessions,
     ISchedulerCommandService scheduler,
-    IClarificationCommandService clarifications)
+    IClarificationCommandService clarifications,
+    IDeadLetterService deadLetter,
+    IReplanService replan,
+    IContinueService continueService)
 {
     [McpServerTool(Name = McpServerToolNames.GoalPause)]
     [Description("Pause a goal and all its active agents. The goal session is marked Paused and active agents are stopped gracefully. The goal can be resumed later via nms_v1_goal_resume.")]
@@ -163,7 +166,7 @@ public sealed class ExternalGoalTools(
     }
 
     [McpServerTool(Name = McpServerToolNames.GoalStatus)]
-    [Description("Get detailed status for a specific goal, including any pending clarifications that need a human response and the current session state.")]
+    [Description("Get detailed status for a specific goal, including any pending clarifications that need a human response, an unresolved failure (if the goal is dead-lettered), and the current session state.")]
     public async Task<string> StatusAsync(
         [Description("The goalId returned by nms_v1_goal_run or nms_v1_goal_list.")] string goalId,
         CancellationToken cancellationToken = default)
@@ -192,6 +195,27 @@ public sealed class ExternalGoalTools(
             var allSessions = await sessions.ListAsync(cancellationToken).ConfigureAwait(false);
             var session = allSessions.FirstOrDefault(s => s.RootWorkUnitId == goal.WorkUnitId);
 
+            // Surfaces an unresolved failure right where the recommended external flow already
+            // looks for state — without this, a caller following nms_v1_goal_run -> poll
+            // nms_v1_goal_status has no way to discover a goal is dead-lettered at all short of
+            // dropping to the detailed nm_v1_dead_letter_* tools or REST.
+            var deadLetterEntry = await deadLetter.GetLatestForWorkUnitAsync(goal.WorkUnitId, cancellationToken)
+                .ConfigureAwait(false);
+            var deadLetterInfo = deadLetterEntry is null ? null : new
+            {
+                entryId = deadLetterEntry.EntryId,
+                kind = deadLetterEntry.Kind.ToString(),
+                reason = deadLetterEntry.Reason,
+                attemptCount = deadLetterEntry.AttemptCount,
+                maxAttemptsReached = deadLetterEntry.MaxAttemptsReached,
+                occurredAt = deadLetterEntry.OccurredAt,
+                recoverableActions = deadLetterEntry.MaxAttemptsReached
+                    ? new[] { "replan" }
+                    : deadLetterEntry.Kind == FailureKind.MaxIterationsExceeded
+                        ? new[] { "retry", "retry_with_context", "continue", "replan" }
+                        : new[] { "retry", "retry_with_context", "replan" }
+            };
+
             return McpJson.Ok(new
             {
                 goalId = goal.GoalId,
@@ -203,12 +227,74 @@ public sealed class ExternalGoalTools(
                 sessionId = goal.SessionId ?? session?.SessionId,
                 sessionStatus = session?.Status.ToString(),
                 pendingClarifications = pending,
+                deadLetter = deadLetterInfo,
                 updatedAt = goal.UpdatedAt
             });
         }
         catch (Exception ex)
         {
             return McpJson.Error(McpServerToolNames.GoalStatus, ex.Message);
+        }
+    }
+
+    [McpServerTool(Name = McpServerToolNames.GoalRecover)]
+    [Description("Recover a dead-lettered goal. Resolves the goal's own latest dead-letter entry internally (no entryId needed — use nms_v1_goal_status to see whether a goal has a recoverable failure and which actions apply). action must be one of: retry (resume with captured credentials), retry_with_context (resume with a human correction folded into the goal, bypassing the normal attempt cap), continue (MaxIterationsExceeded only — resume the SAME work unit with its own prior conversation reconstructed and a fresh iteration budget), or replan (decompose the failed goal into fresh sub-slices; the only action still available once max attempts is reached).")]
+    public async Task<string> RecoverAsync(
+        [Description("The goalId to recover.")] string goalId,
+        [Description("One of: retry, retry_with_context, continue, replan.")] string action,
+        [Description("Required when action=retry_with_context — a human correction folded into the goal, addressing a different root cause than what produced the prior failures.")] string? steeringContext = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var goal = await goalNodes.GetAsync(goalId, cancellationToken).ConfigureAwait(false);
+            if (goal is null)
+                return McpJson.Error(McpServerToolNames.GoalRecover, $"Goal '{goalId}' not found.");
+
+            var entry = await deadLetter.GetLatestForWorkUnitAsync(goal.WorkUnitId, cancellationToken).ConfigureAwait(false);
+            if (entry is null)
+                return McpJson.Error(McpServerToolNames.GoalRecover, $"Goal '{goalId}' has no dead-letter entry to recover from.");
+
+            switch (action)
+            {
+                case "retry":
+                {
+                    var result = await deadLetter.RetryAsync(entry.EntryId, cancellationToken).ConfigureAwait(false);
+                    return result.Outcome == DeadLetterRetryOutcome.Retried
+                        ? McpJson.Ok(new { goalId, action, outcome = result.Outcome.ToString() })
+                        : McpJson.Error(McpServerToolNames.GoalRecover, result.Message ?? $"Retry failed: {result.Outcome}.");
+                }
+                case "retry_with_context":
+                {
+                    if (string.IsNullOrWhiteSpace(steeringContext))
+                        return McpJson.Error(McpServerToolNames.GoalRecover, "steeringContext is required for action=retry_with_context.");
+                    var result = await deadLetter.RetryWithContextAsync(entry.EntryId, steeringContext, cancellationToken: cancellationToken)
+                        .ConfigureAwait(false);
+                    return result.Outcome == DeadLetterRetryOutcome.Retried
+                        ? McpJson.Ok(new { goalId, action, outcome = result.Outcome.ToString() })
+                        : McpJson.Error(McpServerToolNames.GoalRecover, result.Message ?? $"Retry failed: {result.Outcome}.");
+                }
+                case "continue":
+                {
+                    var result = await continueService.ContinueWithPriorContextAsync(entry.EntryId, cancellationToken).ConfigureAwait(false);
+                    return result.Outcome == ContinueOutcome.Continued
+                        ? McpJson.Ok(new { goalId, action, outcome = result.Outcome.ToString() })
+                        : McpJson.Error(McpServerToolNames.GoalRecover, result.Message ?? $"Continue failed: {result.Outcome}.");
+                }
+                case "replan":
+                {
+                    var result = await replan.ReplanFailedSliceAsync(entry.EntryId, cancellationToken).ConfigureAwait(false);
+                    return result.Outcome == ReplanOutcome.Replanned
+                        ? McpJson.Ok(new { goalId, action, outcome = result.Outcome.ToString(), newWorkUnitIds = result.NewWorkUnitIds })
+                        : McpJson.Error(McpServerToolNames.GoalRecover, result.Message ?? $"Re-plan failed: {result.Outcome}.");
+                }
+                default:
+                    return McpJson.Error(McpServerToolNames.GoalRecover, $"Unknown action '{action}' — must be one of: retry, retry_with_context, continue, replan.");
+            }
+        }
+        catch (Exception ex)
+        {
+            return McpJson.Error(McpServerToolNames.GoalRecover, ex.Message);
         }
     }
 

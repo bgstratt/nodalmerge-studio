@@ -22,6 +22,26 @@ internal sealed class MalformedLlmResponseException(string rawContent, string re
     public string Reason { get; } = reason;
 }
 
+// Thrown on any non-success HTTP status from a provider call. Distinct from
+// MalformedLlmResponseException (that's a 2xx response whose body doesn't parse; this is the
+// request itself being rejected). Carries RetryAfter when the provider sent one, so a transient
+// retry can honor it instead of guessing a backoff delay.
+internal sealed class LlmHttpException(string message, System.Net.HttpStatusCode? statusCode, TimeSpan? retryAfter)
+    : HttpRequestException(message, null, statusCode)
+{
+    public TimeSpan? RetryAfter { get; } = retryAfter;
+}
+
+// Reported to callers (via SendAsync's onTransientRetry callback) once per transient-error retry
+// attempt, so a caller with domain context (workUnitId/agentId/sessionId) can record it somewhere
+// more durable than a log line — see ExecutionEventKind.ProviderRetryAttempted.
+internal sealed record TransientRetryAttempt(
+    System.Net.HttpStatusCode? StatusCode,
+    int AttemptNumber,
+    int MaxAttempts,
+    TimeSpan Delay,
+    string Reason);
+
 internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = null)
 {
     // Appended to every outgoing system prompt — DeepSeek (OpenAI-compatible path) is the main
@@ -33,6 +53,29 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
         "fences, commentary, or stray/non-JSON characters mixed in.";
 
     private const int MaxRetries = 2;
+
+    // Transient provider errors (overload/rate-limit/gateway) benefit from more attempts with
+    // real spacing between them than a malformed-response retry, which is nearly free — that one
+    // just re-asks on the same connection with no reason to expect the *next* attempt to differ
+    // unless the model corrects itself.
+    private const int MaxTransientRetries = 3;
+
+    private static readonly System.Net.HttpStatusCode[] TransientStatusCodes =
+    [
+        System.Net.HttpStatusCode.TooManyRequests,     // 429
+        System.Net.HttpStatusCode.InternalServerError, // 500
+        System.Net.HttpStatusCode.BadGateway,          // 502
+        System.Net.HttpStatusCode.ServiceUnavailable,  // 503
+        (System.Net.HttpStatusCode)529,                // Anthropic "Overloaded" — no BCL member
+    ];
+
+    private static bool IsTransient(System.Net.HttpStatusCode? statusCode) =>
+        statusCode is { } code && TransientStatusCodes.Contains(code);
+
+    private static TimeSpan ComputeBackoffDelay(int attempt) =>
+        // 1s, 2s, 4s... plus up to 250ms jitter so concurrent callers hitting the same overloaded
+        // provider don't all retry in lockstep.
+        TimeSpan.FromMilliseconds((1000 << attempt) + Random.Shared.Next(250));
 
     private static readonly JsonSerializerOptions SerOpts = new()
     {
@@ -52,9 +95,11 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
         IReadOnlyList<NmMessage> messages,
         IReadOnlyList<LlmToolDef> tools,
         string systemPrompt,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Func<TransientRetryAttempt, Task>? onTransientRetry = null)
     {
         var attemptMessages = messages;
+        var transientAttempt = 0;
         for (var attempt = 0; ; attempt++)
         {
             try
@@ -69,6 +114,19 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
                     "LLM response malformed (attempt {Attempt}/{Max}): {Reason}",
                     attempt + 1, MaxRetries + 1, ex.Reason);
                 attemptMessages = [.. messages, BuildReaskMessage(ex.Reason, ex.RawContent)];
+            }
+            catch (LlmHttpException ex) when (transientAttempt < MaxTransientRetries && IsTransient(ex.StatusCode))
+            {
+                transientAttempt++;
+                var delay = ex.RetryAfter ?? ComputeBackoffDelay(transientAttempt - 1);
+                logger?.LogWarning(
+                    "Transient provider error (attempt {Attempt}/{Max}): {Message}. Retrying in {DelayMs}ms.",
+                    transientAttempt, MaxTransientRetries, ex.Message, delay.TotalMilliseconds);
+                var retryInfo = new TransientRetryAttempt(
+                    ex.StatusCode, transientAttempt, MaxTransientRetries, delay, ex.Message);
+                if (onTransientRetry is not null)
+                    await onTransientRetry(retryInfo).ConfigureAwait(false);
+                await Task.Delay(delay, ct).ConfigureAwait(false);
             }
         }
     }
@@ -97,13 +155,25 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
         {
             ["model"]     = model,
             ["max_tokens"] = 8192,
-            ["system"]    = systemPrompt + OutputFormatGuardrail,
-            ["tools"]     = tools.Select(t => (object)new
+            // Both system and tools are identical on every cycle of a work unit's loop (the
+            // growing part is `messages`, not these) — marking a cache_control breakpoint on each
+            // means every cycle after the first is a cheap cache read for this portion instead of
+            // full-price input tokens. This was the "fast follow" flagged after the eval run
+            // showed real cost concentrated in the same system+tools payload being resent
+            // unchanged, cycle after cycle. Message-history caching (letting the ever-growing
+            // conversation itself benefit, which is the bigger piece of that cost) is deferred —
+            // it needs the last message forced out of the string-shorthand form into block form,
+            // more invasive than this, and worth its own pass with live verification.
+            ["system"]    = new object[]
             {
-                name         = t.Name,
-                description  = t.Description,
-                input_schema = t.InputSchema
-            }).ToList(),
+                new Dictionary<string, object>
+                {
+                    ["type"] = "text",
+                    ["text"] = systemPrompt + OutputFormatGuardrail,
+                    ["cache_control"] = new { type = "ephemeral" }
+                }
+            },
+            ["tools"]     = BuildCacheableAnthropicTools(tools),
             ["messages"]  = messages.Select(SerializeAnthropicMessage).ToList()
         };
 
@@ -118,8 +188,8 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
         if (!resp.IsSuccessStatusCode)
         {
             var errorBody = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            throw new HttpRequestException(
-                $"Anthropic {(int)resp.StatusCode}: {errorBody}", null, resp.StatusCode);
+            throw new LlmHttpException(
+                $"Anthropic {(int)resp.StatusCode}: {errorBody}", resp.StatusCode, resp.Headers.RetryAfter?.Delta);
         }
 
         var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
@@ -134,11 +204,38 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
             throw new MalformedLlmResponseException(json, $"Response was not valid JSON: {ex.Message}");
         }
 
+        if (raw.Usage is { CacheReadInputTokens: > 0 } or { CacheCreationInputTokens: > 0 })
+        {
+            logger?.LogInformation(
+                "Prompt cache: {CacheRead} tokens read, {CacheWrite} tokens written this call.",
+                raw.Usage.CacheReadInputTokens ?? 0, raw.Usage.CacheCreationInputTokens ?? 0);
+        }
+
         return new LlmResponse(
             raw.Content.Select(ParseAnthropicBlock).OfType<NmContent>().ToList(),
             raw.StopReason,
             raw.Usage?.InputTokens,
             raw.Usage?.OutputTokens);
+    }
+
+    // Anthropic caches everything up to and including a marked block, so putting the breakpoint
+    // on the LAST tool definition covers the whole (otherwise-identical-every-cycle) tools array.
+    private static List<object> BuildCacheableAnthropicTools(IReadOnlyList<LlmToolDef> tools)
+    {
+        var list = new List<object>(tools.Count);
+        for (var i = 0; i < tools.Count; i++)
+        {
+            var dict = new Dictionary<string, object>
+            {
+                ["name"] = tools[i].Name,
+                ["description"] = tools[i].Description,
+                ["input_schema"] = tools[i].InputSchema
+            };
+            if (i == tools.Count - 1)
+                dict["cache_control"] = new { type = "ephemeral" };
+            list.Add(dict);
+        }
+        return list;
     }
 
     // Single-text messages serialized as string shorthand — keeps ScriptedLlmHandler working
@@ -209,8 +306,8 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
         if (!resp.IsSuccessStatusCode)
         {
             var errorBody = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            throw new HttpRequestException(
-                $"OpenAI-compat {(int)resp.StatusCode}: {errorBody}", null, resp.StatusCode);
+            throw new LlmHttpException(
+                $"OpenAI-compat {(int)resp.StatusCode}: {errorBody}", resp.StatusCode, resp.Headers.RetryAfter?.Delta);
         }
 
         var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
@@ -262,6 +359,14 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
             _            => "end_turn"
         };
 
+        // Unlike Anthropic, OpenAI and DeepSeek both cache automatically — no request-side
+        // cache_control needed, but the two report a hit differently: OpenAI nests it under
+        // prompt_tokens_details.cached_tokens, DeepSeek is a flat prompt_cache_hit_tokens. Whoever
+        // this endpoint actually is, at most one of the two will ever be populated.
+        var cacheReadTokens = raw.Usage?.PromptCacheHitTokens ?? raw.Usage?.PromptTokensDetails?.CachedTokens ?? 0;
+        if (cacheReadTokens > 0)
+            logger?.LogInformation("Prompt cache: {CacheRead} tokens read this call (OpenAI-compatible endpoint).", cacheReadTokens);
+
         return new LlmResponse(
             contents, stopReason, raw.Usage?.PromptTokens, raw.Usage?.CompletionTokens,
             raw.Usage?.Estimated ?? false);
@@ -309,7 +414,13 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
 
     private sealed record AnthropicUsage(
         [property: JsonPropertyName("input_tokens")]  int? InputTokens,
-        [property: JsonPropertyName("output_tokens")] int? OutputTokens);
+        [property: JsonPropertyName("output_tokens")] int? OutputTokens,
+        // Present once cache_control breakpoints are actually taking effect — logged (not yet
+        // threaded further into ConversationLogEntry/UI) so caching can be verified against a
+        // real call rather than trusted blindly. CacheReadInputTokens > 0 confirms a cache hit;
+        // CacheCreationInputTokens > 0 confirms this call wrote the cache the next one should hit.
+        [property: JsonPropertyName("cache_read_input_tokens")]     int? CacheReadInputTokens = null,
+        [property: JsonPropertyName("cache_creation_input_tokens")] int? CacheCreationInputTokens = null);
 
     private sealed record AnthropicContentBlock(
         [property: JsonPropertyName("type")]  string Type,
@@ -329,7 +440,15 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
         [property: JsonPropertyName("completion_tokens")] int? CompletionTokens,
         // Set by LmApiProxy.ts when these counts come from VS Code's countTokens() rather than a
         // real provider-reported usage block (vscode-lm/Copilot never reports real usage).
-        [property: JsonPropertyName("estimated")]         bool? Estimated = null);
+        [property: JsonPropertyName("estimated")]         bool? Estimated = null,
+        // DeepSeek's automatic disk-based caching — flat fields, no request-side markers needed.
+        [property: JsonPropertyName("prompt_cache_hit_tokens")]  int? PromptCacheHitTokens = null,
+        [property: JsonPropertyName("prompt_cache_miss_tokens")] int? PromptCacheMissTokens = null,
+        // OpenAI's automatic caching (gpt-4o/gpt-4.1+, prompts >= 1024 tokens) — nested, not flat.
+        [property: JsonPropertyName("prompt_tokens_details")]    OpenAiPromptTokensDetails? PromptTokensDetails = null);
+
+    private sealed record OpenAiPromptTokensDetails(
+        [property: JsonPropertyName("cached_tokens")] int? CachedTokens);
 
     private sealed record OpenAiChoice(
         [property: JsonPropertyName("finish_reason")] string? FinishReason,

@@ -62,7 +62,7 @@ public class DeadLetterIntegrationTests
             }
 
             Assert.NotNull(entry);
-            Assert.Equal("Max iterations reached", entry.Reason);
+            Assert.StartsWith("Max iterations reached", entry.Reason);
             Assert.Equal(1, entry.AttemptCount);
 
             var unit = await workUnits.GetAsync(wu.WorkUnitId);

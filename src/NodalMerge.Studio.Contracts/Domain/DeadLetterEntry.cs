@@ -19,4 +19,7 @@ public sealed record DeadLetterEntry(
     string? Model = null,
     string? BaseUrl = null,
     string? ApiKey = null,
-    string? Provider = null);
+    string? Provider = null,
+    // Structured failure classification — see FailureKind for the two-track recovery model this
+    // enables. Defaults to Exception for any recording path not yet updated to pass a real value.
+    FailureKind Kind = FailureKind.Exception);

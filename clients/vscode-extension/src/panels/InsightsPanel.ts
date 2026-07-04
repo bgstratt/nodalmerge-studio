@@ -313,7 +313,8 @@ export class InsightsPanel {
     try {
       const cfg = await this.configService.resolveSpawnLlmConfig(profileId, this.secrets, this.lmProxyBaseUrl);
       if (!cfg) {
-        throw new Error('Selected profile is missing LLM credentials — set it up in Model & Agent Studio.');
+        const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl);
+        throw new Error(`Selected profile isn't ready — ${reason}.`);
       }
       await this.post('/studio/insights/llm-scan', cfg);
       await this.sendFindings();

@@ -75,4 +75,8 @@ public enum ExecutionEventKind
     // Slice 23 — domain-agent constraint feedback loop
     ArtifactSurfaced,
     ArtifactConsideredInDecision,
+
+    // Orchestrator reliability — records a transient-provider-error retry as it happens, not just
+    // the terminal dead-letter reason if all retries are exhausted.
+    ProviderRetryAttempted,
 }

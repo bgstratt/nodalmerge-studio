@@ -385,7 +385,7 @@ seeding strategies, scoped materialization (Phase 11), and the full `Workspace` 
 
 ## MCP Integration
 
-NodalMerge Studio exposes a frozen MCP v1 tool surface with **66 tools** across 19 namespaces. All tools use the `nm_v1_*` namespace (canonical constants in `McpToolNames`). 42 of the 66 tools are dispatched in-process to autonomous agents; the rest are available to external MCP clients and the VS Code extension only.
+NodalMerge Studio exposes an MCP v1 tool surface with **117 `nm_v1_*` tools** (canonical constants in `McpToolNames`), **72 of them** dispatched in-process to autonomous agents; the rest are available to external MCP clients and the VS Code extension only. A separate, smaller **`nms_v1_*` surface (14 tools, `McpServerToolNames`)** is the recommended entry point for external MCP clients (Claude Code, Cursor, scripts) — goal-centric, without requiring knowledge of work units or branches. See [docs/reference/api-reference.md](docs/reference/api-reference.md) for the full, verified catalog and coverage breakdown.
 
 Core namespaces: `nm_v1_projection_*`, `nm_v1_workunit_*`, `nm_v1_task_*`, `nm_v1_branch_*`, `nm_v1_merge_*`, `nm_v1_workspace_*` (file I/O, build/test/run, semantic navigation, profile), `nm_v1_scheduler_*`, `nm_v1_artifact_*`. Phase 6.7+ adds `nm_v1_goal_*`, `nm_v1_decision_*`, `nm_v1_evidence_*`, `nm_v1_trajectory_*`, `nm_v1_hypothesis_*`, `nm_v1_reasoning_*`, `nm_v1_model_*` (none dispatched to agents yet). Phase 7 capabilities (Experiments, Steering, Counterfactuals, Review Policy, Promotion Branches) are REST-only.
 

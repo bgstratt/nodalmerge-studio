@@ -16,6 +16,7 @@ public sealed class WorkspaceCacheManager(
     IRepositorySnapshotService snapshotService,
     IMaterializationEngine materializer,
     IStudioNodeStore nodeStore,
+    IRepositoryRegistryService repositories,
     WorkspaceOptions? options = null) : IWorkspaceCacheManager, IHostedService
 {
     private static readonly HashSet<WorkUnitStatus> TerminalEvictableStatuses =
@@ -41,7 +42,7 @@ public sealed class WorkspaceCacheManager(
         var workUnit = await GetWorkUnitAsync(workUnitId, ct).ConfigureAwait(false);
         if (workUnit is null) return false;
 
-        var repositoryId = GetRepositoryId();
+        var repositoryId = await GetRepositoryIdAsync(workUnit, ct).ConfigureAwait(false);
         var snapshot     = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
         if (snapshot?.TreeEntries is null) return false;
 
@@ -140,7 +141,7 @@ public sealed class WorkspaceCacheManager(
     // last update — i.e., the between-run sync ran after its changes landed in the seed repo.
     private async Task<bool> PassesSafeEvictionInvariantAsync(WorkUnit wu, CancellationToken ct)
     {
-        var repositoryId = GetRepositoryId();
+        var repositoryId = await GetRepositoryIdAsync(wu, ct).ConfigureAwait(false);
         var snapshot = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
         if (snapshot?.TreeEntries is null) return false;
         return snapshot.CreatedAt > wu.UpdatedAt;
@@ -155,8 +156,23 @@ public sealed class WorkspaceCacheManager(
         return true;
     }
 
-    private string GetRepositoryId() =>
-        Path.GetFullPath(options?.SeedRepositoryPath ?? Directory.GetCurrentDirectory());
+    // Prefers the work unit's own registered repository (multi-repo goals) over the global
+    // default — matches the snapshot store's actual key convention (Path.GetFullPath of the
+    // physical repo path, not the registry's opaque RepositoryId) used everywhere else
+    // (RepositorySyncService, FileSystemWorkspaceService). Falls back to today's global-default
+    // behavior when RepositoryId is null or the registry lookup misses (stale/deleted entry) —
+    // eviction should degrade safely, not throw.
+    private async Task<string> GetRepositoryIdAsync(WorkUnit workUnit, CancellationToken ct)
+    {
+        if (workUnit.RepositoryId is { } repositoryId)
+        {
+            var repository = await repositories.GetAsync(repositoryId, ct).ConfigureAwait(false);
+            if (repository is not null)
+                return Path.GetFullPath(repository.Path);
+        }
+
+        return Path.GetFullPath(options?.SeedRepositoryPath ?? Directory.GetCurrentDirectory());
+    }
 
     private IWorkUnitService GetWorkUnitService() =>
         serviceProvider.GetRequiredService<IWorkUnitService>();

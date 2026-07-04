@@ -18,6 +18,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     private readonly IServiceProvider? _serviceProvider;
     private readonly IFileLeaseService? _fileLease;
     private readonly IRepositoryRegistryService? _repositories;
+    private readonly IRepositorySyncService? _repositorySync;
 
     // IWorkUnitService is resolved lazily (via IServiceProvider) rather than constructor-injected:
     // its production implementation (InMemoryWorkUnitService) already depends on IMergeService
@@ -39,7 +40,8 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         IArtifactLineageService artifacts,
         IServiceProvider? serviceProvider = null,
         IFileLeaseService? fileLease = null,
-        IRepositoryRegistryService? repositories = null)
+        IRepositoryRegistryService? repositories = null,
+        IRepositorySyncService? repositorySync = null)
     {
         _nodeStore        = nodeStore;
         _fileWorkspace    = fileWorkspace;
@@ -49,6 +51,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         _serviceProvider  = serviceProvider;
         _fileLease        = fileLease;
         _repositories     = repositories;
+        _repositorySync   = repositorySync;
     }
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
@@ -357,9 +360,20 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             ? _workspaceOptions.CandidateBranchId
             : proposal.TargetBranch;
 
-        // Copy workspace files: source branch → effective target branch
-        await _fileWorkspace.ApplyBranchAsync(proposal.SourceBranch, effectiveTarget, cancellationToken)
-            .ConfigureAwait(false);
+        // Land this proposal's own changes additively rather than mirroring its whole branch onto
+        // the target (see TryApplyAdditivelyAsync's own comment for why — ApplyBranchAsync's
+        // "delete anything the source doesn't have" semantics silently reverts whatever a sibling
+        // proposal already landed on this same target, for any file only the sibling touched).
+        // Drift-vs-target conflict detection is scoped to fan-out children specifically
+        // (ParentWorkUnitId set) — that's the actual scenario the bug is in (siblings landing on
+        // their shared parent branch). Two independent top-level goals that happen to both target
+        // the literal branch name "main" (e.g. distinct single-repo goals sharing the default
+        // convention) aren't "siblings" in any meaningful sense, and — confirmed via
+        // MultiRepoWriteBackTests — write-back for a repo-backed goal always sources from the
+        // proposal's own SourceBranch directly, never from whatever ends up on the shared target,
+        // so a textual collision there isn't a real conflict for that case.
+        var checkForDrift = owningWorkUnit?.ParentWorkUnitId is not null;
+        await TryApplyAdditivelyAsync(proposal, effectiveTarget, checkForDrift, cancellationToken).ConfigureAwait(false);
 
         // Phase 12 — release-and-resume: this proposal's holder kept a write lease on every file
         // it touched (McpToolDispatcher.CheckFileLeaseAsync) until this exact moment. Now that the
@@ -408,6 +422,27 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         if (!string.IsNullOrWhiteSpace(writeBackPath))
         {
             await WriteBackToRepositoryAsync(proposal.SourceBranch, writeBackPath, cancellationToken).ConfigureAwait(false);
+
+            // Best-effort CAS/snapshot audit-trail refresh — scoped to the global default repo
+            // specifically, because "main"'s on-disk branch directory mirrors that repo. A
+            // multi-repo work unit's own writeBackPath (resolved above) points at a *different*
+            // physical repo, and syncing "main" against it would diff the wrong pairing. A failed
+            // or skipped resync must never affect the merge itself, which already succeeded.
+            if (_repositorySync is not null
+                && string.Equals(writeBackPath, _workspaceOptions.SeedRepositoryPath, StringComparison.Ordinal))
+            {
+                try
+                {
+                    await _repositorySync.SyncBranchFromRepositoryAsync(
+                        "main", writeBackPath, SyncTrigger.PostMergeWriteBack, cancellationToken).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Best-effort audit-trail refresh — the merge already succeeded and files are
+                    // already on disk; a resync failure must never fail or roll back an
+                    // already-completed apply.
+                }
+            }
         }
 
         var updated = proposal with { Status = MergeProposalStatus.Merged, AutoApplied = autoApplied };
@@ -576,6 +611,96 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         }
 
         return updated;
+    }
+
+    // Found via a live multi-sibling run (see plans/orchestrator-reliability-and-observability.md
+    // Phase 4 item 3): landing a proposal via the old ApplyBranchAsync (full mirror — deletes
+    // anything in the target absent from the source) silently reverted an already-merged
+    // sibling's changes for any file only that sibling had touched, because neither sibling's
+    // branch was ever refreshed with the other's changes (only *declared dependencies* get that
+    // treatment, via FanOutService.RefreshBranchFromDependenciesAsync — independent siblings never
+    // do). This lands only the files THIS proposal actually changed (add/modify by copying,
+    // delete only what it explicitly deleted), and additionally detects the case where the target
+    // has drifted since this proposal's own base/{proposalId} snapshot in a way that genuinely
+    // overlaps this proposal's own changed lines — reusing the exact same line-range-overlap
+    // primitive MergeReconciliationService already uses for sibling-vs-sibling conflict detection,
+    // just pointed at base-vs-current-target instead of proposal-vs-proposal. Both comparisons
+    // share the same "before" side (base/{proposalId}), so the resulting ranges are directly
+    // comparable — no coordinate translation needed.
+    //
+    // Deliberately conservative for the first pass: on a genuine overlap, this throws rather than
+    // attempting any automatic rebase/resolution — a human resolves it (the diff editor already
+    // wired to GET /studio/merges/{id}/file-changes shows exactly what this proposal changed;
+    // the conflict report added here shows what changed underneath it since).
+    //
+    // checkForDrift is the caller's call on whether "target" is a meaningfully shared concept for
+    // this proposal (true for a fan-out child landing on its parent's own branch — the actual bug
+    // scenario) — additive apply itself (never destructively mirroring) always happens regardless.
+    private async Task TryApplyAdditivelyAsync(
+        MergeProposal proposal, string effectiveTarget, bool checkForDrift, CancellationToken ct)
+    {
+        var baseBranch = $"base/{proposal.ProposalId}";
+        var filesToScan = proposal.FilesTouched.Count > 0
+            ? proposal.FilesTouched
+            : await _fileWorkspace.ListAsync(proposal.SourceBranch, ct: ct).ConfigureAwait(false);
+
+        var toCopy = new List<string>();
+        var toDelete = new List<string>();
+        var conflicts = new List<string>();
+
+        foreach (var path in filesToScan)
+        {
+            var baseContent = await _fileWorkspace.ReadAsync(baseBranch, path, ct).ConfigureAwait(false);
+            var proposalContent = await _fileWorkspace.ReadAsync(proposal.SourceBranch, path, ct).ConfigureAwait(false);
+
+            if (baseContent == proposalContent)
+                continue; // this proposal never actually changed this path — nothing to land or check
+
+            if (checkForDrift)
+            {
+                var targetContent = await _fileWorkspace.ReadAsync(effectiveTarget, path, ct).ConfigureAwait(false);
+                var proposalRanges = LineRangeConflictDetector.ComputeChangedRanges(baseContent, proposalContent);
+                var driftRanges = LineRangeConflictDetector.ComputeChangedRanges(baseContent, targetContent);
+
+                if (driftRanges.Count > 0 && proposalRanges.Count > 0 &&
+                    LineRangeConflictDetector.RangesOverlap(proposalRanges, driftRanges))
+                {
+                    conflicts.Add(path);
+                    continue;
+                }
+            }
+
+            if (proposalContent is null)
+                toDelete.Add(path);
+            else
+                toCopy.Add(path);
+        }
+
+        if (conflicts.Count > 0)
+        {
+            var report =
+                $"# Merge conflict report\n\n" +
+                $"Proposal '{proposal.ProposalId}' conflicts with changes already on '{effectiveTarget}' " +
+                "that landed after this proposal's own branch was created. Resolve manually (open each " +
+                "file's diff, e.g. via GET /studio/merges/{proposalId}/file-changes, to see both sides) " +
+                "or re-propose from the current target state.\n\n" +
+                string.Join("\n", conflicts.Select(f => $"## {f}"));
+            await _fileWorkspace
+                .WriteAsync(proposal.SourceBranch, MergeReconciliationService.ConflictReportFileName, report, ct)
+                .ConfigureAwait(false);
+
+            throw new InvalidOperationException(
+                $"Cannot apply proposal '{proposal.ProposalId}': it conflicts with changes already on " +
+                $"'{effectiveTarget}' for file(s): {string.Join(", ", conflicts)}. See " +
+                $"{MergeReconciliationService.ConflictReportFileName} on the proposal's own branch " +
+                "('" + proposal.SourceBranch + "') for details.");
+        }
+
+        foreach (var path in toDelete)
+            await _fileWorkspace.DeleteAsync(effectiveTarget, path, ct).ConfigureAwait(false);
+
+        if (toCopy.Count > 0)
+            await _fileWorkspace.CopyFilesAsync(proposal.SourceBranch, effectiveTarget, toCopy, ct).ConfigureAwait(false);
     }
 
     private async Task WriteBackToRepositoryAsync(string sourceBranchId, string repoPath, CancellationToken ct)

@@ -7,9 +7,12 @@ actually reaches each one. It supersedes the tool counts in
 document remains the source of truth for tool-naming design principles and the error envelope
 format.
 
-Ground truth as of this writing: **66 `nm_v1_*` MCP tools** (`McpToolNames.All`), **42 of them** dispatched
-in-process to autonomous agents (`McpToolDispatcher.cs`), **13 `nms_v1_*` external-caller tools**
-(`McpServerToolNames`), and **112 REST routes** (`StudioRestEndpoints.cs`).
+Ground truth as of this writing (recounted directly against source — the tables below had drifted
+from these totals before this pass, and still don't enumerate every tool 1:1; treat the tables as
+illustrative of shape/category, not an exhaustive per-tool listing): **117 `nm_v1_*` MCP tools**
+(`McpToolNames.All`), **72 of them** dispatched in-process to autonomous agents
+(`McpToolDispatcher.cs`'s switch cases), **14 `nms_v1_*` external-caller tools**
+(`McpServerToolNames`), and **187 REST routes** (`app.Map*` calls in `StudioRestEndpoints.cs`).
 
 ---
 
@@ -23,15 +26,16 @@ without requiring knowledge of work units, branches, or the internal DAG.
 > marks the Studio-level abstraction layer. Both namespaces share the same host and the same error
 > envelope format.
 
-### Goal management (6)
+### Goal management (7)
 | Tool | Purpose |
 |---|---|
 | `nms_v1_goal_run` | Start a new goal — creates a work unit, execution session, and enqueues the orchestrator in one call. Returns `goalId` and `sessionId`. |
 | `nms_v1_goal_list` | List all goals with current status. Use to discover `goalId` values. |
-| `nms_v1_goal_status` | Detailed status for one goal, including pending clarifications and session state. |
+| `nms_v1_goal_status` | Detailed status for one goal, including pending clarifications, an unresolved failure if the goal is dead-lettered (with which recovery actions currently apply), and session state. |
 | `nms_v1_goal_cancel` | Cancel a goal and its entire subtree. Completed or merged work units are left untouched. |
 | `nms_v1_goal_pause` | Pause a goal and all its active agents. Agents stop gracefully; goal can be resumed. |
 | `nms_v1_goal_resume` | Resume a paused goal. Optionally inject a steering message to redirect the next agent run. |
+| `nms_v1_goal_recover` | Recover a dead-lettered goal — `action` is one of `retry`, `retry_with_context`, `continue` (`MaxIterationsExceeded` only), or `replan`. Resolves the goal's own latest dead-letter entry internally; no entry ID needed. |
 
 ### Clarifications (1)
 | Tool | Purpose |
@@ -91,7 +95,7 @@ caller can still be heavily used — just by agents, via the MCP tool it shares 
 
 ---
 
-## MCP Tool Catalog (66 tools)
+## MCP Tool Catalog (117 tools total — categories below are not exhaustive)
 
 ✅ = dispatched in-process to orchestrator/worker agents · — = MCP-client or REST/extension only
 
@@ -132,6 +136,26 @@ caller can still be heavily used — just by agents, via the MCP tool it shares 
 | `nm_v1_merge_validate` | ✅ | Validate a draft proposal, moves it to ReadyForReview |
 | `nm_v1_merge_review` | ✅ | Approve/reject (supports `automated=true` for the reviewer-agent path) |
 | `nm_v1_merge_apply` | ✅ | Apply an approved proposal — runs the `BeforeMerge` policy gate (review-policy/promotion-branch logic) |
+
+### Dead-letter (8)
+| Tool | Dispatched | Purpose |
+|---|---|---|
+| `nm_v1_dead_letter_list` | — | List every dead-letter entry across all work units |
+| `nm_v1_dead_letter_get` | — | Get a single dead-letter entry by its own entry ID |
+| `nm_v1_dead_letter_by_work_unit` | — | Get the latest dead-letter entry for a work unit, if any |
+| `nm_v1_dead_letter_history` | — | Full failure history for a work unit, oldest first |
+| `nm_v1_dead_letter_retry` | — | Retry a dead-lettered work unit (optional credential override) |
+| `nm_v1_dead_letter_retry_with_context` | — | Retry with a human correction folded into the goal, bypassing the attempt cap |
+| `nm_v1_dead_letter_replan` | — | Re-plan a failed fan-out slice into fresh sub-slices; original marked `Cancelled` |
+| `nm_v1_dead_letter_continue` | — | Resume the same work unit with reconstructed prior context (`MaxIterationsExceeded` only) |
+
+Deliberately **not** dispatched to orchestrator/worker agents — see the note in
+`McpServerToolNames.cs` and `DeadLetterTools.cs`: these are human-initiated recovery actions on an
+already-failed, already-exited work unit, not something a running agent would ever call on itself.
+Mirror the REST dead-letter endpoints one-for-one. The recommended external-caller flow reaches the
+same capability through `nms_v1_goal_status` (surfaces an unresolved failure and which actions
+apply) and `nms_v1_goal_recover` (resolves the goal's own latest entry internally — no entry ID
+needed) instead of these detailed, entry-ID-based tools.
 
 ### Replay (3)
 | Tool | Dispatched | Purpose |
@@ -339,7 +363,15 @@ segment can never match.
 - `GET/POST /studio/artifacts` (list/query, record) · `GET /studio/artifacts/{id}` (get) · `GET /studio/artifacts/{id}/children`
 
 ### Dead-letter queue
-- `GET /studio/dead-letter` (list) · `GET /studio/dead-letter/{id}` (get) · `POST /studio/dead-letter/{id}/retry`
+- `GET /studio/dead-letter` (list) · `GET /studio/dead-letter/{id}` (get) ·
+  `GET /studio/dead-letter/by-work-unit/{workUnitId}` · `GET /studio/dead-letter/history/{workUnitId}`
+  (full failure history for a work unit, oldest first)
+- `POST /studio/dead-letter/{id}/retry` · `POST /studio/dead-letter/{id}/retry-with-context`
+  (folds a human correction into the goal, bypasses the normal attempt cap) ·
+  `POST /studio/dead-letter/{id}/replan` (decompose the failed slice into fresh sub-slices, mark
+  original `Cancelled` — never gated on attempt count since it never resumes the failed work unit) ·
+  `POST /studio/dead-letter/{id}/continue` (`MaxIterationsExceeded` only — resume the SAME work
+  unit with reconstructed prior context and a fresh iteration budget)
 
 ### Options / settings
 - `GET/POST /studio/options` — concurrency, polling, build/test gates, promotion branch

@@ -971,6 +971,17 @@ public static class StudioRestEndpoints
         fanOutInfo = wu.FanOutInfo,
         branchedFromProposalId = wu.BranchedFromProposalId,
         forkType = wu.ForkType?.ToString(),
+        // Bug fix — this projection silently omitted these fields, so GET /studio/workunits and
+        // GET /studio/workunits/{id} could never show a work unit's own review/merge-target
+        // settings at all (only GET .../children happened to reveal them, since it returns raw
+        // WorkUnit records instead of this projection) — a real observability gap that made a
+        // fan-out review-policy bug harder to diagnose than it needed to be.
+        reviewPolicy = wu.ReviewPolicy,
+        bypassPromotionBranch = wu.BypassPromotionBranch,
+        expectedOutputKind = wu.ExpectedOutputKind,
+        repositoryId = wu.RepositoryId,
+        referenceFiles = wu.ReferenceFiles,
+        workspaceId = wu.WorkspaceId,
         proposalCount,
     };
 
@@ -2284,6 +2295,20 @@ public static class StudioRestEndpoints
 
     // ── /studio/dead-letter ───────────────────────────────────────────────────
 
+    // DeadLetterEntry.ApiKey is stored in plaintext deliberately — a retry needs it and the live
+    // orchestrator registry it would otherwise come from is ephemeral (see the entry's own doc
+    // comment). That's fine for internal use; it must never go out over REST unredacted, which is
+    // what every GET endpoint below did until now. RetryAsync/RetryWithCredentialOverrideAsync
+    // read the entry directly via IDeadLetterService, not through this redacted projection, so
+    // retry is unaffected.
+    private static string? RedactApiKey(string? apiKey) =>
+        string.IsNullOrEmpty(apiKey) ? apiKey
+        : apiKey.Length <= 8 ? "***"
+        : $"{apiKey[..3]}...{apiKey[^4..]}";
+
+    private static DeadLetterEntry RedactForRest(DeadLetterEntry entry) =>
+        entry with { ApiKey = RedactApiKey(entry.ApiKey) };
+
     private static void MapDeadLetterEndpoints(WebApplication app)
     {
         app.MapGet("/studio/dead-letter", async (
@@ -2291,7 +2316,7 @@ public static class StudioRestEndpoints
             CancellationToken ct) =>
         {
             var list = await deadLetter.ListAsync(ct).ConfigureAwait(false);
-            return Results.Ok(list);
+            return Results.Ok(list.Select(RedactForRest));
         });
 
         app.MapGet("/studio/dead-letter/{entryId}", async (
@@ -2302,7 +2327,7 @@ public static class StudioRestEndpoints
             var entry = await deadLetter.GetAsync(entryId, ct).ConfigureAwait(false);
             return entry is null
                 ? Results.NotFound(new { error = $"Dead-letter entry '{entryId}' not found." })
-                : Results.Ok(entry);
+                : Results.Ok(RedactForRest(entry));
         });
 
         app.MapPost("/studio/dead-letter/{entryId}/retry", async (
@@ -2345,7 +2370,19 @@ public static class StudioRestEndpoints
             var entry = await deadLetter.GetLatestForWorkUnitAsync(workUnitId, ct).ConfigureAwait(false);
             return entry is null
                 ? Results.NotFound(new { error = $"No dead-letter entry found for work unit '{workUnitId}'." })
-                : Results.Ok(entry);
+                : Results.Ok(RedactForRest(entry));
+        });
+
+        // The full failure story for a work unit in one call — e.g. "max iterations" -> manually
+        // steered retry -> "transient 529" — instead of following steeredFromDeadLetterEntryId
+        // across separate GetAsync calls by hand.
+        app.MapGet("/studio/dead-letter/history/{workUnitId}", async (
+            string workUnitId,
+            IDeadLetterService deadLetter,
+            CancellationToken ct) =>
+        {
+            var history = await deadLetter.GetHistoryForWorkUnitAsync(workUnitId, ct).ConfigureAwait(false);
+            return Results.Ok(history.Select(RedactForRest));
         });
 
         app.MapPost("/studio/dead-letter/{entryId}/retry-with-context", async (
@@ -2373,6 +2410,42 @@ public static class StudioRestEndpoints
                 DeadLetterRetryOutcome.MaxAttemptsReached => Results.Conflict(new { error = result.Message }),
                 DeadLetterRetryOutcome.InvalidState => Results.BadRequest(new { error = result.Message }),
                 _ => Results.BadRequest(new { error = result.Message ?? "Retry failed." }),
+            };
+        });
+
+        // Phase 1.4 — re-plan-the-slice: spawns a bounded planner scoped to just the failed
+        // slice's goal + failure reason, fans out fresh sub-slices, and marks the original
+        // Cancelled. Never retries the failed work unit itself, unlike the retry endpoints above.
+        app.MapPost("/studio/dead-letter/{entryId}/replan", async (
+            string entryId,
+            IReplanService replan,
+            CancellationToken ct) =>
+        {
+            var result = await replan.ReplanFailedSliceAsync(entryId, ct).ConfigureAwait(false);
+            return result.Outcome switch
+            {
+                ReplanOutcome.Replanned => Results.Ok(result),
+                ReplanOutcome.NotFound => Results.NotFound(new { error = result.Message }),
+                ReplanOutcome.NotApplicable => Results.BadRequest(new { error = result.Message }),
+                _ => Results.UnprocessableEntity(new { error = result.Message ?? "Re-plan failed." }),
+            };
+        });
+
+        // Phase 1.4 Continue-track — resumes the SAME dead-lettered work unit with reconstructed
+        // prior context and a fresh iteration budget, unlike Retry/Re-plan which either resume
+        // with just a steering hint or spawn fresh siblings. Only valid for MaxIterationsExceeded.
+        app.MapPost("/studio/dead-letter/{entryId}/continue", async (
+            string entryId,
+            IContinueService continueService,
+            CancellationToken ct) =>
+        {
+            var result = await continueService.ContinueWithPriorContextAsync(entryId, ct).ConfigureAwait(false);
+            return result.Outcome switch
+            {
+                ContinueOutcome.Continued => Results.Ok(result),
+                ContinueOutcome.NotFound => Results.NotFound(new { error = result.Message }),
+                ContinueOutcome.NotApplicable => Results.BadRequest(new { error = result.Message }),
+                _ => Results.UnprocessableEntity(new { error = result.Message ?? "Continue failed." }),
             };
         });
     }
@@ -3156,6 +3229,28 @@ public static class StudioRestEndpoints
 
     private static void MapGoalEndpoints(WebApplication app)
     {
+        // Phase 2 item 1 — per-goal cost/time guardrail. Alert-only: computed fresh on every
+        // call (no background poller, no "already alerted" state to go stale), never blocks or
+        // stops anything itself — the dashboard just badges any goal this reports as exceeded.
+        app.MapGet("/studio/goals/guardrail-status", async (
+            IGoalGuardrailService guardrail,
+            CancellationToken ct) =>
+        {
+            var statuses = await guardrail.GetActiveGoalStatusesAsync(ct).ConfigureAwait(false);
+            return Results.Ok(statuses);
+        });
+
+        app.MapGet("/studio/goals/{workUnitId}/guardrail-status", async (
+            string workUnitId,
+            IGoalGuardrailService guardrail,
+            CancellationToken ct) =>
+        {
+            var status = await guardrail.GetStatusAsync(workUnitId, ct).ConfigureAwait(false);
+            return status is null
+                ? Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." })
+                : Results.Ok(status);
+        });
+
         // Create a goal (mirrors nm_v1_goal_create)
         app.MapPost("/studio/goals", async (
             CreateGoalBody body,

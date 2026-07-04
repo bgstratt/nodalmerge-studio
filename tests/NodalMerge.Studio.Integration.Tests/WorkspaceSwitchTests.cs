@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Host;
@@ -29,6 +30,17 @@ public class WorkspaceSwitchTests : IDisposable
     {
         if (Directory.Exists(_repoAPath)) Directory.Delete(_repoAPath, recursive: true);
         if (Directory.Exists(_repoBPath)) Directory.Delete(_repoBPath, recursive: true);
+    }
+
+    // No production code anywhere in this repo registers a real IBlobStoreProvider (it's only ever
+    // supplied via the Rust host's FFI bridge) — a minimal fake makes the CAS/snapshot path
+    // actually active for this test, same as RepositoryImportServiceTests.
+    private sealed class FakeBlobStoreProvider : IBlobStoreProvider
+    {
+        public ValueTask<BlobReadResult> TryGetBlobAsync(string hashHex, CancellationToken ct = default) =>
+            ValueTask.FromResult(BlobReadResult.Missing);
+        public ValueTask PutBlobAsync(string hashHex, byte[] bytes, string? contentType, CancellationToken ct = default) =>
+            ValueTask.CompletedTask;
     }
 
     [Fact]
@@ -58,6 +70,44 @@ public class WorkspaceSwitchTests : IDisposable
         var state = await repositorySync.GetStateAsync("main");
         Assert.NotNull(state);
         Assert.Equal(_repoBPath, state!.RepositoryPath);
+    }
+
+    [Fact]
+    public async Task REST_switch_to_the_same_repository_again_after_a_disk_change_advances_the_snapshot()
+    {
+        // Phase 2 item 2 follow-up regression test — the REST endpoint's SyncTrigger.ManualRefresh
+        // call used to be a silent no-op for CAS-snapshot purposes on any repeat call for a
+        // repository already bootstrapped (RepositoryImportService.EnsureBootstrappedAsync's
+        // one-time gate). ForceSyncAsync now makes ManualRefresh actually re-diff and advance the
+        // snapshot every time, proven here at the real HTTP endpoint, not just the service call.
+        Directory.CreateDirectory(_repoAPath);
+        await File.WriteAllTextAsync(Path.Combine(_repoAPath, "Program.cs"), "// v1");
+
+        await using var app = StudioWebApplication.Build(
+            [], configureWebHost: webHost => webHost.UseTestServer(),
+            configureServices: services =>
+            {
+                services.AddInMemoryStorage();
+                services.AddSingleton<IBlobStoreProvider>(new FakeBlobStoreProvider());
+            });
+        await app.StartAsync();
+        var client = app.GetTestClient();
+        var snapshots = app.Services.GetRequiredService<IRepositorySnapshotService>();
+        var repositoryId = Path.GetFullPath(_repoAPath);
+
+        var first = await client.PostAsJsonAsync("/studio/workspace/switch", new { repositoryPath = _repoAPath });
+        first.EnsureSuccessStatusCode();
+        var snapshotAfterFirstSwitch = await snapshots.GetLatestAsync(repositoryId);
+        Assert.NotNull(snapshotAfterFirstSwitch);
+
+        await File.WriteAllTextAsync(Path.Combine(_repoAPath, "Program.cs"), "// v2 — changed on disk");
+        var second = await client.PostAsJsonAsync("/studio/workspace/switch", new { repositoryPath = _repoAPath });
+        second.EnsureSuccessStatusCode();
+
+        var snapshotAfterSecondSwitch = await snapshots.GetLatestAsync(repositoryId);
+        Assert.NotNull(snapshotAfterSecondSwitch);
+        Assert.NotEqual(snapshotAfterFirstSwitch!.SnapshotId, snapshotAfterSecondSwitch!.SnapshotId);
+        Assert.True(snapshotAfterSecondSwitch.Generation > snapshotAfterFirstSwitch.Generation);
     }
 
     [Fact]

@@ -55,12 +55,19 @@ internal sealed class RepositorySyncService : IRepositorySyncService, IRehydrata
         string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct)
     {
         // Phase 5 — one-time CAS bootstrap: walk the repo, put every file to CAS, emit Import ops,
-        // and record the Generation-0 RepositorySnapshot. Fast no-op on all subsequent calls.
+        // and record the Generation-0 RepositorySnapshot. Fast no-op on subsequent GoalCreation/
+        // StartupRecovery calls (a one-time seed is all those need). PostMergeWriteBack and
+        // ManualRefresh instead force a fresh Case 1/Case 2 check every time — without this,
+        // EnsureBootstrappedAsync's one-time gate means RepositorySnapshot would never advance
+        // again after a repo's first goal creation, no matter how many merges land or how many
+        // times a resync is explicitly requested.
         if (_repositoryImport is not null)
         {
             var repositoryId = Path.GetFullPath(repositoryPath);
-            await _repositoryImport.EnsureBootstrappedAsync(repositoryId, repositoryPath, ct)
-                .ConfigureAwait(false);
+            if (trigger is SyncTrigger.PostMergeWriteBack or SyncTrigger.ManualRefresh)
+                await _repositoryImport.ForceSyncAsync(repositoryId, repositoryPath, ct).ConfigureAwait(false);
+            else
+                await _repositoryImport.EnsureBootstrappedAsync(repositoryId, repositoryPath, ct).ConfigureAwait(false);
         }
 
         // No-op if main is already populated (today's existing one-time seed mechanism, untouched).
