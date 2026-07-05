@@ -102,10 +102,17 @@ export class TrajectoryReplayPanel {
   static getFragment(webview: vscode.Webview, extensionUri: vscode.Uri, nonce: string):
     { css: string; html: string; scriptTag: string } {
     const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'out', 'dag-replay.js'));
+    return TrajectoryReplayPanel.getFragmentForScriptSrc(String(scriptUri), nonce);
+  }
+
+  /** Pure variant of getFragment — no vscode API needed; used by getFragment above and by the
+   * webview smoke-test harness, which serves out/dag-replay.js from a plain file path. */
+  static getFragmentForScriptSrc(scriptSrc: string, nonce: string):
+    { css: string; html: string; scriptTag: string } {
     return {
       css: scopeViewCss(DAG_REPLAY_CSS, TrajectoryReplayPanel.containerId),
       html: `<div id="${TrajectoryReplayPanel.containerId}" class="nm-shell-pane">${DAG_REPLAY_HTML}</div>`,
-      scriptTag: `<script nonce="${nonce}" src="${scriptUri}"></script>`,
+      scriptTag: `<script nonce="${nonce}" src="${scriptSrc}"></script>`,
     };
   }
 

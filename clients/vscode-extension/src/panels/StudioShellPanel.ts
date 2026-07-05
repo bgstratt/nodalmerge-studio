@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import type { OutputChannel } from 'vscode';
 import { toWebSocketUrl } from '../constants';
-import { buildNonce, SHELL_CSS_VARS } from './sharedWebviewChrome';
+import { buildNonce } from './sharedWebviewChrome';
+import { composeShellHtml } from './shellHtml';
 import { DecisionConvergencePanel } from './MergeReviewPanel';
 import { ModelAgentStudioPanel } from './AgentConfigPanel';
 import { ExecutionTimelinePanel } from './WorkspaceDashboardPanel';
@@ -12,7 +13,17 @@ import { ProjectionComparisonPanel } from './ProjectionComparisonPanel';
 import type { NotificationManager } from '../NotificationManager';
 import type { AgentConfigService } from '../AgentConfigService';
 
-interface TabDef { id: string; label: string }
+/** [containerId, label] pairs in tab order; first entry is the initially-active tab.
+ * Exported for the webview smoke-test harness. */
+export const STUDIO_SHELL_TABS: Array<[string, string]> = [
+  [GoalWorkspacePanel.containerId, 'Goal Workspace'],
+  [ModelAgentStudioPanel.containerId, 'Model & Agent Studio'],
+  [ExecutionTimelinePanel.containerId, 'Activity Center'],
+  [DecisionConvergencePanel.containerId, 'Review'],
+  [TrajectoryReplayPanel.containerId, 'Pathways'],
+  [InsightsPanel.containerId, 'Insights'],
+  [ProjectionComparisonPanel.containerId, 'Projection Snapshots'],
+];
 
 /**
  * NodalMerge Studio shell.
@@ -179,117 +190,30 @@ export class StudioShellPanel implements vscode.Disposable {
     ]);
   }
 
-  // style-src below intentionally omits a nonce: VS Code's webview host injects the current
-  // theme's CSS custom properties via inline style attributes on load, and pairing 'unsafe-inline'
-  // with a nonce/hash on the same directive makes browsers disregard 'unsafe-inline' entirely
-  // (CSP3 backwards-compat rule) — that blocked the injection and a host-side fallback path threw
-  // a document.write() SyntaxError that aborted parsing the rest of the page, silently preventing
-  // every script tag after the failure point (including Decision Convergence's) from ever running.
+  // The document itself (CSP notes included) lives in shellHtml.ts so the smoke-test harness
+  // can compose the exact production document outside a VS Code extension host.
   private buildHtml(extensionUri: vscode.Uri): string {
     const nonce   = buildNonce();
     const webview = this.panel.webview;
     const wsOrigin = toWebSocketUrl(this.baseUrl);
 
-    const goalWorkspaceFragment        = GoalWorkspacePanel.getFragment();
-    const modelAgentStudioFragment     = ModelAgentStudioPanel.getFragment();
-    const executionTimelineFragment    = ExecutionTimelinePanel.getFragment();
-    const decisionConvergenceFragment  = DecisionConvergencePanel.getFragment();
-    const trajectoryFragment           = TrajectoryReplayPanel.getFragment(webview, extensionUri, nonce);
-    const insightsFragment             = InsightsPanel.getFragment();
-    const projectionComparisonFragment = ProjectionComparisonPanel.getFragment();
+    const viewsScriptUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(extensionUri, 'out', 'studio-views.js'));
 
-    const tabs: TabDef[] = [
-      { id: GoalWorkspacePanel.containerId, label: 'Goal Workspace' },
-      { id: ModelAgentStudioPanel.containerId, label: 'Model & Agent Studio' },
-      { id: ExecutionTimelinePanel.containerId, label: 'Activity Center' },
-      { id: DecisionConvergencePanel.containerId, label: 'Review' },
-      { id: TrajectoryReplayPanel.containerId, label: 'Pathways' },
-      { id: InsightsPanel.containerId, label: 'Insights' },
-      { id: ProjectionComparisonPanel.containerId, label: 'Projection Snapshots' },
-    ];
-    const tabButtonsHtml = tabs
-      .map(t => `<button class="nm-shell-tab${t.id === GoalWorkspacePanel.containerId ? ' active' : ''}" data-tab="${t.id}">${t.label}</button>`)
-      .join('\n');
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy"
-        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src ${wsOrigin} ${wsOrigin}/*;">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-   <title>NodalMerge Studio</title>
-  <style nonce="${nonce}">
-${SHELL_CSS_VARS}
-${goalWorkspaceFragment.css}
-${modelAgentStudioFragment.css}
-${executionTimelineFragment.css}
-${decisionConvergenceFragment.css}
-${trajectoryFragment.css}
-${insightsFragment.css}
-${projectionComparisonFragment.css}
-  </style>
-</head>
-<body>
-  <div id="nm-shell-tabbar">${tabButtonsHtml}</div>
-  <div id="nm-shell-content">
-${goalWorkspaceFragment.html}
-${modelAgentStudioFragment.html}
-${executionTimelineFragment.html}
-${decisionConvergenceFragment.html}
-${trajectoryFragment.html}
-${insightsFragment.html}
-${projectionComparisonFragment.html}
-  </div>
-  <script nonce="${nonce}">
-    (function() {
-      window.__nmVscode = acquireVsCodeApi();
-      window.onerror = function(msg, src, line, col, err) {
-        var stack = (err && err.stack) || (src + ':' + line + ':' + col);
-        window.__nmVscode.postMessage({ type: 'nm-webview-error', message: String(msg), stack: stack });
-        return false;
-      };
-      window.onunhandledrejection = function(event) {
-        var r = event.reason;
-        window.__nmVscode.postMessage({ type: 'nm-webview-error', message: String(r), stack: (r && r.stack) || '' });
-      };
-      var tabButtons = document.querySelectorAll('.nm-shell-tab');
-      var panes = document.querySelectorAll('#nm-shell-content > .nm-shell-pane');
-      function showTab(tabId) {
-        tabButtons.forEach(function(b) { b.classList.toggle('active', b.getAttribute('data-tab') === tabId); });
-        panes.forEach(function(p) { p.classList.toggle('active', p.id === tabId); });
-        window.__nmVscode.postMessage({ type: 'studio.tabActivated', tab: tabId });
-      }
-      tabButtons.forEach(function(b) {
-        b.addEventListener('click', function() { showTab(b.getAttribute('data-tab')); });
-      });
-      window.addEventListener('message', function(event) {
-        var msg = event.data;
-        if (msg && msg.type === 'studio.showTab') { showTab(msg.tab); }
-      });
-    })();
-  </script>
-  <script nonce="${nonce}">
-${modelAgentStudioFragment.script}
-  </script>
-  <script nonce="${nonce}">
-${executionTimelineFragment.script}
-  </script>
-  <script nonce="${nonce}">
-${decisionConvergenceFragment.script}
-  </script>
-  <script nonce="${nonce}">
-${goalWorkspaceFragment.script}
-  </script>
-  <script nonce="${nonce}">
-${insightsFragment.script}
-  </script>
-  <script nonce="${nonce}">
-${projectionComparisonFragment.script}
-  </script>
-${trajectoryFragment.scriptTag}
-</body>
-</html>`;
+    return composeShellHtml({
+      nonce,
+      wsOrigin,
+      resourceCspSource: webview.cspSource,
+      viewsScriptTag: `<script nonce="${nonce}" src="${viewsScriptUri}"></script>`,
+      goalWorkspace: GoalWorkspacePanel.getFragment(),
+      modelAgentStudio: ModelAgentStudioPanel.getFragment(),
+      executionTimeline: ExecutionTimelinePanel.getFragment(),
+      decisionConvergence: DecisionConvergencePanel.getFragment(),
+      trajectory: TrajectoryReplayPanel.getFragment(webview, extensionUri, nonce),
+      insights: InsightsPanel.getFragment(),
+      projectionComparison: ProjectionComparisonPanel.getFragment(),
+      tabs: STUDIO_SHELL_TABS,
+    });
   }
 
   dispose(): void {
