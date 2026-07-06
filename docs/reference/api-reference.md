@@ -18,7 +18,7 @@ illustrative of shape/category, not an exhaustive per-tool listing): **117 `nm_v
 
 ## External Caller Surface (`nms_v1_*`)
 
-These 13 tools are the recommended entry point for external MCP clients — Claude Code, Cursor,
+These 14 tools are the recommended entry point for external MCP clients — Claude Code, Cursor,
 scripts, CI agents. They cover the full human-in-the-loop lifecycle at a goal-centric level,
 without requiring knowledge of work units, branches, or the internal DAG.
 
