@@ -31,16 +31,26 @@ const dagReplayOptions = {
   logLevel: 'info',
 };
 
+/** Studio Shell views extracted from the panels' former inline <script> template strings.
+ * @type {import('esbuild').BuildOptions} */
+const studioViewsOptions = {
+  entryPoints: ['src/webviews/views/main.js'],
+  bundle: true,
+  format: 'iife',   // browser WebView — not CommonJS
+  minify: production,
+  sourcemap: !production,
+  sourcesContent: false,
+  platform: 'browser',
+  outfile: 'out/studio-views.js',
+  logLevel: 'info',
+};
+
+const allOptions = [extensionOptions, dagReplayOptions, studioViewsOptions];
+
 if (watch) {
-  const [extCtx, dagCtx] = await Promise.all([
-    esbuild.context(extensionOptions),
-    esbuild.context(dagReplayOptions),
-  ]);
-  await Promise.all([extCtx.watch(), dagCtx.watch()]);
+  const contexts = await Promise.all(allOptions.map(o => esbuild.context(o)));
+  await Promise.all(contexts.map(c => c.watch()));
   console.log('[esbuild] watching...');
 } else {
-  await Promise.all([
-    esbuild.build(extensionOptions),
-    esbuild.build(dagReplayOptions),
-  ]);
+  await Promise.all(allOptions.map(o => esbuild.build(o)));
 }

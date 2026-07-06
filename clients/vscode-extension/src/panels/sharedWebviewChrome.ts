@@ -18,7 +18,7 @@ export function buildNonce(): string {
  * and `document.getElementById` calls would collide on duplicate ids that were never meant to
  * coexist (both AgentConfigPanel and WorkspaceDashboardPanel use `id="btn-spawn"`).
  *
- * Rather than hand-renaming every id and selector in ~2,500 lines of existing template strings,
+ * Rather than hand-renaming every id and selector in the views' CSS,
  * this wraps each view's CSS in a native CSS `@scope` block (limits every selector — including
  * bare `button`/`section`/`table` — to descendants of the view's own container, unmodified) and
  * rewrites each view's JS so `document.getElementById('x')` becomes a lookup scoped to that same
@@ -40,34 +40,11 @@ export function scopeViewCss(css: string, containerId: string): string {
   return `@scope (#${containerId}) {\n${scoped}\n}`;
 }
 
-export function scopeViewScript(js: string): string {
-  return js
-    .replace(/(?:var|const|let)\s+vscode\s*=\s*acquireVsCodeApi\(\)\s*;/, 'var vscode = window.__nmVscode;')
-    .replace(/document\.getElementById\(/g, '$(')
-    .replace(/document\.querySelectorAll\(/g, 'root.querySelectorAll(')
-    .replace(/document\.querySelector\(/g, 'root.querySelector(');
-}
-
-/** Applies scopeViewScript and wraps the result in an IIFE with its own `root`/`vscode`/`$`,
- * so each view's local helpers (multiple views define their own `esc()`, `setText()`, etc.)
- * can't collide either. This is the one function each view's getHtmlFragment() needs to call. */
-export function wrapViewScript(js: string, containerId: string): string {
-  return `(function(){\n` +
-    `try {\n` +
-    `var root = document.getElementById('${containerId}');\n` +
-    `if (!root) { throw new Error('container not found: ${containerId}'); }\n` +
-    `function $(id) { return root.querySelector('#' + id); }\n` +
-    `${scopeViewScript(js)}\n` +
-    `} catch (nmWrapErr) {\n` +
-    `  var nmErrRoot = document.getElementById('${containerId}');\n` +
-    `  var nmErrDiv = document.createElement('div');\n` +
-    `  nmErrDiv.style.cssText = 'color:#f14c4c;font-family:monospace;white-space:pre-wrap;padding:12px;';\n` +
-    `  nmErrDiv.textContent = 'NM-FATAL[${containerId}]: ' + (nmWrapErr && nmWrapErr.stack || nmWrapErr);\n` +
-    `  if (nmErrRoot) { nmErrRoot.prepend(nmErrDiv); } else { document.body.prepend(nmErrDiv); }\n` +
-    `  if (window.__nmVscode) { window.__nmVscode.postMessage({ type: 'nm-webview-error', containerId: '${containerId}', message: String(nmWrapErr), stack: (nmWrapErr && nmWrapErr.stack) || '' }); }\n` +
-    `}\n` +
-    `})();`;
-}
+// Historical note: view JS used to be inline template strings, rewritten at build-html time
+// by scopeViewScript()/wrapViewScript() here (getElementById -> container-scoped $, shared
+// acquireVsCodeApi handle, NM-FATAL error trap). Views are now real modules in
+// src/webviews/views/ bundled to out/studio-views.js; the same scoping/error semantics live
+// in src/webviews/views/runtime.js (runView).
 
 export const SHELL_CSS_VARS = `
   :root {
