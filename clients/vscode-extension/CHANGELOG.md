@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.8 — 2026-07-06
+
+- Bumped bundled `NodalMerge.DotNetHost` to 0.2.0, which converges blob storage
+  on one canonical cross-runtime layout: a flat, global content-addressed pool
+  at `data/blobs/blake3/<hash>` (no shard directories, no `.blob` extension).
+- **Existing workspaces convert themselves automatically** — on the first blob
+  access after upgrading, the store migrates legacy `<shard>/<hash>.blob` files
+  into `blake3/`, dedupes identical content, and writes a `.layout-v2` marker so
+  the migration runs exactly once. No manual steps; anything unrecognized is
+  quarantined into `.migration-skipped/` rather than deleted.
+- Blob writes are now atomic (temp + rename), fixing a race where concurrent
+  writes of the same asset could fail with a file-sharing violation.
+
 ## 0.1.6 — 2026-07-03
 
 - Bumped bundled `NodalMerge.DotNetHost` to 0.1.4, picking up two correctness fixes:

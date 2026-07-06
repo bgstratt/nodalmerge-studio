@@ -33,7 +33,10 @@ Write-Host "Restoring NodalMerge Studio solution ..."
 $localFeed = Join-Path $nodalMergePath "artifacts/package-local/nuget"
 Push-Location $studioRoot
 try {
-    dotnet restore "NodalMerge.Studio.slnx" --configfile "NuGet.config" --source $localFeed --source "https://api.nuget.org/v3/index.json"
+    # RestoreAdditionalProjectSources appends the local feed to NuGet.config's sources.
+    # (Passing multiple --source flags misparses the URL as a relative local path on
+    # current SDKs — same issue previously fixed in nodalmerge's pack-local-nuget.ps1.)
+    dotnet restore "NodalMerge.Studio.slnx" --configfile "NuGet.config" "-p:RestoreAdditionalProjectSources=$localFeed"
 }
 finally {
     Pop-Location
