@@ -155,7 +155,7 @@ Agents receive compact projections — not full DAG history. Projections compres
 
 ### MCP-Native
 
-Full MCP v1 tool surface with 66 frozen tool names under `nm_v1_*` namespaces. Integrate any MCP-compatible client with the Studio host.
+Full MCP v1 tool surface with 117 frozen tool names across 21 namespaces under `nm_v1_*`, plus a 14-tool `nms_v1_*` external-caller surface. Integrate any MCP-compatible client with the Studio host. See [docs/reference/api-reference.md](docs/reference/api-reference.md) for the verified catalog.
 
 ---
 
