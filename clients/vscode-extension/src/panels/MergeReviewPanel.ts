@@ -1,6 +1,40 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { scopeViewCss } from './sharedWebviewChrome';
 import type { AgentConfigService } from '../AgentConfigService';
+
+// ── Read-only diff viewer ────────────────────────────────────────────────────
+//
+// "Open Diff in Editor" used to open two vscode.workspace.openTextDocument({content})
+// buffers — untitled, in-memory documents with no backing file. VS Code lets you type
+// into those, which looked editable but silently went nowhere on save (no connection
+// back to the branch). Routing both sides through a registered content-provider scheme
+// instead makes them genuinely read-only, the same mechanism VS Code's own Git extension
+// uses for historical revisions — there's no edit provider for this scheme, so VS Code
+// refuses edits outright instead of accepting and discarding them.
+const NM_DIFF_SCHEME = 'nodalmerge-diff';
+
+class ReadOnlyDiffContentProvider implements vscode.TextDocumentContentProvider {
+  private readonly contents = new Map<string, string>();
+
+  set(uri: vscode.Uri, content: string): void {
+    this.contents.set(uri.toString(), content);
+  }
+
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    return this.contents.get(uri.toString()) ?? '';
+  }
+}
+
+let diffProvider: ReadOnlyDiffContentProvider | undefined;
+function getDiffProvider(): ReadOnlyDiffContentProvider {
+  if (!diffProvider) {
+    diffProvider = new ReadOnlyDiffContentProvider();
+    vscode.workspace.registerTextDocumentContentProvider(NM_DIFF_SCHEME, diffProvider);
+  }
+  return diffProvider;
+}
 
 // ── Domain types ───────────────────────────────────────────────────────────
 
@@ -90,6 +124,16 @@ export class DecisionConvergencePanel {
   private proposalId?: string;
   private workUnitId?: string;
   private lastProposal?: MergeProposal;
+  private conflictBranchId?: string;
+  // Path -> content captured at the moment "Edit File" opened it, for Resync Workspace to diff
+  // the (possibly now hand-edited) live file against. Cleared whenever a fresh proposal/conflict
+  // loads, since a stale baseline from a previous decision would compare against the wrong thing.
+  private editBaselines = new Map<string, string>();
+
+  /** The branch a human-editable file actually lives on, for whichever mode is currently loaded. */
+  private get editableBranchId(): string | undefined {
+    return this.mode === 'conflict' ? this.conflictBranchId : this.lastProposal?.sourceBranch;
+  }
 
   constructor(
     panel: vscode.WebviewPanel,
@@ -111,6 +155,7 @@ export class DecisionConvergencePanel {
     this.mode = 'proposal';
     this.proposalId = proposalId;
     this.workUnitId = undefined;
+    this.editBaselines.clear();
     void this.load();
   }
 
@@ -118,6 +163,7 @@ export class DecisionConvergencePanel {
     this.mode = 'conflict';
     this.workUnitId = workUnitId;
     this.proposalId = undefined;
+    this.editBaselines.clear();
     void this.load();
   }
 
@@ -166,8 +212,9 @@ export class DecisionConvergencePanel {
   private async load(): Promise<void> {
     if (this.mode === 'conflict') {
       try {
-        const report = await this.get<{ workUnitId: string; status: string; content: string }>(
+        const report = await this.get<{ workUnitId: string; branchId: string; status: string; content: string }>(
           '/studio/workunits/' + this.workUnitId + '/conflict-report');
+        this.conflictBranchId = report.branchId;
         void this.panel.webview.postMessage({
           type: 'conflict',
           workUnitId: report.workUnitId,
@@ -249,14 +296,112 @@ export class DecisionConvergencePanel {
           }
           return;
         case 'openDiff': {
-          const path = String(msg.path ?? 'file');
+          const filePath = String(msg.path ?? 'file');
           const before = (msg.beforeContent as string | null | undefined) ?? '';
           const after = (msg.afterContent as string | null | undefined) ?? '';
-          const lang = path.includes('.') ? path.split('.').pop() : 'plaintext';
-          const left = await vscode.workspace.openTextDocument({ language: lang, content: before });
-          const right = await vscode.workspace.openTextDocument({ language: lang, content: after });
-          const title = path + ' (base ↔ proposed)';
-          await vscode.commands.executeCommand('vscode.diff', left.uri, right.uri, title);
+          const provider = getDiffProvider();
+          // Nonce keeps repeat "View Diff" clicks on the same path from colliding on identical
+          // URIs — registerTextDocumentContentProvider content is looked up by URI, so reusing one
+          // would show whatever the *last* set() call for that path wrote, not necessarily this one.
+          const nonce = Date.now().toString(36);
+          const leftUri = vscode.Uri.parse(`${NM_DIFF_SCHEME}:/${nonce}/base/${filePath}`);
+          const rightUri = vscode.Uri.parse(`${NM_DIFF_SCHEME}:/${nonce}/proposed/${filePath}`);
+          provider.set(leftUri, before);
+          provider.set(rightUri, after);
+          const title = filePath + ' (base ↔ proposed, read-only)';
+          // Explicit, non-preview, beside the Studio panel's own column — a bare vscode.diff call
+          // defaults to a preview tab, which a second "View Diff" click would silently reuse/replace
+          // instead of opening its own tab (and could otherwise land in the Studio panel's own
+          // column). Matches the same { preview: false } editFile already uses below.
+          await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title, {
+            preview: false,
+            viewColumn: vscode.ViewColumn.Beside,
+          });
+          break;
+        }
+        case 'editFile': {
+          const filePath = String(msg.path ?? '');
+          const branchId = this.editableBranchId;
+          if (!filePath || !branchId) {
+            void vscode.window.showWarningMessage('NodalMerge: no branch loaded to edit this file on.');
+            return;
+          }
+          try {
+            const [{ content }, { workingDirectory }] = await Promise.all([
+              this.get<{ content: string | null }>(
+                '/studio/workspace/read?branchId=' + encodeURIComponent(branchId) + '&path=' + encodeURIComponent(filePath)),
+              this.get<{ workingDirectory: string | null }>(
+                '/studio/workspace/path?branchId=' + encodeURIComponent(branchId)),
+            ]);
+            if (!workingDirectory) {
+              void vscode.window.showErrorMessage('NodalMerge: no materialized working directory for this branch.');
+              return;
+            }
+            // Baseline captured now, at the true "about to edit" boundary — not at whenever the
+            // proposal/conflict happened to load, which could be stale by the time editing starts.
+            this.editBaselines.set(filePath, content ?? '');
+            void this.panel.webview.postMessage({ type: 'editBaselineSet', path: filePath });
+            const realUri = vscode.Uri.file(path.join(workingDirectory, filePath));
+            const doc = await vscode.workspace.openTextDocument(realUri);
+            await vscode.window.showTextDocument(doc, { preview: false });
+          } catch (err) {
+            void vscode.window.showErrorMessage('NodalMerge: could not open ' + filePath + ' for editing — ' + String(err));
+          }
+          return;
+        }
+        case 'resyncWorkspace': {
+          const branchId = this.editableBranchId;
+          if (!branchId) {
+            void vscode.window.showWarningMessage('NodalMerge: no branch loaded to resync.');
+            return;
+          }
+          if (this.editBaselines.size === 0) {
+            void vscode.window.showInformationMessage(
+              'NodalMerge: nothing to resync — use "Edit File" first to open a file for editing.');
+            return;
+          }
+          try {
+            const { workingDirectory } = await this.get<{ workingDirectory: string | null }>(
+              '/studio/workspace/path?branchId=' + encodeURIComponent(branchId));
+            if (!workingDirectory) {
+              void vscode.window.showErrorMessage('NodalMerge: no materialized working directory for this branch.');
+              return;
+            }
+            const files: { path: string; content: string }[] = [];
+            const deletedPaths: string[] = [];
+            for (const [filePath, baseline] of this.editBaselines) {
+              const fullPath = path.join(workingDirectory, filePath);
+              let current: string | undefined;
+              try {
+                current = await fs.promises.readFile(fullPath, 'utf8');
+              } catch {
+                current = undefined; // file no longer exists on disk
+              }
+              if (current === undefined) {
+                if (baseline !== '') deletedPaths.push(filePath);
+              } else if (current !== baseline) {
+                files.push({ path: filePath, content: current });
+              }
+            }
+            if (files.length === 0 && deletedPaths.length === 0) {
+              void vscode.window.showInformationMessage('NodalMerge: no changes found in the file(s) you edited.');
+              return;
+            }
+            const result = await this.post<{ written: string[]; deleted: string[]; errors: { path: string; error: string }[] }>(
+              '/studio/branches/' + encodeURIComponent(branchId) + '/resync-files',
+              { files, deletedPaths });
+            this.editBaselines.clear();
+            if (result.errors?.length) {
+              void vscode.window.showWarningMessage(
+                'NodalMerge: resynced with errors — ' + result.errors.map(e => e.path + ': ' + e.error).join('; '));
+            } else {
+              void vscode.window.showInformationMessage(
+                `NodalMerge: resynced ${result.written.length} file(s)` +
+                (result.deleted.length ? `, deleted ${result.deleted.length}` : '') + '.');
+            }
+          } catch (err) {
+            void vscode.window.showErrorMessage('NodalMerge: resync failed — ' + String(err));
+          }
           break;
         }
         case 'validateEvidence':
@@ -805,9 +950,12 @@ const DC_HTML = `
       <h2>Decision Conflict</h2>
       <pre id="conflict-report-content" class="diff-pre"></pre>
       <p style="opacity:0.7;font-size:0.9em">
-        Resolve conflicting hypotheses manually — edit the conflicting files on the affected branches outside this panel,
-        then re-run the merger for this work unit.
+        Edit a conflicting file below, then use <strong>Resync Workspace</strong> to record your
+        fix as a real, hash-linked change on this branch. This report itself won't clear on its
+        own even after a successful fix — re-trigger review for this work unit (from Activity
+        Center, or via the API) to actually retry the merge.
       </p>
+      <div id="conflict-file-rows"></div>
     </section>
     <section id="section-goal">
       <h2>Goal</h2>

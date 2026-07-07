@@ -261,7 +261,12 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         var owningWorkUnit = proposal.WorkUnitId is not null && workUnits is not null
             ? await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false)
             : null;
-        var isInlineReviewPolicy = owningWorkUnit?.ReviewPolicy is ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid;
+        // See WorkspaceReviewScope — work units whose apply can reach the real repo are gated by
+        // WorkspaceReviewPolicy; everything else by TaskReviewPolicy.
+        var effectiveInlinePolicy = WorkspaceReviewScope.AppliesToRealRepo(owningWorkUnit)
+            ? owningWorkUnit?.WorkspaceReviewPolicy
+            : owningWorkUnit?.TaskReviewPolicy;
+        var isInlineReviewPolicy = effectiveInlinePolicy is ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid;
 
         var nextStatus = decision == MergeProposalStatus.Approved
             ? (isInlineReviewPolicy ? MergeProposalStatus.Approved : MergeProposalStatus.ReadyForReview)
@@ -419,7 +424,15 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 writeBackPath = repository.Path;
         }
 
-        if (!string.IsNullOrWhiteSpace(writeBackPath))
+        // Hard invariant: disk write-back may only ever fire for a work unit whose own apply is
+        // allowed to reach the real repo — see WorkspaceReviewScope. That's the top-level goal, or
+        // a work unit explicitly linked to its own RepositoryId (e.g. a Multi-Model Comparison
+        // child, which gets one from ArtifactExplorerPanel.ts despite having a ParentWorkUnitId).
+        // Ordinary fanned-out task children and generic experiment forks never get their own
+        // RepositoryId, so they stay excluded. Previously this was only incidentally true — nothing
+        // enforced it, so if SeedRepositoryPath were ever globally configured a plain task child
+        // would have written straight to disk with no policy gate. Enforce explicitly.
+        if (WorkspaceReviewScope.AppliesToRealRepo(owningWorkUnit) && !string.IsNullOrWhiteSpace(writeBackPath))
         {
             await WriteBackToRepositoryAsync(proposal.SourceBranch, writeBackPath, cancellationToken).ConfigureAwait(false);
 

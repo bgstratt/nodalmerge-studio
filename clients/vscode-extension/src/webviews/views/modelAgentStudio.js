@@ -436,13 +436,16 @@ export function init(ctx) {
   }
 
   $('btn-save-session-defaults').addEventListener('click', function() {
-    var sel = $('default-review-policy');
-    var reviewPolicy = sel ? sel.value : 'HumanRequired';
+    var taskSel = $('default-task-review-policy');
+    var workspaceSel = $('default-workspace-review-policy');
+    var taskPolicy = taskSel ? taskSel.value : 'HumanRequired';
+    var workspacePolicy = workspaceSel ? workspaceSel.value : 'HumanRequired';
     var checkedAgents = Array.prototype.slice.call(root.querySelectorAll('.domain-agent-toggle:checked'))
       .map(function(el) { return el.getAttribute('data-name'); });
     vscode.postMessage({
       type: 'saveSessionDefaults',
-      defaultReviewPolicy: reviewPolicy,
+      defaultTaskReviewPolicy: taskPolicy,
+      defaultWorkspaceReviewPolicy: workspacePolicy,
       enabledDomainAgents: checkedAgents,
     });
     var statusEl = $('session-defaults-status');
@@ -595,8 +598,10 @@ export function init(ctx) {
       renderTemplates();
       updateExploreStrategySelector();
       renderPipelineProfiles();
-      var rpSel = $('default-review-policy');
-      if (rpSel && msg.defaultReviewPolicy) { rpSel.value = msg.defaultReviewPolicy; }
+      var taskRpSel = $('default-task-review-policy');
+      if (taskRpSel && msg.defaultTaskReviewPolicy) { taskRpSel.value = msg.defaultTaskReviewPolicy; }
+      var workspaceRpSel = $('default-workspace-review-policy');
+      if (workspaceRpSel && msg.defaultWorkspaceReviewPolicy) { workspaceRpSel.value = msg.defaultWorkspaceReviewPolicy; }
       domainAgents = msg.domainAgents || [];
       enabledDomainAgents = msg.enabledDomainAgents || [];
       renderDomainAgentToggles();
@@ -618,8 +623,10 @@ export function init(ctx) {
       return;
     }
     if (msg.type === 'sessionDefaults') {
-      var sel = $('default-review-policy');
-      if (sel && msg.defaultReviewPolicy) { sel.value = msg.defaultReviewPolicy; }
+      var taskSel = $('default-task-review-policy');
+      if (taskSel && msg.defaultTaskReviewPolicy) { taskSel.value = msg.defaultTaskReviewPolicy; }
+      var workspaceSel = $('default-workspace-review-policy');
+      if (workspaceSel && msg.defaultWorkspaceReviewPolicy) { workspaceSel.value = msg.defaultWorkspaceReviewPolicy; }
       if (msg.enabledDomainAgents) {
         enabledDomainAgents = msg.enabledDomainAgents;
         renderDomainAgentToggles();

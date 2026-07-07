@@ -95,19 +95,61 @@ export function init(ctx) {
     vscode.postMessage({ type: 'explorerGoalResume', goalId: session.rootWorkUnitId });
   });
 
+  // ── Task/Workspace Review radios — reveal the hybrid-minutes textbox only when Hybrid is
+  // selected for that group. Two independent groups since Task Review (worker -> session) and
+  // Workspace Review (session -> your workspace on disk) are separate concerns.
+  function bindHybridMinutesToggle(radioName, minutesId) {
+    var minutesEl = $(minutesId);
+    root.querySelectorAll('input[name=' + radioName + ']').forEach(function(radio) {
+      radio.addEventListener('change', function() {
+        if (minutesEl) { minutesEl.classList.toggle('hidden', this.value !== 'Hybrid'); }
+      });
+    });
+  }
+  bindHybridMinutesToggle('gw-task-review-policy', 'gw-task-review-hybrid-minutes');
+  bindHybridMinutesToggle('gw-workspace-review-policy', 'gw-workspace-review-hybrid-minutes');
+
+  // ── Seed Task Review / Workspace Review from the session defaults (Model & Agent Studio panel
+  // / the nodalmerge.defaultTaskReviewPolicy / nodalmerge.defaultWorkspaceReviewPolicy settings)
+  // at goal-creation time only — this is a one-time seed, not a live binding: once the user
+  // changes a radio here it's this goal's own choice, and changing the session default later
+  // must not retroactively change it.
+  function seedReviewPolicyDefaults(taskPolicy, workspacePolicy) {
+    if (taskPolicy) {
+      var taskRadio = root.querySelector('input[name=gw-task-review-policy][value="' + taskPolicy + '"]');
+      if (taskRadio) { taskRadio.checked = true; }
+    }
+    if (workspacePolicy) {
+      var workspaceRadio = root.querySelector('input[name=gw-workspace-review-policy][value="' + workspacePolicy + '"]');
+      if (workspaceRadio) { workspaceRadio.checked = true; }
+    }
+  }
+
   $('gw-run').addEventListener('click', function() {
     var goal = $('gw-goal').value.trim();
     var strategy = $('gw-strategy').value;
     if (!goal) { return; }
     var forkConfig = collectForkConfig();
-    var reviewPolicyEl = root.querySelector('input[name=gw-review-policy]:checked');
+    var taskReviewPolicyEl = root.querySelector('input[name=gw-task-review-policy]:checked');
+    var workspaceReviewPolicyEl = root.querySelector('input[name=gw-workspace-review-policy]:checked');
+    var taskMinutesEl = $('gw-task-review-hybrid-minutes');
+    var workspaceMinutesEl = $('gw-workspace-review-hybrid-minutes');
     var targetEl = root.querySelector('input[name=gw-target]:checked');
     var btn = $('gw-run');
     btn.disabled = true;
     btn.textContent = 'Running…';
+    var taskReviewPolicy = taskReviewPolicyEl ? taskReviewPolicyEl.value : 'HumanRequired';
+    var workspaceReviewPolicy = workspaceReviewPolicyEl ? workspaceReviewPolicyEl.value : 'HumanRequired';
+    var taskMinutes = (taskReviewPolicy === 'Hybrid' && taskMinutesEl && taskMinutesEl.value.trim())
+      ? parseInt(taskMinutesEl.value.trim(), 10) : undefined;
+    var workspaceMinutes = (workspaceReviewPolicy === 'Hybrid' && workspaceMinutesEl && workspaceMinutesEl.value.trim())
+      ? parseInt(workspaceMinutesEl.value.trim(), 10) : undefined;
     vscode.postMessage({
       type: 'explorerRun', strategy: strategy, goal: goal, forkConfig: forkConfig,
-      reviewPolicy: reviewPolicyEl ? reviewPolicyEl.value : 'HumanRequired',
+      taskReviewPolicy: taskReviewPolicy,
+      workspaceReviewPolicy: workspaceReviewPolicy,
+      taskReviewHybridTimeoutMinutes: (taskMinutes && !isNaN(taskMinutes)) ? taskMinutes : undefined,
+      workspaceReviewHybridTimeoutMinutes: (workspaceMinutes && !isNaN(workspaceMinutes)) ? workspaceMinutes : undefined,
       bypassPromotionBranch: targetEl ? targetEl.value === 'direct' : false,
       referenceFiles: (state.referenceFiles || []).map(function(r) { return { repositoryId: r.repositoryId, path: r.path }; }),
     });
@@ -1351,6 +1393,10 @@ export function init(ctx) {
       } else {
         panel.classList.remove('visible');
       }
+      // Seed the Task/Workspace Review radios from the session defaults — one-time seed for the
+      // "new goal" form, not a live binding to already-created goals (this panel only ever holds
+      // form state for the goal about to be created via gw-run).
+      seedReviewPolicyDefaults(msg.defaultTaskReviewPolicy, msg.defaultWorkspaceReviewPolicy);
       return;
     }
     if (msg.type === 'sessions') {

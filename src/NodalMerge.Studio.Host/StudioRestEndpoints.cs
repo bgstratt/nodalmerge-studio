@@ -25,7 +25,10 @@ public static class StudioRestEndpoints
         string? ParentWorkUnitId = null,
         IReadOnlyList<string>? DependsOn = null,
         IReadOnlyList<string>? FileScope = null,
-        ReviewPolicy? ReviewPolicy = null,
+        ReviewPolicy? TaskReviewPolicy = null,
+        ReviewPolicy? WorkspaceReviewPolicy = null,
+        int? TaskReviewHybridTimeoutMinutes = null,
+        int? WorkspaceReviewHybridTimeoutMinutes = null,
         bool BypassPromotionBranch = false,
         string? SeedFromBranchId = null,
         WorkUnitExpectedOutputKind? ExpectedOutputKind = null,
@@ -296,8 +299,13 @@ public static class StudioRestEndpoints
         string ForkType,
         IReadOnlyList<ExperimentForkBody> Forks,
         string? ComparisonMetricHint = null,
-        string? ReviewPolicy = null,
-        string? SessionId = null);
+        string? TaskReviewPolicy = null,
+        string? WorkspaceReviewPolicy = null,
+        int? TaskReviewHybridTimeoutMinutes = null,
+        int? WorkspaceReviewHybridTimeoutMinutes = null,
+        string? SessionId = null,
+        string? RepositoryPath = null,
+        string? RepositoryId = null);
 
     private sealed record ExperimentForkBody(
         string? ProfileId = null,
@@ -693,6 +701,19 @@ public static class StudioRestEndpoints
             return result is not null ? Results.Ok(result) : Results.NotFound();
         });
 
+        // REST twin of nm_v1_workspace_read, for the extension's own use (it talks REST, not MCP).
+        // Used to capture a pre-edit baseline the instant a human opens a file for manual editing —
+        // see /studio/branches/{branchId}/resync-files below for why a baseline is unavoidable here.
+        app.MapGet("/studio/workspace/read", async (
+            [FromQuery] string branchId,
+            [FromQuery] string path,
+            IFileWorkspaceService fileWorkspace,
+            CancellationToken ct) =>
+        {
+            var content = await fileWorkspace.ReadAsync(branchId, path, ct).ConfigureAwait(false);
+            return Results.Ok(new { branchId, path, content, exists = content is not null });
+        });
+
         app.MapGet("/studio/workspace/path", async (
             [FromQuery] string branchId,
             IWorkspaceExecutionCommandService cmd,
@@ -976,7 +997,10 @@ public static class StudioRestEndpoints
         // settings at all (only GET .../children happened to reveal them, since it returns raw
         // WorkUnit records instead of this projection) — a real observability gap that made a
         // fan-out review-policy bug harder to diagnose than it needed to be.
-        reviewPolicy = wu.ReviewPolicy,
+        taskReviewPolicy = wu.TaskReviewPolicy,
+        workspaceReviewPolicy = wu.WorkspaceReviewPolicy,
+        taskReviewHybridTimeoutMinutes = wu.TaskReviewHybridTimeoutMinutes,
+        workspaceReviewHybridTimeoutMinutes = wu.WorkspaceReviewHybridTimeoutMinutes,
         bypassPromotionBranch = wu.BypassPromotionBranch,
         expectedOutputKind = wu.ExpectedOutputKind,
         repositoryId = wu.RepositoryId,
@@ -1109,7 +1133,7 @@ public static class StudioRestEndpoints
             if (content is null)
                 return Results.NotFound(new { error = "No conflict report exists for this work unit." });
 
-            return Results.Ok(new { workUnitId, status = wu.Status.ToString(), content });
+            return Results.Ok(new { workUnitId, branchId = wu.BranchId, status = wu.Status.ToString(), content });
         });
 
         app.MapGet("/studio/workunits/{workUnitId}/proposal-dag", async (
@@ -1185,7 +1209,10 @@ public static class StudioRestEndpoints
                 var wu = await workUnitCommands.CreateAsync(
                     new WorkUnitCreateCommand(body.Goal, body.Owner, body.BranchId, body.SuccessCriteria,
                         body.RepositoryPath, body.ParentWorkUnitId, body.DependsOn, body.FileScope,
-                        ReviewPolicy: body.ReviewPolicy, BypassPromotionBranch: body.BypassPromotionBranch,
+                        TaskReviewPolicy: body.TaskReviewPolicy, WorkspaceReviewPolicy: body.WorkspaceReviewPolicy,
+                        TaskReviewHybridTimeoutMinutes: body.TaskReviewHybridTimeoutMinutes,
+                        WorkspaceReviewHybridTimeoutMinutes: body.WorkspaceReviewHybridTimeoutMinutes,
+                        BypassPromotionBranch: body.BypassPromotionBranch,
                         SeedFromBranchId: body.SeedFromBranchId, ExpectedOutputKind: body.ExpectedOutputKind,
                         RepositoryId: body.RepositoryId, ReferenceFiles: body.ReferenceFiles),
                     ct).ConfigureAwait(false);
@@ -1855,6 +1882,58 @@ public static class StudioRestEndpoints
                 ? Results.Ok(new { branchId, path, materialized = true })
                 : Results.NotFound(new { branchId, path, materialized = false,
                     reason = "Path does not exist in the latest repository snapshot." });
+        });
+
+        // Replays manual on-disk edits (e.g. a human hand-fixing a pending proposal or a merge
+        // conflict directly in the branch's materialized working directory) through the same
+        // WriteAsync/DeleteAsync path agents use, so they become real hash-linked DAG ops instead
+        // of silently-untracked filesystem changes. Deliberately calls IFileWorkspaceService
+        // directly rather than going through McpToolDispatcher's agent-oriented WorkspaceWriteAsync
+        // — that path enforces a read-before-write guard and a file-lease conflict check meant to
+        // protect *concurrent live agent sessions* on an active branch, neither of which applies to
+        // a human editing an already-quiescent, under-review branch.
+        //
+        // Callers are expected to have captured each file's pre-edit content themselves (via
+        // GET /studio/workspace/read, at the moment they opened it for editing) — this endpoint
+        // has no way to know what changed on its own; see the "Edit File" flow in the Control
+        // Tower's Decision Convergence panel for how the baseline is captured and diffed.
+        app.MapPost("/studio/branches/{branchId}/resync-files", async (
+            string branchId,
+            ResyncFilesBody body,
+            IFileWorkspaceService fileWorkspace,
+            CancellationToken ct) =>
+        {
+            var written = new List<string>();
+            var deleted = new List<string>();
+            var errors = new List<object>();
+
+            foreach (var file in body.Files ?? [])
+            {
+                try
+                {
+                    await fileWorkspace.WriteAsync(branchId, file.Path, file.Content, ct).ConfigureAwait(false);
+                    written.Add(file.Path);
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(new { path = file.Path, error = ex.Message });
+                }
+            }
+
+            foreach (var path in body.DeletedPaths ?? [])
+            {
+                try
+                {
+                    await fileWorkspace.DeleteAsync(branchId, path, ct).ConfigureAwait(false);
+                    deleted.Add(path);
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(new { path, error = ex.Message });
+                }
+            }
+
+            return Results.Ok(new { branchId, written, deleted, errors });
         });
 
         // Slice 21b — explicit human action to promote candidate → main. Never automatic.
@@ -3972,6 +4051,10 @@ public static class StudioRestEndpoints
 
     private sealed record SwitchWorkspaceBody(string? RepositoryId = null, string? RepositoryPath = null, string? BranchId = null);
 
+    private sealed record ResyncFileEntry(string Path, string Content);
+
+    private sealed record ResyncFilesBody(List<ResyncFileEntry>? Files = null, List<string>? DeletedPaths = null);
+
     private static void MapRepositoryEndpoints(WebApplication app)
     {
         // List known repositories (mirrors nm_v1_repository_list) — used by the VS Code extension's
@@ -4177,12 +4260,19 @@ public static class StudioRestEndpoints
             if (forkTypeError is not null)
                 return Results.BadRequest(new { error = forkTypeError });
 
-            ReviewPolicy? reviewPolicy = null;
-            if (body.ReviewPolicy is not null && Enum.TryParse<ReviewPolicy>(body.ReviewPolicy, ignoreCase: true, out var rp))
-                reviewPolicy = rp;
+            ReviewPolicy? taskReviewPolicy = null;
+            if (body.TaskReviewPolicy is not null && Enum.TryParse<ReviewPolicy>(body.TaskReviewPolicy, ignoreCase: true, out var trp))
+                taskReviewPolicy = trp;
+            ReviewPolicy? workspaceReviewPolicy = null;
+            if (body.WorkspaceReviewPolicy is not null && Enum.TryParse<ReviewPolicy>(body.WorkspaceReviewPolicy, ignoreCase: true, out var wrp))
+                workspaceReviewPolicy = wrp;
 
             var forks = body.Forks.Select(f => new ExperimentForkSpec(f.ProfileId, f.ConstraintText)).ToList();
-            var spec  = new ExperimentSpec(body.Goal, body.Owner, forkType, forks, body.ComparisonMetricHint, reviewPolicy, body.SessionId);
+            var spec  = new ExperimentSpec(
+                body.Goal, body.Owner, forkType, forks, body.ComparisonMetricHint,
+                taskReviewPolicy, workspaceReviewPolicy,
+                body.TaskReviewHybridTimeoutMinutes, body.WorkspaceReviewHybridTimeoutMinutes,
+                body.SessionId, body.RepositoryPath, body.RepositoryId);
             var result = await experiments.CreateAsync(spec, ct).ConfigureAwait(false);
             return Results.Ok(result);
         });

@@ -217,9 +217,12 @@ public sealed class FanOutService : IFanOutService
                 // Bug fix — a fanned-out child previously always got CreateWorkUnitAsync's own
                 // default (ReviewPolicy.HumanRequired), regardless of what the parent goal's
                 // ReviewPolicy/BypassPromotionBranch were actually set to (e.g. via the Goal
-                // Workspace "Agent Approval" radio button) — reviewPolicy/bypassPromotionBranch
+                // Workspace "Task Review" radio button) — reviewPolicy/bypassPromotionBranch
                 // were simply never passed here. A child slice should inherit its parent's chosen
-                // review policy/merge target, not silently revert to the human-required default.
+                // task review policy/merge target, not silently revert to the human-required
+                // default. Children never need WorkspaceReviewPolicy — that field only ever gates
+                // the top-level goal's own apply into the real on-disk repo, and a child is never
+                // top-level.
                 var child = await _orchestrator.CreateWorkUnitAsync(
                     slice.Goal,
                     parent.Owner,
@@ -228,7 +231,8 @@ public sealed class FanOutService : IFanOutService
                     fileScope: slice.FileScope,
                     seedFromBranchId: parent.BranchId,
                     sliceId: slice.SliceId,
-                    reviewPolicy: parent.ReviewPolicy,
+                    taskReviewPolicy: parent.TaskReviewPolicy,
+                    taskReviewHybridTimeoutMinutes: parent.TaskReviewHybridTimeoutMinutes,
                     bypassPromotionBranch: parent.BypassPromotionBranch,
                     cancellationToken: ct).ConfigureAwait(false);
 

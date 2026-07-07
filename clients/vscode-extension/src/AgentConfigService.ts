@@ -88,13 +88,28 @@ export class AgentConfigService {
       .update('defaultTopology', name, vscode.ConfigurationTarget.Workspace);
   }
 
-  getDefaultReviewPolicy(): string {
-    return vscode.workspace.getConfiguration('nodalmerge').get<string>('defaultReviewPolicy') ?? 'HumanRequired';
+  // Split from a single defaultReviewPolicy setting: Task Review gates a worker proposal merging
+  // into the agent session ("Automatically integrates worker proposals into the agent session"),
+  // Workspace Review gates the session's own changes applying to the real workspace on disk
+  // ("Controls whether session changes are automatically applied to your workspace"). These are
+  // *seed* values only — consulted when Goal Workspace creates a new goal, not a live binding to
+  // an already-created goal's own radio state.
+  getDefaultTaskReviewPolicy(): string {
+    return vscode.workspace.getConfiguration('nodalmerge').get<string>('defaultTaskReviewPolicy') ?? 'HumanRequired';
   }
 
-  async saveDefaultReviewPolicy(policy: string): Promise<void> {
+  async saveDefaultTaskReviewPolicy(policy: string): Promise<void> {
     await vscode.workspace.getConfiguration('nodalmerge')
-      .update('defaultReviewPolicy', policy, vscode.ConfigurationTarget.Workspace);
+      .update('defaultTaskReviewPolicy', policy, vscode.ConfigurationTarget.Workspace);
+  }
+
+  getDefaultWorkspaceReviewPolicy(): string {
+    return vscode.workspace.getConfiguration('nodalmerge').get<string>('defaultWorkspaceReviewPolicy') ?? 'HumanRequired';
+  }
+
+  async saveDefaultWorkspaceReviewPolicy(policy: string): Promise<void> {
+    await vscode.workspace.getConfiguration('nodalmerge')
+      .update('defaultWorkspaceReviewPolicy', policy, vscode.ConfigurationTarget.Workspace);
   }
 
   async resolveApiKey(profile: AgentProfile, secrets: vscode.SecretStorage): Promise<string | undefined> {

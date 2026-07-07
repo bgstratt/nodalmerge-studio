@@ -257,7 +257,11 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
             if (workUnits is not null)
             {
                 var wu = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false);
-                if (wu?.ReviewPolicy is ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid)
+                // See WorkspaceReviewScope — work units whose apply can reach the real repo (top-level
+                // goals, plus any work unit explicitly linked to its own RepositoryId) are gated by
+                // WorkspaceReviewPolicy; everything else by TaskReviewPolicy.
+                var effectivePolicy = WorkspaceReviewScope.AppliesToRealRepo(wu) ? wu?.WorkspaceReviewPolicy : wu?.TaskReviewPolicy;
+                if (effectivePolicy is ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid)
                 {
                     var proposalIdToApply = created.ProposalId;
                     _ = Task.Run(async () =>

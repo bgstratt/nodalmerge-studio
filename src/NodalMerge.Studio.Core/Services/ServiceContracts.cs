@@ -550,7 +550,10 @@ public interface IOrchestratorService
         string? sliceId = null,
         IReadOnlyDictionary<string, string>? metadata = null,
         HypothesisForkType? forkType = null,
-        ReviewPolicy? reviewPolicy = null,
+        ReviewPolicy? taskReviewPolicy = null,
+        ReviewPolicy? workspaceReviewPolicy = null,
+        int? taskReviewHybridTimeoutMinutes = null,
+        int? workspaceReviewHybridTimeoutMinutes = null,
         bool bypassPromotionBranch = false,
         WorkUnitExpectedOutputKind expectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
         string? repositoryId = null,
@@ -577,7 +580,10 @@ public sealed record WorkUnitCreateCommand(
     IReadOnlyList<string>? DependsOn = null,
     IReadOnlyList<string>? FileScope = null,
     HypothesisForkType? ForkType = null,
-    ReviewPolicy? ReviewPolicy = null,
+    ReviewPolicy? TaskReviewPolicy = null,
+    ReviewPolicy? WorkspaceReviewPolicy = null,
+    int? TaskReviewHybridTimeoutMinutes = null,
+    int? WorkspaceReviewHybridTimeoutMinutes = null,
     bool BypassPromotionBranch = false,
     string? SeedFromBranchId = null,
     WorkUnitExpectedOutputKind? ExpectedOutputKind = null,
@@ -2035,8 +2041,21 @@ public sealed record ExperimentSpec(
     HypothesisForkType ForkType,
     IReadOnlyList<ExperimentForkSpec> Forks,
     string? ComparisonMetricHint = null,
-    ReviewPolicy? ReviewPolicy = null,
-    string? SessionId = null);
+    // Split from a single ReviewPolicy field. The experiment's parent container work unit has no
+    // ParentWorkUnitId (it's never enqueued/executed, but is structurally "top-level"), so it
+    // carries WorkspaceReviewPolicy; the fork children are true children, so they carry
+    // TaskReviewPolicy — same split as a fresh top-level goal (WorkUnitCreateCommand).
+    ReviewPolicy? TaskReviewPolicy = null,
+    ReviewPolicy? WorkspaceReviewPolicy = null,
+    int? TaskReviewHybridTimeoutMinutes = null,
+    int? WorkspaceReviewHybridTimeoutMinutes = null,
+    string? SessionId = null,
+    // Without one of these, forks never get their own RepositoryId, and
+    // WorkspaceReviewScope.AppliesToRealRepo (NodalMerge.Studio.Merge) only allows disk
+    // write-back for a top-level goal or a work unit explicitly linked to its own repo — a fork
+    // (always has a ParentWorkUnitId) needs the latter to ever apply into the real repo.
+    string? RepositoryPath = null,
+    string? RepositoryId = null);
 
 public sealed record ExperimentResult(
     string ExperimentId,

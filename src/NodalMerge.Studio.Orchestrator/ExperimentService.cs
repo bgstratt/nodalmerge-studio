@@ -17,7 +17,8 @@ public sealed class ExperimentService(
     IMergeService merges,
     IMergeCommandService mergeCommands,
     IDecisionNodeService decisions,
-    IStudioNodeStore nodeStore) : IExperimentService
+    IStudioNodeStore nodeStore,
+    IRepositoryRegistryService repositories) : IExperimentService
 {
     private static readonly JsonSerializerOptions JsonOpts = new() { PropertyNameCaseInsensitive = true };
 
@@ -32,12 +33,30 @@ public sealed class ExperimentService(
         if (typeError is not null)
             throw new ArgumentException(typeError, nameof(spec));
 
+        // Resolve a durable RepositoryId once, same precedence as WorkUnitCommandService.CreateAsync
+        // (RepositoryId takes priority over a raw path; a raw path auto-registers). Every fork gets
+        // this same id below — without one, a fork (always has a ParentWorkUnitId) is never allowed
+        // to write its apply back to the real repo (see WorkspaceReviewScope.AppliesToRealRepo).
+        var effectiveRepositoryId = spec.RepositoryId;
+        if (effectiveRepositoryId is not null)
+        {
+            _ = await repositories.GetAsync(effectiveRepositoryId, ct).ConfigureAwait(false)
+                ?? throw new KeyNotFoundException($"Repository '{effectiveRepositoryId}' was not found.");
+        }
+        else if (!string.IsNullOrWhiteSpace(spec.RepositoryPath))
+        {
+            var registered = await repositories.RegisterAsync(spec.RepositoryPath, label: null, ct).ConfigureAwait(false);
+            effectiveRepositoryId = registered.RepositoryId;
+        }
+
         // Parent work unit — a named container, never enqueued or executed.
         var parent = await orchestrator.CreateWorkUnitAsync(
             goal:         spec.Goal,
             owner:        spec.Owner,
             metadata:     new Dictionary<string, string> { ["experimentForkType"] = spec.ForkType.ToString() },
-            reviewPolicy: spec.ReviewPolicy,
+            workspaceReviewPolicy: spec.WorkspaceReviewPolicy,
+            workspaceReviewHybridTimeoutMinutes: spec.WorkspaceReviewHybridTimeoutMinutes,
+            repositoryId: effectiveRepositoryId,
             cancellationToken: ct).ConfigureAwait(false);
 
         var forkIds = new List<string>(spec.Forks.Count);
@@ -58,7 +77,15 @@ public sealed class ExperimentService(
                 parentWorkUnitId: parent.WorkUnitId,
                 forkType:         spec.ForkType,
                 metadata:         forkMeta.Count > 0 ? forkMeta : null,
-                reviewPolicy:     spec.ReviewPolicy,
+                taskReviewPolicy: spec.TaskReviewPolicy,
+                taskReviewHybridTimeoutMinutes: spec.TaskReviewHybridTimeoutMinutes,
+                // A fork given its own RepositoryId is gated by WorkspaceReviewPolicy instead of
+                // TaskReviewPolicy (see WorkspaceReviewScope.AppliesToRealRepo) — pass both through
+                // so the fork's own apply gate matches what the caller actually selected, same as
+                // Multi-Model Comparison's children (ArtifactExplorerPanel.ts).
+                workspaceReviewPolicy: spec.WorkspaceReviewPolicy,
+                workspaceReviewHybridTimeoutMinutes: spec.WorkspaceReviewHybridTimeoutMinutes,
+                repositoryId: effectiveRepositoryId,
                 cancellationToken: ct).ConfigureAwait(false);
 
             forkIds.Add(forkWu.WorkUnitId);

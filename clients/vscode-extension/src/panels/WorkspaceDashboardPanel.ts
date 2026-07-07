@@ -299,15 +299,25 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
             ignoreFocusOut: true,
           });
           if (!owner) { return; }
-          const reviewPolicyPick = await vscode.window.showQuickPick(
+          const taskReviewPolicyPick = await vscode.window.showQuickPick(
             [
               { label: '$(person) Human Required', description: 'Proposal waits for manual apply (default)', value: 'HumanRequired' },
               { label: '$(robot) Agent Approval', description: 'Reviewer agent approves; merges automatically', value: 'AgentApproval' },
               { label: '$(clock) Hybrid (5 min)', description: 'Agent approves; auto-merges after 5 min unless overridden', value: 'Hybrid' },
             ],
-            { placeHolder: 'Review policy', ignoreFocusOut: true }
+            { placeHolder: 'Task Review — automatically integrates worker proposals into the agent session', ignoreFocusOut: true }
           );
-          if (!reviewPolicyPick) { return; }
+          if (!taskReviewPolicyPick) { return; }
+
+          const workspaceReviewPolicyPick = await vscode.window.showQuickPick(
+            [
+              { label: '$(person) Human Required', description: 'Proposal waits for manual apply (default)', value: 'HumanRequired' },
+              { label: '$(robot) Agent Approval', description: 'Reviewer agent approves; merges automatically', value: 'AgentApproval' },
+              { label: '$(clock) Hybrid (5 min)', description: 'Agent approves; auto-merges after 5 min unless overridden', value: 'Hybrid' },
+            ],
+            { placeHolder: 'Workspace Review — controls whether session changes are automatically applied to your workspace', ignoreFocusOut: true }
+          );
+          if (!workspaceReviewPolicyPick) { return; }
 
           // Slice 21c — when promotion branch is on, let the user pick the effective target;
           // "Direct" sets BypassPromotionBranch so this work unit's applies skip candidate.
@@ -327,7 +337,8 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           const repositoryPath = resolveRepositoryPath();
           await this.post('/studio/workunits', {
             goal, owner,
-            reviewPolicy: reviewPolicyPick.value,
+            taskReviewPolicy: taskReviewPolicyPick.value,
+            workspaceReviewPolicy: workspaceReviewPolicyPick.value,
             bypassPromotionBranch,
             ...(repositoryPath ? { repositoryPath } : {}),
           });

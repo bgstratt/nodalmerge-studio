@@ -29,6 +29,7 @@ export class ModelAgentStudioPanel {
   private readonly configService: AgentConfigService;
   private readonly secrets: vscode.SecretStorage;
   private readonly lmProxyBaseUrl: string;
+  private readonly onConfigChanged?: () => void;
 
   constructor(
     panel: vscode.WebviewPanel,
@@ -36,12 +37,17 @@ export class ModelAgentStudioPanel {
     configService: AgentConfigService,
     secrets: vscode.SecretStorage,
     lmProxyBaseUrl: string,
+    // Lets Goal Workspace (agent profiles feed its strategy list and fork-config picker, and
+    // session defaults seed its Task/Workspace Review radios) refresh immediately after a save
+    // here, instead of waiting for its own ~30s poll cadence.
+    onConfigChanged?: () => void,
   ) {
     this.panel          = panel;
     this.baseUrl        = baseUrl;
     this.configService  = configService;
     this.secrets        = secrets;
     this.lmProxyBaseUrl = lmProxyBaseUrl;
+    this.onConfigChanged = onConfigChanged;
   }
 
   /** Called once by the shell right after construction — was the tail of createOrShow(). */
@@ -88,7 +94,8 @@ export class ModelAgentStudioPanel {
       credentialStatus,
       templates:            this.configService.getTemplates(),
       defaultTopology:      this.configService.getDefaultTopology(),
-      defaultReviewPolicy:  this.configService.getDefaultReviewPolicy(),
+      defaultTaskReviewPolicy:      this.configService.getDefaultTaskReviewPolicy(),
+      defaultWorkspaceReviewPolicy: this.configService.getDefaultWorkspaceReviewPolicy(),
       pipelineProfiles,
       domainAgents,
       enabledDomainAgents,
@@ -107,11 +114,13 @@ export class ModelAgentStudioPanel {
       case 'saveProfiles':
         await this.configService.saveProfiles(msg.profiles as AgentProfile[]);
         void vscode.window.showInformationMessage('NodalMerge: Agent profiles saved.');
+        this.onConfigChanged?.();
         break;
 
       case 'saveTemplates':
         await this.configService.saveTemplates(msg.templates as TopologyTemplate[]);
         void vscode.window.showInformationMessage('NodalMerge: Topology templates saved.');
+        this.onConfigChanged?.();
         break;
 
       case 'setDefault':
@@ -167,17 +176,27 @@ export class ModelAgentStudioPanel {
       }
 
       case 'saveSessionDefaults': {
-        const policy = msg.defaultReviewPolicy as string;
+        const taskPolicy      = msg.defaultTaskReviewPolicy as string;
+        const workspacePolicy = msg.defaultWorkspaceReviewPolicy as string;
         const enabledDomainAgents = (msg.enabledDomainAgents as string[] | undefined) ?? [];
-        if (policy) {
-          await this.configService.saveDefaultReviewPolicy(policy);
+        if (taskPolicy) {
+          await this.configService.saveDefaultTaskReviewPolicy(taskPolicy);
+        }
+        if (workspacePolicy) {
+          await this.configService.saveDefaultWorkspaceReviewPolicy(workspacePolicy);
         }
         try {
           const currentOpts = await this.get<Record<string, unknown>>('/studio/options');
           await this.post('/studio/options', { ...currentOpts, enabledDomainAgents });
         } catch { /* host may not be running */ }
-        void this.panel.webview.postMessage({ type: 'sessionDefaults', defaultReviewPolicy: policy, enabledDomainAgents });
+        void this.panel.webview.postMessage({
+          type: 'sessionDefaults',
+          defaultTaskReviewPolicy: taskPolicy,
+          defaultWorkspaceReviewPolicy: workspacePolicy,
+          enabledDomainAgents,
+        });
         void vscode.window.showInformationMessage('NodalMerge: Session defaults saved.');
+        this.onConfigChanged?.();
         break;
       }
 
@@ -484,11 +503,21 @@ const MAS_HTML = `
       <h3>Session Defaults</h3>
       <p class="sub">These defaults apply to new goals created in the Goal Workspace.</p>
       <div class="field">
-        <label>Default Review Policy</label>
-        <select id="default-review-policy">
+        <label>Task Review</label>
+        <p class="sub">Automatically integrates worker proposals into the agent session</p>
+        <select id="default-task-review-policy">
           <option value="HumanRequired">Human Required — manual apply (default)</option>
           <option value="AgentApproval">Agent Approval — reviewer agent auto-merges</option>
-          <option value="Hybrid">Hybrid — agent approves; auto-merges after 5 min</option>
+          <option value="Hybrid">Hybrid — agent approves; auto-merges after a time delay</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Workspace Review</label>
+        <p class="sub">Controls whether session changes are automatically applied to your workspace</p>
+        <select id="default-workspace-review-policy">
+          <option value="HumanRequired">Human Required — manual apply (default)</option>
+          <option value="AgentApproval">Agent Approval — reviewer agent auto-merges</option>
+          <option value="Hybrid">Hybrid — agent approves; auto-merges after a time delay</option>
         </select>
       </div>
       <div class="field">

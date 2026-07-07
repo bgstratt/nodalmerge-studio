@@ -127,7 +127,9 @@ public class AutoReviewRuleTests
             null,
             [],
             [],
-            ReviewPolicy: policy);
+            // ParentWorkUnitId is null above (top-level), so AutoReviewRule consults
+            // WorkspaceReviewPolicy for this work unit.
+            WorkspaceReviewPolicy: policy);
 
     private static MergeProposal MakeProposal(string proposalId, MergeProposalStatus status) =>
         new(proposalId, "feat/x", "main", "goal", "summary", "desc", null, null, null, status);

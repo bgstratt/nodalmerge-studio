@@ -368,6 +368,19 @@ internal sealed class WorkspaceExecutionService(
             psi.Arguments = arguments;
         }
 
+        // ProcessStartInfo inherits the current process's environment by default. When the Studio
+        // host itself was spawned by HostManager (VS Code extension, both dev and packaged), its own
+        // process env carries ASPNETCORE_URLS/ASPNETCORE_HTTP_PORTS/ASPNETCORE_HTTPS_PORTS pointing
+        // at the *Studio host's own* bind address (default 127.0.0.1:5080) — standard ASP.NET Core
+        // variables any .NET web app reads automatically. Without scrubbing them here, a build/test/
+        // run command for the project under review (if it has no launchSettings.json of its own to
+        // override them) would silently inherit Studio's own port and try to bind the same address
+        // Studio itself is already listening on.
+        foreach (var key in new[] { "ASPNETCORE_URLS", "ASPNETCORE_HTTP_PORTS", "ASPNETCORE_HTTPS_PORTS" })
+        {
+            psi.EnvironmentVariables.Remove(key);
+        }
+
         return psi;
     }
 }

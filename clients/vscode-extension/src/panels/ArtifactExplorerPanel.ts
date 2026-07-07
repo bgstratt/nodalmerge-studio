@@ -236,7 +236,9 @@ export class GoalWorkspacePanel {
     if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = undefined; }
   }
 
-  private async sendStrategies(): Promise<void> {
+  /** Public so ModelAgentStudioPanel (via StudioShellPanel) can push a refresh immediately after
+   *  saving profiles/templates/session defaults, instead of waiting for the ~30s poll cadence. */
+  async sendStrategies(): Promise<void> {
     if (!this.configService) { return; }
     const templates = this.configService.getTemplates();
     const profiles = this.configService.getProfiles();
@@ -271,7 +273,14 @@ export class GoalWorkspacePanel {
         strategies.push({ name: es.name, orchestrator: '', workers: [], disabled: false, experimentType: es.experimentType });
       }
     }
-    void this.panel.webview.postMessage({ type: 'strategies', strategies, profiles: profiles.map(p => ({ id: p.id, label: p.label, domain: p.domain, model: p.model })) });
+    void this.panel.webview.postMessage({
+      type: 'strategies', strategies, profiles: profiles.map(p => ({ id: p.id, label: p.label, domain: p.domain, model: p.model })),
+      // Seed values only — consulted by goalWorkspace.js when a new goal's radios first render.
+      // Not a live binding: once a goal exists, changing the session default must not retroactively
+      // change that goal's already-set values.
+      defaultTaskReviewPolicy: this.configService.getDefaultTaskReviewPolicy(),
+      defaultWorkspaceReviewPolicy: this.configService.getDefaultWorkspaceReviewPolicy(),
+    });
   }
 
   // Slice 12c — live stage badges.
@@ -579,7 +588,10 @@ export class GoalWorkspacePanel {
         case 'explorerRun':
           await this.handleRun(
             msg.strategy as string, msg.goal as string,
-            (msg.reviewPolicy as string) || undefined,
+            (msg.taskReviewPolicy as string) || undefined,
+            (msg.workspaceReviewPolicy as string) || undefined,
+            (msg.taskReviewHybridTimeoutMinutes as number) || undefined,
+            (msg.workspaceReviewHybridTimeoutMinutes as number) || undefined,
             !!msg.bypassPromotionBranch,
             (msg.forkConfig as Array<{ profileId: string; constraintHint?: string }>) || [],
             (msg.referenceFiles as Array<{ repositoryId: string; path: string }>) || [],
@@ -908,7 +920,10 @@ export class GoalWorkspacePanel {
   }
 
   private async handleRun(
-    strategy: string, goal: string, reviewPolicy?: string, bypassPromotionBranch?: boolean,
+    strategy: string, goal: string,
+    taskReviewPolicy?: string, workspaceReviewPolicy?: string,
+    taskReviewHybridTimeoutMinutes?: number, workspaceReviewHybridTimeoutMinutes?: number,
+    bypassPromotionBranch?: boolean,
     forkConfig?: Array<{ profileId: string; constraintHint?: string }>,
     referenceFiles?: Array<{ repositoryId: string; path: string }>,
   ): Promise<void> {
@@ -939,6 +954,12 @@ export class GoalWorkspacePanel {
         return;
       }
       try {
+        // Slice 22c fix — without a repositoryPath, forks never receive their own RepositoryId,
+        // and WorkspaceReviewScope.AppliesToRealRepo (nodalmerge-studio/src/NodalMerge.Studio.Merge/
+        // WorkspaceReviewScope.cs) only allows disk write-back for a top-level goal or a work unit
+        // explicitly linked to its own repo — a fork (which always has a ParentWorkUnitId) needs the
+        // latter. Same mechanism Multi-Model Comparison's children already use below.
+        const repositoryPath = resolveRepositoryPath();
         const result = await this.post<{ experimentId: string; parentWorkUnitId: string; forkWorkUnitIds: string[] }>(
           '/studio/experiments',
           {
@@ -946,7 +967,11 @@ export class GoalWorkspacePanel {
             owner: 'user',
             forkType: EXPERIMENT_FORK_TYPES[strategy],
             forks: forks.map(f => ({ profileId: f.profileId || undefined, constraintText: f.constraintHint || undefined })),
-            ...(reviewPolicy ? { reviewPolicy } : {}),
+            ...(taskReviewPolicy ? { taskReviewPolicy } : {}),
+            ...(workspaceReviewPolicy ? { workspaceReviewPolicy } : {}),
+            ...(taskReviewHybridTimeoutMinutes ? { taskReviewHybridTimeoutMinutes } : {}),
+            ...(workspaceReviewHybridTimeoutMinutes ? { workspaceReviewHybridTimeoutMinutes } : {}),
+            ...(repositoryPath ? { repositoryPath } : {}),
           },
         );
         const session = await this.post<ExecutionSession>('/studio/sessions', {
@@ -1005,7 +1030,10 @@ export class GoalWorkspacePanel {
 
         const repositoryPath = resolveRepositoryPath();
         const reviewAndTarget = {
-          ...(reviewPolicy ? { reviewPolicy } : {}),
+          ...(taskReviewPolicy ? { taskReviewPolicy } : {}),
+          ...(workspaceReviewPolicy ? { workspaceReviewPolicy } : {}),
+          ...(taskReviewHybridTimeoutMinutes ? { taskReviewHybridTimeoutMinutes } : {}),
+          ...(workspaceReviewHybridTimeoutMinutes ? { workspaceReviewHybridTimeoutMinutes } : {}),
           bypassPromotionBranch: !!bypassPromotionBranch,
         };
         // Create a parent work unit to hold both model runs
@@ -1117,7 +1145,10 @@ export class GoalWorkspacePanel {
       const rootWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
         goal,
         owner: template.orchestrator,
-        ...(reviewPolicy ? { reviewPolicy } : {}),
+        ...(taskReviewPolicy ? { taskReviewPolicy } : {}),
+        ...(workspaceReviewPolicy ? { workspaceReviewPolicy } : {}),
+        ...(taskReviewHybridTimeoutMinutes ? { taskReviewHybridTimeoutMinutes } : {}),
+        ...(workspaceReviewHybridTimeoutMinutes ? { workspaceReviewHybridTimeoutMinutes } : {}),
         bypassPromotionBranch: !!bypassPromotionBranch,
         ...(repositoryPath ? { repositoryPath } : {}),
         ...referenceFilesPatch,
@@ -1400,6 +1431,8 @@ const GW_CSS = `
   .gw-radio-group { display: flex; gap: 12px; align-items: center; }
   .gw-radio-group-label { opacity: 0.6; text-transform: uppercase; font-size: 0.72em; letter-spacing: 0.05em; margin-right: 4px; }
   .gw-radio-option { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  .gw-hybrid-minutes { width: 48px; padding: 2px 4px; font-size: 0.85em; }
+  .hidden { display: none; }
   .gw-target-row { display: none; }
   .gw-target-row.visible { display: flex; }
   .gw-body { flex: 1; display: flex; overflow: hidden; min-height: 0; }
@@ -1609,11 +1642,19 @@ const GW_HTML = `
     <button id="gw-settings-btn" class="ghost" title="Exploration Settings">&#9881;</button>
   </div>
   <div class="gw-options-row">
-    <div class="gw-radio-group">
-      <span class="gw-radio-group-label">Review</span>
-      <label class="gw-radio-option"><input type="radio" name="gw-review-policy" value="HumanRequired" checked/> Human Required</label>
-      <label class="gw-radio-option"><input type="radio" name="gw-review-policy" value="AgentApproval"/> Agent Approval</label>
-      <label class="gw-radio-option"><input type="radio" name="gw-review-policy" value="Hybrid"/> Hybrid (5 min)</label>
+    <div class="gw-radio-group" title="Automatically integrates worker proposals into the agent session">
+      <span class="gw-radio-group-label">Task Review</span>
+      <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="HumanRequired" checked/> Human Required</label>
+      <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="AgentApproval"/> Agent Approval</label>
+      <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="Hybrid"/> Hybrid</label>
+      <input type="text" id="gw-task-review-hybrid-minutes" class="gw-hybrid-minutes hidden" placeholder="5" title="Minutes before auto-merge">
+    </div>
+    <div class="gw-radio-group" title="Controls whether session changes are automatically applied to your workspace">
+      <span class="gw-radio-group-label">Workspace Review</span>
+      <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="HumanRequired" checked/> Human Required</label>
+      <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="AgentApproval"/> Agent Approval</label>
+      <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="Hybrid"/> Hybrid</label>
+      <input type="text" id="gw-workspace-review-hybrid-minutes" class="gw-hybrid-minutes hidden" placeholder="5" title="Minutes before auto-apply">
     </div>
     <div class="gw-radio-group gw-target-row" id="gw-target-row">
       <span class="gw-radio-group-label">Target</span>

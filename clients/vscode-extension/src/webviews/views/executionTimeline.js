@@ -103,9 +103,13 @@ export function init(ctx) {
       html += '<span class="mono">' + esc(g.workUnitId) + '</span>';
       html += '<span class="mono">fork: ' + esc(g.branchId) + '</span>';
       if (g.owner) { html += '<span class="mono">owner: ' + esc(g.owner) + '</span>'; }
-      if (g.reviewPolicy && g.reviewPolicy !== 'HumanRequired') {
-        var rp = g.reviewPolicy === 'AgentApproval' ? '🤖 Agent Approval' : '⏱ Hybrid';
-        html += '<span class="badge reviewing">' + rp + '</span>';
+      if (g.taskReviewPolicy && g.taskReviewPolicy !== 'HumanRequired') {
+        var trp = g.taskReviewPolicy === 'AgentApproval' ? '🤖 Agent Approval' : '⏱ Hybrid';
+        html += '<span class="badge reviewing" title="Task Review">Task: ' + trp + '</span>';
+      }
+      if (g.workspaceReviewPolicy && g.workspaceReviewPolicy !== 'HumanRequired') {
+        var wrp = g.workspaceReviewPolicy === 'AgentApproval' ? '🤖 Agent Approval' : '⏱ Hybrid';
+        html += '<span class="badge reviewing" title="Workspace Review">Workspace: ' + wrp + '</span>';
       }
       if (globalUsePromotionBranch) {
         html += '<span class="badge" title="Applies land on ' + esc(globalCandidateBranchId) + '; promote to main manually">→ ' + esc(globalCandidateBranchId) + '</span>';

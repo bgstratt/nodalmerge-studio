@@ -52,7 +52,14 @@ public sealed class CounterfactualService(
             branchedFromProposalId:   command.ProposalId,
             forkType:                 HypothesisForkType.Model,
             metadata:                 counterfactualMeta,
-            reviewPolicy:             originalWu.ReviewPolicy,
+            taskReviewPolicy:      originalWu.TaskReviewPolicy,
+            workspaceReviewPolicy: originalWu.WorkspaceReviewPolicy,
+            taskReviewHybridTimeoutMinutes:      originalWu.TaskReviewHybridTimeoutMinutes,
+            workspaceReviewHybridTimeoutMinutes: originalWu.WorkspaceReviewHybridTimeoutMinutes,
+            // This fork inherits originalWu.ParentWorkUnitId (a sibling, not a child), so it must
+            // also inherit RepositoryId — otherwise its own apply resolves the wrong (or no)
+            // write-back path in a multi-repo setup when it ends up top-level.
+            repositoryId: originalWu.RepositoryId,
             cancellationToken:        ct).ConfigureAwait(false);
 
         // 4. Enqueue the counterfactual work unit with the new profile

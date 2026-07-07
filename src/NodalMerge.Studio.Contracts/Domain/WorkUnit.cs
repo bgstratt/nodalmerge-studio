@@ -57,7 +57,18 @@ public sealed record WorkUnit(
     WorkUnitFanOutInfo? FanOutInfo = null,
     string? BranchedFromProposalId = null,
     HypothesisForkType? ForkType = null,
-    ReviewPolicy ReviewPolicy = ReviewPolicy.HumanRequired,
+    // Split from a single ReviewPolicy field: TaskReviewPolicy gates a child/task proposal
+    // merging into its parent/orchestrator's branch (worker -> candidate); WorkspaceReviewPolicy
+    // gates the top-level goal's own proposal applying into the real on-disk repo
+    // (orchestrator -> workspace). Children only ever use TaskReviewPolicy (they're never
+    // top-level), while the top-level goal's own apply is gated by WorkspaceReviewPolicy.
+    ReviewPolicy TaskReviewPolicy = ReviewPolicy.HumanRequired,
+    ReviewPolicy WorkspaceReviewPolicy = ReviewPolicy.HumanRequired,
+    // Per-work-unit override for the Hybrid countdown duration; null falls back to
+    // AutoReviewRule's 5-minute default. Only the field matching the policy actually selected
+    // (Task vs Workspace, per AutoReviewRule's top-level/child branch) is consulted.
+    int? TaskReviewHybridTimeoutMinutes = null,
+    int? WorkspaceReviewHybridTimeoutMinutes = null,
     // Slice 21c — per-work-unit override: when true, applies always target the proposal's
     // TargetBranch directly even if WorkspaceOptions.UsePromotionBranch is on session-wide.
     bool BypassPromotionBranch = false,
