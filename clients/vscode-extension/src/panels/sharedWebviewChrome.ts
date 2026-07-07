@@ -34,8 +34,17 @@ export function scopeViewCss(css: string, containerId: string): string {
   // `height: 100vh` is dropped, not translated to `:scope`'s height — the container is already
   // sized to fill its tab pane via the shell's own `position: absolute; inset: 0` (StudioShellPanel
   // CSS), and an explicit 100vh here would override that and overflow past the tab bar.
+  //
+  // Same problem, same fix, for `:root { --nm-*: ...; }`: every view defines its own `--nm-fg`/
+  // `--nm-input-bdr`/etc. custom-property palette on :root, assuming it owned the document. :root
+  // only ever matches <html>, which is never a descendant of the container div either — so every
+  // one of these blocks was silently matching nothing once wrapped in @scope, meaning none of a
+  // view's --nm-* custom properties were ever actually set (var() references with no fallback just
+  // went invalid). Rewriting to :scope makes the container div itself carry the properties, which
+  // then inherit normally to every descendant, exactly like :root does for the whole document.
   const scoped = css
     .replace(/(^|\}|\s)body(\s*\{)/g, '$1:scope$2')
+    .replace(/(^|\}|\s):root(\s*\{)/g, '$1:scope$2')
     .replace(/height:\s*100vh;?/g, '');
   return `@scope (#${containerId}) {\n${scoped}\n}`;
 }
@@ -55,12 +64,20 @@ export const SHELL_CSS_VARS = `
     --nm-btn:        var(--vscode-button-background);
     --nm-btn-fg:     var(--vscode-button-foreground);
     --nm-btn-hover:  var(--vscode-button-hoverBackground);
+    --nm-input-bg:   var(--vscode-input-background, #3c3c3c);
+    --nm-input-fg:   var(--vscode-input-foreground, #ccc);
+    /* Many themes leave --vscode-input-border unset (flat input design) or set it equal to the
+       background, either of which reads as "no separation" against the surrounding UI. Derive a
+       subtle border from the foreground color instead, so there's always some visible contrast
+       regardless of what the active theme does with inputBorder. */
+    --nm-input-bdr:  color-mix(in srgb, var(--nm-fg) 25%, transparent);
     --nm-font:       var(--vscode-font-family);
     --nm-mono:       var(--vscode-editor-font-family, monospace);
     --nm-size:       var(--vscode-font-size, 13px);
     --nm-success:    #4dac26;
     --nm-warn:       #cca700;
     --nm-error:      #f14c4c;
+    --nm-info:       var(--vscode-textLink-foreground, #3794ff);
   }
   * { box-sizing: border-box; }
   html, body {
@@ -69,6 +86,21 @@ export const SHELL_CSS_VARS = `
     margin: 0; padding: 0; height: 100%; overflow: hidden;
   }
   body { display: flex; flex-direction: column; }
+  /* Shared, theme-correct base for every view's native form controls. A view can still override
+     these locally (its own scoped rule wins over this unscoped one at equal specificity — see
+     CSS scoping proximity), but views that don't bother get sane non-white, bordered defaults
+     instead of raw browser UA styling. */
+  select, textarea, input[type=text] {
+    background: var(--nm-input-bg); color: var(--nm-input-fg); border: 1px solid var(--nm-input-bdr);
+    border-radius: 3px; padding: 4px 6px; font-family: var(--nm-font); font-size: 0.9em;
+  }
+  button {
+    background: var(--nm-btn); color: var(--nm-btn-fg); border: 1px solid var(--nm-input-bdr);
+    border-radius: 3px; padding: 4px 10px; font-family: var(--nm-font); font-size: 0.9em; cursor: pointer;
+  }
+  button:hover { background: var(--nm-btn-hover); }
+  button.ghost { background: transparent; color: var(--nm-fg); border: 1px solid var(--nm-border); }
+  button.ghost:hover { background: color-mix(in srgb, var(--nm-border) 50%, transparent); }
   #nm-shell-tabbar {
     display: flex; flex-shrink: 0;
     border-bottom: 1px solid var(--nm-border);

@@ -1388,7 +1388,11 @@ const GW_CSS = `
     --nm-btn-hover:  var(--vscode-button-hoverBackground);
     --nm-input-bg:   var(--vscode-input-background, #3c3c3c);
     --nm-input-fg:   var(--vscode-input-foreground, #ccc);
-    --nm-input-bdr:  var(--vscode-input-border, #555);
+    /* Many themes leave --vscode-input-border unset (flat input design) or set it equal to the
+       background, either of which reads as "no separation" against the surrounding UI. Derive a
+       subtle border from the foreground color instead, so there's always some visible contrast
+       regardless of what the active theme does with inputBorder. */
+    --nm-input-bdr:  color-mix(in srgb, var(--nm-fg) 25%, transparent);
     --nm-font:       var(--vscode-font-family);
     --nm-mono:       var(--vscode-editor-font-family, monospace);
     --nm-size:       var(--vscode-font-size, 13px);
@@ -1402,7 +1406,7 @@ const GW_CSS = `
   :scope { display: flex; flex-direction: column; height: 100%; }
   .gw-topbar {
     flex-shrink: 0; padding: 10px 14px; border-bottom: 1px solid var(--nm-border);
-    display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end;
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start;
     background: var(--nm-section-bg);
   }
   .gw-field { display: flex; flex-direction: column; gap: 2px; }
@@ -1411,7 +1415,7 @@ const GW_CSS = `
     background: var(--nm-input-bg); color: var(--nm-input-fg); border: 1px solid var(--nm-input-bdr);
     border-radius: 3px; padding: 4px 6px; font-family: var(--nm-font); font-size: 0.9em;
   }
-  textarea#gw-goal { width: 320px; height: 32px; min-height: 32px; resize: vertical; }
+  textarea#gw-goal { width: 320px; height: 48px; min-height: 48px; resize: vertical; }
   button {
     background: var(--nm-btn); color: var(--nm-btn-fg); border: none; border-radius: 3px;
     padding: 5px 14px; font-size: 0.88em; cursor: pointer; font-family: var(--nm-font);
@@ -1426,8 +1430,14 @@ const GW_CSS = `
   /* Slice 21c — inline Review/Target controls */
   .gw-options-row {
     flex-shrink: 0; padding: 6px 14px; border-bottom: 1px solid var(--nm-border);
-    display: flex; gap: 18px; flex-wrap: wrap; align-items: center; font-size: 0.82em;
+    display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; font-size: 0.82em;
   }
+  /* Workspace Review governs applying into the real repo; Task Review (governs workers merging
+     into the session) is stacked directly beneath it with an indent + tree connector, since a
+     goal's tasks are children of that same goal's workspace. */
+  .gw-review-stack { display: flex; flex-direction: column; gap: 6px; }
+  .gw-review-nested { margin-left: 10px; }
+  .gw-review-connector { opacity: 0.45; font-family: var(--vscode-editor-font-family, monospace); margin-right: 2px; }
   .gw-radio-group { display: flex; gap: 12px; align-items: center; }
   .gw-radio-group-label { opacity: 0.6; text-transform: uppercase; font-size: 0.72em; letter-spacing: 0.05em; margin-right: 4px; }
   .gw-radio-option { display: flex; align-items: center; gap: 4px; cursor: pointer; }
@@ -1469,6 +1479,14 @@ const GW_CSS = `
   .tl-item { border: 1px solid var(--nm-border); border-radius: 4px; margin-bottom: 6px; padding: 6px 10px; cursor: default; }
   .tl-item.clickable { cursor: pointer; }
   .tl-item.clickable:hover { background: color-mix(in srgb, var(--nm-border) 25%, transparent); }
+  /* Decision Candidates (MergeProposal rows — the only [data-proposal] items) are a step that
+     needs the user's action, not just a log entry, so they get a persistent accent even before
+     selection. .tl-selected is the actively-open one (auto-picked on node select, or last clicked). */
+  .tl-item[data-proposal] { border-left: 3px solid var(--nm-info); }
+  .tl-item.tl-selected {
+    border-color: var(--nm-info);
+    background: color-mix(in srgb, var(--nm-info) 14%, transparent);
+  }
   .tl-kind { font-size: 0.7em; text-transform: uppercase; opacity: 0.5; letter-spacing: 0.05em; }
   .tl-title { font-size: 0.9em; margin-top: 2px; }
   .tl-time { font-size: 0.72em; opacity: 0.4; float: right; }
@@ -1638,23 +1656,26 @@ const GW_HTML = `
       <label>Goal</label>
       <textarea id="gw-goal" placeholder="Describe a goal — e.g. Add dark mode support across the settings UI"></textarea>
     </div>
-    <button id="gw-run">&#x25B6; Run</button>
-    <button id="gw-settings-btn" class="ghost" title="Exploration Settings">&#9881;</button>
+    <button id="gw-run" style="align-self:flex-end">&#x25B6; Run</button>
+    <button id="gw-settings-btn" class="ghost" title="Exploration Settings" style="align-self:flex-end">&#9881;</button>
   </div>
   <div class="gw-options-row">
-    <div class="gw-radio-group" title="Automatically integrates worker proposals into the agent session">
-      <span class="gw-radio-group-label">Task Review</span>
-      <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="HumanRequired" checked/> Human Required</label>
-      <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="AgentApproval"/> Agent Approval</label>
-      <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="Hybrid"/> Hybrid</label>
-      <input type="text" id="gw-task-review-hybrid-minutes" class="gw-hybrid-minutes hidden" placeholder="5" title="Minutes before auto-merge">
-    </div>
-    <div class="gw-radio-group" title="Controls whether session changes are automatically applied to your workspace">
-      <span class="gw-radio-group-label">Workspace Review</span>
-      <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="HumanRequired" checked/> Human Required</label>
-      <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="AgentApproval"/> Agent Approval</label>
-      <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="Hybrid"/> Hybrid</label>
-      <input type="text" id="gw-workspace-review-hybrid-minutes" class="gw-hybrid-minutes hidden" placeholder="5" title="Minutes before auto-apply">
+    <div class="gw-review-stack">
+      <div class="gw-radio-group" title="Controls whether session changes are automatically applied to your workspace">
+        <span class="gw-radio-group-label">Workspace Review</span>
+        <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="HumanRequired" checked/> Human Required</label>
+        <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="AgentApproval"/> Agent Approval</label>
+        <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="Hybrid"/> Hybrid</label>
+        <input type="text" id="gw-workspace-review-hybrid-minutes" class="gw-hybrid-minutes hidden" placeholder="5" title="Minutes before auto-apply">
+      </div>
+      <div class="gw-radio-group gw-review-nested" title="Automatically integrates worker proposals into the agent session">
+        <span class="gw-review-connector" aria-hidden="true">&#x2514;</span>
+        <span class="gw-radio-group-label">Task Review</span>
+        <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="HumanRequired" checked/> Human Required</label>
+        <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="AgentApproval"/> Agent Approval</label>
+        <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="Hybrid"/> Hybrid</label>
+        <input type="text" id="gw-task-review-hybrid-minutes" class="gw-hybrid-minutes hidden" placeholder="5" title="Minutes before auto-merge">
+      </div>
     </div>
     <div class="gw-radio-group gw-target-row" id="gw-target-row">
       <span class="gw-radio-group-label">Target</span>

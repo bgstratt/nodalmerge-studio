@@ -63,7 +63,7 @@ export class StudioShellPanel implements vscode.Disposable {
 
     this.activityCenter   = new ExecutionTimelinePanel(panel, baseUrl, notifications, configService, secrets, lmProxyBaseUrl, this.getSelectedSessionId);
     this.reviewPanel = new DecisionConvergencePanel(panel, baseUrl, configService, this.getSelectedSessionId);
-    this.modelAgentStudio    = new ModelAgentStudioPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl, this.onModelAgentConfigChanged);
+    this.modelAgentStudio    = new ModelAgentStudioPanel(panel, baseUrl, configService, secrets, this.onModelAgentConfigChanged);
     this.pathways    = new TrajectoryReplayPanel(panel, baseUrl, this.getSelectedSessionId);
     this.goalWorkspace       = new GoalWorkspacePanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl, this.onSessionChanged);
     this.insights            = new InsightsPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);

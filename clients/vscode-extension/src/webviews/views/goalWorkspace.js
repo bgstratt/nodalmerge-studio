@@ -1005,6 +1005,23 @@ export function init(ctx) {
 
   // ── Timeline ─────────────────────────────────────────────────────────────
 
+  // Picks which Decision Candidate (MergeProposal artifact) a newly-selected Decision Tree node
+  // should jump straight to, instead of making the user scroll the timeline, click the candidate,
+  // then click "Open in Review" as three separate steps. Prefers whichever candidate still needs a
+  // decision (not yet Merged/Rejected/Superseded); if several are pending, the most recent one. If
+  // none are pending, falls through to null so the caller keeps today's default node-level view.
+  function findDefaultProposalCandidate(artifacts) {
+    var proposals = (artifacts || []).filter(function(a) { return a.type === 'MergeProposal'; });
+    if (!proposals.length) { return null; }
+    var pending = proposals.filter(function(a) {
+      return a.status !== 'Merged' && a.status !== 'Rejected' && a.status !== 'Superseded';
+    });
+    var pool = pending.length ? pending : [];
+    if (!pool.length) { return null; }
+    pool.sort(function(a, b) { return new Date(a.createdAt) - new Date(b.createdAt); });
+    return pool[pool.length - 1];
+  }
+
   function renderTimeline(artifacts, events) {
     state.timelineArtifacts = artifacts || [];
     state.timelineEvents = events || [];
@@ -1047,6 +1064,8 @@ export function init(ctx) {
     el.querySelectorAll('[data-proposal]').forEach(function(node) {
       node.addEventListener('click', function() {
         var id = node.getAttribute('data-proposal');
+        el.querySelectorAll('.tl-selected').forEach(function(n) { n.classList.remove('tl-selected'); });
+        node.classList.add('tl-selected');
         $('gw-inspector').innerHTML = '<p class="empty">Loading…</p>';
         vscode.postMessage({ type: 'explorerSelectProposal', proposalId: id });
       });
@@ -1446,7 +1465,13 @@ export function init(ctx) {
         state.reasoningGraph = msg.reasoningGraph;
       }
       var wu = state.decisionNodes.find(function(w) { return w.workUnitId === state.selectedNodeId; });
-      if (wu) {
+      var defaultCandidate = findDefaultProposalCandidate(msg.artifacts);
+      if (defaultCandidate) {
+        var candidateNode = root.querySelector('[data-proposal="' + defaultCandidate.artifactId + '"]');
+        if (candidateNode) { candidateNode.classList.add('tl-selected'); }
+        $('gw-inspector').innerHTML = '<p class="empty">Loading…</p>';
+        vscode.postMessage({ type: 'explorerSelectProposal', proposalId: defaultCandidate.artifactId });
+      } else if (wu) {
         $('gw-inspector').innerHTML = renderDecisionInspector(wu);
         bindDecisionInspectorTabs();
       }

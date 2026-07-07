@@ -67,7 +67,6 @@ export function init(ctx) {
         '</div></td>';
       tbody.appendChild(tr);
     });
-    updateExploreStrategySelector();
   }
 
   $('profile-tbody').addEventListener('click', function(e) {
@@ -297,7 +296,6 @@ export function init(ctx) {
         '</div></td>';
       tbody.appendChild(tr);
     });
-    updateExploreStrategySelector();
   }
 
   $('template-tbody').addEventListener('click', function(e) {
@@ -376,37 +374,6 @@ export function init(ctx) {
 
   $('btn-add-template').addEventListener('click', function() {
     showTemplateForm(-1);
-  });
-
-  // ── Quick Explore strategy selector ────────────────────────────────────────
-  function updateExploreStrategySelector() {
-    const sel = $('explore-strategy');
-    if (!sel) { return; }
-    const current = sel.value;
-    sel.innerHTML = templates.map(function(t) {
-      return '<option value="' + esc(t.name) + '">' + esc(t.name) + '</option>';
-    }).join('');
-    if (templates.find(function(t) { return t.name === current; })) {
-      sel.value = current;
-    } else if (defaultTopology) {
-      sel.value = defaultTopology;
-    }
-  }
-
-  // ── Quick Explore ──────────────────────────────────────────────────────────
-  $('btn-explore').addEventListener('click', function() {
-    const templateName = $('explore-strategy').value;
-    const goal = $('explore-goal').value.trim();
-    if (!goal) { alert('Goal is required.'); return; }
-    const autoReview = $('explore-auto-review').checked;
-    this.disabled    = true;
-    this.textContent = 'Exploring…';
-    vscode.postMessage({
-      type: 'quickExplore',
-      templateName: templateName,
-      goal: goal,
-      autoReviewProfileId: autoReview ? 'reviewer' : undefined
-    });
   });
 
   // ── Save ──────────────────────────────────────────────────────────────────
@@ -596,7 +563,6 @@ export function init(ctx) {
       pipelineProfiles = msg.pipelineProfiles || [];
       renderProfiles();
       renderTemplates();
-      updateExploreStrategySelector();
       renderPipelineProfiles();
       var taskRpSel = $('default-task-review-policy');
       if (taskRpSel && msg.defaultTaskReviewPolicy) { taskRpSel.value = msg.defaultTaskReviewPolicy; }
@@ -636,22 +602,6 @@ export function init(ctx) {
     if (msg.type === 'participants') {
       renderParticipants(msg.participants || []);
       return;
-    }
-    if (msg.type === 'spawnResult') {
-      const btn = $('btn-explore');
-      btn.disabled    = false;
-      btn.textContent = '\u25B6 Quick Explore';
-      const result = $('explore-result');
-      if (result) {
-        result.classList.remove('hidden');
-        result.className     = 'explore-result ' + (msg.success ? 'ok' : 'err');
-        result.textContent   = msg.success ? 'Exploration started successfully!' : ('Error: ' + (msg.message || 'unknown'));
-      }
-      if (msg.success) {
-        const g = $('explore-goal');
-        if (g && 'value' in g) { g.value = ''; }
-        setTimeout(function() { if (result) result.classList.add('hidden'); }, 5000);
-      }
     }
   });
 

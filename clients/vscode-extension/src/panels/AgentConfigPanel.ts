@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
 import type { AgentConfigService, AgentProfile, TopologyTemplate } from '../AgentConfigService';
-import { resolveRepositoryPath } from '../repositoryPath';
 import { scopeViewCss } from './sharedWebviewChrome';
 
 export interface PipelineProfile {
@@ -28,7 +27,6 @@ export class ModelAgentStudioPanel {
   private readonly baseUrl: string;
   private readonly configService: AgentConfigService;
   private readonly secrets: vscode.SecretStorage;
-  private readonly lmProxyBaseUrl: string;
   private readonly onConfigChanged?: () => void;
 
   constructor(
@@ -36,7 +34,6 @@ export class ModelAgentStudioPanel {
     baseUrl: string,
     configService: AgentConfigService,
     secrets: vscode.SecretStorage,
-    lmProxyBaseUrl: string,
     // Lets Goal Workspace (agent profiles feed its strategy list and fork-config picker, and
     // session defaults seed its Task/Workspace Review radios) refresh immediately after a save
     // here, instead of waiting for its own ~30s poll cadence.
@@ -46,7 +43,6 @@ export class ModelAgentStudioPanel {
     this.baseUrl        = baseUrl;
     this.configService  = configService;
     this.secrets        = secrets;
-    this.lmProxyBaseUrl = lmProxyBaseUrl;
     this.onConfigChanged = onConfigChanged;
   }
 
@@ -157,14 +153,6 @@ export class ModelAgentStudioPanel {
         break;
       }
 
-      case 'quickExplore':
-        await this.handleQuickExplore(
-          msg.templateName as string,
-          msg.goal as string,
-          msg.autoReviewProfileId as string | undefined,
-        );
-        break;
-
       case 'getModels': {
         const models = await this.fetchModels(
           msg.provider as string,
@@ -213,49 +201,6 @@ export class ModelAgentStudioPanel {
         break;
       }
 
-    }
-  }
-
-  private async handleQuickExplore(templateName: string, goal: string, autoReviewProfileId?: string): Promise<void> {
-    const templates = this.configService.getTemplates();
-    const template  = templates.find(t => t.name === templateName);
-    if (!template) {
-      void vscode.window.showErrorMessage(`NodalMerge: Exploration strategy "${templateName}" not found.`);
-      void this.panel.webview.postMessage({ type: 'spawnResult', success: false, message: 'Exploration strategy not found.' });
-      return;
-    }
-
-    try {
-      const orchCfg = await this.configService.resolveSpawnLlmConfig(
-        template.orchestrator, this.secrets, this.lmProxyBaseUrl,
-      );
-      if (!orchCfg) {
-        const reason = await this.configService.describeMissingCredentials(template.orchestrator, this.secrets, this.lmProxyBaseUrl);
-        throw new Error(`Profile "${template.orchestrator}" isn't ready — ${reason}.`);
-      }
-
-      const repositoryPath = resolveRepositoryPath();
-      const orchWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
-        goal,
-        owner: template.orchestrator,
-        ...(repositoryPath ? { repositoryPath } : {}),
-      });
-      await this.post('/studio/agents/spawn', {
-        agentType:  'orchestrator',
-        workUnitId: orchWu.workUnitId,
-        ...orchCfg,
-        ...(autoReviewProfileId ? { autoReviewProfileId } : {}),
-      });
-
-      void this.panel.webview.postMessage({ type: 'spawnResult', success: true });
-      void vscode.window.showInformationMessage(
-        `NodalMerge: Started exploration for "${templateName}": ${goal}`,
-      );
-    } catch (err) {
-      void this.panel.webview.postMessage({
-        type: 'spawnResult', success: false, message: String(err),
-      });
-      void vscode.window.showErrorMessage('NodalMerge: Quick explore failed — ' + String(err));
     }
   }
 
@@ -334,7 +279,11 @@ const MAS_CSS = `
     --nm-size:       var(--vscode-font-size, 13px);
     --nm-input-bg:   var(--vscode-input-background, #3c3c3c);
     --nm-input-fg:   var(--vscode-input-foreground, #ccc);
-    --nm-input-bdr:  var(--vscode-input-border, #555);
+    /* Many themes leave --vscode-input-border unset (flat input design) or set it equal to the
+       background, either of which reads as "no separation" against the surrounding UI. Derive a
+       subtle border from the foreground color instead, so there's always some visible contrast
+       regardless of what the active theme does with inputBorder. */
+    --nm-input-bdr:  color-mix(in srgb, var(--nm-fg) 25%, transparent);
   }
   * { box-sizing: border-box; }
   body {
@@ -444,7 +393,6 @@ const MAS_HTML = `
   <div class="tabs">
     <button class="tab-btn active" data-tab="profiles">Profiles</button>
     <button class="tab-btn" data-tab="strategies">Agent Topology</button>
-    <button class="tab-btn" data-tab="explore">Quick Explore</button>
     <button class="tab-btn" data-tab="pipeline-profiles">Pipeline Profiles</button>
     <button class="tab-btn" data-tab="session-defaults">Session Defaults</button>
     <button class="tab-btn" data-tab="participants">Participants</button>
@@ -466,27 +414,6 @@ const MAS_HTML = `
       <tbody id="template-tbody"></tbody>
     </table>
     <button class="add-btn" id="btn-add-template">+ Add Topology</button>
-  </div>
-
-  <div id="pane-explore" class="tab-pane">
-    <div class="explore-form">
-      <div class="field">
-        <label>Agent Topology</label>
-        <select id="explore-strategy"></select>
-      </div>
-      <div class="field">
-        <label>Goal</label>
-        <input type="text" id="explore-goal" placeholder="e.g. Refactor the auth module">
-      </div>
-      <div class="field">
-        <label class="checkbox-label">
-          <input type="checkbox" id="explore-auto-review" checked>
-          Run automated review before human gate
-        </label>
-      </div>
-      <button id="btn-explore">&#x25B6; Quick Explore</button>
-      <div id="explore-result" class="explore-result hidden"></div>
-    </div>
   </div>
 
   <div id="pane-pipeline-profiles" class="tab-pane">
