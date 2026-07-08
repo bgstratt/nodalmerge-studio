@@ -185,6 +185,15 @@ export class StudioShellPanel implements vscode.Disposable {
       await this.goalWorkspace.openConversationStandalone(msg.workUnitId as string);
       return;
     }
+    // Merge review panel's "View in Candidate Promotion" link — shown on any proposal whose
+    // targetBranch is the candidate branch, so a reviewer can jump straight to that conflict/
+    // promotion queue instead of hunting for it. Same showTab + direct panel-method pattern as
+    // activityViewTranscript above.
+    if (msg.type === 'viewCandidatePromotion') {
+      this.showTab(ExecutionTimelinePanel.containerId);
+      this.activityCenter.focusCandidatePromotion();
+      return;
+    }
     await Promise.all([
       this.activityCenter.handleMessage(msg),
       this.reviewPanel.handleMessage(msg),

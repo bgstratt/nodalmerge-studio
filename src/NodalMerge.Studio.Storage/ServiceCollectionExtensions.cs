@@ -231,6 +231,19 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IConflictService>(sp => sp.GetRequiredService<InMemoryConflictService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryConflictService>());
 
+        // Candidate-branch cross-goal conflicts (distinct from the CAS-level IConflictService above
+        // — see CandidateConflictRecord's doc comment). Detected in InMemoryMergeService, recorded
+        // here for the promote UI to query.
+        services.AddSingleton<InMemoryCandidateConflictService>();
+        services.AddSingleton<ICandidateConflictService>(sp => sp.GetRequiredService<InMemoryCandidateConflictService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryCandidateConflictService>());
+
+        // Fan-out-sibling task-level conflicts (distinct from the above — see TaskConflictRecord's
+        // doc comment). Same detection block in InMemoryMergeService, recorded here.
+        services.AddSingleton<InMemoryTaskConflictService>();
+        services.AddSingleton<ITaskConflictService>(sp => sp.GetRequiredService<InMemoryTaskConflictService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryTaskConflictService>());
+
         // Phase 11.5 — co-modification pattern service. On-demand compute; rehydrates last
         // computed patterns from node store on startup so projection hints are available immediately.
         services.AddSingleton<InMemoryCoModService>();

@@ -68,7 +68,7 @@ public static class StudioRestEndpoints
         string? Provider = null,
         string? SessionId = null);
 
-    private sealed record ReviewBody(string Decision, string? Notes = null, string? SessionId = null);
+    private sealed record ReviewBody(string Decision, string? Notes = null, string? SessionId = null, string? RestartMode = null);
 
     private sealed record BranchProposalBody(
         string Goal,
@@ -108,6 +108,26 @@ public static class StudioRestEndpoints
         string Goal,
         string? ProfileId = null,
         string? SessionId = null);
+
+    // Optional explicit credentials for the reconciliation orchestrator (e.g. resolved client-side
+    // from a dedicated "Reconciler" slot on the caller's Agent Topology template) — see
+    // ReconciliationRequest.Credentials's own comment for why these take priority over
+    // ReconciliationAgentService's best-effort inheritance from a source goal's credentials.
+    private sealed record ReconcileConflictBody(
+        string? SteeringNotes = null,
+        string? Provider = null,
+        string? Model = null,
+        string? BaseUrl = null,
+        string? ApiKey = null,
+        string? ProfileId = null)
+    {
+        public OrchestratorCredentials? ToCredentials() =>
+            !string.IsNullOrWhiteSpace(Model) && !string.IsNullOrWhiteSpace(BaseUrl)
+                ? new OrchestratorCredentials(Provider ?? "anthropic", Model, BaseUrl, ApiKey ?? string.Empty, ProfileId)
+                : null;
+    }
+
+    private sealed record ResolveConflictBody(IReadOnlyDictionary<string, string>? Files = null);
 
     private sealed record EnqueueBody(
         string WorkUnitId,
@@ -1136,6 +1156,79 @@ public static class StudioRestEndpoints
             return Results.Ok(new { workUnitId, branchId = wu.BranchId, status = wu.Status.ToString(), content });
         });
 
+        // Queryable fan-out-sibling conflict records — see TaskConflictRecord's doc comment.
+        // Distinct from the markdown conflict-report above (that one's for MergeReconciliationService's
+        // own DetectOverlappingFilesAsync path, once all siblings are already Proposed/Merged; this one
+        // is for the apply-time drift check, firing per-sibling as each one lands on merge/{workUnitId}).
+        app.MapGet("/studio/workunits/{workUnitId}/task-conflicts", async (
+            string workUnitId,
+            ITaskConflictService taskConflicts,
+            CancellationToken ct) =>
+        {
+            var open = await taskConflicts.GetOpenAsync(workUnitId, ct).ConfigureAwait(false);
+            return Results.Ok(open);
+        });
+
+        // Human-triggered alternative to Restart: instead of throwing away the losing sibling's work
+        // and re-running it from scratch, create a reconciliation work unit (a proper fan-out child)
+        // that sees both siblings' intents and both diverged versions of the conflicting file(s), and
+        // produces one combined result. See IReconciliationAgentService/ITaskReconciliationTrigger.
+        app.MapPost("/studio/workunits/{workUnitId}/task-conflicts/{conflictId}/reconcile", async (
+            string workUnitId,
+            string conflictId,
+            ReconcileConflictBody? body,
+            ITaskReconciliationTrigger trigger,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var reconciliationChild = await trigger.TryTriggerAsync(
+                    conflictId, body?.SteeringNotes, body?.ToCredentials(), ct).ConfigureAwait(false);
+                if (reconciliationChild is null)
+                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is not open (already reconciling or resolved, or does not exist)." });
+
+                return Results.Ok(reconciliationChild);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        // Human already knows the correct combination and supplies it directly instead of spinning
+        // up an agent turn. See ITaskReconciliationTrigger.TryResolveManuallyAsync.
+        app.MapPost("/studio/workunits/{workUnitId}/task-conflicts/{conflictId}/resolve", async (
+            string workUnitId,
+            string conflictId,
+            ResolveConflictBody body,
+            ITaskReconciliationTrigger trigger,
+            CancellationToken ct) =>
+        {
+            if (body.Files is null || body.Files.Count == 0)
+                return Results.BadRequest(new { error = "files must contain at least one path → content entry." });
+
+            try
+            {
+                var proposal = await trigger.TryResolveManuallyAsync(conflictId, body.Files, ct).ConfigureAwait(false);
+                if (proposal is null)
+                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is not open (already reconciling or resolved, or does not exist)." });
+
+                return Results.Ok(proposal);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
         app.MapGet("/studio/workunits/{workUnitId}/proposal-dag", async (
             string workUnitId,
             IWorkUnitService workUnits,
@@ -1677,6 +1770,14 @@ public static class StudioRestEndpoints
             {
                 return Results.BadRequest(new { error = "Decision must be 'Approved' or 'Rejected'." });
             }
+
+            var restartMode = RestartMode.Revise;
+            if (!string.IsNullOrWhiteSpace(body.RestartMode) &&
+                !Enum.TryParse(body.RestartMode, ignoreCase: true, out restartMode))
+            {
+                return Results.BadRequest(new { error = "restartMode must be 'Revise' or 'Revert'." });
+            }
+
             try
             {
                 var result = await mergeCommands.ReviewAsync(
@@ -1688,7 +1789,7 @@ public static class StudioRestEndpoints
                 if (status == MergeProposalStatus.Rejected)
                 {
                     await reviewGate.HandleHumanRejectionAsync(
-                        proposalId, body.Notes, body.SessionId, ct).ConfigureAwait(false);
+                        proposalId, body.Notes, restartMode, body.SessionId, ct).ConfigureAwait(false);
                 }
 
                 if (result.WorkUnitId is { Length: > 0 } reviewedWorkUnitId)
@@ -1936,17 +2037,118 @@ public static class StudioRestEndpoints
             return Results.Ok(new { branchId, written, deleted, errors });
         });
 
-        // Slice 21b — explicit human action to promote candidate → main. Never automatic.
+        // Everything currently sitting on "candidate" (landed, i.e. Merged) but not yet promoted to
+        // disk — what a human reviewing the promotion queue needs to see before deciding to
+        // POST .../promote. Mirrors PromoteAsync's own eligibility filter exactly.
+        app.MapGet("/studio/branches/candidate/pending", async (
+            IMergeService merge,
+            CancellationToken ct) =>
+        {
+            var all = await merge.ListAsync(cancellationToken: ct).ConfigureAwait(false);
+            var pending = all.Where(p => p.Status == MergeProposalStatus.Merged && !p.PromotedToDisk
+                && p.LandedOnCandidateBranch);
+            return Results.Ok(pending.Select(p => new
+            {
+                p.ProposalId,
+                p.WorkUnitId,
+                p.Goal,
+                p.Summary,
+                p.FilesTouched,
+            }));
+        });
+
+        // Open cross-goal conflicts on the candidate branch (two independent goals landing
+        // overlapping changes) — see CandidateConflictRecord. Distinct from
+        // /studio/conflicts (IConflictService/RepositoryConflict), a different CAS-level concept.
+        app.MapGet("/studio/branches/candidate/conflicts", async (
+            ICandidateConflictService candidateConflicts,
+            CancellationToken ct) =>
+        {
+            var open = await candidateConflicts.GetOpenAsync(ct).ConfigureAwait(false);
+            return Results.Ok(open);
+        });
+
+        // Human-triggered alternative to Restart: instead of throwing away the losing goal's work
+        // and re-running it from scratch, create a reconciliation work unit that sees both goals'
+        // intents and both diverged versions of the conflicting file(s), and produces one combined
+        // result. See IReconciliationAgentService/ICandidateReconciliationTrigger.
+        app.MapPost("/studio/branches/candidate/conflicts/{conflictId}/reconcile", async (
+            string conflictId,
+            ReconcileConflictBody? body,
+            ICandidateReconciliationTrigger trigger,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var workUnit = await trigger.TryTriggerAsync(
+                    conflictId, body?.SteeringNotes, body?.ToCredentials(), ct).ConfigureAwait(false);
+                if (workUnit is null)
+                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is not open (already reconciling or resolved, or does not exist)." });
+
+                return Results.Ok(workUnit);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        // Human-triggered alternative to both Reconcile and Restart: the human already knows the
+        // correct combination (e.g. "keep both, in this order") and supplies it directly instead of
+        // spinning up an agent turn. See ICandidateReconciliationTrigger.TryResolveManuallyAsync.
+        app.MapPost("/studio/branches/candidate/conflicts/{conflictId}/resolve", async (
+            string conflictId,
+            ResolveConflictBody body,
+            ICandidateReconciliationTrigger trigger,
+            CancellationToken ct) =>
+        {
+            if (body.Files is null || body.Files.Count == 0)
+                return Results.BadRequest(new { error = "files must contain at least one path → content entry." });
+
+            try
+            {
+                var proposal = await trigger.TryResolveManuallyAsync(conflictId, body.Files, ct).ConfigureAwait(false);
+                if (proposal is null)
+                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is not open (already reconciling or resolved, or does not exist)." });
+
+                return Results.Ok(proposal);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        // Slice 21b — explicit human action to promote candidate → main (and, for any proposal
+        // whose owning goal has a real repo attached, to disk). Never automatic.
         app.MapPost("/studio/branches/candidate/promote", async (
             WorkspaceOptions options,
-            IFileWorkspaceService fileWorkspace,
+            IMergeService merge,
             CancellationToken ct) =>
         {
             if (!options.UsePromotionBranch)
                 return Results.BadRequest(new { error = "Promotion branch is not enabled. Set usePromotionBranch via POST /studio/options first." });
 
-            await fileWorkspace.ApplyBranchAsync(options.CandidateBranchId, "main", ct).ConfigureAwait(false);
-            return Results.Ok(new { promoted = true, source = options.CandidateBranchId, target = "main" });
+            var result = await merge.PromoteAsync(ct).ConfigureAwait(false);
+            if (!result.Succeeded)
+                return Results.BadRequest(new { error = result.FailureReason });
+
+            return Results.Ok(new
+            {
+                promoted = true,
+                source = options.CandidateBranchId,
+                target = "main",
+                proposalCount = result.Promoted.Count,
+                proposalIds = result.Promoted.Select(p => p.ProposalId),
+            });
         });
     }
 
@@ -2061,7 +2263,8 @@ public static class StudioRestEndpoints
             IIntentGraphService intents,
             CancellationToken ct) =>
         {
-            var items = await scheduler.ListPendingAsync(ct).ConfigureAwait(false);
+            var items = (await scheduler.ListPendingAsync(ct).ConfigureAwait(false))
+                .Select(RedactCredentials).ToList();
             if (includeIntentGraph != 1)
                 return Results.Ok(items);
 
@@ -2082,7 +2285,7 @@ public static class StudioRestEndpoints
             CancellationToken ct) =>
         {
             var items = await scheduler.ListAwaitingResumeAsync(ct).ConfigureAwait(false);
-            return Results.Ok(items);
+            return Results.Ok(items.Select(RedactCredentials));
         });
 
         app.MapPost("/studio/scheduler/{workUnitId}/resume", async (
@@ -2118,6 +2321,13 @@ public static class StudioRestEndpoints
             return Results.Ok(new { workUnitId = item.WorkUnitId, profileId = item.ProfileId, taskId = item.TaskId, sessionId = item.SessionId, status = "enqueued" });
         });
     }
+
+    // ScheduledItem carries the LLM credentials a worker needs to actually resume — required
+    // server-side (RunScheduledWorkerAsync reads Model/BaseUrl/ApiKey off the scheduler's own
+    // internal queue item), but nothing on the client ever reads ApiKey back out of a GET response
+    // (the VS Code extension's own ScheduledItem type doesn't even declare the field) — no reason to
+    // put a live API key on the wire for a read-only status view.
+    private static ScheduledItem RedactCredentials(ScheduledItem item) => item with { ApiKey = null };
 
     private static void MapClarificationEndpoints(WebApplication app)
     {

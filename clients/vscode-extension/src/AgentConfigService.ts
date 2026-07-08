@@ -27,6 +27,11 @@ export interface TopologyTemplate {
   planner?:     string;
   worker?:      string;
   reviewer?:    string;
+  // Profile used to spawn the reconciliation agent when a candidate-branch or task-level conflict
+  // is Reconciled. Distinct from all four stage roles above: reconciliation work units aren't part
+  // of any goal's own Plan/Execute/Review pipeline, so there's no natural "inherit" fallback among
+  // them — falls back to the orchestrator profile only if unset, same as the others.
+  reconciler?:  string;
 }
 
 /** Runtime participant from GET /studio/participants — covers both in-process agents and room peers. */

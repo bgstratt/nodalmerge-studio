@@ -249,6 +249,7 @@ public class WorkUnitLifecycleTests
         public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false) => throw new NotSupportedException();
         public Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal> SupersedeAsync(string proposalId, string supersededByProposalId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<PromoteResult> PromoteAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
     private sealed class NoopKnownGoodStateService : IKnownGoodStateService

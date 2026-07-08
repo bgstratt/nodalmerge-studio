@@ -65,14 +65,20 @@ export function init(ctx) {
   $('btn-accept').addEventListener('click', function() {
     vscode.postMessage({ type: 'acceptDecision', notes: reviewNotesValue() });
   });
-  $('btn-reject').addEventListener('click', function() {
-    vscode.postMessage({ type: 'rejectDecision', notes: reviewNotesValue() });
+  $('btn-revise').addEventListener('click', function() {
+    vscode.postMessage({ type: 'reviseDecision', notes: reviewNotesValue() });
+  });
+  $('btn-revert').addEventListener('click', function() {
+    vscode.postMessage({ type: 'revertAndRestart', notes: reviewNotesValue() });
   });
   $('btn-apply').addEventListener('click', function() {
     vscode.postMessage({ type: 'applyDecision' });
   });
   $('btn-fork').addEventListener('click', function() {
     vscode.postMessage({ type: 'forkHypothesis' });
+  });
+  $('btn-view-candidate-promotion').addEventListener('click', function() {
+    vscode.postMessage({ type: 'viewCandidatePromotion' });
   });
   $('btn-restore').addEventListener('click', function() {
     vscode.postMessage({ type: 'restoreWorkspace' });
@@ -652,6 +658,10 @@ export function init(ctx) {
     setHtml('status-badge', '<span class="' + badgeClass + '">' + esc(p.status) + '</span>');
     setText('source-branch', p.sourceBranch);
     setText('target-branch', p.targetBranch);
+    // targetBranch stays the proposal's ultimate destination ("main") whether or not promotion
+    // branch is in play — landedOnCandidateBranch is the actual "did this land on the shared
+    // candidate staging branch" signal, set at apply time (see MergeProposal.LandedOnCandidateBranch).
+    showIf('btn-view-candidate-promotion', !!p.landedOnCandidateBranch);
     setText('confidence', p.confidence != null ? (Math.round(p.confidence * 100) + '%') : '—');
     setText('goal', p.goal);
     setText('summary', p.summary);
@@ -752,7 +762,8 @@ export function init(ctx) {
     var btns = STATUS_BUTTONS[status] || { validate: false, accept: false, reject: false, apply: false };
     setDisabled('btn-validate', !btns.validate);
     setDisabled('btn-accept',  !btns.accept);
-    setDisabled('btn-reject',  !btns.reject);
+    setDisabled('btn-revise',  !btns.reject);
+    setDisabled('btn-revert',  !btns.reject);
     setDisabled('btn-apply',   !btns.apply);
   });
 

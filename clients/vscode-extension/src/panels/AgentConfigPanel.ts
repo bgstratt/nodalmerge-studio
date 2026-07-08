@@ -410,7 +410,7 @@ const MAS_HTML = `
   <div id="pane-strategies" class="tab-pane">
     <div id="template-form-area"></div>
     <table>
-      <thead><tr><th>Name</th><th>Orchestrator Profile</th><th>Planner Profile</th><th>Worker Profile</th><th>Reviewer Profile</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Orchestrator Profile</th><th>Planner Profile</th><th>Worker Profile</th><th>Reviewer Profile</th><th>Reconciler Profile</th><th></th></tr></thead>
       <tbody id="template-tbody"></tbody>
     </table>
     <button class="add-btn" id="btn-add-template">+ Add Topology</button>

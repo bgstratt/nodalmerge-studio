@@ -133,6 +133,9 @@ public sealed class WorkUnitCommandService(
             repositoryId: effectiveRepositoryId,
             referenceFiles: command.ReferenceFiles,
             workspaceId: workspace.WorkspaceId,
+            reconciliationSourceProposalIds: command.ReconciliationSourceProposalIds,
+            reconciliationTargetPaths: command.ReconciliationTargetPaths,
+            reconciliationSourceRef: command.ReconciliationSourceRef,
             cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 

@@ -147,8 +147,11 @@ The merge-review gate. Two modes depending on the proposal/work-unit state.
 - Code Changes: **Inline** / **Split** diff toggle, per-file expand, **Open Diff in Editor**
 - Evidence: build/test results, **download full output** when truncated
 - Converged Decision section (if synthesized from multiple candidates): constituent proposal cards
-- **Validate Evidence** · **Accept Decision** · **Reject Decision** · **Apply Decision** ·
-  **Fork Hypothesis** · **Restore workspace** (read-only pre-change files)
+- **Validate Evidence** · **Accept Decision** · **Revise** (keep the agent's current file changes,
+  attach a compacted summary of the almost-correct attempt, and steer it toward the gap) ·
+  **Revert and Restart** (wipe the work unit's branch back to its pre-attempt snapshot and restart
+  the goal fresh with just your steering note) · **Apply Decision** · **Fork Hypothesis** ·
+  **Restore workspace** (read-only pre-change files)
 
 ### Conflict resolution mode
 Shows the conflict report; resolution itself happens by editing the conflicting branches outside

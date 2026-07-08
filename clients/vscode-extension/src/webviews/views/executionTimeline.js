@@ -536,6 +536,15 @@ export function init(ctx) {
       }
       return;
     }
+    if (msg.type === 'conflictResolveData') {
+      renderManualResolveFiles(msg.conflictId, msg.files || [], msg.parentWorkUnitId || null);
+      return;
+    }
+    if (msg.type === 'focusCandidatePromotion') {
+      var promoSection = $('candidate-promotion-section');
+      if (promoSection) { promoSection.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+      return;
+    }
     if (msg.type !== 'data') { return; }
     if (typeof msg.usePromotionBranch !== 'undefined') {
       globalUsePromotionBranch = !!msg.usePromotionBranch;
@@ -548,10 +557,233 @@ export function init(ctx) {
     renderPendingDecisions(msg.merges);
     renderBlockedExplorations(msg.deadLetters || [], msg.workUnits, msg.providerRetries || []);
     renderFileLeases(msg.fileLeases || [], msg.workUnits);
+    renderCandidatePromotion(msg.candidatePending || [], msg.candidateConflicts || []);
+    renderTaskConflicts(msg.taskConflicts || []);
     renderSyncGraph(msg.syncGraph || { frontierHeads: [] });
     var ts = $('last-updated');
     if (ts) { ts.textContent = 'updated ' + new Date().toLocaleTimeString(); }
   });
+
+  // The 2s poll tick re-renders these sections by overwriting innerHTML wholesale — if that
+  // happens while the user is mid-keystroke in one of the section's own textareas (steering notes,
+  // resolve-manually content), the element gets destroyed and recreated out from under them,
+  // silently dropping focus and whatever they'd typed. Skip the rebuild entirely while any
+  // textarea/input inside the container is focused; the next poll after they click away picks up
+  // fresh data normally.
+  function isEditingWithin(container) {
+    var active = document.activeElement;
+    return !!(active && container && container.contains(active) &&
+      (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT'));
+  }
+
+  // pending: CandidatePendingItem[] (GET /studio/branches/candidate/pending), conflicts:
+  // CandidateConflictRecord[] (GET /studio/branches/candidate/conflicts). Only rendered/visible
+  // when globalUsePromotionBranch is on — see the 'data' handler below.
+  function renderCandidatePromotion(pending, conflicts) {
+    var section = $('candidate-promotion-section');
+    var el = $('candidate-promotion');
+    if (!section || !el) { return; }
+    if (isEditingWithin(el)) { return; }
+
+    if (!globalUsePromotionBranch) {
+      section.style.display = 'none';
+      return;
+    }
+    section.style.display = '';
+
+    // The endpoint already excludes Resolved — "open" here covers both Open and Reconciling so a
+    // conflict stays visible (with its actions disabled) while its reconciliation work unit runs.
+    var openConflicts = conflicts || [];
+    var conflictedProposalIds = {};
+    for (var ci = 0; ci < openConflicts.length; ci++) { conflictedProposalIds[openConflicts[ci].proposalId] = openConflicts[ci]; }
+
+    var html = '';
+
+    if (!pending || !pending.length) {
+      html += '<p class="empty">Nothing pending on "' + esc(globalCandidateBranchId) + '".</p>';
+    } else {
+      html += '<div class="row"><button class="add-btn" id="btn-promote-candidate" title="Write everything on ' +
+        esc(globalCandidateBranchId) + ' to main (and disk, for any goal with a real repository attached)"' +
+        (openConflicts.length ? ' disabled' : '') + '>↑ Promote to Main (' + pending.length + ')</button></div>';
+      if (openConflicts.length) {
+        html += '<p class="empty">Resolve the conflict(s) below before promoting.</p>';
+      }
+      for (var pi = 0; pi < pending.length; pi++) {
+        var p = pending[pi];
+        html += '<div class="card">';
+        html += '<div class="row"><strong>' + esc(p.goal || p.summary) + '</strong></div>';
+        html += '<div class="row"><span class="mono">' + esc(p.proposalId) + '</span>';
+        if (p.workUnitId) { html += '<span class="mono">' + esc(p.workUnitId) + '</span>'; }
+        html += '</div>';
+        if (p.filesTouched && p.filesTouched.length) {
+          html += '<div class="row mono" style="opacity:0.7">' + esc(p.filesTouched.join(', ')) + '</div>';
+        }
+        html += '</div>';
+      }
+    }
+
+    for (var oi = 0; oi < openConflicts.length; oi++) {
+      html += buildConflictCardHtml(openConflicts[oi], null);
+    }
+
+    el.innerHTML = html;
+
+    var promoteBtn = $('btn-promote-candidate');
+    if (promoteBtn) {
+      promoteBtn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'promoteCandidate' });
+      });
+    }
+    wireConflictCardActions(el);
+  }
+
+  // Shared by renderCandidatePromotion and renderTaskConflicts — every button carries a
+  // data-parent attribute only when it belongs to a task conflict (set by buildConflictCardHtml),
+  // which is what picks the task-scoped message type/fields over the candidate ones.
+  function wireConflictCardActions(el) {
+    el.querySelectorAll('[data-action="restartConflict"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var conflictId = btn.getAttribute('data-cid');
+        var notesEl = el.querySelector('[data-notes-for="' + conflictId + '"]');
+        var steeringNotes = notesEl ? notesEl.value.trim() : '';
+        // Restart just rejects the losing proposal — identical REST call regardless of source.
+        vscode.postMessage({
+          type: 'restartCandidateConflict', proposalId: btn.getAttribute('data-pid'),
+          steeringNotes: steeringNotes || null,
+        });
+      });
+    });
+    el.querySelectorAll('[data-action="reconcileConflict"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var conflictId = btn.getAttribute('data-cid');
+        var parentWorkUnitId = btn.getAttribute('data-parent');
+        var notesEl = el.querySelector('[data-notes-for="' + conflictId + '"]');
+        var steeringNotes = notesEl ? notesEl.value.trim() : '';
+        vscode.postMessage(parentWorkUnitId
+          ? { type: 'reconcileTaskConflict', conflictId: conflictId, parentWorkUnitId: parentWorkUnitId, steeringNotes: steeringNotes || null }
+          : { type: 'reconcileCandidateConflict', conflictId: conflictId, steeringNotes: steeringNotes || null });
+      });
+    });
+    el.querySelectorAll('[data-action="viewConflictDiff"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var paths = (btn.getAttribute('data-paths') || '').split('|').filter(Boolean);
+        vscode.postMessage({
+          type: 'viewConflictDiff',
+          conflictId: btn.getAttribute('data-cid'),
+          proposalId: btn.getAttribute('data-pid'),
+          winningProposalId: btn.getAttribute('data-wpid') || null,
+          conflictingPaths: paths,
+        });
+      });
+    });
+    el.querySelectorAll('[data-action="loadManualResolve"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var paths = (btn.getAttribute('data-paths') || '').split('|').filter(Boolean);
+        var parentWorkUnitId = btn.getAttribute('data-parent');
+        vscode.postMessage({
+          type: 'requestResolveManually',
+          conflictId: btn.getAttribute('data-cid'),
+          proposalId: btn.getAttribute('data-pid'),
+          winningProposalId: btn.getAttribute('data-wpid') || null,
+          conflictingPaths: paths,
+          parentWorkUnitId: parentWorkUnitId || null,
+        });
+      });
+    });
+  }
+
+  // Shared conflict-card markup for both candidate-branch and task-level conflicts. Pass
+  // parentWorkUnitId only for the task case — its presence on the Reconcile/Resolve-Manually
+  // buttons (as data-parent) is what wireConflictCardActions uses to route to the task-scoped
+  // message types instead of the candidate ones.
+  function buildConflictCardHtml(c, parentWorkUnitId) {
+    var reconciling = c.status === 'Reconciling';
+    var parentAttr = parentWorkUnitId ? ' data-parent="' + esc(parentWorkUnitId) + '"' : '';
+    var html = '<div class="card" style="border-color:var(--nm-warn, #d9822b)">';
+    html += '<div class="row"><span class="badge failed">⚠ Conflict' + (reconciling ? ' — reconciling…' : '') + '</span>' +
+      '<span class="mono">' + esc(c.proposalId) + '</span></div>';
+    if (parentWorkUnitId) {
+      html += '<div class="row mono" style="opacity:0.6">goal ' + esc(parentWorkUnitId) + '</div>';
+    }
+    html += '<div class="row mono" style="opacity:0.8">' + esc((c.conflictingPaths || []).join(', ')) + '</div>';
+    html += '<div class="row"><button class="ghost" data-action="viewConflictDiff" data-cid="' + esc(c.conflictId) +
+      '" data-pid="' + esc(c.proposalId) + '" data-wpid="' + esc(c.winningProposalId || '') +
+      '" data-paths="' + esc((c.conflictingPaths || []).join('|')) +
+      '" title="Open a read-only diff for each conflicting file: what is on the shared target now vs. what the losing goal produced">👁 View Diff</button></div>';
+    html += '<textarea class="steering-notes" data-notes-for="' + esc(c.conflictId) +
+      '" placeholder="Steering notes (optional, used by both Reconcile and Restart below) — e.g. keep both sections, Brad first then Jake"' +
+      (reconciling ? ' disabled' : '') + '></textarea>';
+    html += '<div class="conflict-actions">';
+    html += '<button class="primary" data-action="reconcileConflict" data-cid="' + esc(c.conflictId) + '"' + parentAttr +
+      ' title="Create an agent to combine the changes from both goals into one result, instead of restarting from scratch"' +
+      (reconciling ? ' disabled' : '') + '>⚭ Reconcile</button>';
+    html += '<button class="danger" data-action="restartConflict" data-cid="' + esc(c.conflictId) +
+      '" data-pid="' + esc(c.proposalId) + '"' +
+      ' title="Revert the losing goal to its pre-attempt snapshot and restart it fresh, using the steering notes above"' +
+      (reconciling ? ' disabled' : '') + '>↺ Revert &amp; Restart</button>';
+    html += '</div>';
+    html += '<div class="row"><button class="ghost" data-action="loadManualResolve" data-cid="' + esc(c.conflictId) +
+      '" data-pid="' + esc(c.proposalId) + '" data-wpid="' + esc(c.winningProposalId || '') +
+      '" data-paths="' + esc((c.conflictingPaths || []).join('|')) + '"' + parentAttr +
+      (reconciling ? ' disabled' : '') + '>✎ Resolve Manually</button></div>';
+    html += '<div class="manual-resolve" id="manual-resolve-' + esc(c.conflictId) + '" style="display:none"></div>';
+    html += '</div>';
+    return html;
+  }
+
+  // conflicts: TaskConflictRecord[] (flattened across every top-level goal's own
+  // GET /studio/workunits/{id}/task-conflicts). Always rendered when non-empty — unlike candidate
+  // promotion, task conflicts aren't gated behind a workspace-wide setting.
+  function renderTaskConflicts(conflicts) {
+    var el = $('task-conflicts');
+    if (!el) { return; }
+    if (isEditingWithin(el)) { return; }
+    if (!conflicts || !conflicts.length) {
+      el.innerHTML = '<p class="empty">No open task conflicts.</p>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < conflicts.length; i++) {
+      html += buildConflictCardHtml(conflicts[i], conflicts[i].parentWorkUnitId);
+    }
+    el.innerHTML = html;
+    wireConflictCardActions(el);
+  }
+
+  // files: [{ path, winningContent, losingContent }], from the panel's requestResolveManually
+  // round trip (fetches both sides' file-changes on demand — not fetched on every poll tick).
+  // parentWorkUnitId is only set for a task conflict — its presence picks the task-scoped submit
+  // message/endpoint over the candidate one.
+  function renderManualResolveFiles(conflictId, files, parentWorkUnitId) {
+    var container = $('manual-resolve-' + conflictId);
+    if (!container) { return; }
+
+    var target = parentWorkUnitId ? 'merge/' + parentWorkUnitId : 'candidate';
+    var html = '<div class="row mono" style="opacity:0.6">Pre-filled with what is currently on ' + esc(target) + ' — edit to combine both sides, then submit.</div>';
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      html += '<div class="row mono" style="opacity:0.7">' + esc(f.path) + '</div>';
+      html += '<div class="row mono" style="opacity:0.55;white-space:pre-wrap;max-height:80px;overflow:auto">Losing goal had: ' + esc(f.losingContent || '(no content)') + '</div>';
+      html += '<textarea class="steering-notes" data-resolve-path="' + esc(f.path) + '" style="min-height:80px">' +
+        esc(f.winningContent || '') + '</textarea>';
+    }
+    html += '<div class="row"><button class="primary" data-action="submitManualResolve" data-cid="' + esc(conflictId) + '">✓ Submit Resolution</button></div>';
+    container.innerHTML = html;
+    container.style.display = '';
+
+    var submitBtn = container.querySelector('[data-action="submitManualResolve"]');
+    if (submitBtn) {
+      submitBtn.addEventListener('click', function() {
+        var fileValues = {};
+        container.querySelectorAll('[data-resolve-path]').forEach(function(ta) {
+          fileValues[ta.getAttribute('data-resolve-path')] = ta.value;
+        });
+        vscode.postMessage(parentWorkUnitId
+          ? { type: 'resolveTaskConflictManually', conflictId: conflictId, parentWorkUnitId: parentWorkUnitId, files: fileValues }
+          : { type: 'resolveConflictManually', conflictId: conflictId, files: fileValues });
+      });
+    }
+  }
 
   function renderSyncGraph(data) {
     var el = $('sync-graph');

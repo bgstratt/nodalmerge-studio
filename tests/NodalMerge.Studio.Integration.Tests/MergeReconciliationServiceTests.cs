@@ -71,15 +71,25 @@ public class MergeReconciliationServiceTests : IDisposable
             await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Queued);
             await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Executing);
             await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Proposed);
+
+            // Reconciliation only folds in a child once its own TaskReviewPolicy gate has cleared
+            // (proposal Approved) — simulate the human approval a HumanRequired task child needs
+            // before its proposal can be superseded into the reconciled workspace proposal.
+            await merge.ReviewAsync(id, MergeProposalStatus.Approved);
             return id;
         }
 
         var p1 = await ProposeChildAsync(child1, "src/Foo.cs");
         var p2 = await ProposeChildAsync(child2, "src/Bar.cs");
 
+        // Approving the last child above may have already triggered reconciliation automatically
+        // (InMemoryMergeService.TryRetriggerParentReconciliationAsync) — this explicit call is then
+        // just confirming it happened, hence AlreadyReconciled is as valid an outcome as Reconciled.
         var result = await reconciliation.TryReconcileAsync(parent.WorkUnitId);
 
-        Assert.Equal(MergeReconciliationOutcome.Reconciled, result.Outcome);
+        Assert.True(
+            result.Outcome is MergeReconciliationOutcome.Reconciled or MergeReconciliationOutcome.AlreadyReconciled,
+            $"Expected Reconciled or AlreadyReconciled, got {result.Outcome}.");
         Assert.NotNull(result.ReconciledProposalId);
 
         var reconciled = await merge.GetAsync(result.ReconciledProposalId!);
@@ -132,6 +142,11 @@ public class MergeReconciliationServiceTests : IDisposable
             await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Queued);
             await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Executing);
             await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Proposed);
+
+            // Reconciliation only folds in a child once its own TaskReviewPolicy gate has cleared
+            // (proposal Approved) — simulate the human approval a HumanRequired task child needs
+            // before its proposal can be superseded into the reconciled workspace proposal.
+            await merge.ReviewAsync(id, MergeProposalStatus.Approved);
             return id;
         }
 
@@ -202,15 +217,25 @@ public class MergeReconciliationServiceTests : IDisposable
             await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Queued);
             await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Executing);
             await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Proposed);
+
+            // Reconciliation only folds in a child once its own TaskReviewPolicy gate has cleared
+            // (proposal Approved) — simulate the human approval a HumanRequired task child needs
+            // before its proposal can be superseded into the reconciled workspace proposal.
+            await merge.ReviewAsync(id, MergeProposalStatus.Approved);
             return id;
         }
 
         await ProposeChildAsync(child1, "src/Shared.cs");
         await ProposeChildAsync(child2, "src/Shared.cs");
 
+        // Approving the last child above may have already triggered reconciliation automatically
+        // (InMemoryMergeService.TryRetriggerParentReconciliationAsync) — this explicit call is then
+        // just confirming it happened, hence AlreadyReconciled is as valid an outcome as Reconciled.
         var result = await reconciliation.TryReconcileAsync(parent.WorkUnitId);
 
-        Assert.Equal(MergeReconciliationOutcome.Reconciled, result.Outcome);
+        Assert.True(
+            result.Outcome is MergeReconciliationOutcome.Reconciled or MergeReconciliationOutcome.AlreadyReconciled,
+            $"Expected Reconciled or AlreadyReconciled, got {result.Outcome}.");
         Assert.Null(result.ConflictReportPath);
         Assert.False(await fileWorkspace.ExistsAsync(parent.BranchId, MergeReconciliationService.ConflictReportFileName));
     }

@@ -56,6 +56,7 @@ export function init(ctx) {
       BranchChangeset:  { label: 'Code Change',      icon: '📁' },
       MergeProposal:    { label: 'Decision Candidate', icon: '📐' },
       MergeResult:      { label: 'Merged',           icon: '✅' },
+      RevisionContext:  { label: 'Prior Attempt',    icon: '↩️' },
     };
     return map[artifactType] || { label: artifactType, icon: '' };
   }
@@ -294,6 +295,10 @@ export function init(ctx) {
 
   $('gw-allow-auto-requeue-checkbox').addEventListener('change', function(ev) {
     vscode.postMessage({ type: 'explorerSetAllowAutoRequeue', value: ev.target.checked });
+  });
+
+  $('gw-use-promotion-branch-checkbox').addEventListener('change', function(ev) {
+    vscode.postMessage({ type: 'explorerSetUsePromotionBranch', value: ev.target.checked });
   });
 
   $('gw-allow-agent-git-commits-checkbox').addEventListener('change', function(ev) {
@@ -1502,6 +1507,7 @@ export function init(ctx) {
       $('gw-enforce-output-kind-checkbox').checked = !!msg.enforceExpectedOutputKind;
       $('gw-block-conflicting-ops-checkbox').checked = !!msg.blockConflictingOps;
       $('gw-allow-auto-requeue-checkbox').checked = !!msg.allowAutoRequeue;
+      $('gw-use-promotion-branch-checkbox').checked = !!msg.usePromotionBranch;
       $('gw-allow-agent-git-commits-checkbox').checked = !!msg.allowAgentGitCommits;
       $('gw-allow-agent-git-push-checkbox').checked = !!msg.allowAgentGitPush;
       if (msg.materializerConcurrency !== undefined) {

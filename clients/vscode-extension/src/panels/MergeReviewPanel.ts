@@ -56,6 +56,11 @@ export interface MergeProposal {
   filesTouched?: string[];
   noFileChangesJustification?: string | null;
   reviewNotes?: string | null;
+  // True once this proposal's own apply actually redirected onto the shared "candidate" staging
+  // branch (WorkspaceOptions.UsePromotionBranch). Distinct from targetBranch, which stays the
+  // proposal's ultimate declared destination ("main") whether or not promotion is in play — see
+  // MergeProposal.LandedOnCandidateBranch's own doc comment.
+  landedOnCandidateBranch?: boolean;
 }
 
 export interface DiffLine {
@@ -415,13 +420,23 @@ export class DecisionConvergencePanel {
           });
           void vscode.window.showInformationMessage('Decision accepted.');
           break;
-        case 'rejectDecision':
+        case 'reviseDecision':
           await this.post('/studio/merges/' + this.proposalId + '/review', {
             decision: 'Rejected',
+            restartMode: 'Revise',
             notes: (msg.notes as string | undefined) || undefined,
             sessionId: this.getEffectiveSessionId(),
           });
-          void vscode.window.showWarningMessage('Decision rejected — retrying with your notes as steering context.');
+          void vscode.window.showWarningMessage('Revising with your notes as steering context.');
+          break;
+        case 'revertAndRestart':
+          await this.post('/studio/merges/' + this.proposalId + '/review', {
+            decision: 'Rejected',
+            restartMode: 'Revert',
+            notes: (msg.notes as string | undefined) || undefined,
+            sessionId: this.getEffectiveSessionId(),
+          });
+          void vscode.window.showWarningMessage('Reverting the workspace and restarting with your notes as steering context.');
           break;
         case 'applyDecision':
           await this.post('/studio/merges/' + this.proposalId + '/apply', {});
@@ -936,7 +951,7 @@ const DC_HTML = `
     <div id="meta-grid" class="meta-grid">
       <span class="meta-label">Decision Status</span> <span id="status-badge"></span>
       <span class="meta-label">Hypothesis Fork</span><span class="meta-value" id="source-branch"></span>
-      <span class="meta-label">Target</span>         <span class="meta-value" id="target-branch"></span>
+      <span class="meta-label">Target</span>         <span class="meta-value" id="target-branch"></span><button class="ghost hidden" id="btn-view-candidate-promotion" style="margin-left:8px">View in Candidate Promotion</button>
       <span class="meta-label">Confidence</span>     <span class="meta-value" id="confidence"></span>
     </div>
     <section id="section-converged" class="hidden converged-banner">
@@ -990,13 +1005,14 @@ const DC_HTML = `
       <p id="rollback-plan"></p>
     </section>
     <div id="review-notes-row" class="review-notes-row">
-      <label for="review-notes">Notes (steering direction for a reject, or context for an accept)</label>
+      <label for="review-notes">Notes (steering direction for a revise/revert, or context for an accept)</label>
       <textarea id="review-notes" rows="3" placeholder="e.g. Missing the edge case for empty input — handle that and resubmit."></textarea>
     </div>
     <div id="actions" class="actions">
       <button id="btn-validate">Validate Evidence</button>
       <button id="btn-accept" class="accept">Accept Decision</button>
-      <button id="btn-reject" class="reject">Reject Decision</button>
+      <button id="btn-revise" class="reject" title="Keep the current file changes and nudge the agent toward the gap.">Revise</button>
+      <button id="btn-revert" class="reject" title="Discard the agent's changes and start the goal over with your notes.">Revert and Restart</button>
       <button id="btn-apply"  class="apply">Apply Decision</button>
       <button id="btn-fork"   class="ghost">Fork Hypothesis</button>
       <button id="btn-restore" class="ghost">Restore workspace</button>

@@ -39,12 +39,20 @@ public class SiblingProposalApplyTests
         await fileWorkspace.WriteAsync(siblingA.BranchId, "FileA.cs", "// added by sibling A");
         await fileWorkspace.WriteAsync(siblingB.BranchId, "FileB.cs", "// added by sibling B");
 
+        // targetBranch is deliberately ignored for a fan-out child — MergeCommandService.ProposeAsync
+        // now unconditionally redirects it to merge/{parentWorkUnitId} (see WorkspaceReviewScope /
+        // the comment on that override) so a child can never land content directly on "main" ahead
+        // of the goal's own WorkspaceReviewPolicy gate. The passed-in parent.BranchId here is just
+        // whatever the caller happened to supply — this test's point is the additive-apply/conflict
+        // behavior, not the target-branch choice, so assertions read from the actual (enforced)
+        // target below.
         var proposalA = await mergeCommands.ProposeAsync(
             sourceBranch: siblingA.BranchId, targetBranch: parent.BranchId, summary: "Add FileA",
             workUnitId: siblingA.WorkUnitId);
         var proposalB = await mergeCommands.ProposeAsync(
             sourceBranch: siblingB.BranchId, targetBranch: parent.BranchId, summary: "Add FileB",
             workUnitId: siblingB.WorkUnitId);
+        var mergeBranch = $"merge/{parent.WorkUnitId}";
 
         await mergeCommands.ValidateAsync(proposalA.ProposalId);
         await mergeCommands.ValidateAsync(proposalB.ProposalId);
@@ -56,9 +64,9 @@ public class SiblingProposalApplyTests
         await mergeCommands.ApplyAsync(proposalA.ProposalId);
         await mergeCommands.ApplyAsync(proposalB.ProposalId);
 
-        Assert.Equal("// added by sibling A", await fileWorkspace.ReadAsync(parent.BranchId, "FileA.cs"));
-        Assert.Equal("// added by sibling B", await fileWorkspace.ReadAsync(parent.BranchId, "FileB.cs"));
-        Assert.Equal("// shared, untouched by either sibling", await fileWorkspace.ReadAsync(parent.BranchId, "Shared.cs"));
+        Assert.Equal("// added by sibling A", await fileWorkspace.ReadAsync(mergeBranch, "FileA.cs"));
+        Assert.Equal("// added by sibling B", await fileWorkspace.ReadAsync(mergeBranch, "FileB.cs"));
+        Assert.Equal("// shared, untouched by either sibling", await fileWorkspace.ReadAsync(mergeBranch, "Shared.cs"));
     }
 
     [Fact]
@@ -82,12 +90,15 @@ public class SiblingProposalApplyTests
         await fileWorkspace.WriteAsync(siblingA.BranchId, "Shared.cs", "line one changed by A\nline two\nline three\n");
         await fileWorkspace.WriteAsync(siblingB.BranchId, "Shared.cs", "line one changed by B\nline two\nline three\n");
 
+        // targetBranch is deliberately ignored for a fan-out child — see the comment in the test
+        // above; assertions read from the actual (enforced) merge/{parentWorkUnitId} target.
         var proposalA = await mergeCommands.ProposeAsync(
             sourceBranch: siblingA.BranchId, targetBranch: parent.BranchId, summary: "Change line one (A)",
             workUnitId: siblingA.WorkUnitId);
         var proposalB = await mergeCommands.ProposeAsync(
             sourceBranch: siblingB.BranchId, targetBranch: parent.BranchId, summary: "Change line one (B)",
             workUnitId: siblingB.WorkUnitId);
+        var mergeBranch = $"merge/{parent.WorkUnitId}";
 
         await mergeCommands.ValidateAsync(proposalA.ProposalId);
         await mergeCommands.ValidateAsync(proposalB.ProposalId);
@@ -102,6 +113,6 @@ public class SiblingProposalApplyTests
         Assert.Contains("Shared.cs", ex.Message);
 
         // A's change must survive the failed apply attempt — the conflict must block, not partially land.
-        Assert.Equal("line one changed by A\nline two\nline three\n", await fileWorkspace.ReadAsync(parent.BranchId, "Shared.cs"));
+        Assert.Equal("line one changed by A\nline two\nline three\n", await fileWorkspace.ReadAsync(mergeBranch, "Shared.cs"));
     }
 }

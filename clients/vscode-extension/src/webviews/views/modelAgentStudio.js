@@ -289,6 +289,7 @@ export function init(ctx) {
         '<td class="mono">' + esc(profileLabel(t.planner)) + '</td>' +
         '<td class="mono">' + esc(profileLabel(t.worker)) + '</td>' +
         '<td class="mono">' + esc(profileLabel(t.reviewer)) + '</td>' +
+        '<td class="mono">' + esc(profileLabel(t.reconciler)) + '</td>' +
         '<td><div class="act-cell">' +
           (isDefault ? '' : '<button class="ghost" data-action="setDefault" data-idx="' + i + '">Set Default</button>') +
           '<button class="ghost" data-action="edit" data-idx="' + i + '">Edit</button>' +
@@ -328,7 +329,7 @@ export function init(ctx) {
 
   function showTemplateForm(idx) {
     const isNew = idx === -1;
-    const t = isNew ? { name: '', orchestrator: '', planner: '', worker: '', reviewer: '' } : templates[idx];
+    const t = isNew ? { name: '', orchestrator: '', planner: '', worker: '', reviewer: '', reconciler: '' } : templates[idx];
     const area = $('template-form-area');
     area.innerHTML =
       '<div class="form-box">' +
@@ -343,17 +344,20 @@ export function init(ctx) {
         '<select id="tmpl-worker">' + profileOptions(t.worker, true) + '</select></div>' +
       '<div class="field"><label>Reviewer Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
         '<select id="tmpl-reviewer">' + profileOptions(t.reviewer, true) + '</select></div>' +
+      '<div class="field"><label>Reconciler Profile <span style="opacity:0.6">(optional — falls back to Orchestrator; used to spawn conflict-reconciliation goals)</span></label>' +
+        '<select id="tmpl-reconciler">' + profileOptions(t.reconciler, true) + '</select></div>' +
       '<div class="form-actions">' +
         '<button id="tmpl-save">Save</button>' +
         '<button class="ghost" id="tmpl-cancel">Cancel</button>' +
       '</div></div>';
 
     $('tmpl-save').addEventListener('click', function() {
-      const name     = $('tmpl-name').value.trim();
-      const orch     = $('tmpl-orch').value;
-      const planner  = $('tmpl-planner').value;
-      const worker   = $('tmpl-worker').value;
-      const reviewer = $('tmpl-reviewer').value;
+      const name       = $('tmpl-name').value.trim();
+      const orch       = $('tmpl-orch').value;
+      const planner    = $('tmpl-planner').value;
+      const worker     = $('tmpl-worker').value;
+      const reviewer   = $('tmpl-reviewer').value;
+      const reconciler = $('tmpl-reconciler').value;
       if (!name || !orch) { alert('Name and Orchestrator Profile are required.'); return; }
       const tmpl = {
         name: name,
@@ -361,6 +365,7 @@ export function init(ctx) {
         planner: planner || undefined,
         worker: worker || undefined,
         reviewer: reviewer || undefined,
+        reconciler: reconciler || undefined,
       };
       if (isNew) { templates.push(tmpl); }
       else       { templates[idx] = tmpl; }
@@ -421,7 +426,7 @@ export function init(ctx) {
 
   // ── Pipeline Profiles ─────────────────────────────────────────────────────
   var pipelineProfiles = [];
-  var PIPELINE_STAGES = ['Orchestrate', 'Plan', 'Execute', 'Review', 'Merge'];
+  var PIPELINE_STAGES = ['Orchestrate', 'Plan', 'Execute', 'Review', 'Merge', 'Reconcile'];
 
   function renderPipelineProfiles() {
     const tbody = $('pipeline-profile-tbody');

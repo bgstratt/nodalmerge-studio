@@ -126,7 +126,23 @@ public interface ITaskService
             string proposalId,
             string supersededByProposalId,
             CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// The human-triggered counterpart to ApplyAsync's deferred write-back when
+    /// WorkspaceOptions.UsePromotionBranch is on: writes CandidateBranchId's current (already
+    /// additively composed) content to every distinct real repo path any Merged-but-not-yet-
+    /// promoted proposal resolves to, then marks each PromotedToDisk. A no-op (Succeeded: true,
+    /// empty Promoted list) when nothing is pending. If RequireBuildBeforeProposal/
+    /// RequireTestBeforeProposal is on, runs that gate against the composed candidate branch first
+    /// and promotes nothing on failure.
+    /// </summary>
+    Task<PromoteResult> PromoteAsync(CancellationToken cancellationToken = default);
     }
+
+    public sealed record PromoteResult(
+        bool Succeeded,
+        IReadOnlyList<MergeProposal> Promoted,
+        string? FailureReason = null);
 
     // Slice 15d — merge command consolidation. ProposeAsync is the heavyweight one: it runs the diff,
     // records artifact lineage, appends execution events, and best-efforts the owning work unit's
@@ -180,6 +196,164 @@ public interface IMergeReconciliationService
         string parentWorkUnitId,
         string? sessionId = null,
         CancellationToken cancellationToken = default);
+}
+
+// Record-keeper for candidate-branch cross-goal conflicts (see CandidateConflictRecord's own doc
+// comment for why this is separate from IConflictService/RepositoryConflict). Detection happens in
+// InMemoryMergeService.TryApplyAdditivelyAsync; this is purely the persisted-record surface the
+// promote UI queries.
+public interface ICandidateConflictService
+{
+    Task<CandidateConflictRecord> RecordAsync(CandidateConflictRecord conflict, CancellationToken ct = default);
+
+    Task<CandidateConflictRecord?> GetAsync(string conflictId, CancellationToken ct = default);
+
+    Task<IReadOnlyList<CandidateConflictRecord>> GetOpenAsync(CancellationToken ct = default);
+
+    // Atomically transitions Open -> Reconciling; returns null if the conflict doesn't exist or
+    // isn't currently Open (re-entrancy guard — two near-simultaneous triggers for the same
+    // conflict must not both create a reconciliation work unit).
+    Task<CandidateConflictRecord?> TryStartReconcilingAsync(string conflictId, CancellationToken ct = default);
+
+    Task<CandidateConflictRecord?> MarkResolvedAsync(string conflictId, CancellationToken ct = default);
+}
+
+// Thin candidate-branch-specific adapter over IReconciliationAgentService — translates a
+// CandidateConflictRecord into a ReconciliationRequest and guards re-entrancy via
+// ICandidateConflictService.TryStartReconcilingAsync. The only place in the codebase that
+// interprets the "candidate-conflict:{id}" ReconciliationSourceRef convention. Also owns the
+// manual-resolution path (TryResolveManuallyAsync) — a human directly supplies the combined
+// content instead of spinning up an agent, for the common case where the correct combination
+// (e.g. "keep both, in this order") is already obvious and not worth a full agent turn.
+public interface ICandidateReconciliationTrigger
+{
+    // Returns null if the conflict doesn't exist or isn't currently Open (already reconciling/
+    // resolved) — a no-op re-entrancy guard rather than a thrown error, since both the human button
+    // and the auto-trigger hook may race to call this for the same conflict. credentials, when
+    // supplied, is passed straight through to ReconciliationRequest.Credentials — see that field's
+    // own comment for why this takes priority over best-effort source-goal credential inheritance.
+    Task<WorkUnit?> TryTriggerAsync(
+        string conflictId, string? steeringNotes = null, OrchestratorCredentials? credentials = null, CancellationToken ct = default);
+
+    // Writes resolvedContent directly onto the candidate branch for each conflicting path, records
+    // a synthetic Merged MergeProposal representing the human's resolution (so it flows through the
+    // same promote/write-back pipeline as any agent-produced one), supersedes the original
+    // conflicting proposals, and marks the conflict Resolved. resolvedContent must cover every path
+    // in the conflict's ConflictingPaths. Returns null under the same re-entrancy guard as
+    // TryTriggerAsync; throws InvalidOperationException if resolvedContent is missing a path.
+    Task<MergeProposal?> TryResolveManuallyAsync(
+        string conflictId, IReadOnlyDictionary<string, string> resolvedContent, CancellationToken ct = default);
+}
+
+// Record-keeper for fan-out-sibling task-level conflicts (see TaskConflictRecord's own doc
+// comment). Mirrors ICandidateConflictService's shape exactly — detection happens in the same
+// InMemoryMergeService.TryApplyAdditivelyAsync block, this is purely the persisted-record surface.
+public interface ITaskConflictService
+{
+    Task<TaskConflictRecord> RecordAsync(TaskConflictRecord conflict, CancellationToken ct = default);
+
+    Task<TaskConflictRecord?> GetAsync(string conflictId, CancellationToken ct = default);
+
+    // parentWorkUnitId filters to one goal's own conflicts — unlike candidate (a single session-wide
+    // branch), task conflicts are naturally scoped per fan-out parent, and the review panel only
+    // ever wants the conflicts for the goal it's showing.
+    Task<IReadOnlyList<TaskConflictRecord>> GetOpenAsync(string? parentWorkUnitId = null, CancellationToken ct = default);
+
+    Task<TaskConflictRecord?> TryStartReconcilingAsync(string conflictId, CancellationToken ct = default);
+
+    Task<TaskConflictRecord?> MarkResolvedAsync(string conflictId, CancellationToken ct = default);
+}
+
+// Thin task-level adapter over IReconciliationAgentService, mirroring ICandidateReconciliationTrigger
+// exactly — the only place that interprets the "task-conflict:{id}" ReconciliationSourceRef
+// convention. TryResolveManuallyAsync writes to a dedicated scratch branch
+// (task-resolution/{conflictId}), not merge/{ParentWorkUnitId} directly — that branch gets
+// destructively rebuilt from scratch by MergeReconciliationService.TryReconcileAsync's own
+// ApplyBranchAsync reset every time it runs, so a manual resolution needs its own durable branch a
+// synthetic proposal's SourceBranch can point to, same as any other child's own branch would.
+public interface ITaskReconciliationTrigger
+{
+    Task<WorkUnit?> TryTriggerAsync(
+        string conflictId, string? steeringNotes = null, OrchestratorCredentials? credentials = null, CancellationToken ct = default);
+
+    Task<MergeProposal?> TryResolveManuallyAsync(
+        string conflictId, IReadOnlyDictionary<string, string> resolvedContent, CancellationToken ct = default);
+}
+
+// Attempts automated per-file resolution for a candidate-branch conflict by calling the same
+// IMergeStrategy implementations ConflictResolutionService orchestrates for the unrelated
+// RepositoryConflict/CAS subsystem — but directly, bypassing that subsystem entirely (see
+// CandidateConflictRecord's doc comment). Storage-agnostic: just base/A/B content strings in,
+// merged content or failure out.
+public interface ICandidateConflictResolutionService
+{
+    Task<CandidateConflictResolution> TryResolveAsync(
+        string path,
+        string? baseContent,
+        string? candidateContent,
+        string? proposalContent,
+        CancellationToken ct = default);
+}
+
+public sealed record CandidateConflictResolution(
+    bool Resolved,
+    string? MergedContent,
+    string? StrategyName = null,
+    string? FailureReason = null);
+
+// Source-agnostic request to reconcile N proposals whose owning goals both had legitimate intent
+// but diverged on the same file(s) — the multi-turn-agent alternative to blocking with a "restart
+// from scratch" report. Deliberately doesn't know which subsystem detected the conflict (candidate-
+// branch cross-goal collisions today; fan-out sibling/task-level conflicts as a future adapter) —
+// see IReconciliationAgentService's own doc comment.
+public sealed record ReconciliationRequest(
+    string SeedBranchId,
+    IReadOnlyList<string> ProposalIds,
+    IReadOnlyList<string> ConflictingPaths,
+    // Opaque to the core — round-tripped onto WorkUnit.ReconciliationSourceRef so the triggering
+    // adapter can later find its own record from InMemoryMergeService.ApplyAsync's completion hook.
+    string SourceRef,
+    ReviewPolicy WorkspaceReviewPolicy = ReviewPolicy.AgentApproval,
+    // Free-text human guidance on HOW to combine the conflicting sides — e.g. "keep both, Brad's
+    // section first then Jake's" rather than picking a winner. Deliberately optional and separate
+    // from each proposal's own goal text: no amount of re-reading two independent goals tells the
+    // agent which combination the human actually wants when the "right" answer is genuinely
+    // ambiguous (both entirely valid, mutually exclusive outcomes). Surfaced first and most
+    // prominently in the synthetic goal when present.
+    string? SteeringNotes = null,
+    // Set only by the task-level adapter: makes the created work unit a proper fan-out child
+    // (gated by TaskReviewPolicy, its proposal auto-redirected to merge/{ParentWorkUnitId} by
+    // MergeCommandService.ProposeAsync's existing fan-out-child override) instead of the default
+    // fresh top-level goal the candidate-branch adapter uses. WorkspaceReviewPolicy above is passed
+    // as both WorkspaceReviewPolicy and TaskReviewPolicy on the created work unit — whichever one
+    // WorkspaceReviewScope.AppliesToRealRepo actually consults for it depends on this field.
+    string? ParentWorkUnitId = null,
+    // Explicit credentials for the reconciliation orchestrator itself (e.g. a dedicated
+    // "Reconciler" slot on the caller's Agent Topology template), resolved client-side the same
+    // way Multi-Model Comparison resolves its own orchestrator credentials before spawning.
+    // Takes priority over ReconciliationAgentService's own best-effort inheritance from a source
+    // goal's in-memory orchestrator registration — that fallback only works if the exact source
+    // goal happens to still have a live registration in this process (lost on host restart, and
+    // never present at all for a fan-out task's own work unit, only its top-level parent), so it
+    // silently no-ops far too often for something advertised as "one-click."
+    OrchestratorCredentials? Credentials = null);
+
+// Creates an ordinary top-level WorkUnit whose goal carries full reconciliation context (every
+// source proposal's owning goal text + the conflicting paths' diverged content) directly in the
+// goal text, seeded from the conflict's own target branch — reusing the existing worker-agent loop,
+// McpToolDispatcher tool surface (including build/test), and propose/review pipeline wholesale
+// rather than inventing a new agent loop. Distinct from:
+//  - LlmAssistedMergeStrategy: a stateless one-shot "three text blobs in, one merged blob out" call
+//    with no goal awareness, no multi-file visibility, and no ability to run anything.
+//  - MergeReconciliationService: a purely mechanical fold of a fan-out's own already-approved
+//    children (CopyFilesAsync only) — no LLM/agent involved at all.
+// Intentionally source-agnostic: knows nothing about CandidateConflictRecord or any other specific
+// conflict-tracking record. A thin, subsystem-specific adapter (e.g. the candidate-branch adapter)
+// translates its own record into a ReconciliationRequest and, on completion, uses
+// WorkUnit.ReconciliationSourceRef to mark its own record resolved.
+public interface IReconciliationAgentService
+{
+    Task<WorkUnit> TriggerAsync(ReconciliationRequest request, CancellationToken ct = default);
 }
 
 public enum MergeReconciliationOutcome
@@ -241,10 +415,29 @@ public interface IAutomatedReviewGateService
     /// resets the rejected work unit (or its children, for a reconciled fan-out proposal) for
     /// retry — same retry/dead-letter budget shape as HandleAutomatedRejectionAsync, tracked
     /// under its own counter so human and automated rejection cycles don't share a budget.
+    /// mode selects whether the retry target's branch is reverted to its pre-attempt snapshot
+    /// (RestartMode.Revert) or left as-is with a compacted RevisionContext artifact attached
+    /// (RestartMode.Revise, the default).
     /// </summary>
     Task<AutomatedRejectionResult> HandleHumanRejectionAsync(
         string proposalId,
         string? reviewNotes,
+        RestartMode mode = RestartMode.Revise,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// A fanned-out task child's own inline reviewer (TaskReviewPolicy.AgentApproval/Hybrid) just
+    /// rejected that child's proposal — unlike HandleAutomatedRejectionAsync (which retries every
+    /// child of a parent whose *reconciled batch* proposal was rejected), this retries only the one
+    /// work unit that owns proposalId, same as HandleHumanRejectionAsync does for a non-fan-out
+    /// proposal. Tracked under its own per-work-unit AutomatedReviewRejectionCount budget so it
+    /// can't be starved by, or starve, a sibling's own retry cycle. Always attaches a compacted
+    /// RevisionContext (RestartMode.Revise) — there's no human present to choose Revert.
+    /// </summary>
+    Task<AutomatedRejectionResult> HandleAutomatedTaskRejectionAsync(
+        string proposalId,
+        string? reviewerAgentId = null,
         string? sessionId = null,
         CancellationToken cancellationToken = default);
 }
@@ -562,6 +755,10 @@ public interface IOrchestratorService
         // caller-supplied. Null keeps today's default ("workspace-default") for callers that
         // bypass WorkUnitCommandService (fan-out, steering, fork-from-node).
         string? workspaceId = null,
+        // See WorkUnit's own fields of the same name — set only by IReconciliationAgentService.
+        IReadOnlyList<string>? reconciliationSourceProposalIds = null,
+        IReadOnlyList<string>? reconciliationTargetPaths = null,
+        string? reconciliationSourceRef = null,
         CancellationToken cancellationToken = default);
 
     Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default);
@@ -593,7 +790,11 @@ public sealed record WorkUnitCreateCommand(
     string? RepositoryId = null,
     // Cross-repo file reference — see WorkUnit.ReferenceFiles. Each entry's RepositoryId is
     // validated against IRepositoryRegistryService by WorkUnitCommandService.CreateAsync.
-    IReadOnlyList<FileReferenceV1>? ReferenceFiles = null);
+    IReadOnlyList<FileReferenceV1>? ReferenceFiles = null,
+    // See WorkUnit's own fields of the same name — set only by IReconciliationAgentService.
+    IReadOnlyList<string>? ReconciliationSourceProposalIds = null,
+    IReadOnlyList<string>? ReconciliationTargetPaths = null,
+    string? ReconciliationSourceRef = null);
 
 public interface IWorkUnitCommandService
 {

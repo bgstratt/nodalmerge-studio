@@ -175,6 +175,8 @@ public class ArtifactLineageTests
 
         public Task<MergeProposal> SupersedeAsync(string proposalId, string supersededByProposalId, CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<PromoteResult> PromoteAsync(CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private sealed class SingleServiceProvider(object service) : IServiceProvider

@@ -13,6 +13,14 @@ public enum ArtifactType
     MergeResult,
     ChangeIntent,
     ExternalChangeset,
+    // A human reviewer's "Revise" restart — a compacted summary (goal, files touched, truncated
+    // diff) of the almost-correct attempt being revised. Distinct from Constraint: this is
+    // per-attempt context to build on, not an inherited rule the agent must obey.
+    RevisionContext,
+    // IReconciliationAgentService's audit trail — records which source proposals a reconciliation
+    // work unit was created to fold together. Distinct from RevisionContext: that's one agent's own
+    // almost-correct attempt being revised; this spans two-or-more independent goals' proposals.
+    ReconciliationContext,
 }
 
 public enum ArtifactStatus

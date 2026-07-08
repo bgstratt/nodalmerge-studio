@@ -72,6 +72,7 @@ public class ProjectionManagerTests
         public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, IReadOnlyList<string>? consideredArtifactIds = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> ApplyAsync(string id, CancellationToken ct = default, bool autoApplied = false) => throw new NotSupportedException();
         public Task<MergeProposal> SupersedeAsync(string proposalId, string supersededByProposalId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<PromoteResult> PromoteAsync(CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private sealed class FakeAgentRuntimeService : IAgentRuntimeService

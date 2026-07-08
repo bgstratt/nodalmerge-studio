@@ -63,6 +63,28 @@ public class FanOutIntegrationTests
                 children.All(c => c.Status is WorkUnitStatus.Queued or WorkUnitStatus.Executing or WorkUnitStatus.Proposed),
                 "Expected both children to enter the scheduler pipeline.");
 
+            // Reconciliation only folds a child's proposal in once it's been Approved — a fanned-out
+            // child defaults to TaskReviewPolicy.HumanRequired, so simulate the human approval each
+            // child needs before the batch can ever produce a reconciled parent proposal.
+            var approvedProposalIds = new HashSet<string>();
+            var approvalDeadline = DateTimeOffset.UtcNow.AddSeconds(20);
+            while (DateTimeOffset.UtcNow < approvalDeadline && approvedProposalIds.Count < 2)
+            {
+                var readyProposals = (await merge.ListAsync())
+                    .Where(p => p.Status == MergeProposalStatus.ReadyForReview
+                        && p.WorkUnitId is not null
+                        && children.Any(c => c.WorkUnitId == p.WorkUnitId)
+                        && !approvedProposalIds.Contains(p.ProposalId));
+                foreach (var proposal in readyProposals)
+                {
+                    await merge.ReviewAsync(proposal.ProposalId, MergeProposalStatus.Approved);
+                    approvedProposalIds.Add(proposal.ProposalId);
+                }
+                if (approvedProposalIds.Count < 2)
+                    await Task.Delay(100);
+            }
+            Assert.Equal(2, approvedProposalIds.Count);
+
             // Wait for reconciled parent proposal (merger runs after both children complete).
             MergeProposal? reconciled = null;
             var proposalDeadline = DateTimeOffset.UtcNow.AddSeconds(35);
@@ -180,8 +202,22 @@ public class FanOutIntegrationTests
             var fooInS2Branch = await fileWorkspace.ReadAsync(s2Final.BranchId, "src/Foo.cs");
             Assert.Equal("class Foo {}", fooInS2Branch);
 
-            var reconciled = (await merge.ListAsync()).FirstOrDefault(p =>
-                p.WorkUnitId == parent.WorkUnitId && p.ReconciledFrom.Count >= 2);
+            // Reconciliation only folds a child's proposal in once it's been Approved — s1 was
+            // already approved above, so approve s2's proposal too before expecting the reconciled
+            // parent proposal to appear.
+            var s2Proposal = (await merge.ListAsync()).Single(p =>
+                p.WorkUnitId == s2Final.WorkUnitId && p.Status == MergeProposalStatus.ReadyForReview);
+            await merge.ReviewAsync(s2Proposal.ProposalId, MergeProposalStatus.Approved);
+
+            MergeProposal? reconciled = null;
+            var reconciledDeadline = DateTimeOffset.UtcNow.AddSeconds(20);
+            while (DateTimeOffset.UtcNow < reconciledDeadline)
+            {
+                reconciled = (await merge.ListAsync()).FirstOrDefault(p =>
+                    p.WorkUnitId == parent.WorkUnitId && p.ReconciledFrom.Count >= 2);
+                if (reconciled is not null) break;
+                await Task.Delay(100);
+            }
             Assert.NotNull(reconciled);
             Assert.Equal(MergeProposalStatus.ReadyForReview, reconciled!.Status);
         }

@@ -580,6 +580,7 @@ public sealed class ProjectionManager : IProjectionManager
                 PipelineStage.Execute     => "Executing",
                 PipelineStage.Review      => "Proposed",
                 PipelineStage.Merge       => wu.Status is WorkUnitStatus.Completed or WorkUnitStatus.Merged ? "Converged" : "Converging",
+                PipelineStage.Reconcile   => wu.Status is WorkUnitStatus.Completed or WorkUnitStatus.Merged ? "Converged" : "Reconciling",
                 _ => wu.Status.ToString()
             };
 

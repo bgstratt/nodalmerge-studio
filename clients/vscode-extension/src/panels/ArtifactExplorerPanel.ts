@@ -242,14 +242,13 @@ export class GoalWorkspacePanel {
     if (!this.configService) { return; }
     const templates = this.configService.getTemplates();
     const profiles = this.configService.getProfiles();
-    const orchModels = new Set(
-      profiles
-        .filter(p => p.domain === 'orchestration' && p.model)
-        .map(p => p.model!)
-    );
     const strategies: Array<{ name: string; orchestrator: string; workers?: { profile: string }[]; disabled?: boolean; tooltip?: string; experimentType?: string }> = [...templates];
 
     // ── Slice 22c — Experiment strategies ──────────────────────────────────
+    // Always offered — the fork-config panel lets the user pick any 2 profiles per run, so
+    // there's nothing to gate up front (previously required 2 domain==='orchestration' profiles
+    // with a model, which just forced a magic-string label onto a choice the panel already makes
+    // freely selectable).
     const experimentStrategies = [
       { name: 'Multi-Model Comparison', experimentType: 'Model' },
       { name: 'Architecture Fork', experimentType: 'Architecture' },
@@ -257,21 +256,7 @@ export class GoalWorkspacePanel {
       { name: 'Product Strategy Fork', experimentType: 'Product' },
     ];
     for (const es of experimentStrategies) {
-      if (es.name === 'Multi-Model Comparison') {
-        if (orchModels.size >= 2) {
-          strategies.push({ name: es.name, orchestrator: '', workers: [], disabled: false, experimentType: es.experimentType });
-        } else {
-          strategies.push({
-            name: '__multi_model__',
-            orchestrator: '',
-            workers: [],
-            disabled: true,
-            tooltip: 'Configure at least 2 orchestrator profiles with different models in Model & Agent Studio.',
-          });
-        }
-      } else {
-        strategies.push({ name: es.name, orchestrator: '', workers: [], disabled: false, experimentType: es.experimentType });
-      }
+      strategies.push({ name: es.name, orchestrator: '', workers: [], disabled: false, experimentType: es.experimentType });
     }
     void this.panel.webview.postMessage({
       type: 'strategies', strategies, profiles: profiles.map(p => ({ id: p.id, label: p.label, domain: p.domain, model: p.model })),
@@ -651,6 +636,9 @@ export class GoalWorkspacePanel {
         case 'explorerSetAllowAutoRequeue':
           await this.updateOptions({ allowAutoRequeue: msg.value as boolean });
           break;
+        case 'explorerSetUsePromotionBranch':
+          await this.updateOptions({ usePromotionBranch: msg.value as boolean });
+          break;
         case 'explorerSetAllowAgentGitCommits':
           await this.updateOptions({ allowAgentGitCommits: msg.value as boolean });
           break;
@@ -1001,15 +989,21 @@ export class GoalWorkspacePanel {
         return;
       }
       const profiles = this.configService.getProfiles();
-      const orchProfiles = profiles.filter(p => p.domain === 'orchestration' && p.model);
-      if (orchProfiles.length < 2) {
+      // Use whatever the user picked in the fork-config panel (any 2 profiles, any domain) rather
+      // than forcing a domain==='orchestration' filter — the panel already lets the user choose
+      // freely, so this just honors that choice instead of silently overriding it with the first
+      // two profiles matching a magic-string label.
+      const chosenProfiles = (forkConfig ?? [])
+        .map(f => profiles.find(p => p.id === f.profileId))
+        .filter((p): p is NonNullable<typeof p> => !!p && !!p.model);
+      if (chosenProfiles.length < 2) {
         void vscode.window.showErrorMessage(
-          'Multi-Model Comparison requires at least 2 orchestrator profiles with different models.',
+          'Multi-Model Comparison requires 2 profiles with a model set — pick them in the fork panel above.',
         );
         return;
       }
-      const modelAProfile = orchProfiles[0];
-      const modelBProfile = orchProfiles[1];
+      const modelAProfile = chosenProfiles[0];
+      const modelBProfile = chosenProfiles[1];
 
       try {
         const [cfgA, cfgB] = await Promise.all([
@@ -1737,6 +1731,10 @@ const GW_HTML = `
     <label class="gw-settings-row">
       <input type="checkbox" id="gw-allow-auto-requeue-checkbox"/>
       Auto-requeue losing work unit when all merge strategies fail
+    </label>
+    <label class="gw-settings-row">
+      <input type="checkbox" id="gw-use-promotion-branch-checkbox"/>
+      Stage AgentApproval/Hybrid goals on a shared candidate branch before promoting to main
     </label>
     <label class="gw-settings-row" style="margin-top:8px;border-top:1px solid var(--nm-border);padding-top:8px">
       Git Integration <span style="font-size:0.8em;color:var(--nm-text-muted)">(opt-in, use with care)</span>

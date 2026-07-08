@@ -7,6 +7,35 @@ import { scopeViewCss } from './sharedWebviewChrome';
 
 const POLL_INTERVAL_MS = 2_000;
 
+// ── Read-only diff viewer for candidate-conflict resolution — the same "registered content
+// provider, not a plain in-memory openTextDocument buffer" pattern MergeReviewPanel.ts uses for its
+// own diff viewer (see that file's own comment for why: a plain openTextDocument({content}) buffer
+// looks editable but silently discards anything typed into it). Kept self-contained here rather
+// than shared, since this panel's lifecycle is independent of MergeReviewPanel's. ──
+const NM_CONFLICT_DIFF_SCHEME = 'nodalmerge-conflict-diff';
+
+class ConflictDiffContentProvider implements vscode.TextDocumentContentProvider {
+  private readonly contents = new Map<string, string>();
+  set(uri: vscode.Uri, content: string): void { this.contents.set(uri.toString(), content); }
+  provideTextDocumentContent(uri: vscode.Uri): string { return this.contents.get(uri.toString()) ?? ''; }
+}
+
+let conflictDiffProvider: ConflictDiffContentProvider | undefined;
+function getConflictDiffProvider(): ConflictDiffContentProvider {
+  if (!conflictDiffProvider) {
+    conflictDiffProvider = new ConflictDiffContentProvider();
+    vscode.workspace.registerTextDocumentContentProvider(NM_CONFLICT_DIFF_SCHEME, conflictDiffProvider);
+  }
+  return conflictDiffProvider;
+}
+
+interface ProposalFileChange {
+  path: string;
+  changeKind: string;
+  beforeContent?: string | null;
+  afterContent?: string | null;
+}
+
 // ── Domain types matching Studio Host REST responses ───────────────────────
 
 interface WorkUnit {
@@ -17,6 +46,7 @@ interface WorkUnit {
   status: string;
   successCriteria?: string | null;
   fanOutInfo?: { blockedReason?: string | null } | null;
+  parentWorkUnitId?: string | null;
 }
 
 interface AgentInfo {
@@ -111,6 +141,38 @@ interface GoalItem {
   updatedAt?: string | null;
 }
 
+// Matches the anonymous shape returned by GET /studio/branches/candidate/pending.
+interface CandidatePendingItem {
+  proposalId: string;
+  workUnitId?: string | null;
+  goal: string;
+  summary: string;
+  filesTouched: string[];
+}
+
+// Matches NodalMerge.Studio.Contracts.Domain.CandidateConflictRecord.
+interface CandidateConflictItem {
+  conflictId: string;
+  proposalId: string;
+  workUnitId?: string | null;
+  conflictingPaths: string[];
+  detectedAt: string;
+  status: string;
+  winningProposalId?: string | null;
+}
+
+// Matches NodalMerge.Studio.Contracts.Domain.TaskConflictRecord.
+interface TaskConflictItem {
+  conflictId: string;
+  parentWorkUnitId: string;
+  proposalId: string;
+  workUnitId?: string | null;
+  conflictingPaths: string[];
+  detectedAt: string;
+  status: string;
+  winningProposalId?: string | null;
+}
+
 interface ClarificationInboxItem {
   requestId: string;
   sessionId?: string | null;
@@ -202,6 +264,15 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
     void this.poll();
   }
 
+  /** Scrolls Activity Center to its Candidate Promotion section — used by the merge review
+   * panel's "View in Candidate Promotion" link so a reviewer looking at a proposal that landed on
+   * the candidate branch can jump straight to that conflict/promotion queue instead of hunting
+   * for it themselves. Mirrors the showTab + direct panel-method pattern StudioShellPanel already
+   * uses for "View live transcript." */
+  focusCandidatePromotion(): void {
+    void this.panel.webview.postMessage({ type: 'focusCandidatePromotion' });
+  }
+
   private getEffectiveSessionId(): string | undefined {
     return this.localSessionOverride ?? this.getSelectedSessionId?.();
   }
@@ -268,12 +339,38 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
       const syncGraph = await this.get<{ frontierHeads: string[] }>('/studio/causal/frontier').catch(() => null);
       const goals = goalsResp?.goals ?? [];
       this.usePromotionBranch = opts.usePromotionBranch ?? false;
+      // Only fetched when promotion branch is actually on — no point polling these for the
+      // (default) direct-apply session.
+      const [candidatePending, candidateConflicts] = this.usePromotionBranch
+        ? await Promise.all([
+            this.get<CandidatePendingItem[]>('/studio/branches/candidate/pending').catch(() => [] as CandidatePendingItem[]),
+            this.get<CandidateConflictItem[]>('/studio/branches/candidate/conflicts').catch(() => [] as CandidateConflictItem[]),
+          ])
+        : [[] as CandidatePendingItem[], [] as CandidateConflictItem[]];
+
+      // Fan-out-sibling conflicts are scoped per top-level goal (unlike candidate's single
+      // session-wide branch) — fetch each top-level work unit's own conflict list and flatten.
+      // Small set in practice (one call per active goal, not per work unit).
+      const topLevelWorkUnitIds = Array.from(new Set(
+        workUnits.filter(w => !w.parentWorkUnitId).map(w => w.workUnitId),
+      ));
+      const taskConflictLists = await Promise.all(
+        topLevelWorkUnitIds.map(id =>
+          this.get<TaskConflictItem[]>('/studio/workunits/' + encodeURIComponent(id) + '/task-conflicts')
+            .catch(() => [] as TaskConflictItem[]),
+        ),
+      );
+      const taskConflicts = taskConflictLists.flat();
+
       void this.panel.webview.postMessage({
         type: 'data', summary, workUnits, goals, agents, awaitingResume, clarifications, clarificationMetrics, merges, deadLetters, fileLeases,
         providerRetries,
         guardrailStatuses,
         usePromotionBranch: this.usePromotionBranch,
         candidateBranchId: opts.candidateBranchId ?? 'candidate',
+        candidatePending,
+        candidateConflicts,
+        taskConflicts,
         syncGraph: syncGraph ?? { frontierHeads: [] },
       });
       this.notifications?.update(merges, workUnits, findings);
@@ -549,10 +646,198 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           void this.poll();
           break;
         }
+        case 'promoteCandidate': {
+          const confirmed = await vscode.window.showWarningMessage(
+            'Promote everything on the candidate branch to main? For any goal with a real ' +
+              'repository attached, this also writes to disk.',
+            { modal: true },
+            'Promote',
+          );
+          if (confirmed !== 'Promote') { return; }
+          const result = (await this.post('/studio/branches/candidate/promote', {})) as {
+            proposalCount?: number;
+          };
+          void vscode.window.showInformationMessage(
+            'NodalMerge: Promoted ' + (result.proposalCount ?? 0) + ' proposal(s) to main.',
+          );
+          void this.poll();
+          break;
+        }
+        case 'restartCandidateConflict': {
+          const proposalId = String(msg.proposalId ?? '');
+          if (!proposalId) { return; }
+          // Steering notes come from the same inline textarea Reconcile reads, rather than a
+          // separate popup — one place to write "avoid touching Shared.cs" regardless of which
+          // action ends up getting clicked.
+          const notes = (msg.steeringNotes as string | null | undefined) ?? null;
+          // Same path a human rejection from the merge review panel takes — POST .../review with
+          // Rejected already auto-triggers AutomatedReviewGateService.HandleHumanRejectionAsync
+          // server-side. Revert (not the default Revise) so the losing goal starts from a clean
+          // branch snapshot rather than building on the content that just lost the conflict.
+          await this.post('/studio/merges/' + encodeURIComponent(proposalId) + '/review', {
+            decision: 'Rejected',
+            restartMode: 'Revert',
+            notes: notes,
+            sessionId: this.getEffectiveSessionId(),
+          });
+          void vscode.window.showInformationMessage('NodalMerge: Goal restarted from a clean snapshot.');
+          void this.poll();
+          break;
+        }
+        case 'reconcileCandidateConflict': {
+          const conflictId = String(msg.conflictId ?? '');
+          if (!conflictId) { return; }
+          const credentials = await this.resolveReconcilerCredentials();
+          await this.post(
+            '/studio/branches/candidate/conflicts/' + encodeURIComponent(conflictId) + '/reconcile',
+            { steeringNotes: (msg.steeringNotes as string | null | undefined) ?? null, ...credentials },
+          );
+          void vscode.window.showInformationMessage(
+            credentials
+              ? 'NodalMerge: Reconciliation goal created and spawned — see the decision tree for progress.'
+              : 'NodalMerge: Reconciliation goal created — no Reconciler profile configured in Model & ' +
+                'Agent Studio → Agent Topology, so you\'ll need to Spawn it manually.',
+          );
+          void this.poll();
+          break;
+        }
+        case 'viewConflictDiff': {
+          const conflictId = String(msg.conflictId ?? '');
+          const losingProposalId = String(msg.proposalId ?? '');
+          const winningProposalId = msg.winningProposalId ? String(msg.winningProposalId) : undefined;
+          const paths = Array.isArray(msg.conflictingPaths) ? (msg.conflictingPaths as string[]) : [];
+          if (!conflictId || !losingProposalId || paths.length === 0) { return; }
+
+          const losing = await this.get<{ fileChanges: ProposalFileChange[] }>(
+            '/studio/merges/' + encodeURIComponent(losingProposalId) + '/file-changes',
+          ).catch(() => ({ fileChanges: [] as ProposalFileChange[] }));
+          const winning = winningProposalId
+            ? await this.get<{ fileChanges: ProposalFileChange[] }>(
+                '/studio/merges/' + encodeURIComponent(winningProposalId) + '/file-changes',
+              ).catch(() => ({ fileChanges: [] as ProposalFileChange[] }))
+            : { fileChanges: [] as ProposalFileChange[] };
+
+          const provider = getConflictDiffProvider();
+          for (const filePath of paths) {
+            const winningContent = winning.fileChanges.find((f) => f.path === filePath)?.afterContent ?? '(no content)';
+            const losingContent = losing.fileChanges.find((f) => f.path === filePath)?.afterContent ?? '(no content)';
+            const leftUri = vscode.Uri.parse(
+              NM_CONFLICT_DIFF_SCHEME + ':/' + encodeURIComponent(conflictId) + '/candidate/' + filePath);
+            const rightUri = vscode.Uri.parse(
+              NM_CONFLICT_DIFF_SCHEME + ':/' + encodeURIComponent(conflictId) + '/losing/' + filePath);
+            provider.set(leftUri, winningContent);
+            provider.set(rightUri, losingContent);
+            await vscode.commands.executeCommand(
+              'vscode.diff', leftUri, rightUri, filePath + ': currently on candidate vs. losing goal',
+              { preview: false },
+            );
+          }
+          break;
+        }
+        case 'requestResolveManually': {
+          const conflictId = String(msg.conflictId ?? '');
+          const losingProposalId = String(msg.proposalId ?? '');
+          const winningProposalId = msg.winningProposalId ? String(msg.winningProposalId) : undefined;
+          const paths = Array.isArray(msg.conflictingPaths) ? (msg.conflictingPaths as string[]) : [];
+          if (!conflictId || !losingProposalId || paths.length === 0) { return; }
+
+          const losing = await this.get<{ fileChanges: ProposalFileChange[] }>(
+            '/studio/merges/' + encodeURIComponent(losingProposalId) + '/file-changes',
+          ).catch(() => ({ fileChanges: [] as ProposalFileChange[] }));
+          const winning = winningProposalId
+            ? await this.get<{ fileChanges: ProposalFileChange[] }>(
+                '/studio/merges/' + encodeURIComponent(winningProposalId) + '/file-changes',
+              ).catch(() => ({ fileChanges: [] as ProposalFileChange[] }))
+            : { fileChanges: [] as ProposalFileChange[] };
+
+          const files = paths.map((filePath) => ({
+            path: filePath,
+            winningContent: winning.fileChanges.find((f) => f.path === filePath)?.afterContent ?? '',
+            losingContent: losing.fileChanges.find((f) => f.path === filePath)?.afterContent ?? '',
+          }));
+          void this.panel.webview.postMessage({
+            type: 'conflictResolveData', conflictId, files,
+            parentWorkUnitId: msg.parentWorkUnitId ?? null,
+          });
+          break;
+        }
+        case 'resolveConflictManually': {
+          const conflictId = String(msg.conflictId ?? '');
+          const files = msg.files as Record<string, string> | undefined;
+          if (!conflictId || !files || Object.keys(files).length === 0) { return; }
+
+          await this.post(
+            '/studio/branches/candidate/conflicts/' + encodeURIComponent(conflictId) + '/resolve',
+            { files },
+          );
+          void vscode.window.showInformationMessage(
+            'NodalMerge: Conflict resolved manually — resolution will apply to main on next Promote.',
+          );
+          void this.poll();
+          break;
+        }
+        case 'reconcileTaskConflict': {
+          const conflictId = String(msg.conflictId ?? '');
+          const parentWorkUnitId = String(msg.parentWorkUnitId ?? '');
+          if (!conflictId || !parentWorkUnitId) { return; }
+          const credentials = await this.resolveReconcilerCredentials();
+          await this.post(
+            '/studio/workunits/' + encodeURIComponent(parentWorkUnitId)
+              + '/task-conflicts/' + encodeURIComponent(conflictId) + '/reconcile',
+            { steeringNotes: (msg.steeringNotes as string | null | undefined) ?? null, ...credentials },
+          );
+          void vscode.window.showInformationMessage(
+            credentials
+              ? 'NodalMerge: Reconciliation task created and spawned — see the decision tree for progress.'
+              : 'NodalMerge: Reconciliation task created — no Reconciler profile configured in Model & ' +
+                'Agent Studio → Agent Topology, so you\'ll need to Spawn it manually.',
+          );
+          void this.poll();
+          break;
+        }
+        case 'resolveTaskConflictManually': {
+          const conflictId = String(msg.conflictId ?? '');
+          const parentWorkUnitId = String(msg.parentWorkUnitId ?? '');
+          const files = msg.files as Record<string, string> | undefined;
+          if (!conflictId || !parentWorkUnitId || !files || Object.keys(files).length === 0) { return; }
+
+          await this.post(
+            '/studio/workunits/' + encodeURIComponent(parentWorkUnitId)
+              + '/task-conflicts/' + encodeURIComponent(conflictId) + '/resolve',
+            { files },
+          );
+          void vscode.window.showInformationMessage(
+            'NodalMerge: Conflict resolved manually — will fold in on the next reconciliation pass.',
+          );
+          void this.poll();
+          break;
+        }
       }
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: ' + String(err));
     }
+  }
+
+  // Resolves the default Agent Topology template's Reconciler profile (falling back to its
+  // Orchestrator profile, same "inherit" convention Planner/Worker/Reviewer already use) into
+  // spawn-ready credentials, so clicking Reconcile is genuinely one-click instead of silently
+  // depending on whichever source goal's own in-memory orchestrator registration happens to still
+  // be alive server-side (see ReconciliationRequest.Credentials's own comment for why that
+  // inheritance is unreliable). Returns undefined — not thrown — when nothing is configured, so
+  // callers can still create the reconciliation goal and fall back to a manual Spawn.
+  private async resolveReconcilerCredentials(): Promise<
+    { provider: string; model: string; baseUrl: string; apiKey: string; profileId: string } | undefined
+  > {
+    if (!this.configService || !this.secrets || !this.lmProxyBaseUrl) { return undefined; }
+
+    const templates = this.configService.getTemplates();
+    const defaultName = this.configService.getDefaultTopology();
+    const template = templates.find(t => t.name === defaultName) ?? templates[0];
+    const profileId = template?.reconciler || template?.orchestrator;
+    if (!profileId) { return undefined; }
+
+    const llm = await this.configService.resolveSpawnLlmConfig(profileId, this.secrets, this.lmProxyBaseUrl);
+    return llm ? { ...llm, profileId } : undefined;
   }
 
   private async get<T>(path: string): Promise<T> {
@@ -713,6 +998,23 @@ const ET_CSS = `
     border-radius: 3px;
   }
   .add-btn:hover { opacity: 1; }
+  .conflict-actions { display: flex; gap: 6px; margin-top: 6px; }
+  .conflict-actions button { flex: 1; padding: 5px 9px; font-size: 0.82em; }
+  .conflict-actions button.primary { background: var(--nm-btn); color: var(--nm-btn-fg); }
+  .steering-notes {
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 6px;
+    background: var(--nm-input-bg, var(--nm-section-bg));
+    color: var(--nm-fg);
+    border: 1px solid var(--nm-border);
+    border-radius: 3px;
+    padding: 5px 7px;
+    font-size: 0.82em;
+    font-family: var(--nm-font);
+    resize: vertical;
+    min-height: 40px;
+  }
   .sync-graph-card {
     background: var(--nm-section-bg);
     border: 1px solid var(--nm-border);
@@ -779,6 +1081,14 @@ const ET_HTML = `
 
   <h2>File Lease Conflicts</h2>
   <div id="file-leases"><p class="empty">No file lease conflicts.</p></div>
+
+  <div id="candidate-promotion-section" style="display:none">
+    <h2>Candidate Promotion</h2>
+    <div id="candidate-promotion"><p class="empty">Loading…</p></div>
+  </div>
+
+  <h2>Task Conflicts</h2>
+  <div id="task-conflicts"><p class="empty">No open task conflicts.</p></div>
 
   <h2>Sync Graph</h2>
   <div id="sync-graph"><p class="empty">Loading…</p></div>

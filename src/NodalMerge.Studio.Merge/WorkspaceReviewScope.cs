@@ -19,8 +19,13 @@ namespace NodalMerge.Studio.Merge;
 // receive their own RepositoryId (both bypass WorkUnitCommandService and call
 // IOrchestratorService.CreateWorkUnitAsync directly with no repositoryId) — so they correctly stay
 // excluded and remain gated by TaskReviewPolicy, never touching disk.
+//
+// A null workUnit means the proposal isn't tracked against any WorkUnit at all (no WorkUnitId, or
+// no IWorkUnitService registered) — the legacy/direct-spawn path predating work-unit tracking, not
+// a fan-out child (those always resolve to a real WorkUnit with ParentWorkUnitId set). That's
+// equivalent to a plain top-level goal, so it qualifies too.
 public static class WorkspaceReviewScope
 {
     public static bool AppliesToRealRepo(WorkUnit? workUnit) =>
-        workUnit is not null && (workUnit.ParentWorkUnitId is null || workUnit.RepositoryId is not null);
+        workUnit is null || workUnit.ParentWorkUnitId is null || workUnit.RepositoryId is not null;
 }

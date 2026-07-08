@@ -42,6 +42,8 @@ public static class StudioNodeKind
     public const string RepositoryConflictV1   = "studio/repository-conflict/v1";
     public const string CoModPatternV1         = "studio/comod-pattern/v1";
     public const string BlobIndexEntryV1       = "studio/blob-index-entry/v1";
+    public const string CandidateConflictV1    = "studio/candidate-conflict/v1";
+    public const string TaskConflictV1         = "studio/task-conflict/v1";
 }
 
 public interface IStudioNodeStore

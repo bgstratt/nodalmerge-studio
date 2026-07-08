@@ -88,7 +88,22 @@ public sealed record WorkUnit(
     // server-side (IWorkspaceRegistryService.GetOrCreateDefaultAsync) by WorkUnitCommandService,
     // never caller-supplied — there's nothing to choose while cardinality is 1. Defaulted here so
     // every existing call site keeps compiling unchanged. See plans/phase-16-workspace-aggregate.md.
-    string WorkspaceId = "workspace-default");
+    string WorkspaceId = "workspace-default",
+    // IReconciliationAgentService — set only on a reconciliation work unit (one created to fold two
+    // or more conflicting proposals' changes into a single combined result). Generic/source-agnostic:
+    // apply-time code (InMemoryMergeService.ApplyAsync) only reads these three fields and never
+    // interprets ReconciliationSourceRef itself; a subsystem-specific adapter (e.g. the
+    // candidate-branch adapter) is the only place that parses it, so a future task-level adapter can
+    // reuse the exact same apply-time bypass/supersede logic without touching it.
+    //
+    // Every proposal this work unit's own result supersedes once it lands.
+    IReadOnlyList<string>? ReconciliationSourceProposalIds = null,
+    // Paths this reconciliation is authoritative to overwrite on apply — bypasses the normal
+    // drift/conflict check for exactly these paths, regardless of which subsystem flagged them.
+    IReadOnlyList<string>? ReconciliationTargetPaths = null,
+    // Opaque back-reference the triggering adapter can parse to find its own record, e.g.
+    // "candidate-conflict:{conflictId}".
+    string? ReconciliationSourceRef = null);
 
 /// <summary>Failure/rejection counters, previously stored as parsed strings in Metadata.</summary>
 public sealed record WorkUnitExecutionInfo(
