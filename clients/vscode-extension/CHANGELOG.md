@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.9 — 2026-07-08
+
+- **Candidate conflict reconciliation.** When promotion branches are on and two
+  proposals land on the shared `candidate` branch touching the same file paths
+  (or two fan-out sibling work units conflict under the same goal — now
+  distinguished as a **Task Conflict**), the Activity Center lists the
+  conflict with four ways to resolve it: **View Conflict Diff** (read-only
+  side-by-side of the candidate branch vs. the losing proposal), **Reconcile**
+  (spawns a dedicated reconciliation work unit seeded from the conflicting
+  diffs plus optional steering notes — auto-spawns if a **Reconciler** agent
+  profile is configured, otherwise created for manual spawn), **Restart**
+  (rejects the losing proposal and restarts its goal in Revert mode from a
+  clean branch snapshot), and **Resolve manually** (submit resolved file
+  content directly, recorded as a synthetic merged proposal that supersedes
+  the losing one(s)).
+- **Edit File / Resync Workspace** in Decision Convergence (Review): both the
+  normal proposal diff view and the apply-time conflict-report view now have
+  an inline **Edit File** button per changed/conflicting path, with a
+  **Resync Workspace** button appearing once you've edited it, to pull that
+  edit back into the work unit's branch before deciding.
+- New REST surface backing the above: `GET /studio/branches/candidate/conflicts`,
+  `POST /studio/branches/candidate/conflicts/{id}/reconcile`,
+  `POST /studio/branches/candidate/conflicts/{id}/resolve`,
+  `GET /studio/workunits/{id}/task-conflicts`,
+  `POST /studio/workunits/{id}/task-conflicts/{conflictId}/reconcile`,
+  `POST /studio/workunits/{id}/task-conflicts/{conflictId}/resolve`,
+  `GET /studio/merges/{id}/constituents`.
+- Review policy and profile/topology selection UX cleanup in Model & Agent
+  Studio and the Goal Workspace (shared webview chrome, trimmed dead code in
+  `AgentConfigPanel` and `modelAgentStudio.js`).
+
 ## 0.1.8 — 2026-07-06
 
 - Bumped bundled `NodalMerge.DotNetHost` to 0.2.0, which converges blob storage
