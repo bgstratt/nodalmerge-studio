@@ -767,6 +767,38 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                                 .ConfigureAwait(false);
                         }
                     }
+
+                    // The reverse direction: proposal.WorkUnitId may itself be a reconciliation
+                    // parent whose own combined proposal just merged. MergeReconciliationService
+                    // .TryReconcileAsync refuses to produce that combined proposal until every
+                    // child is already Proposed or Merged (children.cs:51-52) — so any child still
+                    // sitting at Proposed right now has no more work coming (its content already
+                    // rode along in the parent's merge, whether folded in directly or via a
+                    // superseded-and-absorbed sibling proposal) and is safe to finalize. Best-effort
+                    // per child — an illegal transition (child already terminal some other way, or
+                    // this turns out not to be a reconciliation parent at all) is not worth failing
+                    // the parent's own merge over.
+                    var children = await workUnits.GetChildrenAsync(proposal.WorkUnitId, cancellationToken)
+                        .ConfigureAwait(false);
+                    foreach (var child in children)
+                    {
+                        if (child.Status is WorkUnitStatus.Completed or WorkUnitStatus.Merged
+                            or WorkUnitStatus.Cancelled or WorkUnitStatus.DeadLettered)
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            await workUnits.UpdateStatusAsync(
+                                child.WorkUnitId, WorkUnitStatus.Merged, proposal.SessionId, cancellationToken)
+                                .ConfigureAwait(false);
+                            await workUnits.SetCurrentStageAsync(child.WorkUnitId, null, cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                        catch (InvalidOperationException) { }
+                        catch (KeyNotFoundException) { }
+                    }
                 }
                 catch (InvalidOperationException) { }
                 catch (KeyNotFoundException) { }

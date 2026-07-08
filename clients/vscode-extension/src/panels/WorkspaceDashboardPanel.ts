@@ -1060,6 +1060,12 @@ const ET_HTML = `
   <h2>Active Goals</h2>
   <div id="active-goals"><p class="empty">Loading…</p></div>
   <button class="add-btn" id="btn-new-goal">+ New Goal</button>
+  <div id="completed-goals-section" style="display:none">
+    <details>
+      <summary id="completed-goals-summary">Completed Goals</summary>
+      <div id="completed-goals"></div>
+    </details>
+  </div>
 
   <h2>Running Agents</h2>
   <div id="agents"><p class="empty">No running agents.</p></div>
@@ -1075,6 +1081,12 @@ const ET_HTML = `
 
   <h2>Pending Decisions</h2>
   <div id="decisions"><p class="empty">No pending decisions.</p></div>
+  <div id="resolved-decisions-section" style="display:none">
+    <details>
+      <summary id="resolved-decisions-summary">Resolved Decisions</summary>
+      <div id="resolved-decisions"></div>
+    </details>
+  </div>
 
   <h2>Blocked Explorations</h2>
   <div id="blocked"><p class="empty">No blocked explorations.</p></div>

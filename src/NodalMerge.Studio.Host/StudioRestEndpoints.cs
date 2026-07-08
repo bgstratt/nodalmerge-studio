@@ -3609,18 +3609,46 @@ public static class StudioRestEndpoints
             var storedGoals = await goalNodes.ListAsync(ct).ConfigureAwait(false);
             if (storedGoals.Count > 0)
             {
-                var goals = storedGoals.Select(g => new
+                // Terminal work-unit statuses never flow back into GoalStatus anywhere else
+                // (only Pause/Resume set Paused/Exploring), so goal-store goals otherwise report
+                // "Exploring" forever even after their work unit finished. Derive the effective
+                // terminal status here and lazily write it back so the store converges.
+                var allWorkUnits = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+                var workUnitById = allWorkUnits.ToDictionary(wu => wu.WorkUnitId);
+
+                var goals = new List<object>(storedGoals.Count);
+                foreach (var g in storedGoals)
                 {
-                    goalId = g.GoalId,
-                    goal = g.Goal,
-                    workUnitId = g.WorkUnitId,
-                    branchId = g.BranchId,
-                    status = g.Status.ToString(),
-                    pauseReason = g.PauseReason,
-                    parentGoalId = g.ParentGoalId,
-                    createdAt = g.CreatedAt,
-                    updatedAt = g.UpdatedAt
-                }).ToList();
+                    var effectiveStatus = g.Status;
+                    if (workUnitById.TryGetValue(g.WorkUnitId, out var wu))
+                    {
+                        var terminal = wu.Status switch
+                        {
+                            WorkUnitStatus.Completed or WorkUnitStatus.Merged => GoalStatus.Converged,
+                            WorkUnitStatus.Cancelled => GoalStatus.Abandoned,
+                            _ => (GoalStatus?)null
+                        };
+                        if (terminal is not null && terminal.Value != g.Status)
+                        {
+                            effectiveStatus = terminal.Value;
+                            var corrected = g with { Status = effectiveStatus, UpdatedAt = DateTimeOffset.UtcNow };
+                            await goalNodes.RecordAsync(corrected, ct).ConfigureAwait(false);
+                        }
+                    }
+
+                    goals.Add(new
+                    {
+                        goalId = g.GoalId,
+                        goal = g.Goal,
+                        workUnitId = g.WorkUnitId,
+                        branchId = g.BranchId,
+                        status = effectiveStatus.ToString(),
+                        pauseReason = g.PauseReason,
+                        parentGoalId = g.ParentGoalId,
+                        createdAt = g.CreatedAt,
+                        updatedAt = g.UpdatedAt
+                    });
+                }
                 return Results.Ok(new { goals, source = "goal-store" });
             }
 

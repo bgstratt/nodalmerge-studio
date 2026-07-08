@@ -46,28 +46,14 @@ export function init(ctx) {
 
   // isGoalStore=true when items come from /studio/goals (have goalId + Paused status);
   // false when falling back to /studio/workunits (no goalId, no goal-level pause support).
-  function renderActiveGoals(goals, isGoalStore, guardrailStatuses) {
-    var el = $('active-goals');
-    if (!goals || !goals.length) {
-      el.innerHTML = '<p class="empty">No active goals.</p>';
-      return;
-    }
-    // Phase 2 item 1 — alert-only guardrail badge. Keyed by workUnitId since that's the one ID
-    // both the goal-store and work-unit-fallback shapes always carry (goalId only exists in the
-    // former). Never disables or hides anything else on the card — this is purely informational.
-    var guardrailByWorkUnit = {};
-    for (var gi = 0; gi < (guardrailStatuses || []).length; gi++) {
-      guardrailByWorkUnit[guardrailStatuses[gi].workUnitId] = guardrailStatuses[gi];
-    }
-    var html = '';
-    for (var i = 0; i < goals.length; i++) {
-      var g = goals[i];
+  function renderGoalCard(g, isGoalStore, guardrailByWorkUnit) {
       var goalId = g.goalId || g.workUnitId;
       var gr = guardrailByWorkUnit[g.workUnitId];
       var status = (g.status || '').toLowerCase();
       var isPaused   = status === 'paused';
       var isReviewing = status === 'reviewing';
       var isTerminal  = ['cancelled', 'completed', 'merged', 'abandoned', 'converged'].indexOf(status) !== -1;
+      var html = '';
       html += '<div class="card">';
       html += '<div class="row">';
       html += '<span class="title" title="' + esc(g.goal) + '">' + esc(g.goal) + '</span>';
@@ -116,8 +102,10 @@ export function init(ctx) {
       }
       html += '</div>';
       html += '</div>';
-    }
-    el.innerHTML = html;
+      return html;
+  }
+
+  function wireGoalCardActions(el) {
     el.querySelectorAll('[data-action="pauseGoal"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: 'dashboardGoalPause', goalId: btn.getAttribute('data-gid') });
@@ -148,6 +136,68 @@ export function init(ctx) {
         vscode.postMessage({ type: 'markKnownGood', workUnitId: btn.getAttribute('data-wu'), branchId: btn.getAttribute('data-branch') });
       });
     });
+  }
+
+  // isGoalStore=true when items come from /studio/goals (have goalId + Paused status);
+  // false when falling back to /studio/workunits (no goalId, no goal-level pause support).
+  // Terminal goals (cancelled/completed/merged/abandoned/converged) are split into a
+  // collapsed "Completed Goals" section instead of piling up forever in Active Goals.
+  function renderActiveGoals(goals, isGoalStore, guardrailStatuses) {
+    var el = $('active-goals');
+    var completedSection = $('completed-goals-section');
+    var completedEl = $('completed-goals');
+    var completedSummary = $('completed-goals-summary');
+
+    if (!goals || !goals.length) {
+      el.innerHTML = '<p class="empty">No active goals.</p>';
+      if (completedSection) { completedSection.style.display = 'none'; }
+      return;
+    }
+
+    // Phase 2 item 1 — alert-only guardrail badge. Keyed by workUnitId since that's the one ID
+    // both the goal-store and work-unit-fallback shapes always carry (goalId only exists in the
+    // former). Never disables or hides anything else on the card — this is purely informational.
+    var guardrailByWorkUnit = {};
+    for (var gi = 0; gi < (guardrailStatuses || []).length; gi++) {
+      guardrailByWorkUnit[guardrailStatuses[gi].workUnitId] = guardrailStatuses[gi];
+    }
+
+    var active = [];
+    var completed = [];
+    for (var i = 0; i < goals.length; i++) {
+      var status = (goals[i].status || '').toLowerCase();
+      var isTerminal = ['cancelled', 'completed', 'merged', 'abandoned', 'converged'].indexOf(status) !== -1;
+      (isTerminal ? completed : active).push(goals[i]);
+    }
+
+    if (!active.length) {
+      el.innerHTML = '<p class="empty">No active goals.</p>';
+    } else {
+      var activeHtml = '';
+      for (var ai = 0; ai < active.length; ai++) {
+        activeHtml += renderGoalCard(active[ai], isGoalStore, guardrailByWorkUnit);
+      }
+      el.innerHTML = activeHtml;
+      wireGoalCardActions(el);
+    }
+
+    if (completedSection && completedEl) {
+      if (!completed.length) {
+        completedSection.style.display = 'none';
+        completedEl.innerHTML = '';
+      } else {
+        completedSection.style.display = '';
+        if (completedSummary) { completedSummary.textContent = 'Completed Goals (' + completed.length + ')'; }
+        completed.sort(function(a, b) { return Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0); });
+        var capped = completed.slice(0, 20);
+        var completedHtml = '';
+        for (var ci = 0; ci < capped.length; ci++) {
+          completedHtml += renderGoalCard(capped[ci], isGoalStore, guardrailByWorkUnit);
+        }
+        completedEl.innerHTML = completedHtml;
+        wireGoalCardActions(completedEl);
+      }
+    }
   }
 
   function renderAgents(agents, goals) {
@@ -348,39 +398,91 @@ export function init(ctx) {
     merged:         'stopped',
   };
 
-  function renderPendingDecisions(merges) {
-    var el = $('decisions');
-    if (!merges || !merges.length) {
-      el.innerHTML = '<p class="empty">No pending decisions.</p>';
-      return;
-    }
+  var RESOLVED_DECISION_STATUSES = ['merged', 'rejected', 'superseded'];
+
+  function renderDecisionCard(m, statusKey) {
+    var badgeClass = 'badge ' + (DECISION_STATUS_COLOR[statusKey] || '');
+    var canReview = statusKey === 'readyforreview' || statusKey === 'approved' || statusKey === 'draft' || statusKey === 'proposed' || statusKey === 'executing' || statusKey === 'merge';
     var html = '';
-    for (var i = 0; i < merges.length; i++) {
-      var m = merges[i];
-      var statusKey = (m.status || '').toLowerCase().replace(/\s+/g, '');
-      var badgeClass = 'badge ' + (DECISION_STATUS_COLOR[statusKey] || '');
-      var canReview = statusKey === 'readyforreview' || statusKey === 'approved' || statusKey === 'draft' || statusKey === 'proposed' || statusKey === 'executing' || statusKey === 'merge';
-      html += '<div class="card">';
-      html += '<div class="row">';
-      html += '<span class="title" title="' + esc(m.goal) + '">' + esc(m.goal) + '</span>';
-      html += '<span class="' + badgeClass + '">' + esc(m.status) + '</span>';
-      if (canReview) {
-        html += '<div class="actions">';
-        html += '<button class="ghost" data-action="openMergeReview" data-pid="' + esc(m.proposalId) + '">Review Decision →</button>';
-        html += '</div>';
-      }
-      html += '</div>';
-      html += '<div class="row">';
-      html += '<span class="mono">' + esc(m.sourceBranch) + ' → ' + esc(m.targetBranch) + '</span>';
-      html += '</div>';
+    html += '<div class="card">';
+    html += '<div class="row">';
+    html += '<span class="title" title="' + esc(m.goal) + '">' + esc(m.goal) + '</span>';
+    html += '<span class="' + badgeClass + '">' + esc(m.status) + '</span>';
+    if (canReview) {
+      html += '<div class="actions">';
+      html += '<button class="ghost" data-action="openMergeReview" data-pid="' + esc(m.proposalId) + '">Review Decision →</button>';
       html += '</div>';
     }
-    el.innerHTML = html;
+    html += '</div>';
+    html += '<div class="row">';
+    html += '<span class="mono">' + esc(m.sourceBranch) + ' → ' + esc(m.targetBranch) + '</span>';
+    html += '</div>';
+    html += '</div>';
+    return html;
+  }
+
+  function wireDecisionCardActions(el) {
     el.querySelectorAll('[data-action="openMergeReview"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: 'openMergeReview', proposalId: btn.getAttribute('data-pid') });
       });
     });
+  }
+
+  // Resolved decisions (merged/rejected/superseded) move into a collapsed "Resolved Decisions"
+  // section instead of piling up forever in the live Pending Decisions list.
+  function renderPendingDecisions(merges) {
+    var el = $('decisions');
+    var resolvedSection = $('resolved-decisions-section');
+    var resolvedEl = $('resolved-decisions');
+    var resolvedSummary = $('resolved-decisions-summary');
+
+    if (!merges || !merges.length) {
+      el.innerHTML = '<p class="empty">No pending decisions.</p>';
+      if (resolvedSection) { resolvedSection.style.display = 'none'; }
+      return;
+    }
+
+    var pending = [];
+    var resolved = [];
+    for (var i = 0; i < merges.length; i++) {
+      var m = merges[i];
+      var statusKey = (m.status || '').toLowerCase().replace(/\s+/g, '');
+      (RESOLVED_DECISION_STATUSES.indexOf(statusKey) !== -1
+        ? resolved
+        : pending).push({ item: m, statusKey: statusKey });
+    }
+
+    if (!pending.length) {
+      el.innerHTML = '<p class="empty">No pending decisions.</p>';
+    } else {
+      var pendingHtml = '';
+      for (var pi = 0; pi < pending.length; pi++) {
+        pendingHtml += renderDecisionCard(pending[pi].item, pending[pi].statusKey);
+      }
+      el.innerHTML = pendingHtml;
+      wireDecisionCardActions(el);
+    }
+
+    if (resolvedSection && resolvedEl) {
+      if (!resolved.length) {
+        resolvedSection.style.display = 'none';
+        resolvedEl.innerHTML = '';
+      } else {
+        resolvedSection.style.display = '';
+        if (resolvedSummary) { resolvedSummary.textContent = 'Resolved Decisions (' + resolved.length + ')'; }
+        resolved.sort(function(a, b) {
+          return Date.parse(b.item.updatedAt || b.item.createdAt || 0) - Date.parse(a.item.updatedAt || a.item.createdAt || 0);
+        });
+        var capped = resolved.slice(0, 20);
+        var resolvedHtml = '';
+        for (var ri = 0; ri < capped.length; ri++) {
+          resolvedHtml += renderDecisionCard(capped[ri].item, capped[ri].statusKey);
+        }
+        resolvedEl.innerHTML = resolvedHtml;
+        wireDecisionCardActions(resolvedEl);
+      }
+    }
   }
 
   // Groups by workUnitId so a work unit that failed more than once (e.g. "max iterations"

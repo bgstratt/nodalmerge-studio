@@ -157,6 +157,13 @@ public static class WorkUnitTransitions
             (WorkUnitStatus.Proposed, WorkUnitStatus.Queued) => true,
             (WorkUnitStatus.Reviewing, WorkUnitStatus.Merged) => true,
             (WorkUnitStatus.Reviewing, WorkUnitStatus.Executing) => true,
+            // Top-level reconciliation/orchestrator work units apply their own merge proposal
+            // directly from Executing — unlike a fanned-out child, they never pass through
+            // Proposed/Reviewing themselves (that's the child proposal's path). Without this,
+            // InMemoryMergeService.ApplyAsync's post-merge status update is an illegal transition
+            // that gets silently swallowed, leaving the work unit stuck at Executing forever even
+            // though its proposal already merged.
+            (WorkUnitStatus.Executing, WorkUnitStatus.Merged) => true,
 
             (_, WorkUnitStatus.Cancelled) when from is not WorkUnitStatus.Completed and not WorkUnitStatus.Merged => true,
             _ => false
