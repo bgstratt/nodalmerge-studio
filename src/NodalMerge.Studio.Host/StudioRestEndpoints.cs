@@ -167,7 +167,6 @@ public static class StudioRestEndpoints
 
     private sealed record UpdateOptionsBody(
         bool UseLlmProfileSelection,
-        bool BlockOverlappingFileScope = false,
         int MaxConcurrentWorkers = 3,
         int SchedulerPollIntervalMs = 2_000,
         bool UsePromotionBranch = false,
@@ -203,7 +202,6 @@ public static class StudioRestEndpoints
     private static object BuildOptionsResponse(WorkspaceOptions o) => new
     {
         useLlmProfileSelection    = o.UseLlmProfileSelection,
-        blockOverlappingFileScope = o.BlockOverlappingFileScope,
         maxConcurrentWorkers      = o.MaxConcurrentWorkers,
         schedulerPollIntervalMs   = o.SchedulerPollIntervalMs,
         requireBuildBeforeProposal = o.RequireBuildBeforeProposal,
@@ -484,7 +482,6 @@ public static class StudioRestEndpoints
                 return Results.BadRequest(new { error = "candidateBranchId must not be empty." });
 
             options.UseLlmProfileSelection   = body.UseLlmProfileSelection;
-            options.BlockOverlappingFileScope = body.BlockOverlappingFileScope;
             options.MaxConcurrentWorkers      = body.MaxConcurrentWorkers;
             options.SchedulerPollIntervalMs   = body.SchedulerPollIntervalMs;
             options.UsePromotionBranch        = body.UsePromotionBranch;
@@ -2732,6 +2729,7 @@ public static class StudioRestEndpoints
             return result.Outcome switch
             {
                 ContinueOutcome.Continued => Results.Ok(result),
+                ContinueOutcome.Parked => Results.Ok(result),
                 ContinueOutcome.NotFound => Results.NotFound(new { error = result.Message }),
                 ContinueOutcome.NotApplicable => Results.BadRequest(new { error = result.Message }),
                 _ => Results.UnprocessableEntity(new { error = result.Message ?? "Continue failed." }),
@@ -3263,6 +3261,42 @@ public static class StudioRestEndpoints
             }
         });
 
+        // plans/pathways-workspace-history.md — true point-in-time materialization: reconstruct
+        // the repository exactly as a RepositorySnapshot recorded it (TreeEntries + CAS), not a
+        // branch's current live content. targetPath is REQUIRED — the branch-based materializers
+        // above default to the real working repo when it's omitted, and reconstructing a
+        // historical tree over the live repo is exactly the destructive surprise this endpoint
+        // must never allow. Route deliberately not under /studio/snapshots/... — that prefix is
+        // ExecutionSnapshot (agent reasoning state), a different concept entirely.
+        app.MapPost("/studio/repository-snapshots/{snapshotId}/materialize", async (
+            string snapshotId,
+            [FromQuery] string? targetPath,
+            IRepositorySnapshotService snapshots,
+            IMaterializationEngine materializer,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(targetPath))
+                return Results.BadRequest(new { error = "targetPath is required — point-in-time materialization never writes to the live repository." });
+
+            var snapshot = await snapshots.GetAsync(snapshotId, ct).ConfigureAwait(false);
+            if (snapshot is null)
+                return Results.NotFound(new { error = $"Repository snapshot '{snapshotId}' was not found." });
+            if (snapshot.TreeEntries is null)
+                return Results.BadRequest(new { error = $"Snapshot '{snapshotId}' predates tree-entry capture and cannot be materialized directly." });
+
+            var fileCount = await materializer.MaterializeAsync(snapshot, targetPath, ct: ct).ConfigureAwait(false);
+            return Results.Ok(new
+            {
+                snapshotId,
+                repositoryId = snapshot.RepositoryId,
+                generation = snapshot.Generation,
+                createdAt = snapshot.CreatedAt,
+                targetPath,
+                fileCount,
+                succeeded = true,
+            });
+        });
+
         app.MapPost("/studio/projections/known-good/{stateId}/materialize", async (
             string stateId,
             [FromQuery] string? targetPath,
@@ -3417,79 +3451,14 @@ public static class StudioRestEndpoints
 
     private static void MapReplayEndpoints(WebApplication app)
     {
-        // Slice 13h — DAG Replay frontend connects here instead of the engine's /ws/runtime
-        // WebSocket for timeline node data. Returns timeline entries (artifacts + orchestration
-        // events) grouped by branch, plus the set of known branches so the frontend can render
-        // them as DAG lanes without a separate init payload.
-        // Slice 19a — optional ?sessionId= filter restricts branches to those owned by the session.
-        app.MapGet("/studio/replay/timeline", async (
-            [FromQuery] string? branchId,
-            [FromQuery] string? sessionId,
-            IBranchService branches,
-            IWorkUnitService workUnits,
-            IExecutionSessionService sessions,
-            IReplayService replay,
-            CancellationToken ct) =>
-        {
-            var allBranchIds = await branches.ListBranchesAsync(ct).ConfigureAwait(false);
-            IEnumerable<string> targetBranches;
-
-            if (branchId is { Length: > 0 })
-            {
-                targetBranches = new[] { branchId };
-            }
-            else if (sessionId is not null)
-            {
-                var session = await sessions.GetAsync(sessionId, ct).ConfigureAwait(false);
-                if (session is null)
-                    return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
-                var sessionWuIds = await GetSessionDescendantIdsAsync(sessions, workUnits, session.RootWorkUnitId, ct).ConfigureAwait(false);
-                var allWus = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
-                var sessionBranchIds = allWus
-                    .Where(wu => sessionWuIds.Contains(wu.WorkUnitId))
-                    .Select(wu => wu.BranchId)
-                    .Distinct()
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                targetBranches = allBranchIds.Where(b => sessionBranchIds.Contains(b));
-            }
-            else
-            {
-                targetBranches = allBranchIds;
-            }
-
-            var resolvedBranches = targetBranches.ToArray();
-            var timelines = new List<object>();
-            foreach (var b in resolvedBranches)
-            {
-                var json = await replay.RangeAsync(b, cancellationToken: ct).ConfigureAwait(false);
-                timelines.Add(JsonSerializer.Deserialize<object>(json)!);
-            }
-
-            return Results.Ok(new { branches = resolvedBranches, timelines });
-        });
-
-        app.MapGet("/studio/replay/timeline/{branchId}", async (
-            string branchId,
-            IReplayService replay,
-            CancellationToken ct) =>
-        {
-            var json = await replay.RangeAsync(branchId, cancellationToken: ct).ConfigureAwait(false);
-            return Results.Ok(JsonSerializer.Deserialize<object>(json)!);
-        });
-
-        // ── Slice 6.5 deferred: replay REST parity ──────────────────────────
-
-        // Range replay with optional from/to node (mirrors nm_v1_replay_range)
-        app.MapGet("/studio/replay/range/{branchId}", async (
-            string branchId,
-            [FromQuery] string? fromNode,
-            [FromQuery] string? toNode,
-            IReplayService replay,
-            CancellationToken ct) =>
-        {
-            var json = await replay.RangeAsync(branchId, fromNode, toNode, ct).ConfigureAwait(false);
-            return Results.Ok(JsonSerializer.Deserialize<object>(json)!);
-        });
+        // Slice 13h introduced this route group for the DAG Replay frontend's timeline polling;
+        // pathways-workspace-history.md replaced that data source with the WorkspacePathways
+        // projection (GET /studio/projections/WorkspacePathways). The timeline/range routes
+        // (GET /studio/replay/timeline[/{branchId}], GET /studio/replay/range/{branchId}) and
+        // their MCP counterpart (nm_v1_replay_range) were removed once confirmed unused by every
+        // consumer — extension, in-process agents, and external MCP callers alike. Rollback and
+        // Inspect remain: Rollback backs "Restore Known Good"; Inspect backs the Pathways
+        // node-detail drawer's proposal/artifact lookups.
 
         // Rollback to a known good state (mirrors nm_v1_replay_rollback)
         app.MapPost("/studio/replay/rollback/{branchId}", async (

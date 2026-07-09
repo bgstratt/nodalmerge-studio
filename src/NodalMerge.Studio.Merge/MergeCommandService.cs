@@ -339,7 +339,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
         // MCP tools, or IMergeService directly.
         return automated
             ? await merge.AutomatedReviewAsync(proposalId, status, verificationResults ?? string.Empty, reviewerAgentId, consideredArtifactIds, cancellationToken).ConfigureAwait(false)
-            : await merge.ReviewAsync(proposalId, status, notes, cancellationToken).ConfigureAwait(false);
+            : await merge.ReviewAsync(proposalId, status, notes, reviewedBy: null, cancellationToken).ConfigureAwait(false);
     }
 
     // Slice 20b — BeforeMerge gate. For AgentApproval/Hybrid policies the AutoReviewRule runs the

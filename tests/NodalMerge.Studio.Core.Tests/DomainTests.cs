@@ -53,8 +53,13 @@ public class MergeProposalTransitionTests
     [InlineData(MergeProposalStatus.ReadyForReview, MergeProposalStatus.Superseded, true)]
     [InlineData(MergeProposalStatus.Approved, MergeProposalStatus.Superseded, true)]
     [InlineData(MergeProposalStatus.Draft, MergeProposalStatus.Superseded, false)]
-    [InlineData(MergeProposalStatus.Merged, MergeProposalStatus.Superseded, false)]
-    public void CanTransition_to_Superseded_only_from_ReadyForReview_or_Approved(
+    // Merged → Superseded is deliberately legal: a fanned-out task child's proposal reaches
+    // Merged when its TaskReviewPolicy gate clears, then reconciliation folds its content into
+    // the batch-level reconciled proposal and supersedes the constituent afterward — see the
+    // transition table's own comment in MergeProposal.cs. This test previously asserted false
+    // and went stale when that edge was added.
+    [InlineData(MergeProposalStatus.Merged, MergeProposalStatus.Superseded, true)]
+    public void CanTransition_to_Superseded_from_ReadyForReview_Approved_or_Merged(
         MergeProposalStatus from, MergeProposalStatus to, bool expected)
     {
         Assert.Equal(expected, MergeProposalTransitions.CanTransition(from, to));

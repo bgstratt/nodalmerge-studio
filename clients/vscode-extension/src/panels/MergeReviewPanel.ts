@@ -1,40 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { scopeViewCss } from './sharedWebviewChrome';
+import { scopeViewCss, openReadOnlyDiff } from './sharedWebviewChrome';
 import type { AgentConfigService } from '../AgentConfigService';
-
-// ── Read-only diff viewer ────────────────────────────────────────────────────
-//
-// "Open Diff in Editor" used to open two vscode.workspace.openTextDocument({content})
-// buffers — untitled, in-memory documents with no backing file. VS Code lets you type
-// into those, which looked editable but silently went nowhere on save (no connection
-// back to the branch). Routing both sides through a registered content-provider scheme
-// instead makes them genuinely read-only, the same mechanism VS Code's own Git extension
-// uses for historical revisions — there's no edit provider for this scheme, so VS Code
-// refuses edits outright instead of accepting and discarding them.
-const NM_DIFF_SCHEME = 'nodalmerge-diff';
-
-class ReadOnlyDiffContentProvider implements vscode.TextDocumentContentProvider {
-  private readonly contents = new Map<string, string>();
-
-  set(uri: vscode.Uri, content: string): void {
-    this.contents.set(uri.toString(), content);
-  }
-
-  provideTextDocumentContent(uri: vscode.Uri): string {
-    return this.contents.get(uri.toString()) ?? '';
-  }
-}
-
-let diffProvider: ReadOnlyDiffContentProvider | undefined;
-function getDiffProvider(): ReadOnlyDiffContentProvider {
-  if (!diffProvider) {
-    diffProvider = new ReadOnlyDiffContentProvider();
-    vscode.workspace.registerTextDocumentContentProvider(NM_DIFF_SCHEME, diffProvider);
-  }
-  return diffProvider;
-}
 
 // ── Domain types ───────────────────────────────────────────────────────────
 
@@ -304,24 +272,7 @@ export class DecisionConvergencePanel {
           const filePath = String(msg.path ?? 'file');
           const before = (msg.beforeContent as string | null | undefined) ?? '';
           const after = (msg.afterContent as string | null | undefined) ?? '';
-          const provider = getDiffProvider();
-          // Nonce keeps repeat "View Diff" clicks on the same path from colliding on identical
-          // URIs — registerTextDocumentContentProvider content is looked up by URI, so reusing one
-          // would show whatever the *last* set() call for that path wrote, not necessarily this one.
-          const nonce = Date.now().toString(36);
-          const leftUri = vscode.Uri.parse(`${NM_DIFF_SCHEME}:/${nonce}/base/${filePath}`);
-          const rightUri = vscode.Uri.parse(`${NM_DIFF_SCHEME}:/${nonce}/proposed/${filePath}`);
-          provider.set(leftUri, before);
-          provider.set(rightUri, after);
-          const title = filePath + ' (base ↔ proposed, read-only)';
-          // Explicit, non-preview, beside the Studio panel's own column — a bare vscode.diff call
-          // defaults to a preview tab, which a second "View Diff" click would silently reuse/replace
-          // instead of opening its own tab (and could otherwise land in the Studio panel's own
-          // column). Matches the same { preview: false } editFile already uses below.
-          await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title, {
-            preview: false,
-            viewColumn: vscode.ViewColumn.Beside,
-          });
+          await openReadOnlyDiff(filePath, before, after);
           break;
         }
         case 'editFile': {

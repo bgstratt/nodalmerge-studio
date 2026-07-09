@@ -113,10 +113,12 @@ public sealed record WorkUnitExecutionInfo(
 
 /// <summary>Fan-out lineage: which plan slice this work unit fulfills and which branch it was seeded from.</summary>
 // Slice 14b — BlockedReason is set when a BeforeEnqueue policy rule rejects this slice (e.g.
-// NonOverlappingFileScopeRule) and cleared the next time it enqueues successfully. The work unit
-// stays Created while blocked, so a later fan-out call retries it automatically once the
-// conflicting sibling finishes — this field is purely the human-readable "why," not authoritative
-// state.
+// WorkspaceExecutionRule) and cleared the next time it enqueues successfully. The work unit stays
+// Created while blocked, so a later fan-out call retries it automatically once whatever the rule
+// was waiting on clears — this field is purely the human-readable "why," not authoritative state.
+// (Overlapping sibling fileScope is handled separately and doesn't use this path — see
+// FanOutService.AutoSequenceOverlappingSiblingsAsync, which inserts a real dependsOn edge instead
+// of rejecting.)
 public sealed record WorkUnitFanOutInfo(string? SliceId, string? SeedFromBranchId, string? BlockedReason = null);
 
 public static class WorkUnitTransitions

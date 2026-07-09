@@ -99,10 +99,15 @@ public interface ITaskService
 
     Task<MergeProposal> ValidateAsync(string proposalId, CancellationToken cancellationToken = default);
 
+    /// <summary>reviewedBy: who made this decision — defaults to "user" (this is the human review
+    /// path; automated review goes through AutomatedReviewAsync, which records the reviewer agent
+    /// id instead). Persisted on MergeProposal.ReviewedBy and carried in the
+    /// ProposalApproved/Rejected event payloads.</summary>
     Task<MergeProposal> ReviewAsync(
         string proposalId,
         MergeProposalStatus decision,
         string? notes = null,
+        string? reviewedBy = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -592,6 +597,13 @@ public enum ContinueOutcome
     // successfully — treated as MaxIterationsExceeded again (a new dead-letter entry is recorded
     // with the same Kind so Continue can be reached for again, or the human can switch tracks).
     NotCompleted,
+    // The resumed run hit a file lease held by another active sibling, or requested a human
+    // clarification — neither is the agent's own fault, so unlike NotCompleted this does NOT
+    // record a fresh dead-letter entry (that would burn one of the work unit's limited
+    // MaxFailureAttempts on pure infrastructure contention). Instead the work unit is handed to
+    // the normal scheduler queue and parked exactly the way a scheduler-driven run already is —
+    // it resumes automatically once the lease clears or a human answers the clarification.
+    Parked,
 }
 
 public sealed record ContinueResult(
@@ -675,6 +687,18 @@ public interface IWorkUnitService
     Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken cancellationToken = default);
+
+    // Fan-out collision avoidance — when two sibling slices declare overlapping fileScope with no
+    // dependsOn between them (a planning gap, not a runtime one), FanOutService inserts this edge
+    // instead of letting both start and fight over a file lease. Idempotent (a repeat call is a
+    // no-op) so a fan-out pass that runs again before the edge takes effect doesn't double-add it.
+    // The caller is responsible for cycle-safety (walking the target's own DependsOn chain before
+    // calling) — this method itself does not check, so a caller elsewhere with a different
+    // invariant isn't forced into this one's specific cycle policy.
+    Task<WorkUnit> AddDependencyAsync(
+        string workUnitId,
+        string dependsOnWorkUnitId,
+        CancellationToken cancellationToken = default);
 }
 
 // Slice 12c — pushes live pipeline-stage updates to connected extension clients over the
@@ -1059,6 +1083,13 @@ public interface IArtifactLineageService
     // artifacts an agent records via nm_v1_artifact_record. GetChainAsync intentionally excludes
     // these since it only indexes work-unit-owned artifacts.
     Task<IReadOnlyList<ArtifactRef>> GetGlobalConstraintsAsync(CancellationToken ct = default);
+
+    // WorkspacePathways (plans/pathways-workspace-history.md) — every artifact of one type,
+    // workspace-wide, regardless of owning work unit. The query surface GetChainAsync
+    // (per-work-unit) can't provide for OwnedByWorkUnitId:null artifacts like ExternalChangeset;
+    // backed by the service's in-memory index so callers don't rescan and re-deserialize the
+    // whole node store per request (the projection previously did exactly that, per poll).
+    Task<IReadOnlyList<ArtifactRef>> GetByTypeAsync(ArtifactType type, CancellationToken ct = default);
 
     // Capability-gap fix — marks a Research/Decision/Constraint artifact Invalidated and flags
     // every artifact in its descendant subtree (via ParentArtifactId/GetChildrenAsync) with
@@ -1653,16 +1684,6 @@ public interface IReviewTimerService
     Task<IReadOnlyList<ReviewTimer>> ListPendingAsync(string? workUnitId = null, CancellationToken ct = default);
 }
 
-// Slice 14b — shape of the "activeSiblings" key FanOutService populates in BeforeEnqueue's
-// context bag. Built by FanOutService (it already depends on IWorkUnitService) so IPolicyRule
-// implementations living in Storage don't need their own IWorkUnitService dependency — that
-// would risk the same circular constructor graph IWorkScheduler's lazy IWorkUnitService
-// resolution (see WorkSchedulerService) already exists to avoid.
-public sealed record FileScopeSibling(
-    string WorkUnitId,
-    string? SliceId,
-    WorkUnitStatus Status,
-    IReadOnlyList<string> FileScope);
 
 public interface IIntentGraphService
 {

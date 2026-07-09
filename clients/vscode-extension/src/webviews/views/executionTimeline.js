@@ -17,6 +17,17 @@ export function init(ctx) {
   var globalUsePromotionBranch = false;
   var globalCandidateBranchId = 'candidate';
 
+  // entryId -> busy label, e.g. { 'DL-abc': 'Continuing…' }. The 2s poll re-renders the whole
+  // blocked-explorations section from scratch (innerHTML wholesale), which would otherwise wipe
+  // out any transient "disabled" state a click handler set on the actual DOM node — so the busy
+  // state has to live here and be consulted every render, not just applied once at click time.
+  // Cleared when WorkspaceDashboardPanel posts back 'deadLetterActionSettled' after its
+  // Continue/Retry/Re-plan request resolves (success or error either way).
+  var pendingDeadLetterActions = {};
+  var lastDeadLetters = [];
+  var lastGoals = null;
+  var lastProviderRetries = [];
+
   $('btn-new-goal').addEventListener('click', function() {
     vscode.postMessage({ type: 'createWorkUnit' });
   });
@@ -489,6 +500,9 @@ export function init(ctx) {
   // then, after a manual retry, a transient provider error) shows as ONE card with a history
   // trail, instead of one confusing card per attempt with no visible relationship between them.
   function renderBlockedExplorations(deadLetters, goals, providerRetries) {
+    lastDeadLetters = deadLetters;
+    lastGoals = goals;
+    lastProviderRetries = providerRetries;
     var el = $('blocked');
     if (!deadLetters || !deadLetters.length) {
       el.innerHTML = '<p class="empty">No blocked explorations.</p>';
@@ -534,16 +548,20 @@ export function init(ctx) {
       html += '<div class="row">';
       html += '<span class="title" title="' + esc(goal) + '">' + esc(goal) + '</span>';
       html += badge('failed');
+      var pendingLabel = pendingDeadLetterActions[latest.entryId];
       html += '<div class="actions">';
-      if (canRetry) {
+      if (pendingLabel) {
+        html += '<button class="ghost" disabled>' + esc(pendingLabel) + '</button>';
+      } else if (canRetry) {
         html += '<button class="ghost" data-action="retryDeadLetter" data-id="' + esc(latest.entryId) + '">Retry</button>';
         if (isMaxIterations) {
           html += '<button class="ghost" data-action="continueDeadLetter" data-id="' + esc(latest.entryId) + '">Continue</button>';
         }
+        html += '<button class="ghost" data-action="replanDeadLetter" data-id="' + esc(latest.entryId) + '">' + esc(replanLabel) + '</button>';
       } else {
         html += '<span class="mono" style="opacity:0.6">Max attempts reached</span>';
+        html += '<button class="ghost" data-action="replanDeadLetter" data-id="' + esc(latest.entryId) + '">' + esc(replanLabel) + '</button>';
       }
-      html += '<button class="ghost" data-action="replanDeadLetter" data-id="' + esc(latest.entryId) + '">' + esc(replanLabel) + '</button>';
       html += '</div></div>';
       html += '<div class="row">';
       html += '<span class="mono">phase: ' + esc(latest.stage) + '</span>';
@@ -564,19 +582,31 @@ export function init(ctx) {
       html += '</div>';
     });
     el.innerHTML = html;
+    // Set the pending flag and re-render synchronously on click, before postMessage — the actual
+    // request can take a while (a full bounded agent turn server-side), and without this there's
+    // no visual cue at all that anything happened beyond scrollback, which is what motivated this.
     el.querySelectorAll('[data-action="retryDeadLetter"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
-        vscode.postMessage({ type: 'retryDeadLetter', entryId: btn.getAttribute('data-id') });
+        var entryId = btn.getAttribute('data-id');
+        pendingDeadLetterActions[entryId] = 'Retrying…';
+        vscode.postMessage({ type: 'retryDeadLetter', entryId: entryId });
+        renderBlockedExplorations(lastDeadLetters, lastGoals, lastProviderRetries);
       });
     });
     el.querySelectorAll('[data-action="replanDeadLetter"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
-        vscode.postMessage({ type: 'replanDeadLetter', entryId: btn.getAttribute('data-id') });
+        var entryId = btn.getAttribute('data-id');
+        pendingDeadLetterActions[entryId] = 'Re-planning…';
+        vscode.postMessage({ type: 'replanDeadLetter', entryId: entryId });
+        renderBlockedExplorations(lastDeadLetters, lastGoals, lastProviderRetries);
       });
     });
     el.querySelectorAll('[data-action="continueDeadLetter"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
-        vscode.postMessage({ type: 'continueDeadLetter', entryId: btn.getAttribute('data-id') });
+        var entryId = btn.getAttribute('data-id');
+        pendingDeadLetterActions[entryId] = 'Continuing…';
+        vscode.postMessage({ type: 'continueDeadLetter', entryId: entryId });
+        renderBlockedExplorations(lastDeadLetters, lastGoals, lastProviderRetries);
       });
     });
   }
@@ -645,6 +675,11 @@ export function init(ctx) {
     if (msg.type === 'focusCandidatePromotion') {
       var promoSection = $('candidate-promotion-section');
       if (promoSection) { promoSection.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+      return;
+    }
+    if (msg.type === 'deadLetterActionSettled') {
+      delete pendingDeadLetterActions[msg.entryId];
+      renderBlockedExplorations(lastDeadLetters, lastGoals, lastProviderRetries);
       return;
     }
     if (msg.type !== 'data') { return; }

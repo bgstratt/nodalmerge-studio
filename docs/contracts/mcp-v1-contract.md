@@ -109,7 +109,6 @@ nm_v1_artifact_*
 
 | Tool | Purpose |
 |------|---------|
-| `nm_v1_replay_range` | Inspect history range |
 | `nm_v1_replay_rollback` | Rollback via known good state |
 | `nm_v1_replay_inspect` | Human-friendly history summary |
 
@@ -560,6 +559,13 @@ well. C# constants live in `McpServerToolNames` (separate from `McpToolNames`).
 None of these tools are dispatched to in-process orchestrator/worker agents — they are external-caller
 only. See [docs/reference/api-reference.md](../reference/api-reference.md) for full descriptions,
 parameter details, and the recommended call sequence.
+
+**This boundary is enforced at registration, not just by naming convention.** The external MCP
+HTTP endpoint (`app.MapMcp("/mcp")`) registers exactly these 5 tool classes via explicit
+`WithTools<T>()` calls in `NodalMerge.Studio.McpServer/ServiceCollectionExtensions.cs` — it no
+longer scans the whole assembly (`WithToolsFromAssembly`), which previously exposed every
+internal `nm_v1_*` tool (~30 classes) on the same external endpoint with nothing actually
+stopping an external caller from reaching them.
 
 ---
 

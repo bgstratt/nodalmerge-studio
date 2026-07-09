@@ -244,7 +244,7 @@ public class WorkUnitLifecycleTests
         public Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal?> GetAsync(string proposalId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal> ValidateAsync(string proposalId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
-        public Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus decision, string? notes = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus decision, string? notes = null, string? reviewedBy = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, IReadOnlyList<string>? consideredArtifactIds = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false) => throw new NotSupportedException();
         public Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken cancellationToken = default) => throw new NotSupportedException();

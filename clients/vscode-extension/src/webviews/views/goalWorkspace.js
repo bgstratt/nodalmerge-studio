@@ -533,6 +533,7 @@ export function init(ctx) {
     var el = $('gw-inspector');
     var html = '<div class="meta-grid"><span class="meta-label">Decision node</span><span class="mono">' + esc(workUnitId) + '</span></div>';
     html += '<div class="inspector-actions">';
+    html += '<button class="ghost" data-wu-action="spawnTask" data-wu="' + esc(workUnitId) + '">Spawn Task</button>';
     html += '<button class="ghost" data-wu-action="forkHypothesis" data-wu="' + esc(workUnitId) + '">Fork Hypothesis</button>';
     html += '<button class="ghost" data-wu-action="reexplore" data-wu="' + esc(workUnitId) + '">Re-explore</button>';
     html += '<button class="ghost" data-wu-action="forkLatest" data-wu="' + esc(workUnitId) + '">Fork from latest candidate</button>';
@@ -652,6 +653,7 @@ export function init(ctx) {
     var statusLower = (wu.status || '').toLowerCase();
     var isRunning = statusLower === 'running' || statusLower === 'executing' || statusLower === 'active' || statusLower === 'queued' || statusLower === 'retrying';
     html += '<div class="inspector-actions">';
+    html += '<button class="ghost" data-wu-action="spawnTask" data-wu="' + esc(wu.workUnitId) + '">Spawn Task</button>';
     html += '<button class="ghost" data-wu-action="forkHypothesis" data-wu="' + esc(wu.workUnitId) + '">Fork Hypothesis</button>';
     html += '<button class="ghost" data-wu-action="reexplore" data-wu="' + esc(wu.workUnitId) + '">Re-explore</button>';
     html += '<button class="ghost" data-wu-action="forkLatest" data-wu="' + esc(wu.workUnitId) + '">Fork from latest candidate</button>';

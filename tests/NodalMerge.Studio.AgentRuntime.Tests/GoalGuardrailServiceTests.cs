@@ -38,6 +38,9 @@ public class GoalGuardrailServiceTests
         public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
+        public Task<WorkUnit> AddDependencyAsync(string workUnitId, string dependsOnWorkUnitId, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
         public Task<WorkUnit> AmendGoalForSteeredRetryAsync(string workUnitId, string amendedGoal, string steeringContext, string deadLetterEntryId, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 

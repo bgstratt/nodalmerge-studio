@@ -213,6 +213,30 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return updated;
     }
 
+    public async Task<WorkUnit> AddDependencyAsync(
+        string workUnitId,
+        string dependsOnWorkUnitId,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        if (workUnit.DependsOn.Contains(dependsOnWorkUnitId))
+            return workUnit;
+
+        var updated = workUnit with
+        {
+            DependsOn = [.. workUnit.DependsOn, dependsOnWorkUnitId],
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
     public async Task<WorkUnit> AmendGoalForSteeredRetryAsync(
         string workUnitId,
         string amendedGoal,

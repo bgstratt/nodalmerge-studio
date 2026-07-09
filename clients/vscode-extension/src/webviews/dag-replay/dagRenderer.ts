@@ -63,6 +63,34 @@ const STAGE_COLORS: Record<string, { fill: string; text: string }> = {
   merge:   { fill: '#2da198', text: '#fff' },
 };
 
+// WorkspacePathways node kinds (ReplayNode.payloadRef carries the kind — see registerPathways)
+// → distinct fill + shape, matching the drawer legend in DagReplayPanel.ts's HTML. Nodes without
+// a recognized kind (live WS ops, merge markers) keep the legacy neutral styling.
+const PATHWAY_KIND_STYLES: Record<string, { fill: string; shape: 'circle' | 'diamond' | 'square' | 'cross' }> = {
+  GoalStarted:    { fill: '#3794ff', shape: 'circle' },
+  Integration:    { fill: '#4dac26', shape: 'diamond' },
+  Rejection:      { fill: '#f14c4c', shape: 'cross' },
+  Superseded:     { fill: '#8a8a8a', shape: 'diamond' },
+  DeadBranch:     { fill: '#7a3333', shape: 'cross' },
+  ExternalUpdate: { fill: '#cca700', shape: 'square' },
+};
+
+// Edge kinds → connector color. Edge kinds mirror the node kind that terminates them (plus
+// DeadEnd/ExternalChain), so the connector reads as "what happened at the far end."
+const PATHWAY_EDGE_COLORS: Record<string, string> = {
+  Integration:   '#4dac26',
+  Rejection:     '#f14c4c',
+  Superseded:    '#8a8a8a',
+  DeadEnd:       '#7a3333',
+  ExternalChain: '#cca700',
+};
+
+export interface PathwayEdgeRef {
+  fromNodeId: string;
+  toNodeId: string;
+  kind: string;
+}
+
 const STAGE_BADGE_W = 13;
 const STAGE_BADGE_H = 13;
 
@@ -73,6 +101,13 @@ export function renderDag(
   state: ReplayState,
   goals: Record<string, string>,
   stages: Record<string, string | null> = {},
+  // Session highlight (plans/pathways-workspace-history.md): Pathways data is always
+  // workspace-wide, so a selected session dims the lanes outside it instead of filtering them
+  // out — the workspace history stays visible, the session's slice of it stands out.
+  dimmedBranchIds: ReadonlySet<string> | null = null,
+  // WorkspacePathways DAG edges — cross-lane connectors drawn beneath the nodes. Endpoints that
+  // aren't in the current node set (e.g. scoped away) are skipped, never dangled.
+  pathwayEdges: readonly PathwayEdgeRef[] = [],
 ): void {
   while (svg.firstChild) { svg.removeChild(svg.firstChild); }
 
@@ -136,6 +171,7 @@ export function renderDag(
     const off  = offsets[branchId] ?? 0;
     const y    = laneY[branchId];
     const main = state.branches[branchId]?.isMain ?? false;
+    const dim  = dimmedBranchIds?.has(branchId) ?? false;
 
     if (ids.length >= 2) {
       const x1 = PAD_L + off * STEP_W;
@@ -143,6 +179,7 @@ export function renderDag(
       root.appendChild(el('line', {
         x1, y1: y, x2, y2: y,
         stroke: C.lane, 'stroke-width': main ? '2' : '1.5',
+        ...(dim ? { opacity: '0.3' } : {}),
       }));
     }
 
@@ -154,6 +191,29 @@ export function renderDag(
       'font-size':    main ? '12' : '11',
       'font-family':  'var(--nm-mono, monospace)',
       'font-weight':  main ? '600' : '400',
+      ...(dim ? { opacity: '0.35' } : {}),
+    }));
+  }
+
+  // ── WorkspacePathways DAG edges ────────────────────────────────────────
+  // Drawn before the nodes so connectors sit underneath. Same-lane edges (a proposal's
+  // Integration → its own Superseded moment) render as a subtle arc above the lane line so they
+  // don't vanish into it; cross-lane edges curve between lanes like fork connectors do.
+  for (const edge of pathwayEdges) {
+    const fromPos = nodePos[edge.fromNodeId];
+    const toPos   = nodePos[edge.toNodeId];
+    if (!fromPos || !toPos) { continue; }
+    const color = PATHWAY_EDGE_COLORS[edge.kind] ?? C.connector;
+    const sameLane = fromPos.y === toPos.y;
+    const d = sameLane
+      ? `M ${fromPos.x} ${fromPos.y - 4} C ${fromPos.x + 10} ${fromPos.y - 18} ${toPos.x - 10} ${toPos.y - 18} ${toPos.x} ${toPos.y - 4}`
+      : `M ${fromPos.x} ${fromPos.y} C ${(fromPos.x + toPos.x) / 2} ${fromPos.y} ${(fromPos.x + toPos.x) / 2} ${toPos.y} ${toPos.x} ${toPos.y}`;
+    root.appendChild(el('path', {
+      d,
+      stroke:         color,
+      'stroke-width': '1.3',
+      fill:           'none',
+      opacity:        '0.65',
     }));
   }
 
@@ -181,6 +241,7 @@ export function renderDag(
 
   for (const branchId of sortedIds) {
     const ids = state.branchNodeIds[branchId] ?? [];
+    const dim = dimmedBranchIds?.has(branchId) ?? false;
     ids.forEach((nodeId, nodeIndex) => {
       const node = state.nodesById[nodeId];
       if (!node) { return; }
@@ -190,33 +251,61 @@ export function renderDag(
       const isMerge  = node.parentIds.length > 1;
       const isCursor = nodeId === cursorId;
       const isHead   = state.branches[branchId]?.headNodeId === nodeId;
+      const kindStyle = node.payloadRef ? PATHWAY_KIND_STYLES[node.payloadRef] : undefined;
 
       const fill   = isCursor
         ? (isPlayback ? C.cursor_play : C.cursor_live)
+        : kindStyle ? kindStyle.fill
         : isMerge ? C.merge_node
         : isHead  ? C.head
                   : C.node;
 
       const r = isMerge ? MERGE_R : NODE_R;
 
-      const circle = el('circle', {
-        cx:             pos.x,
-        cy:             pos.y,
-        r,
+      const shapeAttrs: Record<string, string | number> = {
         fill,
         stroke:         isCursor ? '#fff' : '#1e1e1e',
         'stroke-width': isCursor ? '2.5' : '1',
         class:          'clickable',
+        // The cursor node stays full-strength even on a dimmed lane — you can still click into
+        // and inspect out-of-session history; dimming is emphasis, not a disablement.
+        ...(dim && !isCursor ? { opacity: '0.3' } : {}),
         // data attrs for click delegation in main.ts
         'data-branch-id':   branchId,
         'data-node-index':  nodeIndex,
         'data-node-id':     nodeId,
-      });
+      };
 
-      circle.appendChild(svgTitle(
-        node.opSummary + '\n' + nodeId.slice(0, 16) + '\n' + node.atIso.slice(0, 19),
-      ));
-      root.appendChild(circle);
+      // Per-kind shapes (see PATHWAY_KIND_STYLES): the cursor always renders as a circle so
+      // "where am I" reads the same regardless of what kind of node it landed on.
+      const shape = isCursor ? 'circle' : (kindStyle?.shape ?? 'circle');
+      const nodeEl =
+        shape === 'diamond' ? el('path', {
+          d: `M ${pos.x} ${pos.y - r - 1} L ${pos.x + r + 1} ${pos.y} L ${pos.x} ${pos.y + r + 1} L ${pos.x - r - 1} ${pos.y} Z`,
+          ...shapeAttrs,
+        })
+        : shape === 'square' ? el('rect', {
+          x: pos.x - r + 1, y: pos.y - r + 1, width: (r - 1) * 2, height: (r - 1) * 2,
+          ...shapeAttrs,
+        })
+        : el('circle', { cx: pos.x, cy: pos.y, r, ...shapeAttrs });
+
+      nodeEl.appendChild(svgTitle(
+        node.opSummary + '\n' + nodeId.slice(0, 16) + '\n' + node.atIso.slice(0, 19)));
+      root.appendChild(nodeEl);
+
+      // "cross" = a filled circle with an X carved through it — reads as "terminated here" at a
+      // glance. The X strokes are non-interactive decoration on top; the circle underneath
+      // carries the clickable class and data attributes.
+      if (shape === 'cross') {
+        const k = r - 2.5;
+        root.appendChild(el('path', {
+          d: `M ${pos.x - k} ${pos.y - k} L ${pos.x + k} ${pos.y + k} M ${pos.x - k} ${pos.y + k} L ${pos.x + k} ${pos.y - k}`,
+          stroke: '#1e1e1e', 'stroke-width': '1.8', fill: 'none',
+          'pointer-events': 'none',
+          ...(dim && !isCursor ? { opacity: '0.3' } : {}),
+        }));
+      }
 
       // Slice 13h — live stage badge on the branch's head node (its "current commit"), parity
       // with ArtifactExplorerPanel's tree. Only the head, not every node, since the stage tracks

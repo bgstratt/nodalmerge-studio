@@ -180,20 +180,30 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     private async Task RunScheduledWorkerAsync(ScheduledItem item, CancellationToken ct)
     {
         Interlocked.Increment(ref _activeWorkerCount);
-        var agentId = $"worker-{Guid.NewGuid():N}";
         var cts = new CancellationTokenSource();
         var success = false;
         var awaitingFileLease = false;
         var awaitingClarification = false;
+        var needsExecuteFallback = false;
         string? failureReason = null;
         var failureKind = FailureKind.Exception;
 
+        // Resolved before the try block (not inside it) so the catch/finally below — which
+        // reference agentId for logging/agent-record cleanup — can still see it even if profile
+        // resolution or anything after it throws.
+        var profile = item.ProfileId is not null
+            ? await _profileService.GetAsync(item.ProfileId, ct).ConfigureAwait(false)
+            : null;
+        // Agent IDs used to be hardcoded "worker-{guid}" regardless of which loop actually ran
+        // (Planner/Reviewer/Worker) — indistinguishable in the conversation log and Activity
+        // Center from a real Execute-stage worker, which made a Planner-profile run pointed at
+        // an already-leaf work unit (see the leaf-slice guard above) look exactly like a worker
+        // had gone rogue and started planning. Naming it after the resolved profile makes the log
+        // honest about which loop is actually executing.
+        var agentId = $"{profile?.AgentProfileId ?? "worker"}-{Guid.NewGuid():N}";
+
         try
         {
-            var profile = item.ProfileId is not null
-                ? await _profileService.GetAsync(item.ProfileId, ct).ConfigureAwait(false)
-                : null;
-
             var provider = item.Provider ?? "anthropic";
             var model    = item.Model    ?? string.Empty;
             var baseUrl  = item.BaseUrl  ?? string.Empty;
@@ -243,6 +253,22 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         ruleFileContext, combinedContext.Length == 0 ? null : combinedContext,
                         conversationLog: conversationLog, events: _events);
                     completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
+
+                    // A Planner that correctly concludes "nothing to decompose here" ends its turn
+                    // without recording a Plan artifact — that's Succeeded, not a failure, but
+                    // nothing else in this pipeline ever calls IFanOutService for a scheduler-driven
+                    // Plan item (only OrchestratorAgentLoop and IReplanService do, for their own
+                    // targets), so without this the work unit would just go idle after a
+                    // "successful" no-op. Hand it straight to Execute instead.
+                    if (completion == AgentLoopCompletion.Succeeded)
+                    {
+                        var artifactLineageForPlan = _serviceProvider.GetService<IArtifactLineageService>();
+                        var recordedPlan = artifactLineageForPlan is not null &&
+                            (await artifactLineageForPlan.GetChainAsync(item.WorkUnitId, ct).ConfigureAwait(false))
+                                .Any(a => a.Type == ArtifactType.Plan && a.OwnedByWorkUnitId == item.WorkUnitId);
+                        if (!recordedPlan)
+                            needsExecuteFallback = true;
+                    }
                 }
                 else if (profile?.Stage == PipelineStage.Review)
                 {
@@ -343,9 +369,6 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         {
             if (failureReason is not null)
             {
-                var profile = item.ProfileId is not null
-                    ? await _profileService.GetAsync(item.ProfileId, ct).ConfigureAwait(false)
-                    : null;
                 await RecordDeadLetterAsync(item, agentId, profile, failureReason, failureKind, ct).ConfigureAwait(false);
             }
 
@@ -371,6 +394,19 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 await _scheduler.ReleaseAsync(item.WorkUnitId, success).ConfigureAwait(false);
                 _logger.LogInformation(
                     "[Scheduler] Released workUnit={WorkUnitId} success={Success}", item.WorkUnitId, success);
+
+                // Must run AFTER ReleaseAsync, not before: EnqueueAsync's AddOrUpdate leaves a
+                // still-leased item untouched, so re-enqueuing while this run's own queue entry is
+                // still leased would silently no-op instead of scheduling the Execute pass.
+                if (needsExecuteFallback)
+                {
+                    await _scheduler.EnqueueAsync(
+                        item.WorkUnitId, "worker", item.TaskId, item.Model, item.BaseUrl,
+                        item.ApiKey, item.Provider, item.SessionId, ct).ConfigureAwait(false);
+                    _logger.LogInformation(
+                        "[Scheduler] Planner recorded no plan for workUnit={WorkUnitId} — " +
+                        "enqueued directly to Execute.", item.WorkUnitId);
+                }
             }
         }
     }

@@ -126,7 +126,12 @@ public sealed record MergeApprovedPayload(
 public sealed record MergeAppliedPayload(
     string ProposalId,
     string TargetBranch,
-    string ResultCommitHash);
+    string ResultCommitHash,
+    // The RepositorySnapshot current after this apply's disk write-back — the point-in-time
+    // anchor WorkspacePathways Integration nodes materialize from. Null when the apply didn't
+    // touch disk (promotion-branch staging, workspace-only sessions) or the CAS layer isn't
+    // configured. See plans/pathways-workspace-history.md verification item 1.
+    string? SnapshotId = null);
 
 // Orchestration
 public enum OrchestrationAction

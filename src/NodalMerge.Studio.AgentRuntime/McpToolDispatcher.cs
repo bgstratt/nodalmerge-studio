@@ -498,7 +498,11 @@ internal sealed class McpToolDispatcher(
                 return ToJson(proposal);
             }
 
-            var reviewed = await merge.ReviewAsync(proposalId, decision, cancellationToken: ct).ConfigureAwait(false);
+            // Non-automated review through the MCP surface — the caller may still be an agent
+            // (or an external MCP client acting for a person), so honor an explicit reviewedBy
+            // and only fall back to ReviewAsync's own "user" default when none is given.
+            var reviewed = await merge.ReviewAsync(
+                proposalId, decision, reviewedBy: Str(input, "reviewedBy"), cancellationToken: ct).ConfigureAwait(false);
             return ToJson(reviewed);
         }
         catch (KeyNotFoundException)

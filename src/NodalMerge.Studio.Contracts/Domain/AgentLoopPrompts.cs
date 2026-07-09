@@ -17,7 +17,13 @@ public static class AgentLoopPrompts
         cycle, showing what changed in the artifact chain since your last turn (added artifacts,
         artifacts whose status changed, newly completed tasks). Route based on the current delta's
         Current state:
-        - No Plan artifact and no child work units → enqueue the planner:
+        - Before enqueuing a planner, check your OWN work unit's fanOutInfo (from
+          nm_v1_workunit_get). If sliceId is already set, your work unit IS a leaf slice that a
+          parent's plan already produced — it cannot be planned again; the server will reject the
+          enqueue. A leaf slice that's too large gets split by re-planning its PARENT (dead-letter
+          it, then Re-plan), never by planning the leaf itself.
+        - No Plan artifact, no child work units, and this work unit is NOT itself a leaf slice
+          (fanOutInfo.sliceId is unset) → enqueue the planner:
           nm_v1_scheduler_enqueue with workUnitId=<your workUnitId>, profileId="planner".
         - Plan artifact exists OR child work units exist → stop. Fan-out and child enqueue are handled
           automatically after your turn — do not create tasks or enqueue workers yourself for slices.
@@ -86,8 +92,17 @@ public static class AgentLoopPrompts
            instead of quoting the literal `bool TryClaimForFulfillment(string orderId)` signature
            the original goal specified) is the single most common way a worker ends up building
            something that doesn't match what was actually asked for.
-        7. Record the plan using nm_v1_artifact_record_plan with your workUnitId and the plan JSON content.
-           The plan JSON must follow this exact shape:
+        6a. If, after steps 1-5, the goal is already a single atomic change — one file, or a
+            tightly-scoped set of files with no independently-parallelizable pieces — do NOT force
+            an artificial split into multiple slices just to have something to record. This is
+            especially true if you were invoked directly on what nm_v1_workunit_get shows is
+            already a leaf slice (fanOutInfo.sliceId set) from a parent's plan: it was already
+            decomposed once, so re-slicing it again is almost never right. In that case, simply end
+            your turn WITHOUT calling nm_v1_artifact_record_plan — the system detects that no plan
+            was recorded and hands this same work unit straight to execution unchanged. This is a
+            normal, successful outcome, not a failure to find something to slice.
+        7. Otherwise, record the plan using nm_v1_artifact_record_plan with your workUnitId and the
+           plan JSON content. The plan JSON must follow this exact shape:
            { "slices": [ { "sliceId": "...", "goal": "...", "fileScope": [...], "dependsOn": [...], "steps": [...] } ] }
         8. Stop — the orchestrator will fan out child workers from your plan.
           9. If key requirements are ambiguous and slicing would require guessing, call

@@ -1,9 +1,21 @@
 import * as vscode from 'vscode';
+import * as os from 'os';
+import * as path from 'path';
+import * as fs from 'fs';
 import { toWebSocketUrl } from '../constants';
 import { resolveRepositoryPath } from '../repositoryPath';
-import { scopeViewCss } from './sharedWebviewChrome';
+import { scopeViewCss, openReadOnlyDiff } from './sharedWebviewChrome';
 
 const POLL_INTERVAL_MS = 2_000;
+
+// Root directory for "Materialize to scratch workspace" output — set once from extension.ts's
+// activate() (the only place with access to ExtensionContext.globalStorageUri) rather than
+// threading an extra constructor parameter through StudioShellPanel's four createOrShow call
+// sites. Falls back to the OS temp dir when unset (e.g. tests constructing the panel directly).
+let pathwaysScratchRoot: string | undefined;
+export function setPathwaysScratchRoot(fsPath: string): void {
+  pathwaysScratchRoot = fsPath;
+}
 
 interface WorkUnit {
   workUnitId: string;
@@ -14,22 +26,40 @@ interface WorkUnit {
   currentStage?: string | null;
 }
 
-// Slice 13h — timeline entries returned by /studio/replay/timeline
-interface TimelineEntry {
-  kind: string;
+// plans/pathways-workspace-history.md slice 1 — nodes/edges from the WorkspacePathways
+// projection (GET /studio/projections/WorkspacePathways). Replaces the old per-work-unit
+// artifact + orchestration-decision-log dump (/studio/replay/timeline) that made Pathways
+// read as an agent's internal task list instead of workspace history.
+interface PathwaysNode {
   nodeId: string;
-  description: string;
+  kind: string;
+  workUnitId?: string | null;
+  branchId?: string | null;
+  actorKind: string;
+  actorId?: string | null;
+  actorModel?: string | null;
+  actorProvider?: string | null;
+  summary: string;
   occurredAt: string;
+  proposalId?: string | null;
+  artifactId?: string | null;
+  filesTouched?: string[] | null;
+  snapshotId?: string | null;
+  externalSyncStateIdBefore?: string | null;
+  externalSyncStateIdAfter?: string | null;
+  reviewedBy?: string | null;
 }
 
-interface TimelineData {
-  branchId: string;
-  entries: TimelineEntry[];
+interface PathwaysEdge {
+  fromNodeId: string;
+  toNodeId: string;
+  kind: string;
 }
 
-interface TimelineResponse {
-  branches: string[];
-  timelines: TimelineData[];
+interface PathwaysPayload {
+  nodes: PathwaysNode[];
+  edges: PathwaysEdge[];
+  generatedAt: string;
 }
 
 interface KnownGoodState {
@@ -116,27 +146,43 @@ export class TrajectoryReplayPanel {
     };
   }
 
+  // WorkspacePathways is deliberately workspace-wide, not session-scoped (it's the "branchable
+  // git tree" of the whole workspace's history, not one agent's task list) — so unlike the
+  // workunits fetch, no sessionId param goes on this request regardless of the session picker.
+  private async fetchPathways(): Promise<PathwaysPayload> {
+    const res = await this.get<{ data: PathwaysPayload }>('/studio/projections/WorkspacePathways?level=Normal');
+    return res.data;
+  }
+
   private async init(): Promise<void> {
     try {
       const sessionId = this.getEffectiveSessionId();
       const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
-      const [workUnits, timeline] = await Promise.all([
+      // Pathways is best-effort: a host predating ProjectionType.WorkspacePathways 400s the
+      // fetch, and that must degrade to "lanes without history nodes," not kill the whole init
+      // (work units, stages, and the WS connection all ride on this call).
+      const [workUnits, pathwaysResult] = await Promise.all([
         this.get<WorkUnit[]>('/studio/workunits' + params),
-        this.get<TimelineResponse>('/studio/replay/timeline' + params),
+        this.fetchPathways().catch(() => undefined),
       ]);
+      const pathways = pathwaysResult;
       void this.panel.webview.postMessage({
         type:      'init',
         wsUrl:     this.buildWsUrl(),
         roomId:    'studio-main',
+        // Tells the webview the workUnits list is session-scoped, so it dims out-of-session
+        // lanes (pathways data itself is always workspace-wide).
+        sessionActive: !!sessionId,
         workUnits: workUnits.map(wu => ({
           workUnitId:   wu.workUnitId,
           branchId:     wu.branchId,
           goal:         wu.goal,
           currentStage: wu.currentStage ?? null,
         })),
-        // Slice 13h — include timeline data in the init payload so the DAG
-        // renders branches/nodes immediately without waiting for a poll cycle.
-        timeline,
+        // Slice 1 (pathways-workspace-history.md) — include pathways data in the init payload so
+        // the DAG renders goal/integration/rejection/external nodes immediately, not just stages
+        // that change after the panel opens.
+        pathways,
       });
     } catch {
       // host not running or no data yet — WebView shows idle state
@@ -145,25 +191,26 @@ export class TrajectoryReplayPanel {
 
   /** Polled every POLL_INTERVAL_MS so work units fanned out after the panel was opened (no
    * goal/stage entry in the webview's workUnitIdToBranchId map otherwise) become visible without
-   * requiring the panel to be closed and reopened. Also refreshes timeline data so new artifacts
-   * and orchestration events appear without a full re-init. */
+   * requiring the panel to be closed and reopened. Also refreshes pathways data so new
+   * integrations/rejections/external updates appear without a full re-init. */
   private async refreshWorkUnits(): Promise<void> {
     try {
       const sessionId = this.getEffectiveSessionId();
       const params = sessionId ? '?sessionId=' + encodeURIComponent(sessionId) : '';
-      const [workUnits, timeline] = await Promise.all([
+      const [workUnits, pathways] = await Promise.all([
         this.get<WorkUnit[]>('/studio/workunits' + params),
-        this.get<TimelineResponse>('/studio/replay/timeline' + params),
+        this.fetchPathways().catch(() => undefined), // best-effort — same reason as init()
       ]);
       void this.panel.webview.postMessage({
         type: 'workUnits',
+        sessionActive: !!sessionId, // same session-highlight flag as init()
         workUnits: workUnits.map(wu => ({
           workUnitId:   wu.workUnitId,
           branchId:     wu.branchId,
           goal:         wu.goal,
           currentStage: wu.currentStage ?? null,
         })),
-        timeline,
+        pathways,
       });
     } catch {
       // host not running — same suppress-and-poll-later convention as init()
@@ -174,6 +221,20 @@ export class TrajectoryReplayPanel {
     // Re-fetch when this tab is activated so the user always sees session-scoped data immediately.
     if (msg.type === 'studio.tabActivated' && msg.tab === TrajectoryReplayPanel.containerId) {
       await this.refreshWorkUnits();
+      return;
+    }
+
+    // Slice 2 fast-follow (pathways-workspace-history.md) — "View Diff" on a node-detail file
+    // change. Shares sharedWebviewChrome's read-only content provider with MergeReviewPanel.ts
+    // rather than registering a second one under the same scheme (VS Code only allows one
+    // registration per scheme per extension). The message type is namespaced ("pathways." prefix)
+    // because StudioShellPanel broadcasts every webview message to every panel's handleMessage —
+    // a bare "openDiff" here was also handled by DecisionConvergencePanel, opening duplicate tabs.
+    if (msg.type === 'pathways.openDiff') {
+      const filePath = String(msg.path ?? 'file');
+      const before = (msg.beforeContent as string | null | undefined) ?? '';
+      const after = (msg.afterContent as string | null | undefined) ?? '';
+      await openReadOnlyDiff(filePath, before, after);
       return;
     }
 
@@ -223,15 +284,191 @@ export class TrajectoryReplayPanel {
       return;
     }
 
+    // Slice 3 (pathways-workspace-history.md) — "Branch from here (new steering)" on an
+    // Integration/Rejection/Superseded node. Generalizes ICounterfactualService (already real,
+    // already reachable at POST /studio/counterfactuals, just never called from any UI) rather
+    // than inventing a new branch-from-node mechanism — PathwaysNode.proposalId is exactly the
+    // ProposalId that service's base/{proposalId} snapshot seeding already keys on.
+    if (msg.type === 'createCounterfactual') {
+      const proposalId = msg.proposalId as string;
+      try {
+        const profiles = await this.get<Array<{ agentProfileId: string; name: string }>>('/studio/agent-profiles');
+        if (profiles.length === 0) {
+          void vscode.window.showWarningMessage('NodalMerge: no agent profiles configured to branch with.');
+          return;
+        }
+        const picked = await vscode.window.showQuickPick(
+          profiles.map(p => ({ label: p.name, description: p.agentProfileId, profile: p })),
+          { placeHolder: 'Pick the profile/model to re-run with', ignoreFocusOut: true },
+        );
+        if (!picked) { return; }
+
+        const newGoalOverride = await vscode.window.showInputBox({
+          prompt:         'Optional: override the goal for this counterfactual',
+          placeHolder:    'Leave blank to keep the original goal',
+          ignoreFocusOut: true,
+        });
+        const constraintText = await vscode.window.showInputBox({
+          prompt:         'Optional: additional steering constraint',
+          placeHolder:    'e.g. Must not modify the public API',
+          ignoreFocusOut: true,
+        });
+
+        const result = await this.post<{ newWorkUnitId: string }>('/studio/counterfactuals', {
+          proposalId,
+          newProfileId:    picked.profile.agentProfileId,
+          newGoalOverride: newGoalOverride || undefined,
+          constraintText:  constraintText || undefined,
+        });
+
+        const newWu = await this.get<{ branchId: string; goal: string }>(
+          '/studio/workunits/' + encodeURIComponent(result.newWorkUnitId));
+        void this.panel.webview.postMessage({
+          type:        'branchCreated',
+          newBranchId: newWu.branchId,
+          workUnitId:  result.newWorkUnitId,
+          goal:        newWu.goal,
+        });
+        void vscode.window.showInformationMessage('NodalMerge: Counterfactual branch created — ' + newWu.goal);
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: ' + String(err));
+      }
+      return;
+    }
+
+    // Slice 3 — "Materialize to scratch" on any node with a workUnitId. Reuses
+    // IProjectionMaterializer (already real, already REST-reachable at
+    // POST /studio/projections/{workUnitId}/materialize) — the only new part is generating a
+    // guaranteed-fresh scratch directory client-side and always passing it explicitly as
+    // targetPath. Never omit targetPath here: MaterializeAsync defaults to
+    // WorkspaceOptions.SeedRepositoryPath when it's absent, which is the REAL working repo, not
+    // a scratch copy. Note this reconstructs the work unit's branch's *current* live content
+    // (IFileWorkspaceService), not a state pinned to the exact moment this pathway node was
+    // recorded — true point-in-time reconstruction needs the RepositorySnapshot+CAS route
+    // (plans/pathways-workspace-history.md verification item 1, still open).
+    if (msg.type === 'materializeNode') {
+      const workUnitId = msg.workUnitId as string | undefined;
+      const snapshotId = msg.snapshotId as string | undefined;
+      try {
+        // Named, discoverable scratch location: {globalStorage}/pathways-scratch/{branch}/{stamp}.
+        // Grouped by branch so repeat materializations of the same lane sit side by side, stamped
+        // so they never overwrite each other, under extension storage so OS temp cleanup can't
+        // silently eat a workspace the user is still reading. Never the live repo (the server
+        // defaults targetPath to WorkspaceOptions.SeedRepositoryPath when omitted — the one thing
+        // this must never do, so targetPath is always explicit here).
+        const branchLabel = ((msg.branchId as string | undefined) ?? workUnitId ?? snapshotId ?? 'node')
+          .replace(/[^A-Za-z0-9._-]/g, '_');
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const scratchDir = path.join(
+          pathwaysScratchRoot ?? path.join(os.tmpdir(), 'nodalmerge'),
+          'pathways-scratch', branchLabel, stamp);
+        fs.mkdirSync(scratchDir, { recursive: true });
+        // Point-in-time route when the node carries a RepositorySnapshot id (Integration nodes
+        // whose MergeApplied event recorded one) — reconstructs the repo exactly as that
+        // integration left it, from snapshot TreeEntries + CAS. Branch-current fallback otherwise.
+        const route = snapshotId
+          ? '/studio/repository-snapshots/' + encodeURIComponent(snapshotId) + '/materialize?targetPath='
+          : '/studio/projections/' + encodeURIComponent(workUnitId ?? '') + '/materialize?targetPath=';
+        const result = await this.post<{ succeeded: boolean; targetPath: string; fileCount: number; error?: string }>(
+          route + encodeURIComponent(scratchDir),
+          {},
+        );
+        if (!result.succeeded) {
+          void vscode.window.showErrorMessage('NodalMerge: materialize failed — ' + (result.error ?? 'unknown error'));
+          return;
+        }
+        const openNow = await vscode.window.showInformationMessage(
+          'NodalMerge: materialized ' + result.fileCount + ' file(s) to ' + result.targetPath,
+          'Open in New Window',
+        );
+        if (openNow === 'Open in New Window') {
+          await vscode.commands.executeCommand(
+            'vscode.openFolder', vscode.Uri.file(result.targetPath), { forceNewWindow: true });
+        }
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: ' + String(err));
+      }
+      return;
+    }
+
+    // Slice 4 — manual "Sync now". Reuses /studio/workspace/switch (its ManualRefresh path is
+    // exactly a resync) — but the path it re-submits is the HOST's currently-configured
+    // SeedRepositoryPath (from /studio/workspace-summary), NOT resolveRepositoryPath()'s VS Code
+    // folder. Switch *sets* SeedRepositoryPath to whatever it's given; submitting the extension's
+    // resolved folder when the host is configured against a different repo would silently perform
+    // a real RepositorySwitch (resetting sync generation and the external-changeset chain).
+    // resolveRepositoryPath() is only the fallback when the host has no path configured yet.
+    if (msg.type === 'syncNow') {
+      try {
+        const summary = await this.get<{ seedRepositoryPath?: string | null }>('/studio/workspace-summary');
+        const repositoryPath = summary.seedRepositoryPath || resolveRepositoryPath();
+        if (!repositoryPath) {
+          void vscode.window.showWarningMessage('NodalMerge: no repository path configured to sync from.');
+          return;
+        }
+        const result = await this.post<{ sync: unknown }>('/studio/workspace/switch', { repositoryPath });
+        if (result.sync) {
+          void vscode.window.showInformationMessage('NodalMerge: synced external changes from the working repository.');
+          await this.refreshWorkUnits();
+        } else {
+          void vscode.window.showInformationMessage('NodalMerge: no external changes found.');
+        }
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: ' + String(err));
+      }
+      return;
+    }
+
+    // Slice 4 (pathways-workspace-history.md) — file-level diff for an ExternalUpdate node.
+    // Reuses IProjectionMaterializer.DiffKnownGoodStatesAsync via the existing
+    // GET /studio/projections/known-good/{a}/diff/{b} — RepositorySyncService already marks a
+    // KnownGoodState immediately before and after applying every external diff (see
+    // ExternalSyncStateIdBefore/After on the pathways node), so this is a path-list diff only
+    // (no hunks — there's no before-content captured for an external edit), same as the plan
+    // always scoped this to.
+    if (msg.type === 'viewExternalDiff') {
+      const stateIdBefore = msg.stateIdBefore as string;
+      const stateIdAfter = msg.stateIdAfter as string;
+      const nodeId = msg.nodeId as string;
+      try {
+        const diff = await this.get<unknown>(
+          '/studio/projections/known-good/' + encodeURIComponent(stateIdBefore)
+          + '/diff/' + encodeURIComponent(stateIdAfter));
+        void this.panel.webview.postMessage({ type: 'externalDiff', nodeId, diff });
+      } catch (err) {
+        void this.panel.webview.postMessage({ type: 'externalDiff', nodeId, error: String(err) });
+      }
+      return;
+    }
+
     if (msg.type === 'inspectNode') {
       const branchId = msg.branchId as string;
       const nodeId = msg.nodeId as string;
+      // Slice 2 (pathways-workspace-history.md) — main.ts only sends this for a MergeProposal
+      // (Integration/Rejection/Superseded pathways nodes; see pathwaysInspectId), so a workUnitId
+      // means "also fetch the file diffs and agent conversation that produced this proposal."
+      const workUnitId = msg.workUnitId as string | undefined;
+      // Opaque echo — the webview matches it against the latest-clicked node to drop stale
+      // responses from rapid consecutive clicks.
+      const requestNodeId = msg.requestNodeId as string | undefined;
       try {
-        const detail = await this.get<unknown>(
+        const detail = await this.get<{ kind?: string; artifact?: { type?: string } }>(
           '/studio/replay/inspect/' + encodeURIComponent(branchId) + '?nodeId=' + encodeURIComponent(nodeId));
-        void this.panel.webview.postMessage({ type: 'nodeDetail', nodeId, detail });
+
+        let fileChanges: unknown;
+        let conversationLog: unknown;
+        if (workUnitId && detail.kind === 'artifact' && detail.artifact?.type === 'MergeProposal') {
+          const [changesResult, logResult] = await Promise.allSettled([
+            this.get<{ fileChanges: unknown }>('/studio/merges/' + encodeURIComponent(nodeId) + '/file-changes'),
+            this.get<unknown>('/studio/workunits/' + encodeURIComponent(workUnitId) + '/conversation-log'),
+          ]);
+          if (changesResult.status === 'fulfilled') { fileChanges = changesResult.value.fileChanges; }
+          if (logResult.status === 'fulfilled') { conversationLog = logResult.value; }
+        }
+
+        void this.panel.webview.postMessage({ type: 'nodeDetail', nodeId, requestNodeId, detail, fileChanges, conversationLog });
       } catch (err) {
-        void this.panel.webview.postMessage({ type: 'nodeDetail', nodeId, error: String(err) });
+        void this.panel.webview.postMessage({ type: 'nodeDetail', nodeId, requestNodeId, error: String(err) });
       }
       return;
     }
@@ -326,6 +563,9 @@ const DAG_REPLAY_CSS = `
       --nm-btn:    var(--vscode-button-background);
       --nm-btn-fg: var(--vscode-button-foreground);
       --nm-btn-h:  var(--vscode-button-hoverBackground);
+      --nm-success: #4dac26;
+      --nm-error:   #f14c4c;
+      --nm-info:    var(--vscode-textLink-foreground, #3794ff);
     }
     .hidden { display: none; }
     .status-dot[data-status="idle"] { background: #555; }
@@ -385,7 +625,7 @@ const DAG_REPLAY_CSS = `
     #btn-restore-kgs:hover { filter: brightness(1.15); }
     #node-detail {
       border-top: 1px solid var(--nm-border);
-      max-height: 240px; overflow-y: auto;
+      max-height: 420px; overflow-y: auto;
       flex-shrink: 0; font-size: 0.82em;
       padding: 8px 14px;
     }
@@ -401,6 +641,36 @@ const DAG_REPLAY_CSS = `
       border-radius: 3px; padding: 6px; margin-top: 4px;
       font-family: var(--nm-mono);
     }
+    /* Slice 2 (pathways-workspace-history.md) — agent context + file diffs, styled to match
+       MergeReviewPanel/decisionConvergence.js's diff rendering conventions. */
+    .node-detail-section {
+      margin-top: 12px; padding-top: 10px;
+      border-top: 1px solid var(--nm-border);
+    }
+    .node-detail-section h3 {
+      font-size: 0.78em; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.07em;
+      opacity: 0.5; margin: 0 0 6px;
+    }
+    .conv-entry {
+      margin: 0 0 8px; padding: 6px 8px;
+      border-left: 2px solid var(--nm-info);
+      background: rgba(127,127,127,0.06);
+    }
+    .conv-entry-meta { opacity: 0.55; font-size: 0.85em; margin-bottom: 2px; }
+    .conv-entry-text { white-space: pre-wrap; }
+    .conv-tool-call { opacity: 0.7; font-family: var(--nm-mono); font-size: 0.85em; margin-top: 2px; }
+    .file-change { margin: 0 0 8px; border: 1px solid var(--nm-border); border-radius: 4px; padding: 4px 8px; }
+    .file-change summary { cursor: pointer; font-family: var(--nm-mono); font-size: 0.9em; }
+    .file-change-badge {
+      display: inline-block; border-radius: 9px; padding: 0 7px; margin-left: 6px;
+      font-size: 0.78em; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
+    }
+    .diff-line { font-family: var(--nm-mono); font-size: 0.85em; white-space: pre; overflow-x: auto; padding: 0 8px; }
+    .diff-add  { color: var(--nm-success); background: rgba(35, 134, 54, 0.12); }
+    .diff-del  { color: var(--nm-error);   background: rgba(241, 76, 76, 0.12); }
+    .diff-meta { color: var(--nm-info); opacity: 0.7; font-family: var(--nm-mono); font-size: 0.85em; padding: 2px 8px; }
+    .diff-empty { opacity: 0.6; padding: 4px 8px; font-size: 0.9em; }
 `;
 
 const DAG_REPLAY_HTML = `
@@ -411,13 +681,22 @@ const DAG_REPLAY_HTML = `
     <span id="node-count"></span>
     <select id="dag-session-override" style="font-size:0.75em;padding:1px 4px;border:1px solid var(--nm-border);border-radius:3px;background:var(--vscode-input-background,#3c3c3c);color:var(--vscode-input-foreground,#ccc);max-width:150px;margin-left:auto;"><option value="">Follow Workspace</option></select>
   </div>
-  <div style="padding: 4px 14px; font-size: 0.8em; opacity: 0.55; border-bottom: 1px solid var(--nm-border); flex-shrink: 0; display: flex; justify-content: space-between; align-items: center;">
-    <span>Trace the evolution of decisions through the goal → decomposition → execution → convergence lifecycle.</span>
+  <div style="padding: 4px 14px; font-size: 0.8em; opacity: 0.55; border-bottom: 1px solid var(--nm-border); flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+    <span>Workspace history — goals started, integrations, rejections, and external file updates. Not per-agent reasoning steps.</span>
+    <button id="btn-sync-now" class="ghost" style="font-size:0.85em;padding:2px 8px;flex-shrink:0;" title="Check the working repository for external changes now, instead of waiting for the next goal creation">Sync now</button>
     <select id="replay-mode" style="font-size:0.8em;padding:2px 6px;border:1px solid var(--nm-border);border-radius:3px;background:var(--vscode-input-background,#3c3c3c);color:var(--vscode-input-foreground,#ccc);">
       <option value="linear">Linear</option>
       <option value="branchexplorer">Branch Explorer</option>
       <option value="counterfactual">Counterfactual</option>
     </select>
+  </div>
+  <div style="display:flex;gap:14px;align-items:center;padding:3px 14px;font-size:0.72em;opacity:0.6;border-bottom:1px solid var(--nm-border);flex-shrink:0;">
+    <span><svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:-1px"><circle cx="5" cy="5" r="4" fill="#3794ff"/></svg> Goal</span>
+    <span><svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:-1px"><path d="M5 0 L10 5 L5 10 L0 5 Z" fill="#4dac26"/></svg> Integration</span>
+    <span><svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:-1px"><circle cx="5" cy="5" r="4" fill="#f14c4c"/><path d="M3 3 L7 7 M3 7 L7 3" stroke="#1e1e1e" stroke-width="1.4"/></svg> Rejection</span>
+    <span><svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:-1px"><path d="M5 0 L10 5 L5 10 L0 5 Z" fill="#8a8a8a"/></svg> Superseded</span>
+    <span><svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:-1px"><circle cx="5" cy="5" r="4" fill="#7a3333"/><path d="M3 3 L7 7 M3 7 L7 3" stroke="#1e1e1e" stroke-width="1.4"/></svg> Dead branch</span>
+    <span><svg width="10" height="10" viewBox="0 0 10 10" style="vertical-align:-1px"><rect x="1" y="1" width="8" height="8" fill="#cca700"/></svg> External update</span>
   </div>
   <div id="dag-scroll">
     <svg id="dag-svg"></svg>

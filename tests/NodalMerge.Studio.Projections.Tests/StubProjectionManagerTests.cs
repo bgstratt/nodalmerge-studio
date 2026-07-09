@@ -2,6 +2,7 @@ using System.Text.Json;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Contracts.Projections;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 using TaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.Projections.Tests;
@@ -33,6 +34,7 @@ public class ProjectionManagerTests
         public Task<IReadOnlyList<WorkUnit>> GetChildrenAsync(string parentId, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<WorkUnit>> GetDependentsAsync(string workUnitId, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<WorkUnit> AddDependencyAsync(string workUnitId, string dependsOnWorkUnitId, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private sealed class FakeTaskService : ITaskService
@@ -68,7 +70,7 @@ public class ProjectionManagerTests
 
         public Task<MergeProposal> ProposeAsync(MergeProposal p, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> ValidateAsync(string id, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<MergeProposal> ReviewAsync(string id, MergeProposalStatus d, string? notes = null, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> ReviewAsync(string id, MergeProposalStatus d, string? notes = null, string? reviewedBy = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, IReadOnlyList<string>? consideredArtifactIds = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> ApplyAsync(string id, CancellationToken ct = default, bool autoApplied = false) => throw new NotSupportedException();
         public Task<MergeProposal> SupersedeAsync(string proposalId, string supersededByProposalId, CancellationToken ct = default) => throw new NotSupportedException();
@@ -125,6 +127,10 @@ public class ProjectionManagerTests
             Task.FromResult<IReadOnlyList<ArtifactRef>>(
                 [.. _byId.Values.Where(a => a.OwnedByWorkUnitId is null && a.Type == ArtifactType.Constraint).OrderBy(a => a.CreatedAt)]);
 
+        public Task<IReadOnlyList<ArtifactRef>> GetByTypeAsync(ArtifactType type, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ArtifactRef>>(
+                [.. _byId.Values.Where(a => a.Type == type).OrderBy(a => a.CreatedAt)]);
+
         public Task<IReadOnlyList<ArtifactRef>> GetChildrenAsync(string parentArtifactId, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
 
@@ -138,18 +144,71 @@ public class ProjectionManagerTests
             throw new NotSupportedException();
     }
 
+    // In-memory stand-in for IStudioNodeStore — only ReadAllNodesAsync/WriteNodeAsync are
+    // exercised by WorkspacePathways' external-update lookup.
+    private sealed class FakeNodeStore : IStudioNodeStore
+    {
+        private readonly Dictionary<(string Kind, string EntityId), string> _nodes = new();
+
+        public Task WriteNodeAsync(string kind, string entityId, string payloadJson, CancellationToken ct = default)
+        {
+            _nodes[(kind, entityId)] = payloadJson;
+            return Task.CompletedTask;
+        }
+
+        public Task<string?> ReadNodeAsync(string kind, string entityId, CancellationToken ct = default) =>
+            Task.FromResult(_nodes.GetValueOrDefault((kind, entityId)));
+
+        public Task<IReadOnlyList<(string EntityId, string PayloadJson)>> ReadAllNodesAsync(string kind, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<(string EntityId, string PayloadJson)>>(
+                [.. _nodes.Where(kv => kv.Key.Kind == kind).Select(kv => (kv.Key.EntityId, kv.Value))]);
+    }
+
+    // Minimal fake for WorkspacePathways' event-sourced derivation — only GetEventsByKindAsync
+    // is exercised; seeded events carry pre-serialized payload JSON exactly as
+    // ExecutionEventStreamService writes it (default serializer options: PascalCase, numeric enums).
+    private sealed class FakeExecutionEventStream : IExecutionEventStream
+    {
+        private readonly List<ExecutionEvent> _events = [];
+
+        public void Seed(ExecutionEventKind kind, object payload, DateTimeOffset occurredAt, string? workUnitId = null) =>
+            _events.Add(new ExecutionEvent(
+                $"EVT-{_events.Count}", "session-1", workUnitId, kind,
+                JsonSerializer.Serialize(payload), null, occurredAt));
+
+        public Task<ExecutionEvent> AppendAsync<T>(string sessionId, string? workUnitId, ExecutionEventKind kind, T payload, string? causedByEventId = null, string? eventId = null, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<IReadOnlyList<ExecutionEvent>> GetSessionEventsAsync(string sessionId, DateTimeOffset? since = null, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<ExecutionEvent?> GetAsync(string eventId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
+
+        public Task<IReadOnlyList<ExecutionEvent>> GetEventsByKindAsync(IReadOnlyList<ExecutionEventKind> kinds, DateTimeOffset? since = null, CancellationToken ct = default)
+        {
+            var kindSet = kinds.ToHashSet();
+            return Task.FromResult<IReadOnlyList<ExecutionEvent>>(
+                [.. _events.Where(e => kindSet.Contains(e.Kind)).OrderBy(e => e.OccurredAt)]);
+        }
+    }
+
     private static ProjectionManager BuildManager(
         FakeWorkUnitService? workUnits = null,
         FakeTaskService? tasks = null,
         FakeMergeService? merges = null,
         FakeAgentRuntimeService? agentRuntime = null,
-        FakeArtifactLineageService? artifacts = null) =>
+        FakeArtifactLineageService? artifacts = null,
+        FakeNodeStore? nodeStore = null,
+        FakeExecutionEventStream? eventStream = null) =>
         new(
             workUnits ?? new FakeWorkUnitService(),
             tasks ?? new FakeTaskService(),
             merges ?? new FakeMergeService(),
             agentRuntime ?? new FakeAgentRuntimeService(),
-            artifacts ?? new FakeArtifactLineageService());
+            artifacts ?? new FakeArtifactLineageService(),
+            nodeStore: nodeStore,
+            eventStream: eventStream);
 
     private static WorkUnit MakeWorkUnit(
         string id, string goal, string branch = "main", WorkUnitStatus status = WorkUnitStatus.Active, string? parentWorkUnitId = null) =>
@@ -397,5 +456,271 @@ public class ProjectionManagerTests
         var result = await BuildManager().GetAsync(new ProjectionRequest(ProjectionType.AgentWorkspace, ProjectionLevel.Normal));
         var doc = JsonDocument.Parse(result.DataJson).RootElement;
         Assert.True(doc.TryGetProperty("error", out _));
+    }
+
+    // ── WorkspacePathways projection ────────────────────────────────────────
+
+    [Fact]
+    public async Task WorkspacePathways_root_work_unit_becomes_GoalStarted_node()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-1", "Add dark mode"));
+        var manager = BuildManager(workUnits);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var node = Assert.Single(payload!.Nodes);
+        Assert.Equal("GoalStarted", node.Kind);
+        Assert.Equal("WU-1", node.WorkUnitId);
+        Assert.Equal("goal:WU-1", node.NodeId);
+    }
+
+    [Fact]
+    public async Task WorkspacePathways_merged_proposal_becomes_Integration_node_edged_to_its_goal()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-1", "Add dark mode"));
+        var merges = new FakeMergeService();
+        merges.Seed(new MergeProposal(
+            "MP-1", "goal/WU-1", "main", "Add dark mode", "summary", "desc", null, null, 0.9,
+            MergeProposalStatus.Merged, WorkUnitId: "WU-1", AgentId: "agent-1", Model: "sonnet", Provider: "anthropic"));
+        var manager = BuildManager(workUnits, merges: merges);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var proposalNode = Assert.Single(payload!.Nodes, n => n.Kind == "Integration");
+        Assert.Equal("proposal:MP-1:integration", proposalNode.NodeId);
+        Assert.Equal("Agent", proposalNode.ActorKind);
+        Assert.Equal("sonnet", proposalNode.ActorModel);
+
+        var edge = Assert.Single(payload.Edges);
+        Assert.Equal("goal:WU-1", edge.FromNodeId);
+        Assert.Equal("proposal:MP-1:integration", edge.ToNodeId);
+        Assert.Equal("Integration", edge.Kind);
+    }
+
+    [Fact]
+    public async Task WorkspacePathways_rejected_proposal_on_a_child_work_unit_anchors_to_the_root_goal()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-Root", "Ship feature"));
+        workUnits.Seed(MakeWorkUnit("WU-Child", "Sub-task", parentWorkUnitId: "WU-Root"));
+        var merges = new FakeMergeService();
+        merges.Seed(new MergeProposal(
+            "MP-2", "task/WU-Child", "goal/WU-Root", "Sub-task", "summary", "desc", null, null, null,
+            MergeProposalStatus.Rejected, WorkUnitId: "WU-Child"));
+        var manager = BuildManager(workUnits, merges: merges);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var rejectionNode = Assert.Single(payload!.Nodes, n => n.Kind == "Rejection");
+        var edge = Assert.Single(payload.Edges);
+        Assert.Equal("goal:WU-Root", edge.FromNodeId); // anchored to root, not the child WU
+        Assert.Equal(rejectionNode.NodeId, edge.ToNodeId);
+    }
+
+    [Fact]
+    public async Task WorkspacePathways_dead_goal_with_no_proposal_becomes_DeadBranch_node()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-1", "Crashed goal", status: WorkUnitStatus.DeadLettered));
+        var manager = BuildManager(workUnits);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        Assert.Contains(payload!.Nodes, n => n.Kind == "GoalStarted");
+        Assert.Contains(payload.Nodes, n => n.Kind == "DeadBranch");
+        Assert.Contains(payload.Edges, e => e.Kind == "DeadEnd");
+    }
+
+    [Fact]
+    public async Task WorkspacePathways_external_changeset_artifact_becomes_ExternalUpdate_node()
+    {
+        var artifacts = new FakeArtifactLineageService();
+        artifacts.Seed(new ArtifactRef(
+            "EXT-1", ArtifactType.ExternalChangeset, null, ArtifactStatus.Applied, DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null, Title: "RepositoryDrift: 2 added, 1 modified, 0 deleted (generation 1)"));
+        var manager = BuildManager(artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var node = Assert.Single(payload!.Nodes);
+        Assert.Equal("ExternalUpdate", node.Kind);
+        Assert.Equal("External", node.ActorKind);
+        Assert.Equal("external:EXT-1", node.NodeId);
+    }
+
+    [Fact]
+    public async Task WorkspacePathways_external_changeset_parses_body_for_files_and_diff_state_ids()
+    {
+        var artifacts = new FakeArtifactLineageService();
+        // Exact shape RepositorySyncService.SyncCoreAsync serializes into ArtifactRef.Body — a
+        // plain JsonSerializer.Serialize(new {...}) call, so this is genuinely camelCase, not
+        // JsonOptions-normalized. Regression coverage for a case-sensitivity bug: deserializing
+        // this without JsonSerializerOptions.Web silently drops every field.
+        var body = "{\"repositoryPath\":\"C:/repo\",\"added\":[\"src/A.cs\"],\"modified\":[\"src/B.cs\"],"
+            + "\"deleted\":[],\"preSyncSnapshotStateId\":\"kgs-pre\",\"postSyncSnapshotStateId\":\"kgs-post\"}";
+        artifacts.Seed(new ArtifactRef(
+            "EXT-2", ArtifactType.ExternalChangeset, null, ArtifactStatus.Applied, DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null, Title: "RepositoryDrift", Body: body));
+        var manager = BuildManager(artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var node = Assert.Single(payload!.Nodes);
+        Assert.Equal(["src/A.cs", "src/B.cs"], node.FilesTouched);
+        Assert.Equal("kgs-pre", node.ExternalSyncStateIdBefore);
+        Assert.Equal("kgs-post", node.ExternalSyncStateIdAfter);
+    }
+
+    [Fact]
+    public async Task WorkspacePathways_external_changesets_are_omitted_when_branch_scoped()
+    {
+        var artifacts = new FakeArtifactLineageService();
+        artifacts.Seed(new ArtifactRef(
+            "EXT-1", ArtifactType.ExternalChangeset, null, ArtifactStatus.Applied, DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null));
+        var manager = BuildManager(artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal, BranchId: "main"));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        Assert.Empty(payload!.Nodes);
+    }
+
+    [Fact]
+    public async Task WorkspacePathways_branch_scoped_child_proposal_emits_no_dangling_root_edge()
+    {
+        // The child work unit is on branch "work-child"; its root-goal parent lives on a
+        // different branch, so a branch-scoped request can't see it. The proposal node must
+        // still appear, but with no edge — an edge to "goal:WU-Child" would reference a node
+        // that is never emitted (children don't get GoalStarted nodes).
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-Root", "Ship feature", branch: "work-root"));
+        workUnits.Seed(MakeWorkUnit("WU-Child", "Sub-task", branch: "work-child", parentWorkUnitId: "WU-Root"));
+        var merges = new FakeMergeService();
+        merges.Seed(new MergeProposal(
+            "MP-9", "work-child", "work-root", "Sub-task", "summary", "desc", null, null, null,
+            MergeProposalStatus.Merged, WorkUnitId: "WU-Child"));
+        var manager = BuildManager(workUnits, merges: merges);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal, BranchId: "work-child"));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        Assert.Single(payload!.Nodes, n => n.Kind == "Integration");
+        Assert.Empty(payload.Edges);
+        var nodeIds = payload.Nodes.Select(n => n.NodeId).ToHashSet();
+        Assert.All(payload.Edges, e => Assert.Contains(e.FromNodeId, nodeIds));
+    }
+
+    // ── WorkspacePathways — event-sourced derivation ────────────────────────
+
+    [Fact]
+    public async Task WorkspacePathways_merged_then_superseded_proposal_keeps_both_history_nodes()
+    {
+        // The retroactive-history-rewrite fix: a reconciliation constituent's status is
+        // Superseded *now*, but the event log proves it integrated first. State-derived, the
+        // Integration moment vanished; event-sourced, both nodes exist with true timestamps
+        // and a lifecycle chain edge between them.
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-1", "Add feature"));
+        var merges = new FakeMergeService();
+        merges.Seed(new MergeProposal(
+            "MP-1", "work-1", "candidate", "Add feature", "summary", "desc", null, null, null,
+            MergeProposalStatus.Superseded, WorkUnitId: "WU-1"));
+        var events = new FakeExecutionEventStream();
+        var appliedAt = DateTimeOffset.UtcNow.AddMinutes(-10);
+        var supersededAt = DateTimeOffset.UtcNow.AddMinutes(-2);
+        events.Seed(ExecutionEventKind.MergeApplied,
+            new MergeAppliedPayload("MP-1", "candidate", "", "snap-42"), appliedAt, "WU-1");
+        events.Seed(ExecutionEventKind.MergeProposalStatusChanged,
+            new MergeProposalStatusChangedPayload("MP-1", MergeProposalStatus.Merged, MergeProposalStatus.Superseded), supersededAt, "WU-1");
+        var manager = BuildManager(workUnits, merges: merges, eventStream: events);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var integration = Assert.Single(payload!.Nodes, n => n.Kind == "Integration");
+        var superseded = Assert.Single(payload.Nodes, n => n.Kind == "Superseded");
+        Assert.Equal("snap-42", integration.SnapshotId);          // point-in-time anchor from the event
+        Assert.Equal(appliedAt, integration.OccurredAt);          // true merge time, not DiffGeneratedAt
+        Assert.Equal(supersededAt, superseded.OccurredAt);
+        Assert.Contains(payload.Edges, e => e.FromNodeId == integration.NodeId && e.ToNodeId == superseded.NodeId);
+    }
+
+    [Fact]
+    public async Task WorkspacePathways_rejection_event_carries_reviewer_identity()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-1", "Fix bug"));
+        var merges = new FakeMergeService();
+        merges.Seed(new MergeProposal(
+            "MP-2", "work-1", "main", "Fix bug", "summary", "desc", null, null, null,
+            MergeProposalStatus.Rejected, WorkUnitId: "WU-1"));
+        var events = new FakeExecutionEventStream();
+        events.Seed(ExecutionEventKind.ProposalRejected,
+            new ProposalRejectedPayload("MP-2", "reviewer-agent-7", "tests failed"), DateTimeOffset.UtcNow, "WU-1");
+        var manager = BuildManager(workUnits, merges: merges, eventStream: events);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var rejection = Assert.Single(payload!.Nodes, n => n.Kind == "Rejection");
+        Assert.Equal("reviewer-agent-7", rejection.ReviewedBy);
+    }
+
+    [Fact]
+    public async Task WorkspacePathways_state_fallback_uses_proposal_ReviewedBy_when_no_events_exist()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-1", "Old goal"));
+        var merges = new FakeMergeService();
+        merges.Seed(new MergeProposal(
+            "MP-3", "work-1", "main", "Old goal", "summary", "desc", null, null, null,
+            MergeProposalStatus.Merged, WorkUnitId: "WU-1", ReviewedBy: "user"));
+        var manager = BuildManager(workUnits, merges: merges); // no event stream at all
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var integration = Assert.Single(payload!.Nodes, n => n.Kind == "Integration");
+        Assert.Equal("user", integration.ReviewedBy);
+        Assert.Equal("proposal:MP-3:integration", integration.NodeId);
+    }
+
+    // ── WorkspacePathways — nested topology ─────────────────────────────────
+
+    [Fact]
+    public async Task WorkspacePathways_child_proposal_anchors_to_parents_earlier_proposal_node()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed(MakeWorkUnit("WU-Root", "Ship feature"));
+        workUnits.Seed(MakeWorkUnit("WU-Child", "Sub-task", parentWorkUnitId: "WU-Root"));
+        var merges = new FakeMergeService();
+        // Parent's own proposal merged first; the child's proposal came after and should chain
+        // to it — nested topology — not jump straight to the root goal node.
+        merges.Seed(new MergeProposal(
+            "MP-Parent", "work-root", "main", "Ship feature", "summary", "desc", null,
+            null, null, MergeProposalStatus.Merged, WorkUnitId: "WU-Root",
+            DiffGeneratedAt: DateTimeOffset.UtcNow.AddMinutes(-30)));
+        merges.Seed(new MergeProposal(
+            "MP-Child", "work-child", "work-root", "Sub-task", "summary", "desc", null,
+            null, null, MergeProposalStatus.Merged, WorkUnitId: "WU-Child",
+            DiffGeneratedAt: DateTimeOffset.UtcNow.AddMinutes(-5)));
+        var manager = BuildManager(workUnits, merges: merges);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.WorkspacePathways, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<WorkspacePathwaysProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var childEdge = Assert.Single(payload!.Edges, e => e.ToNodeId == "proposal:MP-Child:integration");
+        Assert.Equal("proposal:MP-Parent:integration", childEdge.FromNodeId);
+        var parentEdge = Assert.Single(payload.Edges, e => e.ToNodeId == "proposal:MP-Parent:integration");
+        Assert.Equal("goal:WU-Root", parentEdge.FromNodeId);
     }
 }

@@ -125,15 +125,22 @@ public sealed class FanOutService : IFanOutService
             var children = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
             foreach (var child in children)
             {
-                if (!await IsReadyToEnqueueAsync(child, ct).ConfigureAwait(false))
+                // Collision avoidance — two sibling slices with overlapping fileScope and no
+                // dependsOn between them is a planning gap, not something to catch at runtime via
+                // the file lease. Sequencing it here (before it's ever enqueued) means the newer
+                // sibling simply never starts until the older one has merged, instead of both
+                // starting, one burning iterations, then discovering the conflict at write time.
+                var sequenced = await AutoSequenceOverlappingSiblingsAsync(child, children, ct).ConfigureAwait(false);
+
+                if (!await IsReadyToEnqueueAsync(sequenced, ct).ConfigureAwait(false))
                     continue;
 
-                await RefreshBranchFromDependenciesAsync(child, ct).ConfigureAwait(false);
+                await RefreshBranchFromDependenciesAsync(sequenced, ct).ConfigureAwait(false);
 
-                if (await EnqueueChildWorkerAsync(child, parentWorkUnitId, creds, sessionId, ct).ConfigureAwait(false))
+                if (await EnqueueChildWorkerAsync(sequenced, parentWorkUnitId, creds, sessionId, ct).ConfigureAwait(false))
                 {
                     actions.Add(FanOutAction.ChildEnqueued);
-                    enqueued.Add(child.WorkUnitId);
+                    enqueued.Add(sequenced.WorkUnitId);
                 }
             }
         }
@@ -249,6 +256,85 @@ public sealed class FanOutService : IFanOutService
         return created;
     }
 
+    // Statuses where a sibling's file-scope claim no longer matters — either its content has
+    // already landed (Merged, so a fresh dependsOn edge onto it is what a NEW overlapping sibling
+    // needs anyway) or it never will (Cancelled). Everything else (Created, Queued, Executing,
+    // Proposed, Reviewing, DeadLettered, Retrying) is still "in flight" from a collision-avoidance
+    // point of view — DeadLettered in particular may yet be retried/continued and land later, so
+    // it still counts as a live claim on its files.
+    private static readonly HashSet<WorkUnitStatus> DoesNotNeedSequencing =
+        [WorkUnitStatus.Merged, WorkUnitStatus.Cancelled];
+
+    // Auto-inserts a dependsOn edge instead of the old NonOverlappingFileScopeRule's flat reject —
+    // a planning gap (two sibling slices sharing a file, no dependsOn declared between them) is
+    // cheap to fix here, before either one is ever enqueued, versus catching it at the file lease
+    // after one side has already burned iterations getting to the conflicting write. Only ever
+    // makes the NEWER of an overlapping pair depend on the OLDER one (a strict, deterministic
+    // total order by CreatedAt, tie-broken by WorkUnitId) — that alone rules out two siblings both
+    // trying to depend on each other in the same pass. The cycle check below additionally guards
+    // the cross-generation case (e.g. a re-planned sibling whose own dependency chain already
+    // reaches back to this one) — if that ever fires, this leaves the pair alone and lets the file
+    // lease serialize them at runtime instead, rather than forcing an edge that would deadlock.
+    private async Task<WorkUnit> AutoSequenceOverlappingSiblingsAsync(
+        WorkUnit child, IReadOnlyList<WorkUnit> siblings, CancellationToken ct)
+    {
+        if (child.FileScope.Count == 0)
+            return child;
+
+        var childScope = new HashSet<string>(child.FileScope.Select(NormalizePath), StringComparer.OrdinalIgnoreCase);
+        var current = child;
+
+        foreach (var sibling in siblings)
+        {
+            if (sibling.WorkUnitId == current.WorkUnitId) continue;
+            if (DoesNotNeedSequencing.Contains(sibling.Status)) continue;
+            if (sibling.FileScope.Count == 0) continue;
+            if (current.DependsOn.Contains(sibling.WorkUnitId)) continue;
+
+            var overlaps = sibling.FileScope.Select(NormalizePath).Any(childScope.Contains);
+            if (!overlaps) continue;
+
+            var siblingIsOlder = sibling.CreatedAt < current.CreatedAt
+                || (sibling.CreatedAt == current.CreatedAt
+                    && string.CompareOrdinal(sibling.WorkUnitId, current.WorkUnitId) < 0);
+            if (!siblingIsOlder) continue;
+
+            if (await WouldCreateCycleAsync(sibling.WorkUnitId, current.WorkUnitId, ct).ConfigureAwait(false))
+                continue;
+
+            current = await _workUnits.AddDependencyAsync(current.WorkUnitId, sibling.WorkUnitId, ct)
+                .ConfigureAwait(false);
+        }
+
+        return current;
+    }
+
+    // True if candidateDependencyId's own DependsOn chain already reaches targetWorkUnitId —
+    // meaning "targetWorkUnitId depends on candidateDependencyId" would close a cycle.
+    private async Task<bool> WouldCreateCycleAsync(
+        string candidateDependencyId, string targetWorkUnitId, CancellationToken ct)
+    {
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        var queue = new Queue<string>();
+        queue.Enqueue(candidateDependencyId);
+
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            if (!visited.Add(current)) continue;
+            if (current == targetWorkUnitId) return true;
+
+            var unit = await _workUnits.GetAsync(current, ct).ConfigureAwait(false);
+            if (unit is null) continue;
+            foreach (var dep in unit.DependsOn)
+                queue.Enqueue(dep);
+        }
+
+        return false;
+    }
+
+    private static string NormalizePath(string path) => path.Replace('\\', '/');
+
     private async Task<bool> IsReadyToEnqueueAsync(WorkUnit child, CancellationToken ct)
     {
         if (child.Status is not WorkUnitStatus.Created)
@@ -359,21 +445,12 @@ public sealed class FanOutService : IFanOutService
                 UsedLlm: false)
             : await _profileSelection.SelectProfileAsync(child, creds, ct).ConfigureAwait(false);
 
-        // Slice 14b — built here (rather than inside a rule) so IPolicyRule implementations like
-        // NonOverlappingFileScopeRule don't need their own IWorkUnitService dependency.
-        var siblings = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
-        var activeSiblings = siblings
-            .Where(s => s.WorkUnitId != child.WorkUnitId)
-            .Select(s => new FileScopeSibling(s.WorkUnitId, s.FanOutInfo?.SliceId, s.Status, s.FileScope))
-            .ToList();
-
         var policyContext = new Dictionary<string, object?>
         {
             ["workUnitId"] = child.WorkUnitId,
             ["parentWorkUnitId"] = parentWorkUnitId,
             ["goal"] = child.Goal,
             ["fileScope"] = child.FileScope,
-            ["activeSiblings"] = activeSiblings,
         };
         var policyResult = await _policyGate
             .EvaluateAsync(PolicyCheckpoint.BeforeEnqueue, policyContext, ct)

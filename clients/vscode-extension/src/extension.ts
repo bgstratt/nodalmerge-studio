@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { HostManager } from './HostManager';
 import { StudioShellPanel } from './panels/StudioShellPanel';
+import { setPathwaysScratchRoot } from './panels/DagReplayPanel';
 import { DecisionConvergencePanel } from './panels/MergeReviewPanel';
 import { InsightsPanel } from './panels/InsightsPanel';
 import { NotificationManager } from './NotificationManager';
@@ -39,6 +40,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const agentConfig = new AgentConfigService();
   const lmProxy     = new LmApiProxy();
   context.subscriptions.push(manager, lmProxy);
+
+  // Pathways "Materialize to scratch workspace" output root — workspace-scoped storage when a
+  // folder is open, global storage otherwise, matching HostManager's own storage convention.
+  setPathwaysScratchRoot(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(LAUNCHER_VIEW_ID, new LauncherViewProvider()),

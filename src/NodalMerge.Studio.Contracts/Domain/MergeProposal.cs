@@ -54,6 +54,12 @@ public sealed record MergeProposal(
     // panel — distinct from VerificationResults (which holds automated build/test output), so a
     // human's "why" doesn't get mixed in with or overwritten by the automated reviewer's notes.
     string? ReviewNotes = null,
+    // Who decided this proposal's review outcome: "user" for the human review path, the reviewer
+    // agent's id for automated review. Null on proposals that predate this field or haven't been
+    // reviewed. Distinct from AgentId (the *proposer*) — WorkspacePathways renders both so an
+    // agent-approved integration reads differently from a human-approved one
+    // (plans/pathways-workspace-history.md, verification item 2).
+    string? ReviewedBy = null,
     // Slice 23 — Constraint/Research artifact IDs the automated reviewer explicitly cited as
     // considered when deciding this proposal (whether or not they were violated). Distinct from
     // ArtifactSurfacedPayload's "was it returned in a projection" — this is "did the decision-maker

@@ -275,9 +275,9 @@ public static class ServiceCollectionExtensions
     {
         services.AddSingleton<IPolicyGateService, PolicyGateService>();
 
-        // Slice 14b — the first real rule. Always registered; gated by
-        // WorkspaceOptions.BlockOverlappingFileScope (default false) inside the rule itself.
-        services.AddSingleton<IPolicyRule, NonOverlappingFileScopeRule>();
+        // Slice 14b's NonOverlappingFileScopeRule (opt-in reject) lived here; replaced by
+        // FanOutService.AutoSequenceOverlappingSiblingsAsync, which is always-on and inserts a
+        // dependsOn edge instead of blocking — see that method's own comment for why.
 
         // Slice 16f — opt-in execution rule; gated by RequireBuildBeforeProposal/RequireTestBeforeProposal.
         services.AddSingleton<IPolicyRule, WorkspaceExecutionRule>();

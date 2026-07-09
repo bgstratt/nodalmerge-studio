@@ -18,10 +18,6 @@ public sealed class WorkspaceOptions
     public bool UseLlmProfileSelection { get; set; } = false;
     public int MaxConcurrentWorkers { get; set; } = 3;
     public int SchedulerPollIntervalMs { get; set; } = 2_000;
-    // Slice 14b — opt-in. False keeps today's behavior byte-for-byte: NonOverlappingFileScopeRule
-    // is registered but evaluates to Allowed regardless of overlap. True rejects the second of two
-    // overlapping siblings at BeforeEnqueue instead of just warning after the fact.
-    public bool BlockOverlappingFileScope { get; set; } = false;
 
     // ── Slice 16e/16f/16m — workspace execution ───────────────────────────────
 

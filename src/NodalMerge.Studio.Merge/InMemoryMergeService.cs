@@ -126,6 +126,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         string proposalId,
         MergeProposalStatus decision,
         string? notes = null,
+        string? reviewedBy = null,
         CancellationToken cancellationToken = default)
     {
         var proposal = GetRequired(proposalId);
@@ -137,7 +138,11 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 $"Proposals must be in ReadyForReview before human review.");
         }
 
-        var updated = proposal with { Status = decision, ReviewNotes = notes ?? proposal.ReviewNotes };
+        // This is the human review path — "user" is the right default, not null: a review that
+        // reached here was a deliberate decision by *someone*, and null previously meant
+        // ReviewCompletedEvent/the pathways projection had no approver identity at all.
+        var reviewer = reviewedBy ?? "user";
+        var updated = proposal with { Status = decision, ReviewNotes = notes ?? proposal.ReviewNotes, ReviewedBy = reviewer };
         _proposals[proposalId] = updated;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.MergeProposalV1,
@@ -147,7 +152,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         EventBus?.Publish(new ReviewCompletedEvent(
             proposalId, proposal.WorkUnitId,
-            decision.ToString(), Automated: false, ReviewerAgentId: null,
+            decision.ToString(), Automated: false, ReviewerAgentId: reviewer,
             DateTimeOffset.UtcNow));
 
         if (proposal.WorkUnitId is not null)
@@ -166,14 +171,14 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                     proposal.SessionId,
                     proposal.WorkUnitId,
                     ExecutionEventKind.ProposalApproved,
-                    new ProposalApprovedPayload(proposalId, "user"),
+                    new ProposalApprovedPayload(proposalId, reviewer),
                     ct: cancellationToken).ConfigureAwait(false);
 
                 await _events.AppendAsync(
                     proposal.SessionId,
                     proposal.WorkUnitId,
                     ExecutionEventKind.MergeApproved,
-                    new MergeApprovedPayload(proposalId, "user", DateTimeOffset.UtcNow),
+                    new MergeApprovedPayload(proposalId, reviewer, DateTimeOffset.UtcNow),
                     causedByEventId: approvedEv.EventId,
                     ct: cancellationToken).ConfigureAwait(false);
             }
@@ -183,7 +188,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                     proposal.SessionId,
                     proposal.WorkUnitId,
                     ExecutionEventKind.ProposalRejected,
-                    new ProposalRejectedPayload(proposalId, "user", null),
+                    new ProposalRejectedPayload(proposalId, reviewer, notes),
                     ct: cancellationToken).ConfigureAwait(false);
             }
 
@@ -343,6 +348,13 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             VerificationResults = verificationResults,
             AgentId = reviewerAgentId ?? proposal.AgentId,
             ConsideredArtifactIds = consideredArtifactIds ?? proposal.ConsideredArtifactIds,
+            // Terminal automated decisions record their reviewer. The Approved→ReadyForReview
+            // hand-back path deliberately does NOT set ReviewedBy — the human sign-off that
+            // follows (ReviewAsync) is the decision of record there, and pre-populating the
+            // automated gate's id would misattribute it.
+            ReviewedBy = nextStatus is MergeProposalStatus.Approved or MergeProposalStatus.Rejected
+                ? reviewerAgentId ?? "automated-reviewer"
+                : proposal.ReviewedBy,
         };
         _proposals[proposalId] = updated;
         await _nodeStore.WriteNodeAsync(
@@ -545,11 +557,12 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // configured.
         var writeBackPath = await ResolveWriteBackPathAsync(owningWorkUnit, cancellationToken).ConfigureAwait(false);
         var promotedToDisk = false;
+        string? appliedSnapshotId = null;
         if (!usingPromotionBranch
             && WorkspaceReviewScope.AppliesToRealRepo(owningWorkUnit) && !string.IsNullOrWhiteSpace(writeBackPath))
         {
             await WriteBackToRepositoryAsync(proposal.SourceBranch, writeBackPath, cancellationToken).ConfigureAwait(false);
-            await BestEffortResyncAsync(writeBackPath, cancellationToken).ConfigureAwait(false);
+            appliedSnapshotId = await BestEffortResyncAsync(writeBackPath, cancellationToken).ConfigureAwait(false);
             promotedToDisk = true;
         }
 
@@ -723,7 +736,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 proposal.SessionId,
                 proposal.WorkUnitId,
                 ExecutionEventKind.MergeApplied,
-                new MergeAppliedPayload(proposalId, proposal.TargetBranch, string.Empty),
+                new MergeAppliedPayload(proposalId, proposal.TargetBranch, string.Empty, appliedSnapshotId),
                 ct: cancellationToken).ConfigureAwait(false);
 
             await _events.AppendAsync(
@@ -1185,27 +1198,52 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         return writeBackPath;
     }
 
-    // Best-effort CAS/snapshot audit-trail refresh — scoped to the global default repo
-    // specifically, because "main"'s on-disk branch directory mirrors that repo. A multi-repo work
-    // unit's own writeBackPath points at a *different* physical repo, and syncing "main" against it
-    // would diff the wrong pairing. A failed or skipped resync must never affect the write-back
-    // itself, which already succeeded.
-    private async Task BestEffortResyncAsync(string writeBackPath, CancellationToken ct)
+    // Best-effort CAS/snapshot audit-trail refresh. Two layers with different scopes:
+    //   1. The full branch resync ("main" content vs the repo) only runs for the global default
+    //      repo — "main"'s on-disk branch directory mirrors that repo specifically; a multi-repo
+    //      work unit's writeBackPath points at a *different* physical repo, and syncing "main"
+    //      against it would diff the wrong pairing.
+    //   2. The CAS/RepositorySnapshot layer (IRepositoryImportService.ForceSyncAsync) is
+    //      per-repository and safe for ANY writeBackPath — it walks that repo's own files against
+    //      that repo's own snapshot chain. Previously this only ran for the default repo too
+    //      (implicitly, via layer 1), which left multi-repo/reconciliation applies with no
+    //      snapshot advance at all — exactly the candidate-into-candidate gap
+    //      plans/pathways-workspace-history.md's verification item 1 flagged.
+    // Returns the repository's latest RepositorySnapshot id after the refresh (the point-in-time
+    // anchor the MergeApplied event carries), or null when the CAS layer isn't configured or the
+    // refresh failed. A failed or skipped resync must never affect the write-back itself, which
+    // already succeeded.
+    private async Task<string?> BestEffortResyncAsync(string writeBackPath, CancellationToken ct)
     {
-        if (_repositorySync is null
-            || !string.Equals(writeBackPath, _workspaceOptions.SeedRepositoryPath, StringComparison.Ordinal))
-            return;
+        var isDefaultRepo = string.Equals(writeBackPath, _workspaceOptions.SeedRepositoryPath, StringComparison.Ordinal);
 
         try
         {
-            await _repositorySync.SyncBranchFromRepositoryAsync(
-                "main", writeBackPath, SyncTrigger.PostMergeWriteBack, ct).ConfigureAwait(false);
+            if (isDefaultRepo && _repositorySync is not null)
+            {
+                // Layer 1 (includes layer 2 internally — RepositorySyncService's own
+                // PostMergeWriteBack path already calls ForceSyncAsync for this repo).
+                await _repositorySync.SyncBranchFromRepositoryAsync(
+                    "main", writeBackPath, SyncTrigger.PostMergeWriteBack, ct).ConfigureAwait(false);
+            }
+            else if (_serviceProvider?.GetService(typeof(IRepositoryImportService)) is IRepositoryImportService import)
+            {
+                // Layer 2 only, for non-default repos.
+                await import.ForceSyncAsync(Path.GetFullPath(writeBackPath), writeBackPath, ct).ConfigureAwait(false);
+            }
+
+            if (_serviceProvider?.GetService(typeof(IRepositorySnapshotService)) is IRepositorySnapshotService snapshots)
+            {
+                var latest = await snapshots.GetLatestAsync(Path.GetFullPath(writeBackPath), ct).ConfigureAwait(false);
+                return latest?.SnapshotId;
+            }
         }
         catch
         {
-            // Best-effort audit-trail refresh — the write-back already succeeded; a resync failure
-            // must never fail or roll back an already-completed apply/promote.
+            // Best-effort audit-trail refresh — never fail or roll back a completed apply/promote.
         }
+
+        return null;
     }
 
     public Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken cancellationToken = default)

@@ -159,13 +159,39 @@ the panel, then re-running the merger.
 
 ---
 
-## Pathways / Trajectory Replay (`DagReplayPanel`)
+## Pathways / Workspace History (`DagReplayPanel`)
 
-DAG visualization and historical scrubbing.
+The workspace's branchable history — "git for agent reasoning." Renders the `WorkspacePathways`
+projection: goals started, integrations, rejections/dead branches, and external file updates,
+each attributed to an actor (agent / human / external). Per-cycle orchestration chatter
+(NoOp/Enqueue/SpawnPlanner) deliberately does not appear here — that lives in the per-goal views.
+See plans/pathways-workspace-history.md for the design.
 
+- Lanes are chronological; selecting a session **dims** out-of-session lanes rather than hiding
+  them (Pathways data is always workspace-wide)
+- History is **event-sourced**: a proposal that merged then was superseded by reconciliation
+  keeps both moments as separate nodes (Integration → Superseded, chained), with true
+  transition timestamps from the execution event log
+- Node kinds render with distinct shapes/colors (legend row above the canvas); the projection's
+  DAG edges draw as cross-lane connectors — a fan-out child's proposal chains to its parent's
+  proposal node, not straight to the root goal
+- **Sync now**: resync external repository changes on demand (uses the host's configured
+  repository path), instead of waiting for the next goal creation
 - **Replay Mode**: Linear / Branch Explorer / Counterfactual
-- DAG canvas: click/hover a node for details
-- Scrubber: slide through the branch's timeline (position shown as `N / Total`)
+- DAG canvas: click a node for the detail drawer:
+  - Integration/Rejection/Superseded nodes: proposal detail, the agent conversation that produced
+    it, inline file diffs + **View Diff in Editor** (read-only side-by-side), **Branch from here
+    (new steering)** (counterfactual re-run from the proposal's base state with a different
+    profile/goal/constraint), **Materialize to scratch workspace**
+  - GoalStarted/DeadBranch nodes: goal/actor/status detail + **Materialize to scratch workspace**
+  - ExternalUpdate nodes: changed-file list + **View file changes** (before/after file-level diff)
+  - Materialize writes to `{extension storage}/pathways-scratch/{branch}/{timestamp}` (never
+    the live repo) and offers to open it in a new window. Integration nodes carrying a
+    repository snapshot get **"Materialize this point in time to scratch"** — the repo exactly
+    as that integration left it (snapshot + CAS); other nodes fall back to
+    **"Materialize current branch state to scratch"**, and the label says which you're getting
+  - Reviewed proposals show **"Reviewed by"** (user vs reviewer-agent identity)
+- Scrubber: slide through the lane's timeline (position shown as `N / Total`)
 - Playback bar: **▶ Live** (jump to latest) · **⎇ Branch from here** (new work unit seeded from the
   scrubbed branch's current content) · **📌 Mark Known Good** (label + save checkpoint) ·
   **↩ Restore Known Good** (pick a marked checkpoint for this branch — confirms if there's only
@@ -181,4 +207,4 @@ DAG visualization and historical scrubbing.
 | Activity Center | Direct work-unit/agent lifecycle without the Decision Tree |
 | Model & Agent Studio | Profiles, topology templates, session-wide defaults |
 | Decision Convergence | The human approval gate — accept/reject/apply |
-| Pathways | DAG visualization, timeline scrubbing, checkpoint marking |
+| Pathways | Workspace history — integrations/rejections/external updates, branch-from-node, materialize-to-scratch |

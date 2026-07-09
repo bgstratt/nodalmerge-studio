@@ -38,7 +38,6 @@ interface WorkUnit {
 
 interface StudioOptions {
   useLlmProfileSelection: boolean;
-  blockOverlappingFileScope: boolean;
   maxConcurrentWorkers: number;
   schedulerPollIntervalMs: number;
   requireBuildBeforeProposal: boolean;
@@ -1173,6 +1172,23 @@ export class GoalWorkspacePanel {
   }
 
   private async handleWorkUnitAction(action: string, workUnitId: string): Promise<void> {
+    if (action === 'spawnTask') {
+      // A plain sibling task under this node — same "create the work unit and let the parent's
+      // next fan-out pass pick it up" mechanism Fork Hypothesis already uses below (POST
+      // /studio/workunits creates it; nothing here calls scheduler.enqueue directly, so profile
+      // selection stays on the normal Execute-stage-only fan-out path instead of letting this
+      // action hand out an arbitrary/wrong-stage profile the way manual scheduler.enqueue can).
+      const goal = await vscode.window.showInputBox({
+        prompt: 'Goal for the new task', ignoreFocusOut: true,
+      });
+      if (!goal) { return; }
+
+      await this.post('/studio/workunits', { goal, owner: 'studio', parentWorkUnitId: workUnitId });
+      void vscode.window.showInformationMessage('NodalMerge: Spawned new task — will be picked up on the next fan-out pass.');
+      if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+      return;
+    }
+
     if (action === 'forkHypothesis' || action === 'split') {
       // Slice 18e — fork type selector before goal collection
       const forkTypes: Array<{ label: string; description: string }> = [

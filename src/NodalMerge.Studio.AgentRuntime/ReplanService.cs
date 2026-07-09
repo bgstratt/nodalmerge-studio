@@ -65,10 +65,21 @@ public sealed class ReplanService(
             $"[Re-plan request] The slice \"{failed.Goal}\" (work unit {failed.WorkUnitId}, file scope: " +
             $"{(failed.FileScope.Count > 0 ? string.Join(", ", failed.FileScope) : "none declared")}) failed " +
             $"and was dead-lettered. Reason: {entry.Reason} (kind: {entry.Kind}).\n\n" +
-            "Decompose THIS SLICE ONLY into 2 or more smaller sub-slices via nm_v1_artifact_record_plan. " +
-            "Do not repeat or redefine any other existing slice in this plan — your planContent should " +
-            "contain only the new sub-slices replacing the failed one, each with its own sliceId distinct " +
-            "from every existing slice.";
+            "Review the failed slice in the context of the overall goal and decide the right fix — " +
+            "you are NOT required to split it into multiple pieces. Choose whichever of these fits:\n" +
+            "  - If the goal/steps were fine and it simply ran out of iterations or took a wrong " +
+            "approach, replace it with a SINGLE revised slice (same scope, corrected/clarified goal " +
+            "and steps) — record a plan with exactly one new slice.\n" +
+            "  - If it was genuinely too large for one execution pass, split it into 2 or more " +
+            "smaller sub-slices.\n" +
+            "  - If working through it revealed the need for follow-up work beyond the original " +
+            "scope, add extra new slices alongside the fix.\n" +
+            "In every case, via nm_v1_artifact_record_plan: do not repeat or redefine any other " +
+            "existing slice in this plan — your planContent should contain only the new slice(s) " +
+            "replacing the failed one, each with its own sliceId distinct from every existing slice. " +
+            "If two or more of your new slices declare overlapping fileScope paths, you MUST declare " +
+            "dependsOn between them so they run in sequence instead of concurrently against the same " +
+            "files — do not leave that ordering to be discovered by a file-lease conflict at runtime.";
 
         var plannerLoop = new PlannerAgentLoop(
             agentId, parentWorkUnitId, agentClient,

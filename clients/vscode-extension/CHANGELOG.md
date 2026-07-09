@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.1.10 — 2026-07-08
+
+- **Pathways is now workspace history, not an agent task list.** The Pathways
+  tab renders the new `WorkspacePathways` projection — goals started,
+  integrations, rejections, dead branches, and external file updates, each
+  attributed to an actor (agent/human/external) — instead of the old
+  per-work-unit artifact + orchestration decision-log dump. The
+  NoOp/Enqueue/SpawnPlanner chatter no longer appears there (it stays in the
+  per-goal views where it belongs). Lanes order chronologically; selecting a
+  session dims out-of-session lanes instead of hiding workspace history.
+- **Pathways node detail.** Clicking an Integration/Rejection/Superseded node
+  shows the proposal's file diffs (inline, plus "View Diff in Editor") and the
+  agent conversation that produced it. External-update nodes list the changed
+  files and can fetch a before/after file-level diff. New actions: "Branch
+  from here (new steering)" (re-run from the proposal's base state with a
+  different profile/goal/constraint), "Materialize to scratch workspace"
+  (reconstructs the branch's current content into
+  `{extension storage}/pathways-scratch/{branch}/{timestamp}` — never the live
+  repo), and a "Sync now" toolbar button that resyncs external changes using
+  the host's own configured repository path.
+- **Pathways history is event-sourced and tamper-proof against supersede.**
+  A proposal that merged and was later superseded by reconciliation now
+  keeps *both* moments in the graph (its Integration node and its Superseded
+  node, chained), with true transition timestamps from the execution event
+  log. Nested topology: a fan-out child's proposal chains to its parent's
+  proposal node, not straight to the root goal.
+- **True point-in-time materialize.** Integration nodes now carry the
+  repository snapshot recorded at apply time (including multi-repo
+  write-backs, previously not snapshotted at all); "Materialize this point
+  in time to scratch" reconstructs the repo exactly as that integration
+  left it, via snapshot + content-addressed store — never the live repo.
+- **Reviewer identity.** Approve/reject now records who decided ("user" or
+  the reviewer agent id) on the proposal, in the event log, and in the
+  Pathways drawer ("Reviewed by").
+- **Pathways DAG visual.** Per-kind node shapes/colors (goal, integration,
+  rejection, superseded, dead branch, external update) with a legend row,
+  and the projection's edges drawn as cross-lane connectors.
+- **Fixes.** Webview HTML escaping in Pathways was a no-op (rendered LLM/diff
+  text unescaped); "View Diff" clicks no longer double-fire across Studio
+  Shell views (duplicate/wrong diff tabs); node detail no longer renders a
+  stale response after rapid node clicks.
+
 ## 0.1.9 — 2026-07-08
 
 - **Candidate conflict reconciliation.** When promotion branches are on and two

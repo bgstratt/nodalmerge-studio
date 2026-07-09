@@ -577,21 +577,32 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           void vscode.commands.executeCommand('nodalmerge.openMergeReviewConflict', msg.workUnitId as string);
           break;
         case 'retryDeadLetter':
-          await this.post('/studio/dead-letter/' + String(msg.entryId) + '/retry', {});
-          void this.poll();
+          // The finally always fires — success, thrown error (surfaced by this method's own
+          // outer catch), or otherwise — so the webview's disabled/busy button state introduced
+          // for this action always gets cleared instead of sticking forever on an error path.
+          try {
+            await this.post('/studio/dead-letter/' + String(msg.entryId) + '/retry', {});
+            void this.poll();
+          } finally {
+            void this.panel.webview.postMessage({ type: 'deadLetterActionSettled', entryId: msg.entryId });
+          }
           break;
         case 'replanDeadLetter': {
           // Phase 1.4 — re-plan-the-slice: spawns a real bounded planner turn server-side, so this
           // can take several seconds; the panel just re-polls after, same as retryDeadLetter above.
-          const replanResult = (await this.post(
-            '/studio/dead-letter/' + String(msg.entryId) + '/replan',
-            {},
-          )) as { newWorkUnitIds?: string[] };
-          const count = replanResult.newWorkUnitIds?.length ?? 0;
-          void vscode.window.showInformationMessage(
-            'NodalMerge: Re-plan complete — ' + count + ' new sub-slice' + (count === 1 ? '' : 's') + ' created.',
-          );
-          void this.poll();
+          try {
+            const replanResult = (await this.post(
+              '/studio/dead-letter/' + String(msg.entryId) + '/replan',
+              {},
+            )) as { newWorkUnitIds?: string[] };
+            const count = replanResult.newWorkUnitIds?.length ?? 0;
+            void vscode.window.showInformationMessage(
+              'NodalMerge: Re-plan complete — ' + count + ' new sub-slice' + (count === 1 ? '' : 's') + ' created.',
+            );
+            void this.poll();
+          } finally {
+            void this.panel.webview.postMessage({ type: 'deadLetterActionSettled', entryId: msg.entryId });
+          }
           break;
         }
         case 'continueDeadLetter': {
@@ -600,9 +611,22 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           // server-side and can take a while; re-poll after, same pattern as retry/replan.
           // A non-2xx outcome (NotApplicable/NotCompleted) throws from post() and is
           // surfaced by this method's own outer catch, same as every other action here.
-          await this.post('/studio/dead-letter/' + String(msg.entryId) + '/continue', {});
-          void vscode.window.showInformationMessage('NodalMerge: Continue completed successfully.');
-          void this.poll();
+          // Parked is a 200 (see StudioRestEndpoints) — a file-lease/clarification wait isn't a
+          // failure, so it gets its own message instead of the generic success toast.
+          try {
+            const continueResult = (await this.post(
+              '/studio/dead-letter/' + String(msg.entryId) + '/continue',
+              {},
+            )) as { outcome?: string; message?: string };
+            void vscode.window.showInformationMessage(
+              continueResult.outcome === 'Parked'
+                ? 'NodalMerge: ' + (continueResult.message ?? 'Continue parked — will resume automatically.')
+                : 'NodalMerge: Continue completed successfully.',
+            );
+            void this.poll();
+          } finally {
+            void this.panel.webview.postMessage({ type: 'deadLetterActionSettled', entryId: msg.entryId });
+          }
           break;
         }
         case 'releaseFileLease': {

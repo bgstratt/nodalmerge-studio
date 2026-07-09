@@ -96,6 +96,35 @@ public sealed class ContinueService(
             return new ContinueResult(ContinueOutcome.Continued, Completion: completion);
         }
 
+        // Neither of these is the agent's own fault — a lease held by another active sibling, or
+        // a human clarification request — so unlike the generic NotCompleted path below, don't
+        // burn one of the work unit's limited MaxFailureAttempts recording a fresh dead-letter
+        // entry for pure infrastructure contention. This loop ran outside the scheduler entirely
+        // (RunAsync above, not scheduler.TryAcquireAsync), so there's no existing queue entry for
+        // MarkAwaitingFileLeaseAsync to park — enqueue first to create one, then park it. Once
+        // IFileLeaseService's release-and-advance hook (or a human clarification response) clears
+        // it, the normal scheduler poll picks it up as a fresh scheduled run (isResume:true from
+        // AttemptCount > 0, not this call's reconstructed prior-turns context — the conversation
+        // was already resumed once to get here).
+        if (completion is AgentLoopCompletion.AwaitingFileLease or AgentLoopCompletion.AwaitingClarification)
+        {
+            var scheduler = serviceProvider.GetRequiredService<IWorkScheduler>();
+            await scheduler.EnqueueAsync(
+                entry.WorkUnitId, entry.ProfileId, taskId: entry.TaskId,
+                model: model, baseUrl: baseUrl, apiKey: apiKey, provider: provider,
+                sessionId: null, ct: cancellationToken).ConfigureAwait(false);
+
+            if (completion == AgentLoopCompletion.AwaitingFileLease)
+                await scheduler.MarkAwaitingFileLeaseAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
+
+            return new ContinueResult(
+                ContinueOutcome.Parked,
+                completion == AgentLoopCompletion.AwaitingFileLease
+                    ? "Continue hit a file lease held by another active work unit — parked, will resume automatically once it's released."
+                    : "Continue requested a human clarification — parked, will resume once it's answered.",
+                completion);
+        }
+
         // Didn't finish again — record a fresh dead-letter entry with the same Kind so Continue
         // can be reached for again, or the human can switch to Re-plan instead.
         await deadLetter.RecordFailureAsync(

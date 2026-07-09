@@ -433,6 +433,7 @@ public class AutomatedReviewGateServiceTests
             string proposalId,
             MergeProposalStatus decision,
             string? notes = null,
+            string? reviewedBy = null,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
@@ -477,6 +478,10 @@ public class AutomatedReviewGateServiceTests
 
         public Task<IReadOnlyList<ArtifactRef>> GetGlobalConstraintsAsync(CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
+
+        public Task<IReadOnlyList<ArtifactRef>> GetByTypeAsync(ArtifactType type, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ArtifactRef>>(
+                [.. Recorded.Where(a => a.Type == type).OrderBy(a => a.CreatedAt)]);
 
         public Task<IReadOnlyList<ArtifactRef>> GetChildrenAsync(string parentArtifactId, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ArtifactRef>>([]);
@@ -731,6 +736,12 @@ public class AutomatedReviewGateServiceTests
             string workUnitId,
             IReadOnlyList<string> fileScope,
             string? sessionId = null,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public Task<WorkUnit> AddDependencyAsync(
+            string workUnitId,
+            string dependsOnWorkUnitId,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
     }

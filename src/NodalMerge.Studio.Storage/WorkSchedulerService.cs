@@ -61,6 +61,34 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
         // Idempotent: track whether this is a new enqueue to avoid duplicate events.
         bool isNew = !_queue.ContainsKey(workUnitId);
 
+        // Guard against re-planning an already-fanned-out leaf slice — a work unit whose
+        // FanOutInfo.SliceId is set was itself produced by a parent's plan, so a Plan-stage
+        // profile enqueued directly against it (e.g. an orchestrator agent manually spawned onto
+        // a leaf, or any other caller of nm_v1_scheduler_enqueue) has nothing left to decompose
+        // and just spins up a redundant, confused planner run instead of executing. Genuine
+        // further decomposition of a leaf goes through IReplanService against its PARENT, which
+        // spawns fresh sibling slices rather than re-planning this same work unit in place.
+        // Mirrors LlmProfileSelectionService's own "only Execute-stage profiles are valid
+        // candidates for a fanned-out child worker" comment — this makes that invariant hold for
+        // every caller, not just the optional LLM-selection path.
+        var profileForGuard = await ResolveProfileAsync(profileId, ct).ConfigureAwait(false);
+        if (profileForGuard?.Stage == PipelineStage.Plan)
+        {
+            var workUnitsForGuard = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+            var target = workUnitsForGuard is not null
+                ? await workUnitsForGuard.GetAsync(workUnitId, ct).ConfigureAwait(false)
+                : null;
+            if (target?.FanOutInfo?.SliceId is not null)
+            {
+                throw new InvalidOperationException(
+                    $"Work unit '{workUnitId}' is already an atomic leaf slice (sliceId " +
+                    $"'{target.FanOutInfo.SliceId}') produced by a parent's plan — it cannot be " +
+                    "planned again directly. If it genuinely needs to be split further, dead-letter " +
+                    "it and use Re-plan on its parent instead of enqueuing a planner against this " +
+                    "work unit.");
+            }
+        }
+
         var conflict = await DetectConflictAsync(workUnitId, ct).ConfigureAwait(false);
 
         _queue.AddOrUpdate(
@@ -109,6 +137,14 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
                 }
             }
         }
+    }
+
+    private async Task<AgentProfile?> ResolveProfileAsync(string profileId, CancellationToken ct)
+    {
+        var profiles = _serviceProvider?.GetService(typeof(IAgentProfileService)) as IAgentProfileService;
+        return profiles is not null
+            ? await profiles.GetAsync(profileId, ct).ConfigureAwait(false)
+            : null;
     }
 
     // Pre-detects overlap from two independent sources, merged into one warning:

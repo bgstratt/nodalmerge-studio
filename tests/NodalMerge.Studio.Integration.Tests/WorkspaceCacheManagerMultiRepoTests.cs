@@ -62,19 +62,23 @@ public class WorkspaceCacheManagerMultiRepoTests : IDisposable
         await mergeCommands.ReviewAsync(proposalA.ProposalId, "Approved");
         await mergeCommands.ReviewAsync(proposalB.ProposalId, "Approved");
 
+        // Only A's proposal is applied. This test originally applied B too and relied on "the
+        // automatic post-merge resync only covers the global default repo" to leave repo B's
+        // snapshot stale — but that resync gap was itself a bug (pathways-workspace-history.md
+        // verification item 1) and BestEffortResyncAsync now force-syncs a multi-repo work unit's
+        // own repository at apply time, so a merged-but-stale repo B can no longer exist through
+        // the apply path. B approved-but-unapplied preserves this test's actual target: eviction
+        // safety must consult each work unit's OWN repository — the old always-use-the-global-
+        // default bug reports no snapshot for BOTH work units and fails the evictedA assertion.
         await mergeCommands.ApplyAsync(proposalA.ProposalId);
-        await mergeCommands.ApplyAsync(proposalB.ProposalId);
 
-        // Only repo A gets a fresh snapshot after its merge landed — deliberately decoupled from
-        // the automatic post-merge resync (Fix 1) so this test isolates Fix 2's own behavior:
-        // resolving each work unit's OWN repository, not always the global default.
         await repositorySync.SyncBranchFromRepositoryAsync("main", _repoAPath, SyncTrigger.ManualRefresh);
 
         var evictedA = await cacheManager.EvictAsync(workUnitA.WorkUnitId);
         var evictedB = await cacheManager.EvictAsync(workUnitB.WorkUnitId);
 
         Assert.True(evictedA); // repo A's own snapshot postdates its merge — safe to evict
-        Assert.False(evictedB); // repo B was never resynced after its merge — must not evict
+        Assert.False(evictedB); // repo B's work is still in flight (approved, unapplied) — must not evict
 
         var branchDirA = await fileWorkspace.GetWorkingDirectoryAsync(workUnitA.BranchId);
         var branchDirB = await fileWorkspace.GetWorkingDirectoryAsync(workUnitB.BranchId);
