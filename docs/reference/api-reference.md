@@ -12,7 +12,7 @@ from these totals before this pass, and still don't enumerate every tool 1:1; tr
 illustrative of shape/category, not an exhaustive per-tool listing): **~117 `nm_v1_*` MCP tools**
 (`McpToolNames.All` — one fewer than earlier counts of this doc, after `nm_v1_replay_range` was
 removed as unused), **72 of them** dispatched in-process to autonomous agents
-(`McpToolDispatcher.cs`'s switch cases), **14 `nms_v1_*` external-caller tools**
+(`McpToolDispatcher.cs`'s switch cases), **15 `nms_v1_*` external-caller tools**
 (`McpServerToolNames`), and a small handful fewer REST routes (`app.Map*` calls in
 `StudioRestEndpoints.cs`) after removing `/studio/replay/timeline[/{branchId}]` and
 `/studio/replay/range/{branchId}` — see the Replay section below.
@@ -23,7 +23,7 @@ entire assembly (`WithToolsFromAssembly`) onto the external HTTP MCP endpoint
 (`app.MapMcp("/mcp")`) — every one of the 116 internal `nm_v1_*` tools was technically reachable
 by an external caller, contradicting the "internal-only" framing below. It now registers only the
 5 `External*Tools` classes (`WithTools<T>()` per class), so an external MCP client genuinely sees
-just the 14 `nms_v1_*` tools. `nm_v1_replay_range` was also removed outright (with its REST
+just the 15 `nms_v1_*` tools. `nm_v1_replay_range` was also removed outright (with its REST
 counterparts, `GET /studio/replay/timeline[/{branchId}]` and `GET /studio/replay/range/{branchId}`
 — see the Replay section below) after confirming it had no caller anywhere, internal or external.
 
@@ -31,7 +31,7 @@ counterparts, `GET /studio/replay/timeline[/{branchId}]` and `GET /studio/replay
 
 ## External Caller Surface (`nms_v1_*`)
 
-These 14 tools are the recommended entry point for external MCP clients — Claude Code, Cursor,
+These 15 tools are the recommended entry point for external MCP clients — Claude Code, Cursor,
 scripts, CI agents. They cover the full human-in-the-loop lifecycle at a goal-centric level,
 without requiring knowledge of work units, branches, or the internal DAG.
 
@@ -39,13 +39,14 @@ without requiring knowledge of work units, branches, or the internal DAG.
 > marks the Studio-level abstraction layer. Both namespaces share the same host and the same error
 > envelope format.
 
-### Goal management (7)
+### Goal management (8)
 | Tool | Purpose |
 |---|---|
 | `nms_v1_goal_run` | Start a new goal — creates a work unit, execution session, and enqueues the orchestrator in one call. Returns `goalId` and `sessionId`. |
 | `nms_v1_goal_list` | List all goals with current status. Use to discover `goalId` values. |
 | `nms_v1_goal_status` | Detailed status for one goal, including pending clarifications, an unresolved failure if the goal is dead-lettered (with which recovery actions currently apply), and session state. |
 | `nms_v1_goal_cancel` | Cancel a goal and its entire subtree. Completed or merged work units are left untouched. |
+| `nms_v1_goal_requeue` | Un-cancel a goal and resume it — the inverse of `nms_v1_goal_cancel`, mirroring Decision Convergence's Unreject-and-Revise for a Rejected proposal. A leaf work unit is re-queued for a worker; a fan-out parent re-attempts reconciliation. Optional `overrideModel`/`overrideBaseUrl`/`overrideApiKey`/`overrideProvider`/`overrideProfileId`/`overrideCredentialRef` resupply LLM credentials (a cancel/requeue cycle commonly spans a Host restart, which wipes the in-memory credential cache the inline reviewer and re-enqueued workers depend on) without spawning a new orchestrator loop. |
 | `nms_v1_goal_pause` | Pause a goal and all its active agents. Agents stop gracefully; goal can be resumed. |
 | `nms_v1_goal_resume` | Resume a paused goal. Optionally inject a steering message to redirect the next agent run. |
 | `nms_v1_goal_recover` | Recover a dead-lettered goal — `action` is one of `retry`, `retry_with_context`, `continue` (`MaxIterationsExceeded` only), or `replan`. Resolves the goal's own latest dead-letter entry internally; no entry ID needed. |
@@ -316,6 +317,7 @@ segment can never match.
 - `GET /studio/workunits/{id}/conflict-report` — merge conflict report (Reviewing status)
 - `GET /studio/workunits/{id}/proposal-dag` — proposal/branch/reconciliation DAG
 - `POST /studio/workunits/{id}/cancel` — cancel a work unit
+- `POST /studio/workunits/{id}/requeue` — un-cancel a work unit and resume it (leaf → re-queued for a worker; fan-out parent → re-attempts reconciliation). Body: optional `notes` plus `overrideModel`/`overrideBaseUrl`/`overrideApiKey`/`overrideProvider`/`overrideProfileId`/`overrideCredentialRef` to resupply LLM credentials
 - `POST /studio/stop-all` — stop all active agents/work units
 
 ### Tasks

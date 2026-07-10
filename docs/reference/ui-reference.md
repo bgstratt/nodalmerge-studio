@@ -52,21 +52,36 @@ require every fork to have a constraint (the backend rejects the request with a 
 ### Reasoning & Execution Timeline (middle column)
 Click any artifact or event to load it into the Decision Lens.
 
-### Decision Lens (right column) — two tabs
+### Decision Lens (right column) — up to four tabs
 
-**Metadata tab:**
+**Metadata tab (always present, active by default):**
 - **Fork Hypothesis** / **Re-explore** / **Fork from latest candidate** / **Fork from Known Good** — same actions as the tree's context menu. Fork from Known Good lists the node's branch's marked checkpoints (prompting for one if there's more than one), then a goal and profile, then forks a new work unit seeded from that checkpoint's content — not the branch's current, possibly-uncertain tip.
 - **↺ Run with different model** (completed/merged nodes) — creates a counterfactual: re-runs this node's latest proposal under a different profile
 - **⏸ Pause & Redirect** (running nodes) — pauses the agent, prompts for a constraint, forks a sibling that resumes with it
 - **↳ Fork from here** (running nodes) — forks a sibling from this node's current state with a new goal + optional constraint
 
-**Context tab:**
+**Context tab (always present):**
 - Loads the goal, plan, assumptions, constraints, evidence, execution results, allowed tools, and model for this node — the structured decision audit, never raw prompt text
 - **📋 Copy as Markdown** — copies the above to clipboard
 - Constraints proposed by domain observers appear in the Artifacts chain here, identifiable by
   their title prefix (e.g., `[SecurityAgent] Missing rate-limit on /api/auth`). See
   [docs/guides/domain-observers.md](../guides/domain-observers.md) for how observers work and
   how to enable them.
+
+**Conversation tab (always present):**
+- Full agent conversation log for this node — one entry per cycle, newest first, with tool
+  calls/results as collapsible blocks and a token-usage summary. Polls live every 2s while the
+  node is running.
+
+**Decision tab (only shown when a decision candidate — a pending `MergeProposal` — exists for
+this node):**
+- Decision Status, Source, Confidence, Files touched, plus **Open in Review →**, **Fork Hypothesis
+  from here**, **Restore workspace**, **Compare with…**
+- The first time a node with a pending candidate is selected, this tab auto-activates so the
+  fastest path (review the candidate) doesn't require an extra click — but it's a tab like any
+  other, not a takeover: Metadata/Context/Conversation stay one click away, and re-selecting the
+  same node won't re-jump you back to it. Clicking any proposal row in the Reasoning & Execution
+  Timeline (not just the auto-picked candidate) also opens it here.
 
 ### Compare Results view (experiments)
 - Click a fork card to select it
@@ -88,7 +103,13 @@ Workspace's Decision Tree.
 - **Session override** — filter this panel to one session
 - **+ New Goal** — create a work unit via sequential prompts: goal → owner → review policy →
   (if promotion branches are on) target (Candidate / Direct)
-- Active Goals: **Spawn** (start an agent) · **View Conflict →** (when Reviewing)
+- Active Goals: **Spawn** (start an agent) · **View Conflict →** (when Reviewing) · **↺ Requeue**
+  (when `Cancelled` — the un-cancel, mirroring Decision Convergence's Unreject-and-Revise for a
+  Rejected proposal; a leaf work unit is re-queued for a worker, a fan-out parent re-attempts
+  reconciliation. Resolves fresh LLM credentials from the configured Orchestrator profile before
+  requeuing, since a cancel/requeue cycle commonly spans a Host restart that wipes the in-memory
+  credential cache the automated reviewer and re-enqueued workers both depend on — no live
+  orchestrator loop is (re-)started as a side effect)
 - Running Agents: **+ Start Agent** · **Pause** · **Resume** · **↺ Resume** (for `Interrupted`
   agents after a host restart) · **Stop**
   Agents spawned by a connected headless peer appear in this list alongside interactively spawned

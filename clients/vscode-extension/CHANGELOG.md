@@ -82,6 +82,55 @@
   auto-sequencing, staggered child completion, stuck-work/goal recovery,
   credential-cache and routing rehydration, planner handoff routing, and
   end-to-end workspace pathways.
+- **Goal-level merge conflicts now use the same Task Conflict machinery as
+  fan-out siblings**, instead of a dead-end `Reviewing` status flip with no
+  actionable entity behind it. `MergeReconciliationService` opens a real
+  `TaskConflictRecord` (with real REST endpoints, a Reconciler agent, and
+  Reconcile/Resolve-Manually buttons already wired end-to-end) for every
+  losing proposal in the conflict, auto-triggering reconciliation when both
+  sides are `AgentApproval`. `MergeCommandService`'s AgentApproval/Hybrid
+  auto-apply also now records an unexpected failure (a crash mid-review, a
+  transient LLM/tool failure) to the dead-letter queue instead of letting the
+  proposal vanish silently at `ReadyForReview` forever.
+- **The automated reviewer is now visible while it's running**, and no longer
+  reads as a flat rejection when it stalls. `InlineReviewerService` registers
+  its synchronous review run in the same Activity Center visibility registry
+  spawned agents use (a pulsing "Agent reviewing…" indicator now shows on the
+  Decision Tree node being reviewed), and distinguishes "ran out of
+  iterations/stalled without a decision" from "reviewer rejected it" — the
+  former is now dead-lettered (`MaxIterationsExceeded`/`Stalled`) so it's
+  resumable via Continue instead of silently stuck. Continue itself can now
+  resume a dead-lettered *review* (not just a worker task) via
+  `ReviewerAgentLoop`, reconstructing the reviewer's own prior turns the same
+  way a resumed worker already did. Also fixed: `nm_v1_merge_review`'s
+  `automated` flag silently falling through when sent as the string `"true"`
+  instead of a JSON boolean; a truncated/anomalous LLM response (most
+  commonly a max-output-tokens cutoff) in either the worker or reviewer loop
+  now gets recorded in the conversation log instead of vanishing.
+- **Requeue Goal — the un-cancel.** `Cancelled` was a true dead end for a
+  work unit (no legal transition out of it at all) — the exact same problem
+  Unreject-and-Revise already solved for a Rejected proposal, for the same
+  reason: a human explicitly asking to resume something should never be
+  permanently blocked by a status designed to stop runaway *automated*
+  retries. **↺ Requeue** now appears on any Cancelled goal card in the
+  Activity Center (and `nms_v1_goal_requeue` for external callers): a leaf
+  work unit is re-queued for a worker; a fan-out parent re-attempts
+  reconciliation via the now-idempotent, status-agnostic
+  `MergeReconciliationService.TryReconcileAsync`. Since a cancel/requeue
+  cycle commonly spans a Host restart (often *why* a human had to step in),
+  Requeue also resupplies LLM credentials from the configured Orchestrator
+  profile before doing anything else — the same in-memory cache the inline
+  reviewer and re-enqueued workers depend on, resolved from settings.json +
+  the saved credential store client-side, same as Reconcile already does —
+  without spawning a new orchestrator loop (see `ResupplyCredentialsAsync`).
+- **Goal Workspace's Decision Lens no longer strands you.** Selecting a
+  goal/task with a pending decision candidate still auto-jumps to review it
+  (the one "Actionable" item), but now as a 4th tab alongside
+  Metadata/Context/Conversation instead of replacing the whole inspector —
+  so the "Important" info those other tabs hold is always one click away,
+  and the auto-jump only fires once per node selection instead of re-firing
+  every time you revisit it. Clicking any proposal directly in the
+  Reasoning & Execution Timeline routes through the same tabbed view.
 
 ## 0.1.9 — 2026-07-08
 
