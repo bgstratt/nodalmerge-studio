@@ -346,14 +346,35 @@ public sealed class FanOutService : IFanOutService
             if (dep is null)
                 return false;
 
-            // Phase 12 — Proposed only means a proposal exists and is awaiting review; its
-            // content isn't real yet. A dependent must not start until its dependency's output
-            // has actually landed, same reasoning as the file-lease queue's merge-gated release.
-            if (dep.Status is not WorkUnitStatus.Merged)
+            if (!await IsDependencyContentReadyAsync(dep, ct).ConfigureAwait(false))
                 return false;
         }
 
         return true;
+    }
+
+    // A dependent must not start until its dependency's output is real — but "real" only ever
+    // meant "review has signed off," not "already merged into the target branch." Requiring
+    // WorkUnitStatus.Merged made a dependent wait for the same all-siblings-simultaneous merge
+    // batch that MergeReconciliationService's staggered-arrival design deliberately doesn't
+    // require (see StaggeredChildCompletionTests) — Agent Approval mode existed specifically to
+    // let a dependent begin as soon as review passed, and a human clicking Approve is the same
+    // signal. RefreshBranchFromDependenciesAsync below already seeds the dependent's branch by
+    // copying the dependency's own branch content (not the merged target), so an Approved-but-
+    // not-yet-merged proposal is already safe to build on.
+    private async Task<bool> IsDependencyContentReadyAsync(WorkUnit dep, CancellationToken ct)
+    {
+        if (dep.Status is WorkUnitStatus.Merged)
+            return true;
+
+        var chain = await _artifacts.GetChainAsync(dep.WorkUnitId, ct).ConfigureAwait(false);
+        var proposalRef = chain.LastOrDefault(a => a.Type == ArtifactType.MergeProposal);
+        if (proposalRef is null)
+            return false;
+
+        var proposal = await _merge.GetAsync(proposalRef.ArtifactId, ct).ConfigureAwait(false);
+        return proposal is not null
+            && proposal.Status is MergeProposalStatus.Approved or MergeProposalStatus.Merged;
     }
 
     // Phase 12 — every child's branch is seeded once from parent.BranchId at fan-out time
@@ -494,6 +515,7 @@ public sealed class FanOutService : IFanOutService
             creds?.ApiKey,
             creds?.Provider,
             sessionId,
+            creds?.CredentialRef,
             ct).ConfigureAwait(false);
 
         // Slice 12d — fan-out child enqueue previously had no decision-log entry at all (it

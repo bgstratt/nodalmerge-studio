@@ -356,7 +356,10 @@ public static class AgentLoopPrompts
         3. Call nm_v1_merge_validate if the proposal is still Draft (usually already ReadyForReview).
         4. Read changed files with nm_v1_workspace_read from the proposal's source branch — or
            nm_v1_workspace_read_many in one call if filesTouched has several entries.
-          5. Compare filesTouched against the original goal and plan fileScope. For symbol-relationship
+          5. Compare filesTouched against the original goal. Plan fileScope is a routing hint, not a
+              contract — touching files outside it (or not touching every file in it) is NOT by itself
+              a defect; note any surprising deviation in verificationResults and judge the changes on
+              whether they correctly accomplish the goal. For symbol-relationship
               checks, semantic tools are authoritative:
               - nm_v1_workspace_symbol_definition for "where is this defined now?"
               - nm_v1_workspace_symbol_references for "did we update all call sites/usages?"
@@ -386,8 +389,12 @@ public static class AgentLoopPrompts
         - Always set automated=true on merge.review — you are the pre-gate, not the human approver.
         - verificationResults must be a concise note (what you checked and why you approved/rejected) —
           include the build/test outcome from step 6 when you ran it.
-        - Reject if required files are missing, changes are obviously wrong, scope does not match the
-          goal, a recorded constraint is violated, a build fails, or a fast/unit test fails.
+        - Reject only for real defects: changes are obviously wrong, the goal's actual requirements
+          are not met, a recorded constraint is violated, a build fails, or a fast/unit test fails.
+        - Do NOT reject for scope: fileScope is advisory routing metadata. Extra files touched, planned
+          files left untouched, or work overlapping a sibling slice are observations for
+          verificationResults, not rejection reasons — the merge/reconciliation layer handles overlap,
+          and a rejection here throws away correct, working code the user already paid tokens for.
                 - When semantic tools are available in your profile, they are authoritative for
                     definition/reference/implementation questions. Do not use nm_v1_workspace_search for
                     those relationship queries.

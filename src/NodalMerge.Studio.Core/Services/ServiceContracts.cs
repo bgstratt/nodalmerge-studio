@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using NodalMerge.Studio.Contracts.Domain;
 
 namespace NodalMerge.Studio.Core.Services;
@@ -220,6 +221,12 @@ public interface ICandidateConflictService
     // conflict must not both create a reconciliation work unit).
     Task<CandidateConflictRecord?> TryStartReconcilingAsync(string conflictId, CancellationToken ct = default);
 
+    // Reconciling -> Open, for when the reconciliation attempt that claimed this conflict died
+    // (agent dead-lettered/cancelled) without ever reaching MarkResolvedAsync. Without this, a
+    // failed reconciliation left the conflict stuck Reconciling forever — un-re-triggerable and
+    // un-resolvable, a dead end for the human. Returns null if not found or not Reconciling.
+    Task<CandidateConflictRecord?> TryReopenAsync(string conflictId, CancellationToken ct = default);
+
     Task<CandidateConflictRecord?> MarkResolvedAsync(string conflictId, CancellationToken ct = default);
 }
 
@@ -265,6 +272,10 @@ public interface ITaskConflictService
     Task<IReadOnlyList<TaskConflictRecord>> GetOpenAsync(string? parentWorkUnitId = null, CancellationToken ct = default);
 
     Task<TaskConflictRecord?> TryStartReconcilingAsync(string conflictId, CancellationToken ct = default);
+
+    // Reconciling -> Open; see ICandidateConflictService.TryReopenAsync — same failed-reconciliation
+    // recovery hatch, same semantics.
+    Task<TaskConflictRecord?> TryReopenAsync(string conflictId, CancellationToken ct = default);
 
     Task<TaskConflictRecord?> MarkResolvedAsync(string conflictId, CancellationToken ct = default);
 }
@@ -374,7 +385,11 @@ public sealed record MergeReconciliationResult(
     MergeReconciliationOutcome Outcome,
     string? ReconciledProposalId = null,
     IReadOnlyList<string>? ConstituentProposalIds = null,
-    string? ConflictReportPath = null);
+    string? ConflictReportPath = null,
+    // Human-readable explanation of WHY this outcome happened (which child is blocking, what a
+    // conflict is on) — surfaced in the orchestrator's decision log so a reinvoke that decides
+    // "nothing to do" says what it saw instead of silently no-op'ing.
+    string? Detail = null);
 
 // Slice 21/22 — domain/intelligence-plane agents. Unlike the structural agents above
 // (Orchestrator/Worker/Reviewer), domain agents (Security, Architecture, ...) own no lifecycle
@@ -485,6 +500,7 @@ public interface IDeadLetterService
         string? apiKey = null,
         string? provider = null,
         FailureKind kind = FailureKind.Exception,
+        string? credentialRef = null,
         CancellationToken cancellationToken = default);
 
     Task<DeadLetterEntry?> GetAsync(string entryId, CancellationToken cancellationToken = default);
@@ -514,6 +530,7 @@ public interface IDeadLetterService
         string? overrideApiKey,
         string? overrideProvider,
         string? overrideProfileId,
+        string? overrideCredentialRef = null,
         CancellationToken cancellationToken = default);
 
     // Human-steered retry: appends corrective context to the work unit's Goal so the agent
@@ -529,6 +546,7 @@ public interface IDeadLetterService
         string? overrideApiKey = null,
         string? overrideProvider = null,
         string? overrideProfileId = null,
+        string? overrideCredentialRef = null,
         CancellationToken cancellationToken = default);
 }
 
@@ -582,7 +600,18 @@ public sealed record ReplanResult(
 // too small, so continuing the same conversation (not restarting it) is the right recovery.
 public interface IContinueService
 {
-    Task<ContinueResult> ContinueWithPriorContextAsync(string entryId, CancellationToken cancellationToken = default);
+    Task<ContinueResult> ContinueWithPriorContextAsync(
+        string entryId,
+        // Optional resupply, same shape/priority as IDeadLetterService.RetryWithCredentialOverrideAsync
+        // — lets a caller (e.g. the VS Code extension re-reading its own SecretStorage) hand back
+        // live credentials when the entry's own captured ApiKey and the shared
+        // IRuntimeCredentialCache are both cold (e.g. right after a Host restart).
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default);
 }
 
 public enum ContinueOutcome
@@ -1001,8 +1030,29 @@ public sealed record OrchestratorCredentials(
     string Provider,
     string Model,
     string BaseUrl,
+    // Never persisted — see OrchestratorRoutingConfig, the safe subset of this shape that actually
+    // gets written to IStudioNodeStore. ApiKey only ever lives in-memory (the live orchestrator
+    // registry) or in IRuntimeCredentialCache, keyed by CredentialRef.
     string ApiKey,
-    string? ProfileId);
+    string? ProfileId,
+    string? CredentialRef = null);
+
+// The safe-to-persist projection of an orchestrator's registration — everything
+// InMemoryAgentRuntimeService's in-memory-only _orchestratorRegistrations needs to survive a Host
+// restart, minus every ApiKey. Written to IStudioNodeStore at SpawnAsync("orchestrator", ...) time
+// and rehydrated on startup, so GetAutoReviewProfileId/GetEnabledDomainAgents work immediately after
+// a restart with no credential resupply needed at all; GetOrchestratorCredentials/
+// GetCredentialsForStage additionally need IRuntimeCredentialCache to have CredentialRef's entry.
+public sealed record OrchestratorRoutingConfig(
+    string WorkUnitId,
+    string Provider,
+    string Model,
+    string BaseUrl,
+    string? ProfileId,
+    string? AutoReviewProfileId,
+    string? CredentialRef,
+    IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? StageCredentials = null,
+    IReadOnlyList<string>? EnabledDomainAgents = null);
 
 public interface IAgentControlService
 {
@@ -1018,12 +1068,28 @@ public interface IAgentControlService
         string? autoReviewProfileId = null,
         IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
         IReadOnlyList<string>? enabledDomainAgents = null,
+        string? credentialRef = null,
         CancellationToken cancellationToken = default);
 
     // Re-enters the orchestrator loop for a work unit whose orchestrator was previously
-    // SpawnAsync'd — a no-op if none was registered (e.g. a work unit whose worker was
-    // enqueued directly via the scheduler debug endpoint, with no orchestrator behind it).
-    Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default);
+    // SpawnAsync'd — called automatically whenever a child work unit finishes (WorkSchedulerService.
+    // ReleaseAsync's success path) so the orchestrator notices and decides what's next. Falls back
+    // to the safe rehydrated routing config + IRuntimeCredentialCache when the in-memory
+    // registration is cold (e.g. after a Host restart); if that's also cold, this is a no-op for
+    // the automatic caller (which never passes override params) — but a manual caller (e.g. a
+    // human clicking "Reinvoke Orchestrator" in the goal workspace) can still recover it by
+    // supplying everything itself via the override* params, including a profile for a work unit
+    // whose orchestrator predates routing-config persistence entirely (nothing on record at all).
+    Task ReinvokeOrchestratorAsync(
+        string workUnitId,
+        string? sessionId = null,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideProfileId = null,
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Returns LLM credentials captured when an orchestrator was first spawned for a work unit.
@@ -1042,6 +1108,15 @@ public interface IAgentControlService
     /// Profile ID for the automated reviewer pre-gate, captured at orchestrator spawn time.
     /// </summary>
     string? GetAutoReviewProfileId(string workUnitId);
+
+    /// <summary>
+    /// The orchestrator's own dispatch profile ID, captured at spawn time — routing data, not a
+    /// credential, so unlike <see cref="GetOrchestratorCredentials"/> this resolves purely from the
+    /// rehydrated routing config and survives a restart with zero credential resupply needed. Lets
+    /// a caller (e.g. a manual "Reinvoke Orchestrator" action) know which profile to resolve fresh
+    /// credentials for without first needing a live ApiKey.
+    /// </summary>
+    string? GetOrchestratorProfileId(string workUnitId);
 
     /// <summary>
     /// Per-work-unit override of which domain agents (by name, e.g. "Security"/"Architecture")
@@ -1246,7 +1321,12 @@ public sealed record ScheduledItem(
     int AttemptCount,
     string? Model,
     string? BaseUrl,
-    string? ApiKey,
+    // Never persisted (see [JsonIgnore]) — the live in-memory value is real for the lifetime of
+    // this process (so same-process re-acquire/retry, e.g. FileLease park/resume, is unaffected),
+    // but a Host restart's rehydrate deserializes this back as null. Dispatch resolves it from
+    // IRuntimeCredentialCache via CredentialRef instead; if that also misses, the item parks as
+    // AwaitingCredentials rather than silently persisting the secret to disk to survive restarts.
+    [property: JsonIgnore] string? ApiKey,
     string? Provider,
     string? SessionId = null,
     ConflictWarning? Conflict = null,
@@ -1261,7 +1341,14 @@ public sealed record ScheduledItem(
     // release-and-advance hook (on the holder's actual merge) clears the flag, at which point the
     // item — never removed from the queue — is simply eligible for re-acquisition again with
     // AttemptCount > 0, so the resumed WorkerAgentLoop gets isResume: true automatically.
-    bool AwaitingFileLease = false);
+    bool AwaitingFileLease = false,
+    // Opaque cache key the client derived (e.g. its VS Code SecretStorage apiKeyRef) — never a
+    // secret itself. Lets dispatch re-resolve ApiKey from IRuntimeCredentialCache after a restart.
+    string? CredentialRef = null,
+    // Set when dispatch needed real credentials (ApiKey null post-rehydrate) but
+    // IRuntimeCredentialCache had no entry for CredentialRef yet. Cleared by SupplyCredentialsAsync
+    // once a human/the extension resupplies them via the Resume flow.
+    bool AwaitingCredentials = false);
 
 public interface IWorkScheduler
 {
@@ -1274,6 +1361,7 @@ public interface IWorkScheduler
         string? apiKey = null,
         string? provider = null,
         string? sessionId = null,
+        string? credentialRef = null,
         CancellationToken ct = default);
 
     Task<ScheduledItem?> TryAcquireAsync(string agentId, CancellationToken ct = default);
@@ -1296,6 +1384,23 @@ public interface IWorkScheduler
     // AttemptCount > 0, which is what gives the resumed WorkerAgentLoop isResume: true.
     Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default);
 
+    // Called by RunScheduledWorkerAsync when dispatch needs a real ApiKey (rehydrated item has
+    // none) and IRuntimeCredentialCache also has nothing for the item's CredentialRef. Mirrors
+    // MarkAwaitingFileLeaseAsync's "park in place" shape.
+    Task MarkAwaitingCredentialsAsync(string workUnitId, CancellationToken ct = default);
+
+    // Called from the Resume flow when the caller (typically the VS Code extension, re-reading its
+    // own SecretStorage) resupplies live connection details. Populates IRuntimeCredentialCache under
+    // the item's own CredentialRef (so any other parked item/orchestrator lookup sharing that ref
+    // also unblocks), updates this item's in-memory connection fields, and clears AwaitingCredentials.
+    Task SupplyCredentialsAsync(
+        string workUnitId,
+        string? provider,
+        string? model,
+        string? baseUrl,
+        string? apiKey,
+        CancellationToken ct = default);
+
     Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default);
 
     // Phase 8c — items flagged AwaitingResume on rehydrate (see ScheduledItem.AwaitingResume).
@@ -1304,6 +1409,18 @@ public interface IWorkScheduler
     Task ApproveResumeAsync(string workUnitId, CancellationToken ct = default);
 
     Task<int> ApproveResumeAllAsync(CancellationToken ct = default);
+
+    // Unconditionally clears every park flag (AwaitingResume, AwaitingFileLease,
+    // AwaitingCredentials) for one item, regardless of whether IFileLeaseService/
+    // IRuntimeCredentialCache actually think it's still blocked. Exists because the two normal
+    // "clear" paths (ClearAwaitingFileLeaseAsync via the lease release-and-advance hook,
+    // SupplyCredentialsAsync via resupply) both require the underlying system to agree the block
+    // is really gone — but the two are tracked independently, so a scoping change, a force-release
+    // elsewhere, or any other drift between them can leave a scheduler item flagged parked with
+    // nothing actually blocking it anymore (an "orphaned" park). Self-healing: if a real conflict
+    // still exists, the resumed worker just re-attempts the write, gets denied, and re-parks
+    // itself cleanly — this is never less safe than leaving a possibly-orphaned flag stuck forever.
+    Task ForceResumeAsync(string workUnitId, CancellationToken ct = default);
 }
 
 // Slice 15f — shared enqueue entry point for MCP/REST/the agent-loop dispatcher, so the
@@ -1319,9 +1436,24 @@ public interface ISchedulerCommandService
         string? apiKey = null,
         string? provider = null,
         string? sessionId = null,
+        string? credentialRef = null,
         CancellationToken ct = default);
 
     Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default);
+}
+
+// Pure in-memory cache mapping an opaque client-supplied CredentialRef (e.g. a VS Code
+// SecretStorage key reference) to the live LLM connection tuple it names. Never backed by
+// IStudioNodeStore or any other durable store — that's the whole point: a raw ApiKey must never
+// survive a Host restart on disk. Capture() is safe to call unconditionally at every ingress point
+// that receives connection fields; it's a no-op unless both a ref and real values are present.
+public sealed record LlmConnectionInfo(string Provider, string Model, string BaseUrl, string ApiKey);
+
+public interface IRuntimeCredentialCache
+{
+    void Capture(string? credentialRef, string? provider, string? model, string? baseUrl, string? apiKey);
+
+    LlmConnectionInfo? TryGet(string? credentialRef);
 }
 
 public interface IClarificationCommandService
@@ -1703,12 +1835,18 @@ public interface IIntentGraphService
 // merge-gated release/resume mechanics.
 public interface IFileLeaseService
 {
+    // Leases are scoped per root goal (the top-level WorkUnit with no parent), resolved internally
+    // from workUnitId — an unrelated goal touching the same relative file path in the shared
+    // repository must never block this one; that's what the merge/reconciliation flow is for, not
+    // proactive cross-goal locking. Two work units only ever contend here if they share a root.
     Task<(bool Granted, string? HolderWorkUnitId)> TryAcquireOrEnqueueAsync(
         string workUnitId, string path, CancellationToken ct = default);
 
     // Clears the current holder for path and promotes the next FIFO waiter (if any) to holder,
-    // returning its WorkUnitId so the caller can copy the merged file into its branch and resume it.
-    Task<string?> ReleaseAndAdvanceAsync(string path, CancellationToken ct = default);
+    // returning its WorkUnitId so the caller can copy the merged file into its branch and resume
+    // it. workUnitId is the unit whose merge just landed — used only to resolve which root goal's
+    // scoped lease on path to release (see TryAcquireOrEnqueueAsync's own doc comment).
+    Task<string?> ReleaseAndAdvanceAsync(string workUnitId, string path, CancellationToken ct = default);
 
     // Failure/dead-letter/manual-stop path: a holder that will never merge must not strand its
     // queue(s) forever. No content is forwarded here — nothing was ever merged. Returns every

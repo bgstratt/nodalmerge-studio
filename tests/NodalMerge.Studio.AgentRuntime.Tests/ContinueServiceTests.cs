@@ -19,7 +19,7 @@ public class ContinueServiceTests
             string workUnitId, string agentId, PipelineStage stage, string profileId, string reason,
             string? taskId = null, string? lastProjectionSnapshot = null, string? sessionId = null,
             string? model = null, string? baseUrl = null, string? apiKey = null, string? provider = null,
-            FailureKind kind = FailureKind.Exception, CancellationToken cancellationToken = default)
+            FailureKind kind = FailureKind.Exception, string? credentialRef = null, CancellationToken cancellationToken = default)
         {
             RecordedFailures.Add((reason, kind));
             return Task.FromResult(new DeadLetterEntry(
@@ -44,12 +44,13 @@ public class ContinueServiceTests
 
         public Task<DeadLetterRetryResult> RetryWithCredentialOverrideAsync(
             string entryId, string? overrideModel, string? overrideBaseUrl, string? overrideApiKey,
-            string? overrideProvider, string? overrideProfileId, CancellationToken cancellationToken = default) =>
+            string? overrideProvider, string? overrideProfileId, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
         public Task<DeadLetterRetryResult> RetryWithContextAsync(
             string entryId, string steeringContext, string? overrideModel = null, string? overrideBaseUrl = null,
             string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null,
+            string? overrideCredentialRef = null,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
     }
@@ -105,16 +106,17 @@ public class ContinueServiceTests
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
             string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
-            IReadOnlyList<string>? enabledDomainAgents = null, CancellationToken cancellationToken = default) =>
+            IReadOnlyList<string>? enabledDomainAgents = null, string? credentialRef = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
-        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default) =>
+        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
 
         public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
         public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => CredentialsToReturn;
         public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => CredentialsToReturn;
         public string? GetAutoReviewProfileId(string workUnitId) => null;
+        public string? GetOrchestratorProfileId(string workUnitId) => null;
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task ResumeAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task StopAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;

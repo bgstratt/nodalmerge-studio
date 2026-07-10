@@ -144,8 +144,14 @@ export const SHELL_CSS_VARS = `
     background: var(--nm-bg); color: var(--nm-fg);
     font-family: var(--nm-font); font-size: var(--nm-size);
     margin: 0; padding: 0; height: 100%; overflow: hidden;
+    /* VS Code's default webview stylesheet sets body { user-select: none } to make webviews feel
+       like native UI — but this shell is full of content a human needs to copy out (goal text,
+       agent conversation, rejection reasons, work unit ids). Re-enable selection everywhere and
+       opt the chrome (buttons/tabs) back out below. */
+    user-select: text; -webkit-user-select: text;
   }
   body { display: flex; flex-direction: column; }
+  button, .nm-shell-tab, .badge { user-select: none; -webkit-user-select: none; }
   /* Shared, theme-correct base for every view's native form controls. A view can still override
      these locally (its own scoped rule wins over this unscoped one at equal specificity — see
      CSS scoping proximity), but views that don't bother get sane non-white, bordered defaults

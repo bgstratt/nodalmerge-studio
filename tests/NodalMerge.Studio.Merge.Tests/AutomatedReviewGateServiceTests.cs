@@ -103,8 +103,13 @@ public class AutomatedReviewGateServiceTests
         Assert.Contains((childId, "worker"), scheduler.Enqueued);
     }
 
+    // The max-attempts cap stops AGENTS from auto-spinning; it must never block a human. A human
+    // explicitly rejecting-with-notes past the cap has looked at the failures and decided to spend
+    // more — the retry proceeds (with their notes as steering) instead of dead-ending in the
+    // dead-letter queue. Previously this escalated, which live-stranded finished work behind an
+    // "Unreject and Revise" click that silently did nothing recoverable.
     [Fact]
-    public async Task HandleHumanRejectionAsync_escalates_to_dead_letter_after_max_rejections()
+    public async Task HandleHumanRejectionAsync_still_retries_past_the_max_rejection_cap()
     {
         const string workUnitId = "WU-SOLO";
         const string proposalId = "MP-1";
@@ -116,15 +121,15 @@ public class AutomatedReviewGateServiceTests
                 executionInfo: new WorkUnitExecutionInfo(FailureAttemptCount: 0, AutomatedReviewRejectionCount: 0, HumanReviewRejectionCount: 2)));
         var merge = new FakeMergeService(MakeRejectedProposal(proposalId, workUnitId: workUnitId));
         var deadLetter = new FakeDeadLetterService();
-        var gate = BuildGate(workUnits, merge, deadLetter);
+        var scheduler = new FakeScheduler();
+        var gate = BuildGate(workUnits, merge, deadLetter, scheduler);
 
         var result = await gate.HandleHumanRejectionAsync(proposalId, "Still wrong.");
 
-        Assert.Equal(AutomatedRejectionOutcome.EscalatedToDeadLetter, result.Outcome);
-        Assert.Single(deadLetter.Calls);
-        Assert.Equal(workUnitId, deadLetter.Calls[0].WorkUnitId);
-        Assert.Contains("Still wrong", deadLetter.Calls[0].Reason, StringComparison.Ordinal);
-        Assert.DoesNotContain((workUnitId, WorkUnitStatus.Queued), workUnits.StatusCalls);
+        Assert.Equal(AutomatedRejectionOutcome.RetriedWorkers, result.Outcome);
+        Assert.Empty(deadLetter.Calls);
+        Assert.Contains((workUnitId, WorkUnitStatus.Queued), workUnits.StatusCalls);
+        Assert.Contains((workUnitId, "worker"), scheduler.Enqueued);
     }
 
     [Fact]
@@ -357,6 +362,7 @@ public class AutomatedReviewGateServiceTests
     private sealed class FakeAgentControlService(string autoReviewProfileId) : IAgentControlService
     {
         public string? GetAutoReviewProfileId(string workUnitId) => autoReviewProfileId;
+        public string? GetOrchestratorProfileId(string workUnitId) => null;
 
         public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
 
@@ -374,6 +380,7 @@ public class AutomatedReviewGateServiceTests
             string? autoReviewProfileId = null,
             IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
             IReadOnlyList<string>? enabledDomainAgents = null,
+            string? credentialRef = null,
             CancellationToken cancellationToken = default) =>
             Task.FromResult("agent");
 
@@ -382,6 +389,12 @@ public class AutomatedReviewGateServiceTests
         public Task ReinvokeOrchestratorAsync(
             string workUnitId,
             string? sessionId = null,
+            string? overrideModel = null,
+            string? overrideBaseUrl = null,
+            string? overrideApiKey = null,
+            string? overrideProvider = null,
+            string? overrideProfileId = null,
+            string? overrideCredentialRef = null,
             CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
 
@@ -589,6 +602,7 @@ public class AutomatedReviewGateServiceTests
             string? apiKey = null,
             string? provider = null,
             string? sessionId = null,
+            string? credentialRef = null,
             CancellationToken ct = default)
         {
             Enqueued.Add((workUnitId, profileId));
@@ -613,6 +627,12 @@ public class AutomatedReviewGateServiceTests
         public Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) =>
             Task.CompletedTask;
 
+        public Task MarkAwaitingCredentialsAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
+        public Task SupplyCredentialsAsync(string workUnitId, string? provider, string? model, string? baseUrl, string? apiKey, CancellationToken ct = default) =>
+            Task.CompletedTask;
+
         public Task<IReadOnlyList<ScheduledItem>> ListAwaitingResumeAsync(CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ScheduledItem>>([]);
 
@@ -621,6 +641,9 @@ public class AutomatedReviewGateServiceTests
 
         public Task<int> ApproveResumeAllAsync(CancellationToken ct = default) =>
             Task.FromResult(0);
+
+        public Task ForceResumeAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.CompletedTask;
     }
 
     private sealed class FakeTaskService : ITaskService
@@ -813,6 +836,7 @@ public class AutomatedReviewGateServiceTests
             string? apiKey = null,
             string? provider = null,
             FailureKind kind = FailureKind.Exception,
+            string? credentialRef = null,
             CancellationToken cancellationToken = default)
         {
             Calls.Add((workUnitId, agentId, stage, profileId, reason));
@@ -856,6 +880,7 @@ public class AutomatedReviewGateServiceTests
             string? overrideApiKey,
             string? overrideProvider,
             string? overrideProfileId,
+            string? overrideCredentialRef = null,
             CancellationToken cancellationToken = default) =>
             Task.FromResult(new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried));
 
@@ -867,6 +892,7 @@ public class AutomatedReviewGateServiceTests
             string? overrideApiKey = null,
             string? overrideProvider = null,
             string? overrideProfileId = null,
+            string? overrideCredentialRef = null,
             CancellationToken cancellationToken = default) =>
             Task.FromResult(new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried));
     }

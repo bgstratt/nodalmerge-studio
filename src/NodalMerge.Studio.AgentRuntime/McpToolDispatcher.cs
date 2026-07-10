@@ -413,6 +413,7 @@ internal sealed class McpToolDispatcher(
             Str(input, "taskId"), Str(input, "model"), Str(input, "baseUrl"), Str(input, "apiKey"),
             Str(input, "provider"), Str(input, "profileId"), Str(input, "autoReviewProfileId"),
             enabledDomainAgents: StrArray(input, "enabledDomainAgents"),
+            credentialRef: Str(input, "credentialRef"),
             cancellationToken: ct).ConfigureAwait(false);
         return ToJson(new { agentId });
     }
@@ -501,8 +502,22 @@ internal sealed class McpToolDispatcher(
             // Non-automated review through the MCP surface — the caller may still be an agent
             // (or an external MCP client acting for a person), so honor an explicit reviewedBy
             // and only fall back to ReviewAsync's own "user" default when none is given.
+            //
+            // Live-observed failure mode: the dedicated reviewer agent's own tool schema requires
+            // verificationResults but not automated=true — an LLM that fills in real reasoning
+            // ("missing tests") but forgets the automated flag falls straight into this branch,
+            // which used to silently discard verificationResults entirely. The saved proposal ended
+            // up with reviewNotes=null, so the retried worker had zero information about why it was
+            // rejected and just guessed (in the observed case, guessing so wrong it re-did all 4
+            // sibling tasks at once and got rejected again for scope). Falling back to
+            // verificationResults as notes closes that hole regardless of which flag the caller
+            // forgot; requiring some reason on Reject closes it for good.
+            var notes = Str(input, "notes") ?? Str(input, "verificationResults");
+            if (decision == MergeProposalStatus.Rejected && string.IsNullOrWhiteSpace(notes))
+                return ToError("notes (or verificationResults) is required when rejecting a proposal — explain what needs to change so the retry has context.");
+
             var reviewed = await merge.ReviewAsync(
-                proposalId, decision, reviewedBy: Str(input, "reviewedBy"), cancellationToken: ct).ConfigureAwait(false);
+                proposalId, decision, notes, reviewedBy: Str(input, "reviewedBy"), cancellationToken: ct).ConfigureAwait(false);
             return ToJson(reviewed);
         }
         catch (KeyNotFoundException)

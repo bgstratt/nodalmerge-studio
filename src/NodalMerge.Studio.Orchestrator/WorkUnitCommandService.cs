@@ -17,7 +17,13 @@ public sealed class WorkUnitCommandService(
     IReviewTimerService reviewTimers,
     IRepositorySyncService repositorySync,
     NodalMerge.Studio.Storage.IRepositoryRegistryService repositories,
-    NodalMerge.Studio.Storage.IWorkspaceRegistryService workspaces) : IWorkUnitCommandService
+    NodalMerge.Studio.Storage.IWorkspaceRegistryService workspaces,
+    IFileLeaseService fileLease,
+    IWorkScheduler scheduler,
+    // Optional so direct-construction test call sites keep compiling — when null, cancel-time
+    // parent reconciliation is simply skipped (the orchestrator's own post-loop sweep still
+    // covers it on the next reinvoke).
+    IMergeReconciliationService? mergeReconciliation = null) : IWorkUnitCommandService
 {
     private static readonly HashSet<WorkUnitStatus> TerminalStatuses = new()
     {
@@ -179,6 +185,38 @@ public sealed class WorkUnitCommandService(
         var pendingTimers = await reviewTimers.ListPendingAsync(ct: cancellationToken).ConfigureAwait(false);
         foreach (var timer in pendingTimers.Where(t => cancelledIds.Contains(t.WorkUnitId)))
             await reviewTimers.TryCancelAsync(timer.ProposalId, cancellationToken).ConfigureAwait(false);
+
+        // A cancelled work unit is never coming back to merge-apply and release its own leases —
+        // unlike dead-letter's max-attempts path (InMemoryDeadLetterService.RecordFailureAsync),
+        // which already does this, cancellation had no release step at all, so any file it held a
+        // lease on stayed locked forever, permanently starving any sibling waiting on it. Mirrors
+        // that same release-and-promote pattern.
+        foreach (var cancelledId in cancelledIds)
+        {
+            var promoted = await fileLease.ForceReleaseAllForWorkUnitAsync(cancelledId, cancellationToken).ConfigureAwait(false);
+            foreach (var promotedWorkUnitId in promoted)
+                await scheduler.ClearAwaitingFileLeaseAsync(promotedWorkUnitId, cancellationToken).ConfigureAwait(false);
+        }
+
+        // Cancelling a straggler is itself a convergence event: if this cancel just removed the
+        // last non-terminal child under a still-live parent, that parent can now produce its
+        // reconciled top-level proposal from the children that DID finish. Without this, the user
+        // had to notice on their own that everything was terminal and manually reinvoke the
+        // orchestrator just to get the goal's merged content proposed toward the real repository.
+        if (mergeReconciliation is not null)
+        {
+            var parentIds = subtree
+                .Where(w => cancelledIds.Contains(w.WorkUnitId)
+                    && w.ParentWorkUnitId is not null
+                    && !cancelledIds.Contains(w.ParentWorkUnitId!))
+                .Select(w => w.ParentWorkUnitId!)
+                .Distinct();
+            foreach (var parentId in parentIds)
+            {
+                try { await mergeReconciliation.TryReconcileAsync(parentId, null, cancellationToken).ConfigureAwait(false); }
+                catch { /* best-effort — the cancellation itself already succeeded */ }
+            }
+        }
 
         return cancelled;
     }

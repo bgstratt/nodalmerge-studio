@@ -222,11 +222,90 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (decision == MergeProposalStatus.Approved)
         {
+            // Human-override accept of a previously Rejected proposal: the rejection path (or the
+            // dead-letter escalation behind it) may have parked the owning work unit in a status
+            // the reconciler refuses to fold in (DeadLettered blocks the whole sibling batch at
+            // WaitingForChildren). Accepting the proposal is a statement that this work IS done —
+            // restore the unit to Proposed so it reads as review-cleared work again, not a corpse.
+            // Best-effort like every other lifecycle side effect here; a unit already in
+            // Proposed/Merged has no restoring to do and the transition table just says no.
+            if (proposal.Status == MergeProposalStatus.Rejected && proposal.WorkUnitId is not null)
+            {
+                var workUnitsForRestore = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+                if (workUnitsForRestore is not null)
+                {
+                    try
+                    {
+                        var owningUnit = await workUnitsForRestore.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false);
+                        if (owningUnit?.Status is WorkUnitStatus.DeadLettered)
+                        {
+                            await workUnitsForRestore
+                                .UpdateStatusAsync(proposal.WorkUnitId, WorkUnitStatus.Proposed, proposal.SessionId, cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                    }
+                    catch (InvalidOperationException) { }
+                    catch (KeyNotFoundException) { }
+                }
+            }
+
             await TryRetriggerParentReconciliationAsync(proposal.WorkUnitId, proposal.SessionId, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else if (decision == MergeProposalStatus.Rejected && proposal.WorkUnitId is not null)
+        {
+            // A rejection reaching this (non-automated) path isn't necessarily a human's deliberate
+            // final call — MCP exposes the same merge_review tool to any agent, and an agent calling
+            // it without automated:true (e.g. the orchestrator judging a proposal wrong on its own,
+            // rather than going through AutomatedReviewGateService's tracked inline-reviewer flow)
+            // lands here too. AutomatedReviewAsync's own Rejected branch already auto-retries via
+            // TryRetriggerTaskRejectionAsync; this path never did, so any task under
+            // TaskReviewPolicy.AgentApproval/Hybrid — where no human is expected to be in the loop
+            // at all — could get silently, permanently stuck with zero retry and zero dead-letter
+            // escalation, invisible to both the scheduler and the human. Auto-retry here too, but
+            // ONLY when the owning work unit's effective policy doesn't require a human — a real
+            // human explicitly rejecting a HumanRequired proposal through the UI must still be final
+            // unless they choose to retry themselves (HandleHumanRejectionAsync).
+            await TryRetriggerTaskRejectionIfNoHumanExpectedAsync(
+                proposal.WorkUnitId, reviewer, proposal.SessionId, cancellationToken)
                 .ConfigureAwait(false);
         }
 
         return updated;
+    }
+
+    private async Task TryRetriggerTaskRejectionIfNoHumanExpectedAsync(
+        string workUnitId, string reviewerAttribution, string? sessionId, CancellationToken cancellationToken)
+    {
+        var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+        var owningWorkUnit = workUnits is not null
+            ? await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false)
+            : null;
+        if (owningWorkUnit?.ParentWorkUnitId is null)
+            return;
+
+        var effectivePolicy = WorkspaceReviewScope.AppliesToRealRepo(owningWorkUnit)
+            ? owningWorkUnit.WorkspaceReviewPolicy
+            : owningWorkUnit.TaskReviewPolicy;
+        if (effectivePolicy is not (ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid))
+            return;
+
+        var automatedReview = _serviceProvider?.GetService(typeof(IAutomatedReviewGateService)) as IAutomatedReviewGateService;
+        if (automatedReview is null)
+            return;
+
+        try
+        {
+            var chain = await _artifacts.GetChainAsync(workUnitId, cancellationToken).ConfigureAwait(false);
+            var proposalRef = chain.LastOrDefault(a => a.Type == ArtifactType.MergeProposal);
+            if (proposalRef is null)
+                return;
+
+            await automatedReview
+                .HandleAutomatedTaskRejectionAsync(proposalRef.ArtifactId, reviewerAttribution, sessionId, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch { /* best-effort — the reject already succeeded regardless of retry outcome */ }
     }
 
     // A fanned-out task child just cleared its own TaskReviewPolicy gate (human via ReviewAsync,
@@ -247,6 +326,23 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             : null;
         if (workUnit?.ParentWorkUnitId is not { } parentWorkUnitId)
             return;
+
+        // This child just reached Approved (agent- or human-reviewed) — a sibling that DependsOn
+        // it no longer has to wait for it to actually merge; IsDependencyContentReadyAsync in
+        // FanOutService already treats Approved as ready and seeds the dependent's branch from
+        // this proposal's own source content. Best-effort, same as reconciliation below: a
+        // dependent that isn't actually ready yet (e.g. a still-unapproved second dependency)
+        // just no-ops here and picks up the next trigger (its own Approve, or this one's Apply).
+        var fanOut = _serviceProvider?.GetService(typeof(IFanOutService)) as IFanOutService;
+        if (fanOut is not null)
+        {
+            try
+            {
+                await fanOut.TryEnqueueReadyDependentsAsync(parentWorkUnitId, sessionId, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch { /* best-effort — the review already succeeded regardless of fan-out outcome */ }
+        }
 
         var reconciliation = _serviceProvider?.GetService(typeof(IMergeReconciliationService)) as IMergeReconciliationService;
         if (reconciliation is null)
@@ -269,6 +365,13 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                     await automatedReview.TryEnqueueReviewerAsync(parentWorkUnitId, sessionId, cancellationToken)
                         .ConfigureAwait(false);
             }
+
+            // Defensive extra check alongside the one in ApplyAsync (the definitive "child
+            // actually landed" event) — harmless no-op unless every child already happens to be
+            // terminal at Approve time too.
+            if (workUnits is not null)
+                await TryCompleteParentIfAllChildrenTerminalAsync(parentWorkUnitId, workUnits, sessionId, cancellationToken)
+                    .ConfigureAwait(false);
         }
         catch { /* best-effort — the review already succeeded regardless of reconciliation outcome */ }
     }
@@ -522,9 +625,17 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             var scheduler = _serviceProvider?.GetService(typeof(IWorkScheduler)) as IWorkScheduler;
             var workUnitsForResume = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
 
+            // Whose lease is being released, not who's waiting — used only to resolve which root
+            // goal's scoped lease on touchedPath to advance (see IFileLeaseService's own doc
+            // comment on why leases are scoped per goal). Falls back to the proposal's own
+            // WorkUnitId/ProposalId if owningWorkUnit is somehow unresolved; a wrong/missing id
+            // here just degrades to the pre-scoping global lookup, not a crash.
+            var releasingWorkUnitId = owningWorkUnit?.WorkUnitId ?? proposal.WorkUnitId ?? proposal.ProposalId;
+
             foreach (var touchedPath in filesTouched)
             {
-                var waiterWorkUnitId = await _fileLease.ReleaseAndAdvanceAsync(touchedPath, cancellationToken)
+                var waiterWorkUnitId = await _fileLease
+                    .ReleaseAndAdvanceAsync(releasingWorkUnitId, touchedPath, cancellationToken)
                     .ConfigureAwait(false);
                 if (waiterWorkUnitId is null)
                     continue;
@@ -779,6 +890,19 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                                 .TryEnqueueReadyDependentsAsync(parentWorkUnitId, proposal.SessionId, cancellationToken)
                                 .ConfigureAwait(false);
                         }
+
+                        // Deterministic completion signal, independent of
+                        // MergeReconciliationService's combined MergeProposal (which only fires
+                        // once every child is simultaneously Proposed/Merged in one
+                        // TryReconcileAsync call — a structural mismatch for staggered,
+                        // dependency-gated fan-out where siblings land hours apart under
+                        // HumanRequired review, not as one batch). Every individual child apply
+                        // is a chance the batch just became complete, so check it here rather
+                        // than relying solely on the orchestrator's own LLM turn to notice — a
+                        // manual reinvoke with no children left to do anything about otherwise
+                        // just reasons over a stale, unchanged projection and stops again.
+                        await TryCompleteParentIfAllChildrenTerminalAsync(parentWorkUnitId, workUnits, proposal.SessionId, cancellationToken)
+                            .ConfigureAwait(false);
                     }
 
                     // The reverse direction: proposal.WorkUnitId may itself be a reconciliation
@@ -819,6 +943,32 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         }
 
         return updated;
+    }
+
+    // See the call site's comment above for why this exists alongside
+    // MergeReconciliationService's combined-proposal completion path rather than replacing it —
+    // that path still fires normally for goals whose children do land together; this one catches
+    // the staggered/dependency-gated case it structurally can't. DeadLettered is deliberately not
+    // "terminal" here — a real failure sitting in the tree should never be silently completed over.
+    private static async Task TryCompleteParentIfAllChildrenTerminalAsync(
+        string parentWorkUnitId, IWorkUnitService workUnits, string? sessionId, CancellationToken ct)
+    {
+        var parent = await workUnits.GetAsync(parentWorkUnitId, ct).ConfigureAwait(false);
+        if (parent is null || parent.Status is WorkUnitStatus.Completed or WorkUnitStatus.Cancelled)
+            return;
+
+        var children = await workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
+        if (children.Count == 0)
+            return;
+        if (!children.All(c => c.Status is WorkUnitStatus.Merged or WorkUnitStatus.Completed or WorkUnitStatus.Cancelled))
+            return;
+
+        try
+        {
+            await workUnits.UpdateStatusAsync(parentWorkUnitId, WorkUnitStatus.Completed, sessionId, ct)
+                .ConfigureAwait(false);
+        }
+        catch (InvalidOperationException) { /* parent in some status this transition doesn't cover — best-effort */ }
     }
 
     public async Task<PromoteResult> PromoteAsync(CancellationToken cancellationToken = default)
@@ -1023,6 +1173,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (conflicts.Count > 0)
         {
+            WorkUnit? reconciliationUnit = null;
             var report =
                 $"# Merge conflict report\n\n" +
                 $"Proposal '{proposal.ProposalId}' conflicts with changes already on '{effectiveTarget}' " +
@@ -1041,24 +1192,34 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             if (_candidateConflicts is not null
                 && string.Equals(effectiveTarget, _workspaceOptions.CandidateBranchId, StringComparison.Ordinal))
             {
-                // Best-effort — the already-landed proposal whose content is currently on candidate
-                // for these paths, so IReconciliationAgentService has both sides to work from.
-                var winningProposal = _proposals.Values.FirstOrDefault(p =>
-                    p.ProposalId != proposal.ProposalId
-                    && p.Status == MergeProposalStatus.Merged
-                    && p.LandedOnCandidateBranch
-                    && p.FilesTouched.Intersect(conflicts).Any());
+                // Re-applying the same losing proposal used to record a brand-new conflict AND
+                // auto-spawn a brand-new reconciliation work unit every single time — a human
+                // retrying apply while a reconciliation was still in flight accumulated an army of
+                // duplicate records and half-dead reconciliation agents for one underlying
+                // conflict. One open conflict per losing proposal; re-applies just re-throw below.
+                var existingOpen = (await _candidateConflicts.GetOpenAsync(ct).ConfigureAwait(false))
+                    .FirstOrDefault(c => c.ProposalId == proposal.ProposalId);
+                if (existingOpen is null)
+                {
+                    // Best-effort — the already-landed proposal whose content is currently on candidate
+                    // for these paths, so IReconciliationAgentService has both sides to work from.
+                    var winningProposal = _proposals.Values.FirstOrDefault(p =>
+                        p.ProposalId != proposal.ProposalId
+                        && p.Status == MergeProposalStatus.Merged
+                        && p.LandedOnCandidateBranch
+                        && p.FilesTouched.Intersect(conflicts).Any());
 
-                var conflictRecord = new CandidateConflictRecord(
-                    $"candconf-{Guid.NewGuid():N}",
-                    proposal.ProposalId,
-                    proposal.WorkUnitId,
-                    conflicts,
-                    DateTimeOffset.UtcNow,
-                    WinningProposalId: winningProposal?.ProposalId);
-                await _candidateConflicts.RecordAsync(conflictRecord, ct).ConfigureAwait(false);
+                    var conflictRecord = new CandidateConflictRecord(
+                        $"candconf-{Guid.NewGuid():N}",
+                        proposal.ProposalId,
+                        proposal.WorkUnitId,
+                        conflicts,
+                        DateTimeOffset.UtcNow,
+                        WinningProposalId: winningProposal?.ProposalId);
+                    await _candidateConflicts.RecordAsync(conflictRecord, ct).ConfigureAwait(false);
 
-                await TryAutoTriggerReconciliationAsync(conflictRecord, ct).ConfigureAwait(false);
+                    reconciliationUnit = await TryAutoTriggerReconciliationAsync(conflictRecord, ct).ConfigureAwait(false);
+                }
             }
 
             // Fan-out-sibling case: this proposal's own apply landed on merge/{ParentWorkUnitId}
@@ -1068,30 +1229,46 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             if (_taskConflicts is not null && owningWorkUnit?.ParentWorkUnitId is { } parentWorkUnitId
                 && string.Equals(effectiveTarget, $"merge/{parentWorkUnitId}", StringComparison.Ordinal))
             {
-                var winningSibling = _proposals.Values.FirstOrDefault(p =>
-                    p.ProposalId != proposal.ProposalId
-                    && p.Status == MergeProposalStatus.Merged
-                    && p.TargetBranch == effectiveTarget
-                    && p.FilesTouched.Intersect(conflicts).Any());
+                // Same dedupe as the candidate case above — one open conflict per losing proposal.
+                var existingOpen = (await _taskConflicts.GetOpenAsync(parentWorkUnitId, ct).ConfigureAwait(false))
+                    .FirstOrDefault(c => c.ProposalId == proposal.ProposalId);
+                if (existingOpen is null)
+                {
+                    var winningSibling = _proposals.Values.FirstOrDefault(p =>
+                        p.ProposalId != proposal.ProposalId
+                        && p.Status == MergeProposalStatus.Merged
+                        && p.TargetBranch == effectiveTarget
+                        && p.FilesTouched.Intersect(conflicts).Any());
 
-                var taskConflictRecord = new TaskConflictRecord(
-                    $"taskconf-{Guid.NewGuid():N}",
-                    parentWorkUnitId,
-                    proposal.ProposalId,
-                    proposal.WorkUnitId,
-                    conflicts,
-                    DateTimeOffset.UtcNow,
-                    WinningProposalId: winningSibling?.ProposalId);
-                await _taskConflicts.RecordAsync(taskConflictRecord, ct).ConfigureAwait(false);
+                    var taskConflictRecord = new TaskConflictRecord(
+                        $"taskconf-{Guid.NewGuid():N}",
+                        parentWorkUnitId,
+                        proposal.ProposalId,
+                        proposal.WorkUnitId,
+                        conflicts,
+                        DateTimeOffset.UtcNow,
+                        WinningProposalId: winningSibling?.ProposalId);
+                    await _taskConflicts.RecordAsync(taskConflictRecord, ct).ConfigureAwait(false);
 
-                await TryAutoTriggerTaskReconciliationAsync(taskConflictRecord, ct).ConfigureAwait(false);
+                    reconciliationUnit ??= await TryAutoTriggerTaskReconciliationAsync(taskConflictRecord, ct).ConfigureAwait(false);
+                }
             }
 
-            throw new InvalidOperationException(
-                $"Cannot apply proposal '{proposal.ProposalId}': it conflicts with changes already on " +
-                $"'{effectiveTarget}' for file(s): {string.Join(", ", conflicts)}. See " +
-                $"{MergeReconciliationService.ConflictReportFileName} on the proposal's own branch " +
-                "('" + proposal.SourceBranch + "') for details.");
+            // Two very different situations share this throw, and the old one-size message ("cannot
+            // apply, see the conflict report") read as "nothing happened" even when a reconciliation
+            // agent had ALREADY been spawned and was actively working — the human stared at a
+            // dead-sounding warning while progress was only visible by digging into the Activity
+            // Center. Say which case this is.
+            throw new InvalidOperationException(reconciliationUnit is not null
+                ? $"Proposal '{proposal.ProposalId}' conflicts with changes already on '{effectiveTarget}' " +
+                  $"for file(s): {string.Join(", ", conflicts)} — a reconciliation agent has been started " +
+                  $"(work unit {reconciliationUnit.WorkUnitId}) to combine both versions. Its merged " +
+                  "proposal will supersede this one when it finishes; watch its progress in the Activity Center."
+                : $"Cannot apply proposal '{proposal.ProposalId}': it conflicts with changes already on " +
+                  $"'{effectiveTarget}' for file(s): {string.Join(", ", conflicts)}. Use the conflict's " +
+                  "Reconcile action (spawns an agent to combine both versions) or Resolve (supply the " +
+                  $"combined content yourself). Details: {MergeReconciliationService.ConflictReportFileName} " +
+                  "on the proposal's own branch ('" + proposal.SourceBranch + "').");
         }
 
         foreach (var path in toDelete)
@@ -1108,14 +1285,18 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     // always trigger reconciliation manually regardless of policy (see the REST endpoint).
     // Best-effort — same shape as TryRetriggerTaskRejectionAsync: a trigger failure must never fail
     // the apply call (and its already-correct conflict recording) that led here.
-    private async Task TryAutoTriggerReconciliationAsync(CandidateConflictRecord conflict, CancellationToken ct)
+    // Returns the spawned reconciliation work unit (null when the policy gate said no, the trigger
+    // no-op'd, or anything failed) so the apply-conflict error message can tell the human the truth
+    // — "an agent is already on it, watch work unit X" reads very differently from a bare "cannot
+    // apply," even though the apply call itself fails either way.
+    private async Task<WorkUnit?> TryAutoTriggerReconciliationAsync(CandidateConflictRecord conflict, CancellationToken ct)
     {
         try
         {
             var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
             var trigger = _serviceProvider?.GetService(typeof(ICandidateReconciliationTrigger)) as ICandidateReconciliationTrigger;
             if (workUnits is null || trigger is null)
-                return;
+                return null;
 
             var losingWorkUnit = conflict.WorkUnitId is not null
                 ? await workUnits.GetAsync(conflict.WorkUnitId, ct).ConfigureAwait(false)
@@ -1130,23 +1311,24 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             if (losingWorkUnit?.WorkspaceReviewPolicy == ReviewPolicy.AgentApproval
                 && winningWorkUnit?.WorkspaceReviewPolicy == ReviewPolicy.AgentApproval)
             {
-                await trigger.TryTriggerAsync(conflict.ConflictId, ct: ct).ConfigureAwait(false);
+                return await trigger.TryTriggerAsync(conflict.ConflictId, ct: ct).ConfigureAwait(false);
             }
         }
         catch { /* best-effort — a human can still trigger reconciliation manually */ }
+        return null;
     }
 
     // Mirrors TryAutoTriggerReconciliationAsync exactly, gated on TaskReviewPolicy instead of
     // WorkspaceReviewPolicy — siblings are gated by TaskReviewPolicy (WorkspaceReviewScope), not
     // WorkspaceReviewPolicy, which only ever governs a top-level goal's own real-repo apply.
-    private async Task TryAutoTriggerTaskReconciliationAsync(TaskConflictRecord conflict, CancellationToken ct)
+    private async Task<WorkUnit?> TryAutoTriggerTaskReconciliationAsync(TaskConflictRecord conflict, CancellationToken ct)
     {
         try
         {
             var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
             var trigger = _serviceProvider?.GetService(typeof(ITaskReconciliationTrigger)) as ITaskReconciliationTrigger;
             if (workUnits is null || trigger is null)
-                return;
+                return null;
 
             var losingWorkUnit = conflict.WorkUnitId is not null
                 ? await workUnits.GetAsync(conflict.WorkUnitId, ct).ConfigureAwait(false)
@@ -1161,10 +1343,11 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             if (losingWorkUnit?.TaskReviewPolicy == ReviewPolicy.AgentApproval
                 && winningWorkUnit?.TaskReviewPolicy == ReviewPolicy.AgentApproval)
             {
-                await trigger.TryTriggerAsync(conflict.ConflictId, ct: ct).ConfigureAwait(false);
+                return await trigger.TryTriggerAsync(conflict.ConflictId, ct: ct).ConfigureAwait(false);
             }
         }
         catch { /* best-effort — a human can still trigger reconciliation manually */ }
+        return null;
     }
 
     private async Task WriteBackToRepositoryAsync(string sourceBranchId, string repoPath, CancellationToken ct)

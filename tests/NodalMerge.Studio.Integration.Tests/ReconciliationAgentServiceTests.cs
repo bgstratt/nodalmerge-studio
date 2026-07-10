@@ -180,6 +180,7 @@ public class ReconciliationAgentServiceTests
         public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
 
         public string? GetAutoReviewProfileId(string workUnitId) => null;
+        public string? GetOrchestratorProfileId(string workUnitId) => null;
 
         public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
 
@@ -195,13 +196,14 @@ public class ReconciliationAgentServiceTests
             string? autoReviewProfileId = null,
             IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
             IReadOnlyList<string>? enabledDomainAgents = null,
+            string? credentialRef = null,
             CancellationToken cancellationToken = default)
         {
             spawnCalls.Add((agentType, workUnitId, model));
             return Task.FromResult("agent-fake");
         }
 
-        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default) =>
+        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
 
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;

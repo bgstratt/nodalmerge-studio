@@ -173,8 +173,53 @@ internal sealed class OrchestratorAgentLoop(
             return AgentLoopCompletion.MaxIterationsExceeded;
 
         await fanOut.TryFanOutFromPlanAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+
+        // Rescue sweep — a child that is itself an orchestrator unit (reconciliation work units
+        // are the canonical case) can end up with a recorded Plan whose fan-out never fired
+        // (historically: the scheduler routed the post-planner handoff at the wrong orchestrator).
+        // Such a child sits Executing forever with no children and no queue item — and reinvoking
+        // THIS orchestrator was the human's only recovery lever, so make that lever actually reach
+        // it. TryFanOutFromPlanAsync is idempotent and returns immediately for children with no
+        // Plan artifact of their own (every ordinary leaf slice), so this is cheap.
+        try
+        {
+            var childUnits = await workUnits.GetChildrenAsync(workUnitId, ct).ConfigureAwait(false);
+            foreach (var child in childUnits)
+            {
+                if (child.Status is WorkUnitStatus.Executing or WorkUnitStatus.Active or WorkUnitStatus.Waiting)
+                    await fanOut.TryFanOutFromPlanAsync(child.WorkUnitId, sessionId, ct).ConfigureAwait(false);
+            }
+        }
+        catch { /* best-effort — the goal's own convergence sweep below still runs */ }
+
         var reconciliation = await mergeReconciliation.TryReconcileAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
         await automatedReview.TryEnqueueReviewerAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+
+        // The LLM turn above routinely ends with a "plan exists, fan-out is automatic" NoOp — the
+        // real convergence scan is these post-loop calls, and they used to run silently. Record
+        // what the reconciliation sweep actually concluded, so a human reinvoking the orchestrator
+        // sees "waiting on child X" / "reconciled proposal created — review it" in the decision
+        // log instead of an apparent dead stop with no explanation.
+        var reconAction = reconciliation.Outcome switch
+        {
+            MergeReconciliationOutcome.Reconciled or MergeReconciliationOutcome.AlreadyReconciled
+                => OrchestrationAction.AwaitReview,
+            MergeReconciliationOutcome.Conflict => OrchestrationAction.Escalate,
+            _ => OrchestrationAction.NoOp,
+        };
+        var reconReason = reconciliation.Outcome switch
+        {
+            MergeReconciliationOutcome.Reconciled =>
+                $"Reconciled child proposals into {reconciliation.ReconciledProposalId} — awaiting workspace review.",
+            MergeReconciliationOutcome.AlreadyReconciled =>
+                $"Reconciled proposal {reconciliation.ReconciledProposalId} already exists — awaiting review/apply.",
+            _ => reconciliation.Detail,
+        };
+        if (reconReason is not null)
+        {
+            try { await RecordDecisionAsync(reconAction, [], reconReason, ct).ConfigureAwait(false); }
+            catch { /* the decision log is informational — never worth failing convergence over */ }
+        }
 
         // Only complete the orchestrator work unit once the reconciled proposal has actually been
         // approved/merged — Reconciled means a fresh proposal was just created in Draft status

@@ -16,9 +16,10 @@ public sealed class SchedulerCommandService(IWorkScheduler scheduler) : ISchedul
         string? apiKey = null,
         string? provider = null,
         string? sessionId = null,
+        string? credentialRef = null,
         CancellationToken ct = default)
     {
-        await scheduler.EnqueueAsync(workUnitId, profileId, taskId, model, baseUrl, apiKey, provider, sessionId, ct)
+        await scheduler.EnqueueAsync(workUnitId, profileId, taskId, model, baseUrl, apiKey, provider, sessionId, credentialRef, ct)
             .ConfigureAwait(false);
 
         // IWorkScheduler.EnqueueAsync is fire-and-forget (returns void), so we need to
@@ -28,7 +29,7 @@ public sealed class SchedulerCommandService(IWorkScheduler scheduler) : ISchedul
         // params plus a null lease/conflict is accurate enough — any real conflict detection
         // or lease info will be produced by the scheduler itself and surfaced on the next
         // ListPendingAsync call.
-        return new ScheduledItem(workUnitId, profileId, taskId, null, null, 0, model, baseUrl, apiKey, provider, sessionId);
+        return new ScheduledItem(workUnitId, profileId, taskId, null, null, 0, model, baseUrl, apiKey, provider, sessionId, CredentialRef: credentialRef);
     }
 
     public Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default) =>

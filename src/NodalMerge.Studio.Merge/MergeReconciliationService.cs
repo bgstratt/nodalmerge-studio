@@ -36,8 +36,18 @@ public sealed class MergeReconciliationService(
         foreach (var proposalRef in parentChain.Where(a => a.Type == ArtifactType.MergeProposal))
         {
             var existing = await merge.GetAsync(proposalRef.ArtifactId, cancellationToken).ConfigureAwait(false);
+            // Only a live reconciled proposal that actually targets "main" counts as "already
+            // reconciled". Two false positives used to dead-end convergence here: (1) a Superseded
+            // reconciled proposal — its replacement either sits on this same chain and matches on
+            // its own merits, or doesn't exist and a fresh reconcile is exactly what's needed; and
+            // (2) a task-conflict resolution proposal (ReconciledFrom is set, but it targets the
+            // goal's own merge/{id} branch, not main — an intermediate artifact, not the top-level
+            // workspace proposal this method exists to produce). Either one made this return
+            // AlreadyReconciled while the goal still had NO proposal a human could review and
+            // apply to the real repository.
             if (existing?.ReconciledFrom.Count > 0 &&
-                existing.Status is not MergeProposalStatus.Rejected)
+                existing.TargetBranch == "main" &&
+                existing.Status is not MergeProposalStatus.Rejected and not MergeProposalStatus.Superseded)
             {
                 return new MergeReconciliationResult(
                     MergeReconciliationOutcome.AlreadyReconciled,
@@ -45,20 +55,46 @@ public sealed class MergeReconciliationService(
             }
         }
 
+        // A Cancelled child was explicitly abandoned by a human (a zombie reconciliation attempt,
+        // a rejected task the user chose not to retry). It contributes nothing to the reconciled
+        // result — but treating it as "waiting" blocked convergence forever: once a user cancelled
+        // the stragglers, every reinvoke returned WaitingForChildren and the goal could never
+        // produce the top-level proposal that gets its content into the real repository. Skip
+        // cancelled children entirely; only genuinely in-flight ones block.
+        var eligibleChildren = children.Where(c => c.Status is not WorkUnitStatus.Cancelled).ToList();
+        if (eligibleChildren.Count == 0)
+        {
+            return new MergeReconciliationResult(
+                MergeReconciliationOutcome.NotApplicable,
+                Detail: "Every child of this goal was cancelled — nothing to reconcile.");
+        }
+
         var childProposals = new List<(WorkUnit Child, MergeProposal Proposal)>();
-        foreach (var child in children)
+        foreach (var child in eligibleChildren)
         {
             if (child.Status is not WorkUnitStatus.Proposed and not WorkUnitStatus.Merged)
-                return new MergeReconciliationResult(MergeReconciliationOutcome.WaitingForChildren);
+            {
+                return new MergeReconciliationResult(
+                    MergeReconciliationOutcome.WaitingForChildren,
+                    Detail: $"Child {child.WorkUnitId} is {child.Status} — waiting for it to reach Proposed or Merged.");
+            }
 
             var chain = await artifacts.GetChainAsync(child.WorkUnitId, cancellationToken).ConfigureAwait(false);
             var proposalRef = chain.LastOrDefault(a => a.Type == ArtifactType.MergeProposal);
             if (proposalRef is null)
-                return new MergeReconciliationResult(MergeReconciliationOutcome.WaitingForChildren);
+            {
+                return new MergeReconciliationResult(
+                    MergeReconciliationOutcome.WaitingForChildren,
+                    Detail: $"Child {child.WorkUnitId} ({child.Status}) has no merge proposal yet.");
+            }
 
             var proposal = await merge.GetAsync(proposalRef.ArtifactId, cancellationToken).ConfigureAwait(false);
             if (proposal is null)
-                return new MergeReconciliationResult(MergeReconciliationOutcome.WaitingForChildren);
+            {
+                return new MergeReconciliationResult(
+                    MergeReconciliationOutcome.WaitingForChildren,
+                    Detail: $"Child {child.WorkUnitId}'s proposal record '{proposalRef.ArtifactId}' could not be loaded.");
+            }
 
             if (proposal.Status is MergeProposalStatus.Superseded)
             {
@@ -74,7 +110,13 @@ public sealed class MergeReconciliationService(
                     ? await merge.GetAsync(supersededById, cancellationToken).ConfigureAwait(false)
                     : null;
                 if (reconciliation is not { Status: MergeProposalStatus.Approved or MergeProposalStatus.Merged })
-                    return new MergeReconciliationResult(MergeReconciliationOutcome.WaitingForChildren);
+                {
+                    return new MergeReconciliationResult(
+                        MergeReconciliationOutcome.WaitingForChildren,
+                        Detail: $"Child {child.WorkUnitId}'s proposal {proposal.ProposalId} was superseded, " +
+                            $"and the superseding reconciliation is not yet Approved/Merged " +
+                            $"(currently {reconciliation?.Status.ToString() ?? "missing"}).");
+                }
                 proposal = reconciliation;
             }
             // A child's own proposal must have already cleared its TaskReviewPolicy gate — a human
@@ -86,7 +128,10 @@ public sealed class MergeReconciliationService(
             // (see AutomatedReviewGateService.HandleHumanRejectionAsync), not ready to fold in.
             else if (proposal.Status is not (MergeProposalStatus.Approved or MergeProposalStatus.Merged))
             {
-                return new MergeReconciliationResult(MergeReconciliationOutcome.WaitingForChildren);
+                return new MergeReconciliationResult(
+                    MergeReconciliationOutcome.WaitingForChildren,
+                    Detail: $"Child {child.WorkUnitId}'s proposal {proposal.ProposalId} is {proposal.Status} — " +
+                        "it must clear its review gate (Approved or Merged) before its changes can be folded in.");
             }
 
             childProposals.Add((child, proposal));
@@ -120,10 +165,12 @@ public sealed class MergeReconciliationService(
 
             return new MergeReconciliationResult(
                 MergeReconciliationOutcome.Conflict,
-                ConflictReportPath: ConflictReportFileName);
+                ConflictReportPath: ConflictReportFileName,
+                Detail: $"Child proposals changed overlapping lines in: {string.Join(", ", conflicts.Keys)} — " +
+                    $"see {ConflictReportFileName} on the goal's branch.");
         }
 
-        var ordered = OrderByDependencies(children, childProposals);
+        var ordered = OrderByDependencies(eligibleChildren, childProposals);
         // DistinctBy preserves first-occurrence order, so this keeps the topological ordering
         // OrderByDependencies just computed (important for the copy loop below — a later child's
         // copy may intentionally build on an earlier dependency's already-copied content) while

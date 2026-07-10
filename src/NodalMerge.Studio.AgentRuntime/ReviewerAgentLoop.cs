@@ -189,13 +189,13 @@ internal sealed class ReviewerAgentLoop(
             new(McpToolNames.MergeValidate, "Validate a draft proposal, moving it to ReadyForReview.",
                 Schema(["proposalId"], new() { ["proposalId"] = Str("Merge proposal ID") })),
 
-            new(McpToolNames.MergeReview, "Submit automated pre-gate review (set automated=true).",
-                Schema(["proposalId", "decision", "verificationResults"], new()
+            new(McpToolNames.MergeReview, "Submit your pre-gate review. You MUST set automated=true — omitting it silently downgrades this to an untracked manual review with no automatic retry, leaving a Rejected proposal permanently stuck.",
+                Schema(["proposalId", "decision", "verificationResults", "automated"], new()
                 {
                     ["proposalId"]            = Str("Merge proposal ID"),
                     ["decision"]              = Str("Approved or Rejected"),
-                    ["verificationResults"]   = Str("Concise review notes"),
-                    ["automated"]             = Str("Must be true for automated pre-gate review"),
+                    ["verificationResults"]   = Str("Concise review notes — on Rejected, this is the ONLY explanation the retried worker will see, so be specific about what to fix"),
+                    ["automated"]             = Str("REQUIRED — must be literally true for every call you make"),
                     ["consideredArtifactIds"] = StrArray("IDs of any recorded Constraint/Research artifacts you explicitly checked the proposal against in step 2, whether or not they were violated (optional)"),
                 })),
 

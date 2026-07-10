@@ -19,7 +19,7 @@ public class ReplanServiceTests
             string workUnitId, string agentId, PipelineStage stage, string profileId, string reason,
             string? taskId = null, string? lastProjectionSnapshot = null, string? sessionId = null,
             string? model = null, string? baseUrl = null, string? apiKey = null, string? provider = null,
-            FailureKind kind = FailureKind.Exception, CancellationToken cancellationToken = default) =>
+            FailureKind kind = FailureKind.Exception, string? credentialRef = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
         public Task<DeadLetterEntry?> GetAsync(string entryId, CancellationToken cancellationToken = default) =>
@@ -39,12 +39,13 @@ public class ReplanServiceTests
 
         public Task<DeadLetterRetryResult> RetryWithCredentialOverrideAsync(
             string entryId, string? overrideModel, string? overrideBaseUrl, string? overrideApiKey,
-            string? overrideProvider, string? overrideProfileId, CancellationToken cancellationToken = default) =>
+            string? overrideProvider, string? overrideProfileId, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
         public Task<DeadLetterRetryResult> RetryWithContextAsync(
             string entryId, string steeringContext, string? overrideModel = null, string? overrideBaseUrl = null,
             string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null,
+            string? overrideCredentialRef = null,
             CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
     }
@@ -104,16 +105,17 @@ public class ReplanServiceTests
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
             string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
-            IReadOnlyList<string>? enabledDomainAgents = null, CancellationToken cancellationToken = default) =>
+            IReadOnlyList<string>? enabledDomainAgents = null, string? credentialRef = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
-        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, CancellationToken cancellationToken = default) =>
+        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
 
         public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
         public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => CredentialsToReturn;
         public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => CredentialsToReturn;
         public string? GetAutoReviewProfileId(string workUnitId) => null;
+        public string? GetOrchestratorProfileId(string workUnitId) => null;
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task ResumeAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task StopAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;
@@ -134,6 +136,41 @@ public class ReplanServiceTests
     private sealed class NoopServiceProvider : IServiceProvider
     {
         public object? GetService(Type serviceType) => null;
+    }
+
+    private sealed class NoopFileLeaseService : IFileLeaseService
+    {
+        public Task<(bool Granted, string? HolderWorkUnitId)> TryAcquireOrEnqueueAsync(
+            string workUnitId, string path, CancellationToken ct = default) =>
+            Task.FromResult<(bool Granted, string? HolderWorkUnitId)>((true, workUnitId));
+        public Task<string?> ReleaseAndAdvanceAsync(string workUnitId, string path, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+        public Task<IReadOnlyList<string>> ForceReleaseAllForWorkUnitAsync(string workUnitId, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<IReadOnlyList<FileLeaseInfo>> ListAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<FileLeaseInfo>>([]);
+    }
+
+    private sealed class NoopScheduler : IWorkScheduler
+    {
+        public Task EnqueueAsync(string workUnitId, string profileId, string? taskId = null, string? model = null,
+            string? baseUrl = null, string? apiKey = null, string? provider = null, string? sessionId = null,
+            string? credentialRef = null, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<ScheduledItem?> TryAcquireAsync(string agentId, CancellationToken ct = default) =>
+            Task.FromResult<ScheduledItem?>(null);
+        public Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default) => Task.CompletedTask;
+        public Task MarkAwaitingResumeAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task MarkAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task MarkAwaitingCredentialsAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task SupplyCredentialsAsync(string workUnitId, string? provider, string? model, string? baseUrl, string? apiKey, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ScheduledItem>>([]);
+        public Task<IReadOnlyList<ScheduledItem>> ListAwaitingResumeAsync(CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ScheduledItem>>([]);
+        public Task ApproveResumeAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<int> ApproveResumeAllAsync(CancellationToken ct = default) => Task.FromResult(0);
+        public Task ForceResumeAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
     }
 
     private static WorkUnit MakeWorkUnit(string workUnitId, string? parentWorkUnitId) => new(
@@ -160,7 +197,9 @@ public class ReplanServiceTests
             workUnits ?? new FakeWorkUnitService(),
             new FakeFanOutService(),
             agentControl ?? new FakeAgentControlService(),
-            new NoopServiceProvider());
+            new NoopServiceProvider(),
+            new NoopFileLeaseService(),
+            new NoopScheduler());
 
     [Fact]
     public async Task ReplanFailedSliceAsync_returns_NotFound_when_entry_does_not_exist()

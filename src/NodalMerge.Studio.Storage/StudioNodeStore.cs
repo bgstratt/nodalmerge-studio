@@ -19,6 +19,10 @@ public static class StudioNodeKind
     public const string OrchestrationEventV1 = "studio/orchestration-event/v1";
     public const string ChangeIntentV1       = "studio/change-intent/v1";
     public const string DeadLetterV1         = "studio/dead-letter/v1";
+    // Safe-to-persist subset of an orchestrator's registration (no ApiKey — see
+    // InMemoryAgentRuntimeService's OrchestratorRoutingConfig) so AutoReviewProfileId/
+    // EnabledDomainAgents/stage routing survive a Host restart without ever writing a secret.
+    public const string OrchestratorRoutingV1 = "studio/orchestrator-routing/v1";
     public const string RuntimeSettingsV1    = "studio/runtime-settings/v1";
     public const string ExecutionResultV1    = "studio/execution-result/v1";
     public const string GoalV1               = "studio/goal/v1";

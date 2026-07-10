@@ -74,7 +74,7 @@ public class DeadLetterMcpToolsTests
     }
 
     [Fact]
-    public async Task ListAsync_returns_the_dead_lettered_entry_with_redacted_api_key()
+    public async Task ListAsync_never_includes_the_api_key()
     {
         var (agentRuntime, _, entryId, app) = await BuildWithDeadLetteredWorkUnitAsync();
         try
@@ -87,9 +87,12 @@ public class DeadLetterMcpToolsTests
 
             Assert.Contains(entries, e => e.GetProperty("EntryId").GetString() == entryId);
             var match = entries.First(e => e.GetProperty("EntryId").GetString() == entryId);
-            var apiKey = match.GetProperty("ApiKey").GetString();
-            Assert.NotNull(apiKey);
-            Assert.DoesNotContain("fake-key-0123456789", apiKey);
+
+            // DeadLetterEntry.ApiKey is [JsonIgnore]d — never persisted, never serialized out over
+            // any transport. No redaction step is needed (or possible) because the property is
+            // simply absent from the JSON entirely.
+            Assert.False(match.TryGetProperty("ApiKey", out _));
+            Assert.DoesNotContain("fake-key-0123456789", json);
         }
         finally
         {

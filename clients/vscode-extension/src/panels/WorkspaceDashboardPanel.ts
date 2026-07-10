@@ -495,8 +495,17 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           void this.poll();
           break;
         case 'cancelWorkUnit':
-          await this.post('/studio/workunits/' + String(msg.workUnitId) + '/cancel', {});
-          void this.poll();
+          try {
+            await this.post('/studio/workunits/' + String(msg.workUnitId) + '/cancel', {});
+            void this.poll();
+          } finally {
+            // entryId is only present when the cancel came from a dead-letter card — clear that
+            // card's busy label whether the cancel succeeded or threw, same pattern as
+            // retry/replan/continue above.
+            if (msg.entryId) {
+              void this.panel.webview.postMessage({ type: 'deadLetterActionSettled', entryId: msg.entryId });
+            }
+          }
           break;
         case 'stopAll': {
           const confirmed = await vscode.window.showWarningMessage(
@@ -509,10 +518,26 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           void this.poll();
           break;
         }
-        case 'resumeWorker':
-          await this.post('/studio/scheduler/' + String(msg.workUnitId) + '/resume', {});
+        case 'resumeWorker': {
+          const resumeWorkUnitId = String(msg.workUnitId);
+          // If this item was parked for a missing credential (server restart wiped
+          // IRuntimeCredentialCache), re-resolve it from the same profile it was dispatched under
+          // and resupply it as part of the resume call — mirrors ArtifactExplorerPanel's Resume
+          // action so both surfaces recover the same way.
+          let resumeBody: Record<string, string> = {};
+          if (this.configService && this.secrets) {
+            const pending = await this.get<Array<{ workUnitId: string; profileId: string }>>('/studio/scheduler/pending').catch(() => []);
+            const item = pending?.find(i => i.workUnitId === resumeWorkUnitId);
+            const profile = item?.profileId ? this.configService.getProfiles().find(p => p.id === item.profileId) : undefined;
+            if (profile) {
+              const llm = await this.configService.resolveSpawnLlmConfig(profile.id, this.secrets, this.lmProxyBaseUrl ?? '');
+              if (llm) { resumeBody = { ...llm }; }
+            }
+          }
+          await this.post('/studio/scheduler/' + resumeWorkUnitId + '/resume', resumeBody);
           void this.poll();
           break;
+        }
         case 'resumeAllWorkers':
           await this.post('/studio/scheduler/resume-all', {});
           void this.poll();
@@ -581,7 +606,20 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           // outer catch), or otherwise — so the webview's disabled/busy button state introduced
           // for this action always gets cleared instead of sticking forever on an error path.
           try {
-            await this.post('/studio/dead-letter/' + String(msg.entryId) + '/retry', {});
+            // Optional steering — a bare retry re-runs the same goal verbatim, which is often
+            // exactly what produced the failure in the first place. Any text here routes through
+            // retry-with-context instead, folding the correction into the goal the retried worker
+            // actually sees. Esc/empty falls back to a plain retry, so the fast path stays fast.
+            const steering = await vscode.window.showInputBox({
+              prompt: 'Optional steering note for the retry — what should be done differently? Leave empty for a plain retry.',
+              placeHolder: 'e.g. Only touch DiscountRules.cs — the other tasks belong to sibling slices.',
+              ignoreFocusOut: true,
+            });
+            if (steering && steering.trim().length > 0) {
+              await this.post('/studio/dead-letter/' + String(msg.entryId) + '/retry-with-context', { steeringContext: steering.trim() });
+            } else {
+              await this.post('/studio/dead-letter/' + String(msg.entryId) + '/retry', {});
+            }
             void this.poll();
           } finally {
             void this.panel.webview.postMessage({ type: 'deadLetterActionSettled', entryId: msg.entryId });
@@ -1039,6 +1077,17 @@ const ET_CSS = `
     resize: vertical;
     min-height: 40px;
   }
+  /* Manual-resolve side-by-side: losing side read-only on the left, editable result on the
+     right. min-width: 0 lets long unwrapped lines scroll inside the pane instead of forcing
+     the flex row (and the whole card) wider. */
+  .mr-compare { display: flex; gap: 8px; margin-top: 4px; }
+  .mr-compare .mr-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .mr-col-label {
+    font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.05em;
+    opacity: 0.6; margin: 2px 0;
+  }
+  .mr-pane { min-height: 140px; font-family: var(--nm-mono); white-space: pre; overflow: auto; }
+  .mr-pane[readonly] { opacity: 0.75; background: transparent; }
   .sync-graph-card {
     background: var(--nm-section-bg);
     border: 1px solid var(--nm-border);

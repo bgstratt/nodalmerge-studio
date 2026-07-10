@@ -105,6 +105,7 @@ public sealed class AutomatedReviewGateService(
                 apiKey: failedCreds?.ApiKey,
                 provider: failedCreds?.Provider,
                 kind: FailureKind.ReviewRejected,
+                credentialRef: failedCreds?.CredentialRef,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
 
             return new AutomatedRejectionResult(AutomatedRejectionOutcome.EscalatedToDeadLetter);
@@ -242,7 +243,15 @@ public sealed class AutomatedReviewGateService(
                 ? agentControl.GetCredentialsForStage(executeParentId, PipelineStage.Execute) ?? agentControl.GetOrchestratorCredentials(executeParentId)
                 : null);
 
-        if (rejectionCount >= InMemoryDeadLetterService.MaxFailureAttempts)
+        // The max-attempts cap exists to stop AGENTS from spinning — an automated reviewer
+        // rejecting the same work over and over burns tokens with no one steering. A human
+        // explicitly asking for another attempt is the opposite situation: they've looked at it,
+        // decided to spend more, and supplied their own steering notes. Blocking them behind the
+        // cap turned "retry with my correction" into a dead end (live-observed: an Unreject-and-
+        // Revise click silently escalated to dead-letter instead of retrying, because earlier
+        // automated cycles had already consumed the budget). Humans get warned by the count in the
+        // UI; they never get blocked. Only automated cycles escalate here.
+        if (automated && rejectionCount >= InMemoryDeadLetterService.MaxFailureAttempts)
         {
             var reason = string.IsNullOrWhiteSpace(reviewNotes)
                 ? $"{reviewerAttribution} rejected the proposal."

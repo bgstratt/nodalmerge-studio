@@ -6,6 +6,7 @@
 // shared escaper.
 
 import { esc } from './lib/esc.js';
+import { hasSelectionWithin } from './lib/selection.js';
 
 /** @param {{ root: HTMLElement, vscode: { postMessage(m: any): void }, $: (id: string) => HTMLElement | null }} ctx */
 export function init(ctx) {
@@ -31,6 +32,26 @@ export function init(ctx) {
   // the block was resolved), so only show it while still Created.
   function isBlocked(wu) {
     return !!(wu && wu.fanOutInfo && wu.fanOutInfo.blockedReason && (wu.status || '').toLowerCase() === 'created');
+  }
+
+  // wu.status doesn't change when a scheduled item is parked (AwaitingFileLease/AwaitingResume
+  // just flag the scheduler queue item, not the WorkUnit) — surface a distinct "paused" badge so
+  // a parked node doesn't just look like it's still running under its last-known status.
+  function isPausedWu(wu) {
+    return !!(wu && (wu.awaitingFileLease || wu.awaitingResume || wu.awaitingCredentials));
+  }
+  function pausedBadge(wu) {
+    if (!isPausedWu(wu)) { return ''; }
+    var label = wu.awaitingResume ? 'paused: awaiting resume'
+      : wu.awaitingCredentials ? 'paused: awaiting credentials'
+      : 'paused: file lease';
+    var title = wu.awaitingResume
+      ? 'A Host restart interrupted this mid-execution — click Resume to continue.'
+      : wu.awaitingCredentials
+      ? 'The Host restarted and lost its cached API key for this task — click Resume to resupply it.'
+      : 'Waiting for another task to release a file it needs — usually resolves automatically. If this ' +
+        'looks stuck, click Resume to force a retry (safe: it just re-checks the file and re-parks itself if the wait is still real).';
+    return '<span class="badge paused" title="' + esc(title) + '">' + esc(label) + '</span>';
   }
 
   function stageBadge(stage) {
@@ -73,15 +94,55 @@ export function init(ctx) {
   function updateSessionControls(sessionId, sessions) {
     var pauseBtn = $('gw-session-pause');
     var resumeBtn = $('gw-session-resume');
+    var parkedBadge = $('gw-session-parked-badge');
+    var resumeParkedBtn = $('gw-session-resume-parked');
+    var stalledBadge = $('gw-session-stalled-badge');
+    var reinvokeBtn = $('gw-session-reinvoke');
     if (!sessionId) {
       pauseBtn.style.display = 'none';
       resumeBtn.style.display = 'none';
+      parkedBadge.style.display = 'none';
+      resumeParkedBtn.style.display = 'none';
+      stalledBadge.style.display = 'none';
+      reinvokeBtn.style.display = 'none';
       return;
     }
     var session = (sessions || []).find(function(s) { return s.sessionId === sessionId; });
     var isPaused = session && session.status === 'Paused';
     pauseBtn.style.display = (!isPaused && session) ? '' : 'none';
     resumeBtn.style.display = isPaused ? '' : 'none';
+
+    // ExecutionSessionStatus (isPaused above) is a human-initiated pause and is never touched by
+    // a Host restart, so this can show "active" while the scheduler has actually parked work
+    // underneath it — surface that separately rather than only showing a misleading plain Pause
+    // button with no indication anything needs attention.
+    var hasParkedWork = !!(session && session.hasParkedWork);
+    if (hasParkedWork) {
+      var reasonLabel = session.parkedReason === 'AwaitingCredentials' ? 'awaiting credentials'
+        : session.parkedReason === 'AwaitingResume' ? 'awaiting resume'
+        : 'file lease';
+      parkedBadge.textContent = 'parked: ' + reasonLabel;
+      parkedBadge.title = 'Work under this goal is parked and needs a human/extension to resume it — the Pause/Resume buttons above track something else entirely (a manual full-goal pause).';
+      parkedBadge.style.display = '';
+      resumeParkedBtn.style.display = '';
+    } else {
+      parkedBadge.style.display = 'none';
+      resumeParkedBtn.style.display = 'none';
+    }
+
+    // No live agent and nothing parked — most commonly every child finished while the
+    // orchestrator's registration was cold after a restart, so it was never woken back up to
+    // notice and decide what's next (or finalize the goal). Mutually exclusive with the parked
+    // badge above by construction (server only sets orchestratorStalled when nothing is parked).
+    var orchestratorStalled = !!(session && session.orchestratorStalled);
+    if (orchestratorStalled) {
+      stalledBadge.title = 'No orchestrator is running for this goal and nothing is blocking it — it likely never got reinvoked after a Host restart. Click Reinvoke Orchestrator to wake it back up.';
+      stalledBadge.style.display = '';
+      reinvokeBtn.style.display = '';
+    } else {
+      stalledBadge.style.display = 'none';
+      reinvokeBtn.style.display = 'none';
+    }
   }
 
   $('gw-session-pause').addEventListener('click', function() {
@@ -94,6 +155,22 @@ export function init(ctx) {
     var session = (state.__sessions || []).find(function(s) { return s.sessionId === state.selectedSessionId; });
     if (!session) { return; }
     vscode.postMessage({ type: 'explorerGoalResume', goalId: session.rootWorkUnitId });
+  });
+
+  $('gw-session-resume-parked').addEventListener('click', function() {
+    var session = (state.__sessions || []).find(function(s) { return s.sessionId === state.selectedSessionId; });
+    if (!session || !session.parkedWorkUnitIds || !session.parkedWorkUnitIds.length) { return; }
+    vscode.postMessage({ type: 'explorerResumeParkedWork', workUnitIds: session.parkedWorkUnitIds });
+  });
+
+  $('gw-session-reinvoke').addEventListener('click', function() {
+    var session = (state.__sessions || []).find(function(s) { return s.sessionId === state.selectedSessionId; });
+    if (!session) { return; }
+    vscode.postMessage({
+      type: 'explorerReinvokeOrchestrator',
+      workUnitId: session.rootWorkUnitId,
+      profileId: session.orchestratorProfileId || null,
+    });
   });
 
   // ── Task/Workspace Review radios — reveal the hybrid-minutes textbox only when Hybrid is
@@ -444,7 +521,7 @@ export function init(ctx) {
       var sel = wu.workUnitId === state.selectedNodeId ? ' selected' : '';
       html += '<div class="dn-node' + sel + '" style="margin-left:' + (depth * 14) + 'px" data-wu="' + esc(wu.workUnitId) + '">';
       html += '<div class="dn-title" title="' + esc(wu.goal) + '">' + esc(wu.goal) + '</div>';
-      html += '<div class="dn-meta">' + badge(wu.status);
+      html += '<div class="dn-meta">' + badge(wu.status) + pausedBadge(wu);
       if (isBlocked(wu)) { html += '<span class="badge blocked" title="' + esc(wu.fanOutInfo.blockedReason) + '">blocked</span>'; }
       // Slice 18b — fork-type badge
       if (wu.forkType && (wu.forkType || '').toLowerCase() !== 'unknown') {
@@ -547,7 +624,7 @@ export function init(ctx) {
     root.querySelectorAll('[data-wu-action]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         var action = btn.getAttribute('data-wu-action');
-        if (action === 'steerPause' || action === 'steerForkFromNode' || action === 'steerDeadLetterRetry') {
+        if (action === 'steerPause' || action === 'steerForkFromNode' || action === 'steerDeadLetterRetry' || action === 'continueDeadLetter') {
           vscode.postMessage({
             type: 'explorerSteeringAction',
             action: action,
@@ -619,7 +696,7 @@ export function init(ctx) {
     // ── Metadata panel ────────────────────────────────────────────────────
     html += '<div class="gw-tab-panel active" id="gw-panel-metadata">';
     html += '<div class="meta-grid">';
-    html += '<span class="meta-label">Decision Status</span>' + badge(wu.status);
+    html += '<span class="meta-label">Decision Status</span>' + badge(wu.status) + pausedBadge(wu);
     html += '<span class="meta-label">Phase</span><span>' + stageBadge(wu.currentStage) + '</span>';
     html += '<span class="meta-label">Initiator</span><span class="mono">' + esc(wu.owner) + '</span>';
     html += '<span class="meta-label">Executor</span><span class="mono">' + esc(wu.assignedAgent || '—') + '</span>';
@@ -667,6 +744,16 @@ export function init(ctx) {
       html += '<button class="ghost" data-wu-action="steerPause" data-wu="' + esc(wu.workUnitId) + '" data-agent="' + esc(wu.assignedAgent || '') + '" style="color:var(--nm-warn);border-color:var(--nm-warn)">⏸ Pause & Redirect</button>';
       html += '<button class="ghost" data-wu-action="steerForkFromNode" data-wu="' + esc(wu.workUnitId) + '">↳ Fork from here</button>';
     }
+    // A Host restart interrupted this mid-execution, wiped the server's in-memory credential
+    // cache, or the task is waiting on a file another sibling holds — a human can explicitly
+    // resume any of these (no silent auto-resume for the first two). AwaitingFileLease normally
+    // clears itself once the holder releases the file, but the flag and the file lease's own
+    // state are tracked independently and can drift out of sync (e.g. a scoping change, or the
+    // holder getting force-released some other way) — Resume here force-clears the park flag
+    // unconditionally; if the wait is still real, the worker just re-parks itself on retry.
+    if (wu.awaitingResume || wu.awaitingCredentials || wu.awaitingFileLease) {
+      html += '<button class="ghost" data-wu-action="resumeWorker" data-wu="' + esc(wu.workUnitId) + '" style="color:var(--nm-warn);border-color:var(--nm-warn)">↺ Resume</button>';
+    }
     if (statusLower === 'deadlettered') {
       html += '<div class="steer-retry-section" style="margin-top:8px;padding:8px;border:1px solid var(--nm-error);border-radius:4px">';
       html += '<div style="font-size:0.85em;opacity:0.8;margin-bottom:6px">🛠 Steer & Retry — correct the agent and optionally swap the model:</div>';
@@ -680,6 +767,13 @@ export function init(ctx) {
       });
       html += '</select>';
       html += '<button class="ghost" data-wu-action="steerDeadLetterRetrySend" data-wu="' + esc(wu.workUnitId) + '" style="color:var(--nm-error);border-color:var(--nm-error)">🛠 Retry</button>';
+      // Continue only makes sense for a MaxIterationsExceeded failure — it resumes the same
+      // work unit with its reconstructed conversation and a fresh iteration budget, rather than
+      // starting over (Retry) or spawning fresh sibling slices (Re-plan). Rendered unconditionally
+      // here, same as Retry above — the backend returns NotApplicable/400 for any other failure
+      // kind and the panel surfaces that as an error toast rather than pre-fetching the entry just
+      // to gate visibility.
+      html += '<button class="ghost" data-wu-action="continueDeadLetter" data-wu="' + esc(wu.workUnitId) + '" title="Only applies to a \'max iterations reached\' failure — resumes this same work unit with its prior conversation and a fresh iteration budget.">▶ Continue</button>';
       html += '</div>';
     }
     html += '</div>';
@@ -1453,6 +1547,10 @@ export function init(ctx) {
       // session is actually selected now, so a stale poll can clobber the new tree with the
       // old (possibly still-in-progress) session's work units.
       if ((msg.sessionId || '') !== state.selectedSessionId) { return; }
+      // Poll-driven innerHTML rebuild — don't destroy a selection the user is copying out
+      // of the tree. Selections elsewhere (inspector, conversation) are unaffected by this
+      // rebuild, so only the tree's own subtree is checked.
+      if (hasSelectionWithin($('gw-tree'))) { return; }
       renderDecisionTree(msg.workUnits);
       return;
     }
@@ -1462,6 +1560,9 @@ export function init(ctx) {
       // newer one and overwrite it — or land for a node that's no longer selected at all,
       // which used to render anyway since this had no workUnitId check.
       if (msg.workUnitId !== state.selectedNodeId) { return; }
+      // Same selection guard as the tree — this handler rewrites both the timeline column
+      // and (below) the inspector, so protect a selection anchored in either.
+      if (hasSelectionWithin($('gw-timeline')) || hasSelectionWithin($('gw-inspector'))) { return; }
       renderTimeline(msg.artifacts, msg.events);
       // Slice 18c — store evidence and re-render inspector if node is still selected
       if (msg.evidence) {
@@ -1568,6 +1669,10 @@ export function init(ctx) {
       if (msg.workUnitId === state.selectedNodeId) {
         state.selectedNodeConversation = msg.entries || [];
         var convPanel = $('gw-panel-conversation');
+        // This is the copy/paste hot spot — the conversation poll rebuilds the whole tab
+        // every 2s, which used to wipe any selection the moment the user tried to copy a
+        // comment or agent message out. Keep the stale render until the selection clears.
+        if (convPanel && hasSelectionWithin(convPanel)) { return; }
         if (convPanel) {
           // Polling re-renders this tab by full innerHTML replacement (entries can change shape
           // mid-run), which would otherwise re-collapse every <details> the user had opened and

@@ -276,7 +276,7 @@ public sealed class ExternalGoalTools(
                 }
                 case "continue":
                 {
-                    var result = await continueService.ContinueWithPriorContextAsync(entry.EntryId, cancellationToken).ConfigureAwait(false);
+                    var result = await continueService.ContinueWithPriorContextAsync(entry.EntryId, cancellationToken: cancellationToken).ConfigureAwait(false);
                     return result.Outcome == ContinueOutcome.Continued
                         ? McpJson.Ok(new { goalId, action, outcome = result.Outcome.ToString() })
                         : McpJson.Error(McpServerToolNames.GoalRecover, result.Message ?? $"Continue failed: {result.Outcome}.");

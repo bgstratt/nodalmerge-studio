@@ -22,14 +22,16 @@ export function init(ctx) {
   }
 
   var STATUS_BUTTONS = {
-    draft:          { validate: true,  accept: false, reject: false, apply: false },
-    readyforreview: { validate: false, accept: true,  reject: true,  apply: false },
-    proposed:       { validate: false, accept: true,  reject: true,  apply: false },
-    executing:      { validate: true,  accept: false, reject: false, apply: false },
-    merge:          { validate: false, accept: false, reject: false, apply: false },
-    approved:       { validate: false, accept: false, reject: false, apply: true  },
-    merged:         { validate: false, accept: false, reject: false, apply: false },
-    rejected:       { validate: false, accept: false, reject: false, apply: false },
+    draft:          { validate: true,  accept: false, reject: false, apply: false, unreject: false },
+    readyforreview: { validate: false, accept: true,  reject: true,  apply: false, unreject: false },
+    proposed:       { validate: false, accept: true,  reject: true,  apply: false, unreject: false },
+    executing:      { validate: true,  accept: false, reject: false, apply: false, unreject: false },
+    merge:          { validate: false, accept: false, reject: false, apply: false, unreject: false },
+    approved:       { validate: false, accept: false, reject: false, apply: true,  unreject: false },
+    merged:         { validate: false, accept: false, reject: false, apply: false, unreject: false },
+    // Rejected is a recommendation, not a wall: a human can overrule it (accept: the backend now
+    // allows Rejected -> Approved for exactly this) or send it back for another attempt (unreject).
+    rejected:       { validate: false, accept: true,  reject: false, apply: false, unreject: true  },
   };
 
   // esc() imported from ./lib/esc.js (local copy didn't escape quotes, but is used in attribute contexts)
@@ -70,6 +72,9 @@ export function init(ctx) {
   });
   $('btn-revert').addEventListener('click', function() {
     vscode.postMessage({ type: 'revertAndRestart', notes: reviewNotesValue() });
+  });
+  $('btn-unreject').addEventListener('click', function() {
+    vscode.postMessage({ type: 'unrejectAndRevise', notes: reviewNotesValue() });
   });
   $('btn-apply').addEventListener('click', function() {
     vscode.postMessage({ type: 'applyDecision' });
@@ -759,12 +764,13 @@ export function init(ctx) {
     );
     showIf('section-auto-applied', isAutoApplied);
 
-    var btns = STATUS_BUTTONS[status] || { validate: false, accept: false, reject: false, apply: false };
+    var btns = STATUS_BUTTONS[status] || { validate: false, accept: false, reject: false, apply: false, unreject: false };
     setDisabled('btn-validate', !btns.validate);
     setDisabled('btn-accept',  !btns.accept);
     setDisabled('btn-revise',  !btns.reject);
     setDisabled('btn-revert',  !btns.reject);
     setDisabled('btn-apply',   !btns.apply);
+    setDisabled('btn-unreject', !btns.unreject);
   });
 
 }

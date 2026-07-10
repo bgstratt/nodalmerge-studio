@@ -19,21 +19,14 @@ public sealed class DeadLetterTools(
     IReplanService replan,
     IContinueService continueService)
 {
-    // Matches StudioRestEndpoints.RedactApiKey/RedactForRest exactly — an API key must never
-    // leave this process unredacted over any transport, REST or MCP alike.
-    private static string? RedactApiKey(string? apiKey) =>
-        string.IsNullOrEmpty(apiKey) ? apiKey
-        : apiKey.Length <= 8 ? "***"
-        : $"{apiKey[..3]}...{apiKey[^4..]}";
-
-    private static DeadLetterEntry Redact(DeadLetterEntry entry) =>
-        entry with { ApiKey = RedactApiKey(entry.ApiKey) };
-
+    // DeadLetterEntry.ApiKey is [JsonIgnore]d (see the record's own doc comment) — it never
+    // reaches JSON output via any serialization path, REST or MCP alike, so no redaction step is
+    // needed here anymore.
     [McpServerTool(Name = McpToolNames.DeadLetterList), Description("List every dead-letter entry across all work units.")]
     public async Task<string> ListAsync(CancellationToken cancellationToken = default)
     {
         var list = await deadLetter.ListAsync(cancellationToken).ConfigureAwait(false);
-        return McpJson.Ok(list.Select(Redact));
+        return McpJson.Ok(list);
     }
 
     [McpServerTool(Name = McpToolNames.DeadLetterGet), Description("Get a single dead-letter entry by its own entry ID.")]
@@ -42,7 +35,7 @@ public sealed class DeadLetterTools(
         var entry = await deadLetter.GetAsync(entryId, cancellationToken).ConfigureAwait(false);
         return entry is null
             ? McpJson.Error(McpToolNames.DeadLetterGet, $"Dead-letter entry '{entryId}' not found.")
-            : McpJson.Ok(Redact(entry));
+            : McpJson.Ok(entry);
     }
 
     [McpServerTool(Name = McpToolNames.DeadLetterByWorkUnit), Description("Get the latest dead-letter entry for a work unit, if any.")]
@@ -51,14 +44,14 @@ public sealed class DeadLetterTools(
         var entry = await deadLetter.GetLatestForWorkUnitAsync(workUnitId, cancellationToken).ConfigureAwait(false);
         return entry is null
             ? McpJson.Error(McpToolNames.DeadLetterByWorkUnit, $"No dead-letter entry found for work unit '{workUnitId}'.")
-            : McpJson.Ok(Redact(entry));
+            : McpJson.Ok(entry);
     }
 
     [McpServerTool(Name = McpToolNames.DeadLetterHistory), Description("Get the full failure history for a work unit, oldest first (e.g. \"max iterations\" -> steered retry -> \"transient 529\") in one call.")]
     public async Task<string> HistoryAsync(string workUnitId, CancellationToken cancellationToken = default)
     {
         var history = await deadLetter.GetHistoryForWorkUnitAsync(workUnitId, cancellationToken).ConfigureAwait(false);
-        return McpJson.Ok(history.Select(Redact));
+        return McpJson.Ok(history);
     }
 
     [McpServerTool(Name = McpToolNames.DeadLetterRetry), Description("Retry a dead-lettered work unit, resuming the same work with its captured credentials. Optionally override the model/provider/credentials for this retry only.")]
@@ -69,6 +62,7 @@ public sealed class DeadLetterTools(
         string? overrideApiKey = null,
         string? overrideProvider = null,
         string? overrideProfileId = null,
+        string? overrideCredentialRef = null,
         CancellationToken cancellationToken = default)
     {
         var hasOverride = overrideModel is not null || overrideBaseUrl is not null || overrideApiKey is not null
@@ -76,7 +70,7 @@ public sealed class DeadLetterTools(
         var result = hasOverride
             ? await deadLetter.RetryWithCredentialOverrideAsync(
                 entryId, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider, overrideProfileId,
-                cancellationToken).ConfigureAwait(false)
+                overrideCredentialRef, cancellationToken).ConfigureAwait(false)
             : await deadLetter.RetryAsync(entryId, cancellationToken).ConfigureAwait(false);
 
         return result.Outcome switch
@@ -95,6 +89,7 @@ public sealed class DeadLetterTools(
         string? overrideApiKey = null,
         string? overrideProvider = null,
         string? overrideProfileId = null,
+        string? overrideCredentialRef = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(steeringContext))
@@ -102,7 +97,7 @@ public sealed class DeadLetterTools(
 
         var result = await deadLetter.RetryWithContextAsync(
             entryId, steeringContext, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider,
-            overrideProfileId, cancellationToken).ConfigureAwait(false);
+            overrideProfileId, overrideCredentialRef, cancellationToken).ConfigureAwait(false);
 
         return result.Outcome switch
         {
@@ -122,10 +117,19 @@ public sealed class DeadLetterTools(
         };
     }
 
-    [McpServerTool(Name = McpToolNames.DeadLetterContinue), Description("Continue a dead-lettered work unit that hit its iteration limit: resumes the SAME work unit with its own prior conversation reconstructed and a fresh iteration budget. Only valid for MaxIterationsExceeded failures — use retry or re-plan for anything else.")]
-    public async Task<string> ContinueAsync(string entryId, CancellationToken cancellationToken = default)
+    [McpServerTool(Name = McpToolNames.DeadLetterContinue), Description("Continue a dead-lettered work unit that hit its iteration limit: resumes the SAME work unit with its own prior conversation reconstructed and a fresh iteration budget. Only valid for MaxIterationsExceeded failures — use retry or re-plan for anything else. Optionally resupply credentials (e.g. after a Host restart) via the override* params.")]
+    public async Task<string> ContinueAsync(
+        string entryId,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default)
     {
-        var result = await continueService.ContinueWithPriorContextAsync(entryId, cancellationToken).ConfigureAwait(false);
+        var result = await continueService.ContinueWithPriorContextAsync(
+            entryId, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider,
+            overrideCredentialRef, cancellationToken).ConfigureAwait(false);
         return result.Outcome switch
         {
             ContinueOutcome.Continued => McpJson.Ok(result),

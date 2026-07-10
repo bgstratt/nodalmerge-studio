@@ -147,6 +147,16 @@ public static class WorkUnitTransitions
             (WorkUnitStatus.Executing, WorkUnitStatus.DeadLettered) => true,
             (WorkUnitStatus.Retrying, WorkUnitStatus.DeadLettered) => true,
             (WorkUnitStatus.DeadLettered, WorkUnitStatus.Retrying) => true,
+            // Human override — a dead-lettered unit's proposal can still be accepted
+            // (MergeProposalTransitions' Rejected -> Approved edge) and applied by a human who
+            // decides the work is good despite the automated escalation. Without these edges the
+            // accept/apply succeeded at the PROPOSAL level but the work unit silently stayed
+            // DeadLettered (ApplyAsync's status update is best-effort and swallowed the illegal
+            // transition), so MergeReconciliationService — which requires every child to be
+            // Proposed or Merged — reported WaitingForChildren forever and the goal could never
+            // converge. Proposed is the accept-time restore; Merged is the apply-time landing.
+            (WorkUnitStatus.DeadLettered, WorkUnitStatus.Proposed) => true,
+            (WorkUnitStatus.DeadLettered, WorkUnitStatus.Merged) => true,
             (WorkUnitStatus.Proposed, WorkUnitStatus.Reviewing) => true,
             // A fan-out parent is the orchestrator's own work unit, spawned via the legacy
             // direct-spawn path (IAgentControlService.SpawnAsync("orchestrator", ...)) — it never

@@ -121,6 +121,7 @@ public sealed class ReconciliationAgentService(
                         "orchestrator", workUnit.WorkUnitId,
                         model: creds.Model, baseUrl: creds.BaseUrl, apiKey: creds.ApiKey,
                         provider: creds.Provider, profileId: creds.ProfileId,
+                        credentialRef: creds.CredentialRef,
                         cancellationToken: ct).ConfigureAwait(false);
                 }
                 catch { /* best-effort — see comment above */ }

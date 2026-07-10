@@ -20,9 +20,17 @@ public sealed class ContinueService(
     IDeadLetterService deadLetter,
     IWorkUnitService workUnits,
     IAgentControlService agentControl,
-    IServiceProvider serviceProvider) : IContinueService
+    IServiceProvider serviceProvider,
+    IRuntimeCredentialCache? credentialCache = null) : IContinueService
 {
-    public async Task<ContinueResult> ContinueWithPriorContextAsync(string entryId, CancellationToken cancellationToken = default)
+    public async Task<ContinueResult> ContinueWithPriorContextAsync(
+        string entryId,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default)
     {
         var entry = await deadLetter.GetAsync(entryId, cancellationToken).ConfigureAwait(false);
         if (entry is null)
@@ -40,14 +48,39 @@ public sealed class ContinueService(
         if (workUnit is null)
             return new ContinueResult(ContinueOutcome.NotFound, "Work unit not found.");
 
-        // The dead-lettered run's own captured credentials are the natural source — this resumes
-        // the exact same run, not a fresh spawn — falling back to the live registry only for
-        // legacy entries recorded before credential capture existed.
-        var model = entry.Model;
-        var baseUrl = entry.BaseUrl;
-        var apiKey = entry.ApiKey;
-        var provider = entry.Provider;
-        if (string.IsNullOrWhiteSpace(baseUrl))
+        // Resolved in the same tiered order as InMemoryDeadLetterService.ResolveRetryCredentials:
+        // an explicit override (a caller resupplying live credentials, e.g. after a Host restart)
+        // takes top priority; then the dead-lettered run's own captured credentials (this resumes
+        // the exact same run, not a fresh spawn); then IRuntimeCredentialCache via the entry's own
+        // CredentialRef, which is the only tier that can still be warm post-restart; then the live
+        // orchestrator registry, for legacy entries recorded before credential capture existed.
+        // Each tier is checked via "apiKey is null", not IsNullOrWhiteSpace — a vscode-lm profile
+        // legitimately captures apiKey as "" (no real secret, see LlmApiProxy), which must count as
+        // present; only null (never captured, or wiped by DeadLetterEntry.ApiKey's [JsonIgnore]
+        // surviving a restart) means "keep looking." A baseUrl-only check would make the same
+        // mistake in the other direction — Model/BaseUrl/Provider are still persisted plaintext, so
+        // after a restart wipes just the key, baseUrl alone looks present and the resolution would
+        // stop too early, proceeding into a real LLM call with an empty ApiKey.
+        string? model = overrideModel, baseUrl = overrideBaseUrl, apiKey = overrideApiKey, provider = overrideProvider;
+        if (apiKey is null)
+        {
+            model = entry.Model;
+            baseUrl = entry.BaseUrl;
+            apiKey = entry.ApiKey;
+            provider = entry.Provider;
+        }
+        if (apiKey is null)
+        {
+            var cached = credentialCache?.TryGet(overrideCredentialRef ?? entry.CredentialRef);
+            if (cached is not null)
+            {
+                model = cached.Model;
+                baseUrl = cached.BaseUrl;
+                apiKey = cached.ApiKey;
+                provider = cached.Provider;
+            }
+        }
+        if (apiKey is null)
         {
             var creds = agentControl.GetCredentialsForStage(entry.WorkUnitId, entry.Stage)
                 ?? agentControl.GetOrchestratorCredentials(entry.WorkUnitId);
@@ -57,8 +90,11 @@ public sealed class ContinueService(
             provider = creds?.Provider;
         }
 
-        if (string.IsNullOrWhiteSpace(baseUrl))
+        if (string.IsNullOrWhiteSpace(baseUrl) || apiKey is null)
             return new ContinueResult(ContinueOutcome.NotCompleted, "No LLM credentials resolvable for this work unit.");
+
+        var resolvedCredentialRef = overrideCredentialRef ?? entry.CredentialRef;
+        credentialCache?.Capture(resolvedCredentialRef, provider, model, baseUrl, apiKey);
 
         var conversationLog = serviceProvider.GetRequiredService<IConversationLogService>();
         var priorEntries = (await conversationLog.GetEntriesAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false))
@@ -112,7 +148,7 @@ public sealed class ContinueService(
             await scheduler.EnqueueAsync(
                 entry.WorkUnitId, entry.ProfileId, taskId: entry.TaskId,
                 model: model, baseUrl: baseUrl, apiKey: apiKey, provider: provider,
-                sessionId: null, ct: cancellationToken).ConfigureAwait(false);
+                sessionId: null, credentialRef: resolvedCredentialRef, ct: cancellationToken).ConfigureAwait(false);
 
             if (completion == AgentLoopCompletion.AwaitingFileLease)
                 await scheduler.MarkAwaitingFileLeaseAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
@@ -142,6 +178,7 @@ public sealed class ContinueService(
             apiKey: apiKey,
             provider: provider,
             kind: FailureKind.MaxIterationsExceeded,
+            credentialRef: resolvedCredentialRef,
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
         return new ContinueResult(

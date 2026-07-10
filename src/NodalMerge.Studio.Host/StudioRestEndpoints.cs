@@ -52,9 +52,24 @@ public static class StudioRestEndpoints
         // Slice 21/22 — per-work-unit override of WorkspaceOptions.EnabledDomainAgents (by domain
         // agent Name, e.g. "Security"/"Architecture"). Null means "no override" (inherit the
         // global default).
-        List<string>? EnabledDomainAgents = null);
+        List<string>? EnabledDomainAgents = null,
+        // Opaque client-derived cache key (e.g. the VS Code extension's SecretStorage apiKeyRef) —
+        // never a secret itself. Lets the server re-resolve ApiKey from IRuntimeCredentialCache
+        // after a restart instead of ever persisting it. See IRuntimeCredentialCache's doc comment.
+        string? CredentialRef = null);
 
-    private sealed record StageCredentialDto(string Provider, string Model, string BaseUrl, string ApiKey);
+    private sealed record StageCredentialDto(string Provider, string Model, string BaseUrl, string ApiKey, string? CredentialRef = null);
+
+    // Optional resupply payload for POST /studio/workunits/{workUnitId}/reinvoke-orchestrator —
+    // mirrors ResumeBody/ContinueBody. Present when the caller (typically the VS Code extension,
+    // re-reading its own SecretStorage) has live connection details to hand back.
+    private sealed record ReinvokeOrchestratorBody(
+        string? OverrideModel = null,
+        string? OverrideBaseUrl = null,
+        string? OverrideApiKey = null,
+        string? OverrideProvider = null,
+        string? OverrideProfileId = null,
+        string? OverrideCredentialRef = null);
 
     private sealed record ProposeMergeBody(
         string SourceBranch,
@@ -69,6 +84,8 @@ public static class StudioRestEndpoints
         string? SessionId = null);
 
     private sealed record ReviewBody(string Decision, string? Notes = null, string? SessionId = null, string? RestartMode = null);
+
+    private sealed record RetryRejectedProposalBody(string? Notes = null, string? SessionId = null, string? RestartMode = null);
 
     private sealed record BranchProposalBody(
         string Goal,
@@ -119,11 +136,12 @@ public static class StudioRestEndpoints
         string? Model = null,
         string? BaseUrl = null,
         string? ApiKey = null,
-        string? ProfileId = null)
+        string? ProfileId = null,
+        string? CredentialRef = null)
     {
         public OrchestratorCredentials? ToCredentials() =>
             !string.IsNullOrWhiteSpace(Model) && !string.IsNullOrWhiteSpace(BaseUrl)
-                ? new OrchestratorCredentials(Provider ?? "anthropic", Model, BaseUrl, ApiKey ?? string.Empty, ProfileId)
+                ? new OrchestratorCredentials(Provider ?? "anthropic", Model, BaseUrl, ApiKey ?? string.Empty, ProfileId, CredentialRef)
                 : null;
     }
 
@@ -137,7 +155,18 @@ public static class StudioRestEndpoints
         string? BaseUrl = null,
         string? ApiKey = null,
         string? Provider = null,
-        string? SessionId = null);
+        string? SessionId = null,
+        string? CredentialRef = null);
+
+    // Optional resupply payload for POST /studio/scheduler/{workUnitId}/resume — present when the
+    // caller (typically the VS Code extension, re-reading its own SecretStorage) has live
+    // connection details to hand back after a Host restart wiped IRuntimeCredentialCache.
+    private sealed record ResumeBody(
+        string? Provider = null,
+        string? Model = null,
+        string? BaseUrl = null,
+        string? ApiKey = null,
+        string? CredentialRef = null);
 
     private sealed record ClarificationRequestBody(
         string WorkUnitId,
@@ -989,12 +1018,17 @@ public static class StudioRestEndpoints
 
     // ── /studio/workunits ─────────────────────────────────────────────────
 
-    private static object ToWorkUnitResponse(WorkUnit wu, int proposalCount) => new
+    private static object ToWorkUnitResponse(WorkUnit wu, int proposalCount, ScheduledItem? scheduled = null) => new
     {
         workUnitId = wu.WorkUnitId,
         goal = wu.Goal,
         branchId = wu.BranchId,
         status = wu.Status,
+        // wu.Status doesn't change when a scheduled item is parked (AwaitingFileLease/AwaitingResume
+        // just flag the queue item, not the WorkUnit itself) — surface the park flags separately so
+        // the UI can show a paused state instead of silently leaving the last-known status displayed.
+        awaitingFileLease = scheduled?.AwaitingFileLease ?? false,
+        awaitingResume = scheduled?.AwaitingResume ?? false,
         createdAt = wu.CreatedAt,
         updatedAt = wu.UpdatedAt,
         owner = wu.Owner,
@@ -1034,6 +1068,7 @@ public static class StudioRestEndpoints
             IWorkUnitService workUnits,
             IMergeService merge,
             IExecutionSessionService sessions,
+            IWorkScheduler scheduler,
             CancellationToken ct) =>
         {
             var list = await workUnits.ListAsync(branchId, ct).ConfigureAwait(false);
@@ -1051,13 +1086,17 @@ public static class StudioRestEndpoints
                 .Where(p => p.WorkUnitId is not null)
                 .GroupBy(p => p.WorkUnitId!)
                 .ToDictionary(g => g.Key, g => g.Count());
-            return Results.Ok(list.Select(wu => ToWorkUnitResponse(wu, counts.GetValueOrDefault(wu.WorkUnitId))));
+            var scheduled = (await scheduler.ListPendingAsync(ct).ConfigureAwait(false))
+                .ToDictionary(i => i.WorkUnitId);
+            return Results.Ok(list.Select(wu =>
+                ToWorkUnitResponse(wu, counts.GetValueOrDefault(wu.WorkUnitId), scheduled.GetValueOrDefault(wu.WorkUnitId))));
         });
 
         app.MapGet("/studio/workunits/{workUnitId}", async (
             string workUnitId,
             IWorkUnitService workUnits,
             IMergeService merge,
+            IWorkScheduler scheduler,
             CancellationToken ct) =>
         {
             var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
@@ -1065,7 +1104,9 @@ public static class StudioRestEndpoints
                 return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
             var proposals = await merge.ListAsync(cancellationToken: ct).ConfigureAwait(false);
             var proposalCount = proposals.Count(p => p.WorkUnitId == workUnitId);
-            return Results.Ok(ToWorkUnitResponse(wu, proposalCount));
+            var scheduled = (await scheduler.ListPendingAsync(ct).ConfigureAwait(false))
+                .FirstOrDefault(i => i.WorkUnitId == workUnitId);
+            return Results.Ok(ToWorkUnitResponse(wu, proposalCount, scheduled));
         });
 
         app.MapGet("/studio/workunits/{workUnitId}/children", async (
@@ -1175,14 +1216,28 @@ public static class StudioRestEndpoints
             string conflictId,
             ReconcileConflictBody? body,
             ITaskReconciliationTrigger trigger,
+            ITaskConflictService taskConflicts,
             CancellationToken ct) =>
         {
             try
             {
                 var reconciliationChild = await trigger.TryTriggerAsync(
                     conflictId, body?.SteeringNotes, body?.ToCredentials(), ct).ConfigureAwait(false);
+
+                // Null usually means "already Reconciling" — but the reconciliation that claimed it
+                // may itself have died (agent dead-lettered/cancelled) without ever marking the
+                // conflict Resolved, which used to leave it permanently stuck: un-re-triggerable AND
+                // un-resolvable. This endpoint is the explicit human surface — a human clicking
+                // Reconcile on a conflict that isn't visibly progressing is taking ownership of it,
+                // so reopen and try once more instead of dead-ending them.
+                if (reconciliationChild is null && await taskConflicts.TryReopenAsync(conflictId, ct).ConfigureAwait(false) is not null)
+                {
+                    reconciliationChild = await trigger.TryTriggerAsync(
+                        conflictId, body?.SteeringNotes, body?.ToCredentials(), ct).ConfigureAwait(false);
+                }
+
                 if (reconciliationChild is null)
-                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is not open (already reconciling or resolved, or does not exist)." });
+                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is already resolved or does not exist." });
 
                 return Results.Ok(reconciliationChild);
             }
@@ -1203,6 +1258,7 @@ public static class StudioRestEndpoints
             string conflictId,
             ResolveConflictBody body,
             ITaskReconciliationTrigger trigger,
+            ITaskConflictService taskConflicts,
             CancellationToken ct) =>
         {
             if (body.Files is null || body.Files.Count == 0)
@@ -1211,8 +1267,17 @@ public static class StudioRestEndpoints
             try
             {
                 var proposal = await trigger.TryResolveManuallyAsync(conflictId, body.Files, ct).ConfigureAwait(false);
+
+                // Same failed-reconciliation recovery hatch as the /reconcile endpoint above — a
+                // human supplying the resolved content directly outranks a reconciliation attempt
+                // that's gone quiet.
+                if (proposal is null && await taskConflicts.TryReopenAsync(conflictId, ct).ConfigureAwait(false) is not null)
+                {
+                    proposal = await trigger.TryResolveManuallyAsync(conflictId, body.Files, ct).ConfigureAwait(false);
+                }
+
                 if (proposal is null)
-                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is not open (already reconciling or resolved, or does not exist)." });
+                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is already resolved or does not exist." });
 
                 return Results.Ok(proposal);
             }
@@ -1507,7 +1572,7 @@ public static class StudioRestEndpoints
                 foreach (var (key, dto) in body.StageCredentials)
                 {
                     if (Enum.TryParse<PipelineStage>(key, ignoreCase: true, out var stage))
-                        resolved[stage] = new OrchestratorCredentials(dto.Provider, dto.Model, dto.BaseUrl, dto.ApiKey, null);
+                        resolved[stage] = new OrchestratorCredentials(dto.Provider, dto.Model, dto.BaseUrl, dto.ApiKey, null, dto.CredentialRef);
                 }
                 stageCredentials = resolved;
             }
@@ -1515,8 +1580,42 @@ public static class StudioRestEndpoints
             var agentId = await agents.SpawnAsync(
                 body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey,
                 body.Provider, body.ProfileId, body.AutoReviewProfileId, stageCredentials,
-                body.EnabledDomainAgents, ct).ConfigureAwait(false);
+                body.EnabledDomainAgents, body.CredentialRef, ct).ConfigureAwait(false);
             return Results.Ok(new { agentId, agentType = body.AgentType, workUnitId = body.WorkUnitId, branchId = wu.BranchId });
+        });
+
+        // Manual recovery for a stalled orchestrator — normally ReinvokeOrchestratorAsync fires
+        // automatically whenever a child finishes (WorkSchedulerService.ReleaseAsync's success
+        // path), but that's a silent no-op if credentials aren't resolvable (e.g. right after a
+        // Host restart, before anything has resupplied IRuntimeCredentialCache): every child could
+        // finish and the orchestrator would just never notice. Guarded against double-spawning a
+        // second live orchestrator loop over an already-running one.
+        app.MapPost("/studio/workunits/{workUnitId}/reinvoke-orchestrator", async (
+            string workUnitId,
+            ReinvokeOrchestratorBody? body,
+            IAgentControlService agents,
+            IWorkUnitService workUnits,
+            CancellationToken ct) =>
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+
+            var active = await agents.ListActiveAsync(ct).ConfigureAwait(false);
+            if (active.Any(a => a.WorkUnitId == workUnitId))
+                return Results.Conflict(new { error = $"An orchestrator is already active for work unit '{workUnitId}'." });
+
+            await agents.ReinvokeOrchestratorAsync(
+                workUnitId,
+                sessionId: null,
+                body?.OverrideModel, body?.OverrideBaseUrl, body?.OverrideApiKey, body?.OverrideProvider,
+                body?.OverrideProfileId, body?.OverrideCredentialRef, ct).ConfigureAwait(false);
+
+            var stillActive = await agents.ListActiveAsync(ct).ConfigureAwait(false);
+            var started = stillActive.Any(a => a.WorkUnitId == workUnitId);
+            return started
+                ? Results.Ok(new { workUnitId, status = "reinvoked" })
+                : Results.UnprocessableEntity(new { error = "No credentials resolvable for this orchestrator — resupply via overrideApiKey." });
         });
 
         // Slice 15e — single-agent status read (list/spawn/pause/resume/stop already existed; this
@@ -1816,6 +1915,51 @@ public static class StudioRestEndpoints
             }
         });
 
+        // A Rejected proposal previously had exactly one road back to a worker: retry-on-reject
+        // firing as a side effect of the /review endpoint's own Reject call, at the moment of
+        // rejection. Anything that landed on Rejected any other way — the merge_review MCP tool's
+        // non-automated form (any agent can call it directly, bypassing the tracked automated gate
+        // entirely), a rejection whose rejection-count never got incremented for some other reason,
+        // or simply a goal a human wants to give another shot after looking at it later — had no
+        // path back at all: MergeProposalTransitions has no outgoing edge from Rejected, and nothing
+        // else in the REST/MCP surface calls IAutomatedReviewGateService standalone. This exposes
+        // the same retry primitive (reset the owning work unit/its children to Queued, re-enqueue,
+        // fold the notes in as a Constraint, bounded by the same max-attempts-then-dead-letter cap)
+        // as its own callable action, independent of ever re-reviewing anything.
+        app.MapPost("/studio/merges/{proposalId}/retry", async (
+            string proposalId,
+            RetryRejectedProposalBody? body,
+            IMergeService merge,
+            IAutomatedReviewGateService reviewGate,
+            CancellationToken ct) =>
+        {
+            var proposal = await merge.GetAsync(proposalId, ct).ConfigureAwait(false);
+            if (proposal is null)
+                return Results.NotFound(new { error = $"Proposal '{proposalId}' not found." });
+            if (proposal.Status != MergeProposalStatus.Rejected)
+                return Results.BadRequest(new { error = $"Proposal '{proposalId}' is not Rejected (current: {proposal.Status}) — nothing to retry." });
+
+            var restartMode = RestartMode.Revise;
+            if (!string.IsNullOrWhiteSpace(body?.RestartMode) &&
+                !Enum.TryParse(body.RestartMode, ignoreCase: true, out restartMode))
+            {
+                return Results.BadRequest(new { error = "restartMode must be 'Revise' or 'Revert'." });
+            }
+
+            var result = await reviewGate.HandleHumanRejectionAsync(
+                proposalId, body?.Notes, restartMode, body?.SessionId, ct).ConfigureAwait(false);
+
+            return result.Outcome switch
+            {
+                AutomatedRejectionOutcome.EscalatedToDeadLetter => Results.Conflict(new
+                {
+                    error = "Max retry attempts already reached — this task was escalated to the dead-letter queue instead. " +
+                            "Use /studio/dead-letter/{entryId}/retry-with-context to force another attempt with a correction.",
+                }),
+                _ => Results.Ok(result),
+            };
+        });
+
         app.MapPost("/studio/merges/{proposalId}/apply", async (
             string proposalId,
             IMergeCommandService mergeCommands,
@@ -2073,14 +2217,25 @@ public static class StudioRestEndpoints
             string conflictId,
             ReconcileConflictBody? body,
             ICandidateReconciliationTrigger trigger,
+            ICandidateConflictService candidateConflicts,
             CancellationToken ct) =>
         {
             try
             {
                 var workUnit = await trigger.TryTriggerAsync(
                     conflictId, body?.SteeringNotes, body?.ToCredentials(), ct).ConfigureAwait(false);
+
+                // Failed-reconciliation recovery hatch — same as the task-conflict /reconcile
+                // endpoint: a conflict stuck Reconciling because its agent died is reopened when a
+                // human explicitly acts on it, instead of dead-ending them.
+                if (workUnit is null && await candidateConflicts.TryReopenAsync(conflictId, ct).ConfigureAwait(false) is not null)
+                {
+                    workUnit = await trigger.TryTriggerAsync(
+                        conflictId, body?.SteeringNotes, body?.ToCredentials(), ct).ConfigureAwait(false);
+                }
+
                 if (workUnit is null)
-                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is not open (already reconciling or resolved, or does not exist)." });
+                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is already resolved or does not exist." });
 
                 return Results.Ok(workUnit);
             }
@@ -2101,6 +2256,7 @@ public static class StudioRestEndpoints
             string conflictId,
             ResolveConflictBody body,
             ICandidateReconciliationTrigger trigger,
+            ICandidateConflictService candidateConflicts,
             CancellationToken ct) =>
         {
             if (body.Files is null || body.Files.Count == 0)
@@ -2109,8 +2265,16 @@ public static class StudioRestEndpoints
             try
             {
                 var proposal = await trigger.TryResolveManuallyAsync(conflictId, body.Files, ct).ConfigureAwait(false);
+
+                // Same failed-reconciliation recovery hatch — a human supplying resolved content
+                // directly outranks a reconciliation attempt that's gone quiet.
+                if (proposal is null && await candidateConflicts.TryReopenAsync(conflictId, ct).ConfigureAwait(false) is not null)
+                {
+                    proposal = await trigger.TryResolveManuallyAsync(conflictId, body.Files, ct).ConfigureAwait(false);
+                }
+
                 if (proposal is null)
-                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is not open (already reconciling or resolved, or does not exist)." });
+                    return Results.BadRequest(new { error = $"Conflict '{conflictId}' is already resolved or does not exist." });
 
                 return Results.Ok(proposal);
             }
@@ -2287,10 +2451,26 @@ public static class StudioRestEndpoints
 
         app.MapPost("/studio/scheduler/{workUnitId}/resume", async (
             string workUnitId,
+            ResumeBody? body,
             IWorkScheduler scheduler,
             CancellationToken ct) =>
         {
-            await scheduler.ApproveResumeAsync(workUnitId, ct).ConfigureAwait(false);
+            // A restart-interrupted item and a credentials-parked item are independent flags — a
+            // single Resume click (typically the VS Code extension re-reading its own
+            // SecretStorage) handles either or both: SupplyCredentialsAsync is a no-op if the item
+            // was never AwaitingCredentials. Supplying credentials also warms the shared cache
+            // under the item's CredentialRef, unblocking any sibling item/orchestrator lookup
+            // sharing that ref too. ForceResumeAsync then unconditionally clears whatever park
+            // flag(s) remain (AwaitingResume, AwaitingFileLease, AwaitingCredentials) — a plain
+            // ApproveResumeAsync only clears AwaitingResume, which left AwaitingFileLease items
+            // with no way to recover if the flag ever drifted out of sync with the file lease's
+            // own state (e.g. after the lease-scoping change) instead of clearing itself normally.
+            if (body is not null && !string.IsNullOrWhiteSpace(body.ApiKey))
+            {
+                await scheduler.SupplyCredentialsAsync(
+                    workUnitId, body.Provider, body.Model, body.BaseUrl, body.ApiKey, ct).ConfigureAwait(false);
+            }
+            await scheduler.ForceResumeAsync(workUnitId, ct).ConfigureAwait(false);
             return Results.Ok(new { workUnitId, status = "resumed" });
         });
 
@@ -2313,17 +2493,17 @@ public static class StudioRestEndpoints
                 return Results.BadRequest(new { error = "profileId is required." });
 
             var item = await scheduler.EnqueueAsync(
-                body.WorkUnitId, body.ProfileId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey, body.Provider, body.SessionId, ct)
+                body.WorkUnitId, body.ProfileId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey, body.Provider, body.SessionId, body.CredentialRef, ct)
                 .ConfigureAwait(false);
             return Results.Ok(new { workUnitId = item.WorkUnitId, profileId = item.ProfileId, taskId = item.TaskId, sessionId = item.SessionId, status = "enqueued" });
         });
     }
 
-    // ScheduledItem carries the LLM credentials a worker needs to actually resume — required
-    // server-side (RunScheduledWorkerAsync reads Model/BaseUrl/ApiKey off the scheduler's own
-    // internal queue item), but nothing on the client ever reads ApiKey back out of a GET response
-    // (the VS Code extension's own ScheduledItem type doesn't even declare the field) — no reason to
-    // put a live API key on the wire for a read-only status view.
+    // ScheduledItem.ApiKey is already [JsonIgnore]d (never persisted, never serialized by
+    // JsonSerializer) — this is defense-in-depth for the in-memory value, which is real during a
+    // live process's active dispatch. Nothing on the client ever reads ApiKey back out of a GET
+    // response (the VS Code extension's own ScheduledItem type doesn't even declare the field) — no
+    // reason to put a live API key on the wire for a read-only status view.
     private static ScheduledItem RedactCredentials(ScheduledItem item) => item with { ApiKey = null };
 
     private static void MapClarificationEndpoints(WebApplication app)
@@ -2527,6 +2707,7 @@ public static class StudioRestEndpoints
             IExecutionSessionService sessions,
             IWorkUnitService workUnits,
             IMergeService merge,
+            IWorkScheduler scheduler,
             CancellationToken ct) =>
         {
             var session = await sessions.GetAsync(sessionId, ct).ConfigureAwait(false);
@@ -2542,6 +2723,8 @@ public static class StudioRestEndpoints
                 .Where(p => p.WorkUnitId is not null)
                 .GroupBy(p => p.WorkUnitId!)
                 .ToDictionary(g => g.Key, g => g.Count());
+            var scheduled = (await scheduler.ListPendingAsync(ct).ConfigureAwait(false))
+                .ToDictionary(i => i.WorkUnitId);
 
             var tree = new List<WorkUnit> { root };
             var frontier = new Queue<string>([root.WorkUnitId]);
@@ -2555,7 +2738,8 @@ public static class StudioRestEndpoints
                 }
             }
 
-            return Results.Ok(tree.Select(wu => ToWorkUnitResponse(wu, counts.GetValueOrDefault(wu.WorkUnitId))));
+            return Results.Ok(tree.Select(wu =>
+                ToWorkUnitResponse(wu, counts.GetValueOrDefault(wu.WorkUnitId), scheduled.GetValueOrDefault(wu.WorkUnitId))));
         });
 
         app.MapPost("/studio/sessions/{sessionId}/branch", async (
@@ -2581,20 +2765,9 @@ public static class StudioRestEndpoints
 
     // ── /studio/dead-letter ───────────────────────────────────────────────────
 
-    // DeadLetterEntry.ApiKey is stored in plaintext deliberately — a retry needs it and the live
-    // orchestrator registry it would otherwise come from is ephemeral (see the entry's own doc
-    // comment). That's fine for internal use; it must never go out over REST unredacted, which is
-    // what every GET endpoint below did until now. RetryAsync/RetryWithCredentialOverrideAsync
-    // read the entry directly via IDeadLetterService, not through this redacted projection, so
-    // retry is unaffected.
-    private static string? RedactApiKey(string? apiKey) =>
-        string.IsNullOrEmpty(apiKey) ? apiKey
-        : apiKey.Length <= 8 ? "***"
-        : $"{apiKey[..3]}...{apiKey[^4..]}";
-
-    private static DeadLetterEntry RedactForRest(DeadLetterEntry entry) =>
-        entry with { ApiKey = RedactApiKey(entry.ApiKey) };
-
+    // DeadLetterEntry.ApiKey is [JsonIgnore]d (see the record's own doc comment) — it never
+    // reaches JSON output via any serialization path, REST or MCP alike, so no redaction step is
+    // needed here anymore.
     private static void MapDeadLetterEndpoints(WebApplication app)
     {
         app.MapGet("/studio/dead-letter", async (
@@ -2602,7 +2775,7 @@ public static class StudioRestEndpoints
             CancellationToken ct) =>
         {
             var list = await deadLetter.ListAsync(ct).ConfigureAwait(false);
-            return Results.Ok(list.Select(RedactForRest));
+            return Results.Ok(list);
         });
 
         app.MapGet("/studio/dead-letter/{entryId}", async (
@@ -2613,7 +2786,7 @@ public static class StudioRestEndpoints
             var entry = await deadLetter.GetAsync(entryId, ct).ConfigureAwait(false);
             return entry is null
                 ? Results.NotFound(new { error = $"Dead-letter entry '{entryId}' not found." })
-                : Results.Ok(RedactForRest(entry));
+                : Results.Ok(entry);
         });
 
         app.MapPost("/studio/dead-letter/{entryId}/retry", async (
@@ -2632,6 +2805,7 @@ public static class StudioRestEndpoints
                     body.OverrideApiKey,
                     body.OverrideProvider,
                     body.OverrideProfileId,
+                    body.OverrideCredentialRef,
                     ct).ConfigureAwait(false);
             }
             else
@@ -2656,7 +2830,7 @@ public static class StudioRestEndpoints
             var entry = await deadLetter.GetLatestForWorkUnitAsync(workUnitId, ct).ConfigureAwait(false);
             return entry is null
                 ? Results.NotFound(new { error = $"No dead-letter entry found for work unit '{workUnitId}'." })
-                : Results.Ok(RedactForRest(entry));
+                : Results.Ok(entry);
         });
 
         // The full failure story for a work unit in one call — e.g. "max iterations" -> manually
@@ -2668,7 +2842,7 @@ public static class StudioRestEndpoints
             CancellationToken ct) =>
         {
             var history = await deadLetter.GetHistoryForWorkUnitAsync(workUnitId, ct).ConfigureAwait(false);
-            return Results.Ok(history.Select(RedactForRest));
+            return Results.Ok(history);
         });
 
         app.MapPost("/studio/dead-letter/{entryId}/retry-with-context", async (
@@ -2688,6 +2862,7 @@ public static class StudioRestEndpoints
                 body.OverrideApiKey,
                 body.OverrideProvider,
                 body.OverrideProfileId,
+                body.OverrideCredentialRef,
                 ct).ConfigureAwait(false);
             return result.Outcome switch
             {
@@ -2722,10 +2897,14 @@ public static class StudioRestEndpoints
         // with just a steering hint or spawn fresh siblings. Only valid for MaxIterationsExceeded.
         app.MapPost("/studio/dead-letter/{entryId}/continue", async (
             string entryId,
+            ContinueBody? body,
             IContinueService continueService,
             CancellationToken ct) =>
         {
-            var result = await continueService.ContinueWithPriorContextAsync(entryId, ct).ConfigureAwait(false);
+            var result = await continueService.ContinueWithPriorContextAsync(
+                entryId,
+                body?.OverrideModel, body?.OverrideBaseUrl, body?.OverrideApiKey, body?.OverrideProvider,
+                body?.OverrideCredentialRef, ct).ConfigureAwait(false);
             return result.Outcome switch
             {
                 ContinueOutcome.Continued => Results.Ok(result),
@@ -2741,12 +2920,24 @@ public static class StudioRestEndpoints
     // different model/profile (e.g. switching from vscode-lm to deepseek) without spawning
     // a new work unit. When set, these take absolute priority over the entry's captured
     // credentials and the live orchestrator registry in ResolveRetryCredentials.
+    // Optional resupply payload for POST /studio/dead-letter/{entryId}/continue — mirrors
+    // DeadLetterRetryBody. Present when the caller (typically the VS Code extension, re-reading
+    // its own SecretStorage) has live connection details to hand back, e.g. after a Host restart
+    // wiped IRuntimeCredentialCache and the entry's own captured ApiKey is unrecoverable.
+    private sealed record ContinueBody(
+        string? OverrideModel = null,
+        string? OverrideBaseUrl = null,
+        string? OverrideApiKey = null,
+        string? OverrideProvider = null,
+        string? OverrideCredentialRef = null);
+
     private sealed record DeadLetterRetryBody(
         string? OverrideModel = null,
         string? OverrideBaseUrl = null,
         string? OverrideApiKey = null,
         string? OverrideProvider = null,
-        string? OverrideProfileId = null);
+        string? OverrideProfileId = null,
+        string? OverrideCredentialRef = null);
 
     private sealed record RetryWithContextBody(
         string SteeringContext,
@@ -2754,7 +2945,8 @@ public static class StudioRestEndpoints
         string? OverrideBaseUrl = null,
         string? OverrideApiKey = null,
         string? OverrideProvider = null,
-        string? OverrideProfileId = null);
+        string? OverrideProfileId = null,
+        string? OverrideCredentialRef = null);
 
     // ── /studio/file-leases — Phase 12 manual-release admin override ───────────
     // Closes the one remaining gap after StopAsync/ReviewAsync(Rejected) were wired to release
@@ -3573,8 +3765,73 @@ public static class StudioRestEndpoints
         app.MapGet("/studio/goals", async (
             IGoalNodeService goalNodes,
             IWorkUnitService workUnits,
+            IWorkScheduler scheduler,
+            IAgentControlService agents,
             CancellationToken ct) =>
         {
+            var allWorkUnits = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
+            var workUnitById = allWorkUnits.ToDictionary(wu => wu.WorkUnitId);
+            var pending = await scheduler.ListPendingAsync(ct).ConfigureAwait(false);
+
+            // A root work unit with no live orchestrator agent and nothing parked underneath it is
+            // "stalled" — nothing is driving it forward at all. Most commonly: every child finished
+            // while the orchestrator's registration was cold after a restart, so
+            // ReinvokeOrchestratorAsync silently no-op'd and never woke it back up to notice and
+            // decide what's next (or finalize the goal). Distinct from hasParkedWork below — that's
+            // "something specific is blocked," this is "nothing is even trying."
+            var activeWorkUnitIds = (await agents.ListActiveAsync(ct).ConfigureAwait(false))
+                .Select(a => a.WorkUnitId).ToHashSet();
+
+            // Session/GoalStatus (Active/Paused, Exploring/Paused) is a human-initiated pause and
+            // is never touched by a restart, so a goal can look perfectly "active" while work
+            // underneath it is actually parked (AwaitingResume/AwaitingFileLease/
+            // AwaitingCredentials — set on the scheduler item, not the goal or the work unit).
+            // Roll that up here so the goal-level UI can show it instead of just a bare "Pause"
+            // button with no indication anything needs a human. Root-goal resolution is memoized
+            // since ParentWorkUnitId chains repeat heavily across a large subtree.
+            var rootCache = new Dictionary<string, string>();
+            string ResolveRoot(string workUnitId)
+            {
+                if (rootCache.TryGetValue(workUnitId, out var cached)) return cached;
+                var current = workUnitId;
+                while (workUnitById.TryGetValue(current, out var wu) && wu.ParentWorkUnitId is { } parentId)
+                    current = parentId;
+                rootCache[workUnitId] = current;
+                return current;
+            }
+            // "Stalled" must mean NOTHING under the whole goal is moving — not just "no agent on
+            // the root work unit itself." An orchestrator is legitimately idle while its planner/
+            // worker children execute (it only wakes for review/reconciliation), and any queued
+            // scheduler item means the poller will drive things forward without an agent existing
+            // yet. Checking only the root's own agent showed a false "stalled" badge + Reinvoke
+            // button through the entire healthy middle of a goal's life.
+            var activeRootIds = activeWorkUnitIds.Select(ResolveRoot).ToHashSet();
+            foreach (var item in pending)
+                activeRootIds.Add(ResolveRoot(item.WorkUnitId));
+
+            var parkedReasonByRoot = new Dictionary<string, string>();
+            var parkedWorkUnitIdsByRoot = new Dictionary<string, List<string>>();
+            foreach (var item in pending)
+            {
+                // Priority: a human/extension needs to act on Credentials or Resume; FileLease
+                // usually clears itself, so only surface it if nothing more actionable is parked.
+                string? reason = item.AwaitingCredentials ? "AwaitingCredentials"
+                    : item.AwaitingResume ? "AwaitingResume"
+                    : item.AwaitingFileLease ? "AwaitingFileLease"
+                    : null;
+                if (reason is null) continue;
+
+                var root = ResolveRoot(item.WorkUnitId);
+                if (!parkedReasonByRoot.TryGetValue(root, out var existing) ||
+                    (existing == "AwaitingFileLease" && reason != "AwaitingFileLease"))
+                {
+                    parkedReasonByRoot[root] = reason;
+                }
+                (parkedWorkUnitIdsByRoot.TryGetValue(root, out var list)
+                    ? list
+                    : parkedWorkUnitIdsByRoot[root] = []).Add(item.WorkUnitId);
+            }
+
             var storedGoals = await goalNodes.ListAsync(ct).ConfigureAwait(false);
             if (storedGoals.Count > 0)
             {
@@ -3582,9 +3839,6 @@ public static class StudioRestEndpoints
                 // (only Pause/Resume set Paused/Exploring), so goal-store goals otherwise report
                 // "Exploring" forever even after their work unit finished. Derive the effective
                 // terminal status here and lazily write it back so the store converges.
-                var allWorkUnits = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
-                var workUnitById = allWorkUnits.ToDictionary(wu => wu.WorkUnitId);
-
                 var goals = new List<object>(storedGoals.Count);
                 foreach (var g in storedGoals)
                 {
@@ -3605,6 +3859,12 @@ public static class StudioRestEndpoints
                         }
                     }
 
+                    parkedReasonByRoot.TryGetValue(g.WorkUnitId, out var parkedReason);
+                    parkedWorkUnitIdsByRoot.TryGetValue(g.WorkUnitId, out var parkedIds);
+                    var orchestratorStalled = g.ParentGoalId is null
+                        && parkedReason is null
+                        && effectiveStatus is not (GoalStatus.Converged or GoalStatus.Abandoned or GoalStatus.Paused)
+                        && !activeRootIds.Contains(g.WorkUnitId);
                     goals.Add(new
                     {
                         goalId = g.GoalId,
@@ -3615,24 +3875,45 @@ public static class StudioRestEndpoints
                         pauseReason = g.PauseReason,
                         parentGoalId = g.ParentGoalId,
                         createdAt = g.CreatedAt,
-                        updatedAt = g.UpdatedAt
+                        updatedAt = g.UpdatedAt,
+                        hasParkedWork = parkedReason is not null,
+                        parkedReason,
+                        parkedWorkUnitIds = (IReadOnlyList<string>?)parkedIds ?? [],
+                        orchestratorStalled,
+                        orchestratorProfileId = orchestratorStalled ? agents.GetOrchestratorProfileId(g.WorkUnitId) : null
                     });
                 }
                 return Results.Ok(new { goals, source = "goal-store" });
             }
 
             var items = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
-            var fallback = items.Select(wu => new
+            var fallback = items.Select(wu =>
             {
-                goalId = wu.WorkUnitId,
-                goal = wu.Goal,
-                workUnitId = wu.WorkUnitId,
-                branchId = wu.BranchId,
-                status = wu.Status.ToString(),
-                pauseReason = (string?)null,
-                parentWorkUnitId = wu.ParentWorkUnitId,
-                createdAt = wu.CreatedAt,
-                updatedAt = wu.UpdatedAt
+                parkedReasonByRoot.TryGetValue(wu.WorkUnitId, out var parkedReason);
+                parkedWorkUnitIdsByRoot.TryGetValue(wu.WorkUnitId, out var parkedIds);
+                // Only meaningful for a root goal (no parent) — a child work unit is never itself
+                // an orchestrator target.
+                var orchestratorStalled = wu.ParentWorkUnitId is null
+                    && parkedReason is null
+                    && wu.Status is not (WorkUnitStatus.Completed or WorkUnitStatus.Merged or WorkUnitStatus.Cancelled)
+                    && !activeRootIds.Contains(wu.WorkUnitId);
+                return new
+                {
+                    goalId = wu.WorkUnitId,
+                    goal = wu.Goal,
+                    workUnitId = wu.WorkUnitId,
+                    branchId = wu.BranchId,
+                    status = wu.Status.ToString(),
+                    pauseReason = (string?)null,
+                    parentWorkUnitId = wu.ParentWorkUnitId,
+                    createdAt = wu.CreatedAt,
+                    updatedAt = wu.UpdatedAt,
+                    hasParkedWork = parkedReason is not null,
+                    parkedReason,
+                    parkedWorkUnitIds = (IReadOnlyList<string>?)parkedIds ?? [],
+                    orchestratorStalled,
+                    orchestratorProfileId = orchestratorStalled ? agents.GetOrchestratorProfileId(wu.WorkUnitId) : null,
+                };
             }).ToList();
             return Results.Ok(new { goals = fallback, source = "work-units" });
         });

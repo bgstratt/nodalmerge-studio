@@ -96,6 +96,8 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IDeadLetterService>(sp => sp.GetRequiredService<InMemoryDeadLetterService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryDeadLetterService>());
 
+        services.AddSingleton<IRuntimeCredentialCache, RuntimeCredentialCache>();
+
         services.AddSingleton<WorkSchedulerService>();
         services.AddSingleton<IWorkScheduler>(sp => sp.GetRequiredService<WorkSchedulerService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<WorkSchedulerService>());

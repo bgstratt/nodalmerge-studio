@@ -389,9 +389,51 @@ export class DecisionConvergencePanel {
           });
           void vscode.window.showWarningMessage('Reverting the workspace and restarting with your notes as steering context.');
           break;
+        case 'unrejectAndRevise': {
+          // A proposal that's already Rejected has no legal transition back through /review — the
+          // only way back is the standalone retry primitive. Requiring notes here (unlike accept)
+          // is deliberate: a hard-rejected proposal already has no recorded reason half the time
+          // (see the MCP-bypass bug this button exists to give a manual escape hatch from), so the
+          // retried worker needs SOMETHING to go on or it's back to guessing.
+          const notes = (msg.notes as string | undefined) || undefined;
+          if (!notes) {
+            void vscode.window.showWarningMessage('NodalMerge: add a note first — the retried worker has no other context for why this was rejected.');
+            return;
+          }
+          try {
+            const result = await this.post<{ outcome: string }>(
+              '/studio/merges/' + this.proposalId + '/retry',
+              { notes, sessionId: this.getEffectiveSessionId() });
+            if (result.outcome === 'EscalatedToDeadLetter') {
+              void vscode.window.showWarningMessage(
+                'NodalMerge: max retry attempts already reached — escalated to the dead-letter queue instead. Use Dead Letters > Retry with Context.');
+            } else {
+              void vscode.window.showInformationMessage('NodalMerge: retrying with your notes as steering context.');
+            }
+          } catch (err) {
+            void vscode.window.showErrorMessage('NodalMerge: retry failed — ' + String(err));
+          }
+          break;
+        }
         case 'applyDecision':
-          await this.post('/studio/merges/' + this.proposalId + '/apply', {});
-          void vscode.window.showInformationMessage('Decision applied successfully.');
+          try {
+            await this.post('/studio/merges/' + this.proposalId + '/apply', {});
+            void vscode.window.showInformationMessage('Decision applied successfully.');
+          } catch (err) {
+            // A conflicting apply isn't a dead end — the backend auto-spawns a reconciliation
+            // agent (or records a conflict a human can Reconcile/Resolve) and says so in the
+            // error text. Showing that as a raw failure toast made it look like nothing happened
+            // while an agent was already working; distinguish "in progress elsewhere" from a
+            // genuine failure.
+            const text = String(err);
+            if (text.includes('reconciliation agent has been started')) {
+              void vscode.window.showInformationMessage(
+                'NodalMerge: conflict detected — a reconciliation agent is combining both versions now. ' +
+                'Its merged proposal will supersede this one; progress is visible in the Activity Center.');
+            } else {
+              void vscode.window.showErrorMessage('NodalMerge: apply failed — ' + text);
+            }
+          }
           break;
         case 'forkHypothesis': {
           const goal = await vscode.window.showInputBox({
@@ -964,6 +1006,7 @@ const DC_HTML = `
       <button id="btn-accept" class="accept">Accept Decision</button>
       <button id="btn-revise" class="reject" title="Keep the current file changes and nudge the agent toward the gap.">Revise</button>
       <button id="btn-revert" class="reject" title="Discard the agent's changes and start the goal over with your notes.">Revert and Restart</button>
+      <button id="btn-unreject" class="reject" title="This proposal is already Rejected (a dead end otherwise — no other action can move it) — reset the task to Queued and retry with your notes as steering context.">Unreject and Revise</button>
       <button id="btn-apply"  class="apply">Apply Decision</button>
       <button id="btn-fork"   class="ghost">Fork Hypothesis</button>
       <button id="btn-restore" class="ghost">Restore workspace</button>

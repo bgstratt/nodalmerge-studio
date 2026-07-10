@@ -14,7 +14,8 @@ public sealed class InMemoryDeadLetterService(
     IOrchestrationDecisionLogService decisionLog,
     IProjectionManager projections,
     ISteeringDecisionService steeringDecisions,
-    IFileLeaseService fileLease) : IDeadLetterService, IRehydratable
+    IFileLeaseService fileLease,
+    IRuntimeCredentialCache? credentialCache = null) : IDeadLetterService, IRehydratable
 {
     public const int MaxFailureAttempts = 3;
 
@@ -34,6 +35,7 @@ public sealed class InMemoryDeadLetterService(
         string? apiKey = null,
         string? provider = null,
         FailureKind kind = FailureKind.Exception,
+        string? credentialRef = null,
         CancellationToken cancellationToken = default)
     {
         var updatedUnit = await workUnits.IncrementFailureAttemptCountAsync(workUnitId, cancellationToken)
@@ -42,6 +44,10 @@ public sealed class InMemoryDeadLetterService(
 
         var snapshot = lastProjectionSnapshot ?? await TryCaptureProjectionAsync(workUnitId, cancellationToken)
             .ConfigureAwait(false);
+
+        // Shared capture point, same as WorkSchedulerService.EnqueueAsync — a dead letter carries
+        // whatever credentials the failed run actually used, so warm the cache from them too.
+        credentialCache?.Capture(credentialRef, provider, model, baseUrl, apiKey);
 
         var entry = new DeadLetterEntry(
             $"DL-{Guid.NewGuid():N}",
@@ -59,7 +65,8 @@ public sealed class InMemoryDeadLetterService(
             baseUrl,
             apiKey,
             provider,
-            kind);
+            kind,
+            credentialRef);
 
         _entries[entry.EntryId] = entry;
         await nodeStore.WriteNodeAsync(
@@ -133,12 +140,13 @@ public sealed class InMemoryDeadLetterService(
         if (!_entries.TryGetValue(entryId, out var entry))
             return new DeadLetterRetryResult(DeadLetterRetryOutcome.NotFound, "Dead-letter entry not found.");
 
-        if (entry.MaxAttemptsReached || entry.AttemptCount >= MaxFailureAttempts)
-        {
-            return new DeadLetterRetryResult(
-                DeadLetterRetryOutcome.MaxAttemptsReached,
-                "Max attempts reached.");
-        }
+        // No max-attempts block here. RetryAsync is only ever reached by an explicit retry request
+        // (REST endpoint or MCP dead-letter tool) — the automated pipeline's own spin-prevention
+        // happens upstream, in the rejection/failure counters that decide whether to dead-letter in
+        // the first place. Someone explicitly asking to retry a dead-lettered unit has already seen
+        // the attempt count and decided to spend more; the system's job is to warn (the count is on
+        // the entry), not to block. Previously this returned MaxAttemptsReached and stranded the
+        // work with no recovery at all once AttemptCount hit the cap.
 
         var unit = await workUnits.GetAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
         if (unit is null)
@@ -171,6 +179,7 @@ public sealed class InMemoryDeadLetterService(
             apiKey: creds.ApiKey,
             provider: creds.Provider,
             sessionId: null,
+            credentialRef: creds.CredentialRef,
             ct: cancellationToken).ConfigureAwait(false);
 
         return new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried);
@@ -183,17 +192,15 @@ public sealed class InMemoryDeadLetterService(
         string? overrideApiKey,
         string? overrideProvider,
         string? overrideProfileId,
-        CancellationToken cancellationToken)
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default)
     {
         if (!_entries.TryGetValue(entryId, out var entry))
             return new DeadLetterRetryResult(DeadLetterRetryOutcome.NotFound, "Dead-letter entry not found.");
 
-        if (entry.MaxAttemptsReached || entry.AttemptCount >= MaxFailureAttempts)
-        {
-            return new DeadLetterRetryResult(
-                DeadLetterRetryOutcome.MaxAttemptsReached,
-                "Max attempts reached.");
-        }
+        // Same reasoning as RetryAsync above — an explicit human retry (here with different
+        // credentials/model, i.e. even more clearly a deliberate new decision) is never blocked by
+        // the attempt cap, only informed by it.
 
         var unit = await workUnits.GetAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
         if (unit is null)
@@ -207,7 +214,7 @@ public sealed class InMemoryDeadLetterService(
         }
 
         var profileId = overrideProfileId ?? entry.ProfileId;
-        var creds = ResolveRetryCredentials(entry, unit, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider);
+        var creds = ResolveRetryCredentials(entry, unit, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider, overrideCredentialRef);
 
         try
         {
@@ -227,6 +234,7 @@ public sealed class InMemoryDeadLetterService(
             apiKey: creds.ApiKey,
             provider: creds.Provider,
             sessionId: null,
+            credentialRef: creds.CredentialRef,
             ct: cancellationToken).ConfigureAwait(false);
 
         return new DeadLetterRetryResult(DeadLetterRetryOutcome.Retried);
@@ -241,26 +249,35 @@ public sealed class InMemoryDeadLetterService(
     // When credential overrides are supplied, they take top priority — this lets a human retry
     // with a different model/profile (e.g. switching from vscode-lm to deepseek) without spawning
     // a new work unit.
-    private (string? Model, string? BaseUrl, string? ApiKey, string? Provider) ResolveRetryCredentials(
+    // ApiKey itself is resolved in three tiers, cheapest/freshest first: entry.ApiKey (same-process,
+    // never survives a restart since it's [JsonIgnore]d), then IRuntimeCredentialCache by
+    // CredentialRef (survives a restart iff someone has resupplied it since), then whatever the live
+    // orchestrator registry still has. If all three miss, ApiKey comes back null and the caller
+    // parks AwaitingCredentials instead of dispatching with nothing.
+    private (string? Model, string? BaseUrl, string? ApiKey, string? Provider, string? CredentialRef) ResolveRetryCredentials(
         DeadLetterEntry entry, WorkUnit unit,
         string? overrideModel = null,
         string? overrideBaseUrl = null,
         string? overrideApiKey = null,
-        string? overrideProvider = null)
+        string? overrideProvider = null,
+        string? overrideCredentialRef = null)
     {
         // Phase Y — human-chosen credential override takes absolute priority.
         if (!string.IsNullOrWhiteSpace(overrideModel) || !string.IsNullOrWhiteSpace(overrideBaseUrl))
-            return (overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider);
+            return (overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider, overrideCredentialRef);
 
         if (!string.IsNullOrWhiteSpace(entry.BaseUrl) || !string.IsNullOrWhiteSpace(entry.Model))
-            return (entry.Model, entry.BaseUrl, entry.ApiKey, entry.Provider);
+        {
+            var apiKey = entry.ApiKey ?? credentialCache?.TryGet(entry.CredentialRef)?.ApiKey;
+            return (entry.Model, entry.BaseUrl, apiKey, entry.Provider, entry.CredentialRef);
+        }
 
         var creds = agentControl.GetCredentialsForStage(unit.WorkUnitId, entry.Stage)
             ?? agentControl.GetOrchestratorCredentials(unit.WorkUnitId)
             ?? (unit.ParentWorkUnitId is { } parentId
                 ? agentControl.GetCredentialsForStage(parentId, entry.Stage) ?? agentControl.GetOrchestratorCredentials(parentId)
                 : null);
-        return (creds?.Model, creds?.BaseUrl, creds?.ApiKey, creds?.Provider);
+        return (creds?.Model, creds?.BaseUrl, creds?.ApiKey, creds?.Provider, creds?.CredentialRef);
     }
 
     public async Task<DeadLetterRetryResult> RetryWithContextAsync(
@@ -271,6 +288,7 @@ public sealed class InMemoryDeadLetterService(
         string? overrideApiKey,
         string? overrideProvider,
         string? overrideProfileId,
+        string? overrideCredentialRef,
         CancellationToken cancellationToken)
     {
         if (!_entries.TryGetValue(entryId, out var entry))
@@ -294,7 +312,7 @@ public sealed class InMemoryDeadLetterService(
             entry.WorkUnitId, amendedGoal, steeringContext, entryId, cancellationToken).ConfigureAwait(false);
 
         var profileId = overrideProfileId ?? entry.ProfileId;
-        var creds = ResolveRetryCredentials(entry, unit, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider);
+        var creds = ResolveRetryCredentials(entry, unit, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider, overrideCredentialRef);
 
         try
         {
@@ -314,6 +332,7 @@ public sealed class InMemoryDeadLetterService(
             apiKey: creds.ApiKey,
             provider: creds.Provider,
             sessionId: null,
+            credentialRef: creds.CredentialRef,
             ct: cancellationToken).ConfigureAwait(false);
 
         await steeringDecisions.RecordAsync(
@@ -336,7 +355,7 @@ public sealed class InMemoryDeadLetterService(
         string entryId,
         string steeringContext,
         CancellationToken cancellationToken = default)
-        => RetryWithContextAsync(entryId, steeringContext, null, null, null, null, null, cancellationToken);
+        => RetryWithContextAsync(entryId, steeringContext, null, null, null, null, null, null, cancellationToken);
 
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {

@@ -108,6 +108,13 @@ public static class MergeProposalTransitions
             // behind it by the time a proposal is Approved.
             (MergeProposalStatus.Approved, MergeProposalStatus.Rejected) => true,
 
+            // Human override — a rejection (whether from an agent reviewer or an earlier human) is
+            // a recommendation, not a wall. The person who paid for the work gets to overrule it
+            // and accept anyway ("I don't care about the missing unit test, I want the working
+            // code"). Rejected was previously a terminal dead end with no outgoing edge at all,
+            // which meant one bad agent rejection permanently stranded finished work.
+            (MergeProposalStatus.Rejected, MergeProposalStatus.Approved) => true,
+
             (MergeProposalStatus.ReadyForReview, MergeProposalStatus.Superseded) => true,
             (MergeProposalStatus.Approved, MergeProposalStatus.Superseded) => true,
             // A fanned-out task child's own proposal reaches Merged the moment its TaskReviewPolicy

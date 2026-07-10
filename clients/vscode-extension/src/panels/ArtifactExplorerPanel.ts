@@ -34,6 +34,9 @@ interface WorkUnit {
   fanOutInfo?: WorkUnitFanOutInfo | null;
   forkType?: string | null;
   metadata?: Record<string, string> | null;
+  awaitingFileLease?: boolean;
+  awaitingResume?: boolean;
+  awaitingCredentials?: boolean;
 }
 
 interface StudioOptions {
@@ -60,6 +63,19 @@ interface ExecutionSession {
   rootWorkUnitId: string;
   status: string;
   startedAt: string;
+  // Merged in client-side from GET /studio/goals by rootWorkUnitId — ExecutionSessionStatus
+  // (the field above) is a human-initiated pause/resume and is never touched by a Host restart,
+  // so a session can read "Active" while the scheduler has actually parked work underneath it
+  // (AwaitingResume/AwaitingFileLease/AwaitingCredentials). Surfaced here so the goal workspace's
+  // pause/resume toolbar can show that instead of a plain, misleading "Pause" button.
+  hasParkedWork?: boolean;
+  parkedReason?: string | null;
+  parkedWorkUnitIds?: string[];
+  // No live agent and nothing parked underneath — most commonly because every child finished
+  // while the orchestrator's registration was cold after a restart, so it was never woken back up
+  // to notice (ReinvokeOrchestratorAsync silently no-ops without resolvable credentials).
+  orchestratorStalled?: boolean;
+  orchestratorProfileId?: string | null;
 }
 
 interface KnownGoodState {
@@ -403,6 +419,28 @@ export class GoalWorkspacePanel {
   private async refreshSessions(): Promise<void> {
     try {
       const sessions = await this.get<ExecutionSession[]>('/studio/sessions');
+
+      // Merge in the scheduler-parked rollup GET /studio/goals already computes (by workUnitId
+      // == rootWorkUnitId) — best-effort, since /studio/goals is a bigger, secondary call and a
+      // failure here shouldn't block the session list itself from showing.
+      try {
+        const goalsResp = await this.get<{ goals: Array<{
+          workUnitId: string; hasParkedWork?: boolean; parkedReason?: string | null; parkedWorkUnitIds?: string[];
+          orchestratorStalled?: boolean; orchestratorProfileId?: string | null;
+        }> }>('/studio/goals');
+        const byWorkUnitId = new Map(goalsResp.goals.map(g => [g.workUnitId, g]));
+        for (const session of sessions) {
+          const goal = byWorkUnitId.get(session.rootWorkUnitId);
+          session.hasParkedWork = goal?.hasParkedWork ?? false;
+          session.parkedReason = goal?.parkedReason ?? null;
+          session.parkedWorkUnitIds = goal?.parkedWorkUnitIds ?? [];
+          session.orchestratorStalled = goal?.orchestratorStalled ?? false;
+          session.orchestratorProfileId = goal?.orchestratorProfileId ?? null;
+        }
+      } catch {
+        // Non-fatal — sessions still render, just without the parked rollup.
+      }
+
       void this.panel.webview.postMessage({
         type: 'sessions', sessions, selectedSessionId: this.selectedSessionId ?? '',
       });
@@ -678,6 +716,12 @@ export class GoalWorkspacePanel {
         case 'explorerGoalResume':
           await this.handleGoalResume(msg.goalId as string);
           break;
+        case 'explorerResumeParkedWork':
+          await this.handleResumeParkedWork(Array.isArray(msg.workUnitIds) ? (msg.workUnitIds as string[]) : []);
+          break;
+        case 'explorerReinvokeOrchestrator':
+          await this.handleReinvokeOrchestrator(msg.workUnitId as string, (msg.profileId as string | null) ?? null);
+          break;
         case 'explorerCounterfactualAction':
           await this.handleCounterfactualAction(
             msg.workUnitId as string,
@@ -698,6 +742,74 @@ export class GoalWorkspacePanel {
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: ' + String(err));
     }
+  }
+
+  // Resumes every scheduler item GET /studio/goals flagged as parked (AwaitingResume/
+  // AwaitingFileLease/AwaitingCredentials) under one goal in one click — the goal-level
+  // "Pause"/"Resume" toolbar button drives ExecutionSessionStatus (a human-initiated pause,
+  // never touched by a restart), which is a different concept entirely from these per-task
+  // scheduler parks; this is the action that actually unsticks a goal.
+  private async handleResumeParkedWork(workUnitIds: string[]): Promise<void> {
+    if (workUnitIds.length === 0) { return; }
+    let failures = 0;
+    for (const workUnitId of workUnitIds) {
+      try {
+        await this.resumeWorkUnit(workUnitId);
+      } catch (err) {
+        failures++;
+        void vscode.window.showErrorMessage('NodalMerge: Resume failed for ' + workUnitId + ' — ' + String(err));
+      }
+    }
+    void vscode.window.showInformationMessage(
+      'NodalMerge: Resumed ' + (workUnitIds.length - failures) + '/' + workUnitIds.length + ' parked task(s).',
+    );
+    await this.refreshSessions();
+    if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+  }
+
+  // Manual recovery for a stalled orchestrator (see WorkUnit.orchestratorStalled) — resolves fresh
+  // credentials for whichever profile the orchestrator was originally spawned under (returned by
+  // GET /studio/goals as orchestratorProfileId, itself sourced from the rehydrated routing config)
+  // and calls the reinvoke endpoint, which is guarded server-side against double-spawning a second
+  // live orchestrator over an already-running one.
+  //
+  // orchestratorProfileId is null for any orchestrator spawned before the routing-persistence fix
+  // shipped — there was nowhere to persist a profile id yet, so nothing survived the restart to
+  // look one up from. Rather than fail outright, fall back to asking which profile to use, same as
+  // the Steer & Retry "use new profile" picker elsewhere in this panel.
+  private async handleReinvokeOrchestrator(workUnitId: string, profileId: string | null): Promise<void> {
+    if (!profileId) {
+      const picked = await this.configService?.pickProfile(
+        'No orchestrator profile is on record for this goal (it predates a fix) — pick one to reinvoke with',
+      );
+      if (!picked) { return; } // user cancelled
+      profileId = picked.id;
+    }
+
+    let body: Record<string, string> = { overrideProfileId: profileId };
+    if (this.configService && this.secrets) {
+      const llm = await this.configService.resolveSpawnLlmConfig(profileId, this.secrets, this.lmProxyBaseUrl ?? '');
+      if (llm) {
+        body = {
+          overrideProfileId: profileId,
+          overrideModel: llm.model, overrideBaseUrl: llm.baseUrl,
+          overrideApiKey: llm.apiKey, overrideProvider: llm.provider,
+          overrideCredentialRef: llm.credentialRef,
+        };
+      } else {
+        const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl ?? '');
+        void vscode.window.showWarningMessage('NodalMerge: could not resolve credentials for profile "' + profileId + '" (' + reason + ') — reinvoking without them will likely fail.');
+      }
+    }
+
+    try {
+      await this.post('/studio/workunits/' + workUnitId + '/reinvoke-orchestrator', body);
+      void vscode.window.showInformationMessage('NodalMerge: Orchestrator reinvoked.');
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: Reinvoke failed — ' + String(err));
+    }
+    await this.refreshSessions();
+    if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
   }
 
   private async handleGoalPause(goalId: string): Promise<void> {
@@ -786,6 +898,53 @@ export class GoalWorkspacePanel {
       return;
     }
 
+    if (action === 'continueDeadLetter') {
+      // Only valid for a MaxIterationsExceeded failure — resumes this same work unit with its
+      // reconstructed prior conversation and a fresh iteration budget (POST /continue takes just
+      // the dead-letter entryId, not workUnitId, so resolve it via the by-work-unit lookup first,
+      // same as steerDeadLetterRetry above). Any other failure kind gets a NotApplicable/400 from
+      // the server, surfaced here as a plain error rather than pre-checking the kind client-side.
+      let entry: { entryId: string; profileId: string } | undefined;
+      try {
+        entry = await this.get<{ entryId: string; profileId: string }>('/studio/dead-letter/by-work-unit/' + workUnitId);
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: Could not load dead-letter entry — ' + String(err));
+        return;
+      }
+
+      // Always try to resupply from the entry's own original profile — this is what makes
+      // Continue actually work after a Host restart wiped the shared credential cache, instead of
+      // silently re-dead-lettering with "missing LLM credentials" the moment it tries the LLM
+      // call. Best-effort: if resolution fails, fall through with no override and let the
+      // server's own entry/cache/registry fallback chain try (same behavior as before this existed).
+      let continueBody: Record<string, string> = {};
+      if (entry.profileId && this.configService && this.secrets) {
+        const llm = await this.configService.resolveSpawnLlmConfig(entry.profileId, this.secrets, this.lmProxyBaseUrl ?? '');
+        if (llm) {
+          continueBody = {
+            overrideModel: llm.model, overrideBaseUrl: llm.baseUrl,
+            overrideApiKey: llm.apiKey, overrideProvider: llm.provider,
+            overrideCredentialRef: llm.credentialRef,
+          };
+        }
+      }
+
+      try {
+        const result = await this.post<{ outcome?: string; message?: string }>(
+          '/studio/dead-letter/' + entry.entryId + '/continue', continueBody,
+        );
+        void vscode.window.showInformationMessage(
+          result?.outcome === 'Parked'
+            ? 'NodalMerge: ' + (result.message ?? 'Parked — waiting on a file lease or clarification.')
+            : 'NodalMerge: Continue completed successfully.',
+        );
+        if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: Continue failed — ' + String(err));
+      }
+      return;
+    }
+
     if (action === 'steerForkFromNode') {
       const goal = await vscode.window.showInputBox({
         prompt: 'Goal for the fork from this node',
@@ -821,24 +980,53 @@ export class GoalWorkspacePanel {
   }
 
   // Phase Y — Steer & Retry with credential override from the Decision Lens inline UI.
+  //
+  // The webview itself can never hold a real API key (it has no SecretStorage access), so
+  // overrideModel/overrideBaseUrl/overrideApiKey/overrideProvider coming from msg are NOT trusted
+  // here — msg.overrideApiKey is always blank by construction (goalWorkspace.js only ever fills
+  // in overrideProfileId, from a client-side profile list that never carries the real secret).
+  // Instead: resolve the actual credentials host-side via configService/secrets, for whichever
+  // profile is in play (the one the user picked, or — if they didn't pick one — the entry's own
+  // original profile, which is exactly the resupply a restart-cold cache needs). This is the same
+  // "server never receives the key from an untrusted source" pattern used for spawn/resume.
   private async handleSteeredRetrySend(msg: Record<string, unknown>): Promise<void> {
     const workUnitId = msg.workUnitId as string;
     const steeringContext = (msg.steeringContext as string) || '';
-    const overrideModel = (msg.overrideModel as string) || undefined;
-    const overrideBaseUrl = (msg.overrideBaseUrl as string) || undefined;
-    const overrideApiKey = (msg.overrideApiKey as string) || undefined;
-    const overrideProvider = (msg.overrideProvider as string) || undefined;
     const overrideProfileId = (msg.overrideProfileId as string) || undefined;
 
-    // Load the dead-letter entry to get the entryId
-    let entry: { entryId: string; reason: string; attemptCount: number } | undefined;
+    // Load the dead-letter entry to get the entryId and its original profileId.
+    let entry: { entryId: string; reason: string; attemptCount: number; profileId: string } | undefined;
     try {
-      entry = await this.get<{ entryId: string; reason: string; attemptCount: number }>(
+      entry = await this.get<{ entryId: string; reason: string; attemptCount: number; profileId: string }>(
         '/studio/dead-letter/by-work-unit/' + workUnitId,
       );
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: Could not load dead-letter entry — ' + String(err));
       return;
+    }
+
+    let overrideModel: string | undefined;
+    let overrideBaseUrl: string | undefined;
+    let overrideApiKey: string | undefined;
+    let overrideProvider: string | undefined;
+    let overrideCredentialRef: string | undefined;
+    const targetProfileId = overrideProfileId || entry.profileId;
+    if (targetProfileId && this.configService && this.secrets) {
+      const llm = await this.configService.resolveSpawnLlmConfig(targetProfileId, this.secrets, this.lmProxyBaseUrl ?? '');
+      if (llm) {
+        overrideModel = llm.model;
+        overrideBaseUrl = llm.baseUrl;
+        overrideApiKey = llm.apiKey;
+        overrideProvider = llm.provider;
+        overrideCredentialRef = llm.credentialRef;
+      } else if (overrideProfileId) {
+        // Only surface this as an error when the user explicitly picked a profile — if it's just
+        // the entry's original profile that can't resolve, fall through silently and let the
+        // dead-letter entry's own captured credentials (or shared cache) try instead, same as
+        // before this resolution existed.
+        const reason = await this.configService.describeMissingCredentials(targetProfileId, this.secrets, this.lmProxyBaseUrl ?? '');
+        void vscode.window.showWarningMessage('NodalMerge: could not resolve credentials for the selected profile (' + reason + ') — retrying without an override.');
+      }
     }
 
     try {
@@ -849,6 +1037,7 @@ export class GoalWorkspacePanel {
         overrideApiKey,
         overrideProvider,
         overrideProfileId,
+        overrideCredentialRef,
       });
       void vscode.window.showInformationMessage(
         'NodalMerge: Retrying with steering' + (overrideProfileId ? ' using profile ' + overrideProfileId : '') + '.');
@@ -1171,7 +1360,48 @@ export class GoalWorkspacePanel {
     }
   }
 
+  // Resolves fresh credentials for whichever profile a parked scheduler item was dispatched
+  // under (best-effort — falls through with no resupply if unresolvable) and force-clears
+  // whatever park flag(s) are set (AwaitingResume/AwaitingFileLease/AwaitingCredentials), via
+  // POST /studio/scheduler/{workUnitId}/resume. Shared by the single-node Resume button and the
+  // goal-level "Resume parked work" action so both go through the exact same resolution.
+  private async resumeWorkUnit(workUnitId: string): Promise<void> {
+    let body: Record<string, string> = {};
+    if (this.configService && this.secrets) {
+      // The scheduler queue item (not WorkUnit, which doesn't carry profileId) says which
+      // profile this task was dispatched under — re-fetch it here rather than threading it
+      // through the click handler, since resume is a rare, human-initiated action.
+      const pending = await this.get<Array<{ workUnitId: string; profileId: string }>>('/studio/scheduler/pending').catch(() => []);
+      const item = pending?.find(i => i.workUnitId === workUnitId);
+      if (item?.profileId) {
+        const profile = this.configService.getProfiles().find(p => p.id === item.profileId);
+        if (profile) {
+          const llm = await this.configService.resolveSpawnLlmConfig(profile.id, this.secrets, this.lmProxyBaseUrl ?? '');
+          if (llm) {
+            body = { ...llm };
+          } else {
+            const reason = await this.configService.describeMissingCredentials(profile.id, this.secrets, this.lmProxyBaseUrl ?? '');
+            void vscode.window.showWarningMessage('NodalMerge: could not resolve credentials to resupply for ' + workUnitId + ' (' + reason + ') — resuming without them.');
+          }
+        }
+      }
+    }
+    await this.post('/studio/scheduler/' + workUnitId + '/resume', body);
+  }
+
   private async handleWorkUnitAction(action: string, workUnitId: string): Promise<void> {
+    if (action === 'resumeWorker') {
+      // AwaitingFileLease usually clears itself once the lease holder releases — but the flag and
+      // the file lease's own state are tracked independently and can drift (e.g. after the
+      // lease-scoping change, or the holder getting force-released some other way), leaving it
+      // stuck with nothing actually blocking it. Resume force-clears every park flag
+      // unconditionally; if a wait is still genuinely real, the worker just re-parks on retry.
+      await this.resumeWorkUnit(workUnitId);
+      void vscode.window.showInformationMessage('NodalMerge: Resumed work unit.');
+      if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+      return;
+    }
+
     if (action === 'spawnTask') {
       // A plain sibling task under this node — same "create the work unit and let the parent's
       // next fan-out pass pick it up" mechanism Fork Hypothesis already uses below (POST
@@ -1481,6 +1711,7 @@ const GW_CSS = `
   .badge.reviewing, .badge.proposed { background: var(--nm-info); color: #fff; }
   .badge.executing, .badge.queued, .badge.retrying { background: var(--nm-warn); color: #000; }
   .badge.blocked { background: var(--nm-error); color: #fff; }
+  .badge.paused { background: transparent; border: 1px solid var(--nm-warn); color: var(--nm-warn); }
   .badge.stage { background: transparent; border: 1px solid var(--nm-border); color: var(--nm-fg); opacity: 0.8; }
   .badge.stage.plan { background: var(--nm-info); color: #fff; border-color: transparent; opacity: 1; }
   .badge.stage.execute { background: var(--nm-warn); color: #000; border-color: transparent; opacity: 1; }
@@ -1656,6 +1887,10 @@ const GW_HTML = `
         <select id="gw-session"><option value="">(no exploration)</option></select>
         <button id="gw-session-pause" class="ghost" title="Pause this exploration" style="display:none;color:var(--nm-warn);border-color:var(--nm-warn);padding:3px 8px;font-size:0.78em">&#x23F8; Pause</button>
         <button id="gw-session-resume" class="ghost" title="Resume this exploration" style="display:none;padding:3px 8px;font-size:0.78em">&#x25B6; Resume</button>
+        <span id="gw-session-parked-badge" class="badge paused" style="display:none"></span>
+        <button id="gw-session-resume-parked" class="ghost" style="display:none;color:var(--nm-warn);border-color:var(--nm-warn);padding:3px 8px;font-size:0.78em">&#x21BA; Resume parked work</button>
+        <span id="gw-session-stalled-badge" class="badge paused" style="display:none">stalled</span>
+        <button id="gw-session-reinvoke" class="ghost" title="No orchestrator is running for this goal and nothing is parked — click to wake it back up" style="display:none;color:var(--nm-warn);border-color:var(--nm-warn);padding:3px 8px;font-size:0.78em">&#x21BA; Reinvoke Orchestrator</button>
       </div>
     </div>
     <div class="gw-field">

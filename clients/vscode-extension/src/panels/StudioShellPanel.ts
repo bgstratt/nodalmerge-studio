@@ -127,6 +127,9 @@ export class StudioShellPanel implements vscode.Disposable {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
+        // VS Code's built-in webview find widget (Ctrl+F) — off by default, which made every
+        // Studio view un-searchable: no way to find text in conversations, cards, or timelines.
+        enableFindWidget: true,
         localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'out')],
       },
     );

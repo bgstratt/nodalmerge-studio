@@ -67,6 +67,23 @@ public sealed class InMemoryCandidateConflictService(IStudioNodeStore nodeStore)
         return updated;
     }
 
+    public async Task<CandidateConflictRecord?> TryReopenAsync(string conflictId, CancellationToken ct = default)
+    {
+        CandidateConflictRecord? updated;
+        lock (_lock)
+        {
+            if (!_byId.TryGetValue(conflictId, out var existing) || existing.Status != CandidateConflictStatus.Reconciling)
+                return null;
+            updated = existing with { Status = CandidateConflictStatus.Open };
+            _byId[conflictId] = updated;
+        }
+
+        await nodeStore.WriteNodeAsync(
+            StudioNodeKind.CandidateConflictV1, conflictId, JsonSerializer.Serialize(updated), ct)
+            .ConfigureAwait(false);
+        return updated;
+    }
+
     public async Task<CandidateConflictRecord?> MarkResolvedAsync(string conflictId, CancellationToken ct = default)
     {
         CandidateConflictRecord? updated;

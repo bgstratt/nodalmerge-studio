@@ -21,7 +21,9 @@ public sealed class ReplanService(
     IWorkUnitService workUnits,
     IFanOutService fanOut,
     IAgentControlService agentControl,
-    IServiceProvider serviceProvider) : IReplanService
+    IServiceProvider serviceProvider,
+    IFileLeaseService fileLease,
+    IWorkScheduler scheduler) : IReplanService
 {
     public async Task<ReplanResult> ReplanFailedSliceAsync(string entryId, CancellationToken cancellationToken = default)
     {
@@ -113,6 +115,13 @@ public sealed class ReplanService(
 
         await workUnits.UpdateStatusAsync(failed.WorkUnitId, WorkUnitStatus.Cancelled, sessionId: null, cancellationToken)
             .ConfigureAwait(false);
+
+        // The cancelled original slice is never coming back to release its own leases — same gap
+        // WorkUnitCommandService.CancelAsync had, and the same fix: dead-letter's max-attempts path
+        // already does this release-and-promote, cancellation elsewhere didn't.
+        var promoted = await fileLease.ForceReleaseAllForWorkUnitAsync(failed.WorkUnitId, cancellationToken).ConfigureAwait(false);
+        foreach (var promotedWorkUnitId in promoted)
+            await scheduler.ClearAwaitingFileLeaseAsync(promotedWorkUnitId, cancellationToken).ConfigureAwait(false);
 
         return new ReplanResult(ReplanOutcome.Replanned, NewWorkUnitIds: newWorkUnitIds);
     }

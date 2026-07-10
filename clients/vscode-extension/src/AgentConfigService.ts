@@ -50,6 +50,10 @@ export interface SpawnLlmConfig {
   model:    string;
   baseUrl:  string;
   apiKey:   string;
+  // Opaque cache key the server uses to re-resolve these connection details after a restart,
+  // instead of ever persisting apiKey itself — see IRuntimeCredentialCache's doc comment on the
+  // server side. Never a secret; safe to log or display.
+  credentialRef: string;
 }
 
 const DEFAULT_PROFILES: AgentProfile[] = [
@@ -166,6 +170,19 @@ export class AgentConfigService {
     return 'an unknown configuration error occurred';
   }
 
+  /**
+   * The opaque cache key sent to the server alongside live connection details — never the secret
+   * itself. Real providers reuse the same apiKeyRef SecretStorage already keys on (so it's already
+   * unique per profile, even when several profiles share a provider). vscode-lm profiles have no
+   * apiKeyRef (no real secret — resolveSpawnLlmConfig always sends apiKey: ''), but the local LM
+   * proxy's baseUrl is still session-ephemeral (a fresh OS-assigned port each activation, see
+   * LmApiProxy.baseUrl) and must be re-resolved on resume the same way, so it gets a ref too.
+   */
+  resolveCredentialRef(profile: AgentProfile): string | undefined {
+    if (profile.provider === 'vscode-lm') { return `vscode-lm:${profile.id}`; }
+    return profile.apiKeyRef;
+  }
+
   async storeApiKey(profile: AgentProfile, key: string, secrets: vscode.SecretStorage): Promise<void> {
     const ref = profile.apiKeyRef ?? `nodalmerge.apikey.${profile.id}`;
     await secrets.store(ref, key);
@@ -200,6 +217,7 @@ export class AgentConfigService {
         model:    p.model ?? '',
         baseUrl:  lmProxyBaseUrl,
         apiKey:   '',
+        credentialRef: this.resolveCredentialRef(p) ?? '',
       };
     }
 
@@ -214,6 +232,7 @@ export class AgentConfigService {
       model:    p.model ?? '',
       baseUrl,
       apiKey,
+      credentialRef: this.resolveCredentialRef(p) ?? '',
     };
   }
 

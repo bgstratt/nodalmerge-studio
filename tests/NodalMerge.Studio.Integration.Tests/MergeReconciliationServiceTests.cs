@@ -239,4 +239,88 @@ public class MergeReconciliationServiceTests : IDisposable
         Assert.Null(result.ConflictReportPath);
         Assert.False(await fileWorkspace.ExistsAsync(parent.BranchId, MergeReconciliationService.ConflictReportFileName));
     }
+
+    [Fact]
+    public async Task TryReconcile_skips_cancelled_children_instead_of_waiting_on_them()
+    {
+        // Regression: a human cancelling an abandoned child (zombie reconciliation attempt,
+        // rejected task they chose not to retry) used to make TryReconcileAsync return
+        // WaitingForChildren forever — the goal could never produce the top-level proposal that
+        // gets its content into the real repository, no matter how many times the orchestrator
+        // was reinvoked.
+        var app = BuildApp();
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var workUnits    = app.Services.GetRequiredService<IWorkUnitService>();
+        var merge        = app.Services.GetRequiredService<IMergeService>();
+        var artifacts    = app.Services.GetRequiredService<IArtifactLineageService>();
+        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var reconciliation = app.Services.GetRequiredService<IMergeReconciliationService>();
+
+        var parent = await orchestrator.CreateWorkUnitAsync("parent goal", "test");
+        var child1 = await orchestrator.CreateWorkUnitAsync(
+            "slice one", "test", parentWorkUnitId: parent.WorkUnitId, fileScope: ["src/Foo.cs"]);
+        var child2 = await orchestrator.CreateWorkUnitAsync(
+            "slice two", "test", parentWorkUnitId: parent.WorkUnitId, fileScope: ["src/Bar.cs"]);
+        var abandoned = await orchestrator.CreateWorkUnitAsync(
+            "abandoned slice", "test", parentWorkUnitId: parent.WorkUnitId, fileScope: ["src/Baz.cs"]);
+
+        await fileWorkspace.WriteAsync(child1.BranchId, "src/Foo.cs", "class Foo {}", CancellationToken.None);
+        await fileWorkspace.WriteAsync(child2.BranchId, "src/Bar.cs", "class Bar {}", CancellationToken.None);
+
+        async Task ProposeChildAsync(WorkUnit child, string file)
+        {
+            var id = $"MP-{Guid.NewGuid():N}";
+            var proposal = new MergeProposal(
+                id, child.BranchId, "main", child.Goal, $"add {file}", $"add {file}",
+                null, null, null, MergeProposalStatus.Draft,
+                FilesTouched: [file], WorkUnitId: child.WorkUnitId);
+            await merge.ProposeAsync(proposal);
+            await merge.ValidateAsync(id);
+            await artifacts.RecordAsync(new ArtifactRef(
+                id, ArtifactType.MergeProposal, child.WorkUnitId, ArtifactStatus.Active,
+                DateTimeOffset.UtcNow, child.WorkUnitId, null));
+            await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Queued);
+            await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Executing);
+            await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Proposed);
+            await merge.ReviewAsync(id, MergeProposalStatus.Approved);
+        }
+
+        await ProposeChildAsync(child1, "src/Foo.cs");
+        await workUnits.UpdateStatusAsync(abandoned.WorkUnitId, WorkUnitStatus.Cancelled);
+        await ProposeChildAsync(child2, "src/Bar.cs");
+
+        var result = await reconciliation.TryReconcileAsync(parent.WorkUnitId);
+
+        Assert.True(
+            result.Outcome is MergeReconciliationOutcome.Reconciled or MergeReconciliationOutcome.AlreadyReconciled,
+            $"Expected Reconciled or AlreadyReconciled despite the cancelled child, got {result.Outcome} ({result.Detail}).");
+        Assert.NotNull(result.ReconciledProposalId);
+
+        var reconciled = await merge.GetAsync(result.ReconciledProposalId!);
+        Assert.Equal(2, reconciled!.ReconciledFrom.Count);
+        Assert.Contains("src/Foo.cs", reconciled.FilesTouched);
+        Assert.Contains("src/Bar.cs", reconciled.FilesTouched);
+        Assert.DoesNotContain("src/Baz.cs", reconciled.FilesTouched);
+    }
+
+    [Fact]
+    public async Task TryReconcile_reports_not_applicable_when_every_child_was_cancelled()
+    {
+        var app = BuildApp();
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var workUnits    = app.Services.GetRequiredService<IWorkUnitService>();
+        var reconciliation = app.Services.GetRequiredService<IMergeReconciliationService>();
+
+        var parent = await orchestrator.CreateWorkUnitAsync("parent goal", "test");
+        var child = await orchestrator.CreateWorkUnitAsync(
+            "only slice", "test", parentWorkUnitId: parent.WorkUnitId, fileScope: ["src/Foo.cs"]);
+        await workUnits.UpdateStatusAsync(child.WorkUnitId, WorkUnitStatus.Cancelled);
+
+        var result = await reconciliation.TryReconcileAsync(parent.WorkUnitId);
+
+        Assert.Equal(MergeReconciliationOutcome.NotApplicable, result.Outcome);
+        Assert.NotNull(result.Detail);
+    }
 }

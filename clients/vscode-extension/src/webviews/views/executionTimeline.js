@@ -6,6 +6,7 @@
 // shared escaper.
 
 import { esc } from './lib/esc.js';
+import { hasSelectionWithin } from './lib/selection.js';
 
 /** @param {{ root: HTMLElement, vscode: { postMessage(m: any): void }, $: (id: string) => HTMLElement | null }} ctx */
 export function init(ctx) {
@@ -531,16 +532,21 @@ export function init(ctx) {
       var earlier = chain.slice(0, -1);
       var wu = goalMap[workUnitId];
       var goal = wu ? wu.goal : workUnitId;
-      var canRetry = !latest.maxAttemptsReached && latest.attemptCount < 3;
+      // A cancelled work unit's dead-letter history is scrollback, not a live blockage — hiding
+      // it is what makes the ✕ Cancel button below feel like it did anything.
+      if (wu && String(wu.status || '').toLowerCase() === 'cancelled') { return; }
+      // Attempt counts warn humans; they never block them. The backend no longer refuses
+      // explicit retries past the cap (the cap only stops AGENTS from auto-spinning), so the UI
+      // must not manufacture a dead end the server doesn't have — a human who's seen the failures
+      // and wants to spend more tokens gets to.
+      var atCap = latest.maxAttemptsReached || latest.attemptCount >= 3;
       var transientRetries = retryCounts[workUnitId] || 0;
       // Phase 1.4 two-track design: MaxIterationsExceeded is the Continue track — both of its
       // options are implemented now: "Continue" (resume the same work unit with reconstructed
       // prior context) and "Re-plan the slice" (decompose into fresh, independently-budgeted
       // siblings). Everything else is the Retry track ("re-plan from scratch" alongside plain
       // Retry). Same replan call either way, label differs only to match how a human would
-      // describe what just happened. Unlike Retry, re-planning is deliberately NOT gated on
-      // attempt count — it never resumes this same work unit; Continue does resume it, so it's
-      // gated on canRetry the same way Retry is.
+      // describe what just happened.
       var replanLabel = latest.kind === 'MaxIterationsExceeded' ? 'Re-plan the slice' : 'Re-plan from scratch';
       var isMaxIterations = latest.kind === 'MaxIterationsExceeded';
 
@@ -552,15 +558,17 @@ export function init(ctx) {
       html += '<div class="actions">';
       if (pendingLabel) {
         html += '<button class="ghost" disabled>' + esc(pendingLabel) + '</button>';
-      } else if (canRetry) {
+      } else {
+        if (atCap) {
+          html += '<span class="mono" style="opacity:0.6" title="The automatic retry budget is spent — these buttons still work, this is just a heads-up that prior attempts kept failing.">Max auto-attempts reached</span>';
+        }
         html += '<button class="ghost" data-action="retryDeadLetter" data-id="' + esc(latest.entryId) + '">Retry</button>';
         if (isMaxIterations) {
           html += '<button class="ghost" data-action="continueDeadLetter" data-id="' + esc(latest.entryId) + '">Continue</button>';
         }
         html += '<button class="ghost" data-action="replanDeadLetter" data-id="' + esc(latest.entryId) + '">' + esc(replanLabel) + '</button>';
-      } else {
-        html += '<span class="mono" style="opacity:0.6">Max attempts reached</span>';
-        html += '<button class="ghost" data-action="replanDeadLetter" data-id="' + esc(latest.entryId) + '">' + esc(replanLabel) + '</button>';
+        html += '<button class="danger" data-action="cancelDeadLetterWorkUnit" data-id="' + esc(latest.entryId) + '" data-wu="' + esc(workUnitId) +
+          '" title="Give up on this work unit entirely: mark it Cancelled so it stops blocking its goal, releases its file leases, and disappears from the pipeline.">✕ Cancel</button>';
       }
       html += '</div></div>';
       html += '<div class="row">';
@@ -606,6 +614,17 @@ export function init(ctx) {
         var entryId = btn.getAttribute('data-id');
         pendingDeadLetterActions[entryId] = 'Continuing…';
         vscode.postMessage({ type: 'continueDeadLetter', entryId: entryId });
+        renderBlockedExplorations(lastDeadLetters, lastGoals, lastProviderRetries);
+      });
+    });
+    // Reuses the panel's existing cancelWorkUnit handler (same one behind a goal card's Stop
+    // button) — a dead-lettered unit nobody intends to revive shouldn't require an API call to
+    // put down; every recovery option's sibling is "stop trying."
+    el.querySelectorAll('[data-action="cancelDeadLetterWorkUnit"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var entryId = btn.getAttribute('data-id');
+        pendingDeadLetterActions[entryId] = 'Cancelling…';
+        vscode.postMessage({ type: 'cancelWorkUnit', workUnitId: btn.getAttribute('data-wu'), entryId: entryId });
         renderBlockedExplorations(lastDeadLetters, lastGoals, lastProviderRetries);
       });
     });
@@ -683,6 +702,14 @@ export function init(ctx) {
       return;
     }
     if (msg.type !== 'data') { return; }
+    // Everything below rebuilds its section via innerHTML, which destroys a live text
+    // selection mid-copy. Skip the whole tick while the user has text selected anywhere in
+    // this view; their next click collapses the selection and normal refresh resumes.
+    if (hasSelectionWithin(root)) {
+      var tsSel = $('last-updated');
+      if (tsSel) { tsSel.textContent = 'refresh paused — text selected'; }
+      return;
+    }
     if (typeof msg.usePromotionBranch !== 'undefined') {
       globalUsePromotionBranch = !!msg.usePromotionBranch;
       globalCandidateBranchId = msg.candidateBranchId || 'candidate';
@@ -713,6 +740,17 @@ export function init(ctx) {
       (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT'));
   }
 
+  // conflictId -> true while that conflict's manual-resolve editor is open (from the moment the
+  // human clicks "Resolve Manually" until they submit or close). Focus-based isEditingWithin alone
+  // isn't enough to protect the editor from the 2s poll re-render: clicking anywhere outside a
+  // textarea (or the fetch round trip finishing after a poll tick) left the freshly-built editor —
+  // and anything typed into it — to be silently wiped by the next innerHTML rebuild.
+  var openManualResolves = {};
+  function anyManualResolveOpen() {
+    for (var k in openManualResolves) { if (openManualResolves[k]) { return true; } }
+    return false;
+  }
+
   // pending: CandidatePendingItem[] (GET /studio/branches/candidate/pending), conflicts:
   // CandidateConflictRecord[] (GET /studio/branches/candidate/conflicts). Only rendered/visible
   // when globalUsePromotionBranch is on — see the 'data' handler below.
@@ -720,7 +758,7 @@ export function init(ctx) {
     var section = $('candidate-promotion-section');
     var el = $('candidate-promotion');
     if (!section || !el) { return; }
-    if (isEditingWithin(el)) { return; }
+    if (isEditingWithin(el) || anyManualResolveOpen()) { return; }
 
     if (!globalUsePromotionBranch) {
       section.style.display = 'none';
@@ -817,6 +855,10 @@ export function init(ctx) {
       btn.addEventListener('click', function() {
         var paths = (btn.getAttribute('data-paths') || '').split('|').filter(Boolean);
         var parentWorkUnitId = btn.getAttribute('data-parent');
+        // Marked open from the CLICK, not from when the editor content arrives — the fetch takes
+        // a round trip through the extension host, and a poll tick landing in that window used to
+        // re-render the card and orphan the response (the editor "did nothing"/vanished).
+        openManualResolves[btn.getAttribute('data-cid')] = true;
         vscode.postMessage({
           type: 'requestResolveManually',
           conflictId: btn.getAttribute('data-cid'),
@@ -834,10 +876,16 @@ export function init(ctx) {
   // buttons (as data-parent) is what wireConflictCardActions uses to route to the task-scoped
   // message types instead of the candidate ones.
   function buildConflictCardHtml(c, parentWorkUnitId) {
+    // "Reconciling" is informational, never a lock. It only means SOME reconciliation attempt
+    // claimed this conflict at some point — that attempt may be actively working, or it may have
+    // died (agent dead-lettered, planner turn that never handed off) with no way to report back.
+    // Disabling the buttons here manufactured a dead end the server doesn't have: the human,
+    // watching nothing happen, couldn't re-trigger OR resolve manually. The server reopens a stuck
+    // Reconciling conflict whenever a human explicitly acts on it, so the buttons stay live.
     var reconciling = c.status === 'Reconciling';
     var parentAttr = parentWorkUnitId ? ' data-parent="' + esc(parentWorkUnitId) + '"' : '';
     var html = '<div class="card" style="border-color:var(--nm-warn, #d9822b)">';
-    html += '<div class="row"><span class="badge failed">⚠ Conflict' + (reconciling ? ' — reconciling…' : '') + '</span>' +
+    html += '<div class="row"><span class="badge failed">⚠ Conflict' + (reconciling ? ' — reconciliation in progress (acting below takes over)' : '') + '</span>' +
       '<span class="mono">' + esc(c.proposalId) + '</span></div>';
     if (parentWorkUnitId) {
       html += '<div class="row mono" style="opacity:0.6">goal ' + esc(parentWorkUnitId) + '</div>';
@@ -848,21 +896,20 @@ export function init(ctx) {
       '" data-paths="' + esc((c.conflictingPaths || []).join('|')) +
       '" title="Open a read-only diff for each conflicting file: what is on the shared target now vs. what the losing goal produced">👁 View Diff</button></div>';
     html += '<textarea class="steering-notes" data-notes-for="' + esc(c.conflictId) +
-      '" placeholder="Steering notes (optional, used by both Reconcile and Restart below) — e.g. keep both sections, Brad first then Jake"' +
-      (reconciling ? ' disabled' : '') + '></textarea>';
+      '" placeholder="Steering notes (optional, used by both Reconcile and Restart below) — e.g. keep both sections, Brad first then Jake"></textarea>';
     html += '<div class="conflict-actions">';
     html += '<button class="primary" data-action="reconcileConflict" data-cid="' + esc(c.conflictId) + '"' + parentAttr +
-      ' title="Create an agent to combine the changes from both goals into one result, instead of restarting from scratch"' +
-      (reconciling ? ' disabled' : '') + '>⚭ Reconcile</button>';
+      ' title="Create an agent to combine the changes from both goals into one result, instead of restarting from scratch' +
+      (reconciling ? ' — replaces the reconciliation attempt currently on record' : '') + '">⚭ Reconcile</button>';
     html += '<button class="danger" data-action="restartConflict" data-cid="' + esc(c.conflictId) +
       '" data-pid="' + esc(c.proposalId) + '"' +
-      ' title="Revert the losing goal to its pre-attempt snapshot and restart it fresh, using the steering notes above"' +
-      (reconciling ? ' disabled' : '') + '>↺ Revert &amp; Restart</button>';
+      ' title="Revert the losing goal to its pre-attempt snapshot and restart it fresh, using the steering notes above">↺ Revert &amp; Restart</button>';
     html += '</div>';
     html += '<div class="row"><button class="ghost" data-action="loadManualResolve" data-cid="' + esc(c.conflictId) +
       '" data-pid="' + esc(c.proposalId) + '" data-wpid="' + esc(c.winningProposalId || '') +
       '" data-paths="' + esc((c.conflictingPaths || []).join('|')) + '"' + parentAttr +
-      (reconciling ? ' disabled' : '') + '>✎ Resolve Manually</button></div>';
+      (reconciling ? ' title="Supply the combined content yourself — takes over from the reconciliation attempt currently on record"' : '') +
+      '>✎ Resolve Manually</button></div>';
     html += '<div class="manual-resolve" id="manual-resolve-' + esc(c.conflictId) + '" style="display:none"></div>';
     html += '</div>';
     return html;
@@ -874,7 +921,7 @@ export function init(ctx) {
   function renderTaskConflicts(conflicts) {
     var el = $('task-conflicts');
     if (!el) { return; }
-    if (isEditingWithin(el)) { return; }
+    if (isEditingWithin(el) || anyManualResolveOpen()) { return; }
     if (!conflicts || !conflicts.length) {
       el.innerHTML = '<p class="empty">No open task conflicts.</p>';
       return;
@@ -896,15 +943,22 @@ export function init(ctx) {
     if (!container) { return; }
 
     var target = parentWorkUnitId ? 'merge/' + parentWorkUnitId : 'candidate';
-    var html = '<div class="row mono" style="opacity:0.6">Pre-filled with what is currently on ' + esc(target) + ' — edit to combine both sides, then submit.</div>';
+    var html = '<div class="row" style="opacity:0.75;font-size:0.85em">The <strong>right</strong> column is the result: it starts as what is currently on ' +
+      esc(target) + ' (the side that got there first). The <strong>left</strong> column is the other goal’s version, read-only, for reference — ' +
+      'copy anything from it you want to keep into the right column, then Submit. What you submit replaces the file on ' + esc(target) + '.</div>';
     for (var i = 0; i < files.length; i++) {
       var f = files[i];
       html += '<div class="row mono" style="opacity:0.7">' + esc(f.path) + '</div>';
-      html += '<div class="row mono" style="opacity:0.55;white-space:pre-wrap;max-height:80px;overflow:auto">Losing goal had: ' + esc(f.losingContent || '(no content)') + '</div>';
-      html += '<textarea class="steering-notes" data-resolve-path="' + esc(f.path) + '" style="min-height:80px">' +
-        esc(f.winningContent || '') + '</textarea>';
+      html += '<div class="mr-compare">';
+      html += '<div class="mr-col"><div class="mr-col-label">Other goal’s version (read-only)</div>' +
+        '<textarea class="steering-notes mr-pane" readonly>' + esc(f.losingContent || '(no content)') + '</textarea></div>';
+      html += '<div class="mr-col"><div class="mr-col-label">Result — edit this, it gets submitted</div>' +
+        '<textarea class="steering-notes mr-pane" data-resolve-path="' + esc(f.path) + '">' +
+        esc(f.winningContent || '') + '</textarea></div>';
+      html += '</div>';
     }
-    html += '<div class="row"><button class="primary" data-action="submitManualResolve" data-cid="' + esc(conflictId) + '">✓ Submit Resolution</button></div>';
+    html += '<div class="row"><button class="primary" data-action="submitManualResolve" data-cid="' + esc(conflictId) + '">✓ Submit Resolution</button>' +
+      '<button class="ghost" data-action="closeManualResolve" data-cid="' + esc(conflictId) + '">✕ Close</button></div>';
     container.innerHTML = html;
     container.style.display = '';
 
@@ -915,9 +969,18 @@ export function init(ctx) {
         container.querySelectorAll('[data-resolve-path]').forEach(function(ta) {
           fileValues[ta.getAttribute('data-resolve-path')] = ta.value;
         });
+        delete openManualResolves[conflictId];
         vscode.postMessage(parentWorkUnitId
           ? { type: 'resolveTaskConflictManually', conflictId: conflictId, parentWorkUnitId: parentWorkUnitId, files: fileValues }
           : { type: 'resolveConflictManually', conflictId: conflictId, files: fileValues });
+      });
+    }
+    var closeBtn = container.querySelector('[data-action="closeManualResolve"]');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', function() {
+        delete openManualResolves[conflictId];
+        container.style.display = 'none';
+        container.innerHTML = '';
       });
     }
   }
