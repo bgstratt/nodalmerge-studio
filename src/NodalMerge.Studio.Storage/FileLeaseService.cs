@@ -181,7 +181,25 @@ public sealed class FileLeaseService : IFileLeaseService, IRehydratable
             "[FileLease] Deadlock detected among {Members} — releasing {Victim}'s leases to break the cycle.",
             string.Join(" -> ", cycleMembers), victim);
 
-        await ForceReleaseAllForWorkUnitAsync(victim, ct).ConfigureAwait(false);
+        // Unlike this method's other five callers (cancel/dead-letter/stop/reject/reconcile-
+        // supersede), the victim here is NOT terminal — it survives, with a dependsOn edge onto
+        // the survivor added below, and is expected to run again once that clears. Two things
+        // ForceReleaseAllForWorkUnitAsync does are easy to lose track of for a survivor, unlike
+        // those other callers: (1) its own AwaitingFileLease flag, if the victim was also queued
+        // as a waiter on some OTHER lease — that purge branch drops it from the WaitQueue with no
+        // signal back, and nothing else will ever flip that flag off again (EnqueueAsync's
+        // update-in-place preserves it as-is), permanently stranding the victim even after its new
+        // dependency is satisfied; (2) any OTHER work unit promoted to holder as a result of
+        // releasing the victim's own held leases — every other caller loops over the returned list
+        // and clears each promoted waiter's flag, this one previously discarded it outright.
+        var promoted = await ForceReleaseAllForWorkUnitAsync(victim, ct).ConfigureAwait(false);
+        var scheduler = _serviceProvider?.GetService(typeof(IWorkScheduler)) as IWorkScheduler;
+        if (scheduler is not null)
+        {
+            await scheduler.ClearAwaitingFileLeaseAsync(victim, ct).ConfigureAwait(false);
+            foreach (var promotedWorkUnitId in promoted)
+                await scheduler.ClearAwaitingFileLeaseAsync(promotedWorkUnitId, ct).ConfigureAwait(false);
+        }
 
         var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
         if (workUnits is null)

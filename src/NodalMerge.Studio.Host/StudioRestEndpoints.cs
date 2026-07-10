@@ -1618,6 +1618,29 @@ public static class StudioRestEndpoints
                 : Results.UnprocessableEntity(new { error = "No credentials resolvable for this orchestrator — resupply via overrideApiKey." });
         });
 
+        // Manual recovery for a goal stuck at Completed with no top-level proposal — normally
+        // TryCompleteParentIfAllChildrenTerminalAsync retries IMergeReconciliationService right at
+        // the moment it confirms every child is terminal, but that only fires once, at the
+        // Completed transition itself; a goal that reached Completed before this retry existed (or
+        // whose reconciliation attempt failed for some other transient reason) has no other path
+        // back to a proposal a human can review. TryReconcileAsync is idempotent (checks for an
+        // already-live "main"-targeted proposal first), so calling it again here is always safe —
+        // this exists purely so a stuck goal doesn't need a Host restart plus a fresh code path to
+        // recover, just a REST call once the underlying cause (if any) is understood.
+        app.MapPost("/studio/workunits/{workUnitId}/reconcile", async (
+            string workUnitId,
+            IMergeReconciliationService mergeReconciliation,
+            IWorkUnitService workUnits,
+            CancellationToken ct) =>
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+
+            var result = await mergeReconciliation.TryReconcileAsync(workUnitId, sessionId: null, ct).ConfigureAwait(false);
+            return Results.Ok(new { workUnitId, outcome = result.Outcome.ToString(), proposalId = result.ReconciledProposalId, detail = result.Detail });
+        });
+
         // Slice 15e — single-agent status read (list/spawn/pause/resume/stop already existed; this
         // fills the gap matching MCP's nm_v1_agent_status and the agent-loop dispatcher equivalent).
         app.MapGet("/studio/agents/{agentId}/status", async (

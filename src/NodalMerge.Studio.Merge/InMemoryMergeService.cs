@@ -620,7 +620,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // sibling was waiting, copy the just-merged content into its branch and clear its parked
         // scheduler flag so it resumes (isResume: true, from its own already-elevated AttemptCount)
         // with current content instead of the stale snapshot it was forked from.
-        if (_fileLease is not null && proposal.FilesTouched is { Count: > 0 } filesTouched)
+        if (_fileLease is not null)
         {
             var scheduler = _serviceProvider?.GetService(typeof(IWorkScheduler)) as IWorkScheduler;
             var workUnitsForResume = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
@@ -632,7 +632,22 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             // here just degrades to the pre-scoping global lookup, not a crash.
             var releasingWorkUnitId = owningWorkUnit?.WorkUnitId ?? proposal.WorkUnitId ?? proposal.ProposalId;
 
-            foreach (var touchedPath in filesTouched)
+            // CheckFileLeaseAsync grants/queues a lease on ANY path a write-family tool call
+            // touches, including exploratory edits that never survive into this proposal's final
+            // diff (reverted, superseded, or otherwise excluded from FilesTouched). Iterating only
+            // FilesTouched left those leases orphaned forever once this work unit was done — the
+            // next caller for that path would be told it's held by a work unit that already merged
+            // and will never release it. Union in every path IFileLeaseService still shows this
+            // work unit holding, so nothing it ever acquired is left behind.
+            var filesTouched = proposal.FilesTouched ?? [];
+            var stillHeldPaths = (await _fileLease.ListAsync(cancellationToken).ConfigureAwait(false))
+                .Where(l => l.HolderWorkUnitId == releasingWorkUnitId)
+                .Select(l => l.Path);
+            var pathsToRelease = filesTouched
+                .Concat(stillHeldPaths)
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var touchedPath in pathsToRelease)
             {
                 var waiterWorkUnitId = await _fileLease
                     .ReleaseAndAdvanceAsync(releasingWorkUnitId, touchedPath, cancellationToken)
@@ -643,7 +658,13 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 var waiter = workUnitsForResume is not null
                     ? await workUnitsForResume.GetAsync(waiterWorkUnitId, cancellationToken).ConfigureAwait(false)
                     : null;
-                if (waiter is not null)
+
+                // Only copy content for paths this proposal actually changed (FilesTouched, in its
+                // original casing) — a path that only surfaced via stillHeldPaths (IFileLeaseService
+                // stores paths pre-normalized to lowercase, so its casing isn't trustworthy for a
+                // real file operation) never had a net change on this branch, so the waiter's own
+                // branch content for it is already correct as-is; nothing to hand off.
+                if (waiter is not null && filesTouched.Contains(touchedPath, StringComparer.OrdinalIgnoreCase))
                 {
                     await _fileWorkspace.CopyFilesAsync(
                         effectiveTarget, waiter.BranchId, [touchedPath], cancellationToken).ConfigureAwait(false);
@@ -950,7 +971,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     // that path still fires normally for goals whose children do land together; this one catches
     // the staggered/dependency-gated case it structurally can't. DeadLettered is deliberately not
     // "terminal" here — a real failure sitting in the tree should never be silently completed over.
-    private static async Task TryCompleteParentIfAllChildrenTerminalAsync(
+    private async Task TryCompleteParentIfAllChildrenTerminalAsync(
         string parentWorkUnitId, IWorkUnitService workUnits, string? sessionId, CancellationToken ct)
     {
         var parent = await workUnits.GetAsync(parentWorkUnitId, ct).ConfigureAwait(false);
@@ -961,6 +982,39 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         if (children.Count == 0)
             return;
         if (!children.All(c => c.Status is WorkUnitStatus.Merged or WorkUnitStatus.Completed or WorkUnitStatus.Cancelled))
+            return;
+
+        // This is the ONLY moment guaranteed to see every child already Proposed-or-Merged at
+        // once — TryReconcileAsync's own trigger (WorkSchedulerService.ReleaseAsync, fired per
+        // worker's own release) runs too early relative to staggered/dependency-gated siblings,
+        // so it can race every single sibling and always bail with WaitingForChildren, leaving a
+        // goal stuck at Completed with zero proposals and nothing ever written back to the real
+        // repo. TryReconcileAsync itself is idempotent (checks for an already-live "main"-targeted
+        // proposal first), so retrying it here even if an earlier call already succeeded is safe.
+        //
+        // Must run BEFORE the Completed transition below, not after: on a real cross-child content
+        // conflict, TryReconcileAsync tries to mark this parent Reviewing itself (so a human sees
+        // "needs attention" instead of a silent stop) — but WorkUnitTransitions.CanTransition has
+        // no edge out of Completed at all, not even to Cancelled. Committing Completed first would
+        // make that Reviewing transition permanently illegal, silently swallowed, and this goal
+        // would look done forever while a real conflict sits unresolved with no way to ever revisit
+        // it — exactly the trap that bit the very first goal this fix shipped for.
+        var mergeReconciliation = _serviceProvider?.GetService(typeof(IMergeReconciliationService)) as IMergeReconciliationService;
+        var reconciliationOutcome = MergeReconciliationOutcome.NotApplicable;
+        if (mergeReconciliation is not null)
+        {
+            try
+            {
+                var reconciliationResult = await mergeReconciliation.TryReconcileAsync(parentWorkUnitId, sessionId, ct).ConfigureAwait(false);
+                reconciliationOutcome = reconciliationResult.Outcome;
+            }
+            catch { /* best-effort — still fine to mark Completed below if this failed for some other reason */ }
+        }
+
+        // A Conflict outcome already moved (or tried to move) the parent to Reviewing itself —
+        // forcing Completed on top of that here would be wrong even when the transition happens to
+        // succeed (it would mask the very problem TryReconcileAsync just flagged).
+        if (reconciliationOutcome == MergeReconciliationOutcome.Conflict)
             return;
 
         try
