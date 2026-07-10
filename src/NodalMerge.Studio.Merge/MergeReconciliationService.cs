@@ -15,7 +15,17 @@ public sealed class MergeReconciliationService(
     WorkspaceOptions? options = null,
     // Optional so direct-construction test call sites keep compiling — when null, the
     // AgentApproval/Hybrid auto-apply below is simply skipped (same as today's behavior).
-    IMergeCommandService? mergeCommands = null) : IMergeReconciliationService
+    IMergeCommandService? mergeCommands = null,
+    // Optional for the same reason — when null, a Conflict outcome falls back to just writing the
+    // report file (no TaskConflictRecord, same as before this system existed).
+    ITaskConflictService? taskConflicts = null,
+    // ITaskReconciliationTrigger can't be a normal constructor parameter here: it depends (via
+    // IReconciliationAgentService -> IWorkUnitCommandService) back on IMergeReconciliationService
+    // itself, which the DI container correctly rejects as a circular dependency. Resolve it lazily
+    // through IServiceProvider instead — the exact same workaround
+    // InMemoryMergeService.TryAutoTriggerTaskReconciliationAsync already uses for this identical
+    // cycle.
+    IServiceProvider? serviceProvider = null) : IMergeReconciliationService
 {
     public const string ConflictReportFileName = "merge-conflict-report.md";
 
@@ -154,20 +164,80 @@ public sealed class MergeReconciliationService(
                 .WriteAsync(parent.BranchId, ConflictReportFileName, report, cancellationToken)
                 .ConfigureAwait(false);
 
-            try
+            // Route through the SAME conflict-resolution machinery a fan-out sibling's apply-time
+            // conflict already uses (InMemoryMergeService.cs's TaskConflictRecord branch) rather than
+            // inventing a second, dead-end status flip — that older approach (parent -> Reviewing,
+            // dead-letter as a fallback) had no actionable entity behind it: no Reconcile button, no
+            // manual-resolution option, discoverable only via a badge on the Active Goals card.
+            // TaskConflictRecord already has real REST endpoints, a real Reconciler agent, and
+            // Reconcile/Resolve-Manually buttons wired end-to-end in the extension — reuse it.
+            //
+            // Unlike the apply-time case (a sibling has already landed, so there's a natural
+            // "winner"), every child proposal here is still symmetric — none has touched
+            // merge/{parentWorkUnitId} yet. Pick a deterministic base: the earliest-created proposal
+            // among every proposal that appears anywhere in the conflict set. Every OTHER conflicting
+            // proposal gets its own TaskConflictRecord with WinningProposalId set to the base — unlike
+            // the apply-time case, WinningProposalId can never be left null here, because
+            // ReconciliationAgentService.TriggerAsync requires >= 2 proposal ids.
+            var conflictingProposalIds = conflicts.Values.SelectMany(ids => ids).Distinct().ToList();
+            var byProposalId = childProposals.ToDictionary(cp => cp.Proposal.ProposalId, cp => cp);
+            var basePair = conflictingProposalIds
+                .Select(id => byProposalId[id])
+                .OrderBy(cp => cp.Child.CreatedAt)
+                .First();
+
+            var createdConflictIds = new List<string>();
+            if (taskConflicts is not null)
             {
-                await workUnits.UpdateStatusAsync(parent.WorkUnitId, WorkUnitStatus.Reviewing, sessionId, cancellationToken)
-                    .ConfigureAwait(false);
-                await workUnits.SetCurrentStageAsync(parent.WorkUnitId, PipelineStage.Review, cancellationToken)
-                    .ConfigureAwait(false);
+                var existingOpen = await taskConflicts.GetOpenAsync(parentWorkUnitId, cancellationToken).ConfigureAwait(false);
+                foreach (var losingId in conflictingProposalIds.Where(id => id != basePair.Proposal.ProposalId))
+                {
+                    if (existingOpen.Any(c => c.ProposalId == losingId))
+                        continue;
+
+                    var losingPair = byProposalId[losingId];
+                    var conflictingPaths = conflicts.Where(kv => kv.Value.Contains(losingId)).Select(kv => kv.Key).ToList();
+
+                    var record = new TaskConflictRecord(
+                        $"taskconf-{Guid.NewGuid():N}",
+                        parentWorkUnitId,
+                        losingPair.Proposal.ProposalId,
+                        losingPair.Child.WorkUnitId,
+                        conflictingPaths,
+                        DateTimeOffset.UtcNow,
+                        WinningProposalId: basePair.Proposal.ProposalId);
+                    await taskConflicts.RecordAsync(record, cancellationToken).ConfigureAwait(false);
+                    createdConflictIds.Add(record.ConflictId);
+
+                    // Best-effort, mirrors InMemoryMergeService.TryAutoTriggerTaskReconciliationAsync
+                    // exactly, including its IServiceProvider indirection (see the constructor
+                    // comment on serviceProvider — a direct ITaskReconciliationTrigger dependency
+                    // here is circular). A trigger failure must never block returning the Conflict
+                    // outcome the report/records above already captured.
+                    if (losingPair.Child.TaskReviewPolicy == ReviewPolicy.AgentApproval
+                        && basePair.Child.TaskReviewPolicy == ReviewPolicy.AgentApproval
+                        && serviceProvider?.GetService(typeof(ITaskReconciliationTrigger)) is ITaskReconciliationTrigger trigger)
+                    {
+                        try
+                        {
+                            await trigger.TryTriggerAsync(record.ConflictId, ct: cancellationToken).ConfigureAwait(false);
+                        }
+                        catch { /* best-effort — a human can still trigger reconciliation manually */ }
+                    }
+                }
             }
-            catch (InvalidOperationException) { }
+
+            var conflictDetail = createdConflictIds.Count > 0
+                ? $"Child proposals changed overlapping lines in: {string.Join(", ", conflicts.Keys)} — " +
+                    $"see {ConflictReportFileName} on the goal's branch. Task conflict(s) opened for resolution: " +
+                    string.Join(", ", createdConflictIds)
+                : $"Child proposals changed overlapping lines in: {string.Join(", ", conflicts.Keys)} — " +
+                    $"see {ConflictReportFileName} on the goal's branch.";
 
             return new MergeReconciliationResult(
                 MergeReconciliationOutcome.Conflict,
                 ConflictReportPath: ConflictReportFileName,
-                Detail: $"Child proposals changed overlapping lines in: {string.Join(", ", conflicts.Keys)} — " +
-                    $"see {ConflictReportFileName} on the goal's branch.");
+                Detail: conflictDetail);
         }
 
         var ordered = OrderByDependencies(eligibleChildren, childProposals);

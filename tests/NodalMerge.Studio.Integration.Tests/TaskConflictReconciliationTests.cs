@@ -277,6 +277,58 @@ public class TaskConflictReconciliationTests : IDisposable
         Assert.Null(second);
     }
 
+    // Unlike every other test in this file (which exercises the apply-time
+    // InMemoryMergeService.checkForDrift path), this drives the conflict through
+    // MergeReconciliationService.TryReconcileAsync's static N-way overlap detection — the new
+    // creation path this plan added. Proves both origins land on the exact same TaskConflictRecord
+    // shape and the exact same resolve -> supersede -> reinvoke loop this file's other tests already
+    // establish for the apply-time origin.
+    [Fact]
+    public async Task Goal_level_conflict_from_TryReconcileAsync_resolves_manually_and_converges_on_reinvoke()
+    {
+        var app = BuildApp();
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var workUnits = app.Services.GetRequiredService<IWorkUnitService>();
+        var merge = app.Services.GetRequiredService<IMergeService>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var taskConflicts = app.Services.GetRequiredService<ITaskConflictService>();
+        var taskReconciliationTrigger = app.Services.GetRequiredService<ITaskReconciliationTrigger>();
+        var reconciliationService = app.Services.GetRequiredService<IMergeReconciliationService>();
+
+        var parent = await orchestrator.CreateWorkUnitAsync("parent goal", "test");
+        var child1 = await orchestrator.CreateWorkUnitAsync(
+            "slice one", "test", parentWorkUnitId: parent.WorkUnitId, fileScope: ["src/Shared.cs"]);
+        var child2 = await orchestrator.CreateWorkUnitAsync(
+            "slice two", "test", parentWorkUnitId: parent.WorkUnitId, fileScope: ["src/Shared.cs"]);
+
+        await fileWorkspace.WriteAsync(child1.BranchId, "src/Shared.cs", "class Shared { /* v1 */ }", CancellationToken.None);
+        await fileWorkspace.WriteAsync(child2.BranchId, "src/Shared.cs", "class Shared { /* v2 */ }", CancellationToken.None);
+
+        var p1 = await ProposeRawValidateApproveAsync(workUnits, merge, artifacts, child1, "main", "add Shared.cs (1)");
+        var p2 = await ProposeRawValidateApproveAsync(workUnits, merge, artifacts, child2, "main", "add Shared.cs (2)");
+
+        var conflictResult = await reconciliationService.TryReconcileAsync(parent.WorkUnitId);
+        Assert.Equal(MergeReconciliationOutcome.Conflict, conflictResult.Outcome);
+
+        var conflict = Assert.Single(await taskConflicts.GetOpenAsync(parent.WorkUnitId));
+        Assert.Equal(p2, conflict.ProposalId);
+        Assert.Equal(p1, conflict.WinningProposalId);
+
+        const string combined = "class Shared { /* v1 and v2 */ }";
+        var resolution = await taskReconciliationTrigger.TryResolveManuallyAsync(
+            conflict.ConflictId, new Dictionary<string, string> { ["src/Shared.cs"] = combined });
+
+        Assert.NotNull(resolution);
+        Assert.Empty(await taskConflicts.GetOpenAsync(parent.WorkUnitId));
+
+        var result = await reconciliationService.TryReconcileAsync(parent.WorkUnitId);
+        Assert.True(
+            result.Outcome is MergeReconciliationOutcome.Reconciled or MergeReconciliationOutcome.AlreadyReconciled,
+            $"Expected Reconciled or AlreadyReconciled, got {result.Outcome} ({result.Detail}).");
+        Assert.Equal(combined, await fileWorkspace.ReadAsync($"merge/{parent.WorkUnitId}", "src/Shared.cs"));
+    }
+
     [Fact]
     public async Task Conflict_between_two_AgentApproval_siblings_auto_triggers_reconciliation_without_a_human()
     {

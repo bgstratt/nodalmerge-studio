@@ -294,10 +294,43 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
                 if (effectivePolicy is ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid)
                 {
                     var proposalIdToApply = created.ProposalId;
+                    var workUnitIdForFailure = workUnitId;
+                    var sessionIdForFailure = sessionId;
                     _ = Task.Run(async () =>
                     {
-                        try { await ApplyAsync(proposalIdToApply, CancellationToken.None, autoApplied: true).ConfigureAwait(false); }
-                        catch { /* reviewer rejection or gate block — proposal stays in current state */ }
+                        try
+                        {
+                            await ApplyAsync(proposalIdToApply, CancellationToken.None, autoApplied: true).ConfigureAwait(false);
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            // Expected: reviewer rejection or gate block. AutomatedReviewGateService
+                            // already dead-letters its own terminal rejections, and the proposal
+                            // status reflects the outcome — nothing further to do here.
+                        }
+                        catch (Exception ex)
+                        {
+                            // Unexpected — anything that never reached the gate's own accounting
+                            // (a crash mid-review, a transient LLM/tool failure, etc.) used to vanish
+                            // silently here, leaving the proposal stuck at ReadyForReview forever with
+                            // no trace anywhere. Record it so it's visible and retryable instead.
+                            var deadLetterForFailure = serviceProvider.GetService(typeof(IDeadLetterService)) as IDeadLetterService;
+                            if (deadLetterForFailure is not null)
+                            {
+                                try
+                                {
+                                    await deadLetterForFailure.RecordFailureAsync(
+                                        workUnitIdForFailure,
+                                        agentId: "auto-review-gate",
+                                        stage: PipelineStage.Review,
+                                        profileId: "reviewer",
+                                        reason: $"Auto-apply for proposal {proposalIdToApply} failed unexpectedly: {ex.Message}",
+                                        sessionId: sessionIdForFailure,
+                                        kind: FailureKind.Exception).ConfigureAwait(false);
+                                }
+                                catch { /* best-effort — never let failure recording itself throw */ }
+                            }
+                        }
                     });
                 }
             }
