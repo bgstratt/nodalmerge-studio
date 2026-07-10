@@ -18,6 +18,13 @@ internal sealed class ReviewerAgentLoop(
     string? noFileChangesJustification = null,
     IConversationLogService? conversationLog = null,
     IExecutionEventStream? events = null,
+    // Phase 1.4 Continue-track, extended to Reviewer — reconstructed assistant/tool-result turns
+    // from a prior attempt's ConversationLogEntry rows (see ContinueService). Null/empty for a
+    // normal fresh run. Added after live evidence (2026-07-10) that restarting cold on every
+    // Continue click wasted the entire budget re-deriving investigation (workunit_get, diff,
+    // reads) the prior attempt had already done, so 3 consecutive attempts each independently ran
+    // out of iterations without ever reaching a decision — mirrors WorkerAgentLoop's priorTurns.
+    IReadOnlyList<NmMessage>? priorTurns = null,
     // Observability-only — see ConversationCompactor. Optional/nullable so call sites and tests
     // that don't wire a logger keep compiling unchanged.
     ILogger? logger = null)
@@ -66,6 +73,28 @@ internal sealed class ReviewerAgentLoop(
                 "Submit automated review when done.")])
         };
 
+        if (priorTurns is { Count: > 0 })
+        {
+            messages.AddRange(priorTurns);
+
+            const string continuationNotice =
+                "[Continuing after hitting the iteration limit on a previous review attempt — the " +
+                "turns above are your own prior investigation of this same proposal, not a new " +
+                "reviewer's. Do not re-fetch what you already checked above. You have a fresh " +
+                "iteration budget; use it to reach a decision and call nm_v1_merge_review — that is " +
+                "the one thing the prior attempt never did.]";
+
+            var last = messages[^1];
+            if (last.Role == "user")
+            {
+                messages[^1] = last with { Content = [.. last.Content, new NmText(continuationNotice)] };
+            }
+            else
+            {
+                messages.Add(new NmMessage("user", [new NmText(continuationNotice)]));
+            }
+        }
+
         var completedNaturally = false;
         int? lastInputTokens = null;
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
@@ -94,7 +123,19 @@ internal sealed class ReviewerAgentLoop(
             }
 
             if (response.StopReason != "tool_use")
+            {
+                // Anything other than a clean end_turn/tool_use — most commonly the model hitting
+                // its own max-output-tokens mid-response after a large tool result (e.g. a multi-
+                // file read) landed in context. Previously this exited with zero record of what
+                // happened: the loop just vanished from the conversation log and the caller reported
+                // MaxIterationsExceeded identically whether this fired on cycle 1 or cycle 14. Record
+                // the turn (StopReason included) so a truncated/anomalous response is visible instead
+                // of indistinguishable from "genuinely used the whole budget."
+                await ConversationLogRecorder.RecordTurnAsync(
+                    conversationLog, workUnitId, agentId, "Reviewer", null, i, response, [], sessionId, ct,
+                    client.Provider, client.Model).ConfigureAwait(false);
                 break;
+            }
 
             var toolResults = new List<NmContent>();
             var awaitingClarification = false;
@@ -206,7 +247,7 @@ internal sealed class ReviewerAgentLoop(
                     ["proposalId"]            = Str("Merge proposal ID"),
                     ["decision"]              = Str("Approved or Rejected"),
                     ["verificationResults"]   = Str("Concise review notes — on Rejected, this is the ONLY explanation the retried worker will see, so be specific about what to fix"),
-                    ["automated"]             = Str("REQUIRED — must be literally true for every call you make"),
+                    ["automated"]             = Bool("REQUIRED — must be literally true (boolean, not the string \"true\") for every call you make"),
                     ["consideredArtifactIds"] = StrArray("IDs of any recorded Constraint/Research artifacts you explicitly checked the proposal against in step 2, whether or not they were violated (optional)"),
                 })),
 

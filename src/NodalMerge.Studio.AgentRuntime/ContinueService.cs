@@ -97,37 +97,65 @@ public sealed class ContinueService(
         credentialCache?.Capture(resolvedCredentialRef, provider, model, baseUrl, apiKey);
 
         var conversationLog = serviceProvider.GetRequiredService<IConversationLogService>();
-        var priorEntries = (await conversationLog.GetEntriesAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false))
-            .Where(e => e.AgentId == entry.AgentId)
-            .OrderBy(e => e.CycleNumber)
-            .ToList();
-        var priorTurns = ReconstructTurns(priorEntries);
+        var isReview = entry.Stage == PipelineStage.Review;
 
-        await workUnits.UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Retrying, sessionId: null, cancellationToken)
-            .ConfigureAwait(false);
-
-        var agentId = $"worker-continue-{Guid.NewGuid():N}";
         var dispatcher = serviceProvider.GetRequiredService<McpToolDispatcher>();
         var llm = serviceProvider.GetRequiredService<LlmClient>();
         var events = serviceProvider.GetService<IExecutionEventStream>();
         var logger = serviceProvider.GetService<ILogger<ContinueService>>();
         var agentClient = new DefaultAgentToolClient(provider ?? "anthropic", model ?? string.Empty, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
 
-        var loop = new WorkerAgentLoop(
-            agentId, entry.WorkUnitId, entry.TaskId ?? string.Empty, agentClient,
-            isResume: true, conversationLog: conversationLog, events: events,
-            priorTurns: priorTurns, logger: logger);
+        // Shared by both branches — reconstructs the exact turns the dead-lettered agent itself
+        // produced (see ReconstructTurns), so the resumed loop picks up its own prior investigation
+        // instead of starting cold. Live evidence (2026-07-10): without this, a Review-stage Continue
+        // re-ran nm_v1_projection_get / nm_v1_workunit_get / nm_v1_workspace_diff / file reads from
+        // scratch every time, burning the whole fresh budget re-deriving context it already had and
+        // never reaching a decision — 3 consecutive attempts, 3 consecutive MaxIterationsExceeded.
+        var priorEntries = (await conversationLog.GetEntriesAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false))
+            .Where(e => e.AgentId == entry.AgentId)
+            .OrderBy(e => e.CycleNumber)
+            .ToList();
+        var priorTurns = ReconstructTurns(priorEntries);
 
-        var completion = await loop.RunAsync(cancellationToken).ConfigureAwait(false);
+        var agentId = isReview ? $"reviewer-continue-{Guid.NewGuid():N}" : $"worker-continue-{Guid.NewGuid():N}";
+        AgentLoopCompletion completion;
+        if (isReview)
+        {
+            // A dead-lettered Review-stage entry's TaskId holds the proposalId being reviewed (see
+            // InlineReviewerService.RecordFailureAsync), not a task to execute — mirrors the
+            // scheduler's own dequeue-path branch (InMemoryAgentRuntimeService, PipelineStage.Review
+            // case), which is the only other place a ReviewerAgentLoop gets spawned from a dead-
+            // letter-adjacent retry. Work-unit status is deliberately left untouched here too,
+            // matching the scheduler path: it's the nm_v1_merge_review tool call itself that drives
+            // the outcome, not a status flip around the loop.
+            var reviewerLoop = new ReviewerAgentLoop(
+                agentId, entry.WorkUnitId, entry.TaskId ?? string.Empty, agentClient,
+                conversationLog: conversationLog, events: events, priorTurns: priorTurns, logger: logger);
+            completion = await reviewerLoop.RunAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await workUnits.UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Retrying, sessionId: null, cancellationToken)
+                .ConfigureAwait(false);
+
+            var workerLoop = new WorkerAgentLoop(
+                agentId, entry.WorkUnitId, entry.TaskId ?? string.Empty, agentClient,
+                isResume: true, conversationLog: conversationLog, events: events,
+                priorTurns: priorTurns, logger: logger);
+            completion = await workerLoop.RunAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         if (completion == AgentLoopCompletion.Succeeded)
         {
-            try
+            if (!isReview)
             {
-                await workUnits.UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Executing, sessionId: null, cancellationToken)
-                    .ConfigureAwait(false);
+                try
+                {
+                    await workUnits.UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Executing, sessionId: null, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (InvalidOperationException) { /* the agent's own tool calls (task.update, merge.propose) may have already moved it further */ }
             }
-            catch (InvalidOperationException) { /* the agent's own tool calls (task.update, merge.propose) may have already moved it further */ }
 
             return new ContinueResult(ContinueOutcome.Continued, Completion: completion);
         }

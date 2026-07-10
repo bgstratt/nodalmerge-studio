@@ -135,7 +135,16 @@ internal sealed class WorkerAgentLoop(
             }
 
             if (response.StopReason != "tool_use")
+            {
+                // See ReviewerAgentLoop's identical branch for the full rationale — this exited with
+                // zero record of what happened (most commonly a max-output-tokens cutoff), reported
+                // identically to genuinely exhausting the whole iteration budget. Record it so a
+                // truncated/anomalous response is visible in the conversation log.
+                await ConversationLogRecorder.RecordTurnAsync(
+                    conversationLog, workUnitId, agentId, "Worker", taskId, i, response, [], sessionId, ct,
+                    client.Provider, client.Model).ConfigureAwait(false);
                 break;
+            }
 
             var toolResults = new List<NmContent>();
             var awaitingFileLease = false;

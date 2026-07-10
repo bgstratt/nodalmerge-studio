@@ -39,6 +39,12 @@ interface WorkUnit {
   awaitingCredentials?: boolean;
 }
 
+interface AgentInfo {
+  agentId: string;
+  workUnitId: string;
+  status: string;
+}
+
 interface StudioOptions {
   useLlmProfileSelection: boolean;
   maxConcurrentWorkers: number;
@@ -452,7 +458,16 @@ export class GoalWorkspacePanel {
   private async refreshDecisionTree(sessionId: string): Promise<void> {
     try {
       const workUnits = await this.get<WorkUnit[]>('/studio/sessions/' + sessionId + '/workunits');
-      void this.panel.webview.postMessage({ type: 'tree', sessionId, workUnits });
+      // Same endpoint Activity Center already polls at the same cadence — an inline reviewer
+      // (InlineReviewerService) registers itself here for the duration of its review, agentId
+      // prefixed "reviewer-auto-" (distinct from the scheduler-dispatched reviewer path's
+      // SpawnAsync-generated id, which is already visible via Activity Center on its own). Best-
+      // effort: a failure here shouldn't block the tree itself from rendering.
+      const agents = await this.get<AgentInfo[]>('/studio/agents?all=true').catch(() => [] as AgentInfo[]);
+      const reviewingWorkUnitIds = agents
+        .filter(a => a.status === 'active' && a.agentId.startsWith('reviewer-auto-'))
+        .map(a => a.workUnitId);
+      void this.panel.webview.postMessage({ type: 'tree', sessionId, workUnits, reviewingWorkUnitIds });
     } catch {
       // session may have just been created and not yet visible
     }
@@ -1701,7 +1716,15 @@ const GW_CSS = `
   .dn-node:hover { background: color-mix(in srgb, var(--nm-border) 30%, transparent); }
   .dn-node.selected { border-color: var(--nm-info); background: color-mix(in srgb, var(--nm-info) 12%, transparent); }
   .dn-title { font-weight: 600; font-size: 0.92em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .dn-meta { display: flex; gap: 6px; margin-top: 3px; flex-wrap: wrap; }
+  .dn-meta { display: flex; gap: 6px; margin-top: 3px; flex-wrap: wrap; align-items: center; }
+  /* Live "agent reviewing" indicator — same visual language as Activity Center's own .pulse. */
+  .pulse {
+    display: inline-block;
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--nm-success);
+    animation: dn-pulse 2s ease-in-out infinite;
+  }
+  @keyframes dn-pulse { 0%,100%{opacity:1} 50%{opacity:0.25} }
   .badge {
     display: inline-block; border-radius: 9px; padding: 1px 8px; font-size: 0.74em; white-space: nowrap;
     background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);

@@ -301,4 +301,85 @@ public class InMemoryAgentRuntimeServiceTests
 
         Assert.Null(svc.GetEnabledDomainAgents("wu-1"));
     }
+
+    // ── TrackInlineAgentAsync ────────────────────────────────────────────────
+
+    [Fact]
+    public async Task TrackInlineAgentAsync_registers_active_then_marks_stopped_on_success()
+    {
+        var svc = Build();
+        string? statusWhileRunning = null;
+
+        var result = await svc.TrackInlineAgentAsync("reviewer-auto-1", "wu-1", "MP-1", async onActivity =>
+        {
+            var midFlight = await svc.ListAllAsync();
+            statusWhileRunning = midFlight.Single().Status;
+            onActivity("Reading diff...");
+            return 42;
+        });
+
+        Assert.Equal(42, result);
+        Assert.Equal("active", statusWhileRunning);
+
+        var after = await svc.ListAllAsync();
+        var record = Assert.Single(after);
+        Assert.Equal("reviewer-auto-1", record.AgentId);
+        Assert.Equal("wu-1", record.WorkUnitId);
+        Assert.Equal("stopped", record.Status);
+        Assert.Null(record.CurrentActivity);
+    }
+
+    [Fact]
+    public async Task TrackInlineAgentAsync_reports_activity_via_callback_while_running()
+    {
+        var svc = Build();
+        string? activityDuringRun = null;
+
+        await svc.TrackInlineAgentAsync<object?>("reviewer-auto-2", "wu-2", null, async onActivity =>
+        {
+            onActivity("Running build...");
+            activityDuringRun = (await svc.ListAllAsync()).Single().CurrentActivity;
+            return null;
+        });
+
+        Assert.Equal("Running build...", activityDuringRun);
+    }
+
+    [Fact]
+    public async Task TrackInlineAgentAsync_marks_failed_and_rethrows_on_exception()
+    {
+        var svc = Build();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            svc.TrackInlineAgentAsync<object?>("reviewer-auto-3", "wu-3", null,
+                _ => throw new InvalidOperationException("reviewer blew up")));
+
+        Assert.Equal("reviewer blew up", ex.Message);
+
+        var record = Assert.Single(await svc.ListAllAsync());
+        Assert.StartsWith("failed:", record.Status);
+        Assert.Null(record.CurrentActivity);
+    }
+
+    [Fact]
+    public async Task TrackInlineAgentAsync_isolated_per_agentId_under_concurrency()
+    {
+        var svc = Build();
+
+        var task1 = svc.TrackInlineAgentAsync<object?>("reviewer-auto-a", "wu-a", null, async _ =>
+        {
+            await Task.Delay(10);
+            return null;
+        });
+        var task2 = svc.TrackInlineAgentAsync<object?>("reviewer-auto-b", "wu-b", null, async _ =>
+        {
+            await Task.Delay(10);
+            return null;
+        });
+        await Task.WhenAll(task1, task2);
+
+        var all = await svc.ListAllAsync();
+        Assert.Equal(2, all.Count);
+        Assert.All(all, a => Assert.Equal("stopped", a.Status));
+    }
 }

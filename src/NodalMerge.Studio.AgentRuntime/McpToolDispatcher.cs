@@ -480,8 +480,14 @@ internal sealed class McpToolDispatcher(
             return ToError("Decision must be 'Approved' or 'Rejected'.");
         }
 
+        // Accept a stringly-typed "true" too — the tool schema declares this as a boolean, but a
+        // model (or any other MCP client) sending it as a string must not silently fall through to
+        // the non-automated branch below, which mislabels ReviewedBy as "user" for what was really
+        // an agent-driven review.
         var automated = input.TryGetProperty("automated", out var autoEl) &&
-                        autoEl.ValueKind == JsonValueKind.True;
+                        (autoEl.ValueKind == JsonValueKind.True ||
+                         (autoEl.ValueKind == JsonValueKind.String &&
+                          bool.TryParse(autoEl.GetString(), out var autoBool) && autoBool));
 
         try
         {
