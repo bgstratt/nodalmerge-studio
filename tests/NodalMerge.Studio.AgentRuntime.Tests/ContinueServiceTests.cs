@@ -111,6 +111,8 @@ public class ContinueServiceTests
 
         public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
+        public Task<bool> ResupplyCredentialsAsync(string workUnitId, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
+            Task.FromResult(false);
 
         public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
         public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => CredentialsToReturn;
@@ -123,6 +125,8 @@ public class ContinueServiceTests
         public Task<string> GetStatusAsync(string agentId, CancellationToken cancellationToken = default) => Task.FromResult("unknown");
         public Task<IReadOnlyList<AgentInfo>> ListActiveAsync(CancellationToken cancellationToken = default) => Task.FromResult<IReadOnlyList<AgentInfo>>([]);
         public Task<IReadOnlyList<AgentInfo>> ListAllAsync(CancellationToken cancellationToken = default) => Task.FromResult<IReadOnlyList<AgentInfo>>([]);
+        public Task<TResult> TrackInlineAgentAsync<TResult>(string agentId, string workUnitId, string? taskId, Func<Action<string?>, Task<TResult>> run, CancellationToken cancellationToken = default) =>
+            run(_ => { });
     }
 
     private sealed class NoopServiceProvider : IServiceProvider

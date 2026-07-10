@@ -668,16 +668,21 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         return agentId;
     }
 
-    public async Task ReinvokeOrchestratorAsync(
+    private readonly record struct ResolvedOrchestratorCredentials(
+        string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? CredentialRef);
+
+    // Shared by ReinvokeOrchestratorAsync and ResupplyCredentialsAsync — both need the exact same
+    // "same-process hot path, then rehydrated routing + IRuntimeCredentialCache, then override*
+    // params" resolution, and both need to (re-)persist whatever they land on so a *future*
+    // restart/lookup recovers it too. The only difference between the two callers is whether an
+    // orchestrator loop then gets spawned on top of this — see ResupplyCredentialsAsync's own doc
+    // comment on IAgentControlService for why a requeue doesn't always want that.
+    private async Task<ResolvedOrchestratorCredentials?> ResolveAndPersistCredentialsAsync(
         string workUnitId,
-        string? sessionId = null,
-        string? overrideModel = null,
-        string? overrideBaseUrl = null,
-        string? overrideApiKey = null,
-        string? overrideProvider = null,
-        string? overrideProfileId = null,
-        string? overrideCredentialRef = null,
-        CancellationToken cancellationToken = default)
+        string? overrideModel, string? overrideBaseUrl, string? overrideApiKey, string? overrideProvider,
+        string? overrideProfileId, string? overrideCredentialRef,
+        string actionName,
+        CancellationToken cancellationToken)
     {
         string? provider = overrideProvider, model = overrideModel, baseUrl = overrideBaseUrl;
         string? apiKey = overrideApiKey, profileId = overrideProfileId, credentialRef = overrideCredentialRef;
@@ -721,25 +726,21 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         if (string.IsNullOrWhiteSpace(baseUrl) || apiKey is null)
         {
             _logger.LogWarning(
-                "[Orchestrator] Reinvoke for workUnit={WorkUnitId} skipped — no credentials resolvable " +
+                "[Orchestrator] {ActionName} for workUnit={WorkUnitId} skipped — no credentials resolvable " +
                 "(registration cold after a restart, and IRuntimeCredentialCache has nothing for " +
-                "CredentialRef={CredentialRef}). Needs a manual reinvoke with resupplied credentials.",
-                workUnitId, credentialRef ?? "(none)");
-            return;
+                "CredentialRef={CredentialRef}). Needs a manual retry with resupplied credentials.",
+                actionName, workUnitId, credentialRef ?? "(none)");
+            return null;
         }
 
         provider ??= "anthropic";
         model ??= string.Empty;
         _credentialCache.Capture(credentialRef, provider, model, baseUrl, apiKey);
 
-        var agentId = $"orchestrator-{Guid.NewGuid():N}";
-        var cts = new CancellationTokenSource();
-        _agents[agentId] = new AgentRecord(agentId, workUnitId, "active", null, model, baseUrl, apiKey, provider, cts);
-
         // Re-warm the hot path so subsequent same-process calls (GetOrchestratorCredentials,
-        // GetAutoReviewProfileId, another ReinvokeOrchestratorAsync, ...) skip the cache lookup —
-        // and (re)persist the safe routing config, so a *future* restart can recover this
-        // orchestrator too, closing the gap that got it here in the first place.
+        // GetAutoReviewProfileId, another ReinvokeOrchestratorAsync/ResupplyCredentialsAsync, ...)
+        // skip the cache lookup — and (re)persist the safe routing config, so a *future* restart
+        // can recover this orchestrator too, closing the gap that got it here in the first place.
         _orchestratorRegistrations[workUnitId] = new OrchestratorRegistration(
             provider, model, baseUrl, apiKey, profileId, autoReviewProfileId,
             stageCredentials, enabledDomainAgents, credentialRef);
@@ -751,11 +752,51 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             StudioNodeKind.OrchestratorRoutingV1, workUnitId,
             JsonSerializer.Serialize(routingToPersist), cancellationToken).ConfigureAwait(false);
 
-        AgentProfile? profile = profileId is not null
-            ? _profileService.GetAsync(profileId, cancellationToken).GetAwaiter().GetResult()
+        return new ResolvedOrchestratorCredentials(provider, model, baseUrl, apiKey, profileId, credentialRef);
+    }
+
+    public async Task ReinvokeOrchestratorAsync(
+        string workUnitId,
+        string? sessionId = null,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideProfileId = null,
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default)
+    {
+        var resolved = await ResolveAndPersistCredentialsAsync(
+            workUnitId, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider,
+            overrideProfileId, overrideCredentialRef, "Reinvoke", cancellationToken).ConfigureAwait(false);
+        if (resolved is not { } creds)
+            return;
+
+        var agentId = $"orchestrator-{Guid.NewGuid():N}";
+        var cts = new CancellationTokenSource();
+        _agents[agentId] = new AgentRecord(agentId, workUnitId, "active", null, creds.Model, creds.BaseUrl, creds.ApiKey, creds.Provider, cts);
+
+        AgentProfile? profile = creds.ProfileId is not null
+            ? _profileService.GetAsync(creds.ProfileId, cancellationToken).GetAwaiter().GetResult()
             : null;
 
-        StartOrchestratorLoop(agentId, workUnitId, provider, model, baseUrl, apiKey, profile, cts, sessionId);
+        StartOrchestratorLoop(agentId, workUnitId, creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey, profile, cts, sessionId);
+    }
+
+    public async Task<bool> ResupplyCredentialsAsync(
+        string workUnitId,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideProfileId = null,
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default)
+    {
+        var resolved = await ResolveAndPersistCredentialsAsync(
+            workUnitId, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider,
+            overrideProfileId, overrideCredentialRef, "Requeue credential resupply", cancellationToken).ConfigureAwait(false);
+        return resolved is not null;
     }
 
     // Same-process hot path first (real ApiKey, no cache lookup needed). Falls back to the
@@ -1021,6 +1062,40 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             .ToList();
 
         return Task.FromResult<IReadOnlyList<AgentInfo>>(all);
+    }
+
+    // Mirrors the register/report/cleanup shape SpawnAsync's own loops use (see StartWorkerLoop
+    // above) for a caller that isn't itself a background Task.Run — InlineReviewerService is
+    // awaited synchronously by AutoReviewRule's BeforeMerge gate, so there's no fire-and-forget
+    // wrapper of its own to hang a finally off. Owning the whole `run` delegate here (rather than
+    // exposing separate Register/Unregister calls) makes it structurally impossible for a future
+    // edit to skip cleanup and leak a stuck "active" entry.
+    public async Task<TResult> TrackInlineAgentAsync<TResult>(
+        string agentId,
+        string workUnitId,
+        string? taskId,
+        Func<Action<string?>, Task<TResult>> run,
+        CancellationToken cancellationToken = default)
+    {
+        _agents[agentId] = new AgentRecord(agentId, workUnitId, "active", taskId);
+        try
+        {
+            return await run(a => ReportActivity(agentId, a)).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            if (_agents.TryGetValue(agentId, out var r))
+            {
+                var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
+                _agents[agentId] = r with { Status = $"failed:{msg}", CurrentActivity = null };
+            }
+            throw;
+        }
+        finally
+        {
+            if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
+                _agents[agentId] = r with { Status = "stopped", CurrentActivity = null };
+        }
     }
 
     private AgentRecord GetRequired(string agentId)

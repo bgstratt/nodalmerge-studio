@@ -177,6 +177,15 @@ public static class WorkUnitTransitions
             // though its proposal already merged.
             (WorkUnitStatus.Executing, WorkUnitStatus.Merged) => true,
 
+            // Human override — mirrors the DeadLettered -> Retrying/Proposed/Merged overrides
+            // above: cancellation is a deliberate stop, not a terminal judgment on the work's
+            // quality, so a human asking to resume it should not be permanently blocked. Queued
+            // covers a plain leaf retry; Executing covers a cancelled fan-out parent re-attempting
+            // reconciliation (mirrors the existing Reviewing -> Executing edge, used for the same
+            // "try convergence again" purpose).
+            (WorkUnitStatus.Cancelled, WorkUnitStatus.Queued) => true,
+            (WorkUnitStatus.Cancelled, WorkUnitStatus.Executing) => true,
+
             (_, WorkUnitStatus.Cancelled) when from is not WorkUnitStatus.Completed and not WorkUnitStatus.Merged => true,
             _ => false
         };

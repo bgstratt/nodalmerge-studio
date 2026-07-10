@@ -86,6 +86,11 @@ export function init(ctx) {
       if (!isTerminal) {
         html += '<button class="danger" data-action="cancelWorkUnit" data-wu="' + esc(g.workUnitId) + '">Stop</button>';
       }
+      // Cancelling used to be a permanent dead end — Requeue is the un-cancel, mirroring
+      // Unreject-and-Revise for a Rejected proposal (see WorkUnitCommandService.RequeueAsync).
+      if (status === 'cancelled') {
+        html += '<button class="ghost" data-action="requeueWorkUnit" data-wu="' + esc(g.workUnitId) + '" style="color:var(--nm-success);border-color:var(--nm-success)" title="Resume this cancelled goal">↺ Requeue</button>';
+      }
       html += '</div>';
       html += '</div>';
       if (isPaused && g.pauseReason) {
@@ -141,6 +146,11 @@ export function init(ctx) {
     el.querySelectorAll('[data-action="cancelWorkUnit"]').forEach(function(btn) {
       btn.addEventListener('click', function() {
         vscode.postMessage({ type: 'cancelWorkUnit', workUnitId: btn.getAttribute('data-wu') });
+      });
+    });
+    el.querySelectorAll('[data-action="requeueWorkUnit"]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        vscode.postMessage({ type: 'requeueWorkUnit', workUnitId: btn.getAttribute('data-wu') });
       });
     });
     el.querySelectorAll('[data-action="markKnownGood"]').forEach(function(btn) {
@@ -227,6 +237,12 @@ export function init(ctx) {
       var statusLower = (a.status || '').toLowerCase();
       var isPaused = statusLower === 'paused';
       var isInterrupted = statusLower === 'interrupted';
+      // An inline reviewer (InlineReviewerService, agentId prefixed "reviewer-auto-") is awaited
+      // synchronously by its caller rather than dispatched through IWorkScheduler, so it has no
+      // CancellationTokenSource registered — Pause/Stop would flip its displayed status without
+      // actually being able to interrupt the run underneath. Hide those controls rather than offer
+      // a button that silently does nothing.
+      var isInlineReviewer = (a.agentId || '').indexOf('reviewer-auto-') === 0;
       html += '<div class="card">';
       html += '<div class="row">';
       html += '<span class="title mono">' + esc(a.agentId) + '</span>';
@@ -235,7 +251,9 @@ export function init(ctx) {
       // Phase 11 — deep-links into Goal Workspace's Decision Lens Conversation tab; the
       // transcript is durable, so this is offered regardless of pause/interrupted/active state.
       html += '<button class="ghost" data-action="viewTranscript" data-wu="' + esc(a.workUnitId) + '">View live transcript</button>';
-      if (isInterrupted) {
+      if (isInlineReviewer) {
+        // No-op — see comment above.
+      } else if (isInterrupted) {
         html += '<button class="ghost" data-action="resumeInterrupted" data-wu="' + esc(a.workUnitId) + '">↺ Resume</button>';
       } else if (isPaused) {
         html += '<button class="ghost" data-action="resumeAgent" data-id="' + esc(a.agentId) + '">Resume</button>';

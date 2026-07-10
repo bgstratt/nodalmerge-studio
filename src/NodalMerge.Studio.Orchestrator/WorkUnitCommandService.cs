@@ -20,6 +20,8 @@ public sealed class WorkUnitCommandService(
     NodalMerge.Studio.Storage.IWorkspaceRegistryService workspaces,
     IFileLeaseService fileLease,
     IWorkScheduler scheduler,
+    ITaskService tasks,
+    IArtifactCommandService artifactCommands,
     // Optional so direct-construction test call sites keep compiling — when null, cancel-time
     // parent reconciliation is simply skipped (the orchestrator's own post-loop sweep still
     // covers it on the next reinvoke).
@@ -231,5 +233,135 @@ public sealed class WorkUnitCommandService(
             cancelled.AddRange(await CancelAsync(root.WorkUnitId, cancellationToken).ConfigureAwait(false));
 
         return cancelled;
+    }
+
+    public async Task<IReadOnlyList<WorkUnit>> RequeueAsync(
+        string workUnitId,
+        string? notes = null,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideProfileId = null,
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default)
+    {
+        var root = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException($"Work unit '{workUnitId}' was not found.");
+        if (root.Status != WorkUnitStatus.Cancelled)
+            throw new InvalidOperationException($"Work unit '{workUnitId}' is not Cancelled (current: {root.Status}) — nothing to requeue.");
+
+        // Best-effort — a cancel/requeue cycle commonly spans a Host restart (often *why* a human
+        // had to step in), which wipes the in-memory credential cache the inline reviewer and any
+        // re-enqueued worker below both depend on. Resupplying onto workUnitId itself covers every
+        // descendant processed below too, via the same one-level-up-to-parent fallback
+        // GetOrchestratorCredentials/GetCredentialsForStage callers already use. Does not spawn an
+        // orchestrator loop — see IAgentControlService.ResupplyCredentialsAsync's doc comment.
+        await agentControl.ResupplyCredentialsAsync(
+            workUnitId, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider,
+            overrideProfileId, overrideCredentialRef, cancellationToken).ConfigureAwait(false);
+
+        // Same subtree shape as CancelAsync — a cancel walked the whole fan-out tree, so requeue
+        // walks it back. Siblings that already finished before the cancel (Merged/Completed) were
+        // never touched by CancelAsync and stay that way here too; only members still Cancelled
+        // are acted on.
+        var subtree = new List<WorkUnit> { root };
+        var childCounts = new Dictionary<string, int> { [workUnitId] = 0 };
+        var frontier = new Queue<string>();
+        frontier.Enqueue(workUnitId);
+        while (frontier.Count > 0)
+        {
+            var parentId = frontier.Dequeue();
+            var children = await workUnits.GetChildrenAsync(parentId, cancellationToken).ConfigureAwait(false);
+            childCounts[parentId] = children.Count;
+            foreach (var child in children)
+            {
+                subtree.Add(child);
+                childCounts[child.WorkUnitId] = 0;
+                frontier.Enqueue(child.WorkUnitId);
+            }
+        }
+
+        // Deepest-first — a parent's reconciliation attempt below needs its children already
+        // requeued (out of Cancelled), not stale.
+        var cancelledMembers = subtree
+            .Where(w => w.Status == WorkUnitStatus.Cancelled)
+            .OrderByDescending(w => childCounts[w.WorkUnitId] == 0 ? 0 : 1)
+            .ToList();
+
+        var requeued = new List<WorkUnit>();
+        foreach (var member in cancelledMembers)
+        {
+            var isFanOutParent = childCounts[member.WorkUnitId] > 0;
+            if (!isFanOutParent)
+            {
+                var creds = agentControl.GetCredentialsForStage(member.WorkUnitId, PipelineStage.Execute)
+                    ?? agentControl.GetOrchestratorCredentials(member.WorkUnitId)
+                    ?? (member.ParentWorkUnitId is { } executeParentId
+                        ? agentControl.GetCredentialsForStage(executeParentId, PipelineStage.Execute) ?? agentControl.GetOrchestratorCredentials(executeParentId)
+                        : null);
+
+                if (!string.IsNullOrWhiteSpace(notes))
+                {
+                    await artifactCommands.RecordAsync(
+                        member.WorkUnitId, "Constraint", "Requeue steering notes", notes,
+                        ct: cancellationToken).ConfigureAwait(false);
+                }
+
+                var updated = await workUnits
+                    .UpdateStatusAsync(member.WorkUnitId, WorkUnitStatus.Queued, cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
+                requeued.Add(updated);
+
+                // A cancelled leaf's tasks are frozen in whatever non-Open status they were in
+                // (usually InProgress) — TaskTransitions has no legal exit from most non-Open
+                // states, so without this the re-queued worker can't even mark itself InProgress.
+                // CreateAsync is an unconditional upsert (mirrors
+                // AutomatedReviewGateService.ResetTasksForRetryAsync).
+                var existingTasks = await tasks.ListAsync(member.WorkUnitId, cancellationToken).ConfigureAwait(false);
+                StudioTask? firstTask = null;
+                foreach (var t in existingTasks)
+                {
+                    if (t.Status != NodalMerge.Studio.Contracts.Domain.TaskStatus.Open)
+                    {
+                        await tasks.CreateAsync(t with { Status = NodalMerge.Studio.Contracts.Domain.TaskStatus.Open, Assignee = null }, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    firstTask ??= t;
+                }
+
+                await scheduler.EnqueueAsync(
+                    member.WorkUnitId,
+                    "worker",
+                    taskId: firstTask?.TaskId,
+                    model: creds?.Model,
+                    baseUrl: creds?.BaseUrl,
+                    apiKey: creds?.ApiKey,
+                    provider: creds?.Provider,
+                    ct: cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                var updated = await workUnits
+                    .UpdateStatusAsync(member.WorkUnitId, WorkUnitStatus.Executing, cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
+                requeued.Add(updated);
+
+                if (!string.IsNullOrWhiteSpace(notes))
+                {
+                    await artifactCommands.RecordAsync(
+                        member.WorkUnitId, "Constraint", "Requeue steering notes", notes,
+                        ct: cancellationToken).ConfigureAwait(false);
+                }
+
+                if (mergeReconciliation is not null)
+                {
+                    try { await mergeReconciliation.TryReconcileAsync(member.WorkUnitId, null, cancellationToken).ConfigureAwait(false); }
+                    catch { /* best-effort — the requeue itself already succeeded */ }
+                }
+            }
+        }
+
+        return requeued;
     }
 }

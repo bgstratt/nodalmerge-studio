@@ -507,6 +507,34 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
             }
           }
           break;
+        case 'requeueWorkUnit':
+          // Un-cancel — the inverse of cancelWorkUnit above (WorkUnitCommandService.RequeueAsync).
+          // A cancel/requeue cycle commonly spans a Host restart (often *why* a human had to step
+          // in), which wipes the in-memory credential cache the inline reviewer and any
+          // re-enqueued worker depend on — resolve fresh ones from settings.json + the saved
+          // credential store client-side, same as Reconcile already does, so requeue doesn't
+          // silently land somewhere with no way to actually run anything.
+          try {
+            const llm = await this.resolveOrchestratorCredentials();
+            const body = llm
+              ? {
+                  overrideModel: llm.model, overrideBaseUrl: llm.baseUrl,
+                  overrideApiKey: llm.apiKey, overrideProvider: llm.provider,
+                  overrideProfileId: llm.profileId, overrideCredentialRef: llm.credentialRef,
+                }
+              : {};
+            await this.post('/studio/workunits/' + String(msg.workUnitId) + '/requeue', body);
+            void vscode.window.showInformationMessage(
+              llm
+                ? 'NodalMerge: Requeued with fresh credentials.'
+                : 'NodalMerge: Requeued — no Orchestrator profile configured in Model & Agent Studio → ' +
+                  'Agent Topology, so any review/worker step needing credentials may still stall.',
+            );
+            void this.poll();
+          } catch (err) {
+            void vscode.window.showErrorMessage('NodalMerge: requeue failed — ' + String(err));
+          }
+          break;
         case 'stopAll': {
           const confirmed = await vscode.window.showWarningMessage(
             'Stop all active goals, agents, and pending reviews?',
@@ -896,6 +924,26 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
     const defaultName = this.configService.getDefaultTopology();
     const template = templates.find(t => t.name === defaultName) ?? templates[0];
     const profileId = template?.reconciler || template?.orchestrator;
+    if (!profileId) { return undefined; }
+
+    const llm = await this.configService.resolveSpawnLlmConfig(profileId, this.secrets, this.lmProxyBaseUrl);
+    return llm ? { ...llm, profileId } : undefined;
+  }
+
+  // Same shape as resolveReconcilerCredentials above, but for the plain Orchestrator profile —
+  // used by Requeue to resupply credentials for a goal whose in-memory registration was wiped by
+  // a Host restart (see the 'requeueWorkUnit' case), same "settings.json + saved credential store"
+  // source Reconcile already draws from. Returns undefined when nothing is configured, so Requeue
+  // still proceeds (same no-op-if-unresolvable contract ResupplyCredentialsAsync has server-side).
+  private async resolveOrchestratorCredentials(): Promise<
+    { provider: string; model: string; baseUrl: string; apiKey: string; profileId: string; credentialRef?: string } | undefined
+  > {
+    if (!this.configService || !this.secrets || !this.lmProxyBaseUrl) { return undefined; }
+
+    const templates = this.configService.getTemplates();
+    const defaultName = this.configService.getDefaultTopology();
+    const template = templates.find(t => t.name === defaultName) ?? templates[0];
+    const profileId = template?.orchestrator;
     if (!profileId) { return undefined; }
 
     const llm = await this.configService.resolveSpawnLlmConfig(profileId, this.secrets, this.lmProxyBaseUrl);

@@ -25,6 +25,10 @@ public class WorkUnitTransitionTests
     [InlineData(WorkUnitStatus.Merged, WorkUnitStatus.Cancelled, false)]
     [InlineData(WorkUnitStatus.Merged, WorkUnitStatus.Executing, false)]
     [InlineData(WorkUnitStatus.Queued, WorkUnitStatus.Merged, false)]
+    // Requeue Goal (uncancel-and-requeue) — mirrors the DeadLettered human-override edges above.
+    [InlineData(WorkUnitStatus.Cancelled, WorkUnitStatus.Queued, true)]
+    [InlineData(WorkUnitStatus.Cancelled, WorkUnitStatus.Executing, true)]
+    [InlineData(WorkUnitStatus.Cancelled, WorkUnitStatus.Merged, false)]
     public void CanTransition_respects_lifecycle(WorkUnitStatus from, WorkUnitStatus to, bool expected)
     {
         Assert.Equal(expected, WorkUnitTransitions.CanTransition(from, to));

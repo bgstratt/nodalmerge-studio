@@ -862,6 +862,32 @@ public interface IWorkUnitCommandService
     // Stop-all — runs CancelAsync against every non-terminal root work unit (no parent), across
     // every session, for a single "stop everything" control.
     Task<IReadOnlyList<WorkUnit>> CancelAllActiveAsync(CancellationToken cancellationToken = default);
+
+    // Un-cancel — the inverse of CancelAsync. Walks the same subtree shape (root + every
+    // descendant), but only acts on members still Cancelled (a sibling that finished before the
+    // cancel stays Merged/Completed and is left alone, same as CancelAsync already does). Leaf
+    // members re-open their tasks and re-enqueue a worker; fan-out parents re-attempt
+    // reconciliation via IMergeReconciliationService, reusing whatever TaskConflictRecord/child
+    // state already exists instead of re-deriving anything. Throws InvalidOperationException if
+    // workUnitId itself isn't Cancelled — nothing to requeue.
+    //
+    // The override* params are best-effort credential resupply (IAgentControlService.
+    // ResupplyCredentialsAsync) for workUnitId itself before anything else runs — a cancel/requeue
+    // cycle commonly spans a Host restart (that's often *why* the goal needed a human to look at
+    // it), which wipes the in-memory IRuntimeCredentialCache the inline reviewer and re-enqueued
+    // workers both depend on. Does not spawn a new orchestrator loop — see
+    // ResupplyCredentialsAsync's own doc comment for why. Silently no-ops (same as today) if
+    // nothing is resolvable and no overrides are supplied.
+    Task<IReadOnlyList<WorkUnit>> RequeueAsync(
+        string workUnitId,
+        string? notes = null,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideProfileId = null,
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default);
 }
 
 public interface IAgentRuntimeService
@@ -1091,6 +1117,24 @@ public interface IAgentControlService
         string? overrideCredentialRef = null,
         CancellationToken cancellationToken = default);
 
+    // Requeue Goal's credential half — same resolve-and-persist logic ReinvokeOrchestratorAsync
+    // uses (registration hot path, then rehydrated routing + IRuntimeCredentialCache, then the
+    // override* params), but without spawning a new orchestrator loop. A requeued goal whose
+    // in-flight work is already done (just needs one more reconcile/review pass) doesn't need an
+    // ongoing planning loop — it just needs GetOrchestratorCredentials/GetCredentialsForStage to
+    // resolve again for whatever one-shot call (inline reviewer, a re-enqueued worker) needs them
+    // next. Returns true if credentials are resolvable (and now persisted) after this call, false
+    // if nothing was resolvable (same "no-op, caller can supply overrides" contract as reinvoke).
+    Task<bool> ResupplyCredentialsAsync(
+        string workUnitId,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideProfileId = null,
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default);
+
     /// <summary>
     /// Returns LLM credentials captured when an orchestrator was first spawned for a work unit.
     /// Used by fan-out to enqueue child workers with the same credentials.
@@ -1137,6 +1181,23 @@ public interface IAgentControlService
     Task<IReadOnlyList<AgentInfo>> ListActiveAsync(CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<AgentInfo>> ListAllAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Registers a synchronous, non-scheduled agent run (e.g. InlineReviewerService's BeforeMerge-
+    /// gate reviewer, which is awaited directly by its caller rather than dispatched through
+    /// IWorkScheduler) into the same visibility registry SpawnAsync-driven agents use, for the
+    /// duration of <paramref name="run"/>. The entry is registered "active" before <paramref
+    /// name="run"/> starts and is guaranteed to be marked "stopped" (or "failed:...", rethrowing)
+    /// before this method returns or throws — callers do not need their own try/finally. <paramref
+    /// name="run"/> receives an activity-reporting callback equivalent to the one SpawnAsync's own
+    /// loops use, for CurrentActivity visibility while it runs.
+    /// </summary>
+    Task<TResult> TrackInlineAgentAsync<TResult>(
+        string agentId,
+        string workUnitId,
+        string? taskId,
+        Func<Action<string?>, Task<TResult>> run,
+        CancellationToken cancellationToken = default);
 }
 
 public interface IArtifactLineageService

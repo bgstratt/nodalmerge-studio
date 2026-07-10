@@ -87,6 +87,15 @@ public static class StudioRestEndpoints
 
     private sealed record RetryRejectedProposalBody(string? Notes = null, string? SessionId = null, string? RestartMode = null);
 
+    private sealed record RequeueWorkUnitBody(
+        string? Notes = null,
+        string? OverrideModel = null,
+        string? OverrideBaseUrl = null,
+        string? OverrideApiKey = null,
+        string? OverrideProvider = null,
+        string? OverrideProfileId = null,
+        string? OverrideCredentialRef = null);
+
     private sealed record BranchProposalBody(
         string Goal,
         string ProfileId,
@@ -1395,6 +1404,34 @@ public static class StudioRestEndpoints
             catch (KeyNotFoundException ex)
             {
                 return Results.NotFound(new { error = ex.Message });
+            }
+        });
+
+        // Un-cancel — the direct analog of /studio/merges/{proposalId}/retry (Unreject and
+        // Revise) for a Cancelled work unit. A human explicitly asking to resume should never be
+        // permanently blocked by a status that only ever meant "someone deliberately stopped
+        // this" — see WorkUnitCommandService.RequeueAsync for the leaf-vs-fan-out-parent split.
+        app.MapPost("/studio/workunits/{workUnitId}/requeue", async (
+            string workUnitId,
+            RequeueWorkUnitBody? body,
+            IWorkUnitCommandService workUnitCommands,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var requeued = await workUnitCommands.RequeueAsync(
+                    workUnitId, body?.Notes,
+                    body?.OverrideModel, body?.OverrideBaseUrl, body?.OverrideApiKey, body?.OverrideProvider,
+                    body?.OverrideProfileId, body?.OverrideCredentialRef, ct).ConfigureAwait(false);
+                return Results.Ok(new { requeuedWorkUnitIds = requeued.Select(w => w.WorkUnitId).ToList() });
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
             }
         });
 

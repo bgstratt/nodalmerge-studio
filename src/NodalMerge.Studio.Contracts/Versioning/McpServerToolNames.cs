@@ -13,6 +13,7 @@ public static class McpServerToolNames
     public const string GoalList              = "nms_v1_goal_list";
     public const string GoalStatus            = "nms_v1_goal_status";
     public const string GoalCancel            = "nms_v1_goal_cancel";
+    public const string GoalRequeue           = "nms_v1_goal_requeue";
     public const string GoalPause             = "nms_v1_goal_pause";
     public const string GoalResume            = "nms_v1_goal_resume";
     public const string GoalRecover            = "nms_v1_goal_recover";

@@ -206,6 +206,9 @@ public class ReconciliationAgentServiceTests
         public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
 
+        public Task<bool> ResupplyCredentialsAsync(string workUnitId, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
+            Task.FromResult(false);
+
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;
 
         public Task ResumeAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;
@@ -220,5 +223,8 @@ public class ReconciliationAgentServiceTests
 
         public Task<IReadOnlyList<AgentInfo>> ListAllAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyList<AgentInfo>>([]);
+
+        public Task<TResult> TrackInlineAgentAsync<TResult>(string agentId, string workUnitId, string? taskId, Func<Action<string?>, Task<TResult>> run, CancellationToken cancellationToken = default) =>
+            run(_ => { });
     }
 }
