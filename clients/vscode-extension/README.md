@@ -14,7 +14,7 @@ Powered by the NodalMerge runtime, Studio enables collaborative software develop
 Create and manage goals across your team of agents. Set the review policy, target branch, and exploration strategy — single agent, multi-agent fanout, or a parallel experiment across models or approaches. Monitor active sessions and inject clarifications without stopping running agents.
 
 ### Activity Center
-Live view of all running work units and agents: status, current task, file leases, and the dead-letter queue. Spawn, pause, resume, or stop agents directly from the panel. Links to live transcripts and deep-link to Decision Convergence when a proposal is waiting.
+Live view of all running work units and agents: status, current task, file leases, and the dead-letter queue. Spawn, pause, resume, or stop agents directly from the panel. Links to live transcripts and deep-link to Decision Convergence when a proposal is waiting. File leases are scoped per goal (an unrelated goal touching the same path never blocks) and a wait-for cycle between two work units is detected and resolved automatically instead of deadlocking. Retrying, continuing, or re-planning a dead-lettered work unit can resupply credentials on the spot — useful after a Host restart clears the in-memory credential registry.
 
 ### Model & Agent Studio
 Configure named agent profiles — provider (Anthropic, OpenAI, or VS Code built-in), model, system prompt, tool allowlist, and deployment mode (inline or headless peer). Build topology templates that define orchestrator + worker compositions you can reuse across goals.

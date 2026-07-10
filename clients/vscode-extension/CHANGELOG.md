@@ -41,6 +41,47 @@
   text unescaped); "View Diff" clicks no longer double-fire across Studio
   Shell views (duplicate/wrong diff tabs); node detail no longer renders a
   stale response after rapid node clicks.
+- **Reconciliation dead-ends eliminated.** A reconciliation work unit's own
+  proposal merging now correctly transitions it `Executing` → `Merged`
+  (previously an illegal-transition error silently left it stuck at
+  `Executing` forever); its still-`Proposed` children get finalized to
+  `Merged` alongside it. `MergeReconciliationService` no longer dead-ends on
+  cancelled children, on a superseded reconciled proposal whose replacement
+  lives elsewhere in the chain, or on a task-conflict resolution proposal
+  mistaken for the top-level "already reconciled" one — and every
+  `WaitingForChildren`/`Conflict` result now carries a human-readable detail
+  (which child, which status, which files) instead of a bare enum.
+- **Orchestrator rescue sweep.** Reinvoking a stuck orchestrator now also
+  sweeps its `Executing`/`Active`/`Waiting` children for a fan-out that never
+  fired (the case where a reconciliation child got planned but never
+  decomposed), and records what the reconciliation sweep concluded — awaiting
+  review, escalated, or the specific blocker — in the decision log instead of
+  an unexplained `NoOp`.
+- **Goal status convergence.** Goals read from the goal store now derive
+  `Converged`/`Abandoned` from their work unit's terminal status and write it
+  back, instead of reporting `Exploring` forever once the underlying work
+  finished.
+- **File lease deadlock detection, scoped per goal.** Leases are now scoped
+  to the root goal, so an unrelated goal touching the same relative file path
+  in the same repository no longer blocks it. A wait-for cycle forming
+  between two work units (each waiting on a file the other holds) is now
+  detected at the moment it would form and resolved synchronously instead of
+  hanging forever.
+- **Credential resupply for retry/continue/re-plan.** Dead-letter retry,
+  continue, and re-plan now accept an `overrideCredentialRef` so credentials
+  can be resupplied after a Host restart wipes the in-memory registry, backed
+  by a new `IRuntimeCredentialCache` that never persists a live API key to
+  disk. `DeadLetterEntry.ApiKey` is `[JsonIgnore]`d end-to-end, so the old
+  manual per-MCP-tool redaction step was removed as dead code rather than a
+  real protection.
+- **Scheduler guard against re-planning a leaf slice.** Enqueuing a Plan-stage
+  profile directly against an already-fanned-out leaf now fails fast with a
+  clear error instead of spinning up a confused planner run; further
+  decomposition goes through Re-plan on the parent instead.
+- **Test coverage.** Added integration tests for overlapping-file-scope
+  auto-sequencing, staggered child completion, stuck-work/goal recovery,
+  credential-cache and routing rehydration, planner handoff routing, and
+  end-to-end workspace pathways.
 
 ## 0.1.9 — 2026-07-08
 
