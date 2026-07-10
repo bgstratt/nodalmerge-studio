@@ -18,7 +18,11 @@ export function init(ctx) {
   var state = {
     decisionNodes: [], selectedNodeId: null, timelineArtifacts: [], timelineEvents: [], selectedSessionId: '',
     selectedNodeConversation: null, conversationPollTimer: null,
-    referenceFiles: [],
+    referenceFiles: [], reviewingWorkUnitIds: [],
+    // Which node the Decision-tab auto-jump has already fired for (so re-selecting or navigating
+    // back to a node doesn't re-jump away from whatever tab the user is reading), and the cached
+    // full detail for whichever proposal is currently shown in the Decision tab.
+    autoJumpedForNodeId: null, selectedNodeProposalDetail: null,
   };
 
   // esc() imported from ./lib/esc.js (local copy had broken entity replacements)
@@ -530,6 +534,13 @@ export function init(ctx) {
       if (wu.currentStage) { html += stageBadge(wu.currentStage); }
       if (wu.proposalCount) { html += '<span class="mono">' + wu.proposalCount + ' candidate(s)</span>'; }
       html += '</div>';
+      // Live "an inline reviewer agent is actively looking at this proposal right now" indicator —
+      // distinct from the static .badge.reviewing class above (that one reflects a reconciled
+      // fan-out parent's WorkUnitStatus.Reviewing, a different concept). Sourced from the same
+      // /studio/agents poll Activity Center already uses; disappears once the review concludes.
+      if ((state.reviewingWorkUnitIds || []).indexOf(wu.workUnitId) !== -1) {
+        html += '<div class="dn-meta"><span class="pulse"></span><span class="mono">Agent reviewing…</span></div>';
+      }
       // Slice 22c — Experiment parent badges
       var children = (byParent[wu.workUnitId] || []);
       if (children.length >= 2) {
@@ -562,9 +573,12 @@ export function init(ctx) {
         stopConversationPoll();
         state.selectedNodeId = id;
         state.selectedNodeConversation = null;
+        state.selectedNodeProposalDetail = null;
         renderDecisionTree(state.decisionNodes);
         $('gw-timeline').innerHTML = '<p class="empty">Loading…</p>';
-        $('gw-inspector').innerHTML = renderDecisionInspector(state.decisionNodes.find(function(w) { return w.workUnitId === id; }));
+        // No Decision tab yet — this node's own timeline/artifacts haven't loaded, so the
+        // previous node's candidate (in state.timelineArtifacts) doesn't apply here.
+        $('gw-inspector').innerHTML = renderDecisionInspector(state.decisionNodes.find(function(w) { return w.workUnitId === id; }), { candidate: null });
         bindDecisionInspectorTabs();
         vscode.postMessage({ type: 'explorerSelectWorkUnit', workUnitId: id });
       });
@@ -683,18 +697,27 @@ export function init(ctx) {
     });
   }
 
-  function renderDecisionInspector(wu) {
+  function renderDecisionInspector(wu, opts) {
     if (!wu) { return '<p class="empty">Select a decision node or timeline item to inspect.</p>'; }
+    opts = opts || {};
+    // A pending decision candidate gets its own tab alongside Metadata/Context/Conversation
+    // (instead of replacing the whole inspector) so jumping to it never strands the user away
+    // from the rest of the goal/task's info — they're one tab click apart either direction.
+    var candidate = ('candidate' in opts) ? opts.candidate : findDefaultProposalCandidate(state.timelineArtifacts);
+    var activeTab = opts.activeTab || 'metadata';
 
     // ── Slice 24b — Tab bar ────────────────────────────────────────────────
     var html = '<div class="gw-tab-bar">';
-    html += '<button class="gw-tab-btn active" data-gw-tab="metadata">Metadata</button>';
-    html += '<button class="gw-tab-btn" data-gw-tab="context">Context</button>';
-    html += '<button class="gw-tab-btn" data-gw-tab="conversation">Conversation</button>';
+    html += '<button class="gw-tab-btn' + (activeTab === 'metadata' ? ' active' : '') + '" data-gw-tab="metadata">Metadata</button>';
+    html += '<button class="gw-tab-btn' + (activeTab === 'context' ? ' active' : '') + '" data-gw-tab="context">Context</button>';
+    html += '<button class="gw-tab-btn' + (activeTab === 'conversation' ? ' active' : '') + '" data-gw-tab="conversation">Conversation</button>';
+    if (candidate) {
+      html += '<button class="gw-tab-btn' + (activeTab === 'decision' ? ' active' : '') + '" data-gw-tab="decision" data-proposal-id="' + esc(candidate.artifactId) + '">Decision</button>';
+    }
     html += '</div>';
 
     // ── Metadata panel ────────────────────────────────────────────────────
-    html += '<div class="gw-tab-panel active" id="gw-panel-metadata">';
+    html += '<div class="gw-tab-panel' + (activeTab === 'metadata' ? ' active' : '') + '" id="gw-panel-metadata">';
     html += '<div class="meta-grid">';
     html += '<span class="meta-label">Decision Status</span>' + badge(wu.status) + pausedBadge(wu);
     html += '<span class="meta-label">Phase</span><span>' + stageBadge(wu.currentStage) + '</span>';
@@ -780,7 +803,7 @@ export function init(ctx) {
     html += '</div>'; // end Metadata panel
 
     // ── Context panel ─────────────────────────────────────────────────────
-    html += '<div class="gw-tab-panel" id="gw-panel-context">';
+    html += '<div class="gw-tab-panel' + (activeTab === 'context' ? ' active' : '') + '" id="gw-panel-context">';
     if (state.selectedNodeContext) {
       html += renderContextTab(state.selectedNodeContext);
     } else {
@@ -789,13 +812,24 @@ export function init(ctx) {
     html += '</div>'; // end Context panel
 
     // ── Conversation panel (Phase 11) ──────────────────────────────────────
-    html += '<div class="gw-tab-panel" id="gw-panel-conversation">';
+    html += '<div class="gw-tab-panel' + (activeTab === 'conversation' ? ' active' : '') + '" id="gw-panel-conversation">';
     if (state.selectedNodeConversation) {
       html += renderConversationTab(state.selectedNodeConversation);
     } else {
       html += '<p class="empty">Conversation loading…</p>';
     }
     html += '</div>'; // end Conversation panel
+
+    // ── Decision panel — the auto-jump target (Slice: keep other tabs reachable) ───────────
+    if (candidate) {
+      html += '<div class="gw-tab-panel' + (activeTab === 'decision' ? ' active' : '') + '" id="gw-panel-decision">';
+      if (state.selectedNodeProposalDetail && state.selectedNodeProposalDetail.proposalId === candidate.artifactId) {
+        html += renderProposalInspector(state.selectedNodeProposalDetail);
+      } else {
+        html += '<p class="empty">Loading…</p>';
+      }
+      html += '</div>'; // end Decision panel
+    }
 
     return html;
   }
@@ -930,6 +964,16 @@ export function init(ctx) {
           if (wu && isWuRunning(wu)) { startConversationPoll(state.selectedNodeId); }
         } else {
           stopConversationPoll();
+        }
+
+        // Decision tab: fetch the candidate's full detail on first view (or if a different
+        // proposal is now the tab's target than what's cached).
+        if (tab === 'decision') {
+          var proposalId = btn.getAttribute('data-proposal-id');
+          if (proposalId && (!state.selectedNodeProposalDetail || state.selectedNodeProposalDetail.proposalId !== proposalId)) {
+            $('gw-panel-decision').innerHTML = '<p class="empty">Loading…</p>';
+            vscode.postMessage({ type: 'explorerSelectProposal', proposalId: proposalId });
+          }
         }
       });
     });
@@ -1102,6 +1146,9 @@ export function init(ctx) {
     bindTabBarClick();
     bindWorkUnitActionButtons();
     bindContextCopyButton();
+    // The Decision tab panel may already have cached proposal detail rendered into it (e.g. on
+    // re-selecting a node whose candidate was already fetched) — wire its buttons too.
+    bindProposalActionButtons();
   }
 
   // ── Timeline ─────────────────────────────────────────────────────────────
@@ -1167,8 +1214,22 @@ export function init(ctx) {
         var id = node.getAttribute('data-proposal');
         el.querySelectorAll('.tl-selected').forEach(function(n) { n.classList.remove('tl-selected'); });
         node.classList.add('tl-selected');
-        $('gw-inspector').innerHTML = '<p class="empty">Loading…</p>';
-        vscode.postMessage({ type: 'explorerSelectProposal', proposalId: id });
+        var clickedArtifact = (state.timelineArtifacts || []).find(function(a) { return a.artifactId === id; });
+        var wu = state.decisionNodes.find(function(w) { return w.workUnitId === state.selectedNodeId; });
+        if (wu) {
+          // Route through the tabbed inspector (Decision tab) rather than replacing it outright,
+          // so Metadata/Context/Conversation stay reachable for whichever proposal is being viewed.
+          if (!state.selectedNodeProposalDetail || state.selectedNodeProposalDetail.proposalId !== id) {
+            state.selectedNodeProposalDetail = null;
+          }
+          $('gw-inspector').innerHTML = renderDecisionInspector(wu, { candidate: clickedArtifact || { artifactId: id }, activeTab: 'decision' });
+          bindDecisionInspectorTabs();
+        } else {
+          $('gw-inspector').innerHTML = '<p class="empty">Loading…</p>';
+        }
+        if (!state.selectedNodeProposalDetail || state.selectedNodeProposalDetail.proposalId !== id) {
+          vscode.postMessage({ type: 'explorerSelectProposal', proposalId: id });
+        }
       });
     });
     el.querySelectorAll('[data-event]').forEach(function(node) {
@@ -1551,6 +1612,7 @@ export function init(ctx) {
       // of the tree. Selections elsewhere (inspector, conversation) are unaffected by this
       // rebuild, so only the tree's own subtree is checked.
       if (hasSelectionWithin($('gw-tree'))) { return; }
+      state.reviewingWorkUnitIds = msg.reviewingWorkUnitIds || [];
       renderDecisionTree(msg.workUnits);
       return;
     }
@@ -1574,20 +1636,39 @@ export function init(ctx) {
       }
       var wu = state.decisionNodes.find(function(w) { return w.workUnitId === state.selectedNodeId; });
       var defaultCandidate = findDefaultProposalCandidate(msg.artifacts);
+      // Jump straight to the Decision tab the first time this node shows a pending candidate —
+      // but only once per selection, and as a tab within the normal inspector rather than a
+      // full replacement, so Metadata/Context/Conversation stay one click away afterwards
+      // instead of getting stranded behind the auto-jump (see goal workspace decision-lens fix).
+      var autoSelectDecision = !!defaultCandidate && state.autoJumpedForNodeId !== state.selectedNodeId;
       if (defaultCandidate) {
         var candidateNode = root.querySelector('[data-proposal="' + defaultCandidate.artifactId + '"]');
         if (candidateNode) { candidateNode.classList.add('tl-selected'); }
-        $('gw-inspector').innerHTML = '<p class="empty">Loading…</p>';
-        vscode.postMessage({ type: 'explorerSelectProposal', proposalId: defaultCandidate.artifactId });
-      } else if (wu) {
-        $('gw-inspector').innerHTML = renderDecisionInspector(wu);
+      }
+      if (wu) {
+        $('gw-inspector').innerHTML = renderDecisionInspector(wu, {
+          candidate: defaultCandidate,
+          activeTab: autoSelectDecision ? 'decision' : 'metadata',
+        });
         bindDecisionInspectorTabs();
+      }
+      if (autoSelectDecision) {
+        state.autoJumpedForNodeId = state.selectedNodeId;
+        vscode.postMessage({ type: 'explorerSelectProposal', proposalId: defaultCandidate.artifactId });
       }
       return;
     }
     if (msg.type === 'proposal') {
-      $('gw-inspector').innerHTML = renderProposalInspector(msg.proposal);
-      bindProposalActionButtons();
+      state.selectedNodeProposalDetail = msg.proposal;
+      var decisionPanel = $('gw-panel-decision');
+      if (decisionPanel) {
+        decisionPanel.innerHTML = renderProposalInspector(msg.proposal);
+        bindProposalActionButtons();
+      } else {
+        // Fallback for any flow that doesn't have the tabbed inspector mounted.
+        $('gw-inspector').innerHTML = renderProposalInspector(msg.proposal);
+        bindProposalActionButtons();
+      }
       return;
     }
     if (msg.type === 'compareResult') {
@@ -1631,12 +1712,13 @@ export function init(ctx) {
     if (msg.type === 'decisionContext') {
       if (msg.workUnitId === state.selectedNodeId) {
         state.selectedNodeContext = msg.context || null;
-        if (state.selectedNodeId) {
-          var wuCtx = state.decisionNodes.find(function(w) { return w.workUnitId === state.selectedNodeId; });
-          if (wuCtx) {
-            $('gw-inspector').innerHTML = renderDecisionInspector(wuCtx);
-            bindDecisionInspectorTabs();
-          }
+        // Update the Context panel in place — a full inspector rebuild here used to reset the
+        // tab bar to Metadata (hardcoded 'active'), silently kicking the user off the Context
+        // tab the moment its data arrived.
+        var contextPanel = $('gw-panel-context');
+        if (contextPanel) {
+          contextPanel.innerHTML = state.selectedNodeContext ? renderContextTab(state.selectedNodeContext) : '<p class="empty">No context recorded.</p>';
+          bindContextCopyButton();
         }
       }
       return;
@@ -1654,7 +1736,10 @@ export function init(ctx) {
       // only affects the Metadata tab's re-render, not the Conversation tab already on screen.
       state.decisionNodes = (state.decisionNodes || []).filter(function(w) { return w.workUnitId !== wu.workUnitId; });
       state.decisionNodes.push(wu);
-      $('gw-inspector').innerHTML = renderDecisionInspector(wu);
+      state.selectedNodeProposalDetail = null;
+      // Opened standalone (not via the timeline), so any cached timelineArtifacts belong to a
+      // different node — no Decision tab to show here.
+      $('gw-inspector').innerHTML = renderDecisionInspector(wu, { candidate: null });
       bindDecisionInspectorTabs();
       root.querySelectorAll('.gw-tab-btn').forEach(function(b) {
         b.classList.toggle('active', b.getAttribute('data-gw-tab') === 'conversation');
