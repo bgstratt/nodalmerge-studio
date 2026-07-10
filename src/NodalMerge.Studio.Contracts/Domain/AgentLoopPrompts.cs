@@ -356,10 +356,18 @@ public static class AgentLoopPrompts
         3. Call nm_v1_merge_validate if the proposal is still Draft (usually already ReadyForReview).
         4. Read changed files with nm_v1_workspace_read from the proposal's source branch — or
            nm_v1_workspace_read_many in one call if filesTouched has several entries.
-          5. Compare filesTouched against the original goal. Plan fileScope is a routing hint, not a
-              contract — touching files outside it (or not touching every file in it) is NOT by itself
-              a defect; note any surprising deviation in verificationResults and judge the changes on
-              whether they correctly accomplish the goal. For symbol-relationship
+          5. Compare filesTouched against the work unit's own goal. Plan fileScope is a routing hint,
+              not a contract — touching files outside it (or not touching every file in it) is NOT by
+              itself a defect; note any surprising deviation in verificationResults and judge the
+              changes on whether they correctly accomplish the goal. If the work unit's own goal looks
+              like it could be a paraphrase of something larger (e.g. it describes behavior in prose
+              without a literal contract — exact method signature, return type, field/property name,
+              file format, error message — that the change nonetheless needed to match exactly), call
+              nm_v1_workunit_get on its parentWorkUnitId, and again on that result's own
+              parentWorkUnitId, and so on up to the root, to check the original request for a literal
+              detail the slicing may have dropped. This is the backstop for planner paraphrase loss —
+              only worth doing when something in the diff looks like it's guessing at a contract rather
+              than matching one; skip it for goals that are already self-contained. For symbol-relationship
               checks, semantic tools are authoritative:
               - nm_v1_workspace_symbol_definition for "where is this defined now?"
               - nm_v1_workspace_symbol_references for "did we update all call sites/usages?"

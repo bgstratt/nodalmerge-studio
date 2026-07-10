@@ -17,6 +17,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// IRuntimeCredentialCache's doc comment.
 /// </summary>
 [Trait("Category", "Integration")]
+[Collection("Sqlite")]
 public class CredentialCacheAndRoutingRehydrationTests : IDisposable
 {
     private readonly string _tempRoot =
@@ -54,7 +55,7 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
         var agentControl1 = app1.Services.GetRequiredService<IAgentControlService>();
 
         var unit = await orchestrator1.CreateWorkUnitAsync("Build the thing", "test");
-        await agentControl1.SpawnAsync(
+        var agentId1 = await agentControl1.SpawnAsync(
             "orchestrator", unit.WorkUnitId,
             model: "fake-model", baseUrl: "http://fake-llm", apiKey: "sk-super-secret-123",
             autoReviewProfileId: "reviewer");
@@ -62,6 +63,14 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
         // Sanity: the live (same-process) registration already has it.
         Assert.Equal("reviewer", agentControl1.GetAutoReviewProfileId(unit.WorkUnitId));
 
+        // SpawnAsync above started a real (fire-and-forget) orchestrator loop against the fake LLM
+        // handler — it writes an OrchestrationDecisionLog entry to SQLite on completion. Stop it and
+        // give it a moment to actually unwind before disposing app1, or that in-flight SQLite write
+        // can still be holding the db file open when Dispose() tries to delete _tempRoot, throwing
+        // an intermittent IOException ("file is being used by another process") — StopAsync only
+        // requests cancellation, it doesn't join the loop's background Task.
+        await agentControl1.StopAsync(agentId1);
+        await Task.Delay(200);
         await app1.DisposeAsync();
 
         var app2 = BuildApp();
@@ -95,7 +104,7 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
         var nodeStore1 = app1.Services.GetRequiredService<IStudioNodeStore>();
 
         var unit = await orchestrator1.CreateWorkUnitAsync("Build the thing", "test");
-        await agentControl1.SpawnAsync(
+        var agentId1 = await agentControl1.SpawnAsync(
             "orchestrator", unit.WorkUnitId,
             model: "fake-model", baseUrl: "http://fake-llm", apiKey: "sk-super-secret-123",
             autoReviewProfileId: "reviewer");
@@ -105,6 +114,13 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
         Assert.Contains(routingRecords, r => r.EntityId == unit.WorkUnitId);
         Assert.All(routingRecords, r => Assert.DoesNotContain("sk-super-secret-123", r.PayloadJson));
 
+        // SpawnAsync above started a real (fire-and-forget) orchestrator loop against the fake LLM
+        // handler — see the matching comment in GetAutoReviewProfileId_survives_a_restart_with_zero_
+        // credential_resupply above for why this must be stopped and given a moment to unwind before
+        // disposing app1 (an in-flight SQLite write can otherwise still hold nodes.db open when
+        // Dispose() tries to delete _tempRoot).
+        await agentControl1.StopAsync(agentId1);
+        await Task.Delay(200);
         await app1.DisposeAsync();
 
         var app2 = BuildApp();
@@ -138,10 +154,15 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
         var agentControl1 = app1.Services.GetRequiredService<IAgentControlService>();
 
         var unit = await orchestrator1.CreateWorkUnitAsync("Build the thing", "test");
-        await agentControl1.SpawnAsync(
+        var agentId1 = await agentControl1.SpawnAsync(
             "orchestrator", unit.WorkUnitId,
             model: "fake-model", baseUrl: "http://fake-llm", apiKey: "sk-super-secret-123");
 
+        // See the matching comment in GetAutoReviewProfileId_survives_a_restart_with_zero_
+        // credential_resupply above — SpawnAsync started a real fire-and-forget orchestrator loop
+        // that must be stopped and given a moment to unwind before disposing app1.
+        await agentControl1.StopAsync(agentId1);
+        await Task.Delay(200);
         await app1.DisposeAsync();
 
         var app2 = BuildApp();
@@ -170,11 +191,16 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
         var agentControl1 = app1.Services.GetRequiredService<IAgentControlService>();
 
         var unit = await orchestrator1.CreateWorkUnitAsync("Build the thing", "test");
-        await agentControl1.SpawnAsync(
+        var agentId1 = await agentControl1.SpawnAsync(
             "orchestrator", unit.WorkUnitId,
             model: "fake-model", baseUrl: "http://fake-llm", apiKey: "sk-super-secret-123",
             autoReviewProfileId: "reviewer");
 
+        // See the matching comment in GetAutoReviewProfileId_survives_a_restart_with_zero_
+        // credential_resupply above — SpawnAsync started a real fire-and-forget orchestrator loop
+        // that must be stopped and given a moment to unwind before disposing app1.
+        await agentControl1.StopAsync(agentId1);
+        await Task.Delay(200);
         await app1.DisposeAsync();
 
         var app2 = BuildApp();

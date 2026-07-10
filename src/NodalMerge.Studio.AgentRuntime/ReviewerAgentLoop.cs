@@ -1,5 +1,6 @@
 using NodalMerge.Studio.Contracts.Domain;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Versioning;
 using NodalMerge.Studio.Core.Services;
 
@@ -16,7 +17,10 @@ internal sealed class ReviewerAgentLoop(
     IReadOnlyList<string>? filesTouched = null,
     string? noFileChangesJustification = null,
     IConversationLogService? conversationLog = null,
-    IExecutionEventStream? events = null)
+    IExecutionEventStream? events = null,
+    // Observability-only — see ConversationCompactor. Optional/nullable so call sites and tests
+    // that don't wire a logger keep compiling unchanged.
+    ILogger? logger = null)
 {
     internal static readonly string DefaultSystemPrompt = AgentLoopPrompts.Reviewer;
 
@@ -63,13 +67,20 @@ internal sealed class ReviewerAgentLoop(
         };
 
         var completedNaturally = false;
+        int? lastInputTokens = null;
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
+            ConversationCompactor.ElideStaleToolResults(messages, logger, agentId, workUnitId);
+            await ConversationCompactor.ApplyRollingSummaryIfDueAsync(
+                    messages, client, ct, logger, agentId, workUnitId, lastInputTokens)
+                .ConfigureAwait(false);
+
             onActivity?.Invoke("Thinking...");
             var response = await client.SendAsync(
                     messages, _tools, _systemPrompt, ct,
                     attempt => OnTransientRetryAsync(attempt, ct))
                 .ConfigureAwait(false);
+            lastInputTokens = response.InputTokens;
 
             messages.Add(new NmMessage("assistant", response.Content));
 
@@ -207,15 +218,17 @@ internal sealed class ReviewerAgentLoop(
                     ["proposalId"]     = Str("Proposal ID (for MergeProposal)"),
                 })),
 
-            new(McpToolNames.WorkspaceRead, "Read a file from the branch working directory.",
+            new(McpToolNames.WorkspaceRead, "Read a file from the branch working directory. Files over 2000 lines are windowed by default (first 2000 lines) — pass offset/limit to page through the rest, or narrow with nm_v1_workspace_search first if you only need a specific section.",
                 Schema(["branchId", "path"], new()
                 {
                     ["branchId"]   = Str("Branch ID"),
                     ["workUnitId"] = Str("The work unit under review — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
                     ["path"]       = Str("Relative file path"),
+                    ["offset"]     = Int("1-based line number to start reading from (optional, default 1)"),
+                    ["limit"]      = Int("Max lines to return (optional, default 2000)")
                 })),
 
-            new(McpToolNames.WorkspaceReadMany, "Read several files in one call instead of multiple sequential nm_v1_workspace_read calls — use this after nm_v1_workspace_search returns several hit files you intend to inspect. A path that doesn't exist comes back with found=false rather than failing the whole call.",
+            new(McpToolNames.WorkspaceReadMany, "Read several files in one call instead of multiple sequential nm_v1_workspace_read calls — use this after nm_v1_workspace_search returns several hit files you intend to inspect. A path that doesn't exist comes back with found=false rather than failing the whole call. Each file is capped at 2000 lines (truncated=true if cut off) — for a specific truncated file, follow up with nm_v1_workspace_read and offset/limit to page further.",
                 Schema(["branchId", "paths"], new()
                 {
                     ["branchId"]   = Str("Branch ID"),

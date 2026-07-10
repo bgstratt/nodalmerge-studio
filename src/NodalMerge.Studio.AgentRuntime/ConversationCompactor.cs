@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 
 namespace NodalMerge.Studio.AgentRuntime;
@@ -18,6 +19,17 @@ internal static class ConversationCompactor
     private const int ElideMinChars = 400;       // don't bother eliding short results
     private const int SummaryTriggerCount = 20;  // messages.Count threshold that fires a summary
     private const int SummaryTailKeep = 6;       // messages kept verbatim after summarizing
+
+    // Token-count trigger, checked alongside SummaryTriggerCount — whichever fires first wins. A
+    // pure message-count trigger either chokes a session early (a handful of messages can carry a
+    // 40k-token AST dump or file diff) or lets one explode (dozens of short human/tool-status
+    // messages costing almost nothing). This uses the real InputTokens the provider reported for
+    // the prior turn when available (LlmResponse.InputTokens, already threaded through by every
+    // caller of SendAsync) — not an estimate — so it reflects what was actually billed, including
+    // whatever the provider already elided/cached. Falls back to EstimateTokensFromChars only for
+    // providers that never report usage (see LlmClient's OpenAiUsage comment re: vscode-lm/Copilot).
+    private const int TokenTriggerEstimate = 40_000;
+    private const double CharsPerTokenEstimate = 4.0; // rough English-text/code average
 
     private const string SummarizationSystemPrompt =
         "Summarize this in-progress coding agent session for continuation. Cover: the task/goal, " +
@@ -84,17 +96,55 @@ internal static class ConversationCompactor
         }
     }
 
-    // Once history crosses SummaryTriggerCount messages, condenses everything after the kickoff
-    // message and before the trailing window into one recap, via a dedicated (tool-free) LLM
-    // call. Mutates messages in place; no-ops (including on a failed/empty summarization response)
-    // rather than risk silently losing history. logger/agentId/workUnitId are observability-only —
-    // see ElideStaleToolResults' comment; both optional and no-op when omitted.
+    // Sums the character length of every content block still in messages (text, tool_use input,
+    // tool_result output) and divides by CharsPerTokenEstimate. Only used as a fallback when the
+    // provider's own reported InputTokens isn't available — see ApplyRollingSummaryIfDueAsync.
+    private static int EstimateTokensFromChars(List<NmMessage> messages)
+    {
+        var totalChars = 0;
+        foreach (var message in messages)
+            foreach (var block in message.Content)
+                totalChars += block switch
+                {
+                    NmText t => t.Text.Length,
+                    NmToolResult r => r.Result.Length,
+                    // Undefined (default(JsonElement), never actually assigned) has no raw text to
+                    // read — treat as zero-length rather than throwing.
+                    NmToolUse { Input.ValueKind: JsonValueKind.Undefined } => 0,
+                    NmToolUse u => u.Input.GetRawText().Length,
+                    _ => 0,
+                };
+        return (int)(totalChars / CharsPerTokenEstimate);
+    }
+
+    // Once history crosses SummaryTriggerCount messages OR an estimated TokenTriggerEstimate
+    // tokens — whichever comes first — condenses everything after the kickoff message and before
+    // the trailing window into one recap, via a dedicated (tool-free) LLM call. Mutates messages in
+    // place; no-ops (including on a failed/empty summarization response) rather than risk silently
+    // losing history. lastInputTokens should be the InputTokens the provider reported for the most
+    // recent SendAsync response in this loop (null on the first iteration, or for a provider that
+    // never reports usage) — when null, falls back to EstimateTokensFromChars. logger/agentId/
+    // workUnitId are observability-only — see ElideStaleToolResults' comment; all optional and
+    // no-op when omitted.
     public static async Task ApplyRollingSummaryIfDueAsync(
         List<NmMessage> messages, IAgentToolClient client, CancellationToken ct,
-        ILogger? logger = null, string? agentId = null, string? workUnitId = null)
+        ILogger? logger = null, string? agentId = null, string? workUnitId = null,
+        int? lastInputTokens = null)
     {
-        if (messages.Count <= SummaryTriggerCount)
+        var tokensAreEstimated = lastInputTokens is null;
+        var effectiveTokens = lastInputTokens ?? EstimateTokensFromChars(messages);
+        var countDue = messages.Count > SummaryTriggerCount;
+        var tokensDue = effectiveTokens > TokenTriggerEstimate;
+        if (!countDue && !tokensDue)
             return;
+
+        logger?.LogInformation(
+            "[Compactor] Rolling summary triggered for agent {AgentId} / work unit {WorkUnitId} — " +
+            "{MessageCount} messages (threshold {CountThreshold}), {Tokens} tokens{Estimated} " +
+            "(threshold {TokenThreshold}). Fired by: {Trigger}.",
+            agentId, workUnitId, messages.Count, SummaryTriggerCount, effectiveTokens,
+            tokensAreEstimated ? " [estimated from chars]" : " [provider-reported]", TokenTriggerEstimate,
+            countDue && tokensDue ? "count+tokens" : countDue ? "count" : "tokens");
 
         // messages[0] is always the kickoff message (role "user"). After that, roles strictly
         // alternate assistant/user, so the tail must start on an assistant message to preserve

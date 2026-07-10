@@ -16,6 +16,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// system-owned (OwnedByWorkUnitId == null) ExternalChangeset artifact.
 /// </summary>
 [Trait("Category", "Integration")]
+[Collection("Sqlite")]
 public class RepositorySyncServiceTests : IDisposable
 {
     private readonly string _rootPath = Path.Combine(Path.GetTempPath(), $"studio-reposync-{Guid.NewGuid():N}");

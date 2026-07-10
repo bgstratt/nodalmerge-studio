@@ -15,6 +15,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// production storage path.
 /// </summary>
 [Trait("Category", "Integration")]
+[Collection("Sqlite")]
 public class WorkSchedulerRehydrationTests : IDisposable
 {
     private readonly string _tempRoot =

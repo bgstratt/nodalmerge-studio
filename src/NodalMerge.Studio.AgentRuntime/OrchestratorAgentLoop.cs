@@ -76,6 +76,7 @@ internal sealed class OrchestratorAgentLoop(
         // read-only workunit_get, then enqueue the planner, then stop — trips the stall detector
         // on the very next fetch, since neither of those two tool calls touches the artifact chain.
         var madeRoutingDecisionLastCycle = false;
+        int? lastInputTokens = null;
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
             var currentProjection = await FetchAgentWorkspaceProjectionAsync(ct).ConfigureAwait(false);
@@ -106,7 +107,8 @@ internal sealed class OrchestratorAgentLoop(
             AppendDeltaToOutgoingMessage(messages, delta);
 
             ConversationCompactor.ElideStaleToolResults(messages, logger, agentId, workUnitId);
-            await ConversationCompactor.ApplyRollingSummaryIfDueAsync(messages, client, ct, logger, agentId, workUnitId)
+            await ConversationCompactor.ApplyRollingSummaryIfDueAsync(
+                    messages, client, ct, logger, agentId, workUnitId, lastInputTokens)
                 .ConfigureAwait(false);
 
             onActivity?.Invoke("Thinking...");
@@ -114,6 +116,7 @@ internal sealed class OrchestratorAgentLoop(
                     messages, _tools, _systemPrompt, ct,
                     attempt => OnTransientRetryAsync(attempt, ct))
                 .ConfigureAwait(false);
+            lastInputTokens = response.InputTokens;
 
             messages.Add(new NmMessage("assistant", response.Content));
 

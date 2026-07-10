@@ -588,11 +588,42 @@ internal sealed class McpToolDispatcher(
     private Task<string?> ResolveBranchIdAsync(JsonElement input, CancellationToken ct) =>
         ResolveBranchIdAsync(Str(input, "workUnitId"), Str(input, "branchId"), ct);
 
+    // Default window when a caller doesn't pass limit — matches the cap Claude Code's own Read tool
+    // uses, so a huge file never lands whole in an agent's context just because it forgot to page.
+    // A file at or under this many lines is returned in full with no truncation note, preserving the
+    // old "just read it" behavior for the overwhelming majority of source files.
+    private const int DefaultReadLineLimit = 2000;
+
+    // offset is 1-based (matches Read tool convention): the first line number to return. limit caps
+    // how many lines come back. Returns the window's own content plus enough metadata (totalLines,
+    // startLine, endLine, truncated) for the caller to page with a follow-up offset without having
+    // to re-derive line counts itself.
+    private static (string Content, int TotalLines, int StartLine, int EndLine, bool Truncated) WindowLines(
+        string content, int? offset, int? limit)
+    {
+        var lines = content.Split('\n');
+        var totalLines = lines.Length;
+        var start = Math.Max(1, offset ?? 1);
+        var take = Math.Max(1, limit ?? DefaultReadLineLimit);
+        if (start > totalLines)
+            return (string.Empty, totalLines, start, start - 1, false);
+
+        var startIndex = start - 1;
+        var endIndex = Math.Min(totalLines, startIndex + take);
+        var windowed = string.Join('\n', lines[startIndex..endIndex]);
+        var truncated = offset is null && limit is null
+            ? totalLines > DefaultReadLineLimit
+            : endIndex < totalLines;
+        return (windowed, totalLines, start, endIndex, truncated);
+    }
+
     private async Task<string> WorkspaceReadAsync(JsonElement input, CancellationToken ct, string? sessionId)
     {
         var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
         var path     = Str(input, "path");
         if (branchId is null || path is null) return ToError("branchId (or workUnitId) and path are required.");
+        var offset = Int(input, "offset");
+        var limit  = Int(input, "limit");
         try
         {
             var content = await fileWorkspace.ReadAsync(branchId, path, ct).ConfigureAwait(false);
@@ -607,7 +638,15 @@ internal sealed class McpToolDispatcher(
             }
             _readPaths[ReadCacheKey(branchId, path)] = 0;
             await RecordWorkspaceReadAsync(sessionId, Str(input, "workUnitId"), [path], ct).ConfigureAwait(false);
-            return ToJson(new { content });
+
+            var window = WindowLines(content, offset, limit);
+            return window.Truncated
+                ? ToJson(new
+                {
+                    content = window.Content, totalLines = window.TotalLines,
+                    startLine = window.StartLine, endLine = window.EndLine, truncated = true,
+                })
+                : ToJson(new { content = window.Content });
         }
         catch (Exception ex) { return ToError(ex.Message); }
     }
@@ -644,10 +683,29 @@ internal sealed class McpToolDispatcher(
             foreach (var file in files.Where(f => f.Found))
                 _readPaths[ReadCacheKey(branchId, file.Path)] = 0;
             await RecordWorkspaceReadAsync(sessionId, Str(input, "workUnitId"), paths, ct).ConfigureAwait(false);
-            return ToJson(new { files, branchId });
+
+            // No per-path offset here (paths differ, so a single offset/limit pair wouldn't mean the
+            // same thing across all of them) — just the same default line cap WorkspaceReadAsync
+            // falls back to, so one huge file in a batch can't blow out the whole response. A caller
+            // that hits truncated=true on a path should follow up with a scoped nm_v1_workspace_read
+            // (offset/limit) on that one path.
+            var windowed = files.Select(f => f.Found && f.Content is not null
+                ? (object)BuildReadManyEntry(f.Path, WindowLines(f.Content, offset: null, limit: null))
+                : new { path = f.Path, content = (string?)null, found = false });
+            return ToJson(new { files = windowed, branchId });
         }
         catch (Exception ex) { return ToError(ex.Message); }
     }
+
+    private static object BuildReadManyEntry(
+        string path, (string Content, int TotalLines, int StartLine, int EndLine, bool Truncated) window) =>
+        window.Truncated
+            ? new
+            {
+                path, content = window.Content, found = true, totalLines = window.TotalLines,
+                startLine = window.StartLine, endLine = window.EndLine, truncated = true,
+            }
+            : new { path, content = window.Content, found = true };
 
     private async Task RecordWorkspaceReadAsync(
         string? sessionId, string? workUnitId, IReadOnlyList<string> paths, CancellationToken ct)

@@ -315,7 +315,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         agentId, item.WorkUnitId, agentClient,
                         profile, item.SessionId, a => ReportActivity(agentId, a),
                         ruleFileContext, combinedContext.Length == 0 ? null : combinedContext,
-                        conversationLog: conversationLog, events: _events);
+                        conversationLog: conversationLog, events: _events, logger: _logger);
                     completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
 
                     // A Planner that correctly concludes "nothing to decompose here" ends its turn
@@ -340,7 +340,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var reviewerLoop = new ReviewerAgentLoop(
                         agentId, item.WorkUnitId, proposalId, agentClient,
                         profile, item.SessionId, a => ReportActivity(agentId, a),
-                        conversationLog: conversationLog, events: _events);
+                        conversationLog: conversationLog, events: _events, logger: _logger);
                     completion = await reviewerLoop.RunAsync(cts.Token).ConfigureAwait(false);
                 }
                 else
@@ -350,13 +350,19 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     // interrupted it. Either way the worker should check existing branch/task
                     // state before assuming a clean start.
     // promptGuidanceContext below carries universal KnowledgeGuideline constraints (the same
-                    // feed Orchestrator/Planner already get), Execute-stage PromptImprovement guidance, and
-                    // the original top-level goal text (see BuildOriginalGoalContextAsync) — Worker writes
-                    // the actual code, so it needs all three, not just the slice's own paraphrased goal.
+                    // feed Orchestrator/Planner already get) and Execute-stage PromptImprovement guidance —
+                    // NOT the original top-level goal text. That was tried (BuildOriginalGoalContextAsync,
+                    // removed) as a blanket fix for planners dropping literal contract details while
+                    // paraphrasing a slice goal, but it injected the full unbounded root goal into every
+                    // fanned-out worker's kickoff regardless of need, which both confused workers with
+                    // irrelevant scope and multiplied token cost across siblings. The real fix belongs at
+                    // the source (Planner prompt: copy literal contracts verbatim into the slice's own
+                    // goal/steps) with Reviewer as the backstop (walks ParentWorkUnitId on demand via
+                    // nm_v1_workunit_get if a proposal looks like it may have lost a literal detail) —
+                    // both pull context only when actually needed instead of pushing it to everyone.
                     var workerConstraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, ct).ConfigureAwait(false);
-                    var workerOriginalGoal = await BuildOriginalGoalContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
-                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerOriginalGoal }.Where(s => s is not null));
+                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
                     // Snapshotted before the loop runs: if the task was already Completed coming
                     // in (e.g. re-queued after a rejection, before the underlying task got reset —
                     // see AutomatedReviewGateService), the agent can't legitimately transition it
@@ -928,8 +934,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var ruleFileContext = await BuildRuleFileContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerConstraintsContext = await BuildConstraintsContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, cts.Token).ConfigureAwait(false);
-                var workerOriginalGoal = await BuildOriginalGoalContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
-                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerOriginalGoal }.Where(s => s is not null));
+                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
                 var loop = new WorkerAgentLoop(
                     agentId, workUnitId, taskId, agentClient, profile,
                     onActivity: a => ReportActivity(agentId, a), ruleFileContext: ruleFileContext,
@@ -1104,44 +1109,6 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         }
     }
 
-    // Found via harness-comparison-eval: a fanned-out worker only ever sees its own slice's Goal
-    // (the planner's own paraphrase of one piece of the original request) — if the planner drops a
-    // literal detail while writing that paraphrase (an exact method signature, return type, field
-    // name), nothing else in the pipeline ever surfaces it again, and the worker has no way to know
-    // it built something that doesn't match what was actually asked for. Folding the true top-level
-    // goal's original text back in as reference material (not a replacement for the slice's own
-    // goal — that still carries the fileScope/steps decomposition) gives the worker something to
-    // cross-check a lossy paraphrase against. Walks to the true root rather than just the immediate
-    // parent, since fan-out can in principle nest more than one level deep.
-    private async Task<string?> BuildOriginalGoalContextAsync(string workUnitId, CancellationToken ct)
-    {
-        try
-        {
-            var workUnits = _serviceProvider.GetRequiredService<IWorkUnitService>();
-            var current = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
-            if (current?.ParentWorkUnitId is null) return null; // this work unit IS the root
-
-            var root = current;
-            while (root.ParentWorkUnitId is { } parentId)
-            {
-                var parent = await workUnits.GetAsync(parentId, ct).ConfigureAwait(false);
-                if (parent is null) break;
-                root = parent;
-            }
-
-            if (string.Equals(root.Goal, current.Goal, StringComparison.Ordinal))
-                return null; // slice goal is already the original text verbatim — nothing to add
-
-            return "[Original request, for reference — the slice goal above may only summarize " +
-                "part of it. If they conflict on a literal detail (an exact method signature, " +
-                "return type, field name, file format, etc.), this original request is " +
-                "authoritative]\n" + root.Goal;
-        }
-        catch
-        {
-            return null;
-        }
-    }
 }
 
 public static class ServiceCollectionExtensions

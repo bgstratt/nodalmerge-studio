@@ -18,6 +18,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// not starting the full host (Kestrel, scheduler poll loop) in this test suite.
 /// </summary>
 [Trait("Category", "Integration")]
+[Collection("Sqlite")]
 public class RuntimeSettingsRehydrationTests : IDisposable
 {
     private readonly string _tempRoot =
