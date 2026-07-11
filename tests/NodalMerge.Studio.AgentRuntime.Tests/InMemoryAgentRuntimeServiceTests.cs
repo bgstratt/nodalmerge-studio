@@ -9,14 +9,14 @@ namespace NodalMerge.Studio.AgentRuntime.Tests;
 public class InMemoryAgentRuntimeServiceTests
 {
     private static InMemoryAgentRuntimeService Build() =>
-        new(new NoopServiceProvider(), NullLogger<InMemoryAgentRuntimeService>.Instance, new NoopAgentProfileService(), new NoopScheduler(), new NoopEventStream(), new WorkspaceOptions(), new NoopFileLeaseService());
+        new(new NoopServiceProvider(), NullLogger<InMemoryAgentRuntimeService>.Instance, new NoopAgentProfileService(), new NoopScheduler(), new NoopEventStream(), new WorkspaceOptions(), new NoopFileLeaseService(), new InMemoryStudioNodeStore(), new RuntimeCredentialCache());
 
     private sealed class NoopFileLeaseService : IFileLeaseService
     {
         public Task<(bool Granted, string? HolderWorkUnitId)> TryAcquireOrEnqueueAsync(
             string workUnitId, string path, CancellationToken ct = default) =>
             Task.FromResult<(bool Granted, string? HolderWorkUnitId)>((true, workUnitId));
-        public Task<string?> ReleaseAndAdvanceAsync(string path, CancellationToken ct = default) =>
+        public Task<string?> ReleaseAndAdvanceAsync(string workUnitId, string path, CancellationToken ct = default) =>
             Task.FromResult<string?>(null);
         public Task<IReadOnlyList<string>> ForceReleaseAllForWorkUnitAsync(string workUnitId, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<string>>([]);
@@ -28,19 +28,22 @@ public class InMemoryAgentRuntimeServiceTests
     {
         public Task EnqueueAsync(string workUnitId, string profileId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? sessionId = null,
-            CancellationToken ct = default) => Task.CompletedTask;
+            string? credentialRef = null, CancellationToken ct = default) => Task.CompletedTask;
         public Task<ScheduledItem?> TryAcquireAsync(string agentId, CancellationToken ct = default) =>
             Task.FromResult<ScheduledItem?>(null);
         public Task ReleaseAsync(string workUnitId, bool success, CancellationToken ct = default) => Task.CompletedTask;
         public Task MarkAwaitingResumeAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
         public Task MarkAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
         public Task ClearAwaitingFileLeaseAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task MarkAwaitingCredentialsAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task SupplyCredentialsAsync(string workUnitId, string? provider, string? model, string? baseUrl, string? apiKey, CancellationToken ct = default) => Task.CompletedTask;
         public Task<IReadOnlyList<ScheduledItem>> ListPendingAsync(CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ScheduledItem>>([]);
         public Task<IReadOnlyList<ScheduledItem>> ListAwaitingResumeAsync(CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<ScheduledItem>>([]);
         public Task ApproveResumeAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
         public Task<int> ApproveResumeAllAsync(CancellationToken ct = default) => Task.FromResult(0);
+        public Task ForceResumeAsync(string workUnitId, CancellationToken ct = default) => Task.CompletedTask;
     }
 
     private sealed class NoopEventStream : IExecutionEventStream
@@ -297,5 +300,86 @@ public class InMemoryAgentRuntimeServiceTests
         await svc.SpawnAsync("orchestrator", "wu-1", model: "m", baseUrl: "http://fake-llm", apiKey: "k");
 
         Assert.Null(svc.GetEnabledDomainAgents("wu-1"));
+    }
+
+    // ── TrackInlineAgentAsync ────────────────────────────────────────────────
+
+    [Fact]
+    public async Task TrackInlineAgentAsync_registers_active_then_marks_stopped_on_success()
+    {
+        var svc = Build();
+        string? statusWhileRunning = null;
+
+        var result = await svc.TrackInlineAgentAsync("reviewer-auto-1", "wu-1", "MP-1", async onActivity =>
+        {
+            var midFlight = await svc.ListAllAsync();
+            statusWhileRunning = midFlight.Single().Status;
+            onActivity("Reading diff...");
+            return 42;
+        });
+
+        Assert.Equal(42, result);
+        Assert.Equal("active", statusWhileRunning);
+
+        var after = await svc.ListAllAsync();
+        var record = Assert.Single(after);
+        Assert.Equal("reviewer-auto-1", record.AgentId);
+        Assert.Equal("wu-1", record.WorkUnitId);
+        Assert.Equal("stopped", record.Status);
+        Assert.Null(record.CurrentActivity);
+    }
+
+    [Fact]
+    public async Task TrackInlineAgentAsync_reports_activity_via_callback_while_running()
+    {
+        var svc = Build();
+        string? activityDuringRun = null;
+
+        await svc.TrackInlineAgentAsync<object?>("reviewer-auto-2", "wu-2", null, async onActivity =>
+        {
+            onActivity("Running build...");
+            activityDuringRun = (await svc.ListAllAsync()).Single().CurrentActivity;
+            return null;
+        });
+
+        Assert.Equal("Running build...", activityDuringRun);
+    }
+
+    [Fact]
+    public async Task TrackInlineAgentAsync_marks_failed_and_rethrows_on_exception()
+    {
+        var svc = Build();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            svc.TrackInlineAgentAsync<object?>("reviewer-auto-3", "wu-3", null,
+                _ => throw new InvalidOperationException("reviewer blew up")));
+
+        Assert.Equal("reviewer blew up", ex.Message);
+
+        var record = Assert.Single(await svc.ListAllAsync());
+        Assert.StartsWith("failed:", record.Status);
+        Assert.Null(record.CurrentActivity);
+    }
+
+    [Fact]
+    public async Task TrackInlineAgentAsync_isolated_per_agentId_under_concurrency()
+    {
+        var svc = Build();
+
+        var task1 = svc.TrackInlineAgentAsync<object?>("reviewer-auto-a", "wu-a", null, async _ =>
+        {
+            await Task.Delay(10);
+            return null;
+        });
+        var task2 = svc.TrackInlineAgentAsync<object?>("reviewer-auto-b", "wu-b", null, async _ =>
+        {
+            await Task.Delay(10);
+            return null;
+        });
+        await Task.WhenAll(task1, task2);
+
+        var all = await svc.ListAllAsync();
+        Assert.Equal(2, all.Count);
+        Assert.All(all, a => Assert.Equal("stopped", a.Status));
     }
 }

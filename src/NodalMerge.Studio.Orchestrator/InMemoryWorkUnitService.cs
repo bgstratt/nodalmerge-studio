@@ -213,6 +213,30 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return updated;
     }
 
+    public async Task<WorkUnit> AddDependencyAsync(
+        string workUnitId,
+        string dependsOnWorkUnitId,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        if (workUnit.DependsOn.Contains(dependsOnWorkUnitId))
+            return workUnit;
+
+        var updated = workUnit with
+        {
+            DependsOn = [.. workUnit.DependsOn, dependsOnWorkUnitId],
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
     public async Task<WorkUnit> AmendGoalForSteeredRetryAsync(
         string workUnitId,
         string amendedGoal,
@@ -314,14 +338,39 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         string? sliceId = null,
         IReadOnlyDictionary<string, string>? metadata = null,
         HypothesisForkType? forkType = null,
-        ReviewPolicy? reviewPolicy = null,
+        ReviewPolicy? taskReviewPolicy = null,
+        ReviewPolicy? workspaceReviewPolicy = null,
+        int? taskReviewHybridTimeoutMinutes = null,
+        int? workspaceReviewHybridTimeoutMinutes = null,
         bool bypassPromotionBranch = false,
         WorkUnitExpectedOutputKind expectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
         string? repositoryId = null,
         IReadOnlyList<FileReferenceV1>? referenceFiles = null,
         string? workspaceId = null,
+        IReadOnlyList<string>? reconciliationSourceProposalIds = null,
+        IReadOnlyList<string>? reconciliationTargetPaths = null,
+        string? reconciliationSourceRef = null,
         CancellationToken cancellationToken = default)
     {
+        // repositoryPath (the extension's auto-detected/override nodalmerge.repositoryPath, sent on
+        // every goal-creation call) used to be silently dropped here — accepted as a parameter but
+        // never turned into a RepositoryId, so PromoteAsync's ResolveWriteBackPathAsync (which only
+        // ever consults WorkUnit.RepositoryId) had nowhere to write back to, and a goal's changes
+        // would land on the candidate/main branch inside NodalMerge's own storage but never reach
+        // the real on-disk repo. RegisterAsync is idempotent by normalized path, so this is safe to
+        // call on every goal creation even if the path's already registered from an earlier goal.
+        var resolvedRepositoryId = repositoryId;
+        if (resolvedRepositoryId is null && repositoryPath is not null)
+        {
+            var repositories = _serviceProvider?.GetService<IRepositoryRegistryService>();
+            if (repositories is not null)
+            {
+                var repository = await repositories.RegisterAsync(repositoryPath, label: null, cancellationToken)
+                    .ConfigureAwait(false);
+                resolvedRepositoryId = repository.RepositoryId;
+            }
+        }
+
         var resolvedBranchId = await _branchService
             .CreateBranchAsync(branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, fileScope, cancellationToken)
             .ConfigureAwait(false);
@@ -348,12 +397,18 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             FanOutInfo: fanOutInfo,
             BranchedFromProposalId: branchedFromProposalId,
             ForkType: forkType,
-            ReviewPolicy: reviewPolicy ?? ReviewPolicy.HumanRequired,
+            TaskReviewPolicy: taskReviewPolicy ?? ReviewPolicy.HumanRequired,
+            WorkspaceReviewPolicy: workspaceReviewPolicy ?? ReviewPolicy.HumanRequired,
+            TaskReviewHybridTimeoutMinutes: taskReviewHybridTimeoutMinutes,
+            WorkspaceReviewHybridTimeoutMinutes: workspaceReviewHybridTimeoutMinutes,
             BypassPromotionBranch: bypassPromotionBranch,
             ExpectedOutputKind: expectedOutputKind,
-            RepositoryId: repositoryId,
+            RepositoryId: resolvedRepositoryId,
             ReferenceFiles: referenceFiles,
-            WorkspaceId: workspaceId ?? "workspace-default");
+            WorkspaceId: workspaceId ?? "workspace-default",
+            ReconciliationSourceProposalIds: reconciliationSourceProposalIds,
+            ReconciliationTargetPaths: reconciliationTargetPaths,
+            ReconciliationSourceRef: reconciliationSourceRef);
 
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }

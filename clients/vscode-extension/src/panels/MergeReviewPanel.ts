@@ -1,5 +1,7 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
-import { scopeViewCss } from './sharedWebviewChrome';
+import { scopeViewCss, openReadOnlyDiff } from './sharedWebviewChrome';
 import type { AgentConfigService } from '../AgentConfigService';
 
 // ── Domain types ───────────────────────────────────────────────────────────
@@ -22,6 +24,11 @@ export interface MergeProposal {
   filesTouched?: string[];
   noFileChangesJustification?: string | null;
   reviewNotes?: string | null;
+  // True once this proposal's own apply actually redirected onto the shared "candidate" staging
+  // branch (WorkspaceOptions.UsePromotionBranch). Distinct from targetBranch, which stays the
+  // proposal's ultimate declared destination ("main") whether or not promotion is in play — see
+  // MergeProposal.LandedOnCandidateBranch's own doc comment.
+  landedOnCandidateBranch?: boolean;
 }
 
 export interface DiffLine {
@@ -90,6 +97,16 @@ export class DecisionConvergencePanel {
   private proposalId?: string;
   private workUnitId?: string;
   private lastProposal?: MergeProposal;
+  private conflictBranchId?: string;
+  // Path -> content captured at the moment "Edit File" opened it, for Resync Workspace to diff
+  // the (possibly now hand-edited) live file against. Cleared whenever a fresh proposal/conflict
+  // loads, since a stale baseline from a previous decision would compare against the wrong thing.
+  private editBaselines = new Map<string, string>();
+
+  /** The branch a human-editable file actually lives on, for whichever mode is currently loaded. */
+  private get editableBranchId(): string | undefined {
+    return this.mode === 'conflict' ? this.conflictBranchId : this.lastProposal?.sourceBranch;
+  }
 
   constructor(
     panel: vscode.WebviewPanel,
@@ -111,6 +128,7 @@ export class DecisionConvergencePanel {
     this.mode = 'proposal';
     this.proposalId = proposalId;
     this.workUnitId = undefined;
+    this.editBaselines.clear();
     void this.load();
   }
 
@@ -118,6 +136,7 @@ export class DecisionConvergencePanel {
     this.mode = 'conflict';
     this.workUnitId = workUnitId;
     this.proposalId = undefined;
+    this.editBaselines.clear();
     void this.load();
   }
 
@@ -166,8 +185,9 @@ export class DecisionConvergencePanel {
   private async load(): Promise<void> {
     if (this.mode === 'conflict') {
       try {
-        const report = await this.get<{ workUnitId: string; status: string; content: string }>(
+        const report = await this.get<{ workUnitId: string; branchId: string; status: string; content: string }>(
           '/studio/workunits/' + this.workUnitId + '/conflict-report');
+        this.conflictBranchId = report.branchId;
         void this.panel.webview.postMessage({
           type: 'conflict',
           workUnitId: report.workUnitId,
@@ -249,14 +269,95 @@ export class DecisionConvergencePanel {
           }
           return;
         case 'openDiff': {
-          const path = String(msg.path ?? 'file');
+          const filePath = String(msg.path ?? 'file');
           const before = (msg.beforeContent as string | null | undefined) ?? '';
           const after = (msg.afterContent as string | null | undefined) ?? '';
-          const lang = path.includes('.') ? path.split('.').pop() : 'plaintext';
-          const left = await vscode.workspace.openTextDocument({ language: lang, content: before });
-          const right = await vscode.workspace.openTextDocument({ language: lang, content: after });
-          const title = path + ' (base ↔ proposed)';
-          await vscode.commands.executeCommand('vscode.diff', left.uri, right.uri, title);
+          await openReadOnlyDiff(filePath, before, after);
+          break;
+        }
+        case 'editFile': {
+          const filePath = String(msg.path ?? '');
+          const branchId = this.editableBranchId;
+          if (!filePath || !branchId) {
+            void vscode.window.showWarningMessage('NodalMerge: no branch loaded to edit this file on.');
+            return;
+          }
+          try {
+            const [{ content }, { workingDirectory }] = await Promise.all([
+              this.get<{ content: string | null }>(
+                '/studio/workspace/read?branchId=' + encodeURIComponent(branchId) + '&path=' + encodeURIComponent(filePath)),
+              this.get<{ workingDirectory: string | null }>(
+                '/studio/workspace/path?branchId=' + encodeURIComponent(branchId)),
+            ]);
+            if (!workingDirectory) {
+              void vscode.window.showErrorMessage('NodalMerge: no materialized working directory for this branch.');
+              return;
+            }
+            // Baseline captured now, at the true "about to edit" boundary — not at whenever the
+            // proposal/conflict happened to load, which could be stale by the time editing starts.
+            this.editBaselines.set(filePath, content ?? '');
+            void this.panel.webview.postMessage({ type: 'editBaselineSet', path: filePath });
+            const realUri = vscode.Uri.file(path.join(workingDirectory, filePath));
+            const doc = await vscode.workspace.openTextDocument(realUri);
+            await vscode.window.showTextDocument(doc, { preview: false });
+          } catch (err) {
+            void vscode.window.showErrorMessage('NodalMerge: could not open ' + filePath + ' for editing — ' + String(err));
+          }
+          return;
+        }
+        case 'resyncWorkspace': {
+          const branchId = this.editableBranchId;
+          if (!branchId) {
+            void vscode.window.showWarningMessage('NodalMerge: no branch loaded to resync.');
+            return;
+          }
+          if (this.editBaselines.size === 0) {
+            void vscode.window.showInformationMessage(
+              'NodalMerge: nothing to resync — use "Edit File" first to open a file for editing.');
+            return;
+          }
+          try {
+            const { workingDirectory } = await this.get<{ workingDirectory: string | null }>(
+              '/studio/workspace/path?branchId=' + encodeURIComponent(branchId));
+            if (!workingDirectory) {
+              void vscode.window.showErrorMessage('NodalMerge: no materialized working directory for this branch.');
+              return;
+            }
+            const files: { path: string; content: string }[] = [];
+            const deletedPaths: string[] = [];
+            for (const [filePath, baseline] of this.editBaselines) {
+              const fullPath = path.join(workingDirectory, filePath);
+              let current: string | undefined;
+              try {
+                current = await fs.promises.readFile(fullPath, 'utf8');
+              } catch {
+                current = undefined; // file no longer exists on disk
+              }
+              if (current === undefined) {
+                if (baseline !== '') deletedPaths.push(filePath);
+              } else if (current !== baseline) {
+                files.push({ path: filePath, content: current });
+              }
+            }
+            if (files.length === 0 && deletedPaths.length === 0) {
+              void vscode.window.showInformationMessage('NodalMerge: no changes found in the file(s) you edited.');
+              return;
+            }
+            const result = await this.post<{ written: string[]; deleted: string[]; errors: { path: string; error: string }[] }>(
+              '/studio/branches/' + encodeURIComponent(branchId) + '/resync-files',
+              { files, deletedPaths });
+            this.editBaselines.clear();
+            if (result.errors?.length) {
+              void vscode.window.showWarningMessage(
+                'NodalMerge: resynced with errors — ' + result.errors.map(e => e.path + ': ' + e.error).join('; '));
+            } else {
+              void vscode.window.showInformationMessage(
+                `NodalMerge: resynced ${result.written.length} file(s)` +
+                (result.deleted.length ? `, deleted ${result.deleted.length}` : '') + '.');
+            }
+          } catch (err) {
+            void vscode.window.showErrorMessage('NodalMerge: resync failed — ' + String(err));
+          }
           break;
         }
         case 'validateEvidence':
@@ -270,17 +371,69 @@ export class DecisionConvergencePanel {
           });
           void vscode.window.showInformationMessage('Decision accepted.');
           break;
-        case 'rejectDecision':
+        case 'reviseDecision':
           await this.post('/studio/merges/' + this.proposalId + '/review', {
             decision: 'Rejected',
+            restartMode: 'Revise',
             notes: (msg.notes as string | undefined) || undefined,
             sessionId: this.getEffectiveSessionId(),
           });
-          void vscode.window.showWarningMessage('Decision rejected — retrying with your notes as steering context.');
+          void vscode.window.showWarningMessage('Revising with your notes as steering context.');
           break;
+        case 'revertAndRestart':
+          await this.post('/studio/merges/' + this.proposalId + '/review', {
+            decision: 'Rejected',
+            restartMode: 'Revert',
+            notes: (msg.notes as string | undefined) || undefined,
+            sessionId: this.getEffectiveSessionId(),
+          });
+          void vscode.window.showWarningMessage('Reverting the workspace and restarting with your notes as steering context.');
+          break;
+        case 'unrejectAndRevise': {
+          // A proposal that's already Rejected has no legal transition back through /review — the
+          // only way back is the standalone retry primitive. Requiring notes here (unlike accept)
+          // is deliberate: a hard-rejected proposal already has no recorded reason half the time
+          // (see the MCP-bypass bug this button exists to give a manual escape hatch from), so the
+          // retried worker needs SOMETHING to go on or it's back to guessing.
+          const notes = (msg.notes as string | undefined) || undefined;
+          if (!notes) {
+            void vscode.window.showWarningMessage('NodalMerge: add a note first — the retried worker has no other context for why this was rejected.');
+            return;
+          }
+          try {
+            const result = await this.post<{ outcome: string }>(
+              '/studio/merges/' + this.proposalId + '/retry',
+              { notes, sessionId: this.getEffectiveSessionId() });
+            if (result.outcome === 'EscalatedToDeadLetter') {
+              void vscode.window.showWarningMessage(
+                'NodalMerge: max retry attempts already reached — escalated to the dead-letter queue instead. Use Dead Letters > Retry with Context.');
+            } else {
+              void vscode.window.showInformationMessage('NodalMerge: retrying with your notes as steering context.');
+            }
+          } catch (err) {
+            void vscode.window.showErrorMessage('NodalMerge: retry failed — ' + String(err));
+          }
+          break;
+        }
         case 'applyDecision':
-          await this.post('/studio/merges/' + this.proposalId + '/apply', {});
-          void vscode.window.showInformationMessage('Decision applied successfully.');
+          try {
+            await this.post('/studio/merges/' + this.proposalId + '/apply', {});
+            void vscode.window.showInformationMessage('Decision applied successfully.');
+          } catch (err) {
+            // A conflicting apply isn't a dead end — the backend auto-spawns a reconciliation
+            // agent (or records a conflict a human can Reconcile/Resolve) and says so in the
+            // error text. Showing that as a raw failure toast made it look like nothing happened
+            // while an agent was already working; distinguish "in progress elsewhere" from a
+            // genuine failure.
+            const text = String(err);
+            if (text.includes('reconciliation agent has been started')) {
+              void vscode.window.showInformationMessage(
+                'NodalMerge: conflict detected — a reconciliation agent is combining both versions now. ' +
+                'Its merged proposal will supersede this one; progress is visible in the Activity Center.');
+            } else {
+              void vscode.window.showErrorMessage('NodalMerge: apply failed — ' + text);
+            }
+          }
           break;
         case 'forkHypothesis': {
           const goal = await vscode.window.showInputBox({
@@ -791,7 +944,7 @@ const DC_HTML = `
     <div id="meta-grid" class="meta-grid">
       <span class="meta-label">Decision Status</span> <span id="status-badge"></span>
       <span class="meta-label">Hypothesis Fork</span><span class="meta-value" id="source-branch"></span>
-      <span class="meta-label">Target</span>         <span class="meta-value" id="target-branch"></span>
+      <span class="meta-label">Target</span>         <span class="meta-value" id="target-branch"></span><button class="ghost hidden" id="btn-view-candidate-promotion" style="margin-left:8px">View in Candidate Promotion</button>
       <span class="meta-label">Confidence</span>     <span class="meta-value" id="confidence"></span>
     </div>
     <section id="section-converged" class="hidden converged-banner">
@@ -805,9 +958,12 @@ const DC_HTML = `
       <h2>Decision Conflict</h2>
       <pre id="conflict-report-content" class="diff-pre"></pre>
       <p style="opacity:0.7;font-size:0.9em">
-        Resolve conflicting hypotheses manually — edit the conflicting files on the affected branches outside this panel,
-        then re-run the merger for this work unit.
+        Edit a conflicting file below, then use <strong>Resync Workspace</strong> to record your
+        fix as a real, hash-linked change on this branch. This report itself won't clear on its
+        own even after a successful fix — re-trigger review for this work unit (from Activity
+        Center, or via the API) to actually retry the merge.
       </p>
+      <div id="conflict-file-rows"></div>
     </section>
     <section id="section-goal">
       <h2>Goal</h2>
@@ -842,13 +998,15 @@ const DC_HTML = `
       <p id="rollback-plan"></p>
     </section>
     <div id="review-notes-row" class="review-notes-row">
-      <label for="review-notes">Notes (steering direction for a reject, or context for an accept)</label>
+      <label for="review-notes">Notes (steering direction for a revise/revert, or context for an accept)</label>
       <textarea id="review-notes" rows="3" placeholder="e.g. Missing the edge case for empty input — handle that and resubmit."></textarea>
     </div>
     <div id="actions" class="actions">
       <button id="btn-validate">Validate Evidence</button>
       <button id="btn-accept" class="accept">Accept Decision</button>
-      <button id="btn-reject" class="reject">Reject Decision</button>
+      <button id="btn-revise" class="reject" title="Keep the current file changes and nudge the agent toward the gap.">Revise</button>
+      <button id="btn-revert" class="reject" title="Discard the agent's changes and start the goal over with your notes.">Revert and Restart</button>
+      <button id="btn-unreject" class="reject" title="This proposal is already Rejected (a dead end otherwise — no other action can move it) — reset the task to Queued and retry with your notes as steering context.">Unreject and Revise</button>
       <button id="btn-apply"  class="apply">Apply Decision</button>
       <button id="btn-fork"   class="ghost">Fork Hypothesis</button>
       <button id="btn-restore" class="ghost">Restore workspace</button>

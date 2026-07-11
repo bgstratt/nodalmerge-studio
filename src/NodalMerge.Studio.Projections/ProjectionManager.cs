@@ -31,6 +31,7 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly IRepositoryOpService? _repositoryOps;
     private readonly WorkspaceOptions? _workspaceOptions;
     private readonly ICoModService? _coMod;
+    private readonly IExecutionEventStream? _eventStream;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
@@ -51,7 +52,8 @@ public sealed class ProjectionManager : IProjectionManager
         IStudioNodeStore? nodeStore = null,
         IRepositoryOpService? repositoryOps = null,
         WorkspaceOptions? workspaceOptions = null,
-        ICoModService? coMod = null)
+        ICoModService? coMod = null,
+        IExecutionEventStream? eventStream = null)
     {
         _workUnits          = workUnits;
         _tasks              = tasks;
@@ -72,6 +74,7 @@ public sealed class ProjectionManager : IProjectionManager
         _repositoryOps      = repositoryOps;
         _workspaceOptions   = workspaceOptions;
         _coMod              = coMod;
+        _eventStream        = eventStream;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -93,6 +96,7 @@ public sealed class ProjectionManager : IProjectionManager
             ProjectionType.CounterfactualComparison => await BuildCounterfactualComparisonAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.RunRetrospective => await BuildRunRetrospectiveAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.HypothesisComparison => await BuildHypothesisComparisonAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.WorkspacePathways => await BuildWorkspacePathwaysAsync(request, cancellationToken).ConfigureAwait(false),
             _ => throw new ArgumentOutOfRangeException(nameof(request), request.Type, "Unknown projection type.")
         };
 
@@ -580,6 +584,7 @@ public sealed class ProjectionManager : IProjectionManager
                 PipelineStage.Execute     => "Executing",
                 PipelineStage.Review      => "Proposed",
                 PipelineStage.Merge       => wu.Status is WorkUnitStatus.Completed or WorkUnitStatus.Merged ? "Converged" : "Converging",
+                PipelineStage.Reconcile   => wu.Status is WorkUnitStatus.Completed or WorkUnitStatus.Merged ? "Converged" : "Reconciling",
                 _ => wu.Status.ToString()
             };
 
@@ -1089,6 +1094,343 @@ public sealed class ProjectionManager : IProjectionManager
             score -= 1;
 
         return score;
+    }
+
+    // ── WorkspacePathways projection — "git for agent reasoning" ────────────────────────
+    //
+    // Deliberately does NOT read IOrchestrationDecisionLogService — that per-cycle chatter
+    // (NoOp/Enqueue/SpawnPlanner) is exactly the noise plans/pathways-workspace-history.md
+    // identified as the wrong data source for this view. Nodes here are provenance-bearing
+    // moments only: a goal starting, a proposal integrating/being rejected/superseded, a
+    // top-level goal dying with no proposal, or an external repository drift sync.
+    private async Task<string> BuildWorkspacePathwaysAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        var allWorkUnits = await _workUnits.ListAsync(request.BranchId, ct).ConfigureAwait(false);
+        var workUnitsById = allWorkUnits.ToDictionary(w => w.WorkUnitId);
+        var workUnitIdSet = workUnitsById.Keys.ToHashSet(StringComparer.Ordinal);
+
+        var nodes = new List<WorkspacePathwaysNode>();
+        var edges = new List<WorkspacePathwaysEdge>();
+        // Every GoalStarted node id actually emitted — edges must only target these. On a
+        // branch-scoped request a child work unit's root-goal ancestor lives on a different
+        // branch and is outside allWorkUnits, so ResolveRootGoalNodeId falls back to the child's
+        // own id, which never gets a GoalStarted node; emitting that edge anyway would hand
+        // consumers a dangling reference.
+        var goalNodeIds = new HashSet<string>(StringComparer.Ordinal);
+
+        // Root goal nodes — every work unit with no parent is a goal the user (or an agent
+        // fan-out) started. wu.Owner == "user" is the same "was this human-initiated" heuristic
+        // BuildRunRetrospectiveAsync's modelPerformanceByStage grouping already relies on.
+        foreach (var wu in allWorkUnits.Where(w => w.ParentWorkUnitId is null))
+        {
+            var isHuman = string.Equals(wu.Owner, "user", StringComparison.OrdinalIgnoreCase);
+            goalNodeIds.Add(GoalNodeId(wu.WorkUnitId));
+            nodes.Add(new WorkspacePathwaysNode(
+                NodeId: GoalNodeId(wu.WorkUnitId),
+                Kind: "GoalStarted",
+                WorkUnitId: wu.WorkUnitId,
+                BranchId: wu.BranchId,
+                ActorKind: isHuman ? "Human" : "Agent",
+                ActorId: isHuman ? wu.Owner : wu.AssignedAgent,
+                ActorModel: null,
+                ActorProvider: null,
+                Summary: wu.Goal,
+                OccurredAt: wu.CreatedAt));
+        }
+
+        // Merge proposals → Integration/Rejection/Superseded nodes. Event-sourced when the
+        // execution event stream has this proposal's lifecycle moments (MergeApplied,
+        // ProposalRejected, MergeProposalStatusChanged→Superseded); state-derived fallback for
+        // proposals without events (no SessionId, or history predating event capture). The
+        // difference matters: a reconciliation constituent goes Merged → Superseded, and the
+        // state-derived view *rewrote history* — its Integration node retroactively became a
+        // Superseded node. Event-sourced, it keeps both: the moment it integrated AND the moment
+        // it was superseded, with the true transition timestamps instead of
+        // DiffGeneratedAt ?? wu.CreatedAt approximations.
+        var allProposals = await _merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+        var momentsByProposal = await CollectProposalMomentsAsync(ct).ConfigureAwait(false);
+        var workUnitsWithProposalNode = new HashSet<string>(StringComparer.Ordinal);
+        var proposalNodesByWorkUnit = new Dictionary<string, List<WorkspacePathwaysNode>>(StringComparer.Ordinal);
+
+        foreach (var p in allProposals)
+        {
+            if (p.WorkUnitId is null || !workUnitIdSet.Contains(p.WorkUnitId))
+                continue; // out of the requested branch's scope, or orphaned proposal
+
+            var moments = momentsByProposal.GetValueOrDefault(p.ProposalId);
+            if (moments is null or { Count: 0 })
+            {
+                // State-derived fallback — one node from the current terminal status.
+                if (p.Status is not (MergeProposalStatus.Merged or MergeProposalStatus.Rejected or MergeProposalStatus.Superseded))
+                    continue;
+                var fallbackKind = p.Status switch
+                {
+                    MergeProposalStatus.Merged => "Integration",
+                    MergeProposalStatus.Rejected => "Rejection",
+                    _ => "Superseded",
+                };
+                var wuForFallback = workUnitsById[p.WorkUnitId];
+                moments = [new ProposalMoment(fallbackKind, p.DiffGeneratedAt ?? wuForFallback.CreatedAt, null, p.ReviewedBy)];
+            }
+
+            var wu = workUnitsById[p.WorkUnitId];
+            WorkspacePathwaysNode? previousMomentNode = null;
+            foreach (var moment in moments.OrderBy(m => m.OccurredAt))
+            {
+                var node = new WorkspacePathwaysNode(
+                    NodeId: ProposalNodeId(p.ProposalId, moment.Kind),
+                    Kind: moment.Kind,
+                    WorkUnitId: p.WorkUnitId,
+                    BranchId: wu.BranchId,
+                    ActorKind: "Agent",
+                    ActorId: p.AgentId,
+                    ActorModel: p.Model,
+                    ActorProvider: p.Provider,
+                    Summary: p.Summary,
+                    OccurredAt: moment.OccurredAt,
+                    ProposalId: p.ProposalId,
+                    FilesTouched: p.FilesTouched,
+                    SnapshotId: moment.SnapshotId,
+                    ReviewedBy: moment.ReviewedBy ?? p.ReviewedBy);
+                nodes.Add(node);
+
+                if (!proposalNodesByWorkUnit.TryGetValue(p.WorkUnitId, out var perWuList))
+                    proposalNodesByWorkUnit[p.WorkUnitId] = perWuList = [];
+                perWuList.Add(node);
+
+                // Chain a proposal's own lifecycle: its Integration node → its Superseded node
+                // (the "this landed, then reconciliation replaced it" story, kept visible).
+                if (previousMomentNode is not null)
+                    edges.Add(new WorkspacePathwaysEdge(previousMomentNode.NodeId, node.NodeId, moment.Kind));
+
+                previousMomentNode = node;
+            }
+
+            workUnitsWithProposalNode.Add(p.WorkUnitId);
+        }
+
+        // Nested topology: each proposal's FIRST lifecycle node anchors to the nearest ancestor
+        // work unit that has an emitted node — the parent's own latest-earlier proposal node when
+        // one exists (a fanned-out child merging into its parent's branch), the parent's
+        // GoalStarted node when the parent is a root goal, walking further up otherwise. Falls
+        // back to no edge on branch-scoped requests where every ancestor is out of scope —
+        // never a dangling reference.
+        foreach (var (workUnitId, perWuNodes) in proposalNodesByWorkUnit)
+        {
+            var firstNode = perWuNodes.OrderBy(n => n.OccurredAt).First();
+            var anchorId = ResolveAnchorNodeId(workUnitId, firstNode.OccurredAt, workUnitsById, proposalNodesByWorkUnit, goalNodeIds);
+            if (anchorId is not null)
+                edges.Add(new WorkspacePathwaysEdge(anchorId, firstNode.NodeId, firstNode.Kind));
+        }
+
+        // Top-level goals that died (Failed/DeadLettered/Cancelled) without ever producing a
+        // proposal node above — otherwise a whole class of dead branches (crashed before
+        // proposing) would be invisible.
+        foreach (var wu in allWorkUnits.Where(w => w.ParentWorkUnitId is null
+            && w.Status is WorkUnitStatus.Failed or WorkUnitStatus.DeadLettered or WorkUnitStatus.Cancelled
+            && !workUnitsWithProposalNode.Contains(w.WorkUnitId)))
+        {
+            var isHuman = string.Equals(wu.Owner, "user", StringComparison.OrdinalIgnoreCase);
+            var nodeId = DeadBranchNodeId(wu.WorkUnitId);
+            nodes.Add(new WorkspacePathwaysNode(
+                NodeId: nodeId,
+                Kind: "DeadBranch",
+                WorkUnitId: wu.WorkUnitId,
+                BranchId: wu.BranchId,
+                ActorKind: isHuman ? "Human" : "Agent",
+                ActorId: isHuman ? wu.Owner : wu.AssignedAgent,
+                ActorModel: null,
+                ActorProvider: null,
+                Summary: $"{wu.Status}: {wu.Goal}",
+                OccurredAt: wu.UpdatedAt));
+            edges.Add(new WorkspacePathwaysEdge(GoalNodeId(wu.WorkUnitId), nodeId, "DeadEnd"));
+        }
+
+        // External-update nodes — ArtifactType.ExternalChangeset artifacts, written by
+        // RepositorySyncService on drift detection. These are OwnedByWorkUnitId: null, so
+        // GetChainAsync (per-work-unit) can never surface them — GetByTypeAsync is the query
+        // surface added for exactly this (previously a full node-store rescan+deserialize per
+        // request, which a 2s-polling panel turned into a hot loop). Workspace-wide by nature
+        // (not branch-scoped), so only included on an unscoped (whole-workspace) request.
+        if (request.BranchId is null)
+        {
+            var externalArtifacts = await _artifactLineage
+                .GetByTypeAsync(ArtifactType.ExternalChangeset, ct).ConfigureAwait(false);
+
+            foreach (var artifact in externalArtifacts)
+            {
+                var nodeId = ExternalNodeId(artifact.ArtifactId);
+                // Best-effort: artifact.Body is a free-form string on ArtifactRef in general, but
+                // RepositorySyncService always writes this exact JSON shape for ExternalChangeset —
+                // a malformed/missing body degrades to "no file list, no diff link" rather than
+                // throwing away the whole node.
+                // JsonOptions (JsonSerializerOptions.Web) is required here, not the raw
+                // deserializer default — RepositorySyncService serialized this body camelCase
+                // (JsonSerializer.Serialize's own default), and plain JsonSerializer.Deserialize
+                // is case-sensitive by default, so it would silently match nothing against this
+                // record's PascalCase property names otherwise.
+                ExternalChangesetBody? body = null;
+                try { body = JsonSerializer.Deserialize<ExternalChangesetBody>(artifact.Body ?? "{}", JsonOptions); }
+                catch (JsonException) { /* degrade gracefully */ }
+
+                var filesTouched = body is null
+                    ? null
+                    : (body.Added ?? []).Concat(body.Modified ?? []).Concat(body.Deleted ?? []).ToList();
+
+                nodes.Add(new WorkspacePathwaysNode(
+                    NodeId: nodeId,
+                    Kind: "ExternalUpdate",
+                    WorkUnitId: null,
+                    BranchId: null,
+                    ActorKind: "External",
+                    ActorId: null,
+                    ActorModel: null,
+                    ActorProvider: null,
+                    Summary: artifact.Title ?? "External repository change",
+                    OccurredAt: artifact.CreatedAt,
+                    ArtifactId: artifact.ArtifactId,
+                    FilesTouched: filesTouched is { Count: > 0 } ? filesTouched : null,
+                    ExternalSyncStateIdBefore: body?.PreSyncSnapshotStateId,
+                    ExternalSyncStateIdAfter: body?.PostSyncSnapshotStateId));
+
+                if (artifact.ParentArtifactId is { } parentArtifactId)
+                    edges.Add(new WorkspacePathwaysEdge(ExternalNodeId(parentArtifactId), nodeId, "ExternalChain"));
+            }
+        }
+
+        var orderedNodes = nodes.OrderBy(n => n.OccurredAt).ToList();
+        return Serialize(new WorkspacePathwaysProjectionPayload(orderedNodes, edges, DateTimeOffset.UtcNow));
+    }
+
+    // Mirrors the anonymous-object shape RepositorySyncService.SyncCoreAsync serializes into
+    // ArtifactRef.Body for every ExternalChangeset artifact — only the fields WorkspacePathways
+    // actually surfaces are declared; JsonSerializer.Deserialize ignores the rest.
+    private sealed record ExternalChangesetBody(
+        IReadOnlyList<string>? Added,
+        IReadOnlyList<string>? Modified,
+        IReadOnlyList<string>? Deleted,
+        string? PreSyncSnapshotStateId,
+        string? PostSyncSnapshotStateId);
+
+    // One provenance-bearing lifecycle moment of a proposal, sourced from the execution event
+    // stream (or synthesized from current state as a fallback). Kind is a WorkspacePathwaysNode
+    // kind: "Integration" | "Rejection" | "Superseded".
+    private sealed record ProposalMoment(string Kind, DateTimeOffset OccurredAt, string? SnapshotId, string? ReviewedBy);
+
+    // Field subsets of MergeAppliedPayload / ProposalRejectedPayload / MergeProposalStatusChangedPayload.
+    // ExecutionEventStreamService serializes payloads with default options (PascalCase, enums as
+    // numbers); JsonOptions (Web) parses both PascalCase and camelCase case-insensitively, and
+    // numeric enum values bind fine.
+    private sealed record MergeAppliedEventBody(string? ProposalId, string? SnapshotId);
+    private sealed record ProposalRejectedEventBody(string? ProposalId, string? RejectedBy);
+    private sealed record StatusChangedEventBody(string? ProposalId, MergeProposalStatus NewStatus);
+
+    private async Task<Dictionary<string, List<ProposalMoment>>> CollectProposalMomentsAsync(CancellationToken ct)
+    {
+        var result = new Dictionary<string, List<ProposalMoment>>(StringComparer.Ordinal);
+        if (_eventStream is null)
+            return result;
+
+        var events = await _eventStream.GetEventsByKindAsync(
+            [ExecutionEventKind.MergeApplied, ExecutionEventKind.ProposalRejected, ExecutionEventKind.MergeProposalStatusChanged],
+            ct: ct).ConfigureAwait(false);
+
+        void Add(string? proposalId, ProposalMoment moment)
+        {
+            if (proposalId is null) return;
+            if (!result.TryGetValue(proposalId, out var list))
+                result[proposalId] = list = [];
+            // One node per (proposal, kind): a re-appended/duplicated event must not double a moment.
+            if (list.All(m => m.Kind != moment.Kind))
+                list.Add(moment);
+        }
+
+        foreach (var ev in events)
+        {
+            try
+            {
+                switch (ev.Kind)
+                {
+                    case ExecutionEventKind.MergeApplied:
+                    {
+                        var body = JsonSerializer.Deserialize<MergeAppliedEventBody>(ev.PayloadJson, JsonOptions);
+                        Add(body?.ProposalId, new ProposalMoment("Integration", ev.OccurredAt, body?.SnapshotId, null));
+                        break;
+                    }
+                    case ExecutionEventKind.ProposalRejected:
+                    {
+                        var body = JsonSerializer.Deserialize<ProposalRejectedEventBody>(ev.PayloadJson, JsonOptions);
+                        Add(body?.ProposalId, new ProposalMoment("Rejection", ev.OccurredAt, null, body?.RejectedBy));
+                        break;
+                    }
+                    case ExecutionEventKind.MergeProposalStatusChanged:
+                    {
+                        var body = JsonSerializer.Deserialize<StatusChangedEventBody>(ev.PayloadJson, JsonOptions);
+                        if (body?.NewStatus == MergeProposalStatus.Superseded)
+                            Add(body.ProposalId, new ProposalMoment("Superseded", ev.OccurredAt, null, null));
+                        break;
+                    }
+                }
+            }
+            catch (JsonException)
+            {
+                // A malformed payload degrades to "no moment from this event" — the state-derived
+                // fallback still covers the proposal if no other event parsed.
+            }
+        }
+
+        return result;
+    }
+
+    private static string GoalNodeId(string workUnitId) => $"goal:{workUnitId}";
+    private static string DeadBranchNodeId(string workUnitId) => $"failed:{workUnitId}";
+    private static string ExternalNodeId(string artifactId) => $"external:{artifactId}";
+
+    // Kind-suffixed so one proposal's multiple lifecycle moments (Integration then Superseded)
+    // get distinct, deterministic node ids. The webview never parses these — it uses the node's
+    // own ProposalId field for inspect round-trips.
+    private static string ProposalNodeId(string proposalId, string kind) =>
+        $"proposal:{proposalId}:{kind.ToLowerInvariant()}";
+
+    // Nested topology (plans/pathways-workspace-history.md): nearest ancestor work unit with an
+    // emitted node — preferring the ancestor's latest proposal node that occurred before this
+    // one (the branch state the child actually forked from work on), then the ancestor's
+    // GoalStarted node. Null when every ancestor is outside the loaded scope (branch-scoped
+    // requests) — the caller emits no edge rather than a dangling one.
+    private static string? ResolveAnchorNodeId(
+        string workUnitId,
+        DateTimeOffset occurredAt,
+        IReadOnlyDictionary<string, WorkUnit> workUnitsById,
+        IReadOnlyDictionary<string, List<WorkspacePathwaysNode>> proposalNodesByWorkUnit,
+        HashSet<string> goalNodeIds)
+    {
+        var visited = new HashSet<string>(StringComparer.Ordinal) { workUnitId };
+        var current = workUnitsById.GetValueOrDefault(workUnitId);
+
+        // A root work unit's own proposals anchor to its own GoalStarted node.
+        if (current?.ParentWorkUnitId is null)
+            return goalNodeIds.Contains(GoalNodeId(workUnitId)) ? GoalNodeId(workUnitId) : null;
+
+        var parentId = current.ParentWorkUnitId;
+        while (parentId is not null && visited.Add(parentId))
+        {
+            if (proposalNodesByWorkUnit.TryGetValue(parentId, out var parentNodes))
+            {
+                var earlier = parentNodes
+                    .Where(n => n.OccurredAt <= occurredAt)
+                    .OrderByDescending(n => n.OccurredAt)
+                    .FirstOrDefault();
+                if (earlier is not null)
+                    return earlier.NodeId;
+            }
+
+            if (goalNodeIds.Contains(GoalNodeId(parentId)))
+                return GoalNodeId(parentId);
+
+            parentId = workUnitsById.GetValueOrDefault(parentId)?.ParentWorkUnitId;
+        }
+
+        return null;
     }
 
     // Manual-only analytics dashboard for the Insights tab — computed fresh from the full DAG

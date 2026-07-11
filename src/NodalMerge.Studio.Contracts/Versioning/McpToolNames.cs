@@ -38,7 +38,6 @@ public static class McpToolNames
     public const string MergeReview = "nm_v1_merge_review";
     public const string MergeApply = "nm_v1_merge_apply";
 
-    public const string ReplayRange = "nm_v1_replay_range";
     public const string ReplayRollback = "nm_v1_replay_rollback";
     public const string ReplayInspect = "nm_v1_replay_inspect";
 
@@ -187,7 +186,6 @@ public static class McpToolNames
         MergeValidate,
         MergeReview,
         MergeApply,
-        ReplayRange,
         ReplayRollback,
         ReplayInspect,
         StateMarkKnownGood,

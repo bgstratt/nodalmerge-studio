@@ -183,6 +183,13 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
                 .OrderBy(a => a.CreatedAt)
                 .ToList());
 
+    public Task<IReadOnlyList<ArtifactRef>> GetByTypeAsync(ArtifactType type, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ArtifactRef>>(
+            _byId.Values
+                .Where(a => a.Type == type)
+                .OrderBy(a => a.CreatedAt)
+                .ToList());
+
     public async Task RehydrateAsync(CancellationToken ct = default)
     {
         var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.ArtifactRefV1, ct).ConfigureAwait(false);

@@ -34,11 +34,19 @@ interface WorkUnit {
   fanOutInfo?: WorkUnitFanOutInfo | null;
   forkType?: string | null;
   metadata?: Record<string, string> | null;
+  awaitingFileLease?: boolean;
+  awaitingResume?: boolean;
+  awaitingCredentials?: boolean;
+}
+
+interface AgentInfo {
+  agentId: string;
+  workUnitId: string;
+  status: string;
 }
 
 interface StudioOptions {
   useLlmProfileSelection: boolean;
-  blockOverlappingFileScope: boolean;
   maxConcurrentWorkers: number;
   schedulerPollIntervalMs: number;
   requireBuildBeforeProposal: boolean;
@@ -61,6 +69,19 @@ interface ExecutionSession {
   rootWorkUnitId: string;
   status: string;
   startedAt: string;
+  // Merged in client-side from GET /studio/goals by rootWorkUnitId — ExecutionSessionStatus
+  // (the field above) is a human-initiated pause/resume and is never touched by a Host restart,
+  // so a session can read "Active" while the scheduler has actually parked work underneath it
+  // (AwaitingResume/AwaitingFileLease/AwaitingCredentials). Surfaced here so the goal workspace's
+  // pause/resume toolbar can show that instead of a plain, misleading "Pause" button.
+  hasParkedWork?: boolean;
+  parkedReason?: string | null;
+  parkedWorkUnitIds?: string[];
+  // No live agent and nothing parked underneath — most commonly because every child finished
+  // while the orchestrator's registration was cold after a restart, so it was never woken back up
+  // to notice (ReinvokeOrchestratorAsync silently no-ops without resolvable credentials).
+  orchestratorStalled?: boolean;
+  orchestratorProfileId?: string | null;
 }
 
 interface KnownGoodState {
@@ -236,18 +257,19 @@ export class GoalWorkspacePanel {
     if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = undefined; }
   }
 
-  private async sendStrategies(): Promise<void> {
+  /** Public so ModelAgentStudioPanel (via StudioShellPanel) can push a refresh immediately after
+   *  saving profiles/templates/session defaults, instead of waiting for the ~30s poll cadence. */
+  async sendStrategies(): Promise<void> {
     if (!this.configService) { return; }
     const templates = this.configService.getTemplates();
     const profiles = this.configService.getProfiles();
-    const orchModels = new Set(
-      profiles
-        .filter(p => p.domain === 'orchestration' && p.model)
-        .map(p => p.model!)
-    );
     const strategies: Array<{ name: string; orchestrator: string; workers?: { profile: string }[]; disabled?: boolean; tooltip?: string; experimentType?: string }> = [...templates];
 
     // ── Slice 22c — Experiment strategies ──────────────────────────────────
+    // Always offered — the fork-config panel lets the user pick any 2 profiles per run, so
+    // there's nothing to gate up front (previously required 2 domain==='orchestration' profiles
+    // with a model, which just forced a magic-string label onto a choice the panel already makes
+    // freely selectable).
     const experimentStrategies = [
       { name: 'Multi-Model Comparison', experimentType: 'Model' },
       { name: 'Architecture Fork', experimentType: 'Architecture' },
@@ -255,23 +277,16 @@ export class GoalWorkspacePanel {
       { name: 'Product Strategy Fork', experimentType: 'Product' },
     ];
     for (const es of experimentStrategies) {
-      if (es.name === 'Multi-Model Comparison') {
-        if (orchModels.size >= 2) {
-          strategies.push({ name: es.name, orchestrator: '', workers: [], disabled: false, experimentType: es.experimentType });
-        } else {
-          strategies.push({
-            name: '__multi_model__',
-            orchestrator: '',
-            workers: [],
-            disabled: true,
-            tooltip: 'Configure at least 2 orchestrator profiles with different models in Model & Agent Studio.',
-          });
-        }
-      } else {
-        strategies.push({ name: es.name, orchestrator: '', workers: [], disabled: false, experimentType: es.experimentType });
-      }
+      strategies.push({ name: es.name, orchestrator: '', workers: [], disabled: false, experimentType: es.experimentType });
     }
-    void this.panel.webview.postMessage({ type: 'strategies', strategies, profiles: profiles.map(p => ({ id: p.id, label: p.label, domain: p.domain, model: p.model })) });
+    void this.panel.webview.postMessage({
+      type: 'strategies', strategies, profiles: profiles.map(p => ({ id: p.id, label: p.label, domain: p.domain, model: p.model })),
+      // Seed values only — consulted by goalWorkspace.js when a new goal's radios first render.
+      // Not a live binding: once a goal exists, changing the session default must not retroactively
+      // change that goal's already-set values.
+      defaultTaskReviewPolicy: this.configService.getDefaultTaskReviewPolicy(),
+      defaultWorkspaceReviewPolicy: this.configService.getDefaultWorkspaceReviewPolicy(),
+    });
   }
 
   // Slice 12c — live stage badges.
@@ -410,6 +425,28 @@ export class GoalWorkspacePanel {
   private async refreshSessions(): Promise<void> {
     try {
       const sessions = await this.get<ExecutionSession[]>('/studio/sessions');
+
+      // Merge in the scheduler-parked rollup GET /studio/goals already computes (by workUnitId
+      // == rootWorkUnitId) — best-effort, since /studio/goals is a bigger, secondary call and a
+      // failure here shouldn't block the session list itself from showing.
+      try {
+        const goalsResp = await this.get<{ goals: Array<{
+          workUnitId: string; hasParkedWork?: boolean; parkedReason?: string | null; parkedWorkUnitIds?: string[];
+          orchestratorStalled?: boolean; orchestratorProfileId?: string | null;
+        }> }>('/studio/goals');
+        const byWorkUnitId = new Map(goalsResp.goals.map(g => [g.workUnitId, g]));
+        for (const session of sessions) {
+          const goal = byWorkUnitId.get(session.rootWorkUnitId);
+          session.hasParkedWork = goal?.hasParkedWork ?? false;
+          session.parkedReason = goal?.parkedReason ?? null;
+          session.parkedWorkUnitIds = goal?.parkedWorkUnitIds ?? [];
+          session.orchestratorStalled = goal?.orchestratorStalled ?? false;
+          session.orchestratorProfileId = goal?.orchestratorProfileId ?? null;
+        }
+      } catch {
+        // Non-fatal — sessions still render, just without the parked rollup.
+      }
+
       void this.panel.webview.postMessage({
         type: 'sessions', sessions, selectedSessionId: this.selectedSessionId ?? '',
       });
@@ -421,7 +458,16 @@ export class GoalWorkspacePanel {
   private async refreshDecisionTree(sessionId: string): Promise<void> {
     try {
       const workUnits = await this.get<WorkUnit[]>('/studio/sessions/' + sessionId + '/workunits');
-      void this.panel.webview.postMessage({ type: 'tree', sessionId, workUnits });
+      // Same endpoint Activity Center already polls at the same cadence — an inline reviewer
+      // (InlineReviewerService) registers itself here for the duration of its review, agentId
+      // prefixed "reviewer-auto-" (distinct from the scheduler-dispatched reviewer path's
+      // SpawnAsync-generated id, which is already visible via Activity Center on its own). Best-
+      // effort: a failure here shouldn't block the tree itself from rendering.
+      const agents = await this.get<AgentInfo[]>('/studio/agents?all=true').catch(() => [] as AgentInfo[]);
+      const reviewingWorkUnitIds = agents
+        .filter(a => a.status === 'active' && a.agentId.startsWith('reviewer-auto-'))
+        .map(a => a.workUnitId);
+      void this.panel.webview.postMessage({ type: 'tree', sessionId, workUnits, reviewingWorkUnitIds });
     } catch {
       // session may have just been created and not yet visible
     }
@@ -579,7 +625,10 @@ export class GoalWorkspacePanel {
         case 'explorerRun':
           await this.handleRun(
             msg.strategy as string, msg.goal as string,
-            (msg.reviewPolicy as string) || undefined,
+            (msg.taskReviewPolicy as string) || undefined,
+            (msg.workspaceReviewPolicy as string) || undefined,
+            (msg.taskReviewHybridTimeoutMinutes as number) || undefined,
+            (msg.workspaceReviewHybridTimeoutMinutes as number) || undefined,
             !!msg.bypassPromotionBranch,
             (msg.forkConfig as Array<{ profileId: string; constraintHint?: string }>) || [],
             (msg.referenceFiles as Array<{ repositoryId: string; path: string }>) || [],
@@ -639,6 +688,9 @@ export class GoalWorkspacePanel {
         case 'explorerSetAllowAutoRequeue':
           await this.updateOptions({ allowAutoRequeue: msg.value as boolean });
           break;
+        case 'explorerSetUsePromotionBranch':
+          await this.updateOptions({ usePromotionBranch: msg.value as boolean });
+          break;
         case 'explorerSetAllowAgentGitCommits':
           await this.updateOptions({ allowAgentGitCommits: msg.value as boolean });
           break;
@@ -679,6 +731,12 @@ export class GoalWorkspacePanel {
         case 'explorerGoalResume':
           await this.handleGoalResume(msg.goalId as string);
           break;
+        case 'explorerResumeParkedWork':
+          await this.handleResumeParkedWork(Array.isArray(msg.workUnitIds) ? (msg.workUnitIds as string[]) : []);
+          break;
+        case 'explorerReinvokeOrchestrator':
+          await this.handleReinvokeOrchestrator(msg.workUnitId as string, (msg.profileId as string | null) ?? null);
+          break;
         case 'explorerCounterfactualAction':
           await this.handleCounterfactualAction(
             msg.workUnitId as string,
@@ -699,6 +757,74 @@ export class GoalWorkspacePanel {
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: ' + String(err));
     }
+  }
+
+  // Resumes every scheduler item GET /studio/goals flagged as parked (AwaitingResume/
+  // AwaitingFileLease/AwaitingCredentials) under one goal in one click — the goal-level
+  // "Pause"/"Resume" toolbar button drives ExecutionSessionStatus (a human-initiated pause,
+  // never touched by a restart), which is a different concept entirely from these per-task
+  // scheduler parks; this is the action that actually unsticks a goal.
+  private async handleResumeParkedWork(workUnitIds: string[]): Promise<void> {
+    if (workUnitIds.length === 0) { return; }
+    let failures = 0;
+    for (const workUnitId of workUnitIds) {
+      try {
+        await this.resumeWorkUnit(workUnitId);
+      } catch (err) {
+        failures++;
+        void vscode.window.showErrorMessage('NodalMerge: Resume failed for ' + workUnitId + ' — ' + String(err));
+      }
+    }
+    void vscode.window.showInformationMessage(
+      'NodalMerge: Resumed ' + (workUnitIds.length - failures) + '/' + workUnitIds.length + ' parked task(s).',
+    );
+    await this.refreshSessions();
+    if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+  }
+
+  // Manual recovery for a stalled orchestrator (see WorkUnit.orchestratorStalled) — resolves fresh
+  // credentials for whichever profile the orchestrator was originally spawned under (returned by
+  // GET /studio/goals as orchestratorProfileId, itself sourced from the rehydrated routing config)
+  // and calls the reinvoke endpoint, which is guarded server-side against double-spawning a second
+  // live orchestrator over an already-running one.
+  //
+  // orchestratorProfileId is null for any orchestrator spawned before the routing-persistence fix
+  // shipped — there was nowhere to persist a profile id yet, so nothing survived the restart to
+  // look one up from. Rather than fail outright, fall back to asking which profile to use, same as
+  // the Steer & Retry "use new profile" picker elsewhere in this panel.
+  private async handleReinvokeOrchestrator(workUnitId: string, profileId: string | null): Promise<void> {
+    if (!profileId) {
+      const picked = await this.configService?.pickProfile(
+        'No orchestrator profile is on record for this goal (it predates a fix) — pick one to reinvoke with',
+      );
+      if (!picked) { return; } // user cancelled
+      profileId = picked.id;
+    }
+
+    let body: Record<string, string> = { overrideProfileId: profileId };
+    if (this.configService && this.secrets) {
+      const llm = await this.configService.resolveSpawnLlmConfig(profileId, this.secrets, this.lmProxyBaseUrl ?? '');
+      if (llm) {
+        body = {
+          overrideProfileId: profileId,
+          overrideModel: llm.model, overrideBaseUrl: llm.baseUrl,
+          overrideApiKey: llm.apiKey, overrideProvider: llm.provider,
+          overrideCredentialRef: llm.credentialRef,
+        };
+      } else {
+        const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl ?? '');
+        void vscode.window.showWarningMessage('NodalMerge: could not resolve credentials for profile "' + profileId + '" (' + reason + ') — reinvoking without them will likely fail.');
+      }
+    }
+
+    try {
+      await this.post('/studio/workunits/' + workUnitId + '/reinvoke-orchestrator', body);
+      void vscode.window.showInformationMessage('NodalMerge: Orchestrator reinvoked.');
+    } catch (err) {
+      void vscode.window.showErrorMessage('NodalMerge: Reinvoke failed — ' + String(err));
+    }
+    await this.refreshSessions();
+    if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
   }
 
   private async handleGoalPause(goalId: string): Promise<void> {
@@ -787,6 +913,53 @@ export class GoalWorkspacePanel {
       return;
     }
 
+    if (action === 'continueDeadLetter') {
+      // Only valid for a MaxIterationsExceeded failure — resumes this same work unit with its
+      // reconstructed prior conversation and a fresh iteration budget (POST /continue takes just
+      // the dead-letter entryId, not workUnitId, so resolve it via the by-work-unit lookup first,
+      // same as steerDeadLetterRetry above). Any other failure kind gets a NotApplicable/400 from
+      // the server, surfaced here as a plain error rather than pre-checking the kind client-side.
+      let entry: { entryId: string; profileId: string } | undefined;
+      try {
+        entry = await this.get<{ entryId: string; profileId: string }>('/studio/dead-letter/by-work-unit/' + workUnitId);
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: Could not load dead-letter entry — ' + String(err));
+        return;
+      }
+
+      // Always try to resupply from the entry's own original profile — this is what makes
+      // Continue actually work after a Host restart wiped the shared credential cache, instead of
+      // silently re-dead-lettering with "missing LLM credentials" the moment it tries the LLM
+      // call. Best-effort: if resolution fails, fall through with no override and let the
+      // server's own entry/cache/registry fallback chain try (same behavior as before this existed).
+      let continueBody: Record<string, string> = {};
+      if (entry.profileId && this.configService && this.secrets) {
+        const llm = await this.configService.resolveSpawnLlmConfig(entry.profileId, this.secrets, this.lmProxyBaseUrl ?? '');
+        if (llm) {
+          continueBody = {
+            overrideModel: llm.model, overrideBaseUrl: llm.baseUrl,
+            overrideApiKey: llm.apiKey, overrideProvider: llm.provider,
+            overrideCredentialRef: llm.credentialRef,
+          };
+        }
+      }
+
+      try {
+        const result = await this.post<{ outcome?: string; message?: string }>(
+          '/studio/dead-letter/' + entry.entryId + '/continue', continueBody,
+        );
+        void vscode.window.showInformationMessage(
+          result?.outcome === 'Parked'
+            ? 'NodalMerge: ' + (result.message ?? 'Parked — waiting on a file lease or clarification.')
+            : 'NodalMerge: Continue completed successfully.',
+        );
+        if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+      } catch (err) {
+        void vscode.window.showErrorMessage('NodalMerge: Continue failed — ' + String(err));
+      }
+      return;
+    }
+
     if (action === 'steerForkFromNode') {
       const goal = await vscode.window.showInputBox({
         prompt: 'Goal for the fork from this node',
@@ -822,24 +995,53 @@ export class GoalWorkspacePanel {
   }
 
   // Phase Y — Steer & Retry with credential override from the Decision Lens inline UI.
+  //
+  // The webview itself can never hold a real API key (it has no SecretStorage access), so
+  // overrideModel/overrideBaseUrl/overrideApiKey/overrideProvider coming from msg are NOT trusted
+  // here — msg.overrideApiKey is always blank by construction (goalWorkspace.js only ever fills
+  // in overrideProfileId, from a client-side profile list that never carries the real secret).
+  // Instead: resolve the actual credentials host-side via configService/secrets, for whichever
+  // profile is in play (the one the user picked, or — if they didn't pick one — the entry's own
+  // original profile, which is exactly the resupply a restart-cold cache needs). This is the same
+  // "server never receives the key from an untrusted source" pattern used for spawn/resume.
   private async handleSteeredRetrySend(msg: Record<string, unknown>): Promise<void> {
     const workUnitId = msg.workUnitId as string;
     const steeringContext = (msg.steeringContext as string) || '';
-    const overrideModel = (msg.overrideModel as string) || undefined;
-    const overrideBaseUrl = (msg.overrideBaseUrl as string) || undefined;
-    const overrideApiKey = (msg.overrideApiKey as string) || undefined;
-    const overrideProvider = (msg.overrideProvider as string) || undefined;
     const overrideProfileId = (msg.overrideProfileId as string) || undefined;
 
-    // Load the dead-letter entry to get the entryId
-    let entry: { entryId: string; reason: string; attemptCount: number } | undefined;
+    // Load the dead-letter entry to get the entryId and its original profileId.
+    let entry: { entryId: string; reason: string; attemptCount: number; profileId: string } | undefined;
     try {
-      entry = await this.get<{ entryId: string; reason: string; attemptCount: number }>(
+      entry = await this.get<{ entryId: string; reason: string; attemptCount: number; profileId: string }>(
         '/studio/dead-letter/by-work-unit/' + workUnitId,
       );
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: Could not load dead-letter entry — ' + String(err));
       return;
+    }
+
+    let overrideModel: string | undefined;
+    let overrideBaseUrl: string | undefined;
+    let overrideApiKey: string | undefined;
+    let overrideProvider: string | undefined;
+    let overrideCredentialRef: string | undefined;
+    const targetProfileId = overrideProfileId || entry.profileId;
+    if (targetProfileId && this.configService && this.secrets) {
+      const llm = await this.configService.resolveSpawnLlmConfig(targetProfileId, this.secrets, this.lmProxyBaseUrl ?? '');
+      if (llm) {
+        overrideModel = llm.model;
+        overrideBaseUrl = llm.baseUrl;
+        overrideApiKey = llm.apiKey;
+        overrideProvider = llm.provider;
+        overrideCredentialRef = llm.credentialRef;
+      } else if (overrideProfileId) {
+        // Only surface this as an error when the user explicitly picked a profile — if it's just
+        // the entry's original profile that can't resolve, fall through silently and let the
+        // dead-letter entry's own captured credentials (or shared cache) try instead, same as
+        // before this resolution existed.
+        const reason = await this.configService.describeMissingCredentials(targetProfileId, this.secrets, this.lmProxyBaseUrl ?? '');
+        void vscode.window.showWarningMessage('NodalMerge: could not resolve credentials for the selected profile (' + reason + ') — retrying without an override.');
+      }
     }
 
     try {
@@ -850,6 +1052,7 @@ export class GoalWorkspacePanel {
         overrideApiKey,
         overrideProvider,
         overrideProfileId,
+        overrideCredentialRef,
       });
       void vscode.window.showInformationMessage(
         'NodalMerge: Retrying with steering' + (overrideProfileId ? ' using profile ' + overrideProfileId : '') + '.');
@@ -908,7 +1111,10 @@ export class GoalWorkspacePanel {
   }
 
   private async handleRun(
-    strategy: string, goal: string, reviewPolicy?: string, bypassPromotionBranch?: boolean,
+    strategy: string, goal: string,
+    taskReviewPolicy?: string, workspaceReviewPolicy?: string,
+    taskReviewHybridTimeoutMinutes?: number, workspaceReviewHybridTimeoutMinutes?: number,
+    bypassPromotionBranch?: boolean,
     forkConfig?: Array<{ profileId: string; constraintHint?: string }>,
     referenceFiles?: Array<{ repositoryId: string; path: string }>,
   ): Promise<void> {
@@ -939,6 +1145,12 @@ export class GoalWorkspacePanel {
         return;
       }
       try {
+        // Slice 22c fix — without a repositoryPath, forks never receive their own RepositoryId,
+        // and WorkspaceReviewScope.AppliesToRealRepo (nodalmerge-studio/src/NodalMerge.Studio.Merge/
+        // WorkspaceReviewScope.cs) only allows disk write-back for a top-level goal or a work unit
+        // explicitly linked to its own repo — a fork (which always has a ParentWorkUnitId) needs the
+        // latter. Same mechanism Multi-Model Comparison's children already use below.
+        const repositoryPath = resolveRepositoryPath();
         const result = await this.post<{ experimentId: string; parentWorkUnitId: string; forkWorkUnitIds: string[] }>(
           '/studio/experiments',
           {
@@ -946,7 +1158,11 @@ export class GoalWorkspacePanel {
             owner: 'user',
             forkType: EXPERIMENT_FORK_TYPES[strategy],
             forks: forks.map(f => ({ profileId: f.profileId || undefined, constraintText: f.constraintHint || undefined })),
-            ...(reviewPolicy ? { reviewPolicy } : {}),
+            ...(taskReviewPolicy ? { taskReviewPolicy } : {}),
+            ...(workspaceReviewPolicy ? { workspaceReviewPolicy } : {}),
+            ...(taskReviewHybridTimeoutMinutes ? { taskReviewHybridTimeoutMinutes } : {}),
+            ...(workspaceReviewHybridTimeoutMinutes ? { workspaceReviewHybridTimeoutMinutes } : {}),
+            ...(repositoryPath ? { repositoryPath } : {}),
           },
         );
         const session = await this.post<ExecutionSession>('/studio/sessions', {
@@ -976,15 +1192,21 @@ export class GoalWorkspacePanel {
         return;
       }
       const profiles = this.configService.getProfiles();
-      const orchProfiles = profiles.filter(p => p.domain === 'orchestration' && p.model);
-      if (orchProfiles.length < 2) {
+      // Use whatever the user picked in the fork-config panel (any 2 profiles, any domain) rather
+      // than forcing a domain==='orchestration' filter — the panel already lets the user choose
+      // freely, so this just honors that choice instead of silently overriding it with the first
+      // two profiles matching a magic-string label.
+      const chosenProfiles = (forkConfig ?? [])
+        .map(f => profiles.find(p => p.id === f.profileId))
+        .filter((p): p is NonNullable<typeof p> => !!p && !!p.model);
+      if (chosenProfiles.length < 2) {
         void vscode.window.showErrorMessage(
-          'Multi-Model Comparison requires at least 2 orchestrator profiles with different models.',
+          'Multi-Model Comparison requires 2 profiles with a model set — pick them in the fork panel above.',
         );
         return;
       }
-      const modelAProfile = orchProfiles[0];
-      const modelBProfile = orchProfiles[1];
+      const modelAProfile = chosenProfiles[0];
+      const modelBProfile = chosenProfiles[1];
 
       try {
         const [cfgA, cfgB] = await Promise.all([
@@ -1005,7 +1227,10 @@ export class GoalWorkspacePanel {
 
         const repositoryPath = resolveRepositoryPath();
         const reviewAndTarget = {
-          ...(reviewPolicy ? { reviewPolicy } : {}),
+          ...(taskReviewPolicy ? { taskReviewPolicy } : {}),
+          ...(workspaceReviewPolicy ? { workspaceReviewPolicy } : {}),
+          ...(taskReviewHybridTimeoutMinutes ? { taskReviewHybridTimeoutMinutes } : {}),
+          ...(workspaceReviewHybridTimeoutMinutes ? { workspaceReviewHybridTimeoutMinutes } : {}),
           bypassPromotionBranch: !!bypassPromotionBranch,
         };
         // Create a parent work unit to hold both model runs
@@ -1117,7 +1342,10 @@ export class GoalWorkspacePanel {
       const rootWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
         goal,
         owner: template.orchestrator,
-        ...(reviewPolicy ? { reviewPolicy } : {}),
+        ...(taskReviewPolicy ? { taskReviewPolicy } : {}),
+        ...(workspaceReviewPolicy ? { workspaceReviewPolicy } : {}),
+        ...(taskReviewHybridTimeoutMinutes ? { taskReviewHybridTimeoutMinutes } : {}),
+        ...(workspaceReviewHybridTimeoutMinutes ? { workspaceReviewHybridTimeoutMinutes } : {}),
         bypassPromotionBranch: !!bypassPromotionBranch,
         ...(repositoryPath ? { repositoryPath } : {}),
         ...referenceFilesPatch,
@@ -1147,7 +1375,65 @@ export class GoalWorkspacePanel {
     }
   }
 
+  // Resolves fresh credentials for whichever profile a parked scheduler item was dispatched
+  // under (best-effort — falls through with no resupply if unresolvable) and force-clears
+  // whatever park flag(s) are set (AwaitingResume/AwaitingFileLease/AwaitingCredentials), via
+  // POST /studio/scheduler/{workUnitId}/resume. Shared by the single-node Resume button and the
+  // goal-level "Resume parked work" action so both go through the exact same resolution.
+  private async resumeWorkUnit(workUnitId: string): Promise<void> {
+    let body: Record<string, string> = {};
+    if (this.configService && this.secrets) {
+      // The scheduler queue item (not WorkUnit, which doesn't carry profileId) says which
+      // profile this task was dispatched under — re-fetch it here rather than threading it
+      // through the click handler, since resume is a rare, human-initiated action.
+      const pending = await this.get<Array<{ workUnitId: string; profileId: string }>>('/studio/scheduler/pending').catch(() => []);
+      const item = pending?.find(i => i.workUnitId === workUnitId);
+      if (item?.profileId) {
+        const profile = this.configService.getProfiles().find(p => p.id === item.profileId);
+        if (profile) {
+          const llm = await this.configService.resolveSpawnLlmConfig(profile.id, this.secrets, this.lmProxyBaseUrl ?? '');
+          if (llm) {
+            body = { ...llm };
+          } else {
+            const reason = await this.configService.describeMissingCredentials(profile.id, this.secrets, this.lmProxyBaseUrl ?? '');
+            void vscode.window.showWarningMessage('NodalMerge: could not resolve credentials to resupply for ' + workUnitId + ' (' + reason + ') — resuming without them.');
+          }
+        }
+      }
+    }
+    await this.post('/studio/scheduler/' + workUnitId + '/resume', body);
+  }
+
   private async handleWorkUnitAction(action: string, workUnitId: string): Promise<void> {
+    if (action === 'resumeWorker') {
+      // AwaitingFileLease usually clears itself once the lease holder releases — but the flag and
+      // the file lease's own state are tracked independently and can drift (e.g. after the
+      // lease-scoping change, or the holder getting force-released some other way), leaving it
+      // stuck with nothing actually blocking it. Resume force-clears every park flag
+      // unconditionally; if a wait is still genuinely real, the worker just re-parks on retry.
+      await this.resumeWorkUnit(workUnitId);
+      void vscode.window.showInformationMessage('NodalMerge: Resumed work unit.');
+      if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+      return;
+    }
+
+    if (action === 'spawnTask') {
+      // A plain sibling task under this node — same "create the work unit and let the parent's
+      // next fan-out pass pick it up" mechanism Fork Hypothesis already uses below (POST
+      // /studio/workunits creates it; nothing here calls scheduler.enqueue directly, so profile
+      // selection stays on the normal Execute-stage-only fan-out path instead of letting this
+      // action hand out an arbitrary/wrong-stage profile the way manual scheduler.enqueue can).
+      const goal = await vscode.window.showInputBox({
+        prompt: 'Goal for the new task', ignoreFocusOut: true,
+      });
+      if (!goal) { return; }
+
+      await this.post('/studio/workunits', { goal, owner: 'studio', parentWorkUnitId: workUnitId });
+      void vscode.window.showInformationMessage('NodalMerge: Spawned new task — will be picked up on the next fan-out pass.');
+      if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
+      return;
+    }
+
     if (action === 'forkHypothesis' || action === 'split') {
       // Slice 18e — fork type selector before goal collection
       const forkTypes: Array<{ label: string; description: string }> = [
@@ -1357,7 +1643,11 @@ const GW_CSS = `
     --nm-btn-hover:  var(--vscode-button-hoverBackground);
     --nm-input-bg:   var(--vscode-input-background, #3c3c3c);
     --nm-input-fg:   var(--vscode-input-foreground, #ccc);
-    --nm-input-bdr:  var(--vscode-input-border, #555);
+    /* Many themes leave --vscode-input-border unset (flat input design) or set it equal to the
+       background, either of which reads as "no separation" against the surrounding UI. Derive a
+       subtle border from the foreground color instead, so there's always some visible contrast
+       regardless of what the active theme does with inputBorder. */
+    --nm-input-bdr:  color-mix(in srgb, var(--nm-fg) 25%, transparent);
     --nm-font:       var(--vscode-font-family);
     --nm-mono:       var(--vscode-editor-font-family, monospace);
     --nm-size:       var(--vscode-font-size, 13px);
@@ -1371,7 +1661,7 @@ const GW_CSS = `
   :scope { display: flex; flex-direction: column; height: 100%; }
   .gw-topbar {
     flex-shrink: 0; padding: 10px 14px; border-bottom: 1px solid var(--nm-border);
-    display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end;
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start;
     background: var(--nm-section-bg);
   }
   .gw-field { display: flex; flex-direction: column; gap: 2px; }
@@ -1380,7 +1670,7 @@ const GW_CSS = `
     background: var(--nm-input-bg); color: var(--nm-input-fg); border: 1px solid var(--nm-input-bdr);
     border-radius: 3px; padding: 4px 6px; font-family: var(--nm-font); font-size: 0.9em;
   }
-  textarea#gw-goal { width: 320px; height: 32px; min-height: 32px; resize: vertical; }
+  textarea#gw-goal { width: 320px; height: 48px; min-height: 48px; resize: vertical; }
   button {
     background: var(--nm-btn); color: var(--nm-btn-fg); border: none; border-radius: 3px;
     padding: 5px 14px; font-size: 0.88em; cursor: pointer; font-family: var(--nm-font);
@@ -1395,11 +1685,19 @@ const GW_CSS = `
   /* Slice 21c — inline Review/Target controls */
   .gw-options-row {
     flex-shrink: 0; padding: 6px 14px; border-bottom: 1px solid var(--nm-border);
-    display: flex; gap: 18px; flex-wrap: wrap; align-items: center; font-size: 0.82em;
+    display: flex; gap: 18px; flex-wrap: wrap; align-items: flex-start; font-size: 0.82em;
   }
+  /* Workspace Review governs applying into the real repo; Task Review (governs workers merging
+     into the session) is stacked directly beneath it with an indent + tree connector, since a
+     goal's tasks are children of that same goal's workspace. */
+  .gw-review-stack { display: flex; flex-direction: column; gap: 6px; }
+  .gw-review-nested { margin-left: 10px; }
+  .gw-review-connector { opacity: 0.45; font-family: var(--vscode-editor-font-family, monospace); margin-right: 2px; }
   .gw-radio-group { display: flex; gap: 12px; align-items: center; }
   .gw-radio-group-label { opacity: 0.6; text-transform: uppercase; font-size: 0.72em; letter-spacing: 0.05em; margin-right: 4px; }
   .gw-radio-option { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  .gw-hybrid-minutes { width: 48px; padding: 2px 4px; font-size: 0.85em; }
+  .hidden { display: none; }
   .gw-target-row { display: none; }
   .gw-target-row.visible { display: flex; }
   .gw-body { flex: 1; display: flex; overflow: hidden; min-height: 0; }
@@ -1418,7 +1716,15 @@ const GW_CSS = `
   .dn-node:hover { background: color-mix(in srgb, var(--nm-border) 30%, transparent); }
   .dn-node.selected { border-color: var(--nm-info); background: color-mix(in srgb, var(--nm-info) 12%, transparent); }
   .dn-title { font-weight: 600; font-size: 0.92em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .dn-meta { display: flex; gap: 6px; margin-top: 3px; flex-wrap: wrap; }
+  .dn-meta { display: flex; gap: 6px; margin-top: 3px; flex-wrap: wrap; align-items: center; }
+  /* Live "agent reviewing" indicator — same visual language as Activity Center's own .pulse. */
+  .pulse {
+    display: inline-block;
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--nm-success);
+    animation: dn-pulse 2s ease-in-out infinite;
+  }
+  @keyframes dn-pulse { 0%,100%{opacity:1} 50%{opacity:0.25} }
   .badge {
     display: inline-block; border-radius: 9px; padding: 1px 8px; font-size: 0.74em; white-space: nowrap;
     background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);
@@ -1428,6 +1734,7 @@ const GW_CSS = `
   .badge.reviewing, .badge.proposed { background: var(--nm-info); color: #fff; }
   .badge.executing, .badge.queued, .badge.retrying { background: var(--nm-warn); color: #000; }
   .badge.blocked { background: var(--nm-error); color: #fff; }
+  .badge.paused { background: transparent; border: 1px solid var(--nm-warn); color: var(--nm-warn); }
   .badge.stage { background: transparent; border: 1px solid var(--nm-border); color: var(--nm-fg); opacity: 0.8; }
   .badge.stage.plan { background: var(--nm-info); color: #fff; border-color: transparent; opacity: 1; }
   .badge.stage.execute { background: var(--nm-warn); color: #000; border-color: transparent; opacity: 1; }
@@ -1436,6 +1743,14 @@ const GW_CSS = `
   .tl-item { border: 1px solid var(--nm-border); border-radius: 4px; margin-bottom: 6px; padding: 6px 10px; cursor: default; }
   .tl-item.clickable { cursor: pointer; }
   .tl-item.clickable:hover { background: color-mix(in srgb, var(--nm-border) 25%, transparent); }
+  /* Decision Candidates (MergeProposal rows — the only [data-proposal] items) are a step that
+     needs the user's action, not just a log entry, so they get a persistent accent even before
+     selection. .tl-selected is the actively-open one (auto-picked on node select, or last clicked). */
+  .tl-item[data-proposal] { border-left: 3px solid var(--nm-info); }
+  .tl-item.tl-selected {
+    border-color: var(--nm-info);
+    background: color-mix(in srgb, var(--nm-info) 14%, transparent);
+  }
   .tl-kind { font-size: 0.7em; text-transform: uppercase; opacity: 0.5; letter-spacing: 0.05em; }
   .tl-title { font-size: 0.9em; margin-top: 2px; }
   .tl-time { font-size: 0.72em; opacity: 0.4; float: right; }
@@ -1595,6 +1910,10 @@ const GW_HTML = `
         <select id="gw-session"><option value="">(no exploration)</option></select>
         <button id="gw-session-pause" class="ghost" title="Pause this exploration" style="display:none;color:var(--nm-warn);border-color:var(--nm-warn);padding:3px 8px;font-size:0.78em">&#x23F8; Pause</button>
         <button id="gw-session-resume" class="ghost" title="Resume this exploration" style="display:none;padding:3px 8px;font-size:0.78em">&#x25B6; Resume</button>
+        <span id="gw-session-parked-badge" class="badge paused" style="display:none"></span>
+        <button id="gw-session-resume-parked" class="ghost" style="display:none;color:var(--nm-warn);border-color:var(--nm-warn);padding:3px 8px;font-size:0.78em">&#x21BA; Resume parked work</button>
+        <span id="gw-session-stalled-badge" class="badge paused" style="display:none">stalled</span>
+        <button id="gw-session-reinvoke" class="ghost" title="No orchestrator is running for this goal and nothing is parked — click to wake it back up" style="display:none;color:var(--nm-warn);border-color:var(--nm-warn);padding:3px 8px;font-size:0.78em">&#x21BA; Reinvoke Orchestrator</button>
       </div>
     </div>
     <div class="gw-field">
@@ -1605,15 +1924,26 @@ const GW_HTML = `
       <label>Goal</label>
       <textarea id="gw-goal" placeholder="Describe a goal — e.g. Add dark mode support across the settings UI"></textarea>
     </div>
-    <button id="gw-run">&#x25B6; Run</button>
-    <button id="gw-settings-btn" class="ghost" title="Exploration Settings">&#9881;</button>
+    <button id="gw-run" style="align-self:flex-end">&#x25B6; Run</button>
+    <button id="gw-settings-btn" class="ghost" title="Exploration Settings" style="align-self:flex-end">&#9881;</button>
   </div>
   <div class="gw-options-row">
-    <div class="gw-radio-group">
-      <span class="gw-radio-group-label">Review</span>
-      <label class="gw-radio-option"><input type="radio" name="gw-review-policy" value="HumanRequired" checked/> Human Required</label>
-      <label class="gw-radio-option"><input type="radio" name="gw-review-policy" value="AgentApproval"/> Agent Approval</label>
-      <label class="gw-radio-option"><input type="radio" name="gw-review-policy" value="Hybrid"/> Hybrid (5 min)</label>
+    <div class="gw-review-stack">
+      <div class="gw-radio-group" title="Controls whether session changes are automatically applied to your workspace">
+        <span class="gw-radio-group-label">Workspace Review</span>
+        <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="HumanRequired" checked/> Human Required</label>
+        <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="AgentApproval"/> Agent Approval</label>
+        <label class="gw-radio-option"><input type="radio" name="gw-workspace-review-policy" value="Hybrid"/> Hybrid</label>
+        <input type="text" id="gw-workspace-review-hybrid-minutes" class="gw-hybrid-minutes hidden" placeholder="5" title="Minutes before auto-apply">
+      </div>
+      <div class="gw-radio-group gw-review-nested" title="Automatically integrates worker proposals into the agent session">
+        <span class="gw-review-connector" aria-hidden="true">&#x2514;</span>
+        <span class="gw-radio-group-label">Task Review</span>
+        <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="HumanRequired" checked/> Human Required</label>
+        <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="AgentApproval"/> Agent Approval</label>
+        <label class="gw-radio-option"><input type="radio" name="gw-task-review-policy" value="Hybrid"/> Hybrid</label>
+        <input type="text" id="gw-task-review-hybrid-minutes" class="gw-hybrid-minutes hidden" placeholder="5" title="Minutes before auto-merge">
+      </div>
     </div>
     <div class="gw-radio-group gw-target-row" id="gw-target-row">
       <span class="gw-radio-group-label">Target</span>
@@ -1675,6 +2005,10 @@ const GW_HTML = `
     <label class="gw-settings-row">
       <input type="checkbox" id="gw-allow-auto-requeue-checkbox"/>
       Auto-requeue losing work unit when all merge strategies fail
+    </label>
+    <label class="gw-settings-row">
+      <input type="checkbox" id="gw-use-promotion-branch-checkbox"/>
+      Stage AgentApproval/Hybrid goals on a shared candidate branch before promoting to main
     </label>
     <label class="gw-settings-row" style="margin-top:8px;border-top:1px solid var(--nm-border);padding-top:8px">
       Git Integration <span style="font-size:0.8em;color:var(--nm-text-muted)">(opt-in, use with care)</span>

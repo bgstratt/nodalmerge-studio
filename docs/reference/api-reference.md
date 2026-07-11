@@ -9,16 +9,29 @@ format.
 
 Ground truth as of this writing (recounted directly against source — the tables below had drifted
 from these totals before this pass, and still don't enumerate every tool 1:1; treat the tables as
-illustrative of shape/category, not an exhaustive per-tool listing): **117 `nm_v1_*` MCP tools**
-(`McpToolNames.All`), **72 of them** dispatched in-process to autonomous agents
-(`McpToolDispatcher.cs`'s switch cases), **14 `nms_v1_*` external-caller tools**
-(`McpServerToolNames`), and **187 REST routes** (`app.Map*` calls in `StudioRestEndpoints.cs`).
+illustrative of shape/category, not an exhaustive per-tool listing): **~117 `nm_v1_*` MCP tools**
+(`McpToolNames.All` — one fewer than earlier counts of this doc, after `nm_v1_replay_range` was
+removed as unused), **72 of them** dispatched in-process to autonomous agents
+(`McpToolDispatcher.cs`'s switch cases), **15 `nms_v1_*` external-caller tools**
+(`McpServerToolNames`), and a small handful fewer REST routes (`app.Map*` calls in
+`StudioRestEndpoints.cs`) after removing `/studio/replay/timeline[/{branchId}]` and
+`/studio/replay/range/{branchId}` — see the Replay section below.
+
+**The `nm_v1_*`/`nms_v1_*` split is now enforced at MCP registration, not just by naming
+convention.** `NodalMerge.Studio.McpServer/ServiceCollectionExtensions.cs` used to register the
+entire assembly (`WithToolsFromAssembly`) onto the external HTTP MCP endpoint
+(`app.MapMcp("/mcp")`) — every one of the 116 internal `nm_v1_*` tools was technically reachable
+by an external caller, contradicting the "internal-only" framing below. It now registers only the
+5 `External*Tools` classes (`WithTools<T>()` per class), so an external MCP client genuinely sees
+just the 15 `nms_v1_*` tools. `nm_v1_replay_range` was also removed outright (with its REST
+counterparts, `GET /studio/replay/timeline[/{branchId}]` and `GET /studio/replay/range/{branchId}`
+— see the Replay section below) after confirming it had no caller anywhere, internal or external.
 
 ---
 
 ## External Caller Surface (`nms_v1_*`)
 
-These 14 tools are the recommended entry point for external MCP clients — Claude Code, Cursor,
+These 15 tools are the recommended entry point for external MCP clients — Claude Code, Cursor,
 scripts, CI agents. They cover the full human-in-the-loop lifecycle at a goal-centric level,
 without requiring knowledge of work units, branches, or the internal DAG.
 
@@ -26,13 +39,14 @@ without requiring knowledge of work units, branches, or the internal DAG.
 > marks the Studio-level abstraction layer. Both namespaces share the same host and the same error
 > envelope format.
 
-### Goal management (7)
+### Goal management (8)
 | Tool | Purpose |
 |---|---|
 | `nms_v1_goal_run` | Start a new goal — creates a work unit, execution session, and enqueues the orchestrator in one call. Returns `goalId` and `sessionId`. |
 | `nms_v1_goal_list` | List all goals with current status. Use to discover `goalId` values. |
 | `nms_v1_goal_status` | Detailed status for one goal, including pending clarifications, an unresolved failure if the goal is dead-lettered (with which recovery actions currently apply), and session state. |
 | `nms_v1_goal_cancel` | Cancel a goal and its entire subtree. Completed or merged work units are left untouched. |
+| `nms_v1_goal_requeue` | Un-cancel a goal and resume it — the inverse of `nms_v1_goal_cancel`, mirroring Decision Convergence's Unreject-and-Revise for a Rejected proposal. A leaf work unit is re-queued for a worker; a fan-out parent re-attempts reconciliation. Optional `overrideModel`/`overrideBaseUrl`/`overrideApiKey`/`overrideProvider`/`overrideProfileId`/`overrideCredentialRef` resupply LLM credentials (a cancel/requeue cycle commonly spans a Host restart, which wipes the in-memory credential cache the inline reviewer and re-enqueued workers depend on) without spawning a new orchestrator loop. |
 | `nms_v1_goal_pause` | Pause a goal and all its active agents. Agents stop gracefully; goal can be resumed. |
 | `nms_v1_goal_resume` | Resume a paused goal. Optionally inject a steering message to redirect the next agent run. |
 | `nms_v1_goal_recover` | Recover a dead-lettered goal — `action` is one of `retry`, `retry_with_context`, `continue` (`MaxIterationsExceeded` only), or `replan`. Resolves the goal's own latest dead-letter entry internally; no entry ID needed. |
@@ -157,10 +171,9 @@ same capability through `nms_v1_goal_status` (surfaces an unresolved failure and
 apply) and `nms_v1_goal_recover` (resolves the goal's own latest entry internally — no entry ID
 needed) instead of these detailed, entry-ID-based tools.
 
-### Replay (3)
+### Replay (2)
 | Tool | Dispatched | Purpose |
 |---|---|---|
-| `nm_v1_replay_range` | — | Inspect a history range for a branch |
 | `nm_v1_replay_rollback` | — | Roll back a branch to a known-good state |
 | `nm_v1_replay_inspect` | — | Human-friendly replay summary |
 
@@ -304,6 +317,7 @@ segment can never match.
 - `GET /studio/workunits/{id}/conflict-report` — merge conflict report (Reviewing status)
 - `GET /studio/workunits/{id}/proposal-dag` — proposal/branch/reconciliation DAG
 - `POST /studio/workunits/{id}/cancel` — cancel a work unit
+- `POST /studio/workunits/{id}/requeue` — un-cancel a work unit and resume it (leaf → re-queued for a worker; fan-out parent → re-attempts reconciliation). Body: optional `notes` plus `overrideModel`/`overrideBaseUrl`/`overrideApiKey`/`overrideProvider`/`overrideProfileId`/`overrideCredentialRef` to resupply LLM credentials
 - `POST /studio/stop-all` — stop all active agents/work units
 
 ### Tasks
@@ -387,7 +401,11 @@ segment can never match.
 - `GET /studio/snapshots/{agentId}` · `GET /studio/snapshots/{agentId}/compare/{otherAgentId}`
 
 ### Replay
-- `GET /studio/replay/timeline` (+ `/{branchId}` variant) · `GET /studio/replay/range/{branchId}` · `POST /studio/replay/rollback/{branchId}` · `GET /studio/replay/inspect/{branchId}`
+- `POST /studio/replay/rollback/{branchId}` · `GET /studio/replay/inspect/{branchId}`
+- `GET /studio/replay/timeline`, `/{branchId}`, and `GET /studio/replay/range/{branchId}` were
+  removed (plans/pathways-workspace-history.md) — confirmed unused by the extension, in-process
+  agents, and external MCP callers (their MCP counterpart, `nm_v1_replay_range`, was removed too).
+  Pathways renders `GET /studio/projections/WorkspacePathways` instead.
 
 ### Goals / Decisions / Evidence / Trajectory / Hypotheses / Reasoning / Models
 - `GET/POST /studio/goals`
@@ -425,11 +443,18 @@ auto-enqueue both call this).
 `state/markKnownGood`, `state/knownGood/{branchId}`, `state/{stateId}/fork`,
 `replay/rollback/{branchId}`, `agent-profiles` CRUD, `options`, `sessions` CRUD,
 `dead-letter/{id}/retry`, `merges/compare`, `merges/{id}/constituents`,
-`merges/{id}/restore-workspace`, `hypotheses/fork`, `experiments` (create/list/get),
-`steering/redirect`, `steering/fork-from-node`, `counterfactuals` (create),
-`projections/{DecisionContext,CounterfactualComparison,ReasoningCommitGraph}`,
-`evidence` (list), `replay/timeline`, `workunits/{id}/orchestration-events`,
-`workunits/{id}/conflict-report`, `workunits/{id}/artifacts`.
+`merges/{id}/restore-workspace`, `merges/{id}/file-changes`, `hypotheses/fork`,
+`experiments` (create/list/get), `steering/redirect`, `steering/fork-from-node`,
+`counterfactuals` (create — Pathways "Branch from here (new steering)"),
+`projections/{DecisionContext,CounterfactualComparison,ReasoningCommitGraph,WorkspacePathways}`,
+`projections/{workUnitId}/materialize` (Pathways branch-current materialize),
+`repository-snapshots/{snapshotId}/materialize` (Pathways point-in-time materialize —
+`targetPath` required; refuses to write to the live repo),
+`projections/known-good/{a}/diff/{b}` (Pathways external-update file diff),
+`workspace-summary` + `workspace/switch` (Pathways "Sync now"),
+`evidence` (list), `workunits/{id}/orchestration-events`,
+`workunits/{id}/conversation-log`, `workunits/{id}/conflict-report`,
+`workunits/{id}/artifacts`.
 
 ### Used by agents only (via MCP, in-process) — no extension UI button calls these directly
 `/studio/workspace/build|test|exec|run|run/stop?branchId=...` (the extension's "Require build/test before proposal"
@@ -469,11 +494,6 @@ branches implicitly; it never lists raw branches).
     for patterns.
   - `nm_v1_goal_list` falls back to returning work units when the goal store is empty, so it is safe
     to call even in workspaces where goals were created via `POST /studio/workunits` alone.
-- **`GET /studio/replay/range/{branchId}`, `GET /studio/replay/inspect/{branchId}`,
-  `GET /studio/replay/timeline/{branchId}`** — the Trajectory Replay panel only calls the bare
-  (no-branchId) `GET /studio/replay/timeline`; these per-branch read variants are unused by the UI
-  (and `replay_range`/`replay_inspect` MCP tools aren't dispatched to agents either).
-  `POST /studio/replay/rollback/{branchId}` is now used — see above.
 - **`GET /studio/nodes`, `GET /studio/policies`** — debug/introspection endpoints.
 
 **Net read:** nothing here is *broken* — these are either deliberate human-only safety boundaries

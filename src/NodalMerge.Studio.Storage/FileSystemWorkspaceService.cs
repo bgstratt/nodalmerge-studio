@@ -148,7 +148,22 @@ internal sealed class FileSystemWorkspaceService(
             Directory.CreateDirectory(dir);
 
         await EmitWriteOpAsync(fullPath, relativePath, contentBytes, ct).ConfigureAwait(false);
-        await File.WriteAllBytesAsync(fullPath, contentBytes, ct).ConfigureAwait(false);
+        // Concurrent actors legitimately touch the same branch file (a background reconciliation
+        // agent refreshing/copying while a human's apply lands, sibling merges into candidate),
+        // and Windows write handles are exclusive — a moment of overlap surfaces as a transient
+        // IOException sharing violation, not a real error. Bounded retry; last attempt rethrows.
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await File.WriteAllBytesAsync(fullPath, contentBytes, ct).ConfigureAwait(false);
+                return;
+            }
+            catch (IOException) when (attempt < 4)
+            {
+                await Task.Delay(25 * (attempt + 1), ct).ConfigureAwait(false);
+            }
+        }
     }
 
     public async Task<WorkspaceReplaceResult> ReplaceAsync(

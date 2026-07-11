@@ -33,7 +33,7 @@ public class AutonomousReviewTests
         var wu = await orchestratorSvc.CreateWorkUnitAsync(
             goal: "Build a hello world feature",
             owner: "integration-test",
-            reviewPolicy: ReviewPolicy.AgentApproval);
+            workspaceReviewPolicy: ReviewPolicy.AgentApproval);
 
         await agentControl.SpawnAsync(
             agentType: "orchestrator",
@@ -64,7 +64,7 @@ public class AutonomousReviewTests
         var wu = await orchestratorSvc.CreateWorkUnitAsync(
             goal: "Build a hello world feature",
             owner: "integration-test",
-            reviewPolicy: ReviewPolicy.AgentApproval);
+            workspaceReviewPolicy: ReviewPolicy.AgentApproval);
 
         await agentControl.SpawnAsync(
             agentType: "orchestrator",
@@ -98,7 +98,7 @@ public class AutonomousReviewTests
         var wu = await orchestratorSvc.CreateWorkUnitAsync(
             goal: "Build a hello world feature",
             owner: "integration-test",
-            reviewPolicy: ReviewPolicy.Hybrid);
+            workspaceReviewPolicy: ReviewPolicy.Hybrid);
 
         await agentControl.SpawnAsync(
             agentType: "orchestrator",
@@ -158,7 +158,7 @@ public class AutonomousReviewTests
         var wu = await orchestratorSvc.CreateWorkUnitAsync(
             goal: "Build a hello world feature",
             owner: "integration-test",
-            reviewPolicy: ReviewPolicy.Hybrid);
+            workspaceReviewPolicy: ReviewPolicy.Hybrid);
 
         await agentControl.SpawnAsync(
             agentType: "orchestrator",

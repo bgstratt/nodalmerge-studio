@@ -57,7 +57,18 @@ public sealed record WorkUnit(
     WorkUnitFanOutInfo? FanOutInfo = null,
     string? BranchedFromProposalId = null,
     HypothesisForkType? ForkType = null,
-    ReviewPolicy ReviewPolicy = ReviewPolicy.HumanRequired,
+    // Split from a single ReviewPolicy field: TaskReviewPolicy gates a child/task proposal
+    // merging into its parent/orchestrator's branch (worker -> candidate); WorkspaceReviewPolicy
+    // gates the top-level goal's own proposal applying into the real on-disk repo
+    // (orchestrator -> workspace). Children only ever use TaskReviewPolicy (they're never
+    // top-level), while the top-level goal's own apply is gated by WorkspaceReviewPolicy.
+    ReviewPolicy TaskReviewPolicy = ReviewPolicy.HumanRequired,
+    ReviewPolicy WorkspaceReviewPolicy = ReviewPolicy.HumanRequired,
+    // Per-work-unit override for the Hybrid countdown duration; null falls back to
+    // AutoReviewRule's 5-minute default. Only the field matching the policy actually selected
+    // (Task vs Workspace, per AutoReviewRule's top-level/child branch) is consulted.
+    int? TaskReviewHybridTimeoutMinutes = null,
+    int? WorkspaceReviewHybridTimeoutMinutes = null,
     // Slice 21c — per-work-unit override: when true, applies always target the proposal's
     // TargetBranch directly even if WorkspaceOptions.UsePromotionBranch is on session-wide.
     bool BypassPromotionBranch = false,
@@ -77,7 +88,22 @@ public sealed record WorkUnit(
     // server-side (IWorkspaceRegistryService.GetOrCreateDefaultAsync) by WorkUnitCommandService,
     // never caller-supplied — there's nothing to choose while cardinality is 1. Defaulted here so
     // every existing call site keeps compiling unchanged. See plans/phase-16-workspace-aggregate.md.
-    string WorkspaceId = "workspace-default");
+    string WorkspaceId = "workspace-default",
+    // IReconciliationAgentService — set only on a reconciliation work unit (one created to fold two
+    // or more conflicting proposals' changes into a single combined result). Generic/source-agnostic:
+    // apply-time code (InMemoryMergeService.ApplyAsync) only reads these three fields and never
+    // interprets ReconciliationSourceRef itself; a subsystem-specific adapter (e.g. the
+    // candidate-branch adapter) is the only place that parses it, so a future task-level adapter can
+    // reuse the exact same apply-time bypass/supersede logic without touching it.
+    //
+    // Every proposal this work unit's own result supersedes once it lands.
+    IReadOnlyList<string>? ReconciliationSourceProposalIds = null,
+    // Paths this reconciliation is authoritative to overwrite on apply — bypasses the normal
+    // drift/conflict check for exactly these paths, regardless of which subsystem flagged them.
+    IReadOnlyList<string>? ReconciliationTargetPaths = null,
+    // Opaque back-reference the triggering adapter can parse to find its own record, e.g.
+    // "candidate-conflict:{conflictId}".
+    string? ReconciliationSourceRef = null);
 
 /// <summary>Failure/rejection counters, previously stored as parsed strings in Metadata.</summary>
 public sealed record WorkUnitExecutionInfo(
@@ -87,10 +113,12 @@ public sealed record WorkUnitExecutionInfo(
 
 /// <summary>Fan-out lineage: which plan slice this work unit fulfills and which branch it was seeded from.</summary>
 // Slice 14b — BlockedReason is set when a BeforeEnqueue policy rule rejects this slice (e.g.
-// NonOverlappingFileScopeRule) and cleared the next time it enqueues successfully. The work unit
-// stays Created while blocked, so a later fan-out call retries it automatically once the
-// conflicting sibling finishes — this field is purely the human-readable "why," not authoritative
-// state.
+// WorkspaceExecutionRule) and cleared the next time it enqueues successfully. The work unit stays
+// Created while blocked, so a later fan-out call retries it automatically once whatever the rule
+// was waiting on clears — this field is purely the human-readable "why," not authoritative state.
+// (Overlapping sibling fileScope is handled separately and doesn't use this path — see
+// FanOutService.AutoSequenceOverlappingSiblingsAsync, which inserts a real dependsOn edge instead
+// of rejecting.)
 public sealed record WorkUnitFanOutInfo(string? SliceId, string? SeedFromBranchId, string? BlockedReason = null);
 
 public static class WorkUnitTransitions
@@ -119,6 +147,16 @@ public static class WorkUnitTransitions
             (WorkUnitStatus.Executing, WorkUnitStatus.DeadLettered) => true,
             (WorkUnitStatus.Retrying, WorkUnitStatus.DeadLettered) => true,
             (WorkUnitStatus.DeadLettered, WorkUnitStatus.Retrying) => true,
+            // Human override — a dead-lettered unit's proposal can still be accepted
+            // (MergeProposalTransitions' Rejected -> Approved edge) and applied by a human who
+            // decides the work is good despite the automated escalation. Without these edges the
+            // accept/apply succeeded at the PROPOSAL level but the work unit silently stayed
+            // DeadLettered (ApplyAsync's status update is best-effort and swallowed the illegal
+            // transition), so MergeReconciliationService — which requires every child to be
+            // Proposed or Merged — reported WaitingForChildren forever and the goal could never
+            // converge. Proposed is the accept-time restore; Merged is the apply-time landing.
+            (WorkUnitStatus.DeadLettered, WorkUnitStatus.Proposed) => true,
+            (WorkUnitStatus.DeadLettered, WorkUnitStatus.Merged) => true,
             (WorkUnitStatus.Proposed, WorkUnitStatus.Reviewing) => true,
             // A fan-out parent is the orchestrator's own work unit, spawned via the legacy
             // direct-spawn path (IAgentControlService.SpawnAsync("orchestrator", ...)) — it never
@@ -131,6 +169,22 @@ public static class WorkUnitTransitions
             (WorkUnitStatus.Proposed, WorkUnitStatus.Queued) => true,
             (WorkUnitStatus.Reviewing, WorkUnitStatus.Merged) => true,
             (WorkUnitStatus.Reviewing, WorkUnitStatus.Executing) => true,
+            // Top-level reconciliation/orchestrator work units apply their own merge proposal
+            // directly from Executing — unlike a fanned-out child, they never pass through
+            // Proposed/Reviewing themselves (that's the child proposal's path). Without this,
+            // InMemoryMergeService.ApplyAsync's post-merge status update is an illegal transition
+            // that gets silently swallowed, leaving the work unit stuck at Executing forever even
+            // though its proposal already merged.
+            (WorkUnitStatus.Executing, WorkUnitStatus.Merged) => true,
+
+            // Human override — mirrors the DeadLettered -> Retrying/Proposed/Merged overrides
+            // above: cancellation is a deliberate stop, not a terminal judgment on the work's
+            // quality, so a human asking to resume it should not be permanently blocked. Queued
+            // covers a plain leaf retry; Executing covers a cancelled fan-out parent re-attempting
+            // reconciliation (mirrors the existing Reviewing -> Executing edge, used for the same
+            // "try convergence again" purpose).
+            (WorkUnitStatus.Cancelled, WorkUnitStatus.Queued) => true,
+            (WorkUnitStatus.Cancelled, WorkUnitStatus.Executing) => true,
 
             (_, WorkUnitStatus.Cancelled) when from is not WorkUnitStatus.Completed and not WorkUnitStatus.Merged => true,
             _ => false

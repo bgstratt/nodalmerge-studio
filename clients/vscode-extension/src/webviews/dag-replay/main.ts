@@ -20,6 +20,12 @@ let goals: Record<string, string> = {};
 let stages: Record<string, string | null> = {};
 let workUnitIdToBranchId: Record<string, string> = {};
 
+// Session highlight (plans/pathways-workspace-history.md) — Pathways data is deliberately
+// workspace-wide, so a selected session dims out-of-session lanes rather than filtering them.
+// True when the host's workUnits fetch was session-scoped (see DagReplayPanel's sessionActive
+// flag); `goals` then holds exactly the session's branches, which is the highlight set.
+let sessionScopeActive = false;
+
 // ── DOM refs ───────────────────────────────────────────────────────────────
 
 const svg         = document.getElementById('dag-svg')     as unknown as SVGSVGElement;
@@ -54,7 +60,10 @@ function dispatch(action: ReplayAction): void {
 }
 
 function render(): void {
-  renderDag(svg, replayState, goals, stages);
+  const dimmed = sessionScopeActive
+    ? new Set(Object.keys(replayState.branches).filter(id => !(id in goals)))
+    : null;
+  renderDag(svg, replayState, goals, stages, dimmed, pathwaysEdges);
 
   const total = Object.keys(replayState.nodesById).length;
   if (nodeCount) { nodeCount.textContent = String(total) + ' node' + (total === 1 ? '' : 's'); }
@@ -114,18 +123,43 @@ svg.addEventListener('click', (e: MouseEvent) => {
     dispatch({ type: 'set-active-branch', branchId });
   }
 
-  // Slice — node detail drawer: ReplayNode.nodeId is seeded from the backend's
-  // artifact/orchestration-event id (see registerTimeline's replayOpId), so most clicks can
-  // resolve real content via /studio/replay/inspect. Locally-synthesized nodes (e.g. merge
-  // markers) won't resolve — the inspect response's `error` field is handled in renderNodeDetail.
+  // Node detail drawer. Pathways nodes (see pathwaysInspectId above) either round-trip to
+  // /studio/replay/inspect for kinds it can resolve, or render straight from the node's own
+  // payloadJson for kinds it can't (GoalStarted/DeadBranch/ExternalUpdate). Locally-synthesized
+  // nodes (e.g. merge markers) fall back to the same "no detail" message renderNodeDetail shows
+  // for an inspect `error` response.
   if (nodeId) {
-    const node = replayState.nodesById[nodeId];
+    const replayNode = replayState.nodesById[nodeId];
     if (nodeDetail && nodeDetailTitle && nodeDetailBody) {
       nodeDetail.classList.remove('hidden');
-      nodeDetailTitle.textContent = node?.opSummary ?? nodeId;
-      nodeDetailBody.innerHTML = '<div class="node-detail-row" style="opacity:0.5;font-style:italic">Loading…</div>';
+      nodeDetailTitle.textContent = replayNode?.opSummary ?? nodeId;
+
+      let pathwaysNode: PathwaysNode | null = null;
+      try { pathwaysNode = replayNode ? (JSON.parse(replayNode.payloadJson) as PathwaysNode) : null; } catch { /* not a pathways node */ }
+      // Slice 3 — remembered so the nodeDetail handler (which fires later, once the async
+      // inspect round-trip resolves) knows whether to offer "Branch from here (new steering)".
+      currentInspectedNode = pathwaysNode;
+
+      if (pathwaysNode && pathwaysNode.kind) {
+        const inspectId = pathwaysInspectId(pathwaysNode);
+        if (inspectId) {
+          nodeDetailBody.innerHTML = '<div class="node-detail-row" style="opacity:0.5;font-style:italic">Loading…</div>';
+          // workUnitId tells the host to also fetch file diffs + the agent conversation that
+          // produced this proposal (slice 2); requestNodeId round-trips through the host so the
+          // nodeDetail handler can drop responses that arrive after the user clicked a different
+          // node (rapid clicks would otherwise render node A's detail with node B's actions).
+          vscode.postMessage({
+            type: 'inspectNode', branchId, nodeId: inspectId,
+            workUnitId: pathwaysNode.workUnitId, requestNodeId: pathwaysNode.nodeId,
+          });
+        } else {
+          nodeDetailBody.innerHTML = renderPathwaysNodeDetail(pathwaysNode) + renderMaterializeAction(pathwaysNode);
+        }
+      } else {
+        nodeDetailBody.innerHTML = '<div class="node-detail-row" style="opacity:0.5;font-style:italic">Loading…</div>';
+        vscode.postMessage({ type: 'inspectNode', branchId, nodeId, requestNodeId: nodeId });
+      }
     }
-    vscode.postMessage({ type: 'inspectNode', branchId, nodeId });
   }
 });
 
@@ -143,6 +177,15 @@ if (scrubber) {
     const branchId = replayState.activeBranchId;
     ws?.requestPack(Object.keys(replayState.nodesById));
     dispatch({ type: 'set-cursor-index', branchId, nodeIndex: idx });
+  });
+}
+
+// ── Sync now (Slice 4, pathways-workspace-history.md) ───────────────────────
+
+const btnSyncNow = document.getElementById('btn-sync-now') as HTMLButtonElement | null;
+if (btnSyncNow) {
+  btnSyncNow.addEventListener('click', () => {
+    vscode.postMessage({ type: 'syncNow' });
   });
 }
 
@@ -190,8 +233,14 @@ if (replayModeSelect) {
 
 // ── Alternate view renderers ──────────────────────────────────────────────
 
-function escHtml(s: string): string {
-  return String(s || '').replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>');
+// Full-fidelity copy of src/webviews/views/lib/esc.js (the canonical escaping helper) — a literal
+// import is blocked by tsconfig (allowJs off, include: *.ts only). The previous local version was
+// a broken no-op (each character "replaced" with itself), so everything routed through it — LLM
+// conversation text, diff content, file paths — reached innerHTML unescaped. Escapes the full set
+// (&, <, >, ", ') so the result is safe in both text and attribute contexts.
+function escHtml(s: unknown): string {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string));
 }
 
 function badgeHtml(status: string): string {
@@ -237,6 +286,220 @@ function renderNodeDetail(payload: any): string {
     return html;
   }
   return '<div class="node-detail-row" style="opacity:0.6;font-style:italic">No additional detail available for this node.</div>';
+}
+
+// Client-side detail render for pathways node kinds /studio/replay/inspect can never resolve
+// (see INSPECTABLE_KINDS) — everything needed is already on the node itself.
+function renderPathwaysNodeDetail(node: PathwaysNode): string {
+  let html = '<div class="node-detail-row"><span class="node-detail-label">Kind</span>' + escHtml(node.kind) + '</div>';
+  html += '<div class="node-detail-row"><span class="node-detail-label">Actor</span>' + escHtml(actorLabel(node)) + '</div>';
+  if (node.reviewedBy) { html += '<div class="node-detail-row"><span class="node-detail-label">Reviewed by</span>' + escHtml(node.reviewedBy) + '</div>'; }
+  if (node.workUnitId) { html += '<div class="node-detail-row"><span class="node-detail-label">Work unit</span>' + escHtml(node.workUnitId) + '</div>'; }
+  if (node.branchId) { html += '<div class="node-detail-row"><span class="node-detail-label">Branch</span>' + escHtml(node.branchId) + '</div>'; }
+  html += '<div class="node-detail-row"><span class="node-detail-label">Occurred</span>' + fmtDate(node.occurredAt) + '</div>';
+  if (node.filesTouched && node.filesTouched.length) {
+    html += '<div class="node-detail-row"><span class="node-detail-label">Files</span>' + escHtml(node.filesTouched.join(', ')) + '</div>';
+  }
+  html += '<div class="node-detail-body-text">' + escHtml(node.summary) + '</div>';
+  // Slice 4 — ExternalUpdate nodes carry the KnownGoodState pair RepositorySyncService marks
+  // immediately before/after applying the drift, letting the host resolve a real file-level diff
+  // on demand rather than trusting the summary's own added/modified/deleted counts.
+  if (node.externalSyncStateIdBefore && node.externalSyncStateIdAfter) {
+    html += '<div id="external-diff-' + escHtml(node.nodeId) + '">';
+    html += '<button class="ghost" data-view-external-diff="' + escHtml(node.nodeId) + '" '
+      + 'data-state-before="' + escHtml(node.externalSyncStateIdBefore) + '" '
+      + 'data-state-after="' + escHtml(node.externalSyncStateIdAfter) + '">View file changes</button>';
+    html += '</div>';
+  }
+  return html;
+}
+
+interface KnownGoodDiffResult {
+  differences: Array<{ relativePath: string; status: 'Added' | 'Removed' | 'Modified' | 'Unchanged' }>;
+  addedCount: number;
+  removedCount: number;
+  modifiedCount: number;
+}
+
+function renderExternalDiff(diff: KnownGoodDiffResult): string {
+  if (!diff.differences || !diff.differences.length) { return '<div class="diff-empty">No file changes.</div>'; }
+  return diff.differences.map((d) => {
+    const cls = d.status === 'Added' ? 'diff-add' : d.status === 'Removed' ? 'diff-del' : '';
+    return '<div class="diff-line ' + cls + '">' + escHtml(d.status) + '  ' + escHtml(d.relativePath) + '</div>';
+  }).join('');
+}
+
+// ── Slice 2 — agent context + file diffs ────────────────────────────────────
+// Diff rendering mirrors decisionConvergence.js's renderInlineHunks/renderFileChanges (same
+// ProposalFileChange/DiffHunk/DiffLine REST shape, same .diff-line/.diff-add/.diff-del classes)
+// so a proposal's diff looks the same whether opened from Merge Review or from a Pathways node.
+// Split-view and "Open Diff in Editor" are not reproduced here — that requires the VS Code
+// TextDocumentContentProvider MergeReviewPanel.ts registers, which is out of scope for this
+// compact drawer; deferred, not forgotten (see plans/pathways-workspace-history.md).
+function hunkHeader(h: DiffHunk): string {
+  return '@@ -' + h.beforeStart + ',' + h.beforeCount + ' +' + h.afterStart + ',' + h.afterCount + ' @@';
+}
+
+function renderInlineHunks(hunks: DiffHunk[]): string {
+  if (!hunks || !hunks.length) { return '<div class="diff-empty">No textual changes.</div>'; }
+  return hunks.map((h) => {
+    const rows = h.lines.map((l) => {
+      const prefix = l.kind === 'Added' ? '+' : l.kind === 'Removed' ? '-' : ' ';
+      const cls = l.kind === 'Added' ? 'diff-add' : l.kind === 'Removed' ? 'diff-del' : '';
+      return '<div class="diff-line ' + cls + '">' + prefix + escHtml(l.text) + '</div>';
+    }).join('');
+    return '<div class="diff-meta">' + escHtml(hunkHeader(h)) + '</div>' + rows;
+  }).join('');
+}
+
+// Populated by the nodeDetail handler right before rendering — data-open-diff="{idx}" click
+// delegation below looks the full before/after content up here rather than round-tripping to
+// the host again (same window-global convention as decisionConvergence.js's __fileChanges,
+// scoped to a module-level array here instead since this bundle isn't inline HTML).
+let currentFileChanges: ProposalFileChange[] = [];
+
+// Slice 3 (pathways-workspace-history.md) — the pathways node currently shown in the detail
+// drawer, set by the click handler before the async inspect/nodeDetail round-trip resolves.
+let currentInspectedNode: PathwaysNode | null = null;
+
+// "Branch from here (new steering)" is offered only for proposal-backed nodes — Integration/
+// Rejection/Superseded are the only kinds with a base/{proposalId} snapshot branch
+// (InMemoryMergeService writes it at propose time) for ICounterfactualService to seed from.
+// GoalStarted/DeadBranch nodes already have an equivalent affordance (the existing "Branch from
+// here" playback-bar button, which seeds from the branch's current tip via branchFromCursor).
+const COUNTERFACTUAL_KINDS = new Set(['Integration', 'Rejection', 'Superseded']);
+
+function renderCounterfactualAction(node: PathwaysNode): string {
+  if (!COUNTERFACTUAL_KINDS.has(node.kind) || !node.proposalId) { return ''; }
+  return '<div class="node-detail-section">'
+    + '<button class="ghost" data-branch-with-steering="' + escHtml(node.proposalId) + '">Branch from here (new steering)</button>'
+    + '</div>';
+}
+
+// "Materialize to scratch" — any node with a workUnitId (every kind except ExternalUpdate,
+// which is workspace-wide and owned by no work unit). When the node carries a snapshotId
+// (Integration nodes whose MergeApplied event recorded one), this is TRUE point-in-time
+// reconstruction — the repository exactly as that integration left it, via RepositorySnapshot +
+// CAS. Without one it falls back to the work unit's branch's *current* content; the button
+// label tells the user which they're getting.
+function renderMaterializeAction(node: PathwaysNode): string {
+  if (!node.workUnitId && !node.snapshotId) { return ''; }
+  const label = node.snapshotId
+    ? 'Materialize this point in time to scratch'
+    : 'Materialize current branch state to scratch';
+  return '<div class="node-detail-section">'
+    + '<button class="ghost" data-materialize="' + escHtml(node.workUnitId ?? '') + '"'
+    + (node.branchId ? ' data-branch="' + escHtml(node.branchId) + '"' : '')
+    + (node.snapshotId ? ' data-snapshot="' + escHtml(node.snapshotId) + '"' : '')
+    + '>' + label + '</button>'
+    + '</div>';
+}
+
+function renderFileChangesSection(changes: ProposalFileChange[]): string {
+  if (!changes || !changes.length) { return ''; }
+  currentFileChanges = changes;
+  let html = '<div class="node-detail-section"><h3>File diffs</h3>';
+  html += changes.map((fc, idx) => {
+    let entry = '<details class="file-change" open>';
+    entry += '<summary>' + escHtml(fc.path) + '<span class="file-change-badge">' + escHtml(fc.changeKind) + '</span></summary>';
+    entry += renderInlineHunks(fc.hunks);
+    if (fc.changeKind !== 'Deleted') {
+      entry += '<button class="ghost" data-pw-open-diff="' + idx + '">View Diff in Editor</button>';
+    }
+    entry += '</details>';
+    return entry;
+  }).join('');
+  html += '</div>';
+  return html;
+}
+
+// One delegated click handler for every drawer action, attached to the Pathways pane itself, not
+// document. Two reasons, both learned the hard way: (1) the Studio Shell is one document hosting
+// every view's bundle, and decisionConvergence.js registers its own document-level listener for
+// its "[data-open-diff]" buttons — a document-level listener here (plus the shared attribute name
+// this originally used) meant one click fired both views' handlers, opening duplicate and
+// potentially wrong-content diff tabs; (2) drawer content is rebuilt on every node click, so
+// per-button listeners would leak/vanish — delegation is still right, just at the pane boundary.
+// Falls back to document only when the pane div is absent (defensive; the fragment always ships it).
+const pathwaysPane = document.getElementById('shell-pane-trajectory-replay') ?? document;
+pathwaysPane.addEventListener('click', (e: Event) => {
+  const target = e.target as HTMLElement;
+
+  const diffBtn = target.closest('[data-pw-open-diff]') as HTMLElement | null;
+  if (diffBtn) {
+    const idx = parseInt(diffBtn.getAttribute('data-pw-open-diff') ?? '', 10);
+    const fc = currentFileChanges[idx];
+    if (!fc) { return; }
+    vscode.postMessage({
+      type: 'pathways.openDiff',
+      path: fc.path,
+      beforeContent: fc.beforeContent,
+      afterContent: fc.afterContent,
+    });
+    return;
+  }
+
+  const cfBtn = target.closest('[data-branch-with-steering]') as HTMLElement | null;
+  if (cfBtn) {
+    const proposalId = cfBtn.getAttribute('data-branch-with-steering');
+    if (!proposalId) { return; }
+    vscode.postMessage({
+      type: 'createCounterfactual',
+      branchId: replayState.cursor.branchId,
+      proposalId,
+      workUnitId: currentInspectedNode?.workUnitId,
+    });
+    return;
+  }
+
+  const matBtn = target.closest('[data-materialize]') as HTMLElement | null;
+  if (matBtn) {
+    const workUnitId = matBtn.getAttribute('data-materialize') || undefined;
+    const snapshotId = matBtn.getAttribute('data-snapshot') || undefined;
+    if (!workUnitId && !snapshotId) { return; }
+    vscode.postMessage({
+      type: 'materializeNode', workUnitId, snapshotId,
+      branchId: matBtn.getAttribute('data-branch') ?? undefined,
+    });
+    return;
+  }
+
+  const extBtn = target.closest('[data-view-external-diff]') as HTMLElement | null;
+  if (extBtn) {
+    const nodeId = extBtn.getAttribute('data-view-external-diff');
+    const stateBefore = extBtn.getAttribute('data-state-before');
+    const stateAfter = extBtn.getAttribute('data-state-after');
+    if (!nodeId || !stateBefore || !stateAfter) { return; }
+    const container = document.getElementById('external-diff-' + nodeId);
+    if (container) { container.innerHTML = '<div class="diff-empty">Loading…</div>'; }
+    vscode.postMessage({ type: 'viewExternalDiff', nodeId, stateIdBefore: stateBefore, stateIdAfter: stateAfter });
+  }
+});
+
+// Capped to the most recent 10 cycles — a long-running work unit could have dozens; the drawer
+// is meant for "what led to this decision," not a full transcript (that's the dedicated
+// conversation-log view elsewhere in Studio).
+const MAX_CONVERSATION_ENTRIES = 10;
+
+function renderConversationLogSection(entries: ConversationLogEntry[]): string {
+  if (!entries || !entries.length) { return ''; }
+  // occurredAt, not cycleNumber: a work unit's log interleaves multiple agents (planner, worker,
+  // reviewer), each with its own cycle counter — cycle numbers only order within one agent.
+  const ordered = [...entries].sort((a, b) => a.occurredAt.localeCompare(b.occurredAt)).slice(-MAX_CONVERSATION_ENTRIES);
+  let html = '<div class="node-detail-section"><h3>Agent context</h3>';
+  html += ordered.map((e) => {
+    const modelBit = e.model ? ' · ' + e.model : '';
+    let entry = '<div class="conv-entry">';
+    entry += '<div class="conv-entry-meta">cycle ' + e.cycleNumber + ' · ' + escHtml(e.agentRole) + modelBit + ' · ' + fmtDate(e.occurredAt) + '</div>';
+    if (e.assistantText) { entry += '<div class="conv-entry-text">' + escHtml(e.assistantText) + '</div>'; }
+    if (e.toolCalls && e.toolCalls.length) {
+      entry += '<div class="conv-tool-call">tools: ' + escHtml(e.toolCalls.map((t) => t.name).join(', ')) + '</div>';
+    }
+    entry += '</div>';
+    return entry;
+  }).join('');
+  html += '</div>';
+  return html;
 }
 
 function renderBranchExplorer(data: any): string {
@@ -330,21 +593,104 @@ interface WorkUnitRef {
   currentStage?: string | null;
 }
 
-interface TimelineEntry {
-  kind: string;
+// plans/pathways-workspace-history.md slice 1 — WorkspacePathways projection node/edge shape.
+// Kind: "GoalStarted" | "Integration" | "Rejection" | "Superseded" | "DeadBranch" |
+// "ExternalUpdate". ActorKind: "Agent" | "Human" | "External".
+interface PathwaysNode {
   nodeId: string;
-  description: string;
+  kind: string;
+  workUnitId?: string | null;
+  branchId?: string | null;
+  actorKind: string;
+  actorId?: string | null;
+  actorModel?: string | null;
+  actorProvider?: string | null;
+  summary: string;
   occurredAt: string;
+  proposalId?: string | null;
+  artifactId?: string | null;
+  filesTouched?: string[] | null;
+  snapshotId?: string | null;
+  externalSyncStateIdBefore?: string | null;
+  externalSyncStateIdAfter?: string | null;
+  reviewedBy?: string | null;
 }
 
-interface TimelineData {
-  branchId: string;
-  entries: TimelineEntry[];
+interface PathwaysEdge {
+  fromNodeId: string;
+  toNodeId: string;
+  kind: string;
 }
 
-interface TimelineResponse {
-  branches: string[];
-  timelines: TimelineData[];
+interface PathwaysPayload {
+  nodes: PathwaysNode[];
+  edges: PathwaysEdge[];
+  generatedAt: string;
+}
+
+// Slice 2 (pathways-workspace-history.md) — node detail context types, mirroring
+// MergeReviewPanel.ts's local copies of the same REST shapes (this codebase doesn't share
+// types across webview bundles).
+interface DiffLine {
+  kind: 'Context' | 'Added' | 'Removed';
+  text: string;
+}
+
+interface DiffHunk {
+  beforeStart: number;
+  beforeCount: number;
+  afterStart: number;
+  afterCount: number;
+  lines: DiffLine[];
+}
+
+interface ProposalFileChange {
+  path: string;
+  changeKind: 'Added' | 'Modified' | 'Deleted';
+  hunks: DiffHunk[];
+  beforeContent?: string | null;
+  afterContent?: string | null;
+}
+
+interface ConversationLogEntry {
+  logId: string;
+  agentId: string;
+  agentRole: string;
+  cycleNumber: number;
+  assistantText?: string | null;
+  toolCalls: Array<{ name: string }>;
+  stopReason: string;
+  occurredAt: string;
+  model?: string | null;
+  provider?: string | null;
+}
+
+// Node kinds the backend's /studio/replay/inspect endpoint can actually resolve. It looks a node
+// up via IArtifactLineageService.GetChainAsync(workUnitId), which is keyed per work unit —
+// Integration/Rejection/Superseded nodes work because MergeCommandService records the
+// MergeProposal's own ArtifactRef under proposal.ProposalId (same id as PathwaysNode.proposalId).
+// GoalStarted/DeadBranch nodes are bare WorkUnitIds with no artifact behind them, and
+// ExternalUpdate artifacts are workspace-wide (OwnedByWorkUnitId: null — see
+// RepositorySyncService), so GetChainAsync can never find them by any branchId. All three render
+// straight from the node's own fields instead of round-tripping to a lookup that would only ever
+// 404 — richer node detail for those kinds is plans/pathways-workspace-history.md slice 2 work.
+const INSPECTABLE_KINDS = new Set(['Integration', 'Rejection', 'Superseded']);
+
+function actorLabel(node: PathwaysNode): string {
+  if (node.actorKind === 'Human') { return 'human' + (node.actorId ? ':' + node.actorId : ''); }
+  if (node.actorKind === 'External') { return 'external'; }
+  return 'agent' + (node.actorModel ? ':' + node.actorModel : node.actorId ? ':' + node.actorId : '');
+}
+
+function pathwaysOpSummary(node: PathwaysNode): string {
+  return `${node.kind} (${actorLabel(node)}): ${node.summary}`;
+}
+
+// The raw id /studio/replay/inspect expects for a node kind that can resolve — null for kinds
+// rendered client-side only (see INSPECTABLE_KINDS above).
+function pathwaysInspectId(node: PathwaysNode): string | null {
+  if (!INSPECTABLE_KINDS.has(node.kind)) { return null; }
+  return node.proposalId ?? node.artifactId ?? null;
 }
 
 function applyStageChange(workUnitId: string, stage: string | null): void {
@@ -354,17 +700,40 @@ function applyStageChange(workUnitId: string, stage: string | null): void {
   render();
 }
 
-// Slice 13h — registers branches and nodes from the /studio/replay/timeline REST
-// response. Called from both init and workUnits message handlers so new artifacts and
-// orchestration events appear without waiting for a full re-init.
-function registerTimeline(timeline: TimelineResponse): void {
-  for (const branchId of timeline.branches) {
-    if (!replayState.branches[branchId]) {
-      const label = goals[branchId] ?? branchId;
-      dispatch({
+// Lane a node belongs to for the existing per-branch-lane SVG renderer. GoalStarted/Integration/
+// Rejection/Superseded/DeadBranch nodes always carry their owning branchId; ExternalUpdate nodes
+// are workspace-wide (not owned by any branch — see RepositorySyncService), so they collect into
+// one synthetic lane instead of being dropped.
+const EXTERNAL_LANE_ID = 'external-updates';
+
+function laneIdFor(node: PathwaysNode): string {
+  return node.branchId ?? EXTERNAL_LANE_ID;
+}
+
+// The full WorkspacePathwaysEdge set from the latest poll — drawn by the renderer as cross-lane
+// connectors (child proposal → parent's node, a proposal's Integration → its own later
+// Superseded, external-update chains). Replaced wholesale per poll.
+let pathwaysEdges: PathwaysEdge[] = [];
+
+// Registers branches (lanes) and nodes from the WorkspacePathways projection. Called from both
+// init and workUnits message handlers so new integrations/rejections/external updates appear
+// without waiting for a full re-init.
+function registerPathways(pathways: PathwaysPayload): void {
+  pathwaysEdges = pathways.edges ?? [];
+
+  // Reducer applied directly, one render() at the end — dispatch() renders per action, and a poll
+  // cycle replays every node every 2s (append is idempotent per nodeId), so dispatching here meant
+  // a full SVG re-render per node per poll.
+  let state = replayState;
+
+  const laneIds = new Set(pathways.nodes.map(laneIdFor));
+  for (const laneId of laneIds) {
+    if (!state.branches[laneId]) {
+      const label = laneId === EXTERNAL_LANE_ID ? 'External updates' : (goals[laneId] ?? laneId);
+      state = replayReducer(state, {
         type: 'register-branch',
-        branchId,
-        roomId: branchId,
+        branchId: laneId,
+        roomId: laneId,
         label,
         basedOnBranchId: null,
         basedOnNodeId: null,
@@ -372,20 +741,30 @@ function registerTimeline(timeline: TimelineResponse): void {
     }
   }
 
-  for (const td of timeline.timelines) {
-    const branchId = td.branchId;
-    for (const entry of td.entries) {
-      dispatch({
-        type: 'append-branch-node',
-        branchId,
-        roomId: branchId,
-        opSummary: `${entry.kind}: ${entry.description}`,
-        payloadJson: JSON.stringify(entry),
-        replayOpId: entry.nodeId,
-        atIso: entry.occurredAt,
-      });
-    }
+  const ordered = [...pathways.nodes].sort((a, b) => a.occurredAt.localeCompare(b.occurredAt));
+  for (const node of ordered) {
+    const laneId = laneIdFor(node);
+    state = replayReducer(state, {
+      type: 'append-branch-node',
+      branchId: laneId,
+      roomId: laneId,
+      opSummary: pathwaysOpSummary(node),
+      payloadJson: JSON.stringify(node),
+      // payloadRef carries the pathways kind so the renderer can pick per-kind shape/color
+      // without JSON-parsing every node's payload on every render frame.
+      payloadRef: node.kind,
+      replayOpId: node.nodeId,
+      // In-lane order comes from compareNodeIds, which sorts by lamport first and falls back to
+      // nodeId.localeCompare when lamports tie — and every pathways node used to arrive with a
+      // null lamport, so lanes ordered alphabetically by prefixed id ("failed:" sorted before
+      // "goal:", proposals by GUID). Epoch millis as the lamport makes lanes chronological.
+      lamport: Date.parse(node.occurredAt) || null,
+      atIso: node.occurredAt,
+    });
   }
+
+  replayState = state;
+  render();
 }
 
 window.addEventListener('message', (event: MessageEvent) => {
@@ -399,6 +778,7 @@ window.addEventListener('message', (event: MessageEvent) => {
     goals = {};
     stages = {};
     workUnitIdToBranchId = {};
+    sessionScopeActive = msg.sessionActive === true;
     for (const wu of wus) {
       goals[wu.branchId] = wu.goal;
       stages[wu.branchId] = wu.currentStage ?? null;
@@ -407,37 +787,10 @@ window.addEventListener('message', (event: MessageEvent) => {
 
     replayState = createInitialReplayState(roomId, roomId, goals[roomId] ?? roomId);
 
-    // Slice 13h — register timeline branches/nodes from REST before connecting
-    // the WebSocket (which now only handles live stage-change events).
-    if (msg.timeline) {
-      // Dispatch each timeline entry through the reducer so branches get auto-registered
-      const tl = msg.timeline as TimelineResponse;
-      for (const branchId of tl.branches) {
-        if (!replayState.branches[branchId]) {
-          const label = goals[branchId] ?? branchId;
-          replayState = replayReducer(replayState, {
-            type: 'register-branch',
-            branchId,
-            roomId: branchId,
-            label,
-            basedOnBranchId: null,
-            basedOnNodeId: null,
-          });
-        }
-      }
-      for (const td of tl.timelines) {
-        for (const entry of td.entries) {
-          replayState = replayReducer(replayState, {
-            type: 'append-branch-node',
-            branchId: td.branchId,
-            roomId: td.branchId,
-            opSummary: `${entry.kind}: ${entry.description}`,
-            payloadJson: JSON.stringify(entry),
-            replayOpId: entry.nodeId,
-            atIso: entry.occurredAt,
-          });
-        }
-      }
+    // plans/pathways-workspace-history.md slice 1 — register pathways lanes/nodes before
+    // connecting the WebSocket (which now only handles live stage-change events).
+    if (msg.pathways) {
+      registerPathways(msg.pathways as PathwaysPayload);
     }
 
     ws?.close();
@@ -453,15 +806,15 @@ window.addEventListener('message', (event: MessageEvent) => {
 
   if (msg.type === 'workUnits') {
     goals = {};
+    sessionScopeActive = msg.sessionActive === true;
     for (const wu of (msg.workUnits as WorkUnitRef[])) {
       goals[wu.branchId] = wu.goal;
       workUnitIdToBranchId[wu.workUnitId] = wu.branchId;
       if (wu.currentStage !== undefined) { stages[wu.branchId] = wu.currentStage; }
     }
-    // Slice 13h — merge updated timeline into existing replay state
-    if (msg.timeline) {
-      const tl = msg.timeline as TimelineResponse;
-      registerTimeline(tl);
+    // plans/pathways-workspace-history.md slice 1 — merge updated pathways into existing state
+    if (msg.pathways) {
+      registerPathways(msg.pathways as PathwaysPayload);
     }
     render();
     return;
@@ -504,8 +857,43 @@ window.addEventListener('message', (event: MessageEvent) => {
   }
 
   if (msg.type === 'nodeDetail') {
+    // Stale-response guard: only render if this response answers the *latest* clicked node.
+    // requestNodeId is absent on responses from hosts predating it — render those unguarded
+    // rather than dropping every detail (same graceful-degrade posture as the pathways fetch).
+    if (msg.requestNodeId && currentInspectedNode && msg.requestNodeId !== currentInspectedNode.nodeId) {
+      return;
+    }
     if (nodeDetailBody) {
-      nodeDetailBody.innerHTML = renderNodeDetail(msg.error ? { error: msg.error } : msg.detail);
+      let html = renderNodeDetail(msg.error ? { error: msg.error } : msg.detail);
+      // Slice 2 — present only when DagReplayPanel resolved a MergeProposal artifact with a
+      // workUnitId (see its inspectNode handler); absent for every other inspect response.
+      if (msg.conversationLog) { html += renderConversationLogSection(msg.conversationLog as ConversationLogEntry[]); }
+      if (msg.fileChanges) { html += renderFileChangesSection(msg.fileChanges as ProposalFileChange[]); }
+      // Slice 3 — offered whenever this response resolved a proposal-backed node, regardless of
+      // whether file changes/conversation log came back (both are best-effort on the host side).
+      if (currentInspectedNode) {
+        if (currentInspectedNode.reviewedBy) {
+          html = '<div class="node-detail-row"><span class="node-detail-label">Reviewed by</span>'
+            + escHtml(currentInspectedNode.reviewedBy) + '</div>' + html;
+        }
+        html += renderCounterfactualAction(currentInspectedNode);
+        html += renderMaterializeAction(currentInspectedNode);
+      }
+      nodeDetailBody.innerHTML = html;
+    }
+    return;
+  }
+
+  // Slice 4 — result of a "View file changes" click on an ExternalUpdate node (see
+  // renderPathwaysNodeDetail). Targets its own container by nodeId rather than replacing the
+  // whole drawer, since the rest of the drawer's content (goal/actor/summary rows) is already
+  // correct and doesn't need re-rendering.
+  if (msg.type === 'externalDiff') {
+    const container = document.getElementById('external-diff-' + (msg.nodeId as string));
+    if (container) {
+      container.innerHTML = msg.error
+        ? '<div class="diff-empty">' + escHtml(String(msg.error)) + '</div>'
+        : renderExternalDiff(msg.diff as KnownGoodDiffResult);
     }
     return;
   }

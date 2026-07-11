@@ -146,6 +146,49 @@ public class ConversationCompactorTests
         Assert.Equal(11, messages.Count);
     }
 
+    // A single 40k+ token tool result (an AST dump, a large diff) can blow the effective context
+    // well before message count crosses 20 — the token trigger exists precisely for this case.
+    [Fact]
+    public async Task ApplyRollingSummaryIfDueAsync_fires_on_provider_reported_tokens_even_under_the_message_count_threshold()
+    {
+        var messages = BuildHistory(cycles: 5); // 11 messages, well under the 20-message trigger
+        var client = new FakeAgentToolClient();
+
+        await ConversationCompactor.ApplyRollingSummaryIfDueAsync(
+            messages, client, CancellationToken.None, lastInputTokens: 50_000);
+
+        Assert.Equal(1, client.CallCount);
+    }
+
+    // When the provider doesn't report usage (lastInputTokens null — e.g. vscode-lm/Copilot),
+    // falls back to estimating from raw character counts rather than skipping the token check
+    // entirely.
+    [Fact]
+    public async Task ApplyRollingSummaryIfDueAsync_fires_on_estimated_tokens_when_the_provider_reports_none()
+    {
+        // 5 cycles * 40,000-char results = 200,000 chars =~ 50,000 estimated tokens (> 40k trigger),
+        // while message count (11) stays well under the 20-message trigger.
+        var messages = BuildHistory(cycles: 5, resultLength: 40_000);
+        var client = new FakeAgentToolClient();
+
+        await ConversationCompactor.ApplyRollingSummaryIfDueAsync(
+            messages, client, CancellationToken.None, lastInputTokens: null);
+
+        Assert.Equal(1, client.CallCount);
+    }
+
+    [Fact]
+    public async Task ApplyRollingSummaryIfDueAsync_does_not_fire_when_both_count_and_tokens_are_under_threshold()
+    {
+        var messages = BuildHistory(cycles: 5); // 11 messages, small results
+        var client = new FakeAgentToolClient();
+
+        await ConversationCompactor.ApplyRollingSummaryIfDueAsync(
+            messages, client, CancellationToken.None, lastInputTokens: 1_000);
+
+        Assert.Equal(0, client.CallCount);
+    }
+
     [Fact]
     public async Task ApplyRollingSummaryIfDueAsync_condenses_older_turns_folds_recap_into_kickoff_and_keeps_tail_verbatim()
     {
@@ -232,7 +275,9 @@ public class ConversationCompactorTests
         await ConversationCompactor.ApplyRollingSummaryIfDueAsync(
             messages, client, CancellationToken.None, logger, "agent-7", "wu-3");
 
-        var entry = Assert.Single(logger.Entries);
+        // Now two entries: the "trigger fired" line (count/token diagnostics) followed by this
+        // "applied" line — assert on the latter, which carries the condensed/kept counts.
+        var entry = Assert.Single(logger.Entries, e => e.Message.Contains("condensed 18 turns"));
         Assert.Equal(LogLevel.Information, entry.Level);
         Assert.Contains("agent-7", entry.Message);
         Assert.Contains("wu-3", entry.Message);
@@ -250,7 +295,8 @@ public class ConversationCompactorTests
         await ConversationCompactor.ApplyRollingSummaryIfDueAsync(
             messages, client, CancellationToken.None, logger, "agent-9", "wu-5");
 
-        var entry = Assert.Single(logger.Entries);
+        // Now two entries: the "trigger fired" line, then this warning — assert on the latter.
+        var entry = Assert.Single(logger.Entries, e => e.Level == LogLevel.Warning);
         Assert.Equal(LogLevel.Warning, entry.Level);
         Assert.Contains("agent-9", entry.Message);
         Assert.Contains("no usable text", entry.Message);

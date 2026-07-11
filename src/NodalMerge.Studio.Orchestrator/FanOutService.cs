@@ -125,15 +125,22 @@ public sealed class FanOutService : IFanOutService
             var children = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
             foreach (var child in children)
             {
-                if (!await IsReadyToEnqueueAsync(child, ct).ConfigureAwait(false))
+                // Collision avoidance — two sibling slices with overlapping fileScope and no
+                // dependsOn between them is a planning gap, not something to catch at runtime via
+                // the file lease. Sequencing it here (before it's ever enqueued) means the newer
+                // sibling simply never starts until the older one has merged, instead of both
+                // starting, one burning iterations, then discovering the conflict at write time.
+                var sequenced = await AutoSequenceOverlappingSiblingsAsync(child, children, ct).ConfigureAwait(false);
+
+                if (!await IsReadyToEnqueueAsync(sequenced, ct).ConfigureAwait(false))
                     continue;
 
-                await RefreshBranchFromDependenciesAsync(child, ct).ConfigureAwait(false);
+                await RefreshBranchFromDependenciesAsync(sequenced, ct).ConfigureAwait(false);
 
-                if (await EnqueueChildWorkerAsync(child, parentWorkUnitId, creds, sessionId, ct).ConfigureAwait(false))
+                if (await EnqueueChildWorkerAsync(sequenced, parentWorkUnitId, creds, sessionId, ct).ConfigureAwait(false))
                 {
                     actions.Add(FanOutAction.ChildEnqueued);
-                    enqueued.Add(child.WorkUnitId);
+                    enqueued.Add(sequenced.WorkUnitId);
                 }
             }
         }
@@ -217,9 +224,12 @@ public sealed class FanOutService : IFanOutService
                 // Bug fix — a fanned-out child previously always got CreateWorkUnitAsync's own
                 // default (ReviewPolicy.HumanRequired), regardless of what the parent goal's
                 // ReviewPolicy/BypassPromotionBranch were actually set to (e.g. via the Goal
-                // Workspace "Agent Approval" radio button) — reviewPolicy/bypassPromotionBranch
+                // Workspace "Task Review" radio button) — reviewPolicy/bypassPromotionBranch
                 // were simply never passed here. A child slice should inherit its parent's chosen
-                // review policy/merge target, not silently revert to the human-required default.
+                // task review policy/merge target, not silently revert to the human-required
+                // default. Children never need WorkspaceReviewPolicy — that field only ever gates
+                // the top-level goal's own apply into the real on-disk repo, and a child is never
+                // top-level.
                 var child = await _orchestrator.CreateWorkUnitAsync(
                     slice.Goal,
                     parent.Owner,
@@ -228,7 +238,8 @@ public sealed class FanOutService : IFanOutService
                     fileScope: slice.FileScope,
                     seedFromBranchId: parent.BranchId,
                     sliceId: slice.SliceId,
-                    reviewPolicy: parent.ReviewPolicy,
+                    taskReviewPolicy: parent.TaskReviewPolicy,
+                    taskReviewHybridTimeoutMinutes: parent.TaskReviewHybridTimeoutMinutes,
                     bypassPromotionBranch: parent.BypassPromotionBranch,
                     cancellationToken: ct).ConfigureAwait(false);
 
@@ -245,6 +256,85 @@ public sealed class FanOutService : IFanOutService
         return created;
     }
 
+    // Statuses where a sibling's file-scope claim no longer matters — either its content has
+    // already landed (Merged, so a fresh dependsOn edge onto it is what a NEW overlapping sibling
+    // needs anyway) or it never will (Cancelled). Everything else (Created, Queued, Executing,
+    // Proposed, Reviewing, DeadLettered, Retrying) is still "in flight" from a collision-avoidance
+    // point of view — DeadLettered in particular may yet be retried/continued and land later, so
+    // it still counts as a live claim on its files.
+    private static readonly HashSet<WorkUnitStatus> DoesNotNeedSequencing =
+        [WorkUnitStatus.Merged, WorkUnitStatus.Cancelled];
+
+    // Auto-inserts a dependsOn edge instead of the old NonOverlappingFileScopeRule's flat reject —
+    // a planning gap (two sibling slices sharing a file, no dependsOn declared between them) is
+    // cheap to fix here, before either one is ever enqueued, versus catching it at the file lease
+    // after one side has already burned iterations getting to the conflicting write. Only ever
+    // makes the NEWER of an overlapping pair depend on the OLDER one (a strict, deterministic
+    // total order by CreatedAt, tie-broken by WorkUnitId) — that alone rules out two siblings both
+    // trying to depend on each other in the same pass. The cycle check below additionally guards
+    // the cross-generation case (e.g. a re-planned sibling whose own dependency chain already
+    // reaches back to this one) — if that ever fires, this leaves the pair alone and lets the file
+    // lease serialize them at runtime instead, rather than forcing an edge that would deadlock.
+    private async Task<WorkUnit> AutoSequenceOverlappingSiblingsAsync(
+        WorkUnit child, IReadOnlyList<WorkUnit> siblings, CancellationToken ct)
+    {
+        if (child.FileScope.Count == 0)
+            return child;
+
+        var childScope = new HashSet<string>(child.FileScope.Select(NormalizePath), StringComparer.OrdinalIgnoreCase);
+        var current = child;
+
+        foreach (var sibling in siblings)
+        {
+            if (sibling.WorkUnitId == current.WorkUnitId) continue;
+            if (DoesNotNeedSequencing.Contains(sibling.Status)) continue;
+            if (sibling.FileScope.Count == 0) continue;
+            if (current.DependsOn.Contains(sibling.WorkUnitId)) continue;
+
+            var overlaps = sibling.FileScope.Select(NormalizePath).Any(childScope.Contains);
+            if (!overlaps) continue;
+
+            var siblingIsOlder = sibling.CreatedAt < current.CreatedAt
+                || (sibling.CreatedAt == current.CreatedAt
+                    && string.CompareOrdinal(sibling.WorkUnitId, current.WorkUnitId) < 0);
+            if (!siblingIsOlder) continue;
+
+            if (await WouldCreateCycleAsync(sibling.WorkUnitId, current.WorkUnitId, ct).ConfigureAwait(false))
+                continue;
+
+            current = await _workUnits.AddDependencyAsync(current.WorkUnitId, sibling.WorkUnitId, ct)
+                .ConfigureAwait(false);
+        }
+
+        return current;
+    }
+
+    // True if candidateDependencyId's own DependsOn chain already reaches targetWorkUnitId —
+    // meaning "targetWorkUnitId depends on candidateDependencyId" would close a cycle.
+    private async Task<bool> WouldCreateCycleAsync(
+        string candidateDependencyId, string targetWorkUnitId, CancellationToken ct)
+    {
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        var queue = new Queue<string>();
+        queue.Enqueue(candidateDependencyId);
+
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            if (!visited.Add(current)) continue;
+            if (current == targetWorkUnitId) return true;
+
+            var unit = await _workUnits.GetAsync(current, ct).ConfigureAwait(false);
+            if (unit is null) continue;
+            foreach (var dep in unit.DependsOn)
+                queue.Enqueue(dep);
+        }
+
+        return false;
+    }
+
+    private static string NormalizePath(string path) => path.Replace('\\', '/');
+
     private async Task<bool> IsReadyToEnqueueAsync(WorkUnit child, CancellationToken ct)
     {
         if (child.Status is not WorkUnitStatus.Created)
@@ -256,14 +346,35 @@ public sealed class FanOutService : IFanOutService
             if (dep is null)
                 return false;
 
-            // Phase 12 — Proposed only means a proposal exists and is awaiting review; its
-            // content isn't real yet. A dependent must not start until its dependency's output
-            // has actually landed, same reasoning as the file-lease queue's merge-gated release.
-            if (dep.Status is not WorkUnitStatus.Merged)
+            if (!await IsDependencyContentReadyAsync(dep, ct).ConfigureAwait(false))
                 return false;
         }
 
         return true;
+    }
+
+    // A dependent must not start until its dependency's output is real — but "real" only ever
+    // meant "review has signed off," not "already merged into the target branch." Requiring
+    // WorkUnitStatus.Merged made a dependent wait for the same all-siblings-simultaneous merge
+    // batch that MergeReconciliationService's staggered-arrival design deliberately doesn't
+    // require (see StaggeredChildCompletionTests) — Agent Approval mode existed specifically to
+    // let a dependent begin as soon as review passed, and a human clicking Approve is the same
+    // signal. RefreshBranchFromDependenciesAsync below already seeds the dependent's branch by
+    // copying the dependency's own branch content (not the merged target), so an Approved-but-
+    // not-yet-merged proposal is already safe to build on.
+    private async Task<bool> IsDependencyContentReadyAsync(WorkUnit dep, CancellationToken ct)
+    {
+        if (dep.Status is WorkUnitStatus.Merged)
+            return true;
+
+        var chain = await _artifacts.GetChainAsync(dep.WorkUnitId, ct).ConfigureAwait(false);
+        var proposalRef = chain.LastOrDefault(a => a.Type == ArtifactType.MergeProposal);
+        if (proposalRef is null)
+            return false;
+
+        var proposal = await _merge.GetAsync(proposalRef.ArtifactId, ct).ConfigureAwait(false);
+        return proposal is not null
+            && proposal.Status is MergeProposalStatus.Approved or MergeProposalStatus.Merged;
     }
 
     // Phase 12 — every child's branch is seeded once from parent.BranchId at fan-out time
@@ -355,21 +466,12 @@ public sealed class FanOutService : IFanOutService
                 UsedLlm: false)
             : await _profileSelection.SelectProfileAsync(child, creds, ct).ConfigureAwait(false);
 
-        // Slice 14b — built here (rather than inside a rule) so IPolicyRule implementations like
-        // NonOverlappingFileScopeRule don't need their own IWorkUnitService dependency.
-        var siblings = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
-        var activeSiblings = siblings
-            .Where(s => s.WorkUnitId != child.WorkUnitId)
-            .Select(s => new FileScopeSibling(s.WorkUnitId, s.FanOutInfo?.SliceId, s.Status, s.FileScope))
-            .ToList();
-
         var policyContext = new Dictionary<string, object?>
         {
             ["workUnitId"] = child.WorkUnitId,
             ["parentWorkUnitId"] = parentWorkUnitId,
             ["goal"] = child.Goal,
             ["fileScope"] = child.FileScope,
-            ["activeSiblings"] = activeSiblings,
         };
         var policyResult = await _policyGate
             .EvaluateAsync(PolicyCheckpoint.BeforeEnqueue, policyContext, ct)
@@ -413,6 +515,7 @@ public sealed class FanOutService : IFanOutService
             creds?.ApiKey,
             creds?.Provider,
             sessionId,
+            creds?.CredentialRef,
             ct).ConfigureAwait(false);
 
         // Slice 12d — fan-out child enqueue previously had no decision-log entry at all (it

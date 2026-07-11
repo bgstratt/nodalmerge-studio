@@ -20,9 +20,17 @@ public sealed class ContinueService(
     IDeadLetterService deadLetter,
     IWorkUnitService workUnits,
     IAgentControlService agentControl,
-    IServiceProvider serviceProvider) : IContinueService
+    IServiceProvider serviceProvider,
+    IRuntimeCredentialCache? credentialCache = null) : IContinueService
 {
-    public async Task<ContinueResult> ContinueWithPriorContextAsync(string entryId, CancellationToken cancellationToken = default)
+    public async Task<ContinueResult> ContinueWithPriorContextAsync(
+        string entryId,
+        string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default)
     {
         var entry = await deadLetter.GetAsync(entryId, cancellationToken).ConfigureAwait(false);
         if (entry is null)
@@ -40,14 +48,39 @@ public sealed class ContinueService(
         if (workUnit is null)
             return new ContinueResult(ContinueOutcome.NotFound, "Work unit not found.");
 
-        // The dead-lettered run's own captured credentials are the natural source — this resumes
-        // the exact same run, not a fresh spawn — falling back to the live registry only for
-        // legacy entries recorded before credential capture existed.
-        var model = entry.Model;
-        var baseUrl = entry.BaseUrl;
-        var apiKey = entry.ApiKey;
-        var provider = entry.Provider;
-        if (string.IsNullOrWhiteSpace(baseUrl))
+        // Resolved in the same tiered order as InMemoryDeadLetterService.ResolveRetryCredentials:
+        // an explicit override (a caller resupplying live credentials, e.g. after a Host restart)
+        // takes top priority; then the dead-lettered run's own captured credentials (this resumes
+        // the exact same run, not a fresh spawn); then IRuntimeCredentialCache via the entry's own
+        // CredentialRef, which is the only tier that can still be warm post-restart; then the live
+        // orchestrator registry, for legacy entries recorded before credential capture existed.
+        // Each tier is checked via "apiKey is null", not IsNullOrWhiteSpace — a vscode-lm profile
+        // legitimately captures apiKey as "" (no real secret, see LlmApiProxy), which must count as
+        // present; only null (never captured, or wiped by DeadLetterEntry.ApiKey's [JsonIgnore]
+        // surviving a restart) means "keep looking." A baseUrl-only check would make the same
+        // mistake in the other direction — Model/BaseUrl/Provider are still persisted plaintext, so
+        // after a restart wipes just the key, baseUrl alone looks present and the resolution would
+        // stop too early, proceeding into a real LLM call with an empty ApiKey.
+        string? model = overrideModel, baseUrl = overrideBaseUrl, apiKey = overrideApiKey, provider = overrideProvider;
+        if (apiKey is null)
+        {
+            model = entry.Model;
+            baseUrl = entry.BaseUrl;
+            apiKey = entry.ApiKey;
+            provider = entry.Provider;
+        }
+        if (apiKey is null)
+        {
+            var cached = credentialCache?.TryGet(overrideCredentialRef ?? entry.CredentialRef);
+            if (cached is not null)
+            {
+                model = cached.Model;
+                baseUrl = cached.BaseUrl;
+                apiKey = cached.ApiKey;
+                provider = cached.Provider;
+            }
+        }
+        if (apiKey is null)
         {
             var creds = agentControl.GetCredentialsForStage(entry.WorkUnitId, entry.Stage)
                 ?? agentControl.GetOrchestratorCredentials(entry.WorkUnitId);
@@ -57,43 +90,103 @@ public sealed class ContinueService(
             provider = creds?.Provider;
         }
 
-        if (string.IsNullOrWhiteSpace(baseUrl))
+        if (string.IsNullOrWhiteSpace(baseUrl) || apiKey is null)
             return new ContinueResult(ContinueOutcome.NotCompleted, "No LLM credentials resolvable for this work unit.");
 
+        var resolvedCredentialRef = overrideCredentialRef ?? entry.CredentialRef;
+        credentialCache?.Capture(resolvedCredentialRef, provider, model, baseUrl, apiKey);
+
         var conversationLog = serviceProvider.GetRequiredService<IConversationLogService>();
-        var priorEntries = (await conversationLog.GetEntriesAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false))
-            .Where(e => e.AgentId == entry.AgentId)
-            .OrderBy(e => e.CycleNumber)
-            .ToList();
-        var priorTurns = ReconstructTurns(priorEntries);
+        var isReview = entry.Stage == PipelineStage.Review;
 
-        await workUnits.UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Retrying, sessionId: null, cancellationToken)
-            .ConfigureAwait(false);
-
-        var agentId = $"worker-continue-{Guid.NewGuid():N}";
         var dispatcher = serviceProvider.GetRequiredService<McpToolDispatcher>();
         var llm = serviceProvider.GetRequiredService<LlmClient>();
         var events = serviceProvider.GetService<IExecutionEventStream>();
         var logger = serviceProvider.GetService<ILogger<ContinueService>>();
         var agentClient = new DefaultAgentToolClient(provider ?? "anthropic", model ?? string.Empty, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
 
-        var loop = new WorkerAgentLoop(
-            agentId, entry.WorkUnitId, entry.TaskId ?? string.Empty, agentClient,
-            isResume: true, conversationLog: conversationLog, events: events,
-            priorTurns: priorTurns, logger: logger);
+        // Shared by both branches — reconstructs the exact turns the dead-lettered agent itself
+        // produced (see ReconstructTurns), so the resumed loop picks up its own prior investigation
+        // instead of starting cold. Live evidence (2026-07-10): without this, a Review-stage Continue
+        // re-ran nm_v1_projection_get / nm_v1_workunit_get / nm_v1_workspace_diff / file reads from
+        // scratch every time, burning the whole fresh budget re-deriving context it already had and
+        // never reaching a decision — 3 consecutive attempts, 3 consecutive MaxIterationsExceeded.
+        var priorEntries = (await conversationLog.GetEntriesAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false))
+            .Where(e => e.AgentId == entry.AgentId)
+            .OrderBy(e => e.CycleNumber)
+            .ToList();
+        var priorTurns = ReconstructTurns(priorEntries);
 
-        var completion = await loop.RunAsync(cancellationToken).ConfigureAwait(false);
+        var agentId = isReview ? $"reviewer-continue-{Guid.NewGuid():N}" : $"worker-continue-{Guid.NewGuid():N}";
+        AgentLoopCompletion completion;
+        if (isReview)
+        {
+            // A dead-lettered Review-stage entry's TaskId holds the proposalId being reviewed (see
+            // InlineReviewerService.RecordFailureAsync), not a task to execute — mirrors the
+            // scheduler's own dequeue-path branch (InMemoryAgentRuntimeService, PipelineStage.Review
+            // case), which is the only other place a ReviewerAgentLoop gets spawned from a dead-
+            // letter-adjacent retry. Work-unit status is deliberately left untouched here too,
+            // matching the scheduler path: it's the nm_v1_merge_review tool call itself that drives
+            // the outcome, not a status flip around the loop.
+            var reviewerLoop = new ReviewerAgentLoop(
+                agentId, entry.WorkUnitId, entry.TaskId ?? string.Empty, agentClient,
+                conversationLog: conversationLog, events: events, priorTurns: priorTurns, logger: logger);
+            completion = await reviewerLoop.RunAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await workUnits.UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Retrying, sessionId: null, cancellationToken)
+                .ConfigureAwait(false);
+
+            var workerLoop = new WorkerAgentLoop(
+                agentId, entry.WorkUnitId, entry.TaskId ?? string.Empty, agentClient,
+                isResume: true, conversationLog: conversationLog, events: events,
+                priorTurns: priorTurns, logger: logger);
+            completion = await workerLoop.RunAsync(cancellationToken).ConfigureAwait(false);
+        }
 
         if (completion == AgentLoopCompletion.Succeeded)
         {
-            try
+            if (!isReview)
             {
-                await workUnits.UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Executing, sessionId: null, cancellationToken)
-                    .ConfigureAwait(false);
+                try
+                {
+                    await workUnits.UpdateStatusAsync(entry.WorkUnitId, WorkUnitStatus.Executing, sessionId: null, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (InvalidOperationException) { /* the agent's own tool calls (task.update, merge.propose) may have already moved it further */ }
             }
-            catch (InvalidOperationException) { /* the agent's own tool calls (task.update, merge.propose) may have already moved it further */ }
 
             return new ContinueResult(ContinueOutcome.Continued, Completion: completion);
+        }
+
+        // Neither of these is the agent's own fault — a lease held by another active sibling, or
+        // a human clarification request — so unlike the generic NotCompleted path below, don't
+        // burn one of the work unit's limited MaxFailureAttempts recording a fresh dead-letter
+        // entry for pure infrastructure contention. This loop ran outside the scheduler entirely
+        // (RunAsync above, not scheduler.TryAcquireAsync), so there's no existing queue entry for
+        // MarkAwaitingFileLeaseAsync to park — enqueue first to create one, then park it. Once
+        // IFileLeaseService's release-and-advance hook (or a human clarification response) clears
+        // it, the normal scheduler poll picks it up as a fresh scheduled run (isResume:true from
+        // AttemptCount > 0, not this call's reconstructed prior-turns context — the conversation
+        // was already resumed once to get here).
+        if (completion is AgentLoopCompletion.AwaitingFileLease or AgentLoopCompletion.AwaitingClarification)
+        {
+            var scheduler = serviceProvider.GetRequiredService<IWorkScheduler>();
+            await scheduler.EnqueueAsync(
+                entry.WorkUnitId, entry.ProfileId, taskId: entry.TaskId,
+                model: model, baseUrl: baseUrl, apiKey: apiKey, provider: provider,
+                sessionId: null, credentialRef: resolvedCredentialRef, ct: cancellationToken).ConfigureAwait(false);
+
+            if (completion == AgentLoopCompletion.AwaitingFileLease)
+                await scheduler.MarkAwaitingFileLeaseAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
+
+            return new ContinueResult(
+                ContinueOutcome.Parked,
+                completion == AgentLoopCompletion.AwaitingFileLease
+                    ? "Continue hit a file lease held by another active work unit — parked, will resume automatically once it's released."
+                    : "Continue requested a human clarification — parked, will resume once it's answered.",
+                completion);
         }
 
         // Didn't finish again — record a fresh dead-letter entry with the same Kind so Continue
@@ -113,6 +206,7 @@ public sealed class ContinueService(
             apiKey: apiKey,
             provider: provider,
             kind: FailureKind.MaxIterationsExceeded,
+            credentialRef: resolvedCredentialRef,
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
         return new ContinueResult(

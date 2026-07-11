@@ -3,6 +3,66 @@
 // nonce for the whole document; this module holds the bits that used to be copy-pasted across
 // MergeReviewPanel.ts, AgentConfigPanel.ts, and WorkspaceDashboardPanel.ts.
 
+import * as vscode from 'vscode';
+
+// ── Read-only diff viewer ────────────────────────────────────────────────────
+//
+// "Open Diff in Editor" used to open two vscode.workspace.openTextDocument({content})
+// buffers — untitled, in-memory documents with no backing file. VS Code lets you type
+// into those, which looked editable but silently went nowhere on save (no connection
+// back to the branch). Routing both sides through a registered content-provider scheme
+// instead makes them genuinely read-only, the same mechanism VS Code's own Git extension
+// uses for historical revisions — there's no edit provider for this scheme, so VS Code
+// refuses edits outright instead of accepting and discarding them.
+//
+// Originally private to MergeReviewPanel.ts; moved here (plans/pathways-workspace-history.md
+// slice 2 fast-follow) so DagReplayPanel.ts can open the same read-only diff for a Pathways
+// node without a second competing registerTextDocumentContentProvider call for the same
+// scheme — VS Code only allows one registration per scheme per extension.
+export const NM_DIFF_SCHEME = 'nodalmerge-diff';
+
+class ReadOnlyDiffContentProvider implements vscode.TextDocumentContentProvider {
+  private readonly contents = new Map<string, string>();
+
+  set(uri: vscode.Uri, content: string): void {
+    this.contents.set(uri.toString(), content);
+  }
+
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    return this.contents.get(uri.toString()) ?? '';
+  }
+}
+
+let diffProvider: ReadOnlyDiffContentProvider | undefined;
+export function getDiffProvider(): ReadOnlyDiffContentProvider {
+  if (!diffProvider) {
+    diffProvider = new ReadOnlyDiffContentProvider();
+    vscode.workspace.registerTextDocumentContentProvider(NM_DIFF_SCHEME, diffProvider);
+  }
+  return diffProvider;
+}
+
+// Shared "open two read-only buffers as a diff" action — same nonce-per-call convention as the
+// original MergeReviewPanel implementation: registerTextDocumentContentProvider content is
+// looked up by URI, so reusing one across repeat "View Diff" clicks on the same path would show
+// whatever the *last* set() call for that path wrote, not necessarily this one.
+export async function openReadOnlyDiff(filePath: string, before: string, after: string): Promise<void> {
+  const provider = getDiffProvider();
+  const nonce = Date.now().toString(36);
+  const leftUri = vscode.Uri.parse(`${NM_DIFF_SCHEME}:/${nonce}/base/${filePath}`);
+  const rightUri = vscode.Uri.parse(`${NM_DIFF_SCHEME}:/${nonce}/proposed/${filePath}`);
+  provider.set(leftUri, before);
+  provider.set(rightUri, after);
+  const title = filePath + ' (base ↔ proposed, read-only)';
+  // Explicit, non-preview, beside the Studio panel's own column — a bare vscode.diff call
+  // defaults to a preview tab, which a second "View Diff" click would silently reuse/replace
+  // instead of opening its own tab (and could otherwise land in the Studio panel's own column).
+  await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title, {
+    preview: false,
+    viewColumn: vscode.ViewColumn.Beside,
+  });
+}
+
 export function buildNonce(): string {
   let text = '';
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -34,8 +94,17 @@ export function scopeViewCss(css: string, containerId: string): string {
   // `height: 100vh` is dropped, not translated to `:scope`'s height — the container is already
   // sized to fill its tab pane via the shell's own `position: absolute; inset: 0` (StudioShellPanel
   // CSS), and an explicit 100vh here would override that and overflow past the tab bar.
+  //
+  // Same problem, same fix, for `:root { --nm-*: ...; }`: every view defines its own `--nm-fg`/
+  // `--nm-input-bdr`/etc. custom-property palette on :root, assuming it owned the document. :root
+  // only ever matches <html>, which is never a descendant of the container div either — so every
+  // one of these blocks was silently matching nothing once wrapped in @scope, meaning none of a
+  // view's --nm-* custom properties were ever actually set (var() references with no fallback just
+  // went invalid). Rewriting to :scope makes the container div itself carry the properties, which
+  // then inherit normally to every descendant, exactly like :root does for the whole document.
   const scoped = css
     .replace(/(^|\}|\s)body(\s*\{)/g, '$1:scope$2')
+    .replace(/(^|\}|\s):root(\s*\{)/g, '$1:scope$2')
     .replace(/height:\s*100vh;?/g, '');
   return `@scope (#${containerId}) {\n${scoped}\n}`;
 }
@@ -55,20 +124,49 @@ export const SHELL_CSS_VARS = `
     --nm-btn:        var(--vscode-button-background);
     --nm-btn-fg:     var(--vscode-button-foreground);
     --nm-btn-hover:  var(--vscode-button-hoverBackground);
+    --nm-input-bg:   var(--vscode-input-background, #3c3c3c);
+    --nm-input-fg:   var(--vscode-input-foreground, #ccc);
+    /* Many themes leave --vscode-input-border unset (flat input design) or set it equal to the
+       background, either of which reads as "no separation" against the surrounding UI. Derive a
+       subtle border from the foreground color instead, so there's always some visible contrast
+       regardless of what the active theme does with inputBorder. */
+    --nm-input-bdr:  color-mix(in srgb, var(--nm-fg) 25%, transparent);
     --nm-font:       var(--vscode-font-family);
     --nm-mono:       var(--vscode-editor-font-family, monospace);
     --nm-size:       var(--vscode-font-size, 13px);
     --nm-success:    #4dac26;
     --nm-warn:       #cca700;
     --nm-error:      #f14c4c;
+    --nm-info:       var(--vscode-textLink-foreground, #3794ff);
   }
   * { box-sizing: border-box; }
   html, body {
     background: var(--nm-bg); color: var(--nm-fg);
     font-family: var(--nm-font); font-size: var(--nm-size);
     margin: 0; padding: 0; height: 100%; overflow: hidden;
+    /* VS Code's default webview stylesheet sets body { user-select: none } to make webviews feel
+       like native UI — but this shell is full of content a human needs to copy out (goal text,
+       agent conversation, rejection reasons, work unit ids). Re-enable selection everywhere and
+       opt the chrome (buttons/tabs) back out below. */
+    user-select: text; -webkit-user-select: text;
   }
   body { display: flex; flex-direction: column; }
+  button, .nm-shell-tab, .badge { user-select: none; -webkit-user-select: none; }
+  /* Shared, theme-correct base for every view's native form controls. A view can still override
+     these locally (its own scoped rule wins over this unscoped one at equal specificity — see
+     CSS scoping proximity), but views that don't bother get sane non-white, bordered defaults
+     instead of raw browser UA styling. */
+  select, textarea, input[type=text] {
+    background: var(--nm-input-bg); color: var(--nm-input-fg); border: 1px solid var(--nm-input-bdr);
+    border-radius: 3px; padding: 4px 6px; font-family: var(--nm-font); font-size: 0.9em;
+  }
+  button {
+    background: var(--nm-btn); color: var(--nm-btn-fg); border: 1px solid var(--nm-input-bdr);
+    border-radius: 3px; padding: 4px 10px; font-family: var(--nm-font); font-size: 0.9em; cursor: pointer;
+  }
+  button:hover { background: var(--nm-btn-hover); }
+  button.ghost { background: transparent; color: var(--nm-fg); border: 1px solid var(--nm-border); }
+  button.ghost:hover { background: color-mix(in srgb, var(--nm-border) 50%, transparent); }
   #nm-shell-tabbar {
     display: flex; flex-shrink: 0;
     border-bottom: 1px solid var(--nm-border);

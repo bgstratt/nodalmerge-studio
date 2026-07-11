@@ -42,6 +42,38 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
             }
         }
 
+        // ── Fan-out child target-branch override ─────────────────────────────────
+        // A fan-out child (or generic experiment fork) must never propose directly against "main"
+        // — regardless of what targetBranch the agent passed — because its own auto-apply (for
+        // TaskReviewPolicy.AgentApproval/Hybrid, triggered below) would otherwise land unreviewed
+        // content onto the shared canonical branch before the goal's WorkspaceReviewPolicy gate
+        // ever runs, and would make MergeReconciliationService's own mergeBranch-vs-main diff come
+        // back empty for whatever that child already landed there directly. Redirect it onto the
+        // same merge/{parentWorkUnitId} scratch branch MergeReconciliationService itself builds —
+        // InitBranchAsync no-ops if that branch already exists, so this is safe to call from every
+        // sibling's own ProposeAsync, whichever one happens to run first seeds it from "main".
+        // Only the reconciled proposal (owned by the top-level goal, built directly via
+        // IMergeService.ProposeAsync — never through this method) is allowed to target "main".
+        WorkUnit? proposingWorkUnit = null;
+        if (workUnitId is not null && workUnits is not null)
+            proposingWorkUnit = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false);
+
+        var effectiveTargetBranch = targetBranch;
+        if (proposingWorkUnit is not null && !WorkspaceReviewScope.AppliesToRealRepo(proposingWorkUnit))
+        {
+            var parentWorkUnitId = proposingWorkUnit.ParentWorkUnitId!;
+            effectiveTargetBranch = $"merge/{parentWorkUnitId}";
+
+            // Seed from the parent goal's own branch, not literal "main" — that's what every child
+            // was itself seeded from (FanOutService.EnsureChildWorkUnitsAsync), and it can already
+            // contain pre-fan-out setup work (e.g. a plan.json the orchestrator wrote) that main
+            // doesn't have yet. Seeding from bare "main" would make every file only the parent
+            // branch has look like an "add" nobody actually proposed.
+            var parentWorkUnit = await workUnits!.GetAsync(parentWorkUnitId, cancellationToken).ConfigureAwait(false);
+            await fileWorkspace.InitBranchAsync(effectiveTargetBranch, seedFromBranchId: parentWorkUnit?.BranchId ?? "main", ct: cancellationToken)
+                .ConfigureAwait(false);
+        }
+
         // ── Slice 16g — ProposalCreated policy gate ──────────────────────────────
         BranchExecutionResult? execResult = null;
         if (policyGate is not null)
@@ -71,7 +103,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
 
                 var blockedProposal = new MergeProposal(
                     $"MP-{Guid.NewGuid():N}",
-                    sourceBranch, targetBranch,
+                    sourceBranch, effectiveTargetBranch,
                     goal ?? summary, summary, changeDescription ?? summary,
                     blockedVerification, null, null,
                     MergeProposalStatus.Rejected,  // blocked policies result in Rejected
@@ -99,7 +131,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
         DateTimeOffset? diffGeneratedAt = null;
         try
         {
-            workspaceChanges = await fileWorkspace.DiffAsync(sourceBranch, targetBranch, cancellationToken).ConfigureAwait(false);
+            workspaceChanges = await fileWorkspace.DiffAsync(sourceBranch, effectiveTargetBranch, cancellationToken).ConfigureAwait(false);
             diffGeneratedAt  = DateTimeOffset.UtcNow;
         }
         catch { /* branch dirs may not exist yet; diff is best-effort */ }
@@ -122,11 +154,9 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
         if (filesTouched.Count == 0
             && workspaceOptions is { EnforceExpectedOutputKind: true }
             && string.IsNullOrWhiteSpace(noFileChangesJustification)
-            && workUnitId is not null
-            && workUnits is not null)
+            && proposingWorkUnit is not null)
         {
-            var owningWorkUnit = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false);
-            if (owningWorkUnit?.ExpectedOutputKind == WorkUnitExpectedOutputKind.FileChange)
+            if (proposingWorkUnit.ExpectedOutputKind == WorkUnitExpectedOutputKind.FileChange)
             {
                 const string noChangesMessage =
                     "No file changes were detected and this task expects FileChange output. Call " +
@@ -134,7 +164,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
                     "noFileChangesJustification explaining why no changes were needed.";
                 var rejectedProposal = new MergeProposal(
                     $"MP-{Guid.NewGuid():N}",
-                    sourceBranch, targetBranch,
+                    sourceBranch, effectiveTargetBranch,
                     goal ?? summary, summary, noChangesMessage,
                     null, null, null,
                     MergeProposalStatus.Rejected,
@@ -171,7 +201,7 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
         var proposal = new MergeProposal(
             proposalId,
             sourceBranch,
-            targetBranch,
+            effectiveTargetBranch,
             goal ?? summary,
             summary,
             changeDescription ?? summary,
@@ -257,13 +287,50 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
             if (workUnits is not null)
             {
                 var wu = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false);
-                if (wu?.ReviewPolicy is ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid)
+                // See WorkspaceReviewScope — work units whose apply can reach the real repo (top-level
+                // goals, plus any work unit explicitly linked to its own RepositoryId) are gated by
+                // WorkspaceReviewPolicy; everything else by TaskReviewPolicy.
+                var effectivePolicy = WorkspaceReviewScope.AppliesToRealRepo(wu) ? wu?.WorkspaceReviewPolicy : wu?.TaskReviewPolicy;
+                if (effectivePolicy is ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid)
                 {
                     var proposalIdToApply = created.ProposalId;
+                    var workUnitIdForFailure = workUnitId;
+                    var sessionIdForFailure = sessionId;
                     _ = Task.Run(async () =>
                     {
-                        try { await ApplyAsync(proposalIdToApply, CancellationToken.None, autoApplied: true).ConfigureAwait(false); }
-                        catch { /* reviewer rejection or gate block — proposal stays in current state */ }
+                        try
+                        {
+                            await ApplyAsync(proposalIdToApply, CancellationToken.None, autoApplied: true).ConfigureAwait(false);
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            // Expected: reviewer rejection or gate block. AutomatedReviewGateService
+                            // already dead-letters its own terminal rejections, and the proposal
+                            // status reflects the outcome — nothing further to do here.
+                        }
+                        catch (Exception ex)
+                        {
+                            // Unexpected — anything that never reached the gate's own accounting
+                            // (a crash mid-review, a transient LLM/tool failure, etc.) used to vanish
+                            // silently here, leaving the proposal stuck at ReadyForReview forever with
+                            // no trace anywhere. Record it so it's visible and retryable instead.
+                            var deadLetterForFailure = serviceProvider.GetService(typeof(IDeadLetterService)) as IDeadLetterService;
+                            if (deadLetterForFailure is not null)
+                            {
+                                try
+                                {
+                                    await deadLetterForFailure.RecordFailureAsync(
+                                        workUnitIdForFailure,
+                                        agentId: "auto-review-gate",
+                                        stage: PipelineStage.Review,
+                                        profileId: "reviewer",
+                                        reason: $"Auto-apply for proposal {proposalIdToApply} failed unexpectedly: {ex.Message}",
+                                        sessionId: sessionIdForFailure,
+                                        kind: FailureKind.Exception).ConfigureAwait(false);
+                                }
+                                catch { /* best-effort — never let failure recording itself throw */ }
+                            }
+                        }
                     });
                 }
             }
@@ -299,9 +366,13 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
                 await timerService.TryCancelAsync(proposalId, cancellationToken).ConfigureAwait(false);
         }
 
+        // The reconciliation re-trigger for a fanned-out child clearing its TaskReviewPolicy gate
+        // lives in InMemoryMergeService itself (TryRetriggerParentReconciliationAsync) — it fires
+        // uniformly whether ReviewAsync/AutomatedReviewAsync is reached through this wrapper, the
+        // MCP tools, or IMergeService directly.
         return automated
             ? await merge.AutomatedReviewAsync(proposalId, status, verificationResults ?? string.Empty, reviewerAgentId, consideredArtifactIds, cancellationToken).ConfigureAwait(false)
-            : await merge.ReviewAsync(proposalId, status, notes, cancellationToken).ConfigureAwait(false);
+            : await merge.ReviewAsync(proposalId, status, notes, reviewedBy: null, cancellationToken).ConfigureAwait(false);
     }
 
     // Slice 20b — BeforeMerge gate. For AgentApproval/Hybrid policies the AutoReviewRule runs the

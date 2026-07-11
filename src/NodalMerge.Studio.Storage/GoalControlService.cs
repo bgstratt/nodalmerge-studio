@@ -8,16 +8,47 @@ public sealed class GoalControlService(
     IAgentControlService agentControl,
     IExecutionSessionService sessions,
     ISchedulerCommandService scheduler,
-    IExecutionEventStream events) : IGoalControlService
+    IExecutionEventStream events,
+    IWorkUnitService workUnits) : IGoalControlService
 {
+    // A GoalNode only exists for goals created through the specific entry points that call
+    // IGoalNodeService.RecordAsync (the /studio/goals create endpoint, and the external/internal
+    // goal-start MCP tools) — a goal spawned any other way (direct work-unit creation + agent
+    // spawn, e.g. an eval harness posting straight to /studio/workunits + /studio/agents/spawn)
+    // has no GoalNode at all, and GET /studio/goals silently falls back to synthesizing read-only
+    // pseudo-goals from WorkUnit for display. Pause/Resume need a real, persisted GoalNode to set
+    // Status/PauseReason on, so — rather than 404 for every goal that happens to have been created
+    // outside those specific paths — synthesize and persist one here on first use, using the exact
+    // same convention (GoalId == WorkUnitId) the create endpoint and the read-only fallback share.
+    private async Task<GoalNode> GetOrSynthesizeAsync(string goalId, CancellationToken ct)
+    {
+        var goal = await goalNodes.GetAsync(goalId, ct).ConfigureAwait(false);
+        if (goal is not null)
+            return goal;
+
+        var workUnit = await workUnits.GetAsync(goalId, ct).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException($"Goal '{goalId}' not found.");
+
+        var synthesized = new GoalNode(
+            GoalId: workUnit.WorkUnitId,
+            Goal: workUnit.Goal,
+            WorkUnitId: workUnit.WorkUnitId,
+            BranchId: workUnit.BranchId,
+            Status: GoalStatus.Exploring,
+            CreatedAt: workUnit.CreatedAt,
+            UpdatedAt: workUnit.UpdatedAt,
+            Owner: workUnit.Owner,
+            ParentGoalId: workUnit.ParentWorkUnitId);
+        return await goalNodes.RecordAsync(synthesized, ct).ConfigureAwait(false);
+    }
+
     public async Task<GoalNode> PauseAsync(
         string goalId,
         string? reason = null,
         string? pausedBy = null,
         CancellationToken ct = default)
     {
-        var goal = await goalNodes.GetAsync(goalId, ct).ConfigureAwait(false)
-            ?? throw new KeyNotFoundException($"Goal '{goalId}' not found.");
+        var goal = await GetOrSynthesizeAsync(goalId, ct).ConfigureAwait(false);
 
         if (goal.Status is GoalStatus.Paused)
             return goal;
@@ -58,8 +89,7 @@ public sealed class GoalControlService(
         string? profileId = null,
         CancellationToken ct = default)
     {
-        var goal = await goalNodes.GetAsync(goalId, ct).ConfigureAwait(false)
-            ?? throw new KeyNotFoundException($"Goal '{goalId}' not found.");
+        var goal = await GetOrSynthesizeAsync(goalId, ct).ConfigureAwait(false);
 
         if (goal.Status is not GoalStatus.Paused)
             throw new InvalidOperationException($"Cannot resume a goal with status '{goal.Status}'. Only Paused goals can be resumed.");

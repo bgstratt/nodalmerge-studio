@@ -276,7 +276,7 @@ public sealed class ExternalGoalTools(
                 }
                 case "continue":
                 {
-                    var result = await continueService.ContinueWithPriorContextAsync(entry.EntryId, cancellationToken).ConfigureAwait(false);
+                    var result = await continueService.ContinueWithPriorContextAsync(entry.EntryId, cancellationToken: cancellationToken).ConfigureAwait(false);
                     return result.Outcome == ContinueOutcome.Continued
                         ? McpJson.Ok(new { goalId, action, outcome = result.Outcome.ToString() })
                         : McpJson.Error(McpServerToolNames.GoalRecover, result.Message ?? $"Continue failed: {result.Outcome}.");
@@ -322,6 +322,43 @@ public sealed class ExternalGoalTools(
         catch (Exception ex)
         {
             return McpJson.Error(McpServerToolNames.GoalCancel, ex.Message);
+        }
+    }
+
+    [McpServerTool(Name = McpServerToolNames.GoalRequeue)]
+    [Description("Un-cancel a previously cancelled goal and resume it — the inverse of nms_v1_goal_cancel. Leaf work units are re-queued for a worker; fan-out parents re-attempt reconciliation. Work units that finished before the cancel (Merged/Completed) are left untouched.")]
+    public async Task<string> RequeueAsync(
+        [Description("The goalId to requeue.")] string goalId,
+        [Description("Optional steering notes recorded as a Constraint artifact for the resumed work.")] string? notes = null,
+        [Description("Optional LLM credential overrides — a cancel/requeue cycle commonly spans a Host restart, which wipes the in-memory credential cache the inline reviewer and re-enqueued workers depend on.")] string? overrideModel = null,
+        string? overrideBaseUrl = null,
+        string? overrideApiKey = null,
+        string? overrideProvider = null,
+        string? overrideProfileId = null,
+        string? overrideCredentialRef = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var goal = await goalNodes.GetAsync(goalId, cancellationToken).ConfigureAwait(false);
+            if (goal is null)
+                return McpJson.Error(McpServerToolNames.GoalRequeue, $"Goal '{goalId}' not found.");
+
+            var requeued = await workUnitCommands.RequeueAsync(
+                goal.WorkUnitId, notes,
+                overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider,
+                overrideProfileId, overrideCredentialRef, cancellationToken).ConfigureAwait(false);
+            return McpJson.Ok(new
+            {
+                goalId,
+                workUnitId = goal.WorkUnitId,
+                requeuedWorkUnits = requeued.Count,
+                status = "requeued"
+            });
+        }
+        catch (Exception ex)
+        {
+            return McpJson.Error(McpServerToolNames.GoalRequeue, ex.Message);
         }
     }
 }

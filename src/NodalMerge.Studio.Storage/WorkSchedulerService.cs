@@ -18,6 +18,7 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
     private readonly IMergeService? _merge;
     private readonly IIntentGraphService? _intents;
     private readonly IExecutionSessionService? _sessions;
+    private readonly IRuntimeCredentialCache? _credentialCache;
 
     // IWorkUnitService is resolved lazily (via IServiceProvider) rather than constructor-injected:
     // its production implementation depends on IAgentControlService, which depends on IWorkScheduler
@@ -26,7 +27,9 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
     // and IArtifactLineageService) so it's constructor-injected directly. IExecutionSessionService is
     // likewise cycle-free, but kept optional (like Artifacts/Merge/Intents below) rather than required
     // so existing direct (non-DI) constructions in tests don't all need updating — when null, Phase
-    // 8b's pause check in TryAcquireAsync is simply skipped.
+    // 8b's pause check in TryAcquireAsync is simply skipped. IRuntimeCredentialCache is similarly
+    // optional and cycle-free — when null, credential capture/resolve is simply skipped, meaning a
+    // rehydrated item with no inline ApiKey parks AwaitingCredentials rather than silently resolving.
     public WorkSchedulerService(
         IStudioNodeStore nodeStore,
         IExecutionEventStream events,
@@ -35,7 +38,8 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
         IArtifactLineageService? artifacts = null,
         IMergeService? merge = null,
         IIntentGraphService? intents = null,
-        IExecutionSessionService? sessions = null)
+        IExecutionSessionService? sessions = null,
+        IRuntimeCredentialCache? credentialCache = null)
     {
         _nodeStore       = nodeStore;
         _events          = events;
@@ -45,6 +49,7 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
         _artifacts       = artifacts;
         _merge           = merge;
         _intents         = intents;
+        _credentialCache = credentialCache;
     }
 
     public async Task EnqueueAsync(
@@ -56,19 +61,53 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
         string? apiKey = null,
         string? provider = null,
         string? sessionId = null,
+        string? credentialRef = null,
         CancellationToken ct = default)
     {
+        // Shared capture point: whenever a fresh apiKey/baseUrl arrives alongside a credentialRef,
+        // warm the cache so a later rehydrated dispatch (or a different work unit sharing the same
+        // ref) can resolve it without the caller re-supplying it every time.
+        _credentialCache?.Capture(credentialRef, provider, model, baseUrl, apiKey);
+
         // Idempotent: track whether this is a new enqueue to avoid duplicate events.
         bool isNew = !_queue.ContainsKey(workUnitId);
+
+        // Guard against re-planning an already-fanned-out leaf slice — a work unit whose
+        // FanOutInfo.SliceId is set was itself produced by a parent's plan, so a Plan-stage
+        // profile enqueued directly against it (e.g. an orchestrator agent manually spawned onto
+        // a leaf, or any other caller of nm_v1_scheduler_enqueue) has nothing left to decompose
+        // and just spins up a redundant, confused planner run instead of executing. Genuine
+        // further decomposition of a leaf goes through IReplanService against its PARENT, which
+        // spawns fresh sibling slices rather than re-planning this same work unit in place.
+        // Mirrors LlmProfileSelectionService's own "only Execute-stage profiles are valid
+        // candidates for a fanned-out child worker" comment — this makes that invariant hold for
+        // every caller, not just the optional LLM-selection path.
+        var profileForGuard = await ResolveProfileAsync(profileId, ct).ConfigureAwait(false);
+        if (profileForGuard?.Stage == PipelineStage.Plan)
+        {
+            var workUnitsForGuard = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+            var target = workUnitsForGuard is not null
+                ? await workUnitsForGuard.GetAsync(workUnitId, ct).ConfigureAwait(false)
+                : null;
+            if (target?.FanOutInfo?.SliceId is not null)
+            {
+                throw new InvalidOperationException(
+                    $"Work unit '{workUnitId}' is already an atomic leaf slice (sliceId " +
+                    $"'{target.FanOutInfo.SliceId}') produced by a parent's plan — it cannot be " +
+                    "planned again directly. If it genuinely needs to be split further, dead-letter " +
+                    "it and use Re-plan on its parent instead of enqueuing a planner against this " +
+                    "work unit.");
+            }
+        }
 
         var conflict = await DetectConflictAsync(workUnitId, ct).ConfigureAwait(false);
 
         _queue.AddOrUpdate(
             workUnitId,
-            _ => new ScheduledItem(workUnitId, profileId, taskId, null, null, 0, model, baseUrl, apiKey, provider, sessionId, conflict),
+            _ => new ScheduledItem(workUnitId, profileId, taskId, null, null, 0, model, baseUrl, apiKey, provider, sessionId, conflict, CredentialRef: credentialRef),
             (_, existing) => existing.LeasedBy is not null
                 ? existing  // keep leased item unchanged
-                : existing with { ProfileId = profileId, TaskId = taskId, Model = model, BaseUrl = baseUrl, ApiKey = apiKey, Provider = provider, SessionId = sessionId, Conflict = conflict });
+                : existing with { ProfileId = profileId, TaskId = taskId, Model = model, BaseUrl = baseUrl, ApiKey = apiKey, Provider = provider, SessionId = sessionId, Conflict = conflict, CredentialRef = credentialRef });
 
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.SchedulerV1,
@@ -109,6 +148,14 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
                 }
             }
         }
+    }
+
+    private async Task<AgentProfile?> ResolveProfileAsync(string profileId, CancellationToken ct)
+    {
+        var profiles = _serviceProvider?.GetService(typeof(IAgentProfileService)) as IAgentProfileService;
+        return profiles is not null
+            ? await profiles.GetAsync(profileId, ct).ConfigureAwait(false)
+            : null;
     }
 
     // Pre-detects overlap from two independent sources, merged into one warning:
@@ -204,6 +251,12 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
             if (item.AwaitingFileLease)
                 continue;
 
+            // Skip items parked by RunScheduledWorkerAsync because dispatch needed a real ApiKey
+            // (rehydrated after a restart, with nothing cached for CredentialRef yet) until
+            // SupplyCredentialsAsync clears the flag via the Resume flow.
+            if (item.AwaitingCredentials)
+                continue;
+
             // Phase 8b — a paused session must actually stop new dispatch under it, not just
             // record a status flag (ExecutionSessionService.SetStatusAsync previously had no
             // effect on the scheduler at all).
@@ -290,6 +343,31 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
             await _workspaces.ArchiveAsync($"ws-{workUnitId}", sessionId, ct).ConfigureAwait(false);
 
             var orchestratorTarget = await ResolveOrchestratorWorkUnitIdAsync(workUnitId, ct).ConfigureAwait(false);
+
+            // A planner item runs ON the orchestrator's own work unit, so its "orchestrator
+            // target" is itself — ResolveOrchestratorWorkUnitIdAsync's parent-walk assumption is
+            // only right for worker/reviewer items, which run on child units. For any parented
+            // orchestrator unit (a reconciliation work unit is the canonical case: its parent is
+            // the goal whose proposals it's combining), the parent walk aimed the whole
+            // post-planner handoff at the WRONG orchestrator: dependents/reconcile ran against the
+            // outer goal and the reinvoke below woke the outer goal's orchestrator, so the freshly
+            // recorded plan never fanned out and the unit sat Executing forever ("the reconciler
+            // spawned a planner and then everything died"). Route by the item's profile stage, and
+            // hand the plan straight to fan-out here — deterministic, no LLM turn needed for the
+            // plan → workers handoff.
+            if (await ResolveProfileStageAsync(profileId, ct).ConfigureAwait(false) == PipelineStage.Plan)
+            {
+                orchestratorTarget = workUnitId;
+                var fanOutForPlan = _serviceProvider?.GetService(typeof(IFanOutService)) as IFanOutService;
+                if (fanOutForPlan is not null)
+                {
+                    // Never let a fan-out hiccup break the lease release itself — the orchestrator
+                    // reinvoke below runs the same (idempotent) fan-out again from its own loop.
+                    try { await fanOutForPlan.TryFanOutFromPlanAsync(workUnitId, sessionId, ct).ConfigureAwait(false); }
+                    catch { }
+                }
+            }
+
             if (orchestratorTarget != workUnitId)
             {
                 var fanOut = _serviceProvider?.GetService(typeof(IFanOutService)) as IFanOutService;
@@ -397,6 +475,53 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
             return;
 
         var resumed = item with { AwaitingFileLease = false };
+        if (!_queue.TryUpdate(workUnitId, resumed, item))
+            return;
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.SchedulerV1, workUnitId,
+            JsonSerializer.Serialize(resumed), ct).ConfigureAwait(false);
+    }
+
+    // Called instead of ReleaseAsync when RunScheduledWorkerAsync needs a real ApiKey it doesn't
+    // have (rehydrated item, cold credential cache). Mirrors MarkAwaitingFileLeaseAsync's shape —
+    // the item stays in _queue, TryAcquireAsync's AwaitingCredentials skip keeps it parked until
+    // SupplyCredentialsAsync runs.
+    public async Task MarkAwaitingCredentialsAsync(string workUnitId, CancellationToken ct = default)
+    {
+        if (!_queue.TryGetValue(workUnitId, out var item))
+            return;
+
+        var parked = item with { LeasedBy = null, LeasedAt = null, AwaitingCredentials = true };
+        if (!_queue.TryUpdate(workUnitId, parked, item))
+            return;
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.SchedulerV1, workUnitId,
+            JsonSerializer.Serialize(parked), ct).ConfigureAwait(false);
+    }
+
+    // Called from the Resume flow (typically the VS Code extension re-reading its own
+    // SecretStorage) with live connection details. Warms the shared cache under this item's own
+    // CredentialRef — so any other parked item/orchestrator lookup sharing that ref also unblocks —
+    // updates this item's in-memory fields directly (avoids a redundant cache round-trip on the
+    // very next dispatch), and clears AwaitingCredentials so TryAcquireAsync can pick it up again.
+    public async Task SupplyCredentialsAsync(
+        string workUnitId, string? provider, string? model, string? baseUrl, string? apiKey, CancellationToken ct = default)
+    {
+        if (!_queue.TryGetValue(workUnitId, out var item))
+            return;
+
+        _credentialCache?.Capture(item.CredentialRef, provider, model, baseUrl, apiKey);
+
+        var resumed = item with
+        {
+            Provider = provider ?? item.Provider,
+            Model = model ?? item.Model,
+            BaseUrl = baseUrl ?? item.BaseUrl,
+            ApiKey = apiKey ?? item.ApiKey,
+            AwaitingCredentials = false,
+        };
         if (!_queue.TryUpdate(workUnitId, resumed, item))
             return;
 
@@ -544,6 +669,22 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
         return count;
     }
 
+    public async Task ForceResumeAsync(string workUnitId, CancellationToken ct = default)
+    {
+        if (!_queue.TryGetValue(workUnitId, out var item))
+            return;
+        if (!item.AwaitingResume && !item.AwaitingFileLease && !item.AwaitingCredentials)
+            return;
+
+        var resumed = item with { AwaitingResume = false, AwaitingFileLease = false, AwaitingCredentials = false };
+        if (!_queue.TryUpdate(workUnitId, resumed, item))
+            return;
+
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.SchedulerV1, workUnitId,
+            JsonSerializer.Serialize(resumed), ct).ConfigureAwait(false);
+    }
+
     // Lazily resolved — IAgentControlService's production impl (InMemoryAgentRuntimeService)
     // depends on IWorkScheduler (this class), so a direct constructor dependency here would be
     // the same two-way cycle already avoided for IWorkUnitService below.
@@ -551,7 +692,7 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
     {
         var agentControl = _serviceProvider?.GetService(typeof(IAgentControlService)) as IAgentControlService;
         if (agentControl is not null)
-            await agentControl.ReinvokeOrchestratorAsync(workUnitId, sessionId, ct).ConfigureAwait(false);
+            await agentControl.ReinvokeOrchestratorAsync(workUnitId, sessionId, cancellationToken: ct).ConfigureAwait(false);
     }
 
     // Same lazy-resolution shape as DetectConflictAsync's IWorkUnitService lookup — best-effort,
@@ -576,6 +717,32 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
             // Work unit not found (e.g. test fakes, or a debug-enqueued item with no real WorkUnit
             // record) — same best-effort reasoning as above.
         }
+    }
+
+    // Which pipeline stage a scheduled item's profile runs at — used by ReleaseAsync to tell a
+    // planner item (runs on the orchestrator's own unit) apart from worker/reviewer items (run on
+    // child units). Falls back to the well-known "planner" profile id when the profile store
+    // can't resolve it (test fakes, deleted custom profiles).
+    private async Task<PipelineStage?> ResolveProfileStageAsync(string? profileId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(profileId))
+            return null;
+
+        var profiles = _serviceProvider?.GetService(typeof(IAgentProfileService)) as IAgentProfileService;
+        if (profiles is not null)
+        {
+            try
+            {
+                var profile = await profiles.GetAsync(profileId, ct).ConfigureAwait(false);
+                if (profile is not null)
+                    return profile.Stage;
+            }
+            catch (KeyNotFoundException) { }
+        }
+
+        return string.Equals(profileId, "planner", StringComparison.OrdinalIgnoreCase)
+            ? PipelineStage.Plan
+            : null;
     }
 
     // CurrentStage on lease acquisition mirrors the spawned agent's own profile stage (planner →

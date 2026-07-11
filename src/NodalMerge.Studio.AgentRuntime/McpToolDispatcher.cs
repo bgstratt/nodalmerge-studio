@@ -413,6 +413,7 @@ internal sealed class McpToolDispatcher(
             Str(input, "taskId"), Str(input, "model"), Str(input, "baseUrl"), Str(input, "apiKey"),
             Str(input, "provider"), Str(input, "profileId"), Str(input, "autoReviewProfileId"),
             enabledDomainAgents: StrArray(input, "enabledDomainAgents"),
+            credentialRef: Str(input, "credentialRef"),
             cancellationToken: ct).ConfigureAwait(false);
         return ToJson(new { agentId });
     }
@@ -479,8 +480,14 @@ internal sealed class McpToolDispatcher(
             return ToError("Decision must be 'Approved' or 'Rejected'.");
         }
 
+        // Accept a stringly-typed "true" too — the tool schema declares this as a boolean, but a
+        // model (or any other MCP client) sending it as a string must not silently fall through to
+        // the non-automated branch below, which mislabels ReviewedBy as "user" for what was really
+        // an agent-driven review.
         var automated = input.TryGetProperty("automated", out var autoEl) &&
-                        autoEl.ValueKind == JsonValueKind.True;
+                        (autoEl.ValueKind == JsonValueKind.True ||
+                         (autoEl.ValueKind == JsonValueKind.String &&
+                          bool.TryParse(autoEl.GetString(), out var autoBool) && autoBool));
 
         try
         {
@@ -498,7 +505,25 @@ internal sealed class McpToolDispatcher(
                 return ToJson(proposal);
             }
 
-            var reviewed = await merge.ReviewAsync(proposalId, decision, cancellationToken: ct).ConfigureAwait(false);
+            // Non-automated review through the MCP surface — the caller may still be an agent
+            // (or an external MCP client acting for a person), so honor an explicit reviewedBy
+            // and only fall back to ReviewAsync's own "user" default when none is given.
+            //
+            // Live-observed failure mode: the dedicated reviewer agent's own tool schema requires
+            // verificationResults but not automated=true — an LLM that fills in real reasoning
+            // ("missing tests") but forgets the automated flag falls straight into this branch,
+            // which used to silently discard verificationResults entirely. The saved proposal ended
+            // up with reviewNotes=null, so the retried worker had zero information about why it was
+            // rejected and just guessed (in the observed case, guessing so wrong it re-did all 4
+            // sibling tasks at once and got rejected again for scope). Falling back to
+            // verificationResults as notes closes that hole regardless of which flag the caller
+            // forgot; requiring some reason on Reject closes it for good.
+            var notes = Str(input, "notes") ?? Str(input, "verificationResults");
+            if (decision == MergeProposalStatus.Rejected && string.IsNullOrWhiteSpace(notes))
+                return ToError("notes (or verificationResults) is required when rejecting a proposal — explain what needs to change so the retry has context.");
+
+            var reviewed = await merge.ReviewAsync(
+                proposalId, decision, notes, reviewedBy: Str(input, "reviewedBy"), cancellationToken: ct).ConfigureAwait(false);
             return ToJson(reviewed);
         }
         catch (KeyNotFoundException)
@@ -569,11 +594,42 @@ internal sealed class McpToolDispatcher(
     private Task<string?> ResolveBranchIdAsync(JsonElement input, CancellationToken ct) =>
         ResolveBranchIdAsync(Str(input, "workUnitId"), Str(input, "branchId"), ct);
 
+    // Default window when a caller doesn't pass limit — matches the cap Claude Code's own Read tool
+    // uses, so a huge file never lands whole in an agent's context just because it forgot to page.
+    // A file at or under this many lines is returned in full with no truncation note, preserving the
+    // old "just read it" behavior for the overwhelming majority of source files.
+    private const int DefaultReadLineLimit = 2000;
+
+    // offset is 1-based (matches Read tool convention): the first line number to return. limit caps
+    // how many lines come back. Returns the window's own content plus enough metadata (totalLines,
+    // startLine, endLine, truncated) for the caller to page with a follow-up offset without having
+    // to re-derive line counts itself.
+    private static (string Content, int TotalLines, int StartLine, int EndLine, bool Truncated) WindowLines(
+        string content, int? offset, int? limit)
+    {
+        var lines = content.Split('\n');
+        var totalLines = lines.Length;
+        var start = Math.Max(1, offset ?? 1);
+        var take = Math.Max(1, limit ?? DefaultReadLineLimit);
+        if (start > totalLines)
+            return (string.Empty, totalLines, start, start - 1, false);
+
+        var startIndex = start - 1;
+        var endIndex = Math.Min(totalLines, startIndex + take);
+        var windowed = string.Join('\n', lines[startIndex..endIndex]);
+        var truncated = offset is null && limit is null
+            ? totalLines > DefaultReadLineLimit
+            : endIndex < totalLines;
+        return (windowed, totalLines, start, endIndex, truncated);
+    }
+
     private async Task<string> WorkspaceReadAsync(JsonElement input, CancellationToken ct, string? sessionId)
     {
         var branchId = await ResolveBranchIdAsync(input, ct).ConfigureAwait(false);
         var path     = Str(input, "path");
         if (branchId is null || path is null) return ToError("branchId (or workUnitId) and path are required.");
+        var offset = Int(input, "offset");
+        var limit  = Int(input, "limit");
         try
         {
             var content = await fileWorkspace.ReadAsync(branchId, path, ct).ConfigureAwait(false);
@@ -588,7 +644,15 @@ internal sealed class McpToolDispatcher(
             }
             _readPaths[ReadCacheKey(branchId, path)] = 0;
             await RecordWorkspaceReadAsync(sessionId, Str(input, "workUnitId"), [path], ct).ConfigureAwait(false);
-            return ToJson(new { content });
+
+            var window = WindowLines(content, offset, limit);
+            return window.Truncated
+                ? ToJson(new
+                {
+                    content = window.Content, totalLines = window.TotalLines,
+                    startLine = window.StartLine, endLine = window.EndLine, truncated = true,
+                })
+                : ToJson(new { content = window.Content });
         }
         catch (Exception ex) { return ToError(ex.Message); }
     }
@@ -625,10 +689,29 @@ internal sealed class McpToolDispatcher(
             foreach (var file in files.Where(f => f.Found))
                 _readPaths[ReadCacheKey(branchId, file.Path)] = 0;
             await RecordWorkspaceReadAsync(sessionId, Str(input, "workUnitId"), paths, ct).ConfigureAwait(false);
-            return ToJson(new { files, branchId });
+
+            // No per-path offset here (paths differ, so a single offset/limit pair wouldn't mean the
+            // same thing across all of them) — just the same default line cap WorkspaceReadAsync
+            // falls back to, so one huge file in a batch can't blow out the whole response. A caller
+            // that hits truncated=true on a path should follow up with a scoped nm_v1_workspace_read
+            // (offset/limit) on that one path.
+            var windowed = files.Select(f => f.Found && f.Content is not null
+                ? (object)BuildReadManyEntry(f.Path, WindowLines(f.Content, offset: null, limit: null))
+                : new { path = f.Path, content = (string?)null, found = false });
+            return ToJson(new { files = windowed, branchId });
         }
         catch (Exception ex) { return ToError(ex.Message); }
     }
+
+    private static object BuildReadManyEntry(
+        string path, (string Content, int TotalLines, int StartLine, int EndLine, bool Truncated) window) =>
+        window.Truncated
+            ? new
+            {
+                path, content = window.Content, found = true, totalLines = window.TotalLines,
+                startLine = window.StartLine, endLine = window.EndLine, truncated = true,
+            }
+            : new { path, content = window.Content, found = true };
 
     private async Task RecordWorkspaceReadAsync(
         string? sessionId, string? workUnitId, IReadOnlyList<string> paths, CancellationToken ct)

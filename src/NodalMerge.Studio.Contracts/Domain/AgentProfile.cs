@@ -7,6 +7,7 @@ public enum PipelineStage
     Execute,
     Review,
     Merge,
+    Reconcile,
 }
 
 // Slice 14c — glob patterns (e.g. "src/**/*.tsx") declaring this profile's file-scope specialty.

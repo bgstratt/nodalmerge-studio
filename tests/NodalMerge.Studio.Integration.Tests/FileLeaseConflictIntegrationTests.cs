@@ -42,8 +42,14 @@ public class FileLeaseConflictIntegrationTests
         await agentRuntime.StartAsync(CancellationToken.None);
         try
         {
-            var holder = await orchestratorSvc.CreateWorkUnitAsync("Introduce Shared.cs", "test");
-            var waiter = await orchestratorSvc.CreateWorkUnitAsync("Also touch Shared.cs", "test");
+            // File leases are scoped per root goal — an unrelated top-level goal must never
+            // lease-block this one, so holder/waiter need a shared parent to actually contend
+            // (the scenario this test exists to exercise: two siblings fanned out from one goal).
+            var parentGoal = await orchestratorSvc.CreateWorkUnitAsync("Shared.cs work", "test");
+            var holder = await orchestratorSvc.CreateWorkUnitAsync(
+                "Introduce Shared.cs", "test", parentWorkUnitId: parentGoal.WorkUnitId);
+            var waiter = await orchestratorSvc.CreateWorkUnitAsync(
+                "Also touch Shared.cs", "test", parentWorkUnitId: parentGoal.WorkUnitId);
 
             var holderTask = await tasks.CreateAsync(new StudioTask(
                 Guid.NewGuid().ToString("N"), holder.WorkUnitId, holder.Goal, "Execute", StudioTaskStatus.Open, null, 0));
@@ -167,8 +173,14 @@ public class FileLeaseConflictIntegrationTests
         await agentRuntime.StartAsync(CancellationToken.None);
         try
         {
-            var holder = await orchestratorSvc.CreateWorkUnitAsync("Introduce Shared.cs", "test");
-            var waiter = await orchestratorSvc.CreateWorkUnitAsync("Also touch Shared.cs", "test");
+            // File leases are scoped per root goal — an unrelated top-level goal must never
+            // lease-block this one, so holder/waiter need a shared parent to actually contend
+            // (the scenario this test exists to exercise: two siblings fanned out from one goal).
+            var parentGoal = await orchestratorSvc.CreateWorkUnitAsync("Shared.cs work", "test");
+            var holder = await orchestratorSvc.CreateWorkUnitAsync(
+                "Introduce Shared.cs", "test", parentWorkUnitId: parentGoal.WorkUnitId);
+            var waiter = await orchestratorSvc.CreateWorkUnitAsync(
+                "Also touch Shared.cs", "test", parentWorkUnitId: parentGoal.WorkUnitId);
 
             var holderTask = await tasks.CreateAsync(new StudioTask(
                 Guid.NewGuid().ToString("N"), holder.WorkUnitId, holder.Goal, "Execute", StudioTaskStatus.Open, null, 0));
@@ -253,8 +265,14 @@ public class FileLeaseConflictIntegrationTests
         await agentRuntime.StartAsync(CancellationToken.None);
         try
         {
-            var holder = await orchestratorSvc.CreateWorkUnitAsync("Introduce Shared.cs", "test");
-            var waiter = await orchestratorSvc.CreateWorkUnitAsync("Also touch Shared.cs", "test");
+            // File leases are scoped per root goal — an unrelated top-level goal must never
+            // lease-block this one, so holder/waiter need a shared parent to actually contend
+            // (the scenario this test exists to exercise: two siblings fanned out from one goal).
+            var parentGoal = await orchestratorSvc.CreateWorkUnitAsync("Shared.cs work", "test");
+            var holder = await orchestratorSvc.CreateWorkUnitAsync(
+                "Introduce Shared.cs", "test", parentWorkUnitId: parentGoal.WorkUnitId);
+            var waiter = await orchestratorSvc.CreateWorkUnitAsync(
+                "Also touch Shared.cs", "test", parentWorkUnitId: parentGoal.WorkUnitId);
 
             var holderTask = await tasks.CreateAsync(new StudioTask(
                 Guid.NewGuid().ToString("N"), holder.WorkUnitId, holder.Goal, "Execute", StudioTaskStatus.Open, null, 0));

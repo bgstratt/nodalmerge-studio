@@ -3,7 +3,7 @@
   "displayName": "NodalMerge Studio",
   "description": "Agent-native collaborative workspace — branch visualization, merge review, and agent orchestration for NodalMerge.",
   "publisher": "nodalmerge-studio",
-  "version": "0.1.8",
+  "version": "0.1.10",
   "license": "MIT",
   "icon": "media/icon.png",
   "repository": {
@@ -217,7 +217,7 @@
           "default": "",
           "description": "Name of the topology template to use when spawning a new workspace."
         },
-        "nodalmerge.defaultReviewPolicy": {
+        "nodalmerge.defaultTaskReviewPolicy": {
           "type": "string",
           "enum": [
             "HumanRequired",
@@ -225,7 +225,17 @@
             "Hybrid"
           ],
           "default": "HumanRequired",
-          "description": "Default review policy applied to new work units created in the Goal Workspace."
+          "description": "Automatically integrates worker proposals into the agent session. Seeds the Task Review setting for new goals created in the Goal Workspace."
+        },
+        "nodalmerge.defaultWorkspaceReviewPolicy": {
+          "type": "string",
+          "enum": [
+            "HumanRequired",
+            "AgentApproval",
+            "Hybrid"
+          ],
+          "default": "HumanRequired",
+          "description": "Controls whether session changes are automatically applied to your workspace. Seeds the Workspace Review setting for new goals created in the Goal Workspace."
         },
         "nodalmerge.requireBuildBeforeProposal": {
           "type": "boolean",

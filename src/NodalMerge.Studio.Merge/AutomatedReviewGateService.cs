@@ -12,7 +12,8 @@ public sealed class AutomatedReviewGateService(
     IWorkUnitService workUnits,
     ITaskService tasks,
     IDeadLetterService deadLetter,
-    IArtifactCommandService artifactCommands) : IAutomatedReviewGateService
+    IArtifactCommandService artifactCommands,
+    IFileWorkspaceService fileWorkspace) : IAutomatedReviewGateService
 {
     public async Task<AutomatedReviewGateResult> TryEnqueueReviewerAsync(
         string parentWorkUnitId,
@@ -104,10 +105,19 @@ public sealed class AutomatedReviewGateService(
                 apiKey: failedCreds?.ApiKey,
                 provider: failedCreds?.Provider,
                 kind: FailureKind.ReviewRejected,
+                credentialRef: failedCreds?.CredentialRef,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
 
             return new AutomatedRejectionResult(AutomatedRejectionOutcome.EscalatedToDeadLetter);
         }
+
+        // Reset merge/{parentWorkUnitId} back to a clean parent.BranchId mirror before children start
+        // re-executing. MergeReconciliationService's own reset (when it eventually reruns) is the
+        // authoritative rebuild regardless, but resetting here too closes the window where a retried
+        // child's TaskReviewPolicy.AgentApproval/Hybrid auto-apply could land before reconciliation
+        // reruns and see the previous (rejected) attempt's stale content as spurious drift.
+        await fileWorkspace.ApplyBranchAsync(parent.BranchId, $"merge/{parentWorkUnitId}", cancellationToken)
+            .ConfigureAwait(false);
 
         var children = await workUnits.GetChildrenAsync(parentWorkUnitId, cancellationToken).ConfigureAwait(false);
         var creds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Execute)
@@ -158,6 +168,7 @@ public sealed class AutomatedReviewGateService(
     public async Task<AutomatedRejectionResult> HandleHumanRejectionAsync(
         string proposalId,
         string? reviewNotes,
+        RestartMode mode = RestartMode.Revise,
         string? sessionId = null,
         CancellationToken cancellationToken = default)
     {
@@ -165,15 +176,66 @@ public sealed class AutomatedReviewGateService(
         if (proposal?.Status != MergeProposalStatus.Rejected || proposal.WorkUnitId is null)
             return new AutomatedRejectionResult(AutomatedRejectionOutcome.RetriedWorkers);
 
-        var workUnitId = proposal.WorkUnitId;
-        var workUnit = await workUnits.GetAsync(workUnitId, cancellationToken).ConfigureAwait(false);
+        var workUnit = await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false);
         if (workUnit is null)
             return new AutomatedRejectionResult(AutomatedRejectionOutcome.RetriedWorkers);
 
-        var updatedWorkUnit = await workUnits
-            .IncrementReviewRejectionCountAsync(workUnitId, automated: false, cancellationToken)
+        return await RetryRejectedProposalOwnerAsync(
+            proposal, workUnit, automated: false, reviewerAttribution: "human-reviewer",
+            reviewNotes, mode, sessionId, cancellationToken).ConfigureAwait(false);
+    }
+
+    // A fanned-out task child's own inline reviewer (TaskReviewPolicy.AgentApproval/Hybrid) just
+    // rejected that specific child's proposal. Unlike HandleAutomatedRejectionAsync — which retries
+    // every child of a parent whose *reconciled batch* proposal was rejected — this retries only
+    // the one work unit that owns proposalId. Without this, an AgentApproval/Hybrid child that gets
+    // rejected has no automatic (or even manual — MergeProposalTransitions has no outgoing edge
+    // from Rejected) path back to Queued, and MergeReconciliationService correctly refuses to fold
+    // a Rejected proposal in, so the parent goal would stall in WaitingForChildren forever.
+    public async Task<AutomatedRejectionResult> HandleAutomatedTaskRejectionAsync(
+        string proposalId,
+        string? reviewerAgentId = null,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var proposal = await merge.GetAsync(proposalId, cancellationToken).ConfigureAwait(false);
+        if (proposal?.Status != MergeProposalStatus.Rejected || proposal.WorkUnitId is null)
+            return new AutomatedRejectionResult(AutomatedRejectionOutcome.RetriedWorkers);
+
+        var workUnit = await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false);
+        if (workUnit is null)
+            return new AutomatedRejectionResult(AutomatedRejectionOutcome.RetriedWorkers);
+
+        return await RetryRejectedProposalOwnerAsync(
+            proposal, workUnit, automated: true, reviewerAttribution: reviewerAgentId ?? "auto-reviewer",
+            reviewNotes: proposal.VerificationResults, mode: RestartMode.Revise, sessionId, cancellationToken)
             .ConfigureAwait(false);
-        var rejectionCount = updatedWorkUnit.ExecutionInfo!.HumanReviewRejectionCount;
+    }
+
+    // Shared by HandleHumanRejectionAsync and HandleAutomatedTaskRejectionAsync — both retry the
+    // single work unit that owns a rejected proposal (or, if that work unit is itself a reconciled
+    // fan-out parent, its Proposed/Merged children). automated selects which of the work unit's two
+    // independent rejection-count budgets (AutomatedReviewRejectionCount vs
+    // HumanReviewRejectionCount) this cycle is tracked and escalated under.
+    private async Task<AutomatedRejectionResult> RetryRejectedProposalOwnerAsync(
+        MergeProposal proposal,
+        WorkUnit workUnit,
+        bool automated,
+        string reviewerAttribution,
+        string? reviewNotes,
+        RestartMode mode,
+        string? sessionId,
+        CancellationToken cancellationToken)
+    {
+        var proposalId = proposal.ProposalId;
+        var workUnitId = workUnit.WorkUnitId;
+
+        var updatedWorkUnit = await workUnits
+            .IncrementReviewRejectionCountAsync(workUnitId, automated, cancellationToken)
+            .ConfigureAwait(false);
+        var rejectionCount = automated
+            ? updatedWorkUnit.ExecutionInfo!.AutomatedReviewRejectionCount
+            : updatedWorkUnit.ExecutionInfo!.HumanReviewRejectionCount;
 
         var creds = agentControl.GetCredentialsForStage(workUnitId, PipelineStage.Execute)
             ?? agentControl.GetOrchestratorCredentials(workUnitId)
@@ -181,15 +243,23 @@ public sealed class AutomatedReviewGateService(
                 ? agentControl.GetCredentialsForStage(executeParentId, PipelineStage.Execute) ?? agentControl.GetOrchestratorCredentials(executeParentId)
                 : null);
 
-        if (rejectionCount >= InMemoryDeadLetterService.MaxFailureAttempts)
+        // The max-attempts cap exists to stop AGENTS from spinning — an automated reviewer
+        // rejecting the same work over and over burns tokens with no one steering. A human
+        // explicitly asking for another attempt is the opposite situation: they've looked at it,
+        // decided to spend more, and supplied their own steering notes. Blocking them behind the
+        // cap turned "retry with my correction" into a dead end (live-observed: an Unreject-and-
+        // Revise click silently escalated to dead-letter instead of retrying, because earlier
+        // automated cycles had already consumed the budget). Humans get warned by the count in the
+        // UI; they never get blocked. Only automated cycles escalate here.
+        if (automated && rejectionCount >= InMemoryDeadLetterService.MaxFailureAttempts)
         {
             var reason = string.IsNullOrWhiteSpace(reviewNotes)
-                ? "Human reviewer rejected the proposal."
-                : $"Human reviewer rejected: {reviewNotes}";
+                ? $"{reviewerAttribution} rejected the proposal."
+                : $"{reviewerAttribution} rejected: {reviewNotes}";
 
             await deadLetter.RecordFailureAsync(
                 workUnitId,
-                "human-reviewer",
+                reviewerAttribution,
                 PipelineStage.Review,
                 "worker",
                 reason,
@@ -212,8 +282,41 @@ public sealed class AutomatedReviewGateService(
         if (!string.IsNullOrWhiteSpace(reviewNotes))
         {
             await artifactCommands.RecordAsync(
-                workUnitId, "Constraint", "Human review feedback", reviewNotes,
+                workUnitId, "Constraint",
+                automated ? "Automated review feedback" : "Human review feedback",
+                reviewNotes,
                 ct: cancellationToken).ConfigureAwait(false);
+        }
+
+        // Revise: attach a compacted summary of the almost-correct attempt (goal, files touched,
+        // truncated diff) so the agent has something to build on instead of re-deriving the change
+        // from scratch. Recorded via the artifact-lineage service directly (like MergeProposal
+        // artifacts are) rather than IArtifactCommandService.RecordAsync — that path is deliberately
+        // gated to the agent-recordable knowledge-note types (Research/Decision/Constraint);
+        // RevisionContext is a review-gate-only artifact, not something an agent free-form records.
+        // Superseded rather than accumulated across repeat Revise attempts — a prior attempt's own
+        // context is stale the moment a newer one exists on top of it.
+        if (mode == RestartMode.Revise)
+        {
+            var existingChain = await artifacts.GetChainAsync(workUnitId, cancellationToken).ConfigureAwait(false);
+            foreach (var stale in existingChain.Where(a => a.Type == ArtifactType.RevisionContext))
+            {
+                await artifacts.UpdateStatusAsync(stale.ArtifactId, ArtifactStatus.Superseded, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            await artifacts.RecordAsync(
+                new ArtifactRef(
+                    $"KA-{Guid.NewGuid():N}",
+                    ArtifactType.RevisionContext,
+                    workUnitId,
+                    ArtifactStatus.Active,
+                    DateTimeOffset.UtcNow,
+                    workUnitId,
+                    null,
+                    "Prior attempt (revise)",
+                    BuildRevisionContextBody(proposal)),
+                cancellationToken).ConfigureAwait(false);
         }
 
         var children = await workUnits.GetChildrenAsync(workUnitId, cancellationToken).ConfigureAwait(false);
@@ -224,8 +327,38 @@ public sealed class AutomatedReviewGateService(
             ? children.Where(c => c.Status is WorkUnitStatus.Proposed or WorkUnitStatus.Merged).ToList()
             : [workUnit];
 
+        if (hasFanOut)
+        {
+            // Same reset as HandleAutomatedRejectionAsync's parent-level retry, for the same reason —
+            // this is the reconciled batch proposal being rejected (workUnit is the top-level goal
+            // here, since only a reconciled proposal's owner has children), so merge/{workUnitId} is
+            // about to accumulate a fresh attempt underneath whatever the rejected attempt left there.
+            await fileWorkspace.ApplyBranchAsync(workUnit.BranchId, $"merge/{workUnitId}", cancellationToken)
+                .ConfigureAwait(false);
+        }
+
         foreach (var target in retryTargets)
         {
+            // Revert: wipe the target's branch back to its pre-attempt snapshot before requeuing —
+            // a genuinely clean slate, no stale diff for the agent to anchor on. The solo (no
+            // fan-out) case already knows its own proposalId; fan-out children each propose
+            // independently, so their own base/{proposalId} snapshot has to be resolved per child.
+            if (mode == RestartMode.Revert)
+            {
+                var seedProposalId = hasFanOut
+                    ? (await artifacts.GetChainAsync(target.WorkUnitId, cancellationToken).ConfigureAwait(false))
+                        .LastOrDefault(a => a.Type == ArtifactType.MergeProposal)?.ArtifactId
+                    : proposalId;
+                var seedBranchId = seedProposalId is not null
+                    ? $"base/{seedProposalId}"
+                    : target.FanOutInfo?.SeedFromBranchId;
+                if (seedBranchId is not null)
+                {
+                    await fileWorkspace.ApplyBranchAsync(seedBranchId, target.BranchId, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+            }
+
             try
             {
                 await workUnits
@@ -265,6 +398,27 @@ public sealed class AutomatedReviewGateService(
         }
 
         return new AutomatedRejectionResult(AutomatedRejectionOutcome.RetriedWorkers);
+    }
+
+    // Kept deliberately short — this rides along on the retried worker's next AgentWorkspace
+    // projection fetch, not a fresh prompt budget of its own. The full diff lives on the proposal
+    // itself (fetchable by ProposalId) for anyone who needs it; this is a nudge, not a replay.
+    private const int MaxRevisionDiffChars = 1500;
+
+    private static string BuildRevisionContextBody(MergeProposal proposal)
+    {
+        var diff = proposal.WorkspaceChanges ?? string.Empty;
+        var truncatedDiff = diff.Length > MaxRevisionDiffChars
+            ? diff[..MaxRevisionDiffChars] + "\n… (truncated)"
+            : diff;
+        var filesTouched = proposal.FilesTouched.Count > 0
+            ? string.Join(", ", proposal.FilesTouched)
+            : "(none recorded)";
+
+        return "Prior attempt summary: " + proposal.Summary +
+            "\nChange description: " + proposal.ChangeDescription +
+            "\nFiles touched: " + filesTouched +
+            "\nDiff (may be truncated):\n" + truncatedDiff;
     }
 
     // A rejected proposal's underlying task(s) are usually already Completed (the worker that

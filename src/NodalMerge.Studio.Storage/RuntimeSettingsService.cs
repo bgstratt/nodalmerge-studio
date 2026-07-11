@@ -7,7 +7,6 @@ namespace NodalMerge.Studio.Storage;
 // and byte-limit fields on WorkspaceOptions stay config-file-only, as they are now.
 public sealed record RuntimeSettingsSnapshot(
     bool UseLlmProfileSelection,
-    bool BlockOverlappingFileScope = false,
     int MaxConcurrentWorkers = 3,
     int SchedulerPollIntervalMs = 2_000,
     bool UsePromotionBranch = false,
@@ -25,7 +24,6 @@ public sealed class RuntimeSettingsService(IStudioNodeStore nodeStore, Workspace
     {
         var snapshot = new RuntimeSettingsSnapshot(
             options.UseLlmProfileSelection,
-            options.BlockOverlappingFileScope,
             options.MaxConcurrentWorkers,
             options.SchedulerPollIntervalMs,
             options.UsePromotionBranch,
@@ -49,7 +47,6 @@ public sealed class RuntimeSettingsService(IStudioNodeStore nodeStore, Workspace
             return;
 
         options.UseLlmProfileSelection = snapshot.UseLlmProfileSelection;
-        options.BlockOverlappingFileScope = snapshot.BlockOverlappingFileScope;
         options.MaxConcurrentWorkers = snapshot.MaxConcurrentWorkers;
         options.SchedulerPollIntervalMs = snapshot.SchedulerPollIntervalMs;
         options.UsePromotionBranch = snapshot.UsePromotionBranch;

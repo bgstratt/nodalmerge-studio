@@ -61,6 +61,9 @@ public class WorkspaceIsolationTests
 
         public Task<WorkUnit> SetFileScopeAsync(string workUnitId, IReadOnlyList<string> fileScope, string? sessionId = null, CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<WorkUnit> AddDependencyAsync(string workUnitId, string dependsOnWorkUnitId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class FakeFileWorkspaceService : IFileWorkspaceService

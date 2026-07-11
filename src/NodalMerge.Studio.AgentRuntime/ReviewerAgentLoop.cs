@@ -1,5 +1,6 @@
 using NodalMerge.Studio.Contracts.Domain;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Versioning;
 using NodalMerge.Studio.Core.Services;
 
@@ -16,7 +17,17 @@ internal sealed class ReviewerAgentLoop(
     IReadOnlyList<string>? filesTouched = null,
     string? noFileChangesJustification = null,
     IConversationLogService? conversationLog = null,
-    IExecutionEventStream? events = null)
+    IExecutionEventStream? events = null,
+    // Phase 1.4 Continue-track, extended to Reviewer — reconstructed assistant/tool-result turns
+    // from a prior attempt's ConversationLogEntry rows (see ContinueService). Null/empty for a
+    // normal fresh run. Added after live evidence (2026-07-10) that restarting cold on every
+    // Continue click wasted the entire budget re-deriving investigation (workunit_get, diff,
+    // reads) the prior attempt had already done, so 3 consecutive attempts each independently ran
+    // out of iterations without ever reaching a decision — mirrors WorkerAgentLoop's priorTurns.
+    IReadOnlyList<NmMessage>? priorTurns = null,
+    // Observability-only — see ConversationCompactor. Optional/nullable so call sites and tests
+    // that don't wire a logger keep compiling unchanged.
+    ILogger? logger = null)
 {
     internal static readonly string DefaultSystemPrompt = AgentLoopPrompts.Reviewer;
 
@@ -62,14 +73,43 @@ internal sealed class ReviewerAgentLoop(
                 "Submit automated review when done.")])
         };
 
+        if (priorTurns is { Count: > 0 })
+        {
+            messages.AddRange(priorTurns);
+
+            const string continuationNotice =
+                "[Continuing after hitting the iteration limit on a previous review attempt — the " +
+                "turns above are your own prior investigation of this same proposal, not a new " +
+                "reviewer's. Do not re-fetch what you already checked above. You have a fresh " +
+                "iteration budget; use it to reach a decision and call nm_v1_merge_review — that is " +
+                "the one thing the prior attempt never did.]";
+
+            var last = messages[^1];
+            if (last.Role == "user")
+            {
+                messages[^1] = last with { Content = [.. last.Content, new NmText(continuationNotice)] };
+            }
+            else
+            {
+                messages.Add(new NmMessage("user", [new NmText(continuationNotice)]));
+            }
+        }
+
         var completedNaturally = false;
+        int? lastInputTokens = null;
         for (var i = 0; i < _maxIterations && !ct.IsCancellationRequested; i++)
         {
+            ConversationCompactor.ElideStaleToolResults(messages, logger, agentId, workUnitId);
+            await ConversationCompactor.ApplyRollingSummaryIfDueAsync(
+                    messages, client, ct, logger, agentId, workUnitId, lastInputTokens)
+                .ConfigureAwait(false);
+
             onActivity?.Invoke("Thinking...");
             var response = await client.SendAsync(
                     messages, _tools, _systemPrompt, ct,
                     attempt => OnTransientRetryAsync(attempt, ct))
                 .ConfigureAwait(false);
+            lastInputTokens = response.InputTokens;
 
             messages.Add(new NmMessage("assistant", response.Content));
 
@@ -83,7 +123,19 @@ internal sealed class ReviewerAgentLoop(
             }
 
             if (response.StopReason != "tool_use")
+            {
+                // Anything other than a clean end_turn/tool_use — most commonly the model hitting
+                // its own max-output-tokens mid-response after a large tool result (e.g. a multi-
+                // file read) landed in context. Previously this exited with zero record of what
+                // happened: the loop just vanished from the conversation log and the caller reported
+                // MaxIterationsExceeded identically whether this fired on cycle 1 or cycle 14. Record
+                // the turn (StopReason included) so a truncated/anomalous response is visible instead
+                // of indistinguishable from "genuinely used the whole budget."
+                await ConversationLogRecorder.RecordTurnAsync(
+                    conversationLog, workUnitId, agentId, "Reviewer", null, i, response, [], sessionId, ct,
+                    client.Provider, client.Model).ConfigureAwait(false);
                 break;
+            }
 
             var toolResults = new List<NmContent>();
             var awaitingClarification = false;
@@ -189,13 +241,13 @@ internal sealed class ReviewerAgentLoop(
             new(McpToolNames.MergeValidate, "Validate a draft proposal, moving it to ReadyForReview.",
                 Schema(["proposalId"], new() { ["proposalId"] = Str("Merge proposal ID") })),
 
-            new(McpToolNames.MergeReview, "Submit automated pre-gate review (set automated=true).",
-                Schema(["proposalId", "decision", "verificationResults"], new()
+            new(McpToolNames.MergeReview, "Submit your pre-gate review. You MUST set automated=true — omitting it silently downgrades this to an untracked manual review with no automatic retry, leaving a Rejected proposal permanently stuck.",
+                Schema(["proposalId", "decision", "verificationResults", "automated"], new()
                 {
                     ["proposalId"]            = Str("Merge proposal ID"),
                     ["decision"]              = Str("Approved or Rejected"),
-                    ["verificationResults"]   = Str("Concise review notes"),
-                    ["automated"]             = Str("Must be true for automated pre-gate review"),
+                    ["verificationResults"]   = Str("Concise review notes — on Rejected, this is the ONLY explanation the retried worker will see, so be specific about what to fix"),
+                    ["automated"]             = Bool("REQUIRED — must be literally true (boolean, not the string \"true\") for every call you make"),
                     ["consideredArtifactIds"] = StrArray("IDs of any recorded Constraint/Research artifacts you explicitly checked the proposal against in step 2, whether or not they were violated (optional)"),
                 })),
 
@@ -207,15 +259,17 @@ internal sealed class ReviewerAgentLoop(
                     ["proposalId"]     = Str("Proposal ID (for MergeProposal)"),
                 })),
 
-            new(McpToolNames.WorkspaceRead, "Read a file from the branch working directory.",
+            new(McpToolNames.WorkspaceRead, "Read a file from the branch working directory. Files over 2000 lines are windowed by default (first 2000 lines) — pass offset/limit to page through the rest, or narrow with nm_v1_workspace_search first if you only need a specific section.",
                 Schema(["branchId", "path"], new()
                 {
                     ["branchId"]   = Str("Branch ID"),
                     ["workUnitId"] = Str("The work unit under review — strongly prefer including this; the server resolves the real branch from it and ignores branchId if both are given"),
                     ["path"]       = Str("Relative file path"),
+                    ["offset"]     = Int("1-based line number to start reading from (optional, default 1)"),
+                    ["limit"]      = Int("Max lines to return (optional, default 2000)")
                 })),
 
-            new(McpToolNames.WorkspaceReadMany, "Read several files in one call instead of multiple sequential nm_v1_workspace_read calls — use this after nm_v1_workspace_search returns several hit files you intend to inspect. A path that doesn't exist comes back with found=false rather than failing the whole call.",
+            new(McpToolNames.WorkspaceReadMany, "Read several files in one call instead of multiple sequential nm_v1_workspace_read calls — use this after nm_v1_workspace_search returns several hit files you intend to inspect. A path that doesn't exist comes back with found=false rather than failing the whole call. Each file is capped at 2000 lines (truncated=true if cut off) — for a specific truncated file, follow up with nm_v1_workspace_read and offset/limit to page further.",
                 Schema(["branchId", "paths"], new()
                 {
                     ["branchId"]   = Str("Branch ID"),

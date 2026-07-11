@@ -741,6 +741,18 @@ fan-out child through a capturing fake LLM handler and confirms the root's liter
 contract text actually reaches the worker's kickoff message, labeled clearly. Full
 solution: 369/369 tests pass (up from 368 — no regressions).
 
+**Amended (2026-07-10):** `BuildOriginalGoalContextAsync` and its test were removed.
+It pushed the full, unbounded root goal text into every fanned-out worker's kickoff
+independently — real cost (duplicated per sibling, no size cap) for a fix aimed at one
+specific class of defect (planner dropping a literal contract), and it was confusing
+workers with root-goal context outside their own slice's scope. The Planner-prompt half
+of the fix above (copy literal contracts verbatim into the slice's own goal/steps) stays
+as the primary defense. The backstop moved to `AgentLoopPrompts.Reviewer` (step 5): when
+a proposal's goal looks like a prose paraphrase that could be hiding a dropped literal
+contract, the reviewer is instructed to walk `parentWorkUnitId` via `nm_v1_workunit_get`
+up to the root on demand — pulled only when something in the diff looks suspect, rather
+than pushed unconditionally to every worker.
+
 ### 3. Destructive merge-apply on multi-sibling fan-out — diagnosed, fix deferred (in progress)
 
 **Root cause, fully confirmed by reading the code.** Two independent sibling slices

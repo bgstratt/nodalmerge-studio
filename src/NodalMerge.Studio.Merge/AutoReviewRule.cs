@@ -23,7 +23,7 @@ public sealed class AutoReviewRule(
     IReviewTimerService? timerService = null,
     IMergeService? mergeService = null) : IPolicyRule
 {
-    private static readonly TimeSpan HybridTimeout = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan DefaultHybridTimeout = TimeSpan.FromMinutes(5);
 
     public string RuleId => "auto-review";
     public PolicyCheckpoint Checkpoint => PolicyCheckpoint.BeforeMerge;
@@ -33,7 +33,20 @@ public sealed class AutoReviewRule(
         CancellationToken ct = default)
     {
         var workUnit = context.TryGetValue("workUnit", out var wu) ? wu as WorkUnit : null;
-        var policy = workUnit?.ReviewPolicy ?? ReviewPolicy.HumanRequired;
+        // A work unit whose own apply can reach the real on-disk repo (see WorkspaceReviewScope —
+        // top-level goals, plus any work unit explicitly linked to its own RepositoryId such as a
+        // Multi-Model Comparison child) is gated by WorkspaceReviewPolicy; everything else
+        // (fanned-out task children, generic experiment forks) is gated by TaskReviewPolicy since
+        // their apply only ever merges into their parent's branch, never onto disk.
+        var appliesToRealRepo = WorkspaceReviewScope.AppliesToRealRepo(workUnit);
+        var policy = (appliesToRealRepo ? workUnit?.WorkspaceReviewPolicy : workUnit?.TaskReviewPolicy)
+            ?? ReviewPolicy.HumanRequired;
+        var hybridTimeoutMinutes = appliesToRealRepo
+            ? workUnit?.WorkspaceReviewHybridTimeoutMinutes
+            : workUnit?.TaskReviewHybridTimeoutMinutes;
+        var hybridTimeout = hybridTimeoutMinutes is { } minutes
+            ? TimeSpan.FromMinutes(minutes)
+            : DefaultHybridTimeout;
 
         if (policy == ReviewPolicy.HumanRequired)
             return new PolicyResult(true, []);
@@ -80,12 +93,12 @@ public sealed class AutoReviewRule(
 
         // Hybrid: reviewer approved → start countdown, block immediate apply.
         if (timerService is not null)
-            await timerService.ScheduleAsync(proposalId, workUnitId, HybridTimeout, ct).ConfigureAwait(false);
+            await timerService.ScheduleAsync(proposalId, workUnitId, hybridTimeout, ct).ConfigureAwait(false);
 
         return new PolicyResult(false,
         [
             new PolicyViolation(RuleId,
-                $"Hybrid review: agent approved. Auto-merges in {(int)HybridTimeout.TotalMinutes} minutes unless overridden.")
+                $"Hybrid review: agent approved. Auto-merges in {(int)hybridTimeout.TotalMinutes} minutes unless overridden.")
         ]);
     }
 }

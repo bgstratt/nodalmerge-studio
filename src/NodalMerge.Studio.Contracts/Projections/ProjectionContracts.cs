@@ -22,6 +22,7 @@ public enum ProjectionType
     CounterfactualComparison,
     RunRetrospective,
     HypothesisComparison,
+    WorkspacePathways,
 }
 
 public enum ProjectionLevel
@@ -468,6 +469,58 @@ public sealed record ReviewOutcomeStat(
     string Outcome,
     int Count,
     double? AvgConfidence);
+
+/// <summary>
+/// WorkspacePathways projection — "git for agent reasoning": a workspace-scoped history of
+/// provenance-bearing moments (goal starts, integrations, rejections/dead branches, external
+/// file updates), each attributed to an actor (agent | human | external). Deliberately excludes
+/// per-cycle orchestration decision-log chatter (NoOp/Enqueue/SpawnPlanner) — that stays in
+/// ReasoningCommitGraph/DecisionContext, scoped per goal, where it belongs. See
+/// plans/pathways-workspace-history.md.
+/// </summary>
+public sealed record WorkspacePathwaysProjectionPayload(
+    IReadOnlyList<WorkspacePathwaysNode> Nodes,
+    IReadOnlyList<WorkspacePathwaysEdge> Edges,
+    DateTimeOffset GeneratedAt);
+
+/// <summary>
+/// Kind values: "GoalStarted" | "Integration" | "Rejection" | "Superseded" | "DeadBranch" |
+/// "ExternalUpdate". ActorKind values: "Agent" | "Human" | "External". SnapshotId is null until
+/// slice 3 guarantees a RepositorySnapshot is recorded at every node-producing event (see plan's
+/// open verification item 1) — never fabricated, so a null here means "not yet materializable,"
+/// not "no state existed."
+/// </summary>
+public sealed record WorkspacePathwaysNode(
+    string NodeId,
+    string Kind,
+    string? WorkUnitId,
+    string? BranchId,
+    string ActorKind,
+    string? ActorId,
+    string? ActorModel,
+    string? ActorProvider,
+    string Summary,
+    DateTimeOffset OccurredAt,
+    string? ProposalId = null,
+    string? ArtifactId = null,
+    IReadOnlyList<string>? FilesTouched = null,
+    string? SnapshotId = null,
+    // Slice 4 — set only on "ExternalUpdate" nodes, from the KnownGoodState pair
+    // RepositorySyncService marks immediately before/after applying the external diff. Lets the
+    // webview fetch a real file-level diff (GET /studio/projections/known-good/{a}/diff/{b}) for
+    // a node kind /studio/replay/inspect can never resolve (see DagReplayPanel.ts's
+    // INSPECTABLE_KINDS note).
+    string? ExternalSyncStateIdBefore = null,
+    string? ExternalSyncStateIdAfter = null,
+    // Who decided the review outcome behind this node ("user" | reviewer agent id) — distinct
+    // from ActorId, which is the proposer. Null when unreviewed or predating capture.
+    string? ReviewedBy = null);
+
+/// <summary>Kind values: "Integration" | "Rejection" | "Superseded" | "DeadEnd" | "ExternalChain".</summary>
+public sealed record WorkspacePathwaysEdge(
+    string FromNodeId,
+    string ToNodeId,
+    string Kind);
 
 public static class ProjectionCatalog
 {

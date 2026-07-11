@@ -50,7 +50,15 @@ public sealed class SteeringService(
             seedFromBranchId: original.BranchId,
             forkType:         HypothesisForkType.Reasoning,
             metadata:         forkMeta,
-            reviewPolicy:     original.ReviewPolicy,
+            taskReviewPolicy:      original.TaskReviewPolicy,
+            workspaceReviewPolicy: original.WorkspaceReviewPolicy,
+            taskReviewHybridTimeoutMinutes:      original.TaskReviewHybridTimeoutMinutes,
+            workspaceReviewHybridTimeoutMinutes: original.WorkspaceReviewHybridTimeoutMinutes,
+            // The fork inherits original.ParentWorkUnitId, so a steer on a top-level goal produces
+            // another top-level (sibling) work unit — it must also inherit RepositoryId, or its own
+            // apply resolves the wrong (or no) write-back path in a multi-repo setup. Null for a
+            // steer on a child, which is correct — a child never writes back to disk directly.
+            repositoryId: original.RepositoryId,
             cancellationToken: ct).ConfigureAwait(false);
 
         // 4. Record the steering decision in the DAG
@@ -114,7 +122,13 @@ public sealed class SteeringService(
             branchedFromProposalId: command.ProposalId,
             forkType:               HypothesisForkType.Reasoning,
             metadata:               forkMeta,
-            reviewPolicy:           original.ReviewPolicy,
+            taskReviewPolicy:      original.TaskReviewPolicy,
+            workspaceReviewPolicy: original.WorkspaceReviewPolicy,
+            taskReviewHybridTimeoutMinutes:      original.TaskReviewHybridTimeoutMinutes,
+            workspaceReviewHybridTimeoutMinutes: original.WorkspaceReviewHybridTimeoutMinutes,
+            // See PauseAndRedirectAsync above — this fork inherits original.ParentWorkUnitId, so it
+            // must also inherit RepositoryId to write back to the correct repo if it ends up top-level.
+            repositoryId: original.RepositoryId,
             cancellationToken: ct).ConfigureAwait(false);
 
         if (command.ProfileId is not null)

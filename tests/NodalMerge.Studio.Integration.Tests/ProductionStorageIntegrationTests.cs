@@ -22,6 +22,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// to end, including across a simulated process restart.
 /// </summary>
 [Trait("Category", "Integration")]
+[Collection("Sqlite")]
 public class ProductionStorageIntegrationTests : IDisposable
 {
     private readonly string _tempRoot =

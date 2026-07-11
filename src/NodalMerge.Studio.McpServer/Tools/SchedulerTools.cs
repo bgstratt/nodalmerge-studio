@@ -18,11 +18,12 @@ public sealed class SchedulerTools(ISchedulerCommandService scheduler, IClarific
         string? apiKey = null,
         string? provider = null,
         string? sessionId = null,
+        string? credentialRef = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
-            var item = await scheduler.EnqueueAsync(workUnitId, profileId, taskId, model, baseUrl, apiKey, provider, sessionId, cancellationToken)
+            var item = await scheduler.EnqueueAsync(workUnitId, profileId, taskId, model, baseUrl, apiKey, provider, sessionId, credentialRef, cancellationToken)
                 .ConfigureAwait(false);
             return McpJson.Ok(new { workUnitId = item.WorkUnitId, profileId = item.ProfileId, taskId = item.TaskId, sessionId = item.SessionId, status = "enqueued" });
         }

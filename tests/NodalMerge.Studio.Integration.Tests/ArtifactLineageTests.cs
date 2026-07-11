@@ -157,6 +157,15 @@ public class ArtifactLineageTests
             _units[workUnitId] = updated;
             return Task.FromResult(updated);
         }
+        public Task<WorkUnit> AddDependencyAsync(string workUnitId, string dependsOnWorkUnitId, CancellationToken ct = default)
+        {
+            var current = _units[workUnitId];
+            var updated = current.DependsOn.Contains(dependsOnWorkUnitId)
+                ? current
+                : current with { DependsOn = [.. current.DependsOn, dependsOnWorkUnitId] };
+            _units[workUnitId] = updated;
+            return Task.FromResult(updated);
+        }
     }
 
     private sealed class FakeMergeService : IMergeService
@@ -167,7 +176,7 @@ public class ArtifactLineageTests
         public Task<MergeProposal?> GetAsync(string proposalId, CancellationToken ct = default) =>
             Task.FromResult(_proposals.GetValueOrDefault(proposalId));
         public Task<MergeProposal> ValidateAsync(string proposalId, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus d, string? notes = null, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<MergeProposal> ReviewAsync(string proposalId, MergeProposalStatus d, string? notes = null, string? reviewedBy = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> AutomatedReviewAsync(string proposalId, MergeProposalStatus decision, string verificationResults, string? reviewerAgentId = null, IReadOnlyList<string>? consideredArtifactIds = null, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken ct = default, bool autoApplied = false) => throw new NotSupportedException();
         public Task<IReadOnlyList<MergeProposal>> ListAsync(string? sourceBranch = null, CancellationToken ct = default) =>
@@ -175,6 +184,8 @@ public class ArtifactLineageTests
 
         public Task<MergeProposal> SupersedeAsync(string proposalId, string supersededByProposalId, CancellationToken ct = default) =>
             throw new NotSupportedException();
+
+        public Task<PromoteResult> PromoteAsync(CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     private sealed class SingleServiceProvider(object service) : IServiceProvider

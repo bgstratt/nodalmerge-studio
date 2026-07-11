@@ -27,6 +27,11 @@ export interface TopologyTemplate {
   planner?:     string;
   worker?:      string;
   reviewer?:    string;
+  // Profile used to spawn the reconciliation agent when a candidate-branch or task-level conflict
+  // is Reconciled. Distinct from all four stage roles above: reconciliation work units aren't part
+  // of any goal's own Plan/Execute/Review pipeline, so there's no natural "inherit" fallback among
+  // them — falls back to the orchestrator profile only if unset, same as the others.
+  reconciler?:  string;
 }
 
 /** Runtime participant from GET /studio/participants — covers both in-process agents and room peers. */
@@ -45,6 +50,10 @@ export interface SpawnLlmConfig {
   model:    string;
   baseUrl:  string;
   apiKey:   string;
+  // Opaque cache key the server uses to re-resolve these connection details after a restart,
+  // instead of ever persisting apiKey itself — see IRuntimeCredentialCache's doc comment on the
+  // server side. Never a secret; safe to log or display.
+  credentialRef: string;
 }
 
 const DEFAULT_PROFILES: AgentProfile[] = [
@@ -88,13 +97,28 @@ export class AgentConfigService {
       .update('defaultTopology', name, vscode.ConfigurationTarget.Workspace);
   }
 
-  getDefaultReviewPolicy(): string {
-    return vscode.workspace.getConfiguration('nodalmerge').get<string>('defaultReviewPolicy') ?? 'HumanRequired';
+  // Split from a single defaultReviewPolicy setting: Task Review gates a worker proposal merging
+  // into the agent session ("Automatically integrates worker proposals into the agent session"),
+  // Workspace Review gates the session's own changes applying to the real workspace on disk
+  // ("Controls whether session changes are automatically applied to your workspace"). These are
+  // *seed* values only — consulted when Goal Workspace creates a new goal, not a live binding to
+  // an already-created goal's own radio state.
+  getDefaultTaskReviewPolicy(): string {
+    return vscode.workspace.getConfiguration('nodalmerge').get<string>('defaultTaskReviewPolicy') ?? 'HumanRequired';
   }
 
-  async saveDefaultReviewPolicy(policy: string): Promise<void> {
+  async saveDefaultTaskReviewPolicy(policy: string): Promise<void> {
     await vscode.workspace.getConfiguration('nodalmerge')
-      .update('defaultReviewPolicy', policy, vscode.ConfigurationTarget.Workspace);
+      .update('defaultTaskReviewPolicy', policy, vscode.ConfigurationTarget.Workspace);
+  }
+
+  getDefaultWorkspaceReviewPolicy(): string {
+    return vscode.workspace.getConfiguration('nodalmerge').get<string>('defaultWorkspaceReviewPolicy') ?? 'HumanRequired';
+  }
+
+  async saveDefaultWorkspaceReviewPolicy(policy: string): Promise<void> {
+    await vscode.workspace.getConfiguration('nodalmerge')
+      .update('defaultWorkspaceReviewPolicy', policy, vscode.ConfigurationTarget.Workspace);
   }
 
   async resolveApiKey(profile: AgentProfile, secrets: vscode.SecretStorage): Promise<string | undefined> {
@@ -146,6 +170,19 @@ export class AgentConfigService {
     return 'an unknown configuration error occurred';
   }
 
+  /**
+   * The opaque cache key sent to the server alongside live connection details — never the secret
+   * itself. Real providers reuse the same apiKeyRef SecretStorage already keys on (so it's already
+   * unique per profile, even when several profiles share a provider). vscode-lm profiles have no
+   * apiKeyRef (no real secret — resolveSpawnLlmConfig always sends apiKey: ''), but the local LM
+   * proxy's baseUrl is still session-ephemeral (a fresh OS-assigned port each activation, see
+   * LmApiProxy.baseUrl) and must be re-resolved on resume the same way, so it gets a ref too.
+   */
+  resolveCredentialRef(profile: AgentProfile): string | undefined {
+    if (profile.provider === 'vscode-lm') { return `vscode-lm:${profile.id}`; }
+    return profile.apiKeyRef;
+  }
+
   async storeApiKey(profile: AgentProfile, key: string, secrets: vscode.SecretStorage): Promise<void> {
     const ref = profile.apiKeyRef ?? `nodalmerge.apikey.${profile.id}`;
     await secrets.store(ref, key);
@@ -180,6 +217,7 @@ export class AgentConfigService {
         model:    p.model ?? '',
         baseUrl:  lmProxyBaseUrl,
         apiKey:   '',
+        credentialRef: this.resolveCredentialRef(p) ?? '',
       };
     }
 
@@ -194,6 +232,7 @@ export class AgentConfigService {
       model:    p.model ?? '',
       baseUrl,
       apiKey,
+      credentialRef: this.resolveCredentialRef(p) ?? '',
     };
   }
 

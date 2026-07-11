@@ -63,7 +63,7 @@ export class StudioShellPanel implements vscode.Disposable {
 
     this.activityCenter   = new ExecutionTimelinePanel(panel, baseUrl, notifications, configService, secrets, lmProxyBaseUrl, this.getSelectedSessionId);
     this.reviewPanel = new DecisionConvergencePanel(panel, baseUrl, configService, this.getSelectedSessionId);
-    this.modelAgentStudio    = new ModelAgentStudioPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
+    this.modelAgentStudio    = new ModelAgentStudioPanel(panel, baseUrl, configService, secrets, this.onModelAgentConfigChanged);
     this.pathways    = new TrajectoryReplayPanel(panel, baseUrl, this.getSelectedSessionId);
     this.goalWorkspace       = new GoalWorkspacePanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl, this.onSessionChanged);
     this.insights            = new InsightsPanel(panel, baseUrl, configService, secrets, lmProxyBaseUrl);
@@ -85,6 +85,12 @@ export class StudioShellPanel implements vscode.Disposable {
     this.insights.activate();
     this.projectionComparison.activate();
   }
+
+  /** Pushed to Goal Workspace right after a profile/template/session-default save in Model &
+   *  Agent Studio, instead of leaving it to Goal Workspace's own ~30s strategies poll. */
+  private onModelAgentConfigChanged = (): void => {
+    void this.goalWorkspace.sendStrategies();
+  };
 
   /** Returns the currently-selected session ID from the Goal Workspace. */
   private getSelectedSessionId = (): string | undefined => {
@@ -111,16 +117,19 @@ export class StudioShellPanel implements vscode.Disposable {
     notifications?: NotificationManager,
   ): StudioShellPanel {
     if (StudioShellPanel.current) {
-      StudioShellPanel.current.panel.reveal(vscode.ViewColumn.Two);
+      StudioShellPanel.current.panel.reveal(vscode.ViewColumn.Active);
       return StudioShellPanel.current;
     }
     const panel = vscode.window.createWebviewPanel(
       StudioShellPanel.viewType,
       'NodalMerge Studio',
-      vscode.ViewColumn.Two,
+      vscode.ViewColumn.Active,
       {
         enableScripts: true,
         retainContextWhenHidden: true,
+        // VS Code's built-in webview find widget (Ctrl+F) — off by default, which made every
+        // Studio view un-searchable: no way to find text in conversations, cards, or timelines.
+        enableFindWidget: true,
         localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'out')],
       },
     );
@@ -177,6 +186,15 @@ export class StudioShellPanel implements vscode.Disposable {
     if (msg.type === 'activityViewTranscript') {
       this.showTab(GoalWorkspacePanel.containerId);
       await this.goalWorkspace.openConversationStandalone(msg.workUnitId as string);
+      return;
+    }
+    // Merge review panel's "View in Candidate Promotion" link — shown on any proposal whose
+    // targetBranch is the candidate branch, so a reviewer can jump straight to that conflict/
+    // promotion queue instead of hunting for it. Same showTab + direct panel-method pattern as
+    // activityViewTranscript above.
+    if (msg.type === 'viewCandidatePromotion') {
+      this.showTab(ExecutionTimelinePanel.containerId);
+      this.activityCenter.focusCandidatePromotion();
       return;
     }
     await Promise.all([

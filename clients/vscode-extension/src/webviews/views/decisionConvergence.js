@@ -22,14 +22,16 @@ export function init(ctx) {
   }
 
   var STATUS_BUTTONS = {
-    draft:          { validate: true,  accept: false, reject: false, apply: false },
-    readyforreview: { validate: false, accept: true,  reject: true,  apply: false },
-    proposed:       { validate: false, accept: true,  reject: true,  apply: false },
-    executing:      { validate: true,  accept: false, reject: false, apply: false },
-    merge:          { validate: false, accept: false, reject: false, apply: false },
-    approved:       { validate: false, accept: false, reject: false, apply: true  },
-    merged:         { validate: false, accept: false, reject: false, apply: false },
-    rejected:       { validate: false, accept: false, reject: false, apply: false },
+    draft:          { validate: true,  accept: false, reject: false, apply: false, unreject: false },
+    readyforreview: { validate: false, accept: true,  reject: true,  apply: false, unreject: false },
+    proposed:       { validate: false, accept: true,  reject: true,  apply: false, unreject: false },
+    executing:      { validate: true,  accept: false, reject: false, apply: false, unreject: false },
+    merge:          { validate: false, accept: false, reject: false, apply: false, unreject: false },
+    approved:       { validate: false, accept: false, reject: false, apply: true,  unreject: false },
+    merged:         { validate: false, accept: false, reject: false, apply: false, unreject: false },
+    // Rejected is a recommendation, not a wall: a human can overrule it (accept: the backend now
+    // allows Rejected -> Approved for exactly this) or send it back for another attempt (unreject).
+    rejected:       { validate: false, accept: true,  reject: false, apply: false, unreject: true  },
   };
 
   // esc() imported from ./lib/esc.js (local copy didn't escape quotes, but is used in attribute contexts)
@@ -65,8 +67,14 @@ export function init(ctx) {
   $('btn-accept').addEventListener('click', function() {
     vscode.postMessage({ type: 'acceptDecision', notes: reviewNotesValue() });
   });
-  $('btn-reject').addEventListener('click', function() {
-    vscode.postMessage({ type: 'rejectDecision', notes: reviewNotesValue() });
+  $('btn-revise').addEventListener('click', function() {
+    vscode.postMessage({ type: 'reviseDecision', notes: reviewNotesValue() });
+  });
+  $('btn-revert').addEventListener('click', function() {
+    vscode.postMessage({ type: 'revertAndRestart', notes: reviewNotesValue() });
+  });
+  $('btn-unreject').addEventListener('click', function() {
+    vscode.postMessage({ type: 'unrejectAndRevise', notes: reviewNotesValue() });
   });
   $('btn-apply').addEventListener('click', function() {
     vscode.postMessage({ type: 'applyDecision' });
@@ -74,9 +82,39 @@ export function init(ctx) {
   $('btn-fork').addEventListener('click', function() {
     vscode.postMessage({ type: 'forkHypothesis' });
   });
+  $('btn-view-candidate-promotion').addEventListener('click', function() {
+    vscode.postMessage({ type: 'viewCandidatePromotion' });
+  });
   $('btn-restore').addEventListener('click', function() {
     vscode.postMessage({ type: 'restoreWorkspace' });
   });
+
+  // Paths with a captured pre-edit baseline (extension told us via 'editBaselineSet') — used
+  // purely to decide whether a row's inline "Resync Workspace" button should show yet. Reset
+  // whenever a fresh proposal/conflict loads (a baseline from a previous decision would be
+  // meaningless here).
+  window.__editedPaths = window.__editedPaths || {};
+
+  // Conflict reports list conflicting paths as "## path" lines (see
+  // InMemoryMergeService's report generation) — parsed here purely for rendering
+  // per-file Edit File buttons, not for anything that changes merge behavior.
+  function renderConflictFileRows(reportContent) {
+    var paths = (reportContent || '').split('\n')
+      .filter(function(line) { return line.indexOf('## ') === 0; })
+      .map(function(line) { return line.slice(3).trim(); })
+      .filter(function(p) { return p.length > 0; });
+    if (!paths.length) return '';
+    return '<div class="file-change" style="padding:8px 12px">' +
+      paths.map(function(p) {
+        var edited = !!window.__editedPaths[p];
+        return '<div style="display:flex;align-items:center;gap:8px;margin:4px 0">' +
+          '<span style="flex:1;font-family:var(--nm-mono);font-size:0.9em">' + esc(p) + '</span>' +
+          '<button class="ghost" data-edit-conflict-file="' + esc(p) + '">Edit File</button>' +
+          (edited ? '<button class="ghost" data-resync>Resync Workspace</button>' : '') +
+          '</div>';
+      }).join('') +
+      '</div>';
+  }
 
   // ── Phase 9f — shared single-item renderers (used by both the persisted-evidence
   // view below and the live per-root results) ──────────────────────────────────
@@ -366,7 +404,11 @@ export function init(ctx) {
       html += '<summary>' + esc(fc.path) + ' <span class="badge">' + esc(fc.changeKind) + '</span></summary>';
       html += '<div class="file-change-body">' + body + '</div>';
       if (!isDeleted) {
-        html += '<button class="ghost" data-open-diff="' + idx + '">Open Diff in Editor</button>';
+        html += '<button class="ghost" data-open-diff="' + idx + '">View Diff (read-only)</button>';
+        html += '<button class="ghost" data-edit-file="' + idx + '">Edit File</button>';
+        if (window.__editedPaths[fc.path]) {
+          html += '<button class="ghost" data-resync>Resync Workspace</button>';
+        }
       }
       html += '</details>';
       return html;
@@ -403,6 +445,28 @@ export function init(ctx) {
         beforeContent: fc.beforeContent,
         afterContent: fc.afterContent
       });
+      return;
+    }
+
+    var editBtn = ev.target.closest('[data-edit-file]');
+    if (editBtn) {
+      var editIdx = parseInt(editBtn.getAttribute('data-edit-file'), 10);
+      var editFc = window.__fileChanges && window.__fileChanges[editIdx];
+      if (editFc) {
+        vscode.postMessage({ type: 'editFile', path: editFc.path });
+      }
+      return;
+    }
+
+    var editConflictBtn = ev.target.closest('[data-edit-conflict-file]');
+    if (editConflictBtn) {
+      vscode.postMessage({ type: 'editFile', path: editConflictBtn.getAttribute('data-edit-conflict-file') });
+      return;
+    }
+
+    var resyncBtn = ev.target.closest('[data-resync]');
+    if (resyncBtn) {
+      vscode.postMessage({ type: 'resyncWorkspace' });
       return;
     }
 
@@ -455,6 +519,15 @@ export function init(ctx) {
       return;
     }
 
+    if (msg.type === 'editBaselineSet') {
+      window.__editedPaths[msg.path] = true;
+      // Re-render whichever view is currently showing this path's row, so its inline
+      // "Resync Workspace" button appears without waiting for a full reload.
+      rerenderFileChanges();
+      setHtml('conflict-file-rows', renderConflictFileRows(window.__lastConflictContent || ''));
+      return;
+    }
+
     if (msg.type === 'noPending') {
       var loadingEl2 = $('loading');
       var contentEl2 = $('content');
@@ -477,6 +550,8 @@ export function init(ctx) {
     }
 
     if (msg.type === 'conflict') {
+      window.__editedPaths = {};
+      window.__lastConflictContent = msg.content || '';
       var loadingEl3 = $('loading');
       var contentEl3 = $('content');
       if (loadingEl3) loadingEl3.classList.add('hidden');
@@ -490,6 +565,7 @@ export function init(ctx) {
       showIf('section-rollback', false);
       showIf('section-conflict-report', true);
       setText('conflict-report-content', msg.content || '');
+      setHtml('conflict-file-rows', renderConflictFileRows(msg.content));
       return;
     }
 
@@ -569,6 +645,7 @@ export function init(ctx) {
     }
 
     if (msg.type !== 'proposal') { return; }
+    window.__editedPaths = {};
     showDecisionSections(true);
     showIf('section-conflict-report', false);
     var p = msg.proposal;
@@ -586,6 +663,10 @@ export function init(ctx) {
     setHtml('status-badge', '<span class="' + badgeClass + '">' + esc(p.status) + '</span>');
     setText('source-branch', p.sourceBranch);
     setText('target-branch', p.targetBranch);
+    // targetBranch stays the proposal's ultimate destination ("main") whether or not promotion
+    // branch is in play — landedOnCandidateBranch is the actual "did this land on the shared
+    // candidate staging branch" signal, set at apply time (see MergeProposal.LandedOnCandidateBranch).
+    showIf('btn-view-candidate-promotion', !!p.landedOnCandidateBranch);
     setText('confidence', p.confidence != null ? (Math.round(p.confidence * 100) + '%') : '—');
     setText('goal', p.goal);
     setText('summary', p.summary);
@@ -683,11 +764,13 @@ export function init(ctx) {
     );
     showIf('section-auto-applied', isAutoApplied);
 
-    var btns = STATUS_BUTTONS[status] || { validate: false, accept: false, reject: false, apply: false };
+    var btns = STATUS_BUTTONS[status] || { validate: false, accept: false, reject: false, apply: false, unreject: false };
     setDisabled('btn-validate', !btns.validate);
     setDisabled('btn-accept',  !btns.accept);
-    setDisabled('btn-reject',  !btns.reject);
+    setDisabled('btn-revise',  !btns.reject);
+    setDisabled('btn-revert',  !btns.reject);
     setDisabled('btn-apply',   !btns.apply);
+    setDisabled('btn-unreject', !btns.unreject);
   });
 
 }

@@ -13,6 +13,28 @@ namespace NodalMerge.Studio.Integration.Tests;
 [Trait("Category", "Integration")]
 public class AutomatedReviewIntegrationTests
 {
+    // Reconciliation only folds a fanned-out child's proposal in once it's been Approved — these
+    // children default to TaskReviewPolicy.HumanRequired, so simulate the human approval each one
+    // needs before the parent's reconciled proposal (what AutomatedReviewGateService reviews) can
+    // ever be produced. Safe to call repeatedly across polling iterations — already-approved
+    // proposals are tracked so they're never re-reviewed.
+    private static async Task ApproveReadyChildProposalsAsync(
+        IMergeService merge, IWorkUnitService workUnits, string parentWorkUnitId, HashSet<string> alreadyApproved)
+    {
+        var children = await workUnits.GetChildrenAsync(parentWorkUnitId);
+        var childIds = children.Select(c => c.WorkUnitId).ToHashSet();
+        var ready = (await merge.ListAsync())
+            .Where(p => p.Status == MergeProposalStatus.ReadyForReview
+                && p.WorkUnitId is not null && childIds.Contains(p.WorkUnitId)
+                && !alreadyApproved.Contains(p.ProposalId))
+            .ToList();
+        foreach (var p in ready)
+        {
+            await merge.ReviewAsync(p.ProposalId, MergeProposalStatus.Approved);
+            alreadyApproved.Add(p.ProposalId);
+        }
+    }
+
     [Fact]
     public async Task AutoReview_approves_reconciled_proposal_before_human_gate()
     {
@@ -27,6 +49,7 @@ public class AutomatedReviewIntegrationTests
         var agentControl    = app.Services.GetRequiredService<IAgentControlService>();
         var agentRuntime    = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
         var merge           = app.Services.GetRequiredService<IMergeService>();
+        var workUnits       = app.Services.GetRequiredService<IWorkUnitService>();
 
         await agentRuntime.StartAsync(CancellationToken.None);
         try
@@ -44,9 +67,11 @@ public class AutomatedReviewIntegrationTests
                 autoReviewProfileId: "reviewer");
 
             MergeProposal? reviewed = null;
+            var approvedChildren = new HashSet<string>();
             var deadline = DateTimeOffset.UtcNow.AddSeconds(45);
             while (DateTimeOffset.UtcNow < deadline)
             {
+                await ApproveReadyChildProposalsAsync(merge, workUnits, parent.WorkUnitId, approvedChildren);
                 reviewed = (await merge.ListAsync()).FirstOrDefault(p =>
                     p.WorkUnitId == parent.WorkUnitId &&
                     p.ReconciledFrom.Count >= 2 &&
@@ -79,6 +104,7 @@ public class AutomatedReviewIntegrationTests
         var agentControl    = app.Services.GetRequiredService<IAgentControlService>();
         var agentRuntime    = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
         var merge           = app.Services.GetRequiredService<IMergeService>();
+        var workUnits       = app.Services.GetRequiredService<IWorkUnitService>();
 
         await agentRuntime.StartAsync(CancellationToken.None);
         try
@@ -96,9 +122,11 @@ public class AutomatedReviewIntegrationTests
                 autoReviewProfileId: "reviewer");
 
             MergeProposal? rejected = null;
+            var approvedChildren = new HashSet<string>();
             var deadline = DateTimeOffset.UtcNow.AddSeconds(45);
             while (DateTimeOffset.UtcNow < deadline)
             {
+                await ApproveReadyChildProposalsAsync(merge, workUnits, parent.WorkUnitId, approvedChildren);
                 rejected = (await merge.ListAsync()).FirstOrDefault(p =>
                     p.WorkUnitId == parent.WorkUnitId &&
                     p.ReconciledFrom.Count >= 2 &&
@@ -131,6 +159,7 @@ public class AutomatedReviewIntegrationTests
         var agentRuntime    = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
         var workUnits       = app.Services.GetRequiredService<IWorkUnitService>();
         var deadLetter      = app.Services.GetRequiredService<IDeadLetterService>();
+        var merge           = app.Services.GetRequiredService<IMergeService>();
 
         await agentRuntime.StartAsync(CancellationToken.None);
         try
@@ -149,9 +178,14 @@ public class AutomatedReviewIntegrationTests
 
             WorkUnit? deadLettered = null;
             DeadLetterEntry? entry = null;
+            // Each rejection cycle re-queues the children and produces fresh proposals, so approval
+            // has to keep running for the whole window, not just once up front.
+            var approvedChildren = new HashSet<string>();
             var deadline = DateTimeOffset.UtcNow.AddSeconds(180);
             while (DateTimeOffset.UtcNow < deadline)
             {
+                await ApproveReadyChildProposalsAsync(merge, workUnits, parent.WorkUnitId, approvedChildren);
+
                 deadLettered = await workUnits.GetAsync(parent.WorkUnitId);
                 if (deadLettered?.Status == WorkUnitStatus.DeadLettered)
                 {
@@ -188,6 +222,7 @@ public class AutomatedReviewIntegrationTests
         var agentControl    = app.Services.GetRequiredService<IAgentControlService>();
         var agentRuntime    = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
         var merge           = app.Services.GetRequiredService<IMergeService>();
+        var workUnits       = app.Services.GetRequiredService<IWorkUnitService>();
 
         await agentRuntime.StartAsync(CancellationToken.None);
         try
@@ -204,9 +239,11 @@ public class AutomatedReviewIntegrationTests
                 apiKey: "fake-key");
 
             MergeProposal? reconciled = null;
+            var approvedChildren = new HashSet<string>();
             var deadline = DateTimeOffset.UtcNow.AddSeconds(35);
             while (DateTimeOffset.UtcNow < deadline)
             {
+                await ApproveReadyChildProposalsAsync(merge, workUnits, parent.WorkUnitId, approvedChildren);
                 reconciled = (await merge.ListAsync()).FirstOrDefault(p =>
                     p.WorkUnitId == parent.WorkUnitId &&
                     p.ReconciledFrom.Count >= 2 &&
