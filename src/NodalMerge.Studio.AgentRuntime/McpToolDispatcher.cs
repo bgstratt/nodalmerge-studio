@@ -1176,7 +1176,7 @@ internal sealed class McpToolDispatcher(
         try
         {
             var recorded = await artifactCommands.RecordAsync(
-                unitId, typeStr, title, body, Str(input, "parentArtifactId"), ct).ConfigureAwait(false);
+                unitId, typeStr, title, body, Str(input, "parentArtifactId"), StrArray(input, "supersedes"), ct).ConfigureAwait(false);
             return ToJson(new { artifactId = recorded.ArtifactId });
         }
         catch (ArgumentException ex)

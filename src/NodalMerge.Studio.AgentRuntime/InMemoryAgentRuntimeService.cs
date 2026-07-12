@@ -310,7 +310,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 {
                     var constraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var promptGuidanceContext = await BuildPromptGuidanceContextAsync(PipelineStage.Plan, ct).ConfigureAwait(false);
-                    var combinedContext = string.Join("\n\n", new[] { constraintsContext, promptGuidanceContext }.Where(s => s is not null));
+                    var engineeringStateContext = await BuildEngineeringStateContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                    var combinedContext = string.Join("\n\n", new[] { constraintsContext, promptGuidanceContext, engineeringStateContext }.Where(s => s is not null));
                     var plannerLoop = new PlannerAgentLoop(
                         agentId, item.WorkUnitId, agentClient,
                         profile, item.SessionId, a => ReportActivity(agentId, a),
@@ -362,7 +363,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     // both pull context only when actually needed instead of pushing it to everyone.
                     var workerConstraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, ct).ConfigureAwait(false);
-                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
+                    var workerEngineeringState = await BuildEngineeringStateContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerEngineeringState }.Where(s => s is not null));
                     // Snapshotted before the loop runs: if the task was already Completed coming
                     // in (e.g. re-queued after a rejection, before the underlying task got reset —
                     // see AutomatedReviewGateService), the agent can't legitimately transition it
@@ -371,15 +373,23 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var taskStatusBeforeRun = !string.IsNullOrWhiteSpace(taskId) && taskServiceForVerify is not null
                         ? (await taskServiceForVerify.GetAsync(taskId, ct).ConfigureAwait(false))?.Status
                         : null;
-                    var loop = new WorkerAgentLoop(
-                        agentId, item.WorkUnitId, taskId, agentClient,
-                        profile, item.SessionId, a => ReportActivity(agentId, a),
-                        isResume: item.AttemptCount > 0, ruleFileContext: ruleFileContext,
-                        selfVerifyBuild: _options.RequireBuildBeforeProposal,
-                        selfVerifyTest: _options.RequireTestBeforeProposal,
-                        promptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
-                        conversationLog: conversationLog, events: _events, logger: _logger);
-                    completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
+                    // plans/harness-hosting-architecture.md Phase B.1 — Worker-role construction
+                    // goes through the executor seam; Plan/Review above stay on the native loop
+                    // classes directly (out of B1's scope). agentClient/conversationLog built
+                    // above for Plan/Review are unused here — NativeHarnessExecutor resolves its
+                    // own from the request's Provider/Model/BaseUrl/ApiKey.
+                    var harnessExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
+                    var executor = harnessExecutorResolver.Resolve(profile?.Executor);
+                    var harnessRequest = new HarnessRunRequest(
+                        HarnessMode.Execute, agentId, item.WorkUnitId, taskId, profile, item.SessionId,
+                        IsResume: item.AttemptCount > 0, ruleFileContext,
+                        PromptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
+                        SelfVerifyBuild: _options.RequireBuildBeforeProposal,
+                        SelfVerifyTest: _options.RequireTestBeforeProposal,
+                        OnActivity: a => ReportActivity(agentId, a),
+                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey);
+                    var harnessResult = await executor.RunAsync(harnessRequest, cts.Token).ConfigureAwait(false);
+                    completion = harnessResult.Completion;
 
                     if (completion == AgentLoopCompletion.Succeeded)
                     {
@@ -968,22 +978,26 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         {
             try
             {
-                var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
-                var llm = _serviceProvider.GetRequiredService<LlmClient>();
-                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
-                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var ruleFileContext = await BuildRuleFileContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerConstraintsContext = await BuildConstraintsContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, cts.Token).ConfigureAwait(false);
-                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
-                var loop = new WorkerAgentLoop(
-                    agentId, workUnitId, taskId, agentClient, profile,
-                    onActivity: a => ReportActivity(agentId, a), ruleFileContext: ruleFileContext,
-                    selfVerifyBuild: _options.RequireBuildBeforeProposal,
-                    selfVerifyTest: _options.RequireTestBeforeProposal,
-                    promptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
-                    conversationLog: conversationLog, logger: _logger);
-                await loop.RunAsync(cts.Token).ConfigureAwait(false);
+                var workerEngineeringState = await BuildEngineeringStateContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
+                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerEngineeringState }.Where(s => s is not null));
+                // plans/harness-hosting-architecture.md Phase B.1 — same seam as
+                // RunScheduledWorkerAsync's Worker branch. Preserves this site's exact existing
+                // behavior: no sessionId, completion discarded, no scheduler/dead-letter
+                // interaction (zero behavior change is B1's acceptance bar for this path).
+                var harnessExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
+                var executor = harnessExecutorResolver.Resolve(profile?.Executor);
+                var harnessRequest = new HarnessRunRequest(
+                    HarnessMode.Execute, agentId, workUnitId, taskId, profile, SessionId: null,
+                    IsResume: false, ruleFileContext,
+                    PromptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
+                    SelfVerifyBuild: _options.RequireBuildBeforeProposal,
+                    SelfVerifyTest: _options.RequireTestBeforeProposal,
+                    OnActivity: a => ReportActivity(agentId, a),
+                    Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey);
+                await executor.RunAsync(harnessRequest, cts.Token).ConfigureAwait(false);
                 _logger.LogInformation("[Agent {AgentId}] Worker loop completed.", agentId);
             }
             catch (OperationCanceledException) { }
@@ -1164,6 +1178,33 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         }
     }
 
+    // plans/harness-hosting-architecture.md Phase A.5 — native-loop kickoff injection of the
+    // EngineeringState projection's rendered markdown, so a native worker gets the same "living
+    // timeline" context an external harness reads from .workspace/state.md, without needing a file
+    // read of its own. Same shape as BuildRuleFileContextAsync/BuildConstraintsContextAsync above:
+    // resolved once up front, never throws.
+    //
+    // WorkspaceContractService.RenderEngineeringStateMarkdownAsync always renders something (even
+    // "no facts yet") because MaterializeAsync needs state.md to exist regardless — this sentinel
+    // is how the kickoff-injection caller (which wants null-on-empty, like BuildConstraintsContextAsync)
+    // recognizes the empty case without a second method on the service. Must match
+    // WorkspaceContractService.RenderEngineeringStateMarkdown's empty-Facts branch exactly.
+    private const string NoEngineeringStateFactsMarkdown = "# Engineering state\n\nNo promoted facts yet.\n";
+
+    private async Task<string?> BuildEngineeringStateContextAsync(string workUnitId, CancellationToken ct)
+    {
+        try
+        {
+            var contracts = _serviceProvider.GetRequiredService<IWorkspaceContractService>();
+            var rendered = await contracts.RenderEngineeringStateMarkdownAsync(workUnitId, ct).ConfigureAwait(false);
+            return rendered == NoEngineeringStateFactsMarkdown ? null : rendered;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     // Promoted PromptImprovement findings targeting this stage — stage-scoped, unlike the
     // universal constraints above. Used by loops (Planner, Worker) that have no projection-fetch
     // loop of their own and so resolve this once up front, same shape as the helpers above.
@@ -1212,6 +1253,17 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IContinueService, ContinueService>();
         // Phase 10 — LLM-backed merge provider (sits inside AgentRuntime where LlmClient lives).
         services.AddSingleton<ILlmMergeProvider, LlmMergeProvider>();
+        // plans/harness-hosting-architecture.md Phase B.1 — the executor seam. NativeHarnessExecutor
+        // wraps the current loop; future adapters (ClaudeCodeExecutor, Phase B.2) register
+        // alongside it as additional IHarnessExecutor implementations, no resolver changes needed.
+        services.AddSingleton<IHarnessExecutor, NativeHarnessExecutor>();
+        services.AddSingleton<IHarnessExecutorResolver, HarnessExecutorResolver>();
+        // Phase B.2 — the first external adapter. ClaudeCodeExecutorOptions.ExecutablePath
+        // defaults to "claude" (resolved via PATH); tests override to a stub CLI — see
+        // ClaudeCodeExecutorOptions' own doc comment for why the real binary must never run in
+        // automated tests.
+        services.AddSingleton(new ClaudeCodeExecutorOptions());
+        services.AddSingleton<IHarnessExecutor, ClaudeCodeExecutor>();
         return services;
     }
 }

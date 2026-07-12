@@ -243,3 +243,13 @@ public sealed record ProviderRetryAttemptedPayload(
     int MaxAttempts,
     int DelayMs,
     string Reason);
+
+// plans/harness-hosting-architecture.md Phase B.3 — one of these per entry in a ClaudeCodeExecutor
+// run's terminal permission_denials array. RawJson carries the denial verbatim (unverified shape
+// beyond "empty array" as of 2026-07-12 — see the plan's B2 research) so nothing is lost even if
+// the parsed ToolName/Reason fields miss a real field name.
+public sealed record HarnessPermissionDeniedPayload(
+    string AgentId,
+    string? ToolName,
+    string? Reason,
+    string RawJson);

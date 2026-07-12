@@ -46,6 +46,7 @@ public class InMemoryMergeServiceTests
         public Task DeleteAsync(string b, string p, CancellationToken ct = default) => Task.CompletedTask;
         public Task<bool> ExistsAsync(string b, string p, CancellationToken ct = default) => Task.FromResult(false);
         public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, string? p2 = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<IReadOnlyList<string>> ListIncludingDotfilesAsync(string b, string s, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
         public Task<(IReadOnlyList<NodalMerge.Studio.Core.Services.WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(string b, string query, string? s = null, string? fp = null, bool regex = false, bool cs = false, int cl = 3, int mr = 200, CancellationToken ct = default) => Task.FromResult<(IReadOnlyList<NodalMerge.Studio.Core.Services.WorkspaceSearchMatch>, bool)>(([], false));
         public Task<NodalMerge.Studio.Core.Services.WorkspaceReplaceResult> ReplaceAsync(string b, string p, string oldText, string newText, int expectedMatches = 1, CancellationToken ct = default) => Task.FromResult(new NodalMerge.Studio.Core.Services.WorkspaceReplaceResult(0, 0, 0, string.Empty));
         public Task<string> DiffAsync(string s, string t, CancellationToken ct = default) => Task.FromResult(string.Empty);

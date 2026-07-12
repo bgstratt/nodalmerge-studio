@@ -2,15 +2,19 @@
 
 ## Status
 
-- [ ] Phase A — Engineering State projection + `.workspace/` contract (no harness dependency)
-- [ ] Phase B — `IHarnessExecutor` seam + Claude Code CLI adapter
+- [x] Phase A — Engineering State projection + `.workspace/` contract (no harness dependency) —
+      implemented 2026-07-12 (A1–A5 all landed; full solution test suite green, 707/707)
+- [x] Phase B — `IHarnessExecutor` seam + Claude Code CLI adapter — B1/B2/B3 implemented
+      2026-07-12 (722/722 tests green); both items originally deferred out of B3
+      (`--add-dir` for cross-repo work units, `--resume`/session-id persistence for steering) were
+      closed the same day, 725/725 tests green — see the Phase B3 implementation notes below
 - [ ] **Gate: run the harness-comparison eval** (`plans/harness-comparison-eval.md` — checkouts
       prepped, never executed) before committing past Phase B
 - [ ] Phase C — Transcript ingestion + capability flags + second adapter
 - [ ] Phase D — Plan ingestion; scheduler shifts from decomposing to coordinating
 - [ ] Phase E (opportunistic) — hooks-based leasing, file watching, Agent SDK sidecar
 
-Nothing here is started. Phases A and B carry implementation-ready slice breakdowns
+Phase A is done. Phase B carries an implementation-ready slice breakdown
 (see "Slice breakdown"); C has a slice mapping; D is deliberately design-gated. This
 plan captures the direction decided 2026-07-11 (external design discussion + code
 analysis) plus all design decisions resolved in the follow-up passes the same day.
@@ -327,13 +331,189 @@ Phase C/D investment.
 | A4 | `WorkspaceContractService`: assemble from projections + work-unit + review-policy state; materialize JSON + derived markdown into the branch workdir | Byte-deterministic materialization; consumed by A5 |
 | A5 | Integration: `.workspace/` exclusion in both places (see decisions), harvest parser (decisions/ + inbox normalization, idempotent by numbered-file domain key), native loop consumes the contract **by kickoff injection of the rendered markdown** (native workers shouldn't need file reads to get context) | Native worker kickoff includes engineering state; harvest re-run doesn't double-record |
 
+#### Phase A implementation notes (shipped 2026-07-12) — gaps folded into Phase B
+
+All 5 slices landed; full solution test suite green (707/707; 3 of these 4 items landed as part
+of B1/B2 — see the Phase B implementation notes below for what actually happened to each).
+Verified against the shipped code, four items were cut or left incomplete relative to this table
+and were carried forward rather than back-patched in isolation, since each is naturally
+B-scoped work anyway:
+
+- **Inbox/outbox harvesting was not built.** A5's `decisions/` harvest parser
+  (`WorkspaceContractService.HarvestDecisionsAsync`) shipped; `inbox/` did not — only the
+  `WorkspaceContractInboxEntry`/`OutboxEntry` DTOs exist (A3). Folds into **B3**, which is
+  where "pause-and-wait" `AwaitingClarification` wiring already lives per the decisions below
+  — inbox harvesting has no independent value until B3 can act on it.
+- **`WorkspaceContractReviewPolicy` is missing `SelfVerifyBuildRequired`/`SelfVerifyTestRequired`.**
+  Confirmed 2026-07-12: these map to `WorkspaceOptions.RequireBuildBeforeProposal`/
+  `RequireTestBeforeProposal` — session-wide checkboxes in the extension's goal-workspace
+  webview (`goalWorkspace.js`), today consumed only as a `WorkerAgentLoop` kickoff-prompt hint
+  (`selfVerifyBuild`/`selfVerifyTest` params), with no gate behind them. Adding the two bool
+  fields to the DTO (sourced from `WorkspaceOptions`, not `WorkUnit` — they aren't per-work-unit
+  today) is a **B3** prerequisite: B3's own text already says these "become harvest-side
+  enforcement for external executors," so the DTO field is B3 work, not a missed A3 field.
+- **`WorkspaceProfileService.IgnoredDirNames`** (`WorkspaceProfileService.cs:16-17`) is a
+  separate, hand-duplicated list that never actually mirrored `WorkspacePathFilter
+  .IgnoredDirNames` (predates this plan — already missing `.git`/`.nodalmerge`) and does not
+  exclude `.workspace` either, so sub-project root/build-command detection still walks into
+  `.workspace/`. Low-risk (nothing project-marker-shaped lives there today); fold into **B1**
+  as a one-line fix alongside the executor-seam refactor, since B1 already touches kickoff
+  plumbing in the same area.
+- **Docs drift**: `docs/reference/api-reference.md` line ~234 still describes
+  `nm_v1_artifact_record` as Research/Decision/Constraint only (missing Supersession/
+  `supersedes`), and its projection catalog (~line 449) doesn't list `EngineeringState`. Fix
+  as part of **B1** (touches the same tool-catalog area when `AgentProfile.executor` lands).
+
+Not carried forward (accepted as-is): `WorkspaceContractGoal` derives "the goal" by walking
+`WorkUnit.ParentWorkUnitId` to the root rather than querying `IGoalNodeService` — reasonable
+proxy, revisit only if `GoalNodeService` proves to be the more authoritative source once B
+exercises the contract for real. `RuntimeVersion()` is a placeholder
+(`Assembly.GetName().Version`) — cosmetic, not blocking.
+
 ### Phase B
 
 | Slice | Content | Acceptance |
 |---|---|---|
-| B1 | `IHarnessExecutor` + `HarnessRunRequest/Result` (Mode enum, `Execute` only); `NativeHarnessExecutor` wraps existing loops; refactor the 3 construction sites; `AgentProfile.executor` field | Full existing test suite green with zero behavior change |
+| B1 | `IHarnessExecutor` + `HarnessRunRequest/Result` (Mode enum, `Execute` only); `NativeHarnessExecutor` wraps existing loops; refactor the 3 construction sites; `AgentProfile.executor` field. Bundled cleanup (see Phase A notes above): add `.workspace` to `WorkspaceProfileService.IgnoredDirNames`; refresh `docs/reference/api-reference.md`'s artifact-record/projection-catalog entries | Full existing test suite green with zero behavior change |
 | B2 | `ClaudeCodeExecutor`: spawn `claude` (cwd = branch workdir, `--print --output-format stream-json`, generated `--settings` allowlist, ambient auth + optional env-key injection), wall-clock/cost caps, exit-code handling | Integration test against a **fake `claude` stub** — reuse the eval-harness stub technique (`RUNBOOK.md`); no API calls in CI |
-| B3 | Harvest: diff → `merge.propose` (existing services), `decisions/` → artifact records, run-level usage → conversation log/cost; failure modes → `AgentLoopCompletion`; `isResume` → re-materialize + `--resume`. **`selfVerifyBuild/Test` becomes harvest-side enforcement for external executors**: Studio runs build/test on the branch at harvest and failure blocks the proposal — the contract *mentions* the requirement (efficiency: agent fixes before exiting), but the guarantee is the gate, not prompt compliance. Same principle as advisory leases: prompt = hint, runtime mechanism = correctness | Full cycle test: spawn(stub) → edit → harvest → gate → proposal → AP-4 approve → apply (mirror of `FullAgentCycleTests`); a build-breaking stub edit is blocked at the gate |
+| B3 | Harvest: diff → `merge.propose` (existing services), `decisions/` → artifact records, run-level usage → conversation log/cost; failure modes → `AgentLoopCompletion`; `isResume` → re-materialize + `--resume`. **`selfVerifyBuild/Test` becomes harvest-side enforcement for external executors**: Studio runs build/test on the branch at harvest and failure blocks the proposal — the contract *mentions* the requirement (efficiency: agent fixes before exiting), but the guarantee is the gate, not prompt compliance. Same principle as advisory leases: prompt = hint, runtime mechanism = correctness. Add `SelfVerifyBuildRequired`/`SelfVerifyTestRequired` to `WorkspaceContractReviewPolicy` (sourced from `WorkspaceOptions`, not `WorkUnit`). Complete the `inbox/` harvest parser (mirror `HarvestDecisionsAsync`) and wire detected questions into `AwaitingClarification` | Full cycle test: spawn(stub) → edit → harvest → gate → proposal → AP-4 approve → apply (mirror of `FullAgentCycleTests`); a build-breaking stub edit is blocked at the gate; an `inbox/0001.md` question pauses the work unit and an `outbox/0001.md` answer resumes it |
+
+#### Phase B1/B2 implementation notes (shipped 2026-07-12) — gaps folded into B3
+
+Full solution suite green (717/717; up from 707 after Phase A). B1 matched this plan closely,
+with one correction found during its own bundled cleanup: **`WorkspaceProfileService
+.IgnoredDirNames` was never actually a functional gap** — its sole caller (`IsIgnored`) already
+treats any dot-prefixed path segment as hidden, independent of that array, so build/test-command
+detection already skipped `.workspace` before the "fix." The array was still synced for parity
+(the two lists drift on non-dot-prefixed entries otherwise), but the original claim that this was
+a real bug was wrong.
+
+B1 also closed a real gap in its own first pass: the initial seam-routing test only exercised the
+direct-spawn Worker construction site (`StartWorkerLoop`, reached via `SpawnAsync` with a non-null
+`taskId` — e.g. the orchestrator's own `nm_v1_agent_spawn` tool call), which discards
+`HarnessRunResult` entirely and never calls `VerifyWorkerProgressAsync`. A second test
+(`Queue_driven_worker_spawn_...`) was added driving a real `ScheduledItem` through
+`IWorkScheduler.EnqueueAsync` + `PollSchedulerAsync`'s background loop to cover the
+queue-driven site (`RunScheduledWorkerAsync`) the plan's acceptance text actually specified.
+
+B2 shipped `ClaudeCodeExecutor`, grounded in one real `claude -p --output-format stream-json`
+invocation (captured 2026-07-12 against claude 2.1.177 — cost $0.044 for a one-word reply,
+confirming automated tests must never call the real binary). Real findings from that capture:
+stream-json is multi-line (`system`/`rate_limit_event`/`assistant`/`result` event types, not a
+single blocking JSON object); `total_cost_usd`/`num_turns`/`usage.input_tokens`/
+`usage.output_tokens` on the terminal `result` event matched `run-one.ps1`'s unverified guesses;
+there is no structured "question" event — confirming the inbox/-file-based clarification design
+was the right call, not something stream-json itself would ever surface.
+
+Four items from this plan's literal B2 text were not implemented in the first pass. Env-key
+injection was closed immediately (below) since it wasn't naturally B3-scoped work; the other
+three are carried forward into **B3**, since the harvest step is where they become actionable:
+
+- **`--add-dir` for multi-root work units was not implemented.** The generated `--settings`
+  allowlist covers Bash/Edit/Write/Read for the single branch workdir only; a multi-root work
+  unit's additional registered-repo roots are not passed via `--add-dir` at all.
+- **Denial → execution-event wiring was not implemented.** The real captured `result` event
+  includes a `permission_denials` array (empty in the trivial probe, unverified non-empty shape)
+  that `ClaudeCodeExecutor`'s parser does not read or act on — a misconfigured allowlist is not
+  yet diagnosable from the dashboard as the plan intended.
+- **`--resume`/session-id threading is unbuilt end-to-end.** `ClaudeCodeExecutor` never sends
+  `--resume`; `HarnessRunResult.HarnessSessionId` captures the session id from stream-json output
+  but nothing persists or reuses it yet (this is explicitly B3's "Resume identity" bullet above,
+  so the gap is intentional, not an oversight — noted here for completeness).
+- ~~**Env-key-injection opt-in has no mechanism.**~~ **Closed 2026-07-12.** Added
+  `AgentProfile.InjectApiKeyEnv` (mirrors `Executor`'s trailing-optional-field pattern, threaded
+  through the REST create/update bodies); `ClaudeCodeExecutor` sets `ANTHROPIC_API_KEY` from
+  `HarnessRunRequest.ApiKey` only when the resolved profile opts in — ambient auth stays the
+  default. 719/719 tests green (2 new: default-no-injection, opt-in-injects).
+
+One deliberate, undiscussed design deviation from this plan's stub description: the test stub is
+a `.cmd` batch file, and `ClaudeCodeExecutor` wraps **every** executable path (stub or real
+`claude`) via `cmd.exe /c` uniformly on Windows, rather than the plan's "directly invocable, no
+cmd.exe wrapping needed in tests" design. This means the wrapping logic itself is exercised by
+the stub-backed tests too (arguably better coverage), but it's a real, un-approved departure from
+what was written, made unilaterally during implementation.
+
+#### Phase B3 implementation notes (shipped 2026-07-12)
+
+722/722 tests green (up from 719 after the B2 env-key-injection follow-up; 3 new test files:
+`ClaudeCodeExecutorHarvestTests` full-cycle/gate/inbox tests). Denial→execution-event wiring and
+the self-verify DTO fields (both carried forward from B1/B2) landed as designed:
+`ExecutionEventKind.HarnessPermissionDenied` + `HarnessPermissionDeniedPayload` (best-effort
+`ToolName`/`Reason` extraction, `RawJson` always preserved since the real shape of a non-empty
+`permission_denials` entry is still unverified); `WorkspaceContractReviewPolicy
+.SelfVerifyBuildRequired`/`TestRequired` sourced from `WorkspaceOptions`.
+
+The harvest pipeline itself lives inside `ClaudeCodeExecutor.RunAsync` (not the caller) —
+`IMergeCommandService.ProposeAsync` + `ValidateAsync` on success, `IWorkspaceContractService
+.HarvestDecisionsAsync`/`HarvestInboxAsync` always, `IClarificationCommandService.RequestAsync`
+per inbox question (reusing the exact same `MarkAwaitingResumeAsync`/`WorkUnitStatus.Waiting`
+parking mechanism a native worker's own `nm_v1_clarification_request` tool call triggers — no new
+pause plumbing needed), one `ConversationLogEntry` per run regardless of outcome. This keeps
+`IHarnessExecutor.RunAsync`'s contract simple ("run the harness AND reach the standard outcome")
+and means `VerifyWorkerProgressAsync` (in the caller) needs zero changes — a real `MergeProposal`
+already exists by the time `RunAsync` returns `Succeeded`, satisfying its existing check for free.
+`targetBranch` defaults to `"main"`; `MergeCommandService.ProposeAsync`'s own fan-out redirect
+(`merge/{parentWorkUnitId}`) overrides this internally for fanned-out children regardless of what's
+passed, same as the native worker's own tool call relies on.
+
+**Real end-to-end smoke test run 2026-07-12** (3 real `claude` invocations, ~$0.24 total, throwaway
+seed repo, temporary test file deleted afterward — not part of the checked-in suite). This is the
+first time any code from Phases A/B ran against the real CLI rather than a stub, and it resolved
+the biggest previously-unverified risk: **the generated `--settings` permission schema is correct**
+— zero `permission_denials` across all 3 runs, confirming the `Edit(//c/...//**)`/`Write(...)`/
+`Read(...)` pattern syntax (reverse-engineered from a real settings.json on the dev machine, per
+B2's own notes) actually works against real enforcement, not just plausible-looking JSON. The
+kickoff prompt also worked as designed — Claude read `.workspace/goal.md`/`workunit.md`/`state.md`
+unprompted and correctly followed a "preserve existing content" instruction on the second attempt.
+The full pipeline (spawn → contract materialization → real edit → harvest → `ProposeAsync` →
+`ValidateAsync`) produced a correctly-attributed `ReadyForReview` proposal.
+
+The first attempt surfaced a real bug — **in the smoke test's own setup, not in Phase A/B code**:
+`IOrchestratorService.CreateWorkUnitAsync(repositoryPath: ...)` alone does not seed branch content
+— it only registers a `RepositoryId` for write-back (`InMemoryWorkUnitService.cs:362-372`). Actual
+seeding needs `WorkspaceOptions.SeedRepositoryPath` set explicitly, `InitBranchAsync("main")`
+called first, and `seedFromBranchId: "main"` passed — exactly the pattern
+`FileSystemWorkspaceServiceSeedingTests` already documents. Worth knowing for anyone else calling
+this API directly rather than through the REST-facing `WorkUnitCommandService`, which has its own
+first-goal seeding logic this bypassed.
+
+**Both previously-deferred items closed 2026-07-12** (725/725 tests green, up from 722 — 3 new
+tests: cross-repo `--add-dir`, resume persists/reuses the CLI session id, a fresh non-resume
+attempt does not resume a stale session; plus one new assertion added to the existing native-path
+`ClarificationWorkflowTests` test for the outbox file):
+
+- **`--add-dir` for multi-root/cross-repo work units.** `WriteSettingsFileAsync` now resolves
+  `WorkUnit.ReferenceFiles`' distinct `RepositoryId`s via `IRepositoryRegistryService.GetAsync`
+  and, per distinct repository, adds a `--add-dir <path>` CLI arg plus a **Read-only** `--settings`
+  allow entry (`ReferenceFiles` is documented as "not write-gating like FileScope; just where to
+  look" — confirmed no Edit/Write entry is generated for these roots, only for the branch's own
+  workdir). `ProjectRoot.RelativePath` (sub-projects *within* one branch, e.g. "frontend") was
+  never actually part of this gap — those already live inside the workdir's own fully-allowed
+  `**` pattern and their Bash allow entries were already wired in B2; the real gap was purely
+  `IRepositoryRegistryService`'s cross-repo resolution, which wasn't researched until now.
+- **`--resume`/session-id persistence + outbox-answer-triggers-respawn.** Closed the
+  `IWorkUnitService.SetMetadataAsync` gap the plan called out: added a generic single-key
+  read-merge-write setter (null value removes the key) — a **default interface method** (using the
+  interface's own `GetAsync`+`CreateAsync`) so all ~15 existing `IWorkUnitService` test fakes kept
+  compiling without a mechanical per-file edit, with `InMemoryWorkUnitService` overriding it with
+  the same direct-dictionary read-merge-write every other setter there uses (avoiding the
+  upsert-race class `IncrementReviewRejectionCountAsync`'s own comment already warns about).
+  `ClaudeCodeExecutor` persists `claude`'s own session id onto `WorkUnit.Metadata["claudeCodeSessionId"]`
+  after every run (success, failure, or timeout — `session_id` appears on every stream-json line
+  per B2's real capture, so even a killed run's session is resumable) and passes `--resume <id>`
+  only when `HarnessRunRequest.IsResume` is true (the same `ScheduledItem.AttemptCount > 0` signal
+  B1 already wired) *and* a prior session id is on record — a fresh first attempt never
+  accidentally resumes an unrelated stale session. On the **respawn** trigger itself: no new
+  plumbing was needed at all — B1's own executor-seam wiring means the scheduler's normal
+  `RunScheduledWorkerAsync` poll (which `ClarificationCommandService.RespondAsync`'s existing
+  `scheduler.ApproveResumeAsync` + `WorkUnitStatus.Queued` already re-triggers for *every* work
+  unit, native or external) already re-resolves `IHarnessExecutorResolver` and re-invokes
+  `ClaudeCodeExecutor.RunAsync` — that was true before this session, just previously undiscovered
+  as the actual resume mechanism. What was missing was purely the CLI-session continuity: the
+  outbox half (`RespondAsync(resume: true)` now writes the human's answer to
+  `.workspace/outbox/NNNN.md`, numbered the same way `.workspace/inbox`/`.workspace/decisions`
+  are — unconditional, not executor-specific, so it's inert-but-harmless for a native worker) and
+  the kickoff prompt now tells a resuming run to check `.workspace/outbox/` before re-asking.
 
 ### Decisions resolved for implementation (2026-07-11)
 

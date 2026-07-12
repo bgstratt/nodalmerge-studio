@@ -79,4 +79,9 @@ public enum ExecutionEventKind
     // Orchestrator reliability — records a transient-provider-error retry as it happens, not just
     // the terminal dead-letter reason if all retries are exhausted.
     ProviderRetryAttempted,
+
+    // plans/harness-hosting-architecture.md Phase B.3 — a generated --settings allowlist denied a
+    // tool call during an external executor run. Emitted so a misconfigured allowlist is
+    // diagnosable from the dashboard, not buried in the harness's own transcript.
+    HarnessPermissionDenied,
 }

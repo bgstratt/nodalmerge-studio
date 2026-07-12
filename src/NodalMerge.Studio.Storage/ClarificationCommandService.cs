@@ -10,6 +10,7 @@ public sealed class ClarificationCommandService(
     IWorkScheduler scheduler,
     IWorkUnitService workUnits,
     IExecutionEventStream events,
+    IFileWorkspaceService fileWorkspace,
     WorkspaceOptions? workspaceOptions = null) : IClarificationCommandService
 {
     private static readonly HashSet<WorkUnitStatus> AbandonedStatuses =
@@ -219,6 +220,12 @@ public sealed class ClarificationCommandService(
         {
             await scheduler.ApproveResumeAsync(workUnitId, ct).ConfigureAwait(false);
             await TryUpdateStatusAsync(workUnitId, WorkUnitStatus.Queued, requested.SessionId, ct).ConfigureAwait(false);
+            // plans/harness-hosting-architecture.md Phase B3 — the outbox half of the pause/resume
+            // loop. Harmless for a native worker (it never reads .workspace/outbox); a respawned
+            // ClaudeCodeExecutor's kickoff prompt tells it to check here for the answer before
+            // asking again. Unconditional (not executor-specific) — the same posture as inbox
+            // harvesting, which also runs regardless of which executor a work unit uses.
+            await WriteOutboxAnswerAsync(workUnitId, response, ct).ConfigureAwait(false);
         }
 
         if (requested.SessionId is not null)
@@ -243,6 +250,28 @@ public sealed class ClarificationCommandService(
             WorkUnitId: workUnitId,
             Resumed: resume,
             Status: resume ? "resumed" : "response_recorded");
+    }
+
+    // Numbered files, same convention as .workspace/inbox and .workspace/decisions
+    // (WorkspaceContractService) — no frontmatter needed, the whole file content is the answer.
+    private async Task WriteOutboxAnswerAsync(string workUnitId, string response, CancellationToken ct)
+    {
+        var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+        if (wu is null)
+            return;
+
+        var existing = await fileWorkspace
+            .ListIncludingDotfilesAsync(wu.BranchId, ".workspace/outbox", ct)
+            .ConfigureAwait(false);
+        var next = existing
+            .Select(f => int.TryParse(Path.GetFileNameWithoutExtension(f), out var n) ? n : (int?)null)
+            .Where(n => n.HasValue)
+            .Select(n => n!.Value)
+            .DefaultIfEmpty(0)
+            .Max() + 1;
+
+        await fileWorkspace.WriteAsync(wu.BranchId, $".workspace/outbox/{next:0000}.md", response, ct)
+            .ConfigureAwait(false);
     }
 
     private async Task<string?> ResolveSessionIdAsync(string workUnitId, string? explicitSessionId, CancellationToken ct)

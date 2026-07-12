@@ -231,7 +231,7 @@ questions (comments, literals, config keys, docs), not for symbol relationship r
 ### Artifact (3)
 | Tool | Dispatched | Purpose |
 |---|---|---|
-| `nm_v1_artifact_record` | ✅ | Record a knowledge note (Research/Decision/Constraint) |
+| `nm_v1_artifact_record` | ✅ | Record a knowledge note (Research/Decision/Constraint/Supersession — the latter requires `supersedes`) |
 | `nm_v1_artifact_query` | ✅ | Search artifacts by type/keyword across a work unit's ancestry |
 | `nm_v1_artifact_list` | ✅ | Full artifact chain for a work unit, ancestors included by default |
 
@@ -446,7 +446,7 @@ auto-enqueue both call this).
 `merges/{id}/restore-workspace`, `merges/{id}/file-changes`, `hypotheses/fork`,
 `experiments` (create/list/get), `steering/redirect`, `steering/fork-from-node`,
 `counterfactuals` (create — Pathways "Branch from here (new steering)"),
-`projections/{DecisionContext,CounterfactualComparison,ReasoningCommitGraph,WorkspacePathways}`,
+`projections/{DecisionContext,CounterfactualComparison,ReasoningCommitGraph,WorkspacePathways,EngineeringState}`,
 `projections/{workUnitId}/materialize` (Pathways branch-current materialize),
 `repository-snapshots/{snapshotId}/materialize` (Pathways point-in-time materialize —
 `targetPath` required; refuses to write to the live repo),

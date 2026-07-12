@@ -256,6 +256,33 @@ internal sealed class FileSystemWorkspaceService(
         return Task.FromResult<IReadOnlyList<string>>(files);
     }
 
+    // plans/harness-hosting-architecture.md Phase A.5 — read-back counterpart to ListAsync's
+    // dot-hidden rule (see IFileWorkspaceService's doc comment). Uses the same dotfile-inclusive
+    // semantics as EnumerateExternalEntries/CopyDirectory below (IsIgnoredDirSegment only), so a
+    // caller that explicitly names a dot-prefixed subPath (e.g. ".workspace/decisions") actually
+    // sees what's in it.
+    public Task<IReadOnlyList<string>> ListIncludingDotfilesAsync(
+        string branchId, string subPath, CancellationToken ct = default)
+    {
+        var branchDir = BranchDir(branchId);
+        var searchRoot = SafePath(branchId, subPath);
+
+        if (!Directory.Exists(searchRoot))
+            return Task.FromResult<IReadOnlyList<string>>([]);
+
+        // IsIgnoredDirSegment is checked relative to searchRoot, not branchDir — subPath itself
+        // (e.g. ".workspace") is what the caller explicitly asked to read, so it must never be
+        // filtered by its own presence in WorkspacePathFilter.IgnoredDirNames; only genuine junk
+        // nested underneath (an unlikely stray node_modules/.git, say) should still be excluded.
+        var files = Directory.EnumerateFiles(searchRoot, "*", SearchOption.AllDirectories)
+            .Where(f => !IsIgnoredDirSegment(Path.GetRelativePath(searchRoot, f)))
+            .Select(f => Path.GetRelativePath(branchDir, f).Replace('\\', '/'))
+            .OrderBy(f => f, StringComparer.Ordinal)
+            .ToList();
+
+        return Task.FromResult<IReadOnlyList<string>>(files);
+    }
+
     // Translates a plain filename ("Foo.cs") into a substring match and a wildcard pattern
     // ("*Foo*"/"Foo?.cs") into a regex — null/empty pattern matches everything.
     private static Func<string, bool> PatternMatcher(string? pattern)

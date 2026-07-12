@@ -664,6 +664,33 @@ public interface IWorkUnitService
         string? blockedReason,
         CancellationToken cancellationToken = default);
 
+    // plans/harness-hosting-architecture.md Phase B3 — external-harness resume identity
+    // (ClaudeCodeExecutor's own CLI session id) needs a durable home; Metadata is the existing
+    // ad hoc/future-use grab-bag (see WorkUnit.cs), already given read-merge-write treatment by
+    // AmendGoalForSteeredRetryAsync below. Generic single-key setter (null value removes the key)
+    // rather than a harness-specific field, so future ad hoc uses don't need their own setter.
+    // Default body (GetAsync + CreateAsync upsert) exists so every existing IWorkUnitService test
+    // fake keeps compiling without a mechanical edit to all of them; InMemoryWorkUnitService
+    // overrides it with the same direct-dictionary read-merge-write every other setter here uses,
+    // avoiding the upsert race IncrementReviewRejectionCountAsync's own comment already warns about.
+    async Task<WorkUnit> SetMetadataAsync(
+        string workUnitId,
+        string key,
+        string? value,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = await GetAsync(workUnitId, cancellationToken).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException($"Work unit '{workUnitId}' was not found.");
+        var metadata = new Dictionary<string, string>(workUnit.Metadata ?? new Dictionary<string, string>());
+        if (value is null)
+            metadata.Remove(key);
+        else
+            metadata[key] = value;
+
+        return await CreateAsync(workUnit with { Metadata = metadata, UpdatedAt = DateTimeOffset.UtcNow }, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
     // Race-safety fix — increments one of the two ExecutionInfo rejection counters via a fresh
     // internal read-merge-write, the same convention every other setter here uses. Replaces the
     // old AutomatedReviewGateService pattern of reading the whole WorkUnit, computing a new
@@ -1571,6 +1598,10 @@ public interface IArtifactCommandService
         string title,
         string body,
         string? parentArtifactId = null,
+        // Phase A — artifact IDs this record supersedes. Required (non-empty) when type is
+        // Supersession; optional on Decision/Constraint/Research when the new record also
+        // explicitly retires an ancestor.
+        IReadOnlyList<string>? supersedes = null,
         CancellationToken ct = default);
 
     /// <summary>
@@ -1964,6 +1995,18 @@ public interface IFileWorkspaceService
     // "WeatherForecastController.cs" matches as a substring, so callers can find a specific file by
     // name across the whole branch (subPath omitted) without already knowing its directory.
     Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, string? pattern = null, CancellationToken ct = default);
+
+    // plans/harness-hosting-architecture.md Phase A.5 — ListAsync's dot-hidden rule (any
+    // dot-prefixed path segment is treated as hidden) is exactly what keeps `.workspace/` out of
+    // generic content browsing/diff, but it also means ListAsync can never see inside
+    // `.workspace/` itself. This is the read-back counterpart: lists files under subPath
+    // ignoring the dot-hidden rule (only WorkspacePathFilter.IgnoredDirNames' genuine junk dirs —
+    // node_modules/bin/obj/.git/… — are excluded), the same dotfile-inclusive semantics
+    // FileSystemWorkspaceService already uses for branch seeding. Used by
+    // WorkspaceContractService to read back harness-written `.workspace/decisions` and
+    // `.workspace/inbox` entries.
+    Task<IReadOnlyList<string>> ListIncludingDotfilesAsync(
+        string branchId, string subPath, CancellationToken ct = default);
 
     // Content search (grep), as opposed to ListAsync's filename-only matching. query is matched
     // literally unless regex=true; caseSensitive defaults to false. filePattern reuses ListAsync's
@@ -2382,6 +2425,43 @@ public interface IWorkspaceProfileService
     /// the cache would grow forever, keyed by GUID branch ids that no longer exist on disk.
     /// </summary>
     void Invalidate(string branchId);
+}
+
+// plans/harness-hosting-architecture.md Phase A.2.2 — assembly is a service, not a projection.
+// Consumes the EngineeringState projection plus work-unit/review-policy state and emits the
+// Workspace Contract (docs/contracts/workspace-contract-v1.md); does not itself compute
+// projections. RenderEngineeringStateMarkdownAsync is its own method (not folded into
+// MaterializeAsync) because the native loop's kickoff injection (Phase A.5) reuses exactly this
+// rendering — single source of markdown, never hand-duplicated.
+public interface IWorkspaceContractService
+{
+    Task<WorkspaceContractBundle> AssembleAsync(string workUnitId, CancellationToken ct = default);
+
+    /// <summary>Writes `.workspace/*.json` + derived `.md` siblings into the work unit's branch
+    /// workdir via IFileWorkspaceService. Deterministic — the same runtime state materializes
+    /// byte-identical content (contract principle WC-2).</summary>
+    Task MaterializeAsync(string workUnitId, CancellationToken ct = default);
+
+    Task<string> RenderEngineeringStateMarkdownAsync(string workUnitId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Parses `.workspace/decisions/*` (JSON or markdown-with-frontmatter, normalized to
+    /// WorkspaceContractDecisionEntry) and records each as an artifact via IArtifactLineageService
+    /// directly (bypassing IArtifactCommandService, which always mints a fresh ArtifactId).
+    /// Idempotent: each entry's ArtifactId is deterministically derived from its file number, so
+    /// IArtifactLineageService.RecordAsync's existing "second record with the same ArtifactId is a
+    /// no-op" behavior makes re-harvesting after a crash or retry safe without new dedup logic.
+    /// </summary>
+    Task<IReadOnlyList<ArtifactRef>> HarvestDecisionsAsync(string workUnitId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Parses `.workspace/inbox/*` (one blocking question per numbered file) — the harness→runtime
+    /// half of the pause-and-wait flow (plan's resolved "pause-and-wait semantics per executor"
+    /// decision: external executor v1 pauses at run granularity, detected at harvest). Returns the
+    /// parsed entries; the caller (Phase B.3 harvest) is responsible for turning each into an
+    /// IClarificationCommandService.RequestAsync call — this method only reads and parses.
+    /// </summary>
+    Task<IReadOnlyList<WorkspaceContractInboxEntry>> HarvestInboxAsync(string workUnitId, CancellationToken ct = default);
 }
 
 // Slice 16c — shared entry point for workspace execution commands — called by both MCP tools

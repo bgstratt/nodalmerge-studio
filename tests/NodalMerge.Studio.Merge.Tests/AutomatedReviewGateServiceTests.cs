@@ -562,6 +562,9 @@ public class AutomatedReviewGateServiceTests
         public Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, string? pattern = null, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<string>>([]);
 
+        public Task<IReadOnlyList<string>> ListIncludingDotfilesAsync(string branchId, string subPath, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<string>>([]);
+
         public Task<(IReadOnlyList<WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(
             string branchId, string query, string? subPath = null, string? filePattern = null,
             bool regex = false, bool caseSensitive = false, int contextLines = 3, int maxResults = 200,
@@ -793,6 +796,7 @@ public class AutomatedReviewGateServiceTests
             string title,
             string body,
             string? parentArtifactId = null,
+            IReadOnlyList<string>? supersedes = null,
             CancellationToken ct = default)
         {
             Recorded.Add((workUnitId, type, title, body));

@@ -170,6 +170,30 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return updated;
     }
 
+    public async Task<WorkUnit> SetMetadataAsync(
+        string workUnitId,
+        string key,
+        string? value,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        var metadata = new Dictionary<string, string>(workUnit.Metadata ?? new Dictionary<string, string>());
+        if (value is null)
+            metadata.Remove(key);
+        else
+            metadata[key] = value;
+
+        var updated = workUnit with { Metadata = metadata, UpdatedAt = DateTimeOffset.UtcNow };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
     public async Task<WorkUnit> IncrementReviewRejectionCountAsync(
         string workUnitId,
         bool automated,

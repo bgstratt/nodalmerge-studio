@@ -118,6 +118,11 @@ public static class ServiceCollectionExtensions
         // so a cold Host just re-detects lazily on first access.
         services.AddSingleton<IWorkspaceProfileService, WorkspaceProfileService>();
 
+        // plans/harness-hosting-architecture.md Phase A.4 — assembled fresh from the
+        // EngineeringState projection + work-unit state on every call; no persistence/rehydration,
+        // same reasoning as IWorkspaceProfileService above.
+        services.AddSingleton<IWorkspaceContractService, WorkspaceContractService>();
+
         // Phase 15a — Roslyn-backed semantic navigation for definition/reference/implementation
         // lookup in branch workspaces. Read-only and recomputed per call; no persistence.
         services.AddSingleton<IWorkspaceSemanticNavigationService, WorkspaceSemanticNavigationService>();

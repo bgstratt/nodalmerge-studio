@@ -112,7 +112,9 @@ public static class StudioRestEndpoints
         string SystemPrompt,
         IReadOnlyList<string> AllowedTools,
         int MaxIterations,
-        IReadOnlyList<string>? FileScopePatterns = null);
+        IReadOnlyList<string>? FileScopePatterns = null,
+        string? Executor = null,
+        bool InjectApiKeyEnv = false);
 
     private sealed record UpdateAgentProfileBody(
         string Name,
@@ -120,7 +122,9 @@ public static class StudioRestEndpoints
         string SystemPrompt,
         IReadOnlyList<string> AllowedTools,
         int MaxIterations,
-        IReadOnlyList<string>? FileScopePatterns = null);
+        IReadOnlyList<string>? FileScopePatterns = null,
+        string? Executor = null,
+        bool InjectApiKeyEnv = false);
 
     private sealed record MarkKnownGoodBody(
         string BranchId,
@@ -3125,7 +3129,9 @@ public static class StudioRestEndpoints
                 body.SystemPrompt ?? string.Empty,
                 body.AllowedTools ?? [],
                 body.MaxIterations > 0 ? body.MaxIterations : 20,
-                body.FileScopePatterns ?? []);
+                body.FileScopePatterns ?? [],
+                body.Executor,
+                body.InjectApiKeyEnv);
             var created = await profiles.CreateAsync(profile, ct).ConfigureAwait(false);
             return Results.Ok(created);
         });
@@ -3147,7 +3153,9 @@ public static class StudioRestEndpoints
                     body.SystemPrompt ?? string.Empty,
                     body.AllowedTools ?? [],
                     body.MaxIterations > 0 ? body.MaxIterations : 20,
-                    body.FileScopePatterns ?? []);
+                    body.FileScopePatterns ?? [],
+                    body.Executor,
+                    body.InjectApiKeyEnv);
                 var updated = await profiles.UpdateAsync(profile, ct).ConfigureAwait(false);
                 return Results.Ok(updated);
             }
@@ -3229,7 +3237,8 @@ public static class StudioRestEndpoints
         string Type,
         string Title,
         string Body,
-        string? ParentArtifactId = null);
+        string? ParentArtifactId = null,
+        IReadOnlyList<string>? Supersedes = null);
 
     private sealed record PlanArtifactBody(
         string WorkUnitId,
@@ -3304,7 +3313,7 @@ public static class StudioRestEndpoints
             try
             {
                 var recorded = await artifactCommands.RecordAsync(
-                    body.WorkUnitId, body.Type, body.Title, body.Body, body.ParentArtifactId, ct).ConfigureAwait(false);
+                    body.WorkUnitId, body.Type, body.Title, body.Body, body.ParentArtifactId, body.Supersedes, ct).ConfigureAwait(false);
                 return Results.Ok(recorded);
             }
             catch (ArgumentException ex)

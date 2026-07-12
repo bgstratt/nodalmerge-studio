@@ -97,6 +97,7 @@ public sealed class ProjectionManager : IProjectionManager
             ProjectionType.RunRetrospective => await BuildRunRetrospectiveAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.HypothesisComparison => await BuildHypothesisComparisonAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.WorkspacePathways => await BuildWorkspacePathwaysAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.EngineeringState => await BuildEngineeringStateAsync(request, cancellationToken).ConfigureAwait(false),
             _ => throw new ArgumentOutOfRangeException(nameof(request), request.Type, "Unknown projection type.")
         };
 
@@ -1300,6 +1301,57 @@ public sealed class ProjectionManager : IProjectionManager
 
         var orderedNodes = nodes.OrderBy(n => n.OccurredAt).ToList();
         return Serialize(new WorkspacePathwaysProjectionPayload(orderedNodes, edges, DateTimeOffset.UtcNow));
+    }
+
+    // plans/harness-hosting-architecture.md Phase A.1/A2 — folds promoted Decision/Constraint/
+    // Supersession artifacts into "what is currently true." Applied-proposal rule: a work-unit-owned
+    // artifact enters the fold iff its owning work unit has a Merged proposal; a global artifact
+    // (OwnedByWorkUnitId null — e.g. a promoted Knowledge Finding) is already promotion-equivalent
+    // by construction and included unconditionally, same treatment BuildAgentWorkspaceAsync gives
+    // GetGlobalConstraintsAsync. SupersededBy/IsCurrent are derived here, never stored (see
+    // EngineeringStateFact's doc comment) — the reverse index is scoped to candidate (promoted)
+    // artifacts only, so an in-flight work unit's Supersedes claim can never retire a promoted fact.
+    private async Task<string> BuildEngineeringStateAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        var allProposals = await _merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+        var promotedWorkUnitIds = allProposals
+            .Where(p => p.Status == MergeProposalStatus.Merged && p.WorkUnitId is not null)
+            .Select(p => p.WorkUnitId!)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var decisions = await _artifactLineage.GetByTypeAsync(ArtifactType.Decision, ct).ConfigureAwait(false);
+        var constraints = await _artifactLineage.GetByTypeAsync(ArtifactType.Constraint, ct).ConfigureAwait(false);
+        var supersessions = await _artifactLineage.GetByTypeAsync(ArtifactType.Supersession, ct).ConfigureAwait(false);
+
+        bool IsPromoted(ArtifactRef a) =>
+            a.OwnedByWorkUnitId is null || promotedWorkUnitIds.Contains(a.OwnedByWorkUnitId);
+
+        var candidates = decisions.Concat(constraints).Concat(supersessions)
+            .Where(IsPromoted)
+            .ToList();
+
+        var reverseIndex = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var candidate in candidates)
+        {
+            foreach (var supersededId in candidate.Supersedes)
+            {
+                if (!reverseIndex.TryGetValue(supersededId, out var supersededByList))
+                    reverseIndex[supersededId] = supersededByList = [];
+                supersededByList.Add(candidate.ArtifactId);
+            }
+        }
+
+        var facts = candidates
+            .Select(a => new EngineeringStateFact(
+                a.ArtifactId, a.Type, a.Title, a.Body, a.Status, a.CreatedAt, a.OwnedByWorkUnitId,
+                a.Supersedes,
+                SupersededBy: reverseIndex.TryGetValue(a.ArtifactId, out var by) ? by : [],
+                IsCurrent: a.Status != ArtifactStatus.Invalidated && !reverseIndex.ContainsKey(a.ArtifactId)))
+            .OrderBy(f => f.CreatedAt)
+            .ThenBy(f => f.ArtifactId, StringComparer.Ordinal)
+            .ToList();
+
+        return Serialize(new EngineeringStateProjectionPayload(facts, DateTimeOffset.UtcNow));
     }
 
     // Mirrors the anonymous-object shape RepositorySyncService.SyncCoreAsync serializes into

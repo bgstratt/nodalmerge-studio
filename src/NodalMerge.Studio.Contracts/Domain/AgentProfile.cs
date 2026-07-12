@@ -20,4 +20,14 @@ public sealed record AgentProfile(
     string SystemPrompt,
     IReadOnlyList<string> AllowedTools,
     int MaxIterations,
-    IReadOnlyList<string> FileScopePatterns);
+    IReadOnlyList<string> FileScopePatterns,
+    // plans/harness-hosting-architecture.md Phase B.1 — which IHarnessExecutor runs this
+    // profile's Worker-stage spawns ("native" | "claude-code" | ...). Null (the default for
+    // every profile that predates this field) resolves to the native executor — see
+    // IHarnessExecutorResolver.
+    string? Executor = null,
+    // Phase B.2 — resolved decision "ambient auth, key opt-in": ClaudeCodeExecutor defaults to
+    // the machine's existing CLI auth and holds no secret. Set true only for headless/CI profiles
+    // that need ClaudeCodeExecutor to inject the caller-supplied credential (HarnessRunRequest
+    // .ApiKey) as ANTHROPIC_API_KEY on the spawned process's environment instead.
+    bool InjectApiKeyEnv = false);
