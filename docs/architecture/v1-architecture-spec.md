@@ -6,7 +6,7 @@ Draft v1
 
 ## Purpose
 
-NodalMerge Studio is an agent-native collaborative workspace platform built on top of NodalMerge.
+NodalMerge Studio is a persistent collaborative runtime for human and AI development work, built on top of NodalMerge. It provides the execution environment, decision history, artifact lineage, and coordination layer for a shared convergent workspace; agent harnesses (native or external) are participants in that runtime, not the product.
 
 NodalMerge provides:
 
@@ -20,7 +20,7 @@ NodalMerge provides:
 
 NodalMerge Studio provides:
 
-* Agent orchestration
+* Agent runtime & coordination (native and, eventually, external harnesses)
 * Task management
 * Work unit management
 * Projection generation

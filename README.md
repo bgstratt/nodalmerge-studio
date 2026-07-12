@@ -2,9 +2,9 @@
 
 **Git for agent reasoning and execution** — not Git for files.
 
-NodalMerge Studio is an agent-native collaborative development runtime built on [NodalMerge](https://github.com/nodalmerge/nodalmerge). Humans, AI agents, automation, and MCP tools work together through deterministic projections, coordinated task execution, and human review workflows — all backed by a persistent, branchable, replayable artifact graph.
+NodalMerge Studio is a persistent collaborative runtime for human and AI development work, built on [NodalMerge](https://github.com/nodalmerge/nodalmerge). It provides the execution environment, decision history, artifact lineage, and coordination layer for a shared, evolving workspace — designed so that any agent harness, tool, or human collaborator can contribute, with every contribution reviewed, promoted, and replayable.
 
-Every step an agent takes produces a durable artifact in a DAG. Every artifact can be inspected, branched, replayed, merged, and audited. The durable graph is the product; agents are features of it.
+Every step an agent takes produces a durable artifact in a DAG. Every artifact can be inspected, branched, replayed, merged, and audited. The durable graph is the product; agents are features of it. The harness is just one participant.
 
 ---
 
