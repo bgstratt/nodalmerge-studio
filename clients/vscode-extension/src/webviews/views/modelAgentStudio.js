@@ -20,6 +20,18 @@ export function init(ctx) {
   let templates = [];
   let defaultTopology = '';
   var onModelsLoaded = null;
+  // plans/harness-hosting-architecture.md Phase C.3 (phase-c-implementation.md C2) — CLI provider
+  // options for the Model Profile dropdown, sent by AgentConfigPanel.sendConfig() from
+  // GET /studio/executors (data-driven, falls back to a static claude-cli/codex-cli list
+  // server-side if that endpoint can't be reached) instead of one hardcoded <option> per adapter.
+  var cliProviders = [];
+  function isCliProviderKey(key) {
+    return cliProviders.some(function(cp) { return cp.providerKey === key; });
+  }
+  function cliDisplayName(key) {
+    var found = cliProviders.find(function(cp) { return cp.providerKey === key; });
+    return found ? found.displayName : key;
+  }
 
   // ── Tab switching ──────────────────────────────────────────────────────────
   root.querySelectorAll('.tab-btn').forEach(function(btn) {
@@ -91,11 +103,16 @@ export function init(ctx) {
       : profiles[idx];
     const curProvider = p.provider || 'anthropic';
     const isVsLm = curProvider === 'vscode-lm';
+    const isCli = isCliProviderKey(curProvider);
     const secretMissing = !isNew && credentialStatus[p.id] === 'secret-missing';
     const area = $('profile-form-area');
     const modelRowClass = 'field';
-    const baseUrlRowClass = isVsLm ? 'field hidden' : 'field';
+    const baseUrlRowClass = (isVsLm || isCli) ? 'field hidden' : 'field';
     const apiKeyRowClass = isVsLm ? 'field hidden' : 'field';
+    const cliOptionsHtml = cliProviders.map(function(cp) {
+      return '<option value="' + esc(cp.providerKey) + '"' + (curProvider === cp.providerKey ? ' selected' : '') +
+        '>' + esc(cp.displayName) + ' (local binary — uses your CLI login)</option>';
+    }).join('');
     area.innerHTML =
       '<div class="form-box">' +
       '<h3>' + (isNew ? 'Add Profile' : 'Edit Profile') + '</h3>' +
@@ -111,8 +128,15 @@ export function init(ctx) {
         '<select id="pf-provider">' +
           '<option value="vscode-lm"' + (curProvider === 'vscode-lm' ? ' selected' : '') + '>VS Code LM (Copilot / Cursor — no key needed)</option>' +
           '<option value="openai"'    + (curProvider === 'openai'    ? ' selected' : '') + '>OpenAI compatible (OpenAI, DeepSeek, Azure, LM Studio, etc.)</option>' +
-          '<option value="anthropic"' + (curProvider === 'anthropic' ? ' selected' : '') + '>Anthropic (claude-*)</option>' +
+          '<option value="anthropic"' + (curProvider === 'anthropic' ? ' selected' : '') + '>Anthropic API (claude-*)</option>' +
+          cliOptionsHtml +
         '</select></div>' +
+      '<div id="pf-cli-note" class="field muted' + (isCli ? '' : ' hidden') + '">' +
+        'Runs the role via the local <code>' + esc(cliDisplayName(curProvider)) + '</code> CLI in the branch working ' +
+        'directory (worker/Execute roles only for now). Auth comes from that CLI\'s own login; ' +
+        'storing an API key below is optional and switches that role to key-based auth. ' +
+        'Leave Model blank to use the CLI\'s default.' +
+      '</div>' +
       '<div id="pf-model-row" class="field">' +
         '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">' +
           '<label style="margin:0;flex:1;font-size:0.8em;opacity:0.6">Model</label>' +
@@ -121,7 +145,7 @@ export function init(ctx) {
         '<select id="pf-model-select"><option value="__custom__">— enter manually —</option>' +
           (p.model ? '<option value="' + esc(p.model) + '" selected>' + esc(p.model) + '</option>' : '') +
         '</select>' +
-        '<input type="text" id="pf-model-custom" style="margin-top:4px;' + (p.model ? 'display:none;' : '') + '" value="' + esc(p.model || '') + '" placeholder="' + (isVsLm ? 'blank = active VS Code model' : 'e.g. claude-sonnet-4-6') + '">' +
+        '<input type="text" id="pf-model-custom" style="margin-top:4px;' + (p.model ? 'display:none;' : '') + '" value="' + esc(p.model || '') + '" placeholder="' + (isVsLm ? 'blank = active VS Code model' : isCli ? 'blank = CLI default (or a CLI-specific alias/model id)' : 'e.g. claude-sonnet-4-6') + '">' +
         '<div id="pf-model-loading" class="muted hidden" style="font-size:0.8em;padding:2px 0">Fetching models…</div>' +
       '</div>' +
       '<div id="pf-baseurl-row" class="' + baseUrlRowClass + '">' +
@@ -156,11 +180,23 @@ export function init(ctx) {
     // Toggle field visibility when provider changes. Keep model visible; update its placeholder.
     $('pf-provider').addEventListener('change', function() {
       const isVs = this.value === 'vscode-lm';
-      $('pf-baseurl-row').classList.toggle('hidden', isVs);
+      const cli  = isCliProviderKey(this.value);
+      $('pf-baseurl-row').classList.toggle('hidden', isVs || cli);
       $('pf-apikey-row').classList.toggle('hidden', isVs);
+      const noteEl = $('pf-cli-note');
+      noteEl.classList.toggle('hidden', !cli);
+      if (cli) {
+        noteEl.innerHTML =
+          'Runs the role via the local <code>' + esc(cliDisplayName(this.value)) + '</code> CLI in the branch ' +
+          'working directory (worker/Execute roles only for now). Auth comes from that CLI\'s own login; ' +
+          'storing an API key below is optional and switches that role to key-based auth. ' +
+          'Leave Model blank to use the CLI\'s default.';
+      }
       const m = $('pf-model-custom');
       if (m) {
-        m.setAttribute('placeholder', isVs ? 'blank = active VS Code model' : 'e.g. claude-sonnet-4-6 or gpt-4o');
+        m.setAttribute('placeholder', isVs ? 'blank = active VS Code model'
+          : cli ? 'blank = CLI default (or a CLI-specific alias/model id)'
+          : 'e.g. claude-sonnet-4-6 or gpt-4o');
       }
       requestModels();
     });
@@ -231,7 +267,7 @@ export function init(ctx) {
       const provider     = $('pf-provider').value;
       const deployMode   = $('pf-deploy-mode').value;
       const model        = getModelValue();
-      const baseUrl      = provider === 'vscode-lm' ? '' : $('pf-baseurl').value.trim();
+      const baseUrl      = (provider === 'vscode-lm' || isCliProviderKey(provider)) ? '' : $('pf-baseurl').value.trim();
       const prompt       = $('pf-prompt').value.trim();
       if (!id || !label || !domain) { alert('ID, Label, and Domain are required.'); return; }
       const keyEl     = $('pf-apikey');
@@ -501,7 +537,9 @@ export function init(ctx) {
       if (!id || !name) { alert('Profile ID and Name are required.'); return; }
       const allowedTools = toolsRaw ? toolsRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
       const fileScopePatterns = fileScopeRaw ? fileScopeRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
-      const profile = { agentProfileId: id, name: name, stage: stage, systemPrompt: prompt, allowedTools: allowedTools, maxIterations: maxIter, fileScopePatterns: fileScopePatterns };
+      // executor/injectApiKeyEnv are not editable here (provider-driven via Model Profiles +
+      // Agent Topology), but REST-set values must survive this form's PUT round-trip.
+      const profile = { agentProfileId: id, name: name, stage: stage, systemPrompt: prompt, allowedTools: allowedTools, maxIterations: maxIter, fileScopePatterns: fileScopePatterns, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv };
       vscode.postMessage({ type: 'savePipelineProfile', profile: profile });
       $('pipeline-profile-form-area').innerHTML = '';
     });
@@ -566,6 +604,7 @@ export function init(ctx) {
       templates        = msg.templates       || [];
       defaultTopology  = msg.defaultTopology || '';
       pipelineProfiles = msg.pipelineProfiles || [];
+      cliProviders     = msg.cliProviders || [];
       renderProfiles();
       renderTemplates();
       renderPipelineProfiles();

@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { scopeViewCss } from './sharedWebviewChrome';
-import type { AgentConfigService, SpawnLlmConfig } from '../AgentConfigService';
+import { isCliProvider, type AgentConfigService, type SpawnLlmConfig } from '../AgentConfigService';
 import type { ProposalFileChange } from './MergeReviewPanel';
 import { COMMANDS } from '../constants';
 import { resolveRepositoryPath } from '../repositoryPath';
@@ -1319,6 +1319,15 @@ export class GoalWorkspacePanel {
         const reason = await this.configService.describeMissingCredentials(template.orchestrator, this.secrets, this.lmProxyBaseUrl);
         throw new Error(`Profile "${template.orchestrator}" isn't ready — ${reason}.`);
       }
+      // A CLI provider (claude-cli, codex-cli, …) routes a role to the server's matching
+      // IHarnessExecutor, which only the worker/Execute construction sites sit behind today
+      // (harness-hosting-architecture.md B1 scope; Plan/Review modes are Phase C/D, orchestrator
+      // coordination never delegates — AP-6). Fail here with a clear message instead of letting the
+      // run degrade mid-flight.
+      if (isCliProvider(orchCfg.provider)) {
+        throw new Error(
+          `Profile "${template.orchestrator}" uses a CLI provider (${orchCfg.provider}), which can't run the Orchestrator role — assign an API-based profile (Anthropic, OpenAI-compatible, or VS Code LM) to the orchestrator in Agent Topology.`);
+      }
 
       // Agent Topology — resolve credentials for any stage that has its own profile configured;
       // unset stages fall back to the Orchestrator's credentials on the backend.
@@ -1334,6 +1343,10 @@ export class GoalWorkspacePanel {
         if (!cfg) {
           const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl);
           throw new Error(`Profile "${profileId}" isn't ready — ${reason}.`);
+        }
+        if (isCliProvider(cfg.provider) && stage !== 'Execute') {
+          throw new Error(
+            `Profile "${profileId}" uses a CLI provider (${cfg.provider}), which only supports the Worker (Execute) role today — assign an API-based profile to the ${stage} stage in Agent Topology.`);
         }
         stageCredentials[stage] = cfg;
       }

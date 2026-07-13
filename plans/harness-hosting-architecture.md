@@ -10,7 +10,13 @@
       closed the same day, 725/725 tests green — see the Phase B3 implementation notes below
 - [ ] **Gate: run the harness-comparison eval** (`plans/harness-comparison-eval.md` — checkouts
       prepped, never executed) before committing past Phase B
-- [ ] Phase C — Transcript ingestion + capability flags + second adapter
+- [x] **UI hook: provider-driven executor selection** — closed 2026-07-12, out-of-band
+      B follow-up (not scoped in any phase text — see "Phase B UI gap" note below). A
+      `claude-cli` Model Profile provider, assigned per role via Agent Topology, routes the
+      role to `ClaudeCodeExecutor` — one selection, no separate executor picker
+- [ ] Phase C — Transcript ingestion + capability flags + second adapter — C1 (transcript
+      ingestion + capability flags) shipped 2026-07-12, 729/729 tests green; see
+      `plans/phase-c-implementation.md`'s C1 implementation notes; C2/C3 not started
 - [ ] Phase D — Plan ingestion; scheduler shifts from decomposing to coordinating
 - [ ] Phase E (opportunistic) — hooks-based leasing, file watching, Agent SDK sidecar
 
@@ -515,6 +521,42 @@ attempt does not resume a stale session; plus one new assertion added to the exi
   are — unconditional, not executor-specific, so it's inert-but-harmless for a native worker) and
   the kickoff prompt now tells a resuming run to check `.workspace/outbox/` before re-asking.
 
+#### Phase B UI gap — discovered and closed 2026-07-12 (provider-driven design)
+
+Auditing this plan against the shipped extension found that **no phase (B, C, or D) ever
+scoped UI work for selecting `AgentProfile.executor`.** B1 added the field to the DTO and
+REST bodies; nothing downstream ever surfaced it. A first fix (an Executor `<select>` on
+the Pipeline Agent Profile form) was built and then **rejected the same day** on UX
+review: it forced users to make two disconnected selections (a provider on the Model
+Profile *and* an executor on the pipeline profile) to know what would actually run.
+
+**The shipped design is provider-driven — one selection.** The extension's Model Profiles
+(the "which LLM and whose credentials" objects assigned per role by Agent Topology)
+gained a fourth provider, `claude-cli`, alongside `anthropic`/`openai`/`vscode-lm`. The
+provider value already travels the per-stage credential channel end-to-end (Topology →
+`stageCredentials` → server-side `OrchestratorRoutingConfig` persistence → `ScheduledItem`
+→ the worker construction sites), so the server just derives the executor from it:
+`HarnessProviders.ResolveExecutorName` (`HarnessExecutorContracts.cs`) maps
+`claude-cli` → `"claude-code"`, falling back to `AgentProfile.Executor` (which remains as
+the REST-level override for headless callers, and survives UI PUT round-trips untouched).
+
+Semantics of a `claude-cli` Model Profile:
+
+- **No base URL; API key optional.** Blank key = the machine's ambient `claude` login
+  (the resolved "ambient auth, key opt-in" decision); a stored key = injected as
+  `ANTHROPIC_API_KEY` — storing the key *is* the opt-in gesture, equivalent to
+  `InjectApiKeyEnv` on the REST path.
+- **Model optional.** Blank = the CLI's own default; otherwise passed via `--model`
+  (aliases like `sonnet`/`opus` or full model ids).
+- **Worker/Execute roles only, enforced at two layers**: the extension's goal-run path
+  rejects a `claude-cli` profile assigned to the orchestrator or Plan/Review stages with
+  an actionable error, and the server's scheduled-run path fails the same combination
+  with a clear reason (Plan/Review still construct native loop classes directly — B1
+  scope; lifted when Phase C/D modes land). The orchestrator restriction is permanent by
+  AP-6 for its coordination half.
+- Credential gates that required baseUrl/apiKey (`canRun` in `RunScheduledWorkerAsync`,
+  `canStartLoop` in `SpawnAsync`) now pass `claude-cli` without them.
+
 ### Decisions resolved for implementation (2026-07-11)
 
 - **Fold input — applied-proposal rule:** an artifact enters the Engineering State fold
@@ -583,6 +625,20 @@ attempt does not resume a stale session; plus one new assertion added to the exi
 *3 slices: C1 = transcript ingestion + capability flags (C.1 + C.2 below — the flag enum
 is small enough to ride along); C2 = second adapter (C.3); C3 = slim MCP mount (C.4).*
 
+**Status (2026-07-12, see `plans/phase-c-implementation.md` for full detail):** Phase C is fully
+shipped. C1 (transcript ingestion + capability flags, 729/729 green), C3 (slim `/mcp-harness` MCP
+mount + per-run bearer token + held-open clarification, 743/743 green — landed independently of C2,
+per the child plan's own "C3 gates on C1's capability flags" ordering note), and C2 (Codex CLI second
+adapter, 754/754 green) all shipped 2026-07-12. C2 was initially parked pending the Codex CLI being
+installed; it became available on this machine later the same day, real `codex exec --json` captures
+(codex-cli 0.144.1) were taken before any parser code was written (the child plan's own ground rule),
+and the adapter landed with a shared `HarnessHarvestPipeline` extracted from `ClaudeCodeExecutor` —
+confirming the seam genuinely isn't Claude-shaped (see the child plan's "C2 implementation notes").
+`GET /studio/executors` (C1) needed no code change to describe the third-and-now-second registered
+executor; the extension's Model Profile provider dropdown is now data-driven from that endpoint
+(static fallback list if the Host isn't reachable), retiring the hardcoded-per-adapter `<option>`
+this section anticipated needing "for a second entry."
+
 - **C.1 Transcript ingestion** — parse Claude Code stream-json / session `.jsonl` into
   `ConversationLogEntry` rows + execution events so Decision Lens, cost tracking, and
   replay keep working (granularity: per-harness-turn, not per-Studio-turn).
@@ -593,9 +649,23 @@ is small enough to ride along); C2 = second adapter (C.3); C3 = slim MCP mount (
 - **C.2 Capability flags** — don't normalize harness features; declare them:
   `SupportsTurnTelemetry`, `SupportsResume`, `SupportsHooks`, `SupportsSubagents`,
   `SupportsMcp`, `SupportsPlanningMode`. Runtime takes advantage when available,
-  degrades cleanly when not.
+  degrades cleanly when not. **UI consequence:** once flags exist server-side, the Model
+  Profile form's CLI-provider note (see the Phase B UI gap section) can become
+  capability-aware — e.g. surface "supports resume/steering" per provider instead of a
+  static description, and the extension's role-validation (worker-only today) can key
+  off `SupportsPlanningMode` instead of a hardcoded stage check.
 - **C.3 Second adapter** (Codex CLI or Aider) — primarily to prove the seam isn't
-  Claude-shaped. Expect its transcript parser to be the bulk of the work.
+  Claude-shaped. Expect its transcript parser to be the bulk of the work. **UI
+  consequence — this is the forcing function, not C.2:** under the provider-driven
+  design (Phase B UI gap section), each CLI adapter surfaces as one more provider option
+  in the Model Profile form (`codex-cli`, `copilot-cli`, …) plus one more mapping in
+  `HarnessProviders.ResolveExecutorName`. That stays hand-maintained honestly for a
+  second entry, but C.3 is the point to add a `GET /studio/executors` endpoint (list of
+  `{ name, providerKey, displayName, capabilities }` from every registered
+  `IHarnessExecutor`) so the extension's provider dropdown, the CLI-note copy, and the
+  server-side mapping are all driven from one registration instead of three hardcoded
+  lists. Per-harness auth quirks (e.g. a Copilot CLI login flow) then live on that
+  provider's own form section, not as ad hoc shared fields.
 - **C.4 Slim MCP mount (optional per-harness)** — a *knowledge/coordination* subset
   mounted into the harness via `.mcp.json`. Confirmed list from the worker-tool parity
   audit (2026-07-11): `workspace_symbol_definition/references/implementation` (Roslyn
@@ -621,6 +691,15 @@ revisit slice shape after B/C land. Tentative sketch: D1 = `Plan` mode on
 `HarnessRunRequest` + `plan.json` schema + fold into WorkUnits; D2 = executor routing
 ("who plans this goal") via the Slice 9d selector machinery; D3 = plan-staleness /
 replan policy (grows from `ReplanService`).*
+
+**UI consequence for D2:** `IAgentProfileSelectorService`-driven routing is *automatic*,
+policy-based selection — a different mechanism from the manual per-role assignment in
+Agent Topology (which, under the provider-driven design, is also what picks the executor
+via the assigned Model Profile's provider). D2 should not replace that manual assignment;
+keep it as the explicit override (a role with a concrete Model Profile assigned skips the
+selector; one left on `auto` is routed by policy). Losing the manual path would remove
+the only way to force a specific harness for debugging, comparison-eval runs, or a role
+the selector gets wrong.
 
 Instead of Studio decomposing goals into N work units, the flow becomes:
 

@@ -63,12 +63,28 @@ public sealed record HarnessRunResult(
     // reconstruction, not a harness-side session id.
     string? HarnessSessionId = null);
 
+// plans/harness-hosting-architecture.md Phase C.1 (phase-c-implementation.md C1.c) — declares what
+// an adapter's own machinery actually supports, so callers (the extension's future executor
+// dropdown, Phase D's plan-mode gating) can branch on real capability rather than string-matching
+// Name. Each flag is honest about the *adapter*, not the underlying vendor CLI's theoretical
+// ceiling — e.g. ClaudeCodeExecutor.SupportsPlanningMode is false because Studio has not wired a
+// Plan mode through this adapter yet (Phase D), even though the `claude` binary itself has one.
+public sealed record HarnessCapabilities(
+    bool SupportsTurnTelemetry,
+    bool SupportsResume,
+    bool SupportsHooks,
+    bool SupportsSubagents,
+    bool SupportsMcp,
+    bool SupportsPlanningMode);
+
 public interface IHarnessExecutor
 {
     // "native", "claude-code", ... — matches AgentProfile.Executor's string values so an
     // unrecognized/future executor name degrades to a resolver lookup miss, not a deserialization
     // failure (same additive-forward-compat reasoning as HarnessMode being a growable enum).
     string Name { get; }
+
+    HarnessCapabilities Capabilities { get; }
 
     Task<HarnessRunResult> RunAsync(HarnessRunRequest request, CancellationToken ct = default);
 }
@@ -79,4 +95,53 @@ public interface IHarnessExecutor
 public interface IHarnessExecutorResolver
 {
     IHarnessExecutor Resolve(string? executorName);
+}
+
+// The user-facing selection model is provider-driven: the extension's Model Profiles carry an
+// LLM provider ("anthropic", "openai", "vscode-lm", "claude-cli"), assigned per pipeline role by
+// the Agent Topology tab, and that provider travels the existing per-stage credential channel all
+// the way to the worker construction sites. "claude-cli" is not an HTTP API — it selects the
+// ClaudeCodeExecutor (spawn the local `claude` binary) rather than a base URL + key. This mapping
+// keeps that single-selection UX without a second executor picker in the UI, while
+// AgentProfile.Executor remains as the REST-level override for headless callers.
+public static class HarnessProviders
+{
+    public const string ClaudeCli = "claude-cli";
+
+    // plans/harness-hosting-architecture.md Phase C.3 (phase-c-implementation.md C2) — the second
+    // CLI provider, routing to CodexCliExecutor. Same "provider selects an adapter, not a base
+    // URL/key" shape ClaudeCli established.
+    public const string CodexCli = "codex-cli";
+
+    private static readonly IReadOnlyDictionary<string, string> ProviderToExecutor =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ClaudeCli] = "claude-code",
+            [CodexCli] = "codex",
+        };
+
+    public static bool IsCliProvider(string? provider) =>
+        provider is not null && ProviderToExecutor.ContainsKey(provider);
+
+    // Provider wins over AgentProfile.Executor when it names a CLI harness: a profile with
+    // Executor unset (every profile predating the field) must still route to the CLI adapter
+    // when the role's Model Profile says so, and a stale Executor value must not silently send
+    // CLI credentials into the native LlmClient path.
+    public static string? ResolveExecutorName(string? provider, string? profileExecutor) =>
+        provider is not null && ProviderToExecutor.TryGetValue(provider, out var executorName)
+            ? executorName
+            : profileExecutor;
+
+    // Reverse of the above, for the executors listing endpoint (C1.c): which provider key (if any)
+    // routes to a given executor. Native has no provider key — it's the default when no CLI
+    // provider is selected, not itself selected via the provider channel.
+    private static readonly IReadOnlyDictionary<string, string> ExecutorProviderKeys =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["claude-code"] = ClaudeCli,
+            ["codex"] = CodexCli,
+        };
+
+    public static string? ProviderKeyFor(string executorName) =>
+        ExecutorProviderKeys.TryGetValue(executorName, out var key) ? key : null;
 }

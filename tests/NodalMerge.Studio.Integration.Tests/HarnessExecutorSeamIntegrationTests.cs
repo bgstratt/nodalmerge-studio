@@ -29,6 +29,7 @@ public class HarnessExecutorSeamIntegrationTests
     private sealed class FakeHarnessExecutor : IHarnessExecutor
     {
         public string Name => "fake-harness";
+        public HarnessCapabilities Capabilities => new(false, false, false, false, false, false);
         public int InvocationCount { get; private set; }
         public HarnessRunRequest? LastRequest { get; private set; }
 

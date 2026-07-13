@@ -1567,6 +1567,25 @@ public static class StudioRestEndpoints
                 keywords = d.Keywords,
             })));
 
+        // plans/harness-hosting-architecture.md Phase C.1 (phase-c-implementation.md C1.c) — lets
+        // a caller discover registered IHarnessExecutors and what each actually supports, without
+        // hardcoding executor names. The extension does not consume this yet (that's a later
+        // slice's dropdown work); the data exists here because it's produced here.
+        app.MapGet("/studio/executors", (IEnumerable<IHarnessExecutor> executors) =>
+            Results.Ok(executors.Select(e => new
+            {
+                name = e.Name,
+                providerKey = HarnessProviders.ProviderKeyFor(e.Name),
+                displayName = e.Name switch
+                {
+                    "native" => "Native",
+                    "claude-code" => "Claude Code CLI",
+                    "codex" => "Codex CLI",
+                    _ => e.Name,
+                },
+                capabilities = e.Capabilities,
+            })));
+
         app.MapGet("/studio/agents", async (
             [FromQuery] bool all,
             [FromQuery] string? sessionId,

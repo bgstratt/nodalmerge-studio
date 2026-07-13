@@ -11,6 +11,7 @@ public class HarnessExecutorResolverTests
     private sealed class FakeExecutor(string name) : IHarnessExecutor
     {
         public string Name => name;
+        public HarnessCapabilities Capabilities => new(false, false, false, false, false, false);
         public Task<HarnessRunResult> RunAsync(HarnessRunRequest request, CancellationToken ct = default) =>
             Task.FromResult(new HarnessRunResult(AgentLoopCompletion.Succeeded));
     }

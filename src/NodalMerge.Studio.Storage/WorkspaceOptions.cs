@@ -109,6 +109,19 @@ public sealed class WorkspaceOptions
     // or "auto_abandon" (stop the work unit).
     public string DefaultClarificationTimeoutBehavior { get; set; } = "auto_continue";
 
+    // ── Phase C.4 (phase-c-implementation.md C3) — held-open clarification MCP call ───────────
+
+    // How long the "/mcp-harness" nm_v1_clarification_request tool CALL itself blocks waiting for
+    // a human answer before returning a "parked" result, distinct from
+    // DefaultClarificationTimeoutSeconds/DefaultClarificationTimeoutBehavior above (which govern
+    // when the clarification REQUEST itself auto-resolves — a much longer, human-facing horizon).
+    // This is the MCP tool-call wait ceiling: short enough that the underlying CLI process's own
+    // tool-call timeout doesn't trip first, long enough that a human answering promptly still gets
+    // the "true mid-turn pause" (no respawn) the parent plan's C.4 section describes. When it
+    // elapses with no answer, the tool returns rather than blocking forever — the .workspace/inbox
+    // + outbox file-based fallback (kill-and-respawn) still resolves the clarification eventually.
+    public int HarnessClarificationHoldOpenSeconds { get; set; } = 55;
+
     // ── Slice 21/22 — domain agents ──────────────────────────────────────────
 
     // Opt-in, default empty (matches DocFetchTools' convention above): holds the Name of each

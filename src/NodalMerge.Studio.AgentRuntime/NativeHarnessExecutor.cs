@@ -15,6 +15,15 @@ internal sealed class NativeHarnessExecutor(
 {
     public string Name => "native";
 
+    // Turn telemetry is the native loop's own per-cycle ConversationLogRecorder — the one
+    // capability it has always had. Resume is ContinueService's conversation reconstruction, not a
+    // harness-side session id, so SupportsResume:false is the honest answer at this seam (see
+    // HarnessRunResult.HarnessSessionId's doc comment). No hooks/subagents/MCP/planning-mode
+    // machinery of its own beyond McpToolDispatcher, which every executor can reach identically.
+    public HarnessCapabilities Capabilities { get; } = new(
+        SupportsTurnTelemetry: true, SupportsResume: false, SupportsHooks: false,
+        SupportsSubagents: false, SupportsMcp: false, SupportsPlanningMode: false);
+
     public async Task<HarnessRunResult> RunAsync(HarnessRunRequest request, CancellationToken ct = default)
     {
         var dispatcher = serviceProvider.GetRequiredService<McpToolDispatcher>();

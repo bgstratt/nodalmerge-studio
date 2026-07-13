@@ -270,9 +270,13 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
             _agents[agentId] = new AgentRecord(agentId, item.WorkUnitId, "active", taskId, model, baseUrl, apiKey, provider, cts);
 
-            var canRun = !awaitingCredentials && !string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
-                && (!string.IsNullOrWhiteSpace(model)
-                    || provider.Equals("openai", StringComparison.OrdinalIgnoreCase));
+            // claude-cli needs no baseUrl/apiKey (ambient CLI auth; blank model = the CLI's own
+            // default) — its only gate is not being parked for a credential-cache re-resolve.
+            var canRun = !awaitingCredentials &&
+                (HarnessProviders.IsCliProvider(provider)
+                    || (!string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
+                        && (!string.IsNullOrWhiteSpace(model)
+                            || provider.Equals("openai", StringComparison.OrdinalIgnoreCase))));
 
             if (awaitingCredentials)
             {
@@ -284,6 +288,20 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             {
                 _logger.LogWarning("[Agent {AgentId}] Scheduled worker will NOT run — missing credentials.", agentId);
                 failureReason = "Missing LLM credentials";
+                failureKind = FailureKind.MissingCredentials;
+            }
+            else if (HarnessProviders.IsCliProvider(provider) &&
+                     profile?.Stage is PipelineStage.Plan or PipelineStage.Review)
+            {
+                // Only the Worker/Execute construction sites are behind the executor seam (B1
+                // scope); Plan/Review still construct native loop classes directly, and those
+                // would hand claude-cli "credentials" to LlmClient. Fail loudly instead of
+                // producing a confusing HTTP error mid-loop. Lifted when Plan/Review modes land
+                // (harness-hosting-architecture.md Phases C/D).
+                _logger.LogWarning(
+                    "[Agent {AgentId}] Scheduled {Stage} run will NOT start — the claude-cli provider only supports Execute-stage (worker) roles today.",
+                    agentId, profile.Stage);
+                failureReason = $"The Claude Code CLI provider cannot run {profile.Stage}-stage roles yet — only Execute (worker). Assign an API-based Model Profile to this role.";
                 failureKind = FailureKind.MissingCredentials;
             }
             else
@@ -379,7 +397,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     // above for Plan/Review are unused here — NativeHarnessExecutor resolves its
                     // own from the request's Provider/Model/BaseUrl/ApiKey.
                     var harnessExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
-                    var executor = harnessExecutorResolver.Resolve(profile?.Executor);
+                    var executor = harnessExecutorResolver.Resolve(HarnessProviders.ResolveExecutorName(provider, profile?.Executor));
                     var harnessRequest = new HarnessRunRequest(
                         HarnessMode.Execute, agentId, item.WorkUnitId, taskId, profile, item.SessionId,
                         IsResume: item.AttemptCount > 0, ruleFileContext,
@@ -634,9 +652,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
         CancellationTokenSource? cts = null;
         var resolvedProvider = provider ?? "anthropic";
-        var canStartLoop = !string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
-            && (!string.IsNullOrWhiteSpace(model)
-                || resolvedProvider.Equals("openai", StringComparison.OrdinalIgnoreCase));
+        // claude-cli needs no baseUrl/apiKey/model (ambient CLI auth, CLI-default model) — but it
+        // only routes through the executor seam for worker spawns; an orchestrator must stay on an
+        // API provider (its coordination loop is native by design — AP-6).
+        var canStartLoop = HarnessProviders.IsCliProvider(resolvedProvider)
+            ? agentType == "worker"
+            : !string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
+                && (!string.IsNullOrWhiteSpace(model)
+                    || resolvedProvider.Equals("openai", StringComparison.OrdinalIgnoreCase));
         _logger.LogInformation(
             "[Agent {AgentId}] Spawn — agentType={AgentType} provider={Provider} model={Model} baseUrl={BaseUrl} profileId={ProfileId} canStartLoop={CanStart}",
             agentId, agentType, resolvedProvider, model ?? "(none)", baseUrl ?? "(none)", profileId ?? "(none)", canStartLoop);
@@ -669,7 +692,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     JsonSerializer.Serialize(routing), cancellationToken).ConfigureAwait(false);
             }
             else if (agentType == "worker" && taskId is not null)
-                StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
+                StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl ?? string.Empty, apiKey ?? string.Empty, profile, cts);
             else
                 cts.Dispose();
         }
@@ -988,7 +1011,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 // behavior: no sessionId, completion discarded, no scheduler/dead-letter
                 // interaction (zero behavior change is B1's acceptance bar for this path).
                 var harnessExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
-                var executor = harnessExecutorResolver.Resolve(profile?.Executor);
+                var executor = harnessExecutorResolver.Resolve(HarnessProviders.ResolveExecutorName(provider, profile?.Executor));
                 var harnessRequest = new HarnessRunRequest(
                     HarnessMode.Execute, agentId, workUnitId, taskId, profile, SessionId: null,
                     IsResume: false, ruleFileContext,
@@ -1258,12 +1281,25 @@ public static class ServiceCollectionExtensions
         // alongside it as additional IHarnessExecutor implementations, no resolver changes needed.
         services.AddSingleton<IHarnessExecutor, NativeHarnessExecutor>();
         services.AddSingleton<IHarnessExecutorResolver, HarnessExecutorResolver>();
+        // phase-c-implementation.md C2 — the harvest block shared by every external CLI adapter
+        // (decisions/inbox harvest, merge.propose + merge.validate, the build/test gate). Registered
+        // once, ahead of the adapters that depend on it.
+        services.AddSingleton<HarnessHarvestPipeline>();
         // Phase B.2 — the first external adapter. ClaudeCodeExecutorOptions.ExecutablePath
         // defaults to "claude" (resolved via PATH); tests override to a stub CLI — see
         // ClaudeCodeExecutorOptions' own doc comment for why the real binary must never run in
         // automated tests.
         services.AddSingleton(new ClaudeCodeExecutorOptions());
         services.AddSingleton<IHarnessExecutor, ClaudeCodeExecutor>();
+        // phase-c-implementation.md C2 — the second external adapter, proving the executor seam
+        // isn't Claude-shaped. CodexCliExecutorOptions.ExecutablePath defaults to "codex" (resolved
+        // via PATH); tests override to a stub CLI — see CodexCliExecutorOptions' own doc comment for
+        // why the real binary must never run in automated tests.
+        services.AddSingleton(new CodexCliExecutorOptions());
+        services.AddSingleton<IHarnessExecutor, CodexCliExecutor>();
+        // Phase C.4 (phase-c-implementation.md C3) — the /mcp-harness bearer-token map. Singleton,
+        // in-memory only; see HarnessMcpTokenService's own doc comment for the restart/resume story.
+        services.AddSingleton<IHarnessMcpTokenService, HarnessMcpTokenService>();
         return services;
     }
 }

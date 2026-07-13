@@ -1,6 +1,25 @@
 import * as vscode from 'vscode';
 
-export type LlmProvider = 'anthropic' | 'openai' | 'vscode-lm';
+// 'claude-cli'/'codex-cli' are not HTTP APIs — each routes the role to the server's matching
+// IHarnessExecutor (ClaudeCodeExecutor / CodexCliExecutor, spawning the local `claude`/`codex`
+// binary). No baseUrl; API key optional (blank = the machine's ambient CLI login; stored key =
+// injected as ANTHROPIC_API_KEY / OPENAI_API_KEY respectively for headless use).
+export type LlmProvider = 'anthropic' | 'openai' | 'vscode-lm' | 'claude-cli' | 'codex-cli';
+
+// plans/harness-hosting-architecture.md Phase C.3 (phase-c-implementation.md C2) — the set of
+// providers that route to a local CLI adapter rather than an HTTP API, kept as one array so a
+// third CLI adapter (Copilot CLI, …) needs a one-line change here instead of hunting down every
+// `=== 'claude-cli'` check across this file, ArtifactExplorerPanel.ts, and modelAgentStudio.js.
+const CLI_PROVIDERS: readonly LlmProvider[] = ['claude-cli', 'codex-cli'];
+
+export function isCliProvider(provider: string | undefined): boolean {
+  return provider !== undefined && (CLI_PROVIDERS as readonly string[]).includes(provider);
+}
+
+/** Human-readable label for a CLI provider's own harness, for error messages. */
+function cliDisplayName(provider: string | undefined): string {
+  return provider === 'codex-cli' ? 'Codex CLI' : 'Claude Code CLI';
+}
 
 export type DeploymentMode = 'inline' | 'headless';
 
@@ -136,6 +155,8 @@ export class AgentConfigService {
     secrets: vscode.SecretStorage,
   ): Promise<'not-needed' | 'not-configured' | 'secret-missing' | 'ok'> {
     if (profile.provider === 'vscode-lm') { return 'not-needed'; }
+    // CLI providers: no key = ambient CLI auth (fine); a stored ref should still verify resolvable.
+    if (isCliProvider(profile.provider) && !profile.apiKeyRef) { return 'not-needed'; }
     if (!profile.apiKeyRef) { return 'not-configured'; }
     const stored = await secrets.get(profile.apiKeyRef);
     return stored ? 'ok' : 'secret-missing';
@@ -154,6 +175,12 @@ export class AgentConfigService {
       return (!lmProxyBaseUrl || lmProxyBaseUrl.endsWith(':0'))
         ? 'the local VS Code LM proxy is not up yet — wait a moment and retry'
         : 'the VS Code LM proxy configuration is invalid';
+    }
+
+    if (isCliProvider(p.provider)) {
+      // resolveSpawnLlmConfig never returns undefined for a CLI provider (no required fields), so
+      // reaching here means something unexpected.
+      return `the ${cliDisplayName(p.provider)} profile could not be resolved — this is unexpected; check the extension logs`;
     }
 
     const status = await this.getCredentialStatus(p, secrets);
@@ -180,6 +207,10 @@ export class AgentConfigService {
    */
   resolveCredentialRef(profile: AgentProfile): string | undefined {
     if (profile.provider === 'vscode-lm') { return `vscode-lm:${profile.id}`; }
+    // A CLI provider has no live connection details to re-resolve, but the server's scheduler still
+    // keys parked-item credential re-warming on a ref, so give it a stable synthetic one when no
+    // key is stored (same pattern as vscode-lm above).
+    if (isCliProvider(profile.provider)) { return profile.apiKeyRef ?? `${profile.provider}:${profile.id}`; }
     return profile.apiKeyRef;
   }
 
@@ -217,6 +248,21 @@ export class AgentConfigService {
         model:    p.model ?? '',
         baseUrl:  lmProxyBaseUrl,
         apiKey:   '',
+        credentialRef: this.resolveCredentialRef(p) ?? '',
+      };
+    }
+
+    if (isCliProvider(p.provider)) {
+      // No HTTP connection — the server maps this provider to a local-binary IHarnessExecutor
+      // (ClaudeCodeExecutor / CodexCliExecutor) with ambient auth. A stored key is optional and
+      // means "inject as ANTHROPIC_API_KEY"/"OPENAI_API_KEY" server-side; blank model means the
+      // CLI's own default.
+      const cliKey = p.apiKeyRef ? await this.resolveApiKey(p, secrets) : undefined;
+      return {
+        provider: p.provider!,
+        model:    p.model ?? '',
+        baseUrl:  '',
+        apiKey:   cliKey ?? '',
         credentialRef: this.resolveCredentialRef(p) ?? '',
       };
     }

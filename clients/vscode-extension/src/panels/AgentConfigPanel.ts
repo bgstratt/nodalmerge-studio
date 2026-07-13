@@ -12,6 +12,12 @@ export interface PipelineProfile {
   // Slice 14c — glob patterns (e.g. "src/**/*.tsx") declaring this profile's file-scope
   // specialty. Empty = no declared specialty, routing falls through to heuristic/LLM selection.
   fileScopePatterns: string[];
+  // Harness-hosting-architecture Phase B1 — which IHarnessExecutor runs this role. Not exposed
+  // in the webview: the user-facing selection is provider-driven (a "claude-cli" Model Profile
+  // assigned via Agent Topology routes the role to ClaudeCodeExecutor server-side). These fields
+  // exist so values set directly over REST survive a UI edit's PUT round-trip.
+  executor?: string;
+  injectApiKeyEnv?: boolean;
 }
 
 export interface DomainAgentInfo {
@@ -95,7 +101,33 @@ export class ModelAgentStudioPanel {
       pipelineProfiles,
       domainAgents,
       enabledDomainAgents,
+      cliProviders: await this.fetchCliProviders(),
     });
+  }
+
+  // plans/harness-hosting-architecture.md Phase C.3 (phase-c-implementation.md C2) — the Model
+  // Profile provider dropdown's CLI entries are data-driven from GET /studio/executors (shipped in
+  // C1) rather than one hardcoded <option> per adapter, so a third CLI adapter needs no extension
+  // edit. The three API providers (vscode-lm/openai/anthropic) stay static in modelAgentStudio.js —
+  // they aren't IHarnessExecutor-backed, so there's nothing for that endpoint to describe about
+  // them. Falls back to the known static CLI list if the endpoint can't be reached (server down).
+  private async fetchCliProviders(): Promise<Array<{ providerKey: string; displayName: string }>> {
+    try {
+      const executors = await this.get<Array<{ providerKey?: string | null; displayName: string }>>('/studio/executors');
+      const cli = executors
+        .filter((e): e is { providerKey: string; displayName: string } => !!e.providerKey)
+        .map(e => ({ providerKey: e.providerKey, displayName: e.displayName }));
+      return cli.length > 0 ? cli : this.staticCliProviders();
+    } catch {
+      return this.staticCliProviders();
+    }
+  }
+
+  private staticCliProviders(): Array<{ providerKey: string; displayName: string }> {
+    return [
+      { providerKey: 'claude-cli', displayName: 'Claude Code CLI' },
+      { providerKey: 'codex-cli', displayName: 'Codex CLI' },
+    ];
   }
 
   private async sendParticipants(): Promise<void> {
@@ -143,8 +175,8 @@ export class ModelAgentStudioPanel {
         const endpoint = '/studio/agent-profiles' + (exists ? '/' + p.agentProfileId : '');
         const method   = exists ? 'PUT' : 'POST';
         const body = exists
-          ? { name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns }
-          : { agentProfileId: p.agentProfileId, name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns };
+          ? { name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv ?? false }
+          : { agentProfileId: p.agentProfileId, name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv ?? false };
         await (method === 'PUT'
           ? fetch(this.baseUrl + endpoint, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
           : this.post(endpoint, body));
@@ -220,6 +252,25 @@ export class ModelAgentStudioPanel {
         'claude-3-5-sonnet-20241022',
         'claude-3-5-haiku-20241022',
       ];
+    }
+    if (provider === 'claude-cli') {
+      // The CLI accepts aliases as well as full model ids; blank (manual entry left empty)
+      // means "use the CLI's own configured default", so this list is suggestions only.
+      return [
+        'sonnet',
+        'opus',
+        'haiku',
+        'claude-fable-5',
+        'claude-opus-4-8',
+        'claude-sonnet-4-6',
+        'claude-haiku-4-5-20251001',
+      ];
+    }
+    if (provider === 'codex-cli') {
+      // Suggestions only, same as claude-cli — the CLI accepts aliases and full model ids, and
+      // blank (manual entry left empty) means "use codex's own configured default". Not fetched
+      // from a live endpoint (codex has no local model-listing API this extension calls today).
+      return ['gpt-5-codex', 'o4-mini', '(blank = CLI default)'];
     }
     if (provider === 'openai' && baseUrl) {
       try {

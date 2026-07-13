@@ -11,6 +11,10 @@
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio" />
     <PackageReference Include="SourceGear.SQLite3" />
+    <!-- plans/harness-hosting-architecture.md Phase C.4 (phase-c-implementation.md C3) — real MCP
+         client, used to hit "/mcp-harness" the way the spawned CLI would (initialize + tools/call),
+         instead of asserting on the endpoint's raw HTTP shape. -->
+    <PackageReference Include="ModelContextProtocol" />
   </ItemGroup>
 
   <ItemGroup>

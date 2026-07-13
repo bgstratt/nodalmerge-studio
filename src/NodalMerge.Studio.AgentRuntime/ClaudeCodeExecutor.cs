@@ -19,15 +19,24 @@ internal sealed class ClaudeCodeExecutor(
     IWorkUnitService workUnits,
     IWorkspaceProfileService workspaceProfiles,
     IWorkspaceContractService workspaceContracts,
-    IMergeCommandService mergeCommands,
-    IClarificationCommandService clarifications,
     IConversationLogService conversationLog,
     IRepositoryRegistryService repositoryRegistry,
+    IHarnessMcpTokenService harnessMcpTokens,
+    HarnessHarvestPipeline harvest,
     ClaudeCodeExecutorOptions options,
     ILogger<ClaudeCodeExecutor> logger,
     IExecutionEventStream? events = null) : IHarnessExecutor
 {
     public string Name => "claude-code";
+
+    // Phase C.1 — turn telemetry (ClaudeTranscriptParser), resume (the CLI's own session_id +
+    // --resume, shipped B3), hooks/subagents/MCP (the underlying `claude` binary's own features,
+    // reachable via the generated --settings file today). SupportsPlanningMode stays false until
+    // Phase D actually wires a Plan mode through this adapter — the flag declares what *this
+    // adapter* supports, not the vendor CLI's theoretical ceiling.
+    public HarnessCapabilities Capabilities { get; } = new(
+        SupportsTurnTelemetry: true, SupportsResume: true, SupportsHooks: true,
+        SupportsSubagents: true, SupportsMcp: true, SupportsPlanningMode: false);
 
     // WorkUnit.Metadata key the claude CLI's own session id is persisted under between runs —
     // additive, no new typed field, matching the "Metadata for genuine ad hoc/future use"
@@ -59,7 +68,21 @@ internal sealed class ClaudeCodeExecutor(
                 ? priorSessionId
                 : null;
 
-        var psi = BuildProcessStartInfo(workDir, settingsPath, request, addDirRoots, resumeSessionId);
+        // Phase C.4 (phase-c-implementation.md C3) — the slim "/mcp-harness" mount, gated on the
+        // adapter's own declared capability (never on the vendor CLI's theoretical ceiling — see
+        // Capabilities' own doc comment) and on the Host's listening address actually being known
+        // (headless BuildPeer callers never populate HarnessMcpBaseUrl, so this degrades to "no MCP
+        // mount this run" there, same as a pre-C3 run). Token is minted fresh per run and revoked on
+        // every exit path below (harvest, timeout-kill) — never reused across runs/resumes.
+        string? harnessMcpToken = null;
+        string? mcpConfigPath = null;
+        if (Capabilities.SupportsMcp && !string.IsNullOrEmpty(options.HarnessMcpBaseUrl))
+        {
+            harnessMcpToken = harnessMcpTokens.Mint(request.WorkUnitId, request.SessionId, request.AgentId);
+            mcpConfigPath = await WriteMcpConfigFileAsync(branchId, workDir, harnessMcpToken, ct).ConfigureAwait(false);
+        }
+
+        var psi = BuildProcessStartInfo(workDir, settingsPath, mcpConfigPath, request, addDirRoots, resumeSessionId);
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(TimeSpan.FromSeconds(options.TimeoutSeconds));
@@ -67,205 +90,73 @@ internal sealed class ClaudeCodeExecutor(
         using var process = Process.Start(psi)
             ?? throw new InvalidOperationException($"Failed to start '{options.ExecutablePath}'.");
 
-        string? sessionId = null;
-        string? resultText = null;
-        string? subtype = null;
-        var isError = false;
-        int? inputTokens = null;
-        int? outputTokens = null;
-        double? totalCostUsd = null;
-        var permissionDenials = new List<string>();
+        // Thin pump — all interpretation of the stream-json lines lives in ClaudeTranscriptParser
+        // (Phase C.1), versioned separately from this executor. OnActivity is invoked by the
+        // parser itself as assistant lines stream in, same timing as before C1.
+        var parser = ClaudeTranscriptParser.Create(request.OnActivity);
 
+        // Phase C.4 (phase-c-implementation.md C3) — the token is revoked at every exit from this
+        // point on (timeout-kill below, or harvest's own return further down), never left live past
+        // the run it was minted for.
         try
         {
-            string? line;
-            while ((line = await process.StandardOutput.ReadLineAsync(cts.Token).ConfigureAwait(false)) is not null)
+            try
             {
-                if (string.IsNullOrWhiteSpace(line))
-                    continue;
+                string? line;
+                while ((line = await process.StandardOutput.ReadLineAsync(cts.Token).ConfigureAwait(false)) is not null)
+                    parser.Accept(line);
 
-                JsonDocument doc;
-                try
-                {
-                    doc = JsonDocument.Parse(line);
-                }
-                catch (JsonException)
-                {
-                    // A partial/malformed line is not fatal to the run — skip it and keep reading.
-                    continue;
-                }
-
-                using (doc)
-                {
-                    var root = doc.RootElement;
-                    if (!root.TryGetProperty("type", out var typeProp))
-                        continue;
-                    var type = typeProp.GetString();
-
-                    if (root.TryGetProperty("session_id", out var sid) && sid.ValueKind == JsonValueKind.String)
-                        sessionId = sid.GetString();
-
-                    switch (type)
-                    {
-                        case "assistant":
-                            request.OnActivity?.Invoke(ExtractAssistantText(root));
-                            break;
-                        case "result":
-                            subtype = root.TryGetProperty("subtype", out var st) ? st.GetString() : null;
-                            isError = root.TryGetProperty("is_error", out var ie) && ie.ValueKind == JsonValueKind.True;
-                            resultText = root.TryGetProperty("result", out var r) && r.ValueKind == JsonValueKind.String
-                                ? r.GetString() : null;
-                            if (root.TryGetProperty("total_cost_usd", out var cost) && cost.ValueKind == JsonValueKind.Number)
-                                totalCostUsd = cost.GetDouble();
-                            if (root.TryGetProperty("usage", out var usage))
-                            {
-                                if (usage.TryGetProperty("input_tokens", out var it) && it.TryGetInt32(out var iv))
-                                    inputTokens = iv;
-                                if (usage.TryGetProperty("output_tokens", out var ot) && ot.TryGetInt32(out var ov))
-                                    outputTokens = ov;
-                            }
-                            if (root.TryGetProperty("permission_denials", out var denials) &&
-                                denials.ValueKind == JsonValueKind.Array)
-                            {
-                                foreach (var denial in denials.EnumerateArray())
-                                    permissionDenials.Add(denial.GetRawText());
-                            }
-                            break;
-                        // "system" (session init metadata), "rate_limit_event", "user" (tool
-                        // results), and any future/unrecognized type are deliberately ignored —
-                        // per-turn transcript parsing is Phase C.1, not B2/B3.
-                    }
-                }
+                await process.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                TryKill(process);
+                // session_id appears on every stream-json line (confirmed against the real CLI), so
+                // even a killed run's session is resumable — persist it before returning.
+                var partial = parser.BuildSummary();
+                await PersistHarnessSessionIdAsync(request, partial.SessionId, ct).ConfigureAwait(false);
+                return new HarnessRunResult(
+                    AgentLoopCompletion.MaxIterationsExceeded,
+                    $"claude CLI run exceeded the {options.TimeoutSeconds}s wall-clock limit.",
+                    HarnessSessionId: partial.SessionId);
             }
 
-            await process.WaitForExitAsync(cts.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            TryKill(process);
-            // session_id appears on every stream-json line (confirmed against the real CLI), so
-            // even a killed run's session is resumable — persist it before returning.
-            await PersistHarnessSessionIdAsync(request, sessionId, ct).ConfigureAwait(false);
-            return new HarnessRunResult(
-                AgentLoopCompletion.MaxIterationsExceeded,
-                $"claude CLI run exceeded the {options.TimeoutSeconds}s wall-clock limit.",
-                HarnessSessionId: sessionId);
-        }
+            var summary = parser.BuildSummary();
 
-        // The process actually completed (didn't time out) — record what happened regardless of
-        // outcome, so a failed run is still auditable, not just a successful one.
-        await EmitPermissionDenialEventsAsync(request, permissionDenials, ct).ConfigureAwait(false);
-        await PersistHarnessSessionIdAsync(request, sessionId, ct).ConfigureAwait(false);
-        await RecordConversationLogAsync(
-            request, resultText, inputTokens, outputTokens, sessionId, ct).ConfigureAwait(false);
+            // The process actually completed (didn't time out) — record what happened regardless of
+            // outcome, so a failed run is still auditable, not just a successful one.
+            await EmitPermissionDenialEventsAsync(request, summary.PermissionDenials, ct).ConfigureAwait(false);
+            await PersistHarnessSessionIdAsync(request, summary.SessionId, ct).ConfigureAwait(false);
+            await RecordConversationLogAsync(request, summary, ct).ConfigureAwait(false);
 
-        if (process.ExitCode != 0)
-        {
-            logger.LogWarning(
-                "[claude-code] workUnitId={WorkUnitId} exited with code {ExitCode}", request.WorkUnitId, process.ExitCode);
-            return new HarnessRunResult(
-                AgentLoopCompletion.Stalled,
-                $"claude CLI exited with code {process.ExitCode}.",
-                resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
-        }
-
-        if (isError || subtype != "success")
-        {
-            return new HarnessRunResult(
-                AgentLoopCompletion.Stalled,
-                resultText ?? $"claude CLI reported subtype='{subtype}'.",
-                resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
-        }
-
-        return await HarvestAsync(
-            request, wu.BranchId, resultText, inputTokens, outputTokens, totalCostUsd, sessionId, ct)
-            .ConfigureAwait(false);
-    }
-
-    // plans/harness-hosting-architecture.md Phase B.3 — the runtime plays the role of "agent
-    // calling nm_v1_artifact_record / nm_v1_clarification_request / nm_v1_merge_propose +
-    // nm_v1_merge_validate" on the external harness's behalf, since a claude-code run has no
-    // in-loop tool call doing any of this itself.
-    private async Task<HarnessRunResult> HarvestAsync(
-        HarnessRunRequest request, string branchId, string? resultText,
-        int? inputTokens, int? outputTokens, double? totalCostUsd, string? sessionId, CancellationToken ct)
-    {
-        await workspaceContracts.HarvestDecisionsAsync(request.WorkUnitId, ct).ConfigureAwait(false);
-
-        var inboxEntries = await workspaceContracts.HarvestInboxAsync(request.WorkUnitId, ct).ConfigureAwait(false);
-        if (inboxEntries.Count > 0)
-        {
-            // Same domain-level parking mechanism a native worker's own nm_v1_clarification_request
-            // tool call triggers (ClarificationCommandService.RequestAsync marks the scheduler item
-            // AwaitingResume and the work unit Waiting) — no new pause/resume plumbing needed here.
-            // The outbox/--resume respawn half of this loop is not wired yet (see the plan's B3 notes).
-            foreach (var entry in inboxEntries)
+            if (process.ExitCode != 0)
             {
-                await clarifications.RequestAsync(
-                    request.WorkUnitId, entry.Question,
-                    requestedByAgentId: request.AgentId, sessionId: request.SessionId,
-                    ct: ct).ConfigureAwait(false);
+                logger.LogWarning(
+                    "[claude-code] workUnitId={WorkUnitId} exited with code {ExitCode}", request.WorkUnitId, process.ExitCode);
+                return new HarnessRunResult(
+                    AgentLoopCompletion.Stalled,
+                    $"claude CLI exited with code {process.ExitCode}.",
+                    summary.ResultText, summary.InputTokens, summary.OutputTokens, summary.TotalCostUsd, summary.SessionId);
             }
 
-            return new HarnessRunResult(
-                AgentLoopCompletion.AwaitingClarification, FailureReason: null,
-                resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
-        }
+            if (summary.IsError || summary.Subtype != "success")
+            {
+                return new HarnessRunResult(
+                    AgentLoopCompletion.Stalled,
+                    summary.ResultText ?? $"claude CLI reported subtype='{summary.Subtype}'.",
+                    summary.ResultText, summary.InputTokens, summary.OutputTokens, summary.TotalCostUsd, summary.SessionId);
+            }
 
-        MergeProposal proposal;
-        try
-        {
-            // targetBranch: "main" is a safe default — MergeCommandService.ProposeAsync's own
-            // fan-out redirect (merge/{parentWorkUnitId}) overrides this internally for a
-            // fanned-out child regardless of what the caller passes, same as the native worker's
-            // own nm_v1_merge_propose tool call relies on.
-            proposal = await mergeCommands.ProposeAsync(
-                sourceBranch: branchId,
-                targetBranch: "main",
-                summary: resultText ?? "Claude Code run completed.",
-                workUnitId: request.WorkUnitId,
-                agentId: request.AgentId,
-                model: Name,
-                provider: "anthropic",
-                sessionId: request.SessionId,
-                cancellationToken: ct).ConfigureAwait(false);
+            return await harvest.HarvestAsync(
+                request, wu.BranchId, summary.ResultText, summary.InputTokens, summary.OutputTokens,
+                summary.TotalCostUsd, summary.SessionId, Name, "anthropic", ct)
+                .ConfigureAwait(false);
         }
-        catch (Exception ex)
+        finally
         {
-            logger.LogWarning(ex, "[claude-code] harvest ProposeAsync failed for workUnitId={WorkUnitId}", request.WorkUnitId);
-            return new HarnessRunResult(
-                AgentLoopCompletion.Stalled, $"Harvest failed: {ex.Message}",
-                resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
+            if (harnessMcpToken is not null)
+                harnessMcpTokens.Revoke(harnessMcpToken);
         }
-
-        // The mechanical hard gate (WorkspaceExecutionRule, fired inside ProposeAsync itself when
-        // WorkspaceOptions.RequireBuildBeforeProposal/RequireTestBeforeProposal are set) rejects the
-        // proposal before Draft, before diff, before artifact lineage — this is the real
-        // "a build-breaking stub edit is blocked at the gate" guarantee, not the kickoff-contract
-        // hint (WorkspaceContractReviewPolicy.SelfVerifyBuildRequired/TestRequired).
-        if (proposal.Status == MergeProposalStatus.Rejected)
-        {
-            return new HarnessRunResult(
-                AgentLoopCompletion.Stalled,
-                proposal.ChangeDescription ?? "Merge proposal was rejected at the gate.",
-                resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
-        }
-
-        try
-        {
-            await mergeCommands.ValidateAsync(proposal.ProposalId, ct).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "[claude-code] harvest ValidateAsync failed for workUnitId={WorkUnitId}", request.WorkUnitId);
-            return new HarnessRunResult(
-                AgentLoopCompletion.Stalled, $"Proposal validation failed: {ex.Message}",
-                resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
-        }
-
-        return new HarnessRunResult(
-            AgentLoopCompletion.Succeeded, FailureReason: null,
-            resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
     }
 
     private async Task EmitPermissionDenialEventsAsync(
@@ -321,56 +212,25 @@ internal sealed class ClaudeCodeExecutor(
     }
 
     private async Task RecordConversationLogAsync(
-        HarnessRunRequest request, string? resultText,
-        int? inputTokens, int? outputTokens, string? sessionId, CancellationToken ct)
+        HarnessRunRequest request, TranscriptRunSummary summary, CancellationToken ct)
     {
-        // One entry per external run (CycleNumber 0) — a legitimate degraded-but-compatible use of
-        // the per-turn DTO every native loop call site also writes to; per-turn transcript parsing
-        // is Phase C.1, not B3.
-        var entry = new ConversationLogEntry(
-            LogId: $"CLE-{Guid.NewGuid():N}",
-            WorkUnitId: request.WorkUnitId,
-            AgentId: request.AgentId,
-            AgentRole: "worker",
-            TaskId: request.TaskId,
-            CycleNumber: 0,
-            AssistantText: resultText,
-            ToolCalls: [],
-            ToolResults: [],
-            StopReason: "end_turn",
-            OccurredAt: DateTimeOffset.UtcNow,
-            SessionId: sessionId,
-            InputTokens: inputTokens,
-            OutputTokens: outputTokens,
-            Provider: "anthropic",
-            Model: Name);
+        // Phase C.1 — per-turn entries (CycleNumber 0..N-1) plus one terminal run-level entry
+        // (CycleNumber N, unchanged "CLE-" LogId prefix from pre-C1). Degrades to exactly one
+        // entry when the transcript's format wasn't recognized (ClaudeTranscriptParser.V1's own
+        // degrade rule) — identical in shape to the pre-C1 single-entry behavior.
+        var entries = ClaudeConversationLogMapper.BuildEntries(
+            summary, request.WorkUnitId, request.AgentId, request.TaskId, Name);
 
         try
         {
-            await conversationLog.RecordAsync(entry, ct).ConfigureAwait(false);
+            foreach (var entry in entries)
+                await conversationLog.RecordAsync(entry, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             // Never let telemetry recording fail the run itself.
             logger.LogWarning(ex, "[claude-code] failed to record conversation log for workUnitId={WorkUnitId}", request.WorkUnitId);
         }
-    }
-
-    private static string? ExtractAssistantText(JsonElement root)
-    {
-        if (!root.TryGetProperty("message", out var message) ||
-            !message.TryGetProperty("content", out var content) ||
-            content.ValueKind != JsonValueKind.Array)
-            return null;
-
-        foreach (var block in content.EnumerateArray())
-        {
-            if (block.TryGetProperty("type", out var t) && t.ValueString() == "text" &&
-                block.TryGetProperty("text", out var text))
-                return text.GetString();
-        }
-
-        return null;
     }
 
     private static void TryKill(Process process)
@@ -431,8 +291,33 @@ internal sealed class ClaudeCodeExecutor(
     private static string ToSettingsPattern(string path) =>
         "//" + path.Replace('\\', '/').Replace(":", "").ToLowerInvariant().TrimStart('/');
 
+    // Phase C.4 (phase-c-implementation.md C3) — the slim harness-scoped MCP mount. Written
+    // alongside .workspace/settings.json (same directory, same "generated, never hand-edited"
+    // posture) and consumed by claude via --mcp-config. Format verified against claude 2.1.177's
+    // documented `.mcp.json` shape for an HTTP-type server entry: a "mcpServers" map keyed by
+    // server name, each entry carrying type/url/headers — the "headers" field is exactly the
+    // bearer-token carrier the plan's decided design calls for.
+    private async Task<string> WriteMcpConfigFileAsync(string branchId, string workDir, string token, CancellationToken ct)
+    {
+        var mcpConfig = new
+        {
+            mcpServers = new Dictionary<string, object>
+            {
+                ["nodalmerge-harness"] = new
+                {
+                    type = "http",
+                    url = $"{options.HarnessMcpBaseUrl!.TrimEnd('/')}/mcp-harness",
+                    headers = new Dictionary<string, string> { ["Authorization"] = $"Bearer {token}" },
+                },
+            },
+        };
+        var mcpConfigJson = JsonSerializer.Serialize(mcpConfig, JsonSerializerOptions.Web);
+        await fileWorkspace.WriteAsync(branchId, ".workspace/mcp.json", mcpConfigJson, ct).ConfigureAwait(false);
+        return Path.Combine(workDir, ".workspace", "mcp.json");
+    }
+
     private ProcessStartInfo BuildProcessStartInfo(
-        string workDir, string settingsPath, HarnessRunRequest request,
+        string workDir, string settingsPath, string? mcpConfigPath, HarnessRunRequest request,
         IReadOnlyList<string> addDirRoots, string? resumeSessionId)
     {
         // Studio-controlled, short, fixed prompt — the actual goal/context lives in
@@ -447,6 +332,20 @@ internal sealed class ClaudeCodeExecutor(
             ".workspace/inbox/. If you are resuming and were waiting on a question, check " +
             ".workspace/outbox/ for the answer before asking again.";
 
+        // Phase C.4 (phase-c-implementation.md C3) — only mentioned when the mount is actually
+        // active (mcpConfigPath non-null), matching --mcp-config below: a harness without the mount
+        // must not be told about tools it can't reach.
+        if (mcpConfigPath is not null)
+        {
+            prompt +=
+                " You also have MCP tools mounted (nm_v1_workspace_symbol_definition/_references/" +
+                "_implementation for semantic code navigation, nm_v1_doc_fetch for external " +
+                "documentation, nm_v1_artifact_record/_query for durable knowledge notes, and " +
+                "nm_v1_clarification_request to ask a blocking question and wait for the answer " +
+                "in this same turn instead of writing to .workspace/inbox/) — prefer them over the " +
+                "file-based fallbacks above when applicable.";
+        }
+
         var args = new List<string>
         {
             "-p", prompt,
@@ -454,6 +353,20 @@ internal sealed class ClaudeCodeExecutor(
             "--verbose",
             "--settings", settingsPath,
         };
+
+        if (mcpConfigPath is not null)
+        {
+            args.Add("--mcp-config");
+            args.Add(mcpConfigPath);
+        }
+
+        // Model Profile-driven model selection ("claude-cli" provider carries the profile's model
+        // through the per-stage credential channel). Blank = the CLI's own configured default.
+        if (!string.IsNullOrWhiteSpace(request.Model))
+        {
+            args.Add("--model");
+            args.Add(request.Model);
+        }
 
         foreach (var addDirRoot in addDirRoots)
         {
@@ -499,17 +412,15 @@ internal sealed class ClaudeCodeExecutor(
             psi.EnvironmentVariables.Remove(key);
 
         // Resolved decision "ambient auth, key opt-in" (plan's Decisions section) — ambient CLI
-        // auth is the default (nothing set here); only a profile that explicitly opts in gets the
-        // caller-supplied credential injected as ANTHROPIC_API_KEY.
-        if (request.Profile?.InjectApiKeyEnv == true && !string.IsNullOrEmpty(request.ApiKey))
+        // auth is the default (nothing set here). Two opt-in paths inject the caller-supplied
+        // credential as ANTHROPIC_API_KEY: AgentProfile.InjectApiKeyEnv (REST/headless), or a
+        // "claude-cli" Model Profile with a stored key — storing a key on that profile *is* the
+        // opt-in gesture there (leaving its key blank keeps ambient auth).
+        var injectKey = request.Profile?.InjectApiKeyEnv == true ||
+            HarnessProviders.IsCliProvider(request.Provider);
+        if (injectKey && !string.IsNullOrEmpty(request.ApiKey))
             psi.EnvironmentVariables["ANTHROPIC_API_KEY"] = request.ApiKey;
 
         return psi;
     }
-}
-
-file static class JsonElementExtensions
-{
-    public static string? ValueString(this JsonElement element) =>
-        element.ValueKind == JsonValueKind.String ? element.GetString() : null;
 }
