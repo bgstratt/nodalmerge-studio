@@ -590,7 +590,50 @@ public enum ReplanOutcome
 public sealed record ReplanResult(
     ReplanOutcome Outcome,
     string? Message = null,
-    IReadOnlyList<string>? NewWorkUnitIds = null);
+    IReadOnlyList<string>? NewWorkUnitIds = null,
+    // plans/phase-d-implementation.md D3 — the manual replan triggers (REST/MCP) surface the
+    // current staleness signal state on the parent (plan-owning) work unit alongside the replan
+    // outcome itself, so a human deciding whether to replan (or having just replanned) can see
+    // "this plan looks stale" in the same response. Null when no parent work unit was resolved
+    // (NotFound/NotApplicable outcomes) or IPlanStalenessService isn't registered.
+    PlanStalenessState? StalenessSignal = null);
+
+// plans/phase-d-implementation.md D3 — staleness *signals* only, never auto-replan (see
+// ExecutionEventKind.PlanStalenessSignalRaised's own doc comment for why automatic replan stays
+// deferred). Evaluated at the two cheapest existing checkpoints where the underlying data already
+// changes — a superseding Decision artifact recorded (IArtifactCommandService.RecordAsync) and a
+// slice transitioning to DeadLettered (IDeadLetterService.RecordFailureAsync) — never a polling
+// timer. Both thresholds are WorkspaceOptions knobs (PlanStalenessSupersedingDecisionThreshold /
+// PlanStalenessDeadLetteredSliceThreshold).
+public interface IPlanStalenessService
+{
+    // Called after a Decision artifact with a non-empty Supersedes list is recorded. Walks the
+    // WorkUnit ancestor chain from decision.OwnedByWorkUnitId for the nearest self-owned Plan
+    // artifact; if found, counts qualifying superseding decisions recorded since that plan across
+    // the plan owner and its immediate fanned-out children, and raises the event when the count
+    // reaches the configured threshold. No-op if decision isn't a superseding Decision or has no
+    // owning work unit.
+    Task NotifySupersedingDecisionRecordedAsync(ArtifactRef decision, CancellationToken ct = default);
+
+    // Called after workUnitId transitions to DeadLettered. Counts sibling slices (children of
+    // workUnitId's immediate parent) currently DeadLettered and raises the event when the count
+    // reaches the configured threshold. No-op if workUnitId has no parent.
+    Task NotifySliceDeadLetteredAsync(string workUnitId, CancellationToken ct = default);
+
+    // On-demand read of the current signal state for planOwnerWorkUnitId — used by the manual
+    // replan triggers to attach staleness state to their response regardless of whether a
+    // Notify* call most recently raised the event (an operator may check well after the
+    // triggering decision/dead-letter, or before either has happened again).
+    Task<PlanStalenessState> GetStateAsync(string planOwnerWorkUnitId, CancellationToken ct = default);
+}
+
+public sealed record PlanStalenessState(
+    bool IsStale,
+    int SupersedingDecisionCount,
+    int SupersedingDecisionThreshold,
+    int DeadLetteredSliceCount,
+    int DeadLetteredSliceThreshold,
+    string? PlanArtifactId);
 
 // Continue-track (Phase 1.4 two-track failure/recovery design): reconstructs a dead-lettered
 // work unit's own prior conversation from ConversationLogEntry rows and resumes the SAME work

@@ -11,7 +11,8 @@ unchanged). Slices sequential: D1 → D2 → D3.
       766/766 tests green (up from 758) — see "D1 implementation notes" below
 - [x] D2 — Executor routing ("who plans this goal") via the profile selector — shipped 2026-07-12,
       769/769 tests green (up from 766) — see "D2 implementation notes" below
-- [ ] D3 — Plan-staleness / replan policy hardening
+- [x] D3 — Plan-staleness / replan policy hardening — shipped 2026-07-12, 773/773 tests green
+      (up from 769) — see "D3 implementation notes" below
 
 ## What the recon changed about D's shape
 
@@ -325,6 +326,118 @@ D3 keeps the "don't build the planning scheduler early" discipline; concretely:
 
 Replan through the seam with a stub CLI planner (full replan cycle test); staleness
 signal event emitted in a constructed scenario; no auto-replan behavior anywhere.
+
+### D3 implementation notes (shipped 2026-07-12)
+
+773/773 tests green (up from 769; 4 new tests: 1 in `ReplanExecutorSeamTests`, 2 in
+`PlanStalenessSignalTests`, both in `tests/NodalMerge.Studio.Integration.Tests` — the existing
+`ReplanServiceIntegrationTests` test already covers "flag off + no topology = native, byte-
+identical," unmodified and still green). Known parallel-run flakes confirmed unrelated by
+isolated rerun: `NativePlanModeSeamTests`, `ClarificationWorkflowTests`,
+`CandidateBranchConflictTests` — none touch ReplanService/ArtifactCommandService/
+InMemoryDeadLetterService, and each passes cleanly alone.
+
+**Replan through the seam.** `ReplanService.ReplanFailedSliceAsync` no longer constructs
+`PlannerAgentLoop`/`DefaultAgentToolClient` directly — it resolves an executor via
+`IHarnessExecutorResolver.ResolveForProvider(provider, profile?.Executor)` (falling back to
+`Resolve("native")` on a capability miss, mirroring D1.a's Plan-stage branch exactly) and runs a
+`HarnessRunRequest(HarnessMode.Plan, ...)` through it, dropping the dispatcher/llm/
+conversationLog locals entirely — `NativeHarnessExecutor`/`ClaudeCodeExecutor`/`CodexCliExecutor`
+each resolve their own collaborators from the request, same as every other seam call site.
+`provider`/`profile` resolution follows D2's discovered precedence: `stageCreds =
+agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Plan)` non-null is "topology
+assignment explicit" (D2's own discovery note) and wins outright — `provider = stageCreds
+.Provider`, the new `IPlannerSelectionService` call site is skipped entirely. When `stageCreds` is
+null, a new call site (`serviceProvider.GetService<IPlannerSelectionService>()`, mirroring
+`OrchestratorAgentLoop.InjectSpawnCredentialsAsync`'s hook) consults
+`SelectPlannerAsync(goalUnit, creds, ct)`; `selection.Provider` is null whenever
+`WorkspaceOptions.UsePlannerExecutorSelection` is off (the default) or the heuristic tier fired,
+in which case `provider`/`profile` are left exactly as they were pre-D3 (`provider ??= creds
+.Provider`, profile stays null) — the pre-existing `ReplanServiceIntegrationTests` test (flag off,
+no topology override) still passes completely unmodified, confirming the "byte-identical" acceptance
+criterion structurally rather than by writing a near-duplicate test. `ReplanExecutorSeamTests`
+exercises the other path: an explicit Plan-stage Agent Topology assignment naming `claude-cli`
+routes the replan to a stub CLI (same fixture shape as `ClaudeCodeExecutorPlanModeTests`), which
+writes `.workspace/plan.json`, and the resulting two-slice plan folds through the completely
+unmodified `FanOutService` path, cancelling the original failed slice and creating two named
+siblings — proving "a plan exists" is now decoupled from "the native orchestrator produced it," the
+parent plan's explicit D3 warning.
+
+**Staleness signals.** New `IPlanStalenessService` (Core `ServiceContracts.cs`, implemented by
+`PlanStalenessService` in `NodalMerge.Studio.Storage` — placed there, not AgentRuntime, because
+both hook points it's called from live in Storage and Storage doesn't reference AgentRuntime) has
+two `Notify*` entry points wired into the two checkpoints the task named: `ArtifactCommandService
+.RecordAsync` calls `NotifySupersedingDecisionRecordedAsync(recorded)` right after recording any
+artifact (no-ops unless it's a `Decision` with a non-empty `Supersedes`), and
+`InMemoryDeadLetterService.RecordFailureAsync` calls `NotifySliceDeadLetteredAsync(workUnitId)`
+right after the work unit's status update to `DeadLettered` (best-effort — the pre-existing
+`catch (InvalidOperationException) { }` around that update is untouched, so an illegal transition
+still doesn't block dead-lettering, it just means the staleness count for that unit doesn't budge
+either, same as it wouldn't have shown as dead-lettered to a human reading WorkUnit status anyway).
+Both are optional/nullable constructor parameters (`IPlanStalenessService? planStaleness = null`),
+same convention as every other optional collaborator in these two services, registered as a real
+singleton in `ServiceCollectionExtensions.AddRehydratableServices` ahead of both consumers (DI
+resolves lazily by type, not registration order, so this is documentation, not a requirement).
+
+"Same work-unit chain" (the task's phrase) resolved to a concrete, cheap scope after reading how
+the two signals' own data is shaped: the plan owner (the work unit `RecordPlanAsync` was called
+against) plus its *immediate* fanned-out children — one level, matching
+`NotifySliceDeadLetteredAsync`'s own sibling scope exactly (dead-lettered slices are always
+immediate children of the plan owner; `ReplanService`'s own additive-fold model never nests a
+plan's children further). `CountSupersedingDecisionsAsync` walks that one-level set and sums
+`IArtifactLineageService.GetChainAsync` hits per work unit, filtered to `Decision` artifacts with
+`Supersedes.Count > 0` and `CreatedAt >= plannedAt` (`>=` not `>` — deliberately: a decision
+recorded in the same clock tick as the plan still counts, there's no meaningful ordering claim to
+make at sub-millisecond granularity either way). Finding "the plan" for a decision walks WorkUnit
+ancestors (`ParentWorkUnitId`) from the decision's own `OwnedByWorkUnitId` for the nearest
+self-owned `Plan` artifact — mirrors `ArtifactCommandService.CollectChainWithAncestorsAsync`'s own
+walk. `GetStateAsync(planOwnerWorkUnitId)` is the on-demand read the manual replan triggers use;
+`ReplanService` calls it once per `ReplanFailedSliceAsync` invocation (before the replan attempt,
+so the snapshot reflects "why this may be worth replanning" regardless of the outcome) and attaches
+it to every returned `ReplanResult` that has a resolved parent work unit (`NotFound`/`NotApplicable`
+leave it null — there's no plan owner to report on). The REST endpoint and the internal
+`DeadLetterTools.ReplanAsync` MCP tool both already serialize the whole `ReplanResult`, so the new
+field rides along for free; `ExternalGoalTools.GoalRecoverAsync`'s `replan` action built its own
+anonymous response object and needed one line added (`stalenessSignal = result.StalenessSignal`) on
+the success branch only — failure branches there were already terse error objects with no room
+for extra context, matching the REST/internal-MCP tools' own posture.
+
+New `ExecutionEventKind.PlanStalenessSignalRaised` + `PlanStalenessSignalPayload` follow the
+`HarnessPlanDiffDiscarded` pattern the task named, with one deliberate deviation: `AppendAsync`
+requires a non-null `sessionId`, but neither hook point has a live Studio session (a decision or
+dead-letter can originate from any agent's own session, not a fixed one) — `PlanWorkUnitId` is
+used as the `sessionId` too, so `GetSessionEventsAsync(planWorkUnitId)` finds it in addition to the
+session-agnostic `GetEventsByKindAsync`, and `ExecutionEventStreamService` places no constraint on
+`sessionId` being a real session (confirmed by reading it — it's a free-form index key).
+
+**No auto-replan, verified structurally, not just by absence.** `IPlanStalenessService`'s two
+`Notify*` methods return `Task`, take no scheduler/`IWorkScheduler` dependency, and
+`PlanStalenessSignalTests.Dead_lettered_siblings_at_threshold_raise_the_signal_but_one_below_does_not`
+asserts `(await scheduler.ListPendingAsync())` is empty after the threshold-crossing dead-letter
+that raises the event — proving the signal path genuinely cannot enqueue anything, not just that
+this particular test run happened not to observe an enqueue.
+
+**Thresholds.** `WorkspaceOptions.PlanStalenessSupersedingDecisionThreshold` (default 3) and
+`PlanStalenessDeadLetteredSliceThreshold` (default 2), both plain `int` opt-in-by-magnitude knobs
+(no separate on/off flag needed — the signal is passive, so there's no behavior to gate the way
+`UsePlannerExecutorSelection` gates an active routing change).
+
+**Deviation from the task's literal wording.** The task said "hook the cheapest correct spot" for
+both signals without naming them exactly; "promoted superseding decisions" in the task prose is
+read here as "recorded" (there's no separate promotion/approval step for a `Decision` artifact in
+the current model — `ArtifactStatus.Active` is the only status a freshly recorded one gets), not a
+distinct `ArtifactStatus.Approved` gate.
+
+**What's still open for Phase E / the orchestrator-as-service future.** Sibling invalidation
+(explicitly out of scope here, per the plan) — a replanned slice's siblings are never told their
+plan changed; a human reading the staleness signal is the whole mitigation for now. Auto-replan
+itself stays deferred pending the same safety verification `RetryWithContextAsync`'s failure-cap
+bypass needs (unchanged from the task's own framing). The staleness *count* is currently
+recomputed on every `Notify*`/`GetStateAsync` call (no caching) — fine at today's fan-out sizes
+(a handful of siblings per plan) but would need memoizing if a future slice makes plans
+meaningfully wider. `IPlanStalenessService` has no REST/MCP surface of its own yet beyond riding
+`ReplanResult` — a future dashboard widget wanting "list every currently-stale plan across the
+workspace" would need a new query method (`GetStateAsync` is single-work-unit only today).
 
 ## Out of scope for D (explicitly)
 

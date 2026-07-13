@@ -17,11 +17,12 @@
 - [ ] Phase C — Transcript ingestion + capability flags + second adapter — C1 (transcript
       ingestion + capability flags) shipped 2026-07-12, 729/729 tests green; see
       `plans/phase-c-implementation.md`'s C1 implementation notes; C2/C3 not started
-- [ ] Phase D — Plan ingestion; scheduler shifts from decomposing to coordinating — D1 (`Plan`
+- [x] Phase D — Plan ingestion; scheduler shifts from decomposing to coordinating — D1 (`Plan`
       mode through the executor seam + plan.json contract + fold) shipped 2026-07-12, 766/766
       tests green; D2 (executor routing via IPlannerSelectionService) shipped 2026-07-12,
-      769/769 tests green; see `plans/phase-d-implementation.md`'s D1/D2 implementation notes;
-      D3 not started
+      769/769 tests green; D3 (replan through the seam + plan-staleness signals) shipped
+      2026-07-12, 773/773 tests green; see `plans/phase-d-implementation.md`'s D1/D2/D3
+      implementation notes — all three slices shipped, Phase D complete
 - [ ] Phase E (opportunistic) — hooks-based leasing, file watching, Agent SDK sidecar
 
 Phase A is done. Phase B carries an implementation-ready slice breakdown
@@ -696,8 +697,14 @@ revisit slice shape after B/C land. Tentative sketch: D1 = `Plan` mode on
 ("who plans this goal") via the Slice 9d/12d/14c selector machinery; D3 = plan-staleness /
 replan policy (grows from `ReplanService`).*
 
-D1 and D2 shipped 2026-07-12 (see `plans/phase-d-implementation.md`'s implementation notes for
-both). The real selector type is `IProfileSelectionService`/`LlmProfileSelectionService` (D2
+D1, D2, and D3 all shipped 2026-07-12 (see `plans/phase-d-implementation.md`'s implementation
+notes for each) — Phase D is complete. D3 put `ReplanService`'s planner spawn through the same
+executor seam D1 built, and added plan-staleness *signals* (superseding-decision count,
+dead-lettered-slice count) surfaced as an execution event + on the manual replan triggers'
+responses — no auto-replan, and sibling invalidation stays explicitly out of scope (the
+"whether a plan is stale, invalidating work units a stale plan produced" line below is half-done:
+staleness detection shipped, invalidation didn't — see D3's "what's still open" note). The real
+selector type is `IProfileSelectionService`/`LlmProfileSelectionService` (D2
 added a parallel `IPlannerSelectionService`/`PlannerSelectionService` for the Plan stage) — every
 `IAgentProfileSelectorService` reference below is the stale pre-implementation name; corrected
 here rather than rewritten, since the surrounding design reasoning (manual override wins, policy

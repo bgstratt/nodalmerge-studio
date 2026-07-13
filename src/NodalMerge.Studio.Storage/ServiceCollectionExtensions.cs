@@ -102,6 +102,12 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IWorkScheduler>(sp => sp.GetRequiredService<WorkSchedulerService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<WorkSchedulerService>());
 
+        // plans/phase-d-implementation.md D3 — plan-staleness signals, consumed by
+        // ArtifactCommandService (superseding decisions) and InMemoryDeadLetterService
+        // (dead-lettered slices) below. Registered ahead of both so DI resolves it into their
+        // optional constructor parameters.
+        services.AddSingleton<IPlanStalenessService, PlanStalenessService>();
+
         // Slice 15f — shared command services that every transport (MCP/REST/dispatcher) calls.
         services.AddSingleton<ISchedulerCommandService, SchedulerCommandService>();
         services.AddSingleton<IArtifactCommandService, ArtifactCommandService>();

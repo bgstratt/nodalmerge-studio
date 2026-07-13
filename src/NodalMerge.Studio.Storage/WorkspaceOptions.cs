@@ -24,6 +24,14 @@ public sealed class WorkspaceOptions
     // consulted when the role's Agent Topology assignment for PipelineStage.Plan is auto/unset —
     // an explicit per-stage Model Profile assignment always bypasses this entirely, flag or not.
     public bool UsePlannerExecutorSelection { get; set; } = false;
+
+    // plans/phase-d-implementation.md D3 — plan-staleness signal thresholds (IPlanStalenessService).
+    // Signals only, never auto-replan — see ExecutionEventKind.PlanStalenessSignalRaised's own doc
+    // comment. Defaults (3, 2) are deliberately small: a handful of superseding decisions or a
+    // second dead-lettered sibling from the same plan is already worth a human glancing at it.
+    public int PlanStalenessSupersedingDecisionThreshold { get; set; } = 3;
+    public int PlanStalenessDeadLetteredSliceThreshold { get; set; } = 2;
+
     public int MaxConcurrentWorkers { get; set; } = 3;
     public int SchedulerPollIntervalMs { get; set; } = 2_000;
 

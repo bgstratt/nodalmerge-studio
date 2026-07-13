@@ -262,3 +262,17 @@ public sealed record HarnessPermissionDeniedPayload(
 public sealed record HarnessPlanDiffDiscardedPayload(
     string AgentId,
     string DiffSummary);
+
+// plans/phase-d-implementation.md D3 — one of these per staleness threshold crossed.
+// PlanWorkUnitId is the plan-owning work unit (not the decision/slice that tipped the count over
+// the threshold); Reason is "SupersedingDecisions" or "DeadLetteredSlices", matching
+// IPlanStalenessService's two Notify* signals. Emitted with SessionId = PlanWorkUnitId (no live
+// Studio session exists at either hook point — a decision/dead-letter can originate from any
+// agent's own session) so IExecutionEventStream.GetSessionEventsAsync(planWorkUnitId) finds it
+// alongside IExecutionEventStream.GetEventsByKindAsync for a cross-session dashboard query.
+public sealed record PlanStalenessSignalPayload(
+    string PlanWorkUnitId,
+    string? PlanArtifactId,
+    string Reason,
+    int Count,
+    int Threshold);

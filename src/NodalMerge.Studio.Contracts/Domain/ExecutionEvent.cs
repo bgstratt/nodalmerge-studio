@@ -91,4 +91,12 @@ public enum ExecutionEventKind
     // the run outright — the plan itself may still be valid — but the drift needs to be
     // diagnosable instead of silently vanishing.
     HarnessPlanDiffDiscarded,
+
+    // plans/phase-d-implementation.md D3 — a plan artifact has accumulated enough superseding
+    // decisions or dead-lettered slices since it was recorded that it may no longer reflect
+    // reality. Signal only — nothing subscribes to this to auto-replan (same reason auto-replan
+    // stays deferred for RetryWithContextAsync-adjacent flows: automatic re-planning needs its own
+    // safety verification first). A human sees this via the dashboard/replan-trigger response and
+    // decides whether to act.
+    PlanStalenessSignalRaised,
 }

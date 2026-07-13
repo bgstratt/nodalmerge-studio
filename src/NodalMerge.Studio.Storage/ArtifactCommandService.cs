@@ -10,7 +10,11 @@ namespace NodalMerge.Studio.Storage;
 public sealed class ArtifactCommandService(
     IArtifactLineageService artifacts,
     IWorkUnitService workUnits,
-    IDomainAgentTriggerService? domainAgentTrigger = null) : IArtifactCommandService
+    IDomainAgentTriggerService? domainAgentTrigger = null,
+    // plans/phase-d-implementation.md D3 — cheapest correct hook for the "superseding decisions"
+    // staleness signal: every Decision artifact with a non-empty Supersedes list passes through
+    // here. Optional/nullable, same convention as domainAgentTrigger above.
+    IPlanStalenessService? planStaleness = null) : IArtifactCommandService
 {
     public async Task<ArtifactRef> RecordAsync(
         string workUnitId,
@@ -45,6 +49,9 @@ public sealed class ArtifactCommandService(
 
         if (domainAgentTrigger is not null)
             await domainAgentTrigger.NotifyArtifactRecordedAsync(recorded, ct).ConfigureAwait(false);
+
+        if (planStaleness is not null)
+            await planStaleness.NotifySupersedingDecisionRecordedAsync(recorded, ct).ConfigureAwait(false);
 
         return recorded;
     }

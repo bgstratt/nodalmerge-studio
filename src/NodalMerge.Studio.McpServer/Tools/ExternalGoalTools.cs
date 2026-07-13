@@ -284,8 +284,15 @@ public sealed class ExternalGoalTools(
                 case "replan":
                 {
                     var result = await replan.ReplanFailedSliceAsync(entry.EntryId, cancellationToken).ConfigureAwait(false);
+                    // plans/phase-d-implementation.md D3 — stalenessSignal rides the response
+                    // regardless of outcome (when resolvable) so a human sees "this plan looks
+                    // stale" alongside the replan result itself.
                     return result.Outcome == ReplanOutcome.Replanned
-                        ? McpJson.Ok(new { goalId, action, outcome = result.Outcome.ToString(), newWorkUnitIds = result.NewWorkUnitIds })
+                        ? McpJson.Ok(new
+                        {
+                            goalId, action, outcome = result.Outcome.ToString(),
+                            newWorkUnitIds = result.NewWorkUnitIds, stalenessSignal = result.StalenessSignal,
+                        })
                         : McpJson.Error(McpServerToolNames.GoalRecover, result.Message ?? $"Re-plan failed: {result.Outcome}.");
                 }
                 default:

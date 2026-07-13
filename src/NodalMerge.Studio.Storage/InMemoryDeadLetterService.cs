@@ -15,7 +15,11 @@ public sealed class InMemoryDeadLetterService(
     IProjectionManager projections,
     ISteeringDecisionService steeringDecisions,
     IFileLeaseService fileLease,
-    IRuntimeCredentialCache? credentialCache = null) : IDeadLetterService, IRehydratable
+    IRuntimeCredentialCache? credentialCache = null,
+    // plans/phase-d-implementation.md D3 — cheapest correct hook for the "dead-lettered slices"
+    // staleness signal: every terminal dead-letter (this method) passes through here. Optional/
+    // nullable, same convention as credentialCache above.
+    IPlanStalenessService? planStaleness = null) : IDeadLetterService, IRehydratable
 {
     public const int MaxFailureAttempts = 3;
 
@@ -96,6 +100,9 @@ public sealed class InMemoryDeadLetterService(
             await workUnits.SetCurrentStageAsync(workUnitId, stage, cancellationToken).ConfigureAwait(false);
         }
         catch (InvalidOperationException) { }
+
+        if (planStaleness is not null)
+            await planStaleness.NotifySliceDeadLetteredAsync(workUnitId, cancellationToken).ConfigureAwait(false);
 
         await RecordEscalationAsync(workUnitId, agentId, stage, snapshot, reason, sessionId, cancellationToken)
             .ConfigureAwait(false);
