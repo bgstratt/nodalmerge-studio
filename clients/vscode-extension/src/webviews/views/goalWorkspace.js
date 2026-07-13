@@ -18,7 +18,7 @@ export function init(ctx) {
   var state = {
     decisionNodes: [], selectedNodeId: null, timelineArtifacts: [], timelineEvents: [], selectedSessionId: '',
     selectedNodeConversation: null, conversationPollTimer: null,
-    referenceFiles: [], reviewingWorkUnitIds: [],
+    referenceFiles: [], reviewingWorkUnitIds: [], planningWorkUnitIds: [],
     // Which node the Decision-tab auto-jump has already fired for (so re-selecting or navigating
     // back to a node doesn't re-jump away from whatever tab the user is reading), and the cached
     // full detail for whichever proposal is currently shown in the Decision tab.
@@ -540,6 +540,11 @@ export function init(ctx) {
       // /studio/agents poll Activity Center already uses; disappears once the review concludes.
       if ((state.reviewingWorkUnitIds || []).indexOf(wu.workUnitId) !== -1) {
         html += '<div class="dn-meta"><span class="pulse"></span><span class="mono">Agent reviewing…</span></div>';
+      }
+      // Same live-indicator mechanism, for the planner's spawn — makes it visible when a Plan
+      // stage is actually running vs. a stalled goal sitting idle at the same "Plan" stage badge.
+      if ((state.planningWorkUnitIds || []).indexOf(wu.workUnitId) !== -1) {
+        html += '<div class="dn-meta"><span class="pulse"></span><span class="mono">Planning…</span></div>';
       }
       // Slice 22c — Experiment parent badges
       var children = (byParent[wu.workUnitId] || []);
@@ -1613,6 +1618,7 @@ export function init(ctx) {
       // rebuild, so only the tree's own subtree is checked.
       if (hasSelectionWithin($('gw-tree'))) { return; }
       state.reviewingWorkUnitIds = msg.reviewingWorkUnitIds || [];
+      state.planningWorkUnitIds = msg.planningWorkUnitIds || [];
       renderDecisionTree(msg.workUnits);
       return;
     }

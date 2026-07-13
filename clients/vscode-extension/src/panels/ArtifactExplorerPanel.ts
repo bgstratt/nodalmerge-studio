@@ -470,7 +470,15 @@ export class GoalWorkspacePanel {
       const reviewingWorkUnitIds = agents
         .filter(a => a.status === 'active' && a.agentId.startsWith('reviewer-auto-'))
         .map(a => a.workUnitId);
-      void this.panel.webview.postMessage({ type: 'tree', sessionId, workUnits, reviewingWorkUnitIds });
+      // Same live-indicator mechanism as reviewingWorkUnitIds above, for a planner's spawn —
+      // agentId is prefixed with the profile id GoalCoordinator.EnsurePlannerAsync enqueues under
+      // ("planner" by default, or whatever PlannerSelectionService picked), the same convention
+      // Activity Center relies on elsewhere. There's no equivalent "orchestrator" agent to badge
+      // any more — GoalCoordinator is a deterministic in-process sweep, not a spawned agent.
+      const planningWorkUnitIds = agents
+        .filter(a => a.status === 'active' && a.agentId.startsWith('planner-'))
+        .map(a => a.workUnitId);
+      void this.panel.webview.postMessage({ type: 'tree', sessionId, workUnits, reviewingWorkUnitIds, planningWorkUnitIds });
     } catch {
       // session may have just been created and not yet visible
     }
