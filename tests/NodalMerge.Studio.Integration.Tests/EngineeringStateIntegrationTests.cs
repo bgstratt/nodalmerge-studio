@@ -122,4 +122,48 @@ public class EngineeringStateIntegrationTests
         var successorFact = Assert.Single(facts, f => f.GetProperty("artifactId").GetString() == successor.ArtifactId);
         Assert.True(successorFact.GetProperty("isCurrent").GetBoolean());
     }
+
+    /// <summary>
+    /// Regression (found live 2026-07-13): BuildEngineeringStateAsync had no scoping at all — a
+    /// promoted Decision from goal A leaked into goal B's state.md/constraints.md even though the
+    /// two goals share nothing. Symptom in the wild: an earlier, cancelled 4-task goal had one of
+    /// its four task slices individually reach Merged before the goal itself was cancelled (its
+    /// changes never actually landed); a brand-new, unrelated re-run of the same 4-task prompt
+    /// inherited that stale "already done" claim and its planner silently dropped 3 of the 4 tasks
+    /// it was asked to do. A request that DOES name a WorkUnitId now only sees owned facts from
+    /// that goal's own root lineage; a request with no WorkUnitId (a global/dashboard query) keeps
+    /// the old unscoped behavior, covered by the tests above.
+    /// </summary>
+    [Fact]
+    public async Task Decision_from_an_unrelated_goal_does_not_leak_into_this_goals_projection()
+    {
+        await using var app = BuildTestApp();
+        await app.StartAsync();
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var artifactCommands = app.Services.GetRequiredService<IArtifactCommandService>();
+
+        var goalA = await orchestrator.CreateWorkUnitAsync("Goal A — rename CustomerId to BuyerId", "user");
+        var staleClaim = await artifactCommands.RecordAsync(
+            goalA.WorkUnitId, "Decision", "All 4 tasks already done", "Automated review claimed completion");
+        await ProposeAndApplyAsync(app, goalA, "MP-EState-Leak-A");
+
+        var goalB = await orchestrator.CreateWorkUnitAsync("Goal B — an unrelated fresh re-run", "user");
+
+        var client = app.GetTestClient();
+        var scopedResponse = await client.GetAsync(
+            "/studio/projections/EngineeringState?level=Normal&workUnitId=" + goalB.WorkUnitId);
+        scopedResponse.EnsureSuccessStatusCode();
+        var scopedFacts = JsonDocument.Parse(await scopedResponse.Content.ReadAsStringAsync())
+            .RootElement.GetProperty("data").GetProperty("facts").EnumerateArray().ToList();
+        Assert.DoesNotContain(scopedFacts, f => f.GetProperty("artifactId").GetString() == staleClaim.ArtifactId);
+
+        // Goal A's own request still sees its own fact — this isn't a promotion regression, just a
+        // cross-goal one.
+        var ownResponse = await client.GetAsync(
+            "/studio/projections/EngineeringState?level=Normal&workUnitId=" + goalA.WorkUnitId);
+        var ownFacts = JsonDocument.Parse(await ownResponse.Content.ReadAsStringAsync())
+            .RootElement.GetProperty("data").GetProperty("facts").EnumerateArray().ToList();
+        Assert.Contains(ownFacts, f => f.GetProperty("artifactId").GetString() == staleClaim.ArtifactId);
+    }
 }
