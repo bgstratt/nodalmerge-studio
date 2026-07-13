@@ -25,7 +25,10 @@ public sealed class WorkUnitCommandService(
     // Optional so direct-construction test call sites keep compiling — when null, cancel-time
     // parent reconciliation is simply skipped (the orchestrator's own post-loop sweep still
     // covers it on the next reinvoke).
-    IMergeReconciliationService? mergeReconciliation = null) : IWorkUnitCommandService
+    IMergeReconciliationService? mergeReconciliation = null,
+    // Optional for the same direct-construction reason — when null, requeued members are enqueued
+    // session-less and ClarificationCommandService's synthetic-session fallback covers them.
+    NodalMerge.Studio.Storage.IGoalNodeService? goalNodes = null) : IWorkUnitCommandService
 {
     private static readonly HashSet<WorkUnitStatus> TerminalStatuses = new()
     {
@@ -261,6 +264,14 @@ public sealed class WorkUnitCommandService(
             workUnitId, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider,
             overrideProfileId, overrideCredentialRef, cancellationToken).ConfigureAwait(false);
 
+        // The requeued members' re-enqueues carry the goal's own session so anything they emit
+        // later (notably a blocking ClarificationRequested event, which is keyed by session) lands
+        // on the goal's timeline instead of ClarificationCommandService's synthetic fallback.
+        var sessionId = goalNodes is not null
+            ? (await goalNodes.ListAsync(cancellationToken).ConfigureAwait(false))
+                .FirstOrDefault(g => string.Equals(g.WorkUnitId, workUnitId, StringComparison.OrdinalIgnoreCase))?.SessionId
+            : null;
+
         // Same subtree shape as CancelAsync — a cancel walked the whole fan-out tree, so requeue
         // walks it back. Siblings that already finished before the cancel (Merged/Completed) were
         // never touched by CancelAsync and stay that way here too; only members still Cancelled
@@ -338,6 +349,7 @@ public sealed class WorkUnitCommandService(
                     baseUrl: creds?.BaseUrl,
                     apiKey: creds?.ApiKey,
                     provider: creds?.Provider,
+                    sessionId: sessionId,
                     ct: cancellationToken).ConfigureAwait(false);
             }
             else

@@ -173,10 +173,15 @@ public sealed class ContinueService(
         if (completion is AgentLoopCompletion.AwaitingFileLease or AgentLoopCompletion.AwaitingClarification)
         {
             var scheduler = serviceProvider.GetRequiredService<IWorkScheduler>();
+            // A real session matters here: if the resumed run asks a blocking clarification, the
+            // ClarificationRequested event is keyed by session — the goal's own session keeps it
+            // grouped with the rest of the goal's timeline instead of falling back to
+            // ClarificationCommandService's synthetic per-work-unit session.
+            var goalSessionId = await ResolveGoalSessionIdAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
             await scheduler.EnqueueAsync(
                 entry.WorkUnitId, entry.ProfileId, taskId: entry.TaskId,
                 model: model, baseUrl: baseUrl, apiKey: apiKey, provider: provider,
-                sessionId: null, credentialRef: resolvedCredentialRef, ct: cancellationToken).ConfigureAwait(false);
+                sessionId: goalSessionId, credentialRef: resolvedCredentialRef, ct: cancellationToken).ConfigureAwait(false);
 
             if (completion == AgentLoopCompletion.AwaitingFileLease)
                 await scheduler.MarkAwaitingFileLeaseAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
@@ -217,6 +222,29 @@ public sealed class ContinueService(
 
     // Converts each cycle's ConversationLogEntry back into the (assistant, user-tool-results) pair
     // WorkerAgentLoop's own messages list would have held at that point. A tool call's InputJson is
+    // Walks ParentWorkUnitId to the root and returns the owning goal node's SessionId (null when
+    // no goal node exists — e.g. work units created outside the goal flow). Mirrors the goal-node
+    // fallback tier in ClarificationCommandService.ResolveSessionIdAsync.
+    private async Task<string?> ResolveGoalSessionIdAsync(string workUnitId, CancellationToken ct)
+    {
+        var goalNodes = serviceProvider.GetService<NodalMerge.Studio.Storage.IGoalNodeService>();
+        if (goalNodes is null)
+            return null;
+
+        var rootId = workUnitId;
+        for (var depth = 0; depth < 32; depth++)
+        {
+            var unit = await workUnits.GetAsync(rootId, ct).ConfigureAwait(false);
+            if (unit?.ParentWorkUnitId is not { } parentId)
+                break;
+            rootId = parentId;
+        }
+
+        var goal = (await goalNodes.ListAsync(ct).ConfigureAwait(false))
+            .FirstOrDefault(g => string.Equals(g.WorkUnitId, rootId, StringComparison.OrdinalIgnoreCase));
+        return goal?.SessionId;
+    }
+
     // parsed and cloned (JsonElement.Clone()) so it's safe to use after the JsonDocument backing it
     // would otherwise be reclaimed.
     internal static List<NmMessage> ReconstructTurns(IReadOnlyList<ConversationLogEntry> entries)
