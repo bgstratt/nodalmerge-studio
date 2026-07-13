@@ -1030,12 +1030,14 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // it — exactly the trap that bit the very first goal this fix shipped for.
         var mergeReconciliation = _serviceProvider?.GetService(typeof(IMergeReconciliationService)) as IMergeReconciliationService;
         var reconciliationOutcome = MergeReconciliationOutcome.NotApplicable;
+        string? reconciledProposalId = null;
         if (mergeReconciliation is not null)
         {
             try
             {
                 var reconciliationResult = await mergeReconciliation.TryReconcileAsync(parentWorkUnitId, sessionId, ct).ConfigureAwait(false);
                 reconciliationOutcome = reconciliationResult.Outcome;
+                reconciledProposalId = reconciliationResult.ReconciledProposalId;
             }
             catch { /* best-effort — still fine to mark Completed below if this failed for some other reason */ }
         }
@@ -1045,6 +1047,23 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // succeed (it would mask the very problem TryReconcileAsync just flagged).
         if (reconciliationOutcome == MergeReconciliationOutcome.Conflict)
             return;
+
+        // A reconciled proposal that hasn't cleared review yet (Draft pending the automated
+        // reviewer, ReadyForReview/UnderReview awaiting a human, or Rejected mid-retry) means the
+        // review gate owns this goal's completion from here — completing now would land the
+        // parent in terminal Completed BEFORE its workspace review finished, and a subsequent
+        // rejection's retry (an Executing write) would silently fail, wedging the goal forever
+        // with a rejected proposal and nothing running (found live 2026-07-13, first real
+        // agent-rejection at the workspace gate). The apply path lands the parent itself when the
+        // proposal merges, and GoalCoordinator's completion check is gated on the same
+        // Approved/Merged condition — this just makes the third completion path agree.
+        if (reconciliationOutcome is MergeReconciliationOutcome.Reconciled or MergeReconciliationOutcome.AlreadyReconciled
+            && reconciledProposalId is not null)
+        {
+            var reconciledProposal = await GetAsync(reconciledProposalId, ct).ConfigureAwait(false);
+            if (reconciledProposal?.Status is not (MergeProposalStatus.Approved or MergeProposalStatus.Merged))
+                return;
+        }
 
         try
         {

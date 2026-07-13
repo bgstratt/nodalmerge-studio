@@ -96,4 +96,36 @@ public class SchedulerReinvocationTests
             await agentRuntime.StopAsync(CancellationToken.None);
         }
     }
+
+    /// <summary>
+    /// Regression (found live 2026-07-13): a dead-lettered ROOT goal that gets driven again (a
+    /// dead-letter retry re-enqueued its planner, or a human hit Reinvoke) stayed badged
+    /// DeadLettered while its children ran to completion underneath it — nothing ever transitioned
+    /// the root back. GoalCoordinator.ConvergeAsync now repairs it to Executing (via the new
+    /// DeadLettered → Executing transition edge) on the next sweep.
+    /// </summary>
+    [Fact]
+    public async Task Converge_repairs_a_dead_lettered_root_back_to_Executing()
+    {
+        var app = StudioWebApplication.Build(
+            [],
+            llmHttpClient: new HttpClient(new ScheduledReinvocationLlmHandler()),
+            configureServices: services => services.AddInMemoryStorage());
+
+        var orchestratorSvc = app.Services.GetRequiredService<IOrchestratorService>();
+        var agentControl    = app.Services.GetRequiredService<IAgentControlService>();
+        var workUnits       = app.Services.GetRequiredService<IWorkUnitService>();
+
+        var wu = await orchestratorSvc.CreateWorkUnitAsync("Goal that dead-lettered", "integration-test");
+        await workUnits.UpdateStatusAsync(wu.WorkUnitId, WorkUnitStatus.Queued, cancellationToken: default);
+        await workUnits.UpdateStatusAsync(wu.WorkUnitId, WorkUnitStatus.Executing, cancellationToken: default);
+        await workUnits.UpdateStatusAsync(wu.WorkUnitId, WorkUnitStatus.DeadLettered, cancellationToken: default);
+
+        // Credential-free reinvoke = one convergence sweep (no scheduler poller needed for the
+        // repair itself — EnsurePlanner isn't requested, and the sweeps are all no-ops here).
+        await agentControl.ReinvokeOrchestratorAsync(wu.WorkUnitId);
+
+        var repaired = await workUnits.GetAsync(wu.WorkUnitId);
+        Assert.Equal(WorkUnitStatus.Executing, repaired!.Status);
+    }
 }

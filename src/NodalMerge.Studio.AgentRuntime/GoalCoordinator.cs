@@ -33,6 +33,19 @@ internal sealed class GoalCoordinator(IServiceProvider serviceProvider, ILogger<
         if (unit is null || unit.Status is WorkUnitStatus.Completed or WorkUnitStatus.Merged or WorkUnitStatus.Cancelled)
             return;
 
+        // A converging DeadLettered goal is being driven again (a dead-letter retry re-enqueued
+        // its planner, a child just released, or a human hit Reinvoke) — repair the stale badge
+        // so the goal doesn't read as dead while work runs underneath it. Best-effort: an
+        // in-flight status race just means the next sweep repairs it instead.
+        if (unit.Status == WorkUnitStatus.DeadLettered)
+        {
+            try
+            {
+                await workUnits.UpdateStatusAsync(workUnitId, WorkUnitStatus.Executing, sessionId, ct).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException) { /* concurrent transition — next sweep repairs */ }
+        }
+
         if (ensurePlanner)
             await EnsurePlannerAsync(workUnitId, unit, sessionId, ct).ConfigureAwait(false);
 
