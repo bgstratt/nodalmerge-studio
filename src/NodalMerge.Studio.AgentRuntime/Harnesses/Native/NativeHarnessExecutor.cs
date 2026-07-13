@@ -15,6 +15,12 @@ internal sealed class NativeHarnessExecutor(
 {
     public string Name => "native";
 
+    public string DisplayName => "Native (API loop)";
+
+    // Native has no provider key — it's the default when no CLI provider is selected, not itself
+    // selected via the provider channel (see IHarnessExecutor.ProviderKey's doc comment).
+    public string? ProviderKey => null;
+
     // Turn telemetry is the native loop's own per-cycle ConversationLogRecorder — the one
     // capability it has always had. Resume is ContinueService's conversation reconstruction, not a
     // harness-side session id, so SupportsResume:false is the honest answer at this seam (see
@@ -47,7 +53,9 @@ internal sealed class NativeHarnessExecutor(
 
 // Resolves AgentProfile.Executor to the matching registered IHarnessExecutor, falling back to
 // "native" for null/unrecognized values — never throws, since falling back is always a safe
-// degrade (see IHarnessExecutorResolver's doc comment).
+// degrade (see IHarnessExecutorResolver's doc comment). Post-C refactor: also owns provider-key
+// resolution, derived from each registered executor's own ProviderKey rather than a separate
+// static HarnessProviders map — this is what makes a third adapter "one new folder + one DI line".
 internal sealed class HarnessExecutorResolver(IEnumerable<IHarnessExecutor> executors) : IHarnessExecutorResolver
 {
     public IHarnessExecutor Resolve(string? executorName)
@@ -61,5 +69,22 @@ internal sealed class HarnessExecutorResolver(IEnumerable<IHarnessExecutor> exec
         }
 
         return executors.First(e => e.Name == "native");
+    }
+
+    public bool IsCliProvider(string? provider) =>
+        provider is not null && executors.Any(
+            e => e.ProviderKey is not null && string.Equals(e.ProviderKey, provider, StringComparison.OrdinalIgnoreCase));
+
+    public IHarnessExecutor ResolveForProvider(string? provider, string? profileExecutor)
+    {
+        if (provider is not null)
+        {
+            var match = executors.FirstOrDefault(
+                e => e.ProviderKey is not null && string.Equals(e.ProviderKey, provider, StringComparison.OrdinalIgnoreCase));
+            if (match is not null)
+                return match;
+        }
+
+        return Resolve(profileExecutor);
     }
 }

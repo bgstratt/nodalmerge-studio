@@ -29,6 +29,10 @@ internal sealed class ClaudeCodeExecutor(
 {
     public string Name => "claude-code";
 
+    public string DisplayName => "Claude Code CLI";
+
+    public string? ProviderKey => "claude-cli";
+
     // Phase C.1 — turn telemetry (ClaudeTranscriptParser), resume (the CLI's own session_id +
     // --resume, shipped B3), hooks/subagents/MCP (the underlying `claude` binary's own features,
     // reachable via the generated --settings file today). SupportsPlanningMode stays false until
@@ -417,7 +421,7 @@ internal sealed class ClaudeCodeExecutor(
         // "claude-cli" Model Profile with a stored key — storing a key on that profile *is* the
         // opt-in gesture there (leaving its key blank keeps ambient auth).
         var injectKey = request.Profile?.InjectApiKeyEnv == true ||
-            HarnessProviders.IsCliProvider(request.Provider);
+            string.Equals(request.Provider, ProviderKey, StringComparison.OrdinalIgnoreCase);
         if (injectKey && !string.IsNullOrEmpty(request.ApiKey))
             psi.EnvironmentVariables["ANTHROPIC_API_KEY"] = request.ApiKey;
 

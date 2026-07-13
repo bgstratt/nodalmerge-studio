@@ -245,6 +245,12 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             var baseUrl  = item.BaseUrl  ?? string.Empty;
             var apiKey   = item.ApiKey;
             var taskId   = item.TaskId   ?? string.Empty;
+            // GetService, not GetRequiredService: this resolver is only used below for the
+            // canRun/Plan-Review CLI-provider gates, which must degrade gracefully (no CLI
+            // providers registered) rather than throw when a test double's IServiceProvider
+            // doesn't carry it — the real executor resolution a few lines down still uses
+            // GetRequiredService since it's on the actual run path, not a gate.
+            var harnessExecutorResolver = _serviceProvider.GetService<IHarnessExecutorResolver>();
 
             // item.ApiKey is [JsonIgnore]d out of persistence — a rehydrated item (Host restart)
             // deserializes it as null. Re-resolve from the shared cache via CredentialRef before
@@ -273,7 +279,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             // claude-cli needs no baseUrl/apiKey (ambient CLI auth; blank model = the CLI's own
             // default) — its only gate is not being parked for a credential-cache re-resolve.
             var canRun = !awaitingCredentials &&
-                (HarnessProviders.IsCliProvider(provider)
+                ((harnessExecutorResolver?.IsCliProvider(provider) ?? false)
                     || (!string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
                         && (!string.IsNullOrWhiteSpace(model)
                             || provider.Equals("openai", StringComparison.OrdinalIgnoreCase))));
@@ -290,7 +296,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 failureReason = "Missing LLM credentials";
                 failureKind = FailureKind.MissingCredentials;
             }
-            else if (HarnessProviders.IsCliProvider(provider) &&
+            else if ((harnessExecutorResolver?.IsCliProvider(provider) ?? false) &&
                      profile?.Stage is PipelineStage.Plan or PipelineStage.Review)
             {
                 // Only the Worker/Execute construction sites are behind the executor seam (B1
@@ -395,9 +401,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     // goes through the executor seam; Plan/Review above stay on the native loop
                     // classes directly (out of B1's scope). agentClient/conversationLog built
                     // above for Plan/Review are unused here — NativeHarnessExecutor resolves its
-                    // own from the request's Provider/Model/BaseUrl/ApiKey.
-                    var harnessExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
-                    var executor = harnessExecutorResolver.Resolve(HarnessProviders.ResolveExecutorName(provider, profile?.Executor));
+                    // own from the request's Provider/Model/BaseUrl/ApiKey. GetRequiredService
+                    // here (unlike the nullable fetch above used only for the gates) — this is the
+                    // real run path, which has always required a registered resolver.
+                    var executorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
+                    var executor = executorResolver.ResolveForProvider(provider, profile?.Executor);
                     var harnessRequest = new HarnessRunRequest(
                         HarnessMode.Execute, agentId, item.WorkUnitId, taskId, profile, item.SessionId,
                         IsResume: item.AttemptCount > 0, ruleFileContext,
@@ -655,7 +663,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         // claude-cli needs no baseUrl/apiKey/model (ambient CLI auth, CLI-default model) — but it
         // only routes through the executor seam for worker spawns; an orchestrator must stay on an
         // API provider (its coordination loop is native by design — AP-6).
-        var canStartLoop = HarnessProviders.IsCliProvider(resolvedProvider)
+        // GetService, not GetRequiredService: this is a gate that must degrade gracefully rather
+        // than throw when a test double's IServiceProvider doesn't carry the resolver (mirrors
+        // RunScheduledWorkerAsync's identical gate above).
+        var harnessExecutorResolverForSpawnGate = _serviceProvider.GetService<IHarnessExecutorResolver>();
+        var canStartLoop = (harnessExecutorResolverForSpawnGate?.IsCliProvider(resolvedProvider) ?? false)
             ? agentType == "worker"
             : !string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
                 && (!string.IsNullOrWhiteSpace(model)
@@ -1011,7 +1023,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 // behavior: no sessionId, completion discarded, no scheduler/dead-letter
                 // interaction (zero behavior change is B1's acceptance bar for this path).
                 var harnessExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
-                var executor = harnessExecutorResolver.Resolve(HarnessProviders.ResolveExecutorName(provider, profile?.Executor));
+                var executor = harnessExecutorResolver.ResolveForProvider(provider, profile?.Executor);
                 var harnessRequest = new HarnessRunRequest(
                     HarnessMode.Execute, agentId, workUnitId, taskId, profile, SessionId: null,
                     IsResume: false, ruleFileContext,

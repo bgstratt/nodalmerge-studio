@@ -84,6 +84,23 @@ public interface IHarnessExecutor
     // failure (same additive-forward-compat reasoning as HarnessMode being a growable enum).
     string Name { get; }
 
+    // Post-C refactor (plans/phase-c-implementation.md) — folds what used to be an out-of-slice
+    // switch (StudioRestEndpoints' /studio/executors displayName) and a static provider map
+    // (HarnessProviders) into the executor itself, so a third adapter is "one new folder + one DI
+    // line" with nothing else to touch server-side.
+    string DisplayName { get; }
+
+    // The user-facing selection model is provider-driven: the extension's Model Profiles carry an
+    // LLM provider ("anthropic", "openai", "vscode-lm", "claude-cli"), assigned per pipeline role
+    // by the Agent Topology tab, and that provider travels the existing per-stage credential
+    // channel all the way to the worker construction sites. A non-null ProviderKey means this
+    // executor is selected via that provider channel rather than AgentProfile.Executor alone (see
+    // IHarnessExecutorResolver.ResolveForProvider) — e.g. "claude-cli" is not an HTTP API, it
+    // selects ClaudeCodeExecutor (spawn the local `claude` binary) rather than a base URL + key.
+    // Native has no provider key: it's the default when no CLI provider is selected, not itself
+    // selected via the provider channel.
+    string? ProviderKey { get; }
+
     HarnessCapabilities Capabilities { get; }
 
     Task<HarnessRunResult> RunAsync(HarnessRunRequest request, CancellationToken ct = default);
@@ -91,57 +108,21 @@ public interface IHarnessExecutor
 
 // Resolves AgentProfile.Executor (null on every profile that predates this field, or an
 // unrecognized value from a newer/older client) to the "native" executor — never throws on an
-// unknown name, since falling back to native is always a safe degrade.
+// unknown name, since falling back to native is always a safe degrade. Also owns provider-key
+// resolution (Post-C refactor) since this is the one seam that already sees every registered
+// IHarnessExecutor via DI — no separate static provider map needed.
 public interface IHarnessExecutorResolver
 {
     IHarnessExecutor Resolve(string? executorName);
-}
 
-// The user-facing selection model is provider-driven: the extension's Model Profiles carry an
-// LLM provider ("anthropic", "openai", "vscode-lm", "claude-cli"), assigned per pipeline role by
-// the Agent Topology tab, and that provider travels the existing per-stage credential channel all
-// the way to the worker construction sites. "claude-cli" is not an HTTP API — it selects the
-// ClaudeCodeExecutor (spawn the local `claude` binary) rather than a base URL + key. This mapping
-// keeps that single-selection UX without a second executor picker in the UI, while
-// AgentProfile.Executor remains as the REST-level override for headless callers.
-public static class HarnessProviders
-{
-    public const string ClaudeCli = "claude-cli";
+    // True when `provider` names a registered executor's ProviderKey (case-insensitive) — i.e. a
+    // CLI harness provider, not an HTTP API provider like "anthropic"/"openai".
+    bool IsCliProvider(string? provider);
 
-    // plans/harness-hosting-architecture.md Phase C.3 (phase-c-implementation.md C2) — the second
-    // CLI provider, routing to CodexCliExecutor. Same "provider selects an adapter, not a base
-    // URL/key" shape ClaudeCli established.
-    public const string CodexCli = "codex-cli";
-
-    private static readonly IReadOnlyDictionary<string, string> ProviderToExecutor =
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            [ClaudeCli] = "claude-code",
-            [CodexCli] = "codex",
-        };
-
-    public static bool IsCliProvider(string? provider) =>
-        provider is not null && ProviderToExecutor.ContainsKey(provider);
-
-    // Provider wins over AgentProfile.Executor when it names a CLI harness: a profile with
-    // Executor unset (every profile predating the field) must still route to the CLI adapter
-    // when the role's Model Profile says so, and a stale Executor value must not silently send
-    // CLI credentials into the native LlmClient path.
-    public static string? ResolveExecutorName(string? provider, string? profileExecutor) =>
-        provider is not null && ProviderToExecutor.TryGetValue(provider, out var executorName)
-            ? executorName
-            : profileExecutor;
-
-    // Reverse of the above, for the executors listing endpoint (C1.c): which provider key (if any)
-    // routes to a given executor. Native has no provider key — it's the default when no CLI
-    // provider is selected, not itself selected via the provider channel.
-    private static readonly IReadOnlyDictionary<string, string> ExecutorProviderKeys =
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["claude-code"] = ClaudeCli,
-            ["codex"] = CodexCli,
-        };
-
-    public static string? ProviderKeyFor(string executorName) =>
-        ExecutorProviderKeys.TryGetValue(executorName, out var key) ? key : null;
+    // Provider wins over AgentProfile.Executor when it names a CLI harness's ProviderKey: a
+    // profile with Executor unset (every profile predating the field) must still route to the CLI
+    // adapter when the role's Model Profile says so, and a stale Executor value must not silently
+    // send CLI credentials into the native LlmClient path. Falls back to Resolve(profileExecutor)
+    // when provider doesn't match any registered executor's ProviderKey.
+    IHarnessExecutor ResolveForProvider(string? provider, string? profileExecutor);
 }

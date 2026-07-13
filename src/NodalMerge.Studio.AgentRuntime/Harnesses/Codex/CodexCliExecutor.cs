@@ -27,6 +27,10 @@ internal sealed class CodexCliExecutor(
 {
     public string Name => "codex";
 
+    public string DisplayName => "Codex CLI";
+
+    public string? ProviderKey => "codex-cli";
+
     // Verified 2026-07-12 against codex-cli 0.144.1 (codex-probe captures, see this file's header):
     // turn.completed carries usage tokens on every successful run -> SupportsTurnTelemetry true;
     // `codex exec resume <thread_id>` verified working (capture-5-resume, same thread_id echoed,
@@ -272,7 +276,7 @@ internal sealed class CodexCliExecutor(
         // which is the verified default); this mirrors the established pattern rather than a
         // confirmed codex-specific env var name.
         var injectKey = request.Profile?.InjectApiKeyEnv == true ||
-            HarnessProviders.IsCliProvider(request.Provider);
+            string.Equals(request.Provider, ProviderKey, StringComparison.OrdinalIgnoreCase);
         if (injectKey && !string.IsNullOrEmpty(request.ApiKey))
             psi.EnvironmentVariables["OPENAI_API_KEY"] = request.ApiKey;
 

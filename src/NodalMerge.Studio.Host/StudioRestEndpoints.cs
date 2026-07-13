@@ -1575,14 +1575,8 @@ public static class StudioRestEndpoints
             Results.Ok(executors.Select(e => new
             {
                 name = e.Name,
-                providerKey = HarnessProviders.ProviderKeyFor(e.Name),
-                displayName = e.Name switch
-                {
-                    "native" => "Native",
-                    "claude-code" => "Claude Code CLI",
-                    "codex" => "Codex CLI",
-                    _ => e.Name,
-                },
+                providerKey = e.ProviderKey,
+                displayName = e.DisplayName,
                 capabilities = e.Capabilities,
             })));
 

@@ -611,3 +611,67 @@ same `WriteMcpConfigFileAsync`-shaped helper gets the mount for free.
   B2 (documented deviation, now load-bearing for stub tests).
 - **Commit discipline**: one commit per slice minimum, referencing this plan; update
   both this file's status block and the parent plan's.
+
+## Post-C refactor: vertical-slice layout + self-describing executors
+
+Light refactor (branch `harness-hosting-architecture`, on top of C1-C3, suite 754/754 green
+pre-refactor) that didn't change behavior — it moved code into a slice layout and folded two
+out-of-slice server-side hooks into the executor interface itself, so that a third CLI adapter
+becomes **one new folder + one DI line**, nothing else.
+
+**Layout** — `src/NodalMerge.Studio.AgentRuntime/Harnesses/`:
+- `ClaudeCode/` — `ClaudeCodeExecutor.cs`, `ClaudeCodeExecutorOptions.cs`, `ClaudeTranscriptParser.cs`,
+  `ClaudeConversationLogMapper.cs`
+- `Codex/` — `CodexCliExecutor.cs`, `CodexCliExecutorOptions.cs`, `CodexTranscriptParser.cs`,
+  `CodexConversationLogMapper.cs`
+- `Shared/` — `HarnessHarvestPipeline.cs`, `HarnessMcpTokenService.cs` (used by both CLI adapters)
+- `Native/` — `NativeHarnessExecutor.cs` + the `HarnessExecutorResolver` implementation (chosen over
+  leaving it at the AgentRuntime root, since it's exactly as much "one executor's own folder" as
+  ClaudeCode/Codex are — the resolver lives alongside it because both are defined in the same file)
+
+Moves were done with `git mv` so history follows the files. **Namespaces were left unchanged**
+(everything is still `NodalMerge.Studio.AgentRuntime`) — C# doesn't require folder layout to match
+namespace, and renaming would have rippled through the whole solution for zero behavioral benefit.
+
+**Interface changes** (`NodalMerge.Studio.Core/Services/HarnessExecutorContracts.cs`):
+- `IHarnessExecutor` gained `string DisplayName { get; }` and `string? ProviderKey { get; }`.
+  Native: `"Native (API loop)"` / `null`. ClaudeCode: `"Claude Code CLI"` / `"claude-cli"`. Codex:
+  `"Codex CLI"` / `"codex-cli"`.
+- The static `HarnessProviders` class (its `ProviderToExecutor`/`ExecutorProviderKeys` maps,
+  `IsCliProvider`, `ResolveExecutorName`, `ProviderKeyFor`) was deleted entirely. Its logic moved
+  onto `IHarnessExecutorResolver`, which already sees every registered `IHarnessExecutor` via DI:
+  - `bool IsCliProvider(string? provider)` — true iff some registered executor's `ProviderKey`
+    case-insensitively matches.
+  - `IHarnessExecutor ResolveForProvider(string? provider, string? profileExecutor)` — provider
+    wins over `AgentProfile.Executor` when it matches a registered executor's `ProviderKey`;
+    otherwise falls back to `Resolve(profileExecutor)`. Same "provider wins for CLI providers,
+    case-insensitive, unknown falls back to native" behavior as before, now test-locked in
+    `HarnessExecutorResolverTests`.
+- `GET /studio/executors` (`StudioRestEndpoints.cs`) now reads `e.DisplayName`/`e.ProviderKey`
+  directly instead of a `displayName` switch + `HarnessProviders.ProviderKeyFor`.
+- The CLI key-injection env-var check (`ANTHROPIC_API_KEY` vs `OPENAI_API_KEY`) in
+  `ClaudeCodeExecutor`/`CodexCliExecutor` now compares `request.Provider` against the executor's
+  own `ProviderKey` rather than calling the deleted `HarnessProviders.IsCliProvider` — stays
+  entirely inside each executor, unaffected in shape.
+- `InMemoryAgentRuntimeService`'s CLI-provider gates (`RunScheduledWorkerAsync`'s `canRun`/
+  Plan-Review guard, `SpawnAsync`'s `canStartLoop`) resolve `IHarnessExecutorResolver` via
+  `GetService` (not `GetRequiredService`) and treat a missing resolver as "no CLI provider" —
+  these are synchronous gates hit by unit tests that construct `InMemoryAgentRuntimeService`
+  against a hand-rolled `IServiceProvider` returning `null` for everything, so the gates must
+  degrade gracefully rather than throw. The actual executor-resolution call on the real run path
+  (just before `RunAsync`) still uses `GetRequiredService`, matching its pre-refactor behavior.
+
+**The invariant this buys**: adapter #3 needs `Harnesses/<Name>/<Name>Executor.cs` (+ options/
+parser/mapper as needed) implementing `IHarnessExecutor` with its own `Name`/`DisplayName`/
+`ProviderKey`/`Capabilities`, plus one `services.AddSingleton<IHarnessExecutor, ...>()` line next to
+the existing two in `InMemoryAgentRuntimeService`'s DI registration. No resolver code, no REST
+endpoint code, no static provider map to extend.
+
+**What still lives outside the slice** (unchanged by this refactor, still worth knowing about for a
+future adapter):
+- The extension's `LlmProvider` union type and its static fallback provider list (not consumed by
+  `/studio/executors` yet — that's the "later slice's dropdown work" the endpoint's own comment
+  already calls out) — a new provider key needs a matching addition there for the Model Profile UI
+  to offer it.
+- The DI registration line itself (`InMemoryAgentRuntimeService.cs`, `AddSingleton<IHarnessExecutor,
+  ...>()`) — unavoidable, and explicitly the "one DI line" half of the invariant.
