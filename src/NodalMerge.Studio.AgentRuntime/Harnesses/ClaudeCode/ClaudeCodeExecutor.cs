@@ -48,6 +48,11 @@ internal sealed class ClaudeCodeExecutor(
     // convention (see WorkUnit.cs).
     private const string HarnessSessionMetadataKey = "claudeCodeSessionId";
 
+    // The server name the generated .workspace/mcp.json registers the "/mcp-harness" mount under —
+    // also the name the settings allowlist's "mcp__<server>" entry must reference, so the two
+    // generators below must agree.
+    private const string HarnessMcpServerName = "nodalmerge-harness";
+
     public async Task<HarnessRunResult> RunAsync(HarnessRunRequest request, CancellationToken ct = default)
     {
         var wu = await workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false)
@@ -265,10 +270,17 @@ internal sealed class ClaudeCodeExecutor(
         List<string> allow;
         if (mode == HarnessMode.Plan)
         {
+            // "Edit(...)", not "Write(...)": the CLI has no Write permission-rule type — Edit
+            // rules gate ALL file-modifying tools (Write/Edit/NotebookEdit). Found by the real-CLI
+            // Plan-mode smoke (2026-07-13, claude 2.1.207): a Write(...) rule never matches (even
+            // "Write(**)" is denied), so in -p mode the planner stalled at an unanswerable
+            // permission prompt and no plan.json was ever written; the same path as an Edit(...)
+            // rule passes with zero denials. Execute mode below was never bitten because it always
+            // emitted an Edit(.../**) entry alongside the (inert) Write one.
             allow =
             [
                 $"Read({workDirPattern}/**)",
-                $"Write({workDirPattern}/.workspace/plan.json)",
+                $"Edit({workDirPattern}/.workspace/plan.json)",
             ];
         }
         else
@@ -308,6 +320,18 @@ internal sealed class ClaudeCodeExecutor(
             }
         }
 
+        // Phase C.4 — the harness MCP mount's tools must be pre-authorized like everything else:
+        // in -p mode a non-allowlisted MCP tool call hits an unanswerable permission prompt.
+        // Found by the real-CLI C3 smoke (2026-07-13, claude 2.1.207): the CLI called
+        // mcp__nodalmerge-harness__nm_v1_clarification_request, stalled on "needs permission",
+        // and ended the run with no clarification ever reaching the Studio side. "mcp__<server>"
+        // allows every tool on that server — appropriate here since the mount's tool set is
+        // Studio-curated (HarnessWorkerTools) rather than arbitrary third-party tools. Gated on
+        // the same condition RunAsync uses to write mcp.json, so a run with no mount never
+        // allowlists a server it doesn't have.
+        if (Capabilities.SupportsMcp && !string.IsNullOrEmpty(options.HarnessMcpBaseUrl))
+            allow.Add($"mcp__{HarnessMcpServerName}");
+
         var settingsJson = JsonSerializer.Serialize(new { permissions = new { allow } }, JsonSerializerOptions.Web);
         await fileWorkspace.WriteAsync(branchId, ".workspace/settings.json", settingsJson, ct).ConfigureAwait(false);
         return (Path.Combine(workDir, ".workspace", "settings.json"), addDirRoots);
@@ -328,7 +352,7 @@ internal sealed class ClaudeCodeExecutor(
         {
             mcpServers = new Dictionary<string, object>
             {
-                ["nodalmerge-harness"] = new
+                [HarnessMcpServerName] = new
                 {
                     type = "http",
                     url = $"{options.HarnessMcpBaseUrl!.TrimEnd('/')}/mcp-harness",

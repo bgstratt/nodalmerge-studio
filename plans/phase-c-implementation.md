@@ -250,6 +250,14 @@ full-suite parallelism (`CandidateBranchConflictTests` once, in the same pattern
 describe) — passed cleanly on an isolated rerun and on a second full-suite run; not something this
 slice introduced.
 
+**Real-CLI smoke RUN and PASSED 2026-07-13** (codex-cli 0.144.1, ChatGPT-seat auth, throwaway
+env-gated test file — B3 posture): scheduler-driven worker spawn → codex created the goal file →
+harvest → correct ReadyForReview proposal, released clean, 26s end to end. Model note: `-m
+gpt-5.1-codex-mini` fails with `400 "not supported when using Codex with a ChatGPT account"` — leave
+the model blank (CLI default) for ChatGPT-seat auth; seat auth draws on the plan's quota rather than
+per-token billing anyway. The stdin-close and `-s danger-full-access` (Windows) decisions from the
+capture sessions both held up in the real run.
+
 **Real capture findings that shaped the adapter (all verified, not training-data guesses):**
 - `thread_id` appears exactly once, on the `thread.started` line — unlike claude's `session_id`,
   which repeats on every line. `CodexTranscriptParser.V1` captures it once and carries it through
@@ -594,6 +602,26 @@ calls for `nm_v1_workspace_symbol_definition` or `nm_v1_artifact_record` firing 
 confirm the CLI process itself never exits/respawns, i.e. the same `claude` process resumes the
 turn. Never run this against the real `claude` binary from automated tests (per the task's
 constraint and B2/B3 precedent).
+
+**Smoke RUN and PASSED 2026-07-13** (claude 2.1.207 bundled with the VSCode extension, `--model
+haiku`, driven by a throwaway env-gated test file, deleted after — B3 posture). Full round trip in a
+27s run: mcp.json generated correctly, claude called
+`mcp__nodalmerge-harness__nm_v1_clarification_request` (after two ToolSearch calls to load the
+deferred schema), the answer given via `IClarificationCommandService.RespondAsync` ~1s after the
+request surfaced was returned inside the held-open tool call, and the SAME claude process resumed
+the turn ("Perfect! The answer is `smoke-clarified.txt`"), wrote the file, and the run harvested a
+correct ReadyForReview proposal. Two real defects found and fixed on the way (commit alongside this
+note):
+1. **MCP tools were never pre-authorized** — the generated `--settings` allowlist had no
+   `mcp__nodalmerge-harness` entry, so in `-p` mode the tool call stalled on an unanswerable
+   permission prompt and the run ended with no clarification ever reaching Studio.
+   `WriteSettingsFileAsync` now appends `mcp__nodalmerge-harness` whenever the mount is active.
+2. **A session-less clarification is invisible** — `ClarificationCommandService.RequestAsync` only
+   appends the `ClarificationRequested` event (the sole source for `ListActiveRequestsAsync` and
+   `RespondAsync`) when a sessionId resolves; an `EnqueueAsync` without `sessionId` still PARKS the
+   work unit (Waiting) but nobody can list or answer the question. The mainline extension path
+   always enqueues with a session; direct API callers must too. Left unfixed (design decision
+   needed: pseudo-session fallback vs. required sessionId) — flagged here so it isn't rediscovered.
 
 **Discovered, relevant to C2/Phase D**: the `ConfigureSessionOptions` per-path tool-swap technique
 generalizes — a future third mount (or a Codex-specific tool subset, if C2's adapter ever needs

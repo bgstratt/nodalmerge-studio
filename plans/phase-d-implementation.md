@@ -189,6 +189,22 @@ acquire/record/release cycle by hand and never actually calls the seam.
   adapter for a Plan-stage spawn, since all three actually run Plan mode — D1 was a real
   prerequisite, not just plumbing.
 
+**Real-CLI Plan-mode smoke RUN and PASSED 2026-07-13** (claude 2.1.207 bundled with the VSCode
+extension, `--model haiku`, throwaway env-gated test file — B3 posture): scheduler-driven Plan item →
+real claude wrote a valid two-slice `.workspace/plan.json` → harvest recorded the Plan artifact →
+item released clean, no dead letter. **It failed first, exposing a real D1.b bug**: the Plan-mode
+allowlist emitted `Write({workDir}/.workspace/plan.json)`, but the CLI has NO `Write(...)`
+permission-rule type — even `Write(**)` never matches; `Edit(...)` rules gate ALL file-modifying
+tools (Write/Edit/NotebookEdit). In `-p` mode the planner therefore stalled at an unanswerable
+permission prompt and ended with "The plan will be written once you grant write permission" — a
+correct decomposition, no plan.json, and (worse) a *silent* no-op in production. Execute mode was
+never bitten because it always emitted `Edit(.../**)` alongside the inert `Write(...)` entry, which
+is also why B3's zero-denials run validated the pattern *syntax* without validating the `Write` rule
+type. Fixed in `WriteSettingsFileAsync` (Plan branch now emits `Edit(...)`); verified by probe runs
+(`Write(**)` denied; `Edit(exact-path)` allowed, case-insensitive) and the passing smoke. The C3
+smoke (see phase-c-implementation.md) found a second allowlist gap the same day: mounted MCP tools
+need a `mcp__nodalmerge-harness` allow entry too.
+
 ## D2 — Executor routing ("who plans this goal")
 
 The real selector is `IProfileSelectionService` (`LlmProfileSelectionService`) — the

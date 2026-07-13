@@ -488,6 +488,13 @@ called first, and `seedFromBranchId: "main"` passed — exactly the pattern
 this API directly rather than through the REST-facing `WorkUnitCommandService`, which has its own
 first-goal seeding logic this bypassed.
 
+**All three post-B3 real-CLI smokes RUN and PASSED 2026-07-13** (same throwaway/not-checked-in
+posture as this B3 smoke): C2 codex worker end-to-end (phase-c-implementation.md C2 notes — model
+must stay blank on ChatGPT-seat auth), C3 MCP mount + held-open clarification (phase-c C3 notes —
+found/fixed missing `mcp__nodalmerge-harness` allowlist entry; flagged session-less-clarification
+invisibility), and D1 real Plan-mode run (phase-d-implementation.md D1 notes — found/fixed the
+Plan-mode allowlist emitting a nonexistent `Write(...)` rule type instead of `Edit(...)`).
+
 **Both previously-deferred items closed 2026-07-12** (725/725 tests green, up from 722 — 3 new
 tests: cross-repo `--add-dir`, resume persists/reuses the CLI session id, a fresh non-resume
 attempt does not resume a stale session; plus one new assertion added to the existing native-path
