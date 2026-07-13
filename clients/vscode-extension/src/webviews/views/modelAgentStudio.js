@@ -133,7 +133,7 @@ export function init(ctx) {
         '</select></div>' +
       '<div id="pf-cli-note" class="field muted' + (isCli ? '' : ' hidden') + '">' +
         'Runs the role via the local <code>' + esc(cliDisplayName(curProvider)) + '</code> CLI in the branch working ' +
-        'directory (worker/Execute roles only for now). Auth comes from that CLI\'s own login; ' +
+        'directory (assignable to the Worker, Planner, and Reviewer roles — the Orchestrator never delegates to a CLI). Auth comes from that CLI\'s own login; ' +
         'storing an API key below is optional and switches that role to key-based auth. ' +
         'Leave Model blank to use the CLI\'s default.' +
       '</div>' +
@@ -188,7 +188,7 @@ export function init(ctx) {
       if (cli) {
         noteEl.innerHTML =
           'Runs the role via the local <code>' + esc(cliDisplayName(this.value)) + '</code> CLI in the branch ' +
-          'working directory (worker/Execute roles only for now). Auth comes from that CLI\'s own login; ' +
+          'working directory (assignable to the Worker, Planner, and Reviewer roles — the Orchestrator never delegates to a CLI). Auth comes from that CLI\'s own login; ' +
           'storing an API key below is optional and switches that role to key-based auth. ' +
           'Leave Model blank to use the CLI\'s default.';
       }

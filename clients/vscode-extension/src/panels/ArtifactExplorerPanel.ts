@@ -1320,9 +1320,9 @@ export class GoalWorkspacePanel {
         throw new Error(`Profile "${template.orchestrator}" isn't ready — ${reason}.`);
       }
       // A CLI provider (claude-cli, codex-cli, …) routes a role to the server's matching
-      // IHarnessExecutor, which only the worker/Execute construction sites sit behind today
-      // (harness-hosting-architecture.md B1 scope; Plan/Review modes are Phase C/D, orchestrator
-      // coordination never delegates — AP-6). Fail here with a clear message instead of letting the
+      // IHarnessExecutor. Execute/Plan/Review all sit behind the executor seam now (B1 / D1.a /
+      // review-seam-and-clarification-sessions.md S2), but orchestrator coordination never
+      // delegates to a CLI harness — AP-6. Fail here with a clear message instead of letting the
       // run degrade mid-flight.
       if (isCliProvider(orchCfg.provider)) {
         throw new Error(
@@ -1344,14 +1344,11 @@ export class GoalWorkspacePanel {
           const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl);
           throw new Error(`Profile "${profileId}" isn't ready — ${reason}.`);
         }
-        // plans/phase-d-implementation.md D1.a — Plan is now wired through the executor seam
-        // (both registered CLI adapters flip SupportsPlanningMode true), so a CLI provider is
-        // assignable to the Planner role too. Review still isn't (ReviewerAgentLoop stays
-        // native-only on the server).
-        if (isCliProvider(cfg.provider) && stage !== 'Execute' && stage !== 'Plan') {
-          throw new Error(
-            `Profile "${profileId}" uses a CLI provider (${cfg.provider}), which only supports the Worker (Execute) and Planner (Plan) roles today — assign an API-based profile to the ${stage} stage in Agent Topology.`);
-        }
+        // Every per-stage role is CLI-assignable now: Execute (harness-hosting-architecture.md
+        // B1), Plan (phase-d-implementation.md D1.a), and Review
+        // (review-seam-and-clarification-sessions.md S2, 2026-07-13 — review-request.json in,
+        // .workspace/review.json verdict out, both CLI adapters flip SupportsReviewMode true).
+        // Only the Orchestrator (checked above) never delegates to a CLI harness — AP-6.
         stageCredentials[stage] = cfg;
       }
 
