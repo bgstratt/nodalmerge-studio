@@ -769,8 +769,14 @@ across a dependency graph. Don't build it; just don't block it.
 
 Open design questions (deliberately unresolved here):
 
-- Plan quality varies by harness — does the AP-4 gate extend to plan review, or do plans
-  auto-promote below a size threshold?
+- ~~Plan quality varies by harness — does the AP-4 gate extend to plan review, or do plans
+  auto-promote below a size threshold?~~ **Resolved 2026-07-13: no plan-level review gate.**
+  Plans are DAG artifacts (recorded via artifact lineage; deliberately kept out of the repo
+  after the commit/merge/tracking problems and the plan.json copy-overwrite bug) and fold
+  straight into child work units via `FanOutService` with no pre-ingestion review. Plan
+  quality is judged where it's observable: AP-4 reviews each slice's *result* against the
+  plan and the original goal. If a pathological harness plan ever demands a gate, it would
+  sit in front of the fold — but nothing today reviews plans as such, by design.
 - How does a harness-authored plan express FileScope well enough for claim
   pre-acquisition?
 - Does `PlannerAgentLoop` survive as the fallback planner, or become
