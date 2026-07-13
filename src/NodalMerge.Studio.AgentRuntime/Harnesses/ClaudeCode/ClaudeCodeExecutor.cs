@@ -39,9 +39,13 @@ internal sealed class ClaudeCodeExecutor(
     // SupportsPlanningMode flips true now that Mode==Plan is wired: a different kickoff prompt
     // (write .workspace/plan.json, implement nothing) and a Write-only-plan.json settings
     // allowlist, both in BuildProcessStartInfo/WriteSettingsFileAsync below.
+    // plans/review-seam-and-clarification-sessions.md S2 — SupportsReviewMode flips true with
+    // Mode==Review wired: a review-request contract file in, a .workspace/review.json verdict out
+    // (see BuildProcessStartInfo's Review kickoff + WriteSettingsFileAsync's Review allowlist).
     public HarnessCapabilities Capabilities { get; } = new(
         SupportsTurnTelemetry: true, SupportsResume: true, SupportsHooks: true,
-        SupportsSubagents: true, SupportsMcp: true, SupportsPlanningMode: true);
+        SupportsSubagents: true, SupportsMcp: true, SupportsPlanningMode: true,
+        SupportsReviewMode: true);
 
     // WorkUnit.Metadata key the claude CLI's own session id is persisted under between runs —
     // additive, no new typed field, matching the "Metadata for genuine ad hoc/future use"
@@ -67,6 +71,16 @@ internal sealed class ClaudeCodeExecutor(
         // Materializes .workspace/{manifest,goal,workunit,state,constraints,review-policy}.json
         // (+ .md siblings) — the runtime→harness half of the contract, built in Phase A.
         await workspaceContracts.MaterializeAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+
+        // plans/review-seam-and-clarification-sessions.md S2 — Review mode additionally needs the
+        // proposal metadata + diff framing on disk before the CLI spawns; a Review run with no
+        // reviewable proposal is terminal (nothing to decide), not worth a paid spawn.
+        if (request.Mode == HarnessMode.Review)
+        {
+            var reviewSetupFailure = await harvest.MaterializeReviewRequestAsync(request, branchId, ct).ConfigureAwait(false);
+            if (reviewSetupFailure is not null)
+                return reviewSetupFailure;
+        }
 
         var (settingsPath, addDirRoots) = await WriteSettingsFileAsync(
             branchId, workDir, wu.ReferenceFiles, request.Mode, ct).ConfigureAwait(false);
@@ -283,6 +297,20 @@ internal sealed class ClaudeCodeExecutor(
                 $"Edit({workDirPattern}/.workspace/plan.json)",
             ];
         }
+        else if (mode == HarnessMode.Review)
+        {
+            // plans/review-seam-and-clarification-sessions.md S2 — a reviewer reads the whole
+            // branch and writes ONLY the verdict file; no general Edit, so the run can't change
+            // what it's reviewing. Build/test Bash entries are included below: verification is
+            // half the reviewer's job (the CLI equivalent of the native loop's
+            // nm_v1_workspace_build/_test tools).
+            allow =
+            [
+                $"Read({workDirPattern}/**)",
+                $"Edit({workDirPattern}/.workspace/review.json)",
+            ];
+            await AddBuildTestBashAllowsAsync().ConfigureAwait(false);
+        }
         else
         {
             allow =
@@ -291,7 +319,11 @@ internal sealed class ClaudeCodeExecutor(
                 $"Write({workDirPattern}/**)",
                 $"Read({workDirPattern}/**)",
             ];
+            await AddBuildTestBashAllowsAsync().ConfigureAwait(false);
+        }
 
+        async Task AddBuildTestBashAllowsAsync()
+        {
             var profile = await workspaceProfiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
             foreach (var root in profile.Roots)
             {
@@ -380,7 +412,27 @@ internal sealed class ClaudeCodeExecutor(
         // restricts Write to that one path and drops Edit/Bash entirely; this prompt is the
         // cooperative half of that contract for a CLI that (unlike the settings file) has no
         // hard-enforced sandbox Studio controls.
-        var prompt = request.Mode == HarnessMode.Plan
+        // plans/review-seam-and-clarification-sessions.md S2 — Mode==Review mirrors Plan's shape:
+        // a distinct kickoff naming the contract file in (.workspace/review-request.json) and the
+        // verdict file out (.workspace/review.json), with the settings allowlist above restricting
+        // writes to exactly that verdict file. The verificationResults wording matches the native
+        // nm_v1_merge_review tool's own schema description — on Rejected it is the only feedback
+        // the retried worker ever sees.
+        var prompt = request.Mode == HarnessMode.Review
+            ? "You are reviewing a merge proposal. Read .workspace/goal.md, .workspace/workunit.md, " +
+              "and .workspace/review-request.json in this directory — this working directory " +
+              "contains the PROPOSED state of the branch, and review-request.json carries the " +
+              "proposal's summary, files touched, and diff against the target. Inspect the changed " +
+              "files, check them against the goal and any recorded constraints, and run the " +
+              "project's build/test commands if available to verify. Then write your verdict to " +
+              ".workspace/review.json as JSON matching this shape exactly: " +
+              "{\"decision\":\"Approved\",\"verificationResults\":\"...\"} — decision must be " +
+              "\"Approved\" or \"Rejected\"; verificationResults is required, and on Rejected it " +
+              "is the ONLY explanation the retried worker will see, so be specific about what to " +
+              "fix. Do NOT create, edit, or delete any other file. Record any Research/Decision/" +
+              "Constraint knowledge via .workspace/decisions/, and blocking questions via " +
+              ".workspace/inbox/."
+            : request.Mode == HarnessMode.Plan
             ? "Read .workspace/goal.md, .workspace/workunit.md, and .workspace/state.md in this " +
               "directory, then decompose the work into slices. Write your plan to " +
               ".workspace/plan.json as JSON matching this shape exactly: " +

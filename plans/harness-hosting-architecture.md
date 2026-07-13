@@ -23,6 +23,14 @@
       769/769 tests green; D3 (replan through the seam + plan-staleness signals) shipped
       2026-07-12, 773/773 tests green; see `plans/phase-d-implementation.md`'s D1/D2/D3
       implementation notes — all three slices shipped, Phase D complete
+- [x] Post-D follow-up (plans/review-seam-and-clarification-sessions.md, shipped 2026-07-13):
+      `HarnessMode.Review` through the seam — the last native-only construction sites
+      (scheduled Review branch + InlineReviewerService, i.e. both the TaskReviewPolicy and
+      WorkspaceReviewPolicy AgentApproval/Hybrid gates) now resolve executors like Plan/Execute,
+      with a `.workspace/review-request.json` → `.workspace/review.json` file contract for CLI
+      adapters. A claude-cli-only topology can now run goal → plan → fan-out → work → review →
+      merge → workspace review end-to-end with agent review at every gate; the orchestrator loop
+      remains the one native-only LLM role (separate pure-service evolution track).
 - [ ] Phase E (opportunistic) — hooks-based leasing, file watching, Agent SDK sidecar
 
 Phase A is done. Phase B carries an implementation-ready slice breakdown

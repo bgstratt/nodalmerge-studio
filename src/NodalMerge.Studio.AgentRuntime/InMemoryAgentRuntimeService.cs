@@ -296,20 +296,6 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 failureReason = "Missing LLM credentials";
                 failureKind = FailureKind.MissingCredentials;
             }
-            else if ((harnessExecutorResolver?.IsCliProvider(provider) ?? false) &&
-                     profile?.Stage is PipelineStage.Review)
-            {
-                // Only the Worker/Execute and Plan construction sites are behind the executor seam
-                // (B1 + plans/phase-d-implementation.md D1.a); Review still constructs the native
-                // loop class directly, and that would hand claude-cli "credentials" to LlmClient.
-                // Fail loudly instead of producing a confusing HTTP error mid-loop. Lifted when
-                // Review mode lands behind the seam.
-                _logger.LogWarning(
-                    "[Agent {AgentId}] Scheduled {Stage} run will NOT start — the claude-cli provider only supports Execute/Plan-stage roles today.",
-                    agentId, profile.Stage);
-                failureReason = $"The Claude Code CLI provider cannot run {profile.Stage}-stage roles yet — only Execute (worker) and Plan. Assign an API-based Model Profile to this role.";
-                failureKind = FailureKind.MissingCredentials;
-            }
             else
             {
                 if (item.SessionId is not null)
@@ -322,10 +308,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         ct: ct).ConfigureAwait(false);
                 }
 
-                var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
-                var llm = _serviceProvider.GetRequiredService<LlmClient>();
-                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
-                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
+                // All three stage branches below (Plan, Review, Worker/Execute) now construct via
+                // the executor seam (plans/review-seam-and-clarification-sessions.md S2 closed the
+                // last one, Review) — NativeHarnessExecutor builds its own DefaultAgentToolClient
+                // from the request's Provider/Model/BaseUrl/ApiKey, so nothing here constructs an
+                // LLM client anymore.
                 var ruleFileContext = await BuildRuleFileContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
 
                 AgentLoopCompletion completion;
@@ -379,12 +366,27 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 }
                 else if (profile?.Stage == PipelineStage.Review)
                 {
+                    // plans/review-seam-and-clarification-sessions.md S2 — Review-stage
+                    // construction moves behind the executor seam, same as Plan (D1.a) and
+                    // Worker (B1): resolve via provider, degrade to native on a capability miss
+                    // (never fail over one). TaskId carries the proposalId — the convention this
+                    // branch always used. This is what lets a claude-cli/codex-cli Reviewer
+                    // profile actually run instead of hitting the (now deleted) loud-fail gate.
                     var proposalId = string.IsNullOrWhiteSpace(taskId) ? string.Empty : taskId;
-                    var reviewerLoop = new ReviewerAgentLoop(
-                        agentId, item.WorkUnitId, proposalId, agentClient,
-                        profile, item.SessionId, a => ReportActivity(agentId, a),
-                        conversationLog: conversationLog, events: _events, logger: _logger);
-                    completion = await reviewerLoop.RunAsync(cts.Token).ConfigureAwait(false);
+                    var reviewExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
+                    var reviewExecutor = reviewExecutorResolver.ResolveForProvider(provider, profile?.Executor);
+                    if (!reviewExecutor.Capabilities.SupportsReviewMode)
+                        reviewExecutor = reviewExecutorResolver.Resolve("native");
+
+                    var reviewRequest = new HarnessRunRequest(
+                        HarnessMode.Review, agentId, item.WorkUnitId, proposalId, profile, item.SessionId,
+                        IsResume: item.AttemptCount > 0, ruleFileContext,
+                        PromptGuidanceContext: null,
+                        SelfVerifyBuild: false, SelfVerifyTest: false,
+                        OnActivity: a => ReportActivity(agentId, a),
+                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey);
+                    var reviewResult = await reviewExecutor.RunAsync(reviewRequest, cts.Token).ConfigureAwait(false);
+                    completion = reviewResult.Completion;
                 }
                 else
                 {

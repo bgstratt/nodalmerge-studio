@@ -29,9 +29,13 @@ internal sealed class NativeHarnessExecutor(
     // implementation.md D1.a — SupportsPlanningMode is true: PlannerAgentLoop is wired through
     // Mode==Plan below, and native is also the capability-miss fallback target for a CLI executor
     // that hasn't wired planning mode yet, so it must actually be able to run Plan mode itself.
+    // SupportsReviewMode (plans/review-seam-and-clarification-sessions.md S2) is true for the same
+    // reason SupportsPlanningMode is: native is the capability-miss fallback target, so it must
+    // actually run every mode itself (ReviewerAgentLoop wired through Mode==Review below).
     public HarnessCapabilities Capabilities { get; } = new(
         SupportsTurnTelemetry: true, SupportsResume: false, SupportsHooks: false,
-        SupportsSubagents: false, SupportsMcp: false, SupportsPlanningMode: true);
+        SupportsSubagents: false, SupportsMcp: false, SupportsPlanningMode: true,
+        SupportsReviewMode: true);
 
     public async Task<HarnessRunResult> RunAsync(HarnessRunRequest request, CancellationToken ct = default)
     {
@@ -60,6 +64,29 @@ internal sealed class NativeHarnessExecutor(
                 conversationLog: conversationLog, events: events, logger: logger);
             var planCompletion = await plannerLoop.RunAsync(ct).ConfigureAwait(false);
             return new HarnessRunResult(planCompletion);
+        }
+
+        // plans/review-seam-and-clarification-sessions.md S2 — moved from the two Reviewer
+        // construction sites (InMemoryAgentRuntimeService's scheduled Review branch and
+        // InlineReviewerService), which now resolve an executor and build this request instead.
+        // TaskId carries the proposalId — the same convention both sites always used. The proposal
+        // fetch feeds ReviewerAgentLoop the filesTouched/justification context up front, exactly
+        // what InlineReviewerService used to do at its own call site.
+        if (request.Mode == HarnessMode.Review)
+        {
+            var merge = serviceProvider.GetRequiredService<IMergeService>();
+            var proposalForReview = string.IsNullOrWhiteSpace(request.TaskId)
+                ? null
+                : await merge.GetAsync(request.TaskId, ct).ConfigureAwait(false);
+
+            var reviewerLoop = new ReviewerAgentLoop(
+                request.AgentId, request.WorkUnitId, request.TaskId, agentClient,
+                request.Profile, request.SessionId, request.OnActivity,
+                filesTouched: proposalForReview?.FilesTouched,
+                noFileChangesJustification: proposalForReview?.NoFileChangesJustification,
+                conversationLog: conversationLog, events: events, logger: logger);
+            var reviewCompletion = await reviewerLoop.RunAsync(ct).ConfigureAwait(false);
+            return new HarnessRunResult(reviewCompletion);
         }
 
         var loop = new WorkerAgentLoop(

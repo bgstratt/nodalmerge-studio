@@ -41,9 +41,14 @@ internal sealed class CodexCliExecutor(
     // flips true: writing a JSON file (.workspace/plan.json) is within codex's verified abilities
     // (it already writes files under `-s workspace-write`/`danger-full-access`); no new CLI feature
     // is assumed, unlike hooks/subagents/MCP above which would be.
+    // plans/review-seam-and-clarification-sessions.md S2 — SupportsReviewMode flips true with
+    // Mode==Review wired: like Plan mode, reading/writing a JSON contract file is within codex's
+    // verified abilities; enforcement is prompt-only (no --settings equivalent), backstopped by
+    // HarnessHarvestPipeline.HarvestReviewAsync judging only the verdict file.
     public HarnessCapabilities Capabilities { get; } = new(
         SupportsTurnTelemetry: true, SupportsResume: true, SupportsHooks: false,
-        SupportsSubagents: false, SupportsMcp: false, SupportsPlanningMode: true);
+        SupportsSubagents: false, SupportsMcp: false, SupportsPlanningMode: true,
+        SupportsReviewMode: true);
 
     // WorkUnit.Metadata key the codex CLI's own thread id is persisted under between runs — mirrors
     // ClaudeCodeExecutor's "claudeCodeSessionId" convention (additive Metadata entry, no new typed
@@ -63,6 +68,16 @@ internal sealed class CodexCliExecutor(
         // (+ .md siblings) — same runtime->harness contract claude-code uses; codex reads the same
         // files via its own file tools, per the shared kickoff prompt below.
         await workspaceContracts.MaterializeAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+
+        // plans/review-seam-and-clarification-sessions.md S2 — same Review-mode contract
+        // materialization as ClaudeCodeExecutor: proposal metadata + diff framing on disk before
+        // the spawn; no reviewable proposal is terminal, not worth a spawn.
+        if (request.Mode == HarnessMode.Review)
+        {
+            var reviewSetupFailure = await harvest.MaterializeReviewRequestAsync(request, branchId, ct).ConfigureAwait(false);
+            if (reviewSetupFailure is not null)
+                return reviewSetupFailure;
+        }
 
         var addDirRoots = await ResolveAddDirRootsAsync(wu.ReferenceFiles, ct).ConfigureAwait(false);
 
@@ -205,7 +220,24 @@ internal sealed class CodexCliExecutor(
         // --settings allowlist to mechanically restrict writes to .workspace/plan.json — this
         // prompt is the only "implement nothing" enforcement on codex's side, backstopped by
         // HarnessHarvestPipeline.HarvestPlanAsync discarding any diff it finds anyway.
-        var prompt = request.Mode == HarnessMode.Plan
+        // plans/review-seam-and-clarification-sessions.md S2 — Review kickoff mirrors
+        // ClaudeCodeExecutor's word-for-word; with no --settings allowlist on codex, this prompt
+        // (plus the harvest judging only .workspace/review.json) is the whole enforcement.
+        var prompt = request.Mode == HarnessMode.Review
+            ? "You are reviewing a merge proposal. Read .workspace/goal.md, .workspace/workunit.md, " +
+              "and .workspace/review-request.json in this directory — this working directory " +
+              "contains the PROPOSED state of the branch, and review-request.json carries the " +
+              "proposal's summary, files touched, and diff against the target. Inspect the changed " +
+              "files, check them against the goal and any recorded constraints, and run the " +
+              "project's build/test commands if available to verify. Then write your verdict to " +
+              ".workspace/review.json as JSON matching this shape exactly: " +
+              "{\"decision\":\"Approved\",\"verificationResults\":\"...\"} — decision must be " +
+              "\"Approved\" or \"Rejected\"; verificationResults is required, and on Rejected it " +
+              "is the ONLY explanation the retried worker will see, so be specific about what to " +
+              "fix. Do NOT create, edit, or delete any other file. Record any Research/Decision/" +
+              "Constraint knowledge via .workspace/decisions/, and blocking questions via " +
+              ".workspace/inbox/."
+            : request.Mode == HarnessMode.Plan
             ? "Read .workspace/goal.md, .workspace/workunit.md, and .workspace/state.md in this " +
               "directory, then decompose the work into slices. Write your plan to " +
               ".workspace/plan.json as JSON matching this shape exactly: " +

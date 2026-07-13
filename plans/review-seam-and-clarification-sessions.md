@@ -2,8 +2,26 @@
 
 ## Status
 
-- [ ] S1 — clarification sessions: synthetic-session fallback + real sessionIds threaded
-- [ ] S2 — `HarnessMode.Review` through the seam (native + claude-code + codex + inline reviewer)
+- [x] S1 — clarification sessions: synthetic-session fallback + real sessionIds threaded —
+      shipped 2026-07-13 (commit 8b52cf9), 775/775 tests green. Fallback chain landed exactly as
+      specified below; `ClarificationSessionFallbackTests` covers both the synthetic and
+      goal-node tiers.
+- [x] S2 — `HarnessMode.Review` through the seam — shipped 2026-07-13, full solution 780/780
+      green (5 new tests in `HarnessReviewModeSeamTests`: claude Approved/Rejected/missing-verdict,
+      codex Approved, and the inline-site claude-cli routing test). Landed as specified below,
+      plus two things discovered while wiring:
+      - `InlineReviewerService` now resolves `GetCredentialsForStage(…, Review)` BEFORE the
+        orchestrator-credentials fallback (both on the work unit and on the parent walk) — the
+        user's per-role Review Model Profile was previously ignored at the inline site even for
+        API providers; only the enqueue site (`AutomatedReviewGateService`) honored it.
+      - `RunScheduledWorkerAsync` no longer constructs `DefaultAgentToolClient`/LlmClient at all —
+        with Review behind the seam, all three stage branches build a `HarnessRunRequest` and the
+        native executor constructs its own client. The scheduled-site loud-fail gate for CLI
+        providers on Review roles is deleted.
+      Known scope note: `ResupplyCredentialsAsync`/`ResolveAndPersistCredentialsAsync` still
+      requires a non-blank baseUrl to register anything (predates CLI providers) — a claude-cli
+      resupply needs a placeholder baseUrl. Cosmetic for now (the CLI adapter ignores it); worth
+      folding into any future credential-model cleanup.
 
 Follow-up to plans/harness-hosting-architecture.md (Phases A–D complete, real-CLI smokes passed
 2026-07-13). Motivation, verbatim from the driving conversation: a claude-cli-only Agent Topology

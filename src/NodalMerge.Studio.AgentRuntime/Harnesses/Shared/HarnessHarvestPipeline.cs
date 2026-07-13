@@ -26,10 +26,18 @@ internal sealed class HarnessHarvestPipeline(
     IMergeCommandService mergeCommands,
     IFileWorkspaceService fileWorkspace,
     IArtifactCommandService artifactCommands,
+    IMergeService merge,
     ILogger<HarnessHarvestPipeline> logger,
     IExecutionEventStream? events = null)
 {
     private const string PlanFilePath = ".workspace/plan.json";
+
+    // plans/review-seam-and-clarification-sessions.md S2 — the Review-mode contract pair: the
+    // pipeline materializes the request (proposal metadata + diff) before the CLI spawns, the
+    // harness writes its verdict, HarvestReviewAsync maps it onto AutomatedReviewAsync. File-based
+    // like plan.json so codex (no MCP) gets review mode without any new tool surface.
+    private const string ReviewRequestFilePath = ".workspace/review-request.json";
+    private const string ReviewVerdictFilePath = ".workspace/review.json";
 
     private static readonly JsonSerializerOptions PlanJsonOpts = new()
     {
@@ -49,6 +57,13 @@ internal sealed class HarnessHarvestPipeline(
         if (request.Mode == HarnessMode.Plan)
         {
             return await HarvestPlanAsync(
+                request, branchId, resultText, inputTokens, outputTokens, totalCostUsd, sessionId, ct)
+                .ConfigureAwait(false);
+        }
+
+        if (request.Mode == HarnessMode.Review)
+        {
+            return await HarvestReviewAsync(
                 request, branchId, resultText, inputTokens, outputTokens, totalCostUsd, sessionId, ct)
                 .ConfigureAwait(false);
         }
@@ -227,6 +242,123 @@ internal sealed class HarnessHarvestPipeline(
         var normalizedPlanJson = JsonSerializer.Serialize(normalizedPlan);
 
         await artifactCommands.RecordPlanAsync(request.WorkUnitId, normalizedPlanJson, ct).ConfigureAwait(false);
+
+        return new HarnessRunResult(
+            AgentLoopCompletion.Succeeded, FailureReason: null,
+            resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
+    }
+
+    // plans/review-seam-and-clarification-sessions.md S2 — called by a CLI adapter before
+    // spawning a Review-mode run. The harness works in the proposal's source-branch workdir (the
+    // changed files are just there), so this file is the metadata framing: which proposal, what
+    // the worker claimed, and the diff vs the target. Returns null when the proposal exists (the
+    // happy path) or a terminal Stalled result the adapter returns as-is when it doesn't — a
+    // review run without a proposal has nothing to decide.
+    public async Task<HarnessRunResult?> MaterializeReviewRequestAsync(
+        HarnessRunRequest request, string branchId, CancellationToken ct)
+    {
+        var proposal = string.IsNullOrWhiteSpace(request.TaskId)
+            ? null
+            : await merge.GetAsync(request.TaskId, ct).ConfigureAwait(false);
+        if (proposal is null)
+        {
+            return new HarnessRunResult(
+                AgentLoopCompletion.Stalled,
+                $"Review-mode run has no reviewable proposal (TaskId='{request.TaskId}').");
+        }
+
+        var reviewRequestJson = JsonSerializer.Serialize(new
+        {
+            proposalId = proposal.ProposalId,
+            workUnitId = proposal.WorkUnitId,
+            goal = proposal.Goal,
+            summary = proposal.Summary,
+            changeDescription = proposal.ChangeDescription,
+            filesTouched = proposal.FilesTouched,
+            noFileChangesJustification = proposal.NoFileChangesJustification,
+            sourceBranch = proposal.SourceBranch,
+            targetBranch = proposal.TargetBranch,
+            diff = proposal.WorkspaceChanges,
+        }, PlanJsonOpts);
+        await fileWorkspace.WriteAsync(branchId, ReviewRequestFilePath, reviewRequestJson, ct).ConfigureAwait(false);
+        return null;
+    }
+
+    private sealed record ReviewVerdictFile(
+        string? Decision,
+        string? VerificationResults,
+        IReadOnlyList<string>? ConsideredArtifactIds);
+
+    // Review-mode harvest: no diff→propose (the branch under review legitimately differs from the
+    // target — that IS the proposal) and no plan-mode diff-discard for the same reason. Parse
+    // .workspace/review.json and make the exact IMergeService.AutomatedReviewAsync call the native
+    // nm_v1_merge_review dispatcher makes (decision must be Approved/Rejected; verificationResults
+    // required — same rules), so every downstream behavior (rejection retry cycles via
+    // AutomatedReviewGateService, evidence, hybrid timers) is identical by construction. A
+    // missing/invalid verdict is Stalled — the same "inconclusive review" family
+    // InlineReviewerService dead-letters, handled by Retry/Continue rather than guessed at here.
+    private async Task<HarnessRunResult> HarvestReviewAsync(
+        HarnessRunRequest request, string branchId, string? resultText,
+        int? inputTokens, int? outputTokens, double? totalCostUsd, string? sessionId, CancellationToken ct)
+    {
+        string? verdictContent;
+        try
+        {
+            verdictContent = await fileWorkspace.ReadAsync(branchId, ReviewVerdictFilePath, ct).ConfigureAwait(false);
+        }
+        catch (FileNotFoundException)
+        {
+            verdictContent = null;
+        }
+
+        if (string.IsNullOrWhiteSpace(verdictContent))
+        {
+            return new HarnessRunResult(
+                AgentLoopCompletion.Stalled,
+                $"Review-mode run did not write {ReviewVerdictFilePath} — no decision to record.",
+                resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
+        }
+
+        ReviewVerdictFile? verdict;
+        try
+        {
+            verdict = JsonSerializer.Deserialize<ReviewVerdictFile>(verdictContent, PlanJsonOpts);
+        }
+        catch (JsonException ex)
+        {
+            return new HarnessRunResult(
+                AgentLoopCompletion.Stalled,
+                $"{ReviewVerdictFilePath} is not valid JSON: {ex.Message}",
+                resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
+        }
+
+        if (verdict is null ||
+            !Enum.TryParse<MergeProposalStatus>(verdict.Decision, ignoreCase: true, out var decision) ||
+            decision is not (MergeProposalStatus.Approved or MergeProposalStatus.Rejected) ||
+            string.IsNullOrWhiteSpace(verdict.VerificationResults))
+        {
+            return new HarnessRunResult(
+                AgentLoopCompletion.Stalled,
+                $"{ReviewVerdictFilePath} must carry decision=Approved|Rejected and non-empty " +
+                "verificationResults — same requirements as nm_v1_merge_review(automated=true).",
+                resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
+        }
+
+        try
+        {
+            await merge.AutomatedReviewAsync(
+                request.TaskId, decision, verdict.VerificationResults, request.AgentId,
+                verdict.ConsideredArtifactIds, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                ex, "[{AgentId}] Review-mode AutomatedReviewAsync failed for proposalId={ProposalId}",
+                request.AgentId, request.TaskId);
+            return new HarnessRunResult(
+                AgentLoopCompletion.Stalled, $"Recording the review decision failed: {ex.Message}",
+                resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
+        }
 
         return new HarnessRunResult(
             AgentLoopCompletion.Succeeded, FailureReason: null,

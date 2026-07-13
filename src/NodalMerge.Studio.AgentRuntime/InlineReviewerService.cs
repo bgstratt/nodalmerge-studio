@@ -19,7 +19,11 @@ public sealed class InlineReviewerService(
         string proposalId,
         CancellationToken ct = default)
     {
-        var creds = agentControl.GetOrchestratorCredentials(workUnitId);
+        // Review-stage Model Profile first (the user's explicit "who reviews" choice via Agent
+        // Topology — the same tier AutomatedReviewGateService's enqueue path resolves), then the
+        // orchestrator registration as the fallback it always was.
+        var creds = agentControl.GetCredentialsForStage(workUnitId, PipelineStage.Review)
+            ?? agentControl.GetOrchestratorCredentials(workUnitId);
 
         // When the work unit is a child worker spawned by fan-out, the orchestrator
         // credentials are registered on the parent, not the child. Walk up to find them.
@@ -30,7 +34,10 @@ public sealed class InlineReviewerService(
             {
                 var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
                 if (wu?.ParentWorkUnitId is { } parentId)
-                    creds = agentControl.GetOrchestratorCredentials(parentId);
+                {
+                    creds = agentControl.GetCredentialsForStage(parentId, PipelineStage.Review)
+                        ?? agentControl.GetOrchestratorCredentials(parentId);
+                }
             }
         }
 
@@ -38,33 +45,34 @@ public sealed class InlineReviewerService(
             return new InlineReviewResult(false, "No LLM credentials configured for this work unit.");
 
         var agentId = $"reviewer-auto-{Guid.NewGuid():N}";
-        var dispatcher = serviceProvider.GetRequiredService<McpToolDispatcher>();
-        var llm = serviceProvider.GetRequiredService<LlmClient>();
-        var conversationLog = serviceProvider.GetRequiredService<IConversationLogService>();
 
-        // Slice — hand the reviewer filesTouched/justification up front instead of relying on it
-        // to remember to go fetch them; ReviewerAgentLoop's prompt already says to check this, but
-        // it previously had no tool that could (see ReviewerAgentLoop kickoff message).
-        var proposalForReview = await merge.GetAsync(proposalId, ct).ConfigureAwait(false);
-
-        var agentClient = new DefaultAgentToolClient(creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey, llm, dispatcher);
-        var events = serviceProvider.GetService<IExecutionEventStream>();
+        // plans/review-seam-and-clarification-sessions.md S2 — construction moves behind the
+        // executor seam: a claude-cli/codex-cli Review provider routes to that CLI adapter
+        // (review-request contract in, .workspace/review.json verdict out, harvested onto the same
+        // AutomatedReviewAsync call the native nm_v1_merge_review tool makes), anything else
+        // degrades to native, whose Mode==Review branch does exactly what this method used to do
+        // inline (fetch the proposal for filesTouched/justification, run ReviewerAgentLoop).
+        var resolver = serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
+        var executor = resolver.ResolveForProvider(creds.Provider, null);
+        if (!executor.Capabilities.SupportsReviewMode)
+            executor = resolver.Resolve("native");
 
         // Registers this run in the same agent-visibility registry SpawnAsync-driven loops use
-        // (Activity Center / /studio/agents), for the duration of RunAsync only — this loop is
+        // (Activity Center / /studio/agents), for the duration of RunAsync only — this run is
         // otherwise invisible since it's awaited synchronously here rather than dispatched through
         // IWorkScheduler like the enqueued reviewer path.
         var completion = await agentControl.TrackInlineAgentAsync(
             agentId, workUnitId, proposalId,
-            onActivity =>
+            async onActivity =>
             {
-                var loop = new ReviewerAgentLoop(
-                    agentId, workUnitId, proposalId, agentClient,
-                    onActivity: onActivity,
-                    filesTouched: proposalForReview?.FilesTouched,
-                    noFileChangesJustification: proposalForReview?.NoFileChangesJustification,
-                    conversationLog: conversationLog, events: events);
-                return loop.RunAsync(ct);
+                var request = new HarnessRunRequest(
+                    HarnessMode.Review, agentId, workUnitId, proposalId, Profile: null,
+                    SessionId: null, IsResume: false, RuleFileContext: null,
+                    PromptGuidanceContext: null, SelfVerifyBuild: false, SelfVerifyTest: false,
+                    OnActivity: onActivity,
+                    Provider: creds.Provider, Model: creds.Model, BaseUrl: creds.BaseUrl, ApiKey: creds.ApiKey);
+                var result = await executor.RunAsync(request, ct).ConfigureAwait(false);
+                return result.Completion;
             },
             ct).ConfigureAwait(false);
 

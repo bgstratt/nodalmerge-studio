@@ -19,10 +19,17 @@ public enum HarnessMode
 
     // plans/phase-d-implementation.md D1.a — wired through NativeHarnessExecutor (wraps
     // PlannerAgentLoop) and both CLI adapters (write .workspace/plan.json, implement nothing).
-    // Review is still a known future value (ReviewerAgentLoop exists natively) — not speculative,
-    // just not built into the seam yet. A mode enum grows without breaking existing adapters; a
-    // multi-method interface would force every adapter to answer questions it can't yet.
+    // A mode enum grows without breaking existing adapters; a multi-method interface would force
+    // every adapter to answer questions it can't yet.
     Plan,
+
+    // plans/review-seam-and-clarification-sessions.md S2 — review the merge proposal named by
+    // TaskId (the same TaskId-carries-proposalId convention the scheduled Review branch and
+    // dead-letter entries always used). Native wraps ReviewerAgentLoop; CLI adapters read the
+    // materialized .workspace/review-request.json and write their verdict to
+    // .workspace/review.json, which HarnessHarvestPipeline maps onto the exact same
+    // IMergeService.AutomatedReviewAsync call the native nm_v1_merge_review tool makes.
+    Review,
 }
 
 public sealed record HarnessRunRequest(
@@ -80,7 +87,12 @@ public sealed record HarnessCapabilities(
     bool SupportsHooks,
     bool SupportsSubagents,
     bool SupportsMcp,
-    bool SupportsPlanningMode);
+    bool SupportsPlanningMode,
+    // plans/review-seam-and-clarification-sessions.md S2 — Mode==Review is wired through this
+    // adapter. Trailing optional (default false) so pre-existing positional constructions and any
+    // future adapter that hasn't wired review yet stay compiling/honest; a capability miss
+    // degrades to the native executor at both Review construction sites, same posture as Plan.
+    bool SupportsReviewMode = false);
 
 public interface IHarnessExecutor
 {
