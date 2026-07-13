@@ -253,7 +253,7 @@ internal sealed class ClaudeCodeExecutor(
         // entry when the transcript's format wasn't recognized (ClaudeTranscriptParser.V1's own
         // degrade rule) — identical in shape to the pre-C1 single-entry behavior.
         var entries = ClaudeConversationLogMapper.BuildEntries(
-            summary, request.WorkUnitId, request.AgentId, request.TaskId, Name);
+            summary, request.WorkUnitId, request.AgentId, request.TaskId, Name, request.Mode);
 
         try
         {

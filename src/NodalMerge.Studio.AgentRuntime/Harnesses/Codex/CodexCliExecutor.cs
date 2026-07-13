@@ -195,7 +195,7 @@ internal sealed class CodexCliExecutor(
         HarnessRunRequest request, CodexTranscriptRunSummary summary, CancellationToken ct)
     {
         var entries = CodexConversationLogMapper.BuildEntries(
-            summary, request.WorkUnitId, request.AgentId, request.TaskId, Name);
+            summary, request.WorkUnitId, request.AgentId, request.TaskId, Name, request.Mode);
 
         try
         {

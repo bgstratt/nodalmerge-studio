@@ -21,8 +21,17 @@ internal static class CodexConversationLogMapper
     // run-level-only (no turns reconstructed), this returns exactly one entry.
     public static IReadOnlyList<ConversationLogEntry> BuildEntries(
         CodexTranscriptRunSummary summary, string workUnitId, string agentId, string? taskId,
-        string executorName)
+        string executorName, Core.Services.HarnessMode mode = Core.Services.HarnessMode.Execute)
     {
+        // Same fix as ClaudeConversationLogMapper (found live 2026-07-13) — role must reflect the
+        // run's actual HarnessMode, not always "worker".
+        var agentRole = mode switch
+        {
+            Core.Services.HarnessMode.Plan => "planner",
+            Core.Services.HarnessMode.Review => "reviewer",
+            _ => "worker",
+        };
+
         var entries = new List<ConversationLogEntry>(summary.Turns.Count + 1);
         var occurredAt = DateTimeOffset.UtcNow;
 
@@ -32,7 +41,7 @@ internal static class CodexConversationLogMapper
                 LogId: $"CLE-turn-{Guid.NewGuid():N}",
                 WorkUnitId: workUnitId,
                 AgentId: agentId,
-                AgentRole: "worker",
+                AgentRole: agentRole,
                 TaskId: taskId,
                 CycleNumber: turn.CycleNumber,
                 AssistantText: turn.AssistantText,
@@ -51,7 +60,7 @@ internal static class CodexConversationLogMapper
             LogId: $"CLE-{Guid.NewGuid():N}",
             WorkUnitId: workUnitId,
             AgentId: agentId,
-            AgentRole: "worker",
+            AgentRole: agentRole,
             TaskId: taskId,
             CycleNumber: summary.Turns.Count,
             AssistantText: summary.ResultText,

@@ -17,8 +17,20 @@ internal static class ClaudeConversationLogMapper
     // one entry — identical in shape to the pre-C1 single-entry behavior.
     public static IReadOnlyList<ConversationLogEntry> BuildEntries(
         TranscriptRunSummary summary, string workUnitId, string agentId, string? taskId,
-        string executorName)
+        string executorName, Core.Services.HarnessMode mode = Core.Services.HarnessMode.Execute)
     {
+        // Found live 2026-07-13: this always wrote AgentRole "worker", so a claude-cli reviewer's
+        // own turns (HarnessMode.Review) were indistinguishable in the Conversation tab from the
+        // task worker's own turns on the same work unit — the native loops
+        // (ReviewerAgentLoop/PlannerAgentLoop via ConversationLogRecorder) always passed their own
+        // role string; the CLI mappers never did.
+        var agentRole = mode switch
+        {
+            Core.Services.HarnessMode.Plan => "planner",
+            Core.Services.HarnessMode.Review => "reviewer",
+            _ => "worker",
+        };
+
         var entries = new List<ConversationLogEntry>(summary.Turns.Count + 1);
         var occurredAt = DateTimeOffset.UtcNow;
 
@@ -28,7 +40,7 @@ internal static class ClaudeConversationLogMapper
                 LogId: $"CLE-turn-{Guid.NewGuid():N}",
                 WorkUnitId: workUnitId,
                 AgentId: agentId,
-                AgentRole: "worker",
+                AgentRole: agentRole,
                 TaskId: taskId,
                 CycleNumber: turn.CycleNumber,
                 AssistantText: turn.AssistantText,
@@ -47,7 +59,7 @@ internal static class ClaudeConversationLogMapper
             LogId: $"CLE-{Guid.NewGuid():N}",
             WorkUnitId: workUnitId,
             AgentId: agentId,
-            AgentRole: "worker",
+            AgentRole: agentRole,
             TaskId: taskId,
             CycleNumber: summary.Turns.Count,
             AssistantText: summary.ResultText,
