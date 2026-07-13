@@ -9,7 +9,8 @@ unchanged). Slices sequential: D1 → D2 → D3.
 
 - [x] D1 — `Plan` mode through the executor seam + plan.json contract + fold — shipped 2026-07-12,
       766/766 tests green (up from 758) — see "D1 implementation notes" below
-- [ ] D2 — Executor routing ("who plans this goal") via the profile selector
+- [x] D2 — Executor routing ("who plans this goal") via the profile selector — shipped 2026-07-12,
+      769/769 tests green (up from 766) — see "D2 implementation notes" below
 - [ ] D3 — Plan-staleness / replan policy hardening
 
 ## What the recon changed about D's shape
@@ -210,6 +211,91 @@ tier first, LLM tier opt-in (`UseLlmProfileSelection`, default off).
 
 Deterministic tier test (planner profile selected by pattern), override test (explicit
 topology assignment bypasses selector), default-off test.
+
+### D2 implementation notes (shipped 2026-07-12)
+
+769/769 tests green (up from 766; 3 new tests, all in `PlannerExecutorRoutingTests`,
+`tests/NodalMerge.Studio.Integration.Tests`).
+
+**Where "Plan-stage items get enqueued" actually is.** There's no dedicated scheduler-shaped
+call site for this — the production path is `OrchestratorAgentLoop` deciding, via its own LLM
+turn, to call the `nm_v1_scheduler_enqueue` tool with `profileId="planner"`. That tool call
+already ran through `InjectSpawnCredentialsAsync` (renamed from the synchronous
+`InjectSpawnCredentials` — D2 needed it async to consult the new selector) before dispatch,
+which already resolves `IAgentControlService.GetCredentialsForStage(workUnitId, PipelineStage
+.Plan)` — the Agent Topology per-stage override — and overwrites model/baseUrl/apiKey/provider
+when it's set. That's the existing "auto/unset" signal the parent plan's D2 note points at:
+`stageCreds is null` *is* "topology assignment auto/unset" for the Plan role, no new state
+needed. The new planner-selection branch sits right before the existing credential-overwrite
+lines, gated on `stage == PipelineStage.Plan && stageCreds is null && plannerSelection is not
+null`, and only ever changes `dict["profileId"]`/the resolved provider — never runs when an
+explicit override exists, never runs for Execute/Review tool calls. `IWorkScheduler.EnqueueAsync`
+called directly (bypassing the orchestrator LLM turn entirely) — used by
+`NativePlanModeSeamTests` and `IReplanService` — does **not** go through this hook; see
+"Discovered, relevant to D3" below.
+
+**Selection result + new interface.** `ProfileSelectionResult` (`ServiceContracts.cs`) gained an
+optional trailing `string? Provider = null`. Every existing producer (FanOutService's
+deterministic FileScope tier, `LlmProfileSelectionService`'s heuristic/LLM tiers) never sets it,
+so it's `null` everywhere pre-D2 code runs — FanOutService.EnqueueChildWorkerAsync needed zero
+changes and its behavior is unchanged byte-for-byte. A new `IPlannerSelectionService` (parallel
+interface, not an overload on `IProfileSelectionService` — the Plan-stage candidate pool,
+prompt, and heuristic default profile id are all different enough that sharing one method would
+mean a stage parameter and Execute-only assumptions creeping into a shared abstraction) declares
+one method, `SelectPlannerAsync(WorkUnit goalUnit, OrchestratorCredentials?, ct)`, implemented by
+`PlannerSelectionService` (new file, `AgentRuntime/PlannerSelectionService.cs`). Unlike the
+Execute path — where the deterministic FileScope tier lives in the caller (FanOutService) and
+only the LLM/heuristic tier lives in the selection service — both tiers live inside
+`PlannerSelectionService` here, because there's no fan-out-shaped caller to split them across;
+`OrchestratorAgentLoop` just wants one answer. The deterministic tier reuses
+`AgentWorkspaceService.MatchesGlob` (Storage project, already a public static method
+FanOutService itself calls) against Plan-stage profiles' `FileScopePatterns`; the LLM tier
+mirrors `LlmProfileSelectionService`'s prompt/parse/timeout shape almost verbatim, scoped to
+Plan-stage candidates and goal text instead of a child work unit's. Provider is derived from the
+selected profile's `Executor` field resolved through the already-registered
+`IHarnessExecutorResolver.Resolve(...).ProviderKey` — the same channel every other
+executor-routing decision in the codebase rides (native profiles resolve to `null`, meaning "no
+override").
+
+**Off-by-default, twice over.** `WorkspaceOptions.UsePlannerExecutorSelection` (new, default
+`false`) gates the entire service — when off, `SelectPlannerAsync` returns the heuristic
+("planner", no provider) without even listing agent profiles, mirroring
+`UseLlmProfileSelection`'s own posture but gating the deterministic tier too (unlike the Execute
+path, where the deterministic tier is unconditional and only the LLM fallback is flag-gated —
+planner routing is a bigger behavior change than picking among Execute-stage workers, so the
+whole feature stays opt-in for v1). Independently, `OrchestratorAgentLoop`'s new constructor
+parameter `IPlannerSelectionService? plannerSelection = null` defaults to null, and its one
+production construction site (`InMemoryAgentRuntimeService.StartOrchestratorLoop`) resolves it
+via `GetService` (not `GetRequiredService`) — so even a caller that forgot to wire the flag still
+can't reach the new branch structurally. `Toggle_off_by_default...` test locks in that with the
+flag off, the enqueued `ScheduledItem.ProfileId`/`Provider`/`Model` are identical to what the
+pre-D2 code would have produced, in the presence of a profile that *would* have matched the
+deterministic tier had it been consulted.
+
+**Test approach.** `PlannerExecutorRoutingTests` drives `OrchestratorAgentLoop` for real via the
+existing `PlannerEnqueueOnlyLlmHandler` fixture (scripts the orchestrator's LLM turn straight to
+`nm_v1_scheduler_enqueue(profileId="planner")`), then inspects `IWorkScheduler.ListPendingAsync()`
+for the resulting `ScheduledItem`. Deliberately never calls `IAgentRuntimeService.StartAsync()` —
+that starts the background scheduler poll loop, which would race to dequeue (and mutate/remove)
+the very item the assertions need to inspect; `agentControl.SpawnAsync("orchestrator", ...)`
+doesn't depend on the poll loop (it starts the orchestrator's own loop via `Task.Run` directly),
+so skipping `StartAsync()` is safe and removes the race entirely, at the cost of this suite never
+exercising an actual Plan-stage *run* — only the enqueue decision, which is D2's whole scope.
+
+**Discovered, relevant to D3:**
+- `IReplanService` and `NativePlanModeSeamTests`-style direct `IWorkScheduler.EnqueueAsync(...,
+  "planner", ...)` calls bypass `OrchestratorAgentLoop.InjectSpawnCredentialsAsync` entirely —
+  they never route through the new selector regardless of the flag, because there's no LLM tool
+  call in between to intercept. D3's own text already flags "route ReplanService's planner spawn
+  through the seam" as in-scope there; worth widening that note to say the planner-selection hook
+  itself also needs a call site inside `ReplanService` (or a shared helper both callers use) if
+  D3 wants replan spawns to honor `UsePlannerExecutorSelection` too — today they never will, flag
+  or not.
+- `ProfileSelectionResult.Provider` is genuinely generic (lives on the record every producer
+  shares), so if a future slice wants FanOutService's Execute-stage child routing to also carry a
+  provider (letting a child worker route to a CLI executor by FileScope pattern, not just by
+  profile id), the plumbing on the result type is already there — only FanOutService's own
+  `_scheduler.EnqueueAsync` call would need to start reading `selection.Provider`.
 
 ## D3 — Plan-staleness / replan hardening
 

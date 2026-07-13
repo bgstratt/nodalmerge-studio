@@ -1698,7 +1698,15 @@ public interface IAgentProfileService
 // pick a profile for each child work unit it enqueues; the LLM-calling implementation lives in
 // AgentRuntime (where LlmClient lives), so this interface is the seam that lets Orchestrator
 // depend on the capability without depending on AgentRuntime directly.
-public sealed record ProfileSelectionResult(string ProfileId, string Reason, bool UsedLlm);
+// plans/phase-d-implementation.md D2 — Provider is additive and optional: null (every existing
+// producer of this record — FanOutService's deterministic FileScope tier, LlmProfileSelectionService's
+// heuristic/LLM tiers) means "no executor-routing opinion, use whatever credentials the caller
+// already resolved," so extending the record here changes nothing about their behavior. Only
+// IPlannerSelectionService (below) ever sets it, carrying the CLI executor's ProviderKey (e.g.
+// "claude-cli") the same way every other executor-routing decision already rides the provider
+// channel (see IHarnessExecutorResolver.ResolveForProvider's doc comment) — null still means
+// "no override" there too (native, or selection disabled/heuristic).
+public sealed record ProfileSelectionResult(string ProfileId, string Reason, bool UsedLlm, string? Provider = null);
 
 public interface IProfileSelectionService
 {
@@ -1709,6 +1717,27 @@ public interface IProfileSelectionService
     /// </summary>
     Task<ProfileSelectionResult> SelectProfileAsync(
         WorkUnit childUnit,
+        OrchestratorCredentials? credentials,
+        CancellationToken ct = default);
+}
+
+// plans/phase-d-implementation.md D2 — "who plans this goal" executor routing. Parallel to
+// IProfileSelectionService but for the Plan stage: picks which profile (and, via
+// ProfileSelectionResult.Provider, which executor) authors a goal's decomposition. Callers must
+// only consult this when the role's Agent Topology assignment for PipelineStage.Plan is
+// auto/unset (see OrchestratorAgentLoop.InjectSpawnCredentialsAsync) — an explicit per-stage
+// Model Profile assignment is the override and must never be second-guessed by this service.
+public interface IPlannerSelectionService
+{
+    /// <summary>
+    /// Picks the agent profile (and optionally the executor provider) that should plan/decompose
+    /// <paramref name="goalUnit"/>. Returns the heuristic default ("planner", no provider
+    /// override) when selection is disabled (WorkspaceOptions.UsePlannerExecutorSelection),
+    /// no Plan-stage candidates are registered, credentials are unavailable, or the LLM tier
+    /// fails/times out/returns an unknown profile id.
+    /// </summary>
+    Task<ProfileSelectionResult> SelectPlannerAsync(
+        WorkUnit goalUnit,
         OrchestratorCredentials? credentials,
         CancellationToken ct = default);
 }

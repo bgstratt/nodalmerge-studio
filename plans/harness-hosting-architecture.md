@@ -19,8 +19,9 @@
       `plans/phase-c-implementation.md`'s C1 implementation notes; C2/C3 not started
 - [ ] Phase D — Plan ingestion; scheduler shifts from decomposing to coordinating — D1 (`Plan`
       mode through the executor seam + plan.json contract + fold) shipped 2026-07-12, 766/766
-      tests green; see `plans/phase-d-implementation.md`'s D1 implementation notes; D2/D3 not
-      started
+      tests green; D2 (executor routing via IPlannerSelectionService) shipped 2026-07-12,
+      769/769 tests green; see `plans/phase-d-implementation.md`'s D1/D2 implementation notes;
+      D3 not started
 - [ ] Phase E (opportunistic) — hooks-based leasing, file watching, Agent SDK sidecar
 
 Phase A is done. Phase B carries an implementation-ready slice breakdown
@@ -692,10 +693,17 @@ of this whole plan. Budget for it; gate it behind C.2 flags.
 *Tentatively 3 slices + design time. Highest conceptual risk — gated on the eval;
 revisit slice shape after B/C land. Tentative sketch: D1 = `Plan` mode on
 `HarnessRunRequest` + `plan.json` schema + fold into WorkUnits; D2 = executor routing
-("who plans this goal") via the Slice 9d selector machinery; D3 = plan-staleness /
+("who plans this goal") via the Slice 9d/12d/14c selector machinery; D3 = plan-staleness /
 replan policy (grows from `ReplanService`).*
 
-**UI consequence for D2:** `IAgentProfileSelectorService`-driven routing is *automatic*,
+D1 and D2 shipped 2026-07-12 (see `plans/phase-d-implementation.md`'s implementation notes for
+both). The real selector type is `IProfileSelectionService`/`LlmProfileSelectionService` (D2
+added a parallel `IPlannerSelectionService`/`PlannerSelectionService` for the Plan stage) — every
+`IAgentProfileSelectorService` reference below is the stale pre-implementation name; corrected
+here rather than rewritten, since the surrounding design reasoning (manual override wins, policy
+routing is automatic) still holds and is what actually shipped.
+
+**UI consequence for D2:** `IPlannerSelectionService`-driven routing is *automatic*,
 policy-based selection — a different mechanism from the manual per-role assignment in
 Agent Topology (which, under the provider-driven design, is also what picks the executor
 via the assigned Model Profile's provider). D2 should not replace that manual assignment;
@@ -720,9 +728,13 @@ Instead of Studio decomposing goals into N work units, the flow becomes:
 by task shape — architectural/greenfield work may favor a vendor harness, while large
 migrations or 400-file epics may favor Studio's global view. The comparison eval (and
 task-type-sliced results — it already labels S/M/L and task type) decides *routing*, not
-just go/no-go. The natural home for "who plans this goal" routing is the Slice 9d
-selector machinery (`IAgentProfileSelectorService`), extended to select an executor, not
-just a profile.
+just go/no-go. The natural home for "who plans this goal" routing is the selector
+machinery — `IPlannerSelectionService`, D2's parallel to `IProfileSelectionService`
+(Slice 9d/12d/14c) — which selects both a profile and (via `ProfileSelectionResult
+.Provider`) an executor, not just a profile. v1 (shipped) routes only on the
+deterministic FileScope-pattern tier and an opt-in LLM tier using goal text — the
+task-type-sliced comparison-eval routing tables described above are still out of scope
+until that eval runs.
 
 **The scheduler is actually two schedulers, and Phase D is where they separate:**
 

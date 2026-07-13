@@ -28,6 +28,11 @@ internal sealed class OrchestratorAgentLoop(
     IConversationLogService? conversationLog = null,
     IAgentControlService? agentControl = null,
     IExecutionEventStream? events = null,
+    // plans/phase-d-implementation.md D2 — "who plans this goal" executor routing. Optional/null
+    // so the one production construction site (InMemoryAgentRuntimeService.StartOrchestratorLoop)
+    // can omit it when unregistered and every other behavior stays unchanged: null means
+    // InjectSpawnCredentialsAsync's planner-selection branch is simply never reached.
+    IPlannerSelectionService? plannerSelection = null,
     // Observability-only — see ConversationCompactor. Optional/nullable so call sites and tests
     // that don't wire a logger keep compiling unchanged.
     ILogger? logger = null)
@@ -143,7 +148,7 @@ internal sealed class OrchestratorAgentLoop(
                 if (block is not NmToolUse toolUse) continue;
 
                 var input = toolUse.Name is McpToolNames.AgentSpawn or McpToolNames.SchedulerEnqueue
-                    ? InjectSpawnCredentials(toolUse.Input)
+                    ? await InjectSpawnCredentialsAsync(toolUse.Input, ct).ConfigureAwait(false)
                     : toolUse.Input;
 
                 onActivity?.Invoke(ActivityLabeler.Describe(toolUse.Name, toolUse.Input));
@@ -386,22 +391,46 @@ internal sealed class OrchestratorAgentLoop(
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    private JsonElement InjectSpawnCredentials(JsonElement input)
+    private async Task<JsonElement> InjectSpawnCredentialsAsync(JsonElement input, CancellationToken ct)
     {
         var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(input) ?? [];
         // Default profileId to "worker" if the model didn't specify one.
         if (!dict.ContainsKey("profileId"))
             dict["profileId"] = JsonSerializer.SerializeToElement("worker");
         var profileId = dict["profileId"].ValueKind == JsonValueKind.String ? dict["profileId"].GetString() : null;
+        var stage = StageForProfileId(profileId);
 
         // Always overwrite credentials — the model must not hallucinate them. Per-stage overrides
         // (configured on the run's Agent Topology) take precedence over this loop's own
         // credentials, so e.g. Planning can use a different model than Orchestration/Execution.
-        var stageCreds = agentControl?.GetCredentialsForStage(workUnitId, StageForProfileId(profileId));
+        var stageCreds = agentControl?.GetCredentialsForStage(workUnitId, stage);
+        string? selectedProvider = null;
+
+        // plans/phase-d-implementation.md D2 — "who plans this goal" executor routing. Only
+        // reachable for the Plan stage, and only when the Agent Topology assignment for Plan is
+        // auto/unset (stageCreds is null) — an explicit per-stage Model Profile assignment is the
+        // override and is never second-guessed here, same as before D2. plannerSelection is null
+        // on every construction site that doesn't wire it, and SelectPlannerAsync itself is a
+        // no-op whenever WorkspaceOptions.UsePlannerExecutorSelection is false — either way this
+        // branch changes nothing about the enqueued profileId/provider by default.
+        if (stage == PipelineStage.Plan && stageCreds is null && plannerSelection is not null)
+        {
+            var goalUnit = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (goalUnit is not null)
+            {
+                var credsForSelection = agentControl?.GetOrchestratorCredentials(workUnitId);
+                var selection = await plannerSelection
+                    .SelectPlannerAsync(goalUnit, credsForSelection, ct).ConfigureAwait(false);
+                if (!string.Equals(selection.ProfileId, profileId, StringComparison.Ordinal))
+                    dict["profileId"] = JsonSerializer.SerializeToElement(selection.ProfileId);
+                selectedProvider = selection.Provider;
+            }
+        }
+
         dict["model"]    = JsonSerializer.SerializeToElement(stageCreds?.Model ?? client.Model);
         dict["baseUrl"]  = JsonSerializer.SerializeToElement(stageCreds?.BaseUrl ?? client.BaseUrl);
         dict["apiKey"]   = JsonSerializer.SerializeToElement(stageCreds?.ApiKey ?? client.ApiKey);
-        dict["provider"] = JsonSerializer.SerializeToElement(stageCreds?.Provider ?? client.Provider);
+        dict["provider"] = JsonSerializer.SerializeToElement(selectedProvider ?? stageCreds?.Provider ?? client.Provider);
         return JsonSerializer.SerializeToElement(dict);
     }
 

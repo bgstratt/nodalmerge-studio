@@ -946,12 +946,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var workspaceOptions = _serviceProvider.GetRequiredService<WorkspaceOptions>();
                 var findingsService = _serviceProvider.GetRequiredService<IFindingService>();
                 var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
+                var plannerSelection = _serviceProvider.GetService<IPlannerSelectionService>();
                 var loop = new OrchestratorAgentLoop(
                     agentId, workUnitId, agentClient,
                     artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, merge, workUnits,
                     findingsService,
                     profile, sessionId, workspaceOptions.StallDetectionCycles, a => ReportActivity(agentId, a),
-                    conversationLog: conversationLog, agentControl: this, events: _events, logger: _logger);
+                    conversationLog: conversationLog, agentControl: this, events: _events,
+                    plannerSelection: plannerSelection, logger: _logger);
                 var completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
                 if (completion is AgentLoopCompletion.MaxIterationsExceeded or AgentLoopCompletion.Stalled)
                 {
@@ -1296,6 +1298,9 @@ public static class ServiceCollectionExtensions
             new LlmClient(llmHttpClient ?? new HttpClient(), sp.GetRequiredService<ILogger<LlmClient>>()));
         services.AddSingleton<IInsightLlmAnalyzerService, InsightLlmAnalyzerService>();
         services.AddSingleton<IProfileSelectionService, LlmProfileSelectionService>();
+        // plans/phase-d-implementation.md D2 — "who plans this goal" executor routing, off by
+        // default (WorkspaceOptions.UsePlannerExecutorSelection).
+        services.AddSingleton<IPlannerSelectionService, PlannerSelectionService>();
         // Slice 20b — inline reviewer for AgentApproval/Hybrid BeforeMerge gate.
         services.AddSingleton<IInlineReviewerService, InlineReviewerService>();
         // Slice 21/22 — reactive domain agents, disabled by default (WorkspaceOptions.EnabledDomainAgents).

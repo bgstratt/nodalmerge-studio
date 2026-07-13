@@ -16,6 +16,14 @@ public sealed class WorkspaceOptions
     // genuinely looping orchestrator well before MaxIterations (25).
     public int StallDetectionCycles { get; set; } = 4;
     public bool UseLlmProfileSelection { get; set; } = false;
+
+    // plans/phase-d-implementation.md D2 — "who plans this goal" executor routing. Mirrors
+    // UseLlmProfileSelection's off-by-default posture: when false, IPlannerSelectionService
+    // returns the requested planner profile/credentials unchanged (a no-op), so
+    // OrchestratorAgentLoop's Plan-stage enqueue is byte-identical to pre-D2 behavior. Only
+    // consulted when the role's Agent Topology assignment for PipelineStage.Plan is auto/unset —
+    // an explicit per-stage Model Profile assignment always bypasses this entirely, flag or not.
+    public bool UsePlannerExecutorSelection { get; set; } = false;
     public int MaxConcurrentWorkers { get; set; } = 3;
     public int SchedulerPollIntervalMs { get; set; } = 2_000;
 
