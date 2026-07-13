@@ -261,19 +261,27 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             // falling through to the "missing credentials" failure path below. A cache miss here
             // (nobody has resupplied yet) parks the item rather than dead-lettering it — it's not
             // actually broken, it just needs a human/the extension to click Resume.
+            //
+            // CLI providers are the exception and must never park for a blank key: blank IS the
+            // credential (ambient CLI login; storing a key is the opt-in to key-based auth), and
+            // RuntimeCredentialCache.Capture deliberately stores nothing for a blank-key/blank-
+            // baseUrl registration — so a claude-cli item with a credentialRef would otherwise
+            // ALWAYS park (found live 2026-07-13: the GoalCoordinator's planner enqueue threads
+            // credentialRef through, which the old orchestrator-LLM enqueue never did, making
+            // this gate reachable for CLI items for the first time).
             if (string.IsNullOrEmpty(apiKey) && !string.IsNullOrWhiteSpace(item.CredentialRef))
             {
                 var cached = _credentialCache.TryGet(item.CredentialRef);
-                if (cached is null)
-                {
-                    awaitingCredentials = true;
-                }
-                else
+                if (cached is not null)
                 {
                     apiKey = cached.ApiKey;
                     if (!string.IsNullOrEmpty(cached.Provider)) provider = cached.Provider;
                     if (!string.IsNullOrEmpty(cached.Model)) model = cached.Model;
                     if (!string.IsNullOrEmpty(cached.BaseUrl)) baseUrl = cached.BaseUrl;
+                }
+                else if (!(harnessExecutorResolver?.IsCliProvider(provider) ?? false))
+                {
+                    awaitingCredentials = true;
                 }
             }
             apiKey ??= string.Empty;

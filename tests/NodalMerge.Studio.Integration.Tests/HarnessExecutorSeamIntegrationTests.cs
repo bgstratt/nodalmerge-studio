@@ -31,7 +31,10 @@ public class HarnessExecutorSeamIntegrationTests
     {
         public string Name => "fake-harness";
         public string DisplayName => "Fake Harness";
-        public string? ProviderKey => null;
+        // Settable so a test can register this fake as a CLI provider (IsCliProvider matches on
+        // registered executors' ProviderKeys) without shelling out to a real/stub CLI binary.
+        public string? ProviderKeyOverride { get; init; }
+        public string? ProviderKey => ProviderKeyOverride;
         public HarnessCapabilities Capabilities => new(false, false, false, false, false, false);
         public int InvocationCount { get; private set; }
         public HarnessRunRequest? LastRequest { get; private set; }
@@ -205,5 +208,66 @@ public class HarnessExecutorSeamIntegrationTests
         Assert.DoesNotContain(pending, i => i.WorkUnitId == wu.WorkUnitId);
         var deadLetterEntry = await deadLetter.GetLatestForWorkUnitAsync(wu.WorkUnitId);
         Assert.Null(deadLetterEntry);
+    }
+
+    /// <summary>
+    /// Regression (found live 2026-07-13, first extension run after orchestrator-pure-service M2):
+    /// a CLI-provider item with a blank apiKey AND a credentialRef must dispatch, not park
+    /// AwaitingCredentials. Blank key IS the credential for CLI providers (ambient CLI login), and
+    /// RuntimeCredentialCache.Capture deliberately stores nothing for a blank-key registration —
+    /// so the dispatch gate's cache-miss branch parked every such item forever. Reachable only
+    /// since GoalCoordinator threads credentialRef into planner enqueues (the old orchestrator-LLM
+    /// enqueue never passed one, which is why the real-CLI smokes never hit it).
+    /// </summary>
+    [Fact]
+    public async Task Queue_driven_cli_provider_item_with_blank_key_and_credentialRef_dispatches_instead_of_parking()
+    {
+        var fakeExecutor = new FakeHarnessExecutor { ProviderKeyOverride = "fake-cli" };
+
+        await using var app = StudioWebApplication.Build(
+            [],
+            configureWebHost: webHost => webHost.UseTestServer(),
+            llmHttpClient: new HttpClient(new ScriptedLlmHandler()),
+            configureServices: services =>
+            {
+                services.AddInMemoryStorage();
+                services.AddSingleton<IHarnessExecutor>(fakeExecutor);
+                services.AddSingleton(new WorkspaceOptions { SchedulerPollIntervalMs = 50 });
+            });
+        await app.StartAsync();
+
+        var orchestratorSvc = app.Services.GetRequiredService<IOrchestratorService>();
+        var scheduler = app.Services.GetRequiredService<IWorkScheduler>();
+        var tasks = app.Services.GetRequiredService<ITaskService>();
+
+        var wu = await orchestratorSvc.CreateWorkUnitAsync("Ambient-auth CLI item must not park", "integration-test");
+        var task = await tasks.CreateAsync(new StudioTask(
+            Guid.NewGuid().ToString("N"), wu.WorkUnitId, wu.Goal, "Execute", StudioTaskStatus.Open, null, 0));
+
+        fakeExecutor.OnRun = async (request, ct) =>
+        {
+            await tasks.UpdateAsync(task with { Status = StudioTaskStatus.Completed }, ct).ConfigureAwait(false);
+        };
+
+        // Exactly what GoalCoordinator's planner enqueue produces for a claude-cli Default
+        // profile: provider set, model/baseUrl/apiKey blank (ambient auth), credentialRef present.
+        await scheduler.EnqueueAsync(
+            wu.WorkUnitId, "worker", taskId: task.TaskId,
+            model: "", baseUrl: "", apiKey: null, provider: "fake-cli",
+            credentialRef: "fake-cli:default");
+
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        IReadOnlyList<ScheduledItem> pending = [];
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            pending = await scheduler.ListPendingAsync();
+            if (fakeExecutor.InvocationCount > 0 && !pending.Any(i => i.WorkUnitId == wu.WorkUnitId)) break;
+            await Task.Delay(25);
+        }
+
+        // Pre-fix this timed out with the item still pending and flagged AwaitingCredentials.
+        Assert.DoesNotContain(pending, i => i.WorkUnitId == wu.WorkUnitId && i.AwaitingCredentials);
+        Assert.Equal(1, fakeExecutor.InvocationCount);
+        Assert.Equal(wu.WorkUnitId, fakeExecutor.LastRequest!.WorkUnitId);
     }
 }
