@@ -14,9 +14,10 @@
       B follow-up (not scoped in any phase text — see "Phase B UI gap" note below). A
       `claude-cli` Model Profile provider, assigned per role via Agent Topology, routes the
       role to `ClaudeCodeExecutor` — one selection, no separate executor picker
-- [ ] Phase C — Transcript ingestion + capability flags + second adapter — C1 (transcript
-      ingestion + capability flags) shipped 2026-07-12, 729/729 tests green; see
-      `plans/phase-c-implementation.md`'s C1 implementation notes; C2/C3 not started
+- [x] Phase C — Transcript ingestion + capability flags + second adapter — C1/C2/C3 all shipped
+      2026-07-12 (754/754 green after C2), plus the post-C vertical-slice/self-describing-executor
+      refactor; see `plans/phase-c-implementation.md` (this line previously lagged the child plan —
+      corrected 2026-07-13)
 - [x] Phase D — Plan ingestion; scheduler shifts from decomposing to coordinating — D1 (`Plan`
       mode through the executor seam + plan.json contract + fold) shipped 2026-07-12, 766/766
       tests green; D2 (executor routing via IPlannerSelectionService) shipped 2026-07-12,
@@ -31,6 +32,11 @@
       adapters. A claude-cli-only topology can now run goal → plan → fan-out → work → review →
       merge → workspace review end-to-end with agent review at every gate; the orchestrator loop
       remains the one native-only LLM role (separate pure-service evolution track).
+      **Update 2026-07-13:** that track shipped — `plans/orchestrator-pure-service.md` M1–M3
+      deleted the orchestrator LLM loop (deterministic `GoalCoordinator` replaces it) and renamed
+      its credential half to the goal's **Default profile**. AP-6's "orchestrator never transfers
+      to any harness" is now resolved **by deletion**: there is no orchestrator agent to host, no
+      role requires an API-based profile, and reinvoke is a credential-free convergence sweep.
 - [ ] Phase E (opportunistic) — hooks-based leasing, file watching, Agent SDK sidecar
 
 Phase A is done. Phase B carries an implementation-ready slice breakdown

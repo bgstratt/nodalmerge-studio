@@ -50,11 +50,16 @@ public sealed class AgentProfileService : IAgentProfileService, IRehydratable
     {
         var defaults = new AgentProfile[]
         {
+            // plans/orchestrator-pure-service.md M2 — goal coordination is the deterministic
+            // GoalCoordinator now, so this profile runs no LLM loop and has no system prompt. It
+            // survives (same id, relabeled "Default") because it's the goal's Default-profile
+            // credential anchor: Agent Topology's mandatory slot and the profile every unset role
+            // inherits.
             new(
                 "orchestrator",
-                "Orchestrator",
+                "Default",
                 PipelineStage.Orchestrate,
-                AgentLoopPrompts.Orchestrator,
+                string.Empty,
                 [],
                 25,
                 []),

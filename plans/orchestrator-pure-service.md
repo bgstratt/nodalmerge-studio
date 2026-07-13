@@ -60,8 +60,16 @@
       - Pending manual smoke (do alongside M4's eval): create a goal with a claude-cli Default
         profile and nothing else configured → plan → fan-out → work → agent review → merge →
         workspace review → materialized, no API key anywhere.
-- [ ] M4 — Cleanup: prompts, dead events, stale docs; run the harness-comparison eval
-      (now genuinely end-to-end on any profile)
+- [~] M4 — Cleanup + the deferred gate. **Cleanup half shipped 2026-07-13** (780/780 green):
+      `AgentLoopPrompts.Orchestrator` deleted; the six "the orchestrator will fan out / apply /
+      review" mentions in the Planner/Worker/Reconciler prompts reworded to "the runtime"; the
+      seeded `orchestrator` pipeline profile relabeled "Default" with an empty system prompt
+      (kept — it's the Default-profile credential anchor); parent plan's stale "C2/C3 not
+      started" line corrected and AP-6 marked resolved-by-deletion.
+      **Still pending (billable/manual — run on Bradley's go):**
+      - The claude-cli-Default-profile end-to-end smoke (see M3 note).
+      - The harness-comparison eval (`plans/harness-comparison-eval.md`) as a true end-to-end on
+        ≥2 harness topologies — the parent plan's last open gate.
 
 Follow-up to `plans/harness-hosting-architecture.md` (Phases A–D + the Review-seam
 follow-up complete as of 2026-07-13). This plan executes the "orchestrator LLM-loop →
