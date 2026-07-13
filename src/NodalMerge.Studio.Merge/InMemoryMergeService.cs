@@ -32,6 +32,17 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     // be the same cycle. IFileLeaseService has no such cycle, so it's constructor-injected
     // directly — but kept optional (default null) so the existing direct (non-DI) test
     // constructions don't all need updating; when null, the release-and-resume hook is skipped.
+    // Serializes ApplyAsync's read-check-write critical section (drift check → additive land →
+    // conflict record → Merged status write). Two concurrent applies targeting the same shared
+    // branch (candidate, or a fan-out parent's merge/ branch) could otherwise BOTH read a
+    // pristine target, BOTH pass the drift check, and BOTH land — silently losing one side's
+    // change with no conflict ever recorded. Reachable in production: MergeCommandService
+    // .ProposeAsync's fire-and-forget auto-apply for AgentApproval/Hybrid policies can run
+    // concurrently with a human's own Apply click (or a second goal's auto-apply). Instance-wide
+    // rather than per-target: applies are rare and fast relative to agent turns, and a
+    // per-target key adds failure modes (candidate vs literal target aliasing) for no real gain.
+    private readonly SemaphoreSlim _applyGate = new(1, 1);
+
     private IParticipantEventBus? EventBus =>
         _serviceProvider?.GetService(typeof(IParticipantEventBus)) as IParticipantEventBus;
 
@@ -544,7 +555,23 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
     public async Task<MergeProposal> ApplyAsync(string proposalId, CancellationToken cancellationToken = default, bool autoApplied = false)
     {
-        var proposal = GetRequired(proposalId);
+        // Locals hoisted out of the _applyGate-guarded block because the post-merge side-effect
+        // tail after it (events, artifacts, post-merge execution, work-unit status fan-out) still
+        // needs them. The gate is deliberately released before that tail runs — it fans out into
+        // services that can schedule further applies, and none of it touches the target branch's
+        // drift-checked content.
+        MergeProposal proposal;
+        MergeProposal updated;
+        string effectiveTarget;
+        bool usingPromotionBranch;
+        WorkUnit? owningWorkUnit = null;
+        var promotedToDisk = false;
+        string? appliedSnapshotId = null;
+
+        await _applyGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+        proposal = GetRequired(proposalId);
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.Merged))
         {
@@ -559,7 +586,6 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // Also resolved here (rather than only inline) so the write-back step below can use the
         // same owning work unit's RepositoryId instead of always falling back to the global default.
         var bypassPromotionBranch = false;
-        WorkUnit? owningWorkUnit = null;
         if (proposal.WorkUnitId is not null)
         {
             var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
@@ -575,9 +601,9 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // .ProposeAsync) specifically so it never lands on a shared branch prematurely; promotion
         // branch must not override that with an even-more-shared "candidate" branch. Only work
         // units that would otherwise reach "main"/disk directly benefit from the extra staging step.
-        var usingPromotionBranch = _workspaceOptions.UsePromotionBranch && !bypassPromotionBranch
+        usingPromotionBranch = _workspaceOptions.UsePromotionBranch && !bypassPromotionBranch
             && WorkspaceReviewScope.AppliesToRealRepo(owningWorkUnit);
-        var effectiveTarget = usingPromotionBranch
+        effectiveTarget = usingPromotionBranch
             ? _workspaceOptions.CandidateBranchId
             : proposal.TargetBranch;
 
@@ -688,8 +714,6 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // get their own RepositoryId, so they stay excluded even if SeedRepositoryPath is globally
         // configured.
         var writeBackPath = await ResolveWriteBackPathAsync(owningWorkUnit, cancellationToken).ConfigureAwait(false);
-        var promotedToDisk = false;
-        string? appliedSnapshotId = null;
         if (!usingPromotionBranch
             && WorkspaceReviewScope.AppliesToRealRepo(owningWorkUnit) && !string.IsNullOrWhiteSpace(writeBackPath))
         {
@@ -698,7 +722,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             promotedToDisk = true;
         }
 
-        var updated = proposal with
+        updated = proposal with
         {
             Status = MergeProposalStatus.Merged,
             AutoApplied = autoApplied,
@@ -759,6 +783,11 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 foreach (var stale in openTaskConflicts.Where(c => sourceProposalIds.Contains(c.ProposalId)))
                     await _taskConflicts.MarkResolvedAsync(stale.ConflictId, cancellationToken).ConfigureAwait(false);
             }
+        }
+        }
+        finally
+        {
+            _applyGate.Release();
         }
 
         EventBus?.Publish(new MergeAcceptedEvent(

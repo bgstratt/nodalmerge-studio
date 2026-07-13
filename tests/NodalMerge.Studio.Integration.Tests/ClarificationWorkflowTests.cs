@@ -34,8 +34,11 @@ public class ClarificationWorkflowTests : IDisposable
     [Fact]
     public async Task Clarification_request_parks_scheduler_item_and_response_resumes_it()
     {
+        // Deliberately NOT started: this test plays the worker itself (TryAcquireAsync below) and
+        // asserts the resumed item is back at Queued — StartAsync would run the real scheduler
+        // poll loop, which legitimately acquires the resumed item and moves it to Executing
+        // before the assertion reads it. Every service used here resolves without the host running.
         await using var app = BuildTestApp();
-        await app.StartAsync();
 
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits = app.Services.GetRequiredService<IWorkUnitService>();

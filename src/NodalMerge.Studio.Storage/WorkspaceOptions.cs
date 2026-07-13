@@ -55,6 +55,13 @@ public sealed class WorkspaceOptions
     public bool UsePromotionBranch { get; set; } = false;
     public string CandidateBranchId { get; set; } = "candidate";
 
+    // Opt-out, default true: for AgentApproval/Hybrid policies, ProposeAsync fires a background
+    // ApplyAsync so the inline reviewer runs without a human clicking "Apply" (Slice 20b). Turn
+    // off when something else deterministically drives the proposal lifecycle — e.g. integration
+    // tests that validate/review/apply manually, where the delayed background apply would race
+    // those same calls on the same proposal.
+    public bool AutoApplyOnPropose { get; set; } = true;
+
     // ── Expected output kind enforcement ─────────────────────────────────────
 
     // Opt-in, default false (matches RequireBuildBeforeProposal's convention above): when true,

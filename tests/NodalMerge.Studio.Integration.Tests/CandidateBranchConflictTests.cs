@@ -23,6 +23,11 @@ public class CandidateBranchConflictTests
         var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
+        // Every test here drives validate/review/apply manually — disable ProposeAsync's
+        // background auto-apply so its delayed Task.Run can't race those manual calls (see the
+        // AgentApproval test's fuller comment; the reconciliation work unit's own policy makes
+        // this reachable even when the two goals are HumanRequired).
+        options.AutoApplyOnPropose = false;
 
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
@@ -60,6 +65,11 @@ public class CandidateBranchConflictTests
         var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
+        // Every test here drives validate/review/apply manually — disable ProposeAsync's
+        // background auto-apply so its delayed Task.Run can't race those manual calls (see the
+        // AgentApproval test's fuller comment; the reconciliation work unit's own policy makes
+        // this reachable even when the two goals are HumanRequired).
+        options.AutoApplyOnPropose = false;
 
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
@@ -108,6 +118,76 @@ public class CandidateBranchConflictTests
     }
 
     /// <summary>
+    /// The concurrent counterpart of the sequential overlap test above, pinning
+    /// InMemoryMergeService's _applyGate: two applies racing each other used to BOTH read a
+    /// pristine candidate, BOTH pass the drift check, and BOTH land — one goal's change silently
+    /// clobbered, no conflict ever recorded. Reachable in production via ProposeAsync's
+    /// fire-and-forget auto-apply (AgentApproval/Hybrid) racing a human's own Apply. Which
+    /// proposal wins the race is legitimately nondeterministic; what must ALWAYS hold is that
+    /// exactly one lands, the loser's apply throws, and the loser is recorded as a conflict.
+    /// </summary>
+    [Fact]
+    public async Task Two_concurrent_applies_with_overlapping_lines_never_both_land_silently()
+    {
+        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        var options = app.Services.GetRequiredService<WorkspaceOptions>();
+        options.UsePromotionBranch = true;
+        // Every test here drives validate/review/apply manually — disable ProposeAsync's
+        // background auto-apply so its delayed Task.Run can't race those manual calls (see the
+        // AgentApproval test's fuller comment; the reconciliation work unit's own policy makes
+        // this reachable even when the two goals are HumanRequired).
+        options.AutoApplyOnPropose = false;
+
+        var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
+        var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
+        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var candidateConflicts = app.Services.GetRequiredService<ICandidateConflictService>();
+
+        await fileWorkspace.WriteAsync("main", "Shared.cs", "line one\nline two\nline three\n");
+
+        var goalA = await workUnitCommands.CreateAsync(new WorkUnitCreateCommand("Goal A", "test", SeedFromBranchId: "main"));
+        var goalB = await workUnitCommands.CreateAsync(new WorkUnitCreateCommand("Goal B", "test", SeedFromBranchId: "main"));
+
+        const string contentA = "line one changed by A\nline two\nline three\n";
+        const string contentB = "line one changed by B\nline two\nline three\n";
+        await fileWorkspace.WriteAsync(goalA.BranchId, "Shared.cs", contentA);
+        await fileWorkspace.WriteAsync(goalB.BranchId, "Shared.cs", contentB);
+
+        var proposalA = await mergeCommands.ProposeAsync(
+            sourceBranch: goalA.BranchId, targetBranch: "main", summary: "Change line one (A)", workUnitId: goalA.WorkUnitId);
+        var proposalB = await mergeCommands.ProposeAsync(
+            sourceBranch: goalB.BranchId, targetBranch: "main", summary: "Change line one (B)", workUnitId: goalB.WorkUnitId);
+
+        await mergeCommands.ValidateAsync(proposalA.ProposalId);
+        await mergeCommands.ValidateAsync(proposalB.ProposalId);
+        await mergeCommands.ReviewAsync(proposalA.ProposalId, "Approved");
+        await mergeCommands.ReviewAsync(proposalB.ProposalId, "Approved");
+
+        async Task<Exception?> TryApply(string proposalId)
+        {
+            try { await mergeCommands.ApplyAsync(proposalId); return null; }
+            catch (Exception ex) { return ex; }
+        }
+
+        var applyTaskA = Task.Run(() => TryApply(proposalA.ProposalId));
+        var applyTaskB = Task.Run(() => TryApply(proposalB.ProposalId));
+        var outcomes = await Task.WhenAll(applyTaskA, applyTaskB);
+
+        var failures = outcomes.Where(e => e is not null).ToList();
+        var loserException = Assert.Single(failures);
+        Assert.IsType<InvalidOperationException>(loserException);
+        Assert.Contains("conflicts", loserException!.Message, StringComparison.OrdinalIgnoreCase);
+
+        var winnerContent = outcomes[0] is null ? contentA : contentB;
+        var loserProposalId = outcomes[0] is null ? proposalB.ProposalId : proposalA.ProposalId;
+        Assert.Equal(winnerContent, await fileWorkspace.ReadAsync(options.CandidateBranchId, "Shared.cs"));
+
+        var recorded = Assert.Single(await candidateConflicts.GetOpenAsync());
+        Assert.Equal(loserProposalId, recorded.ProposalId);
+        Assert.Contains("Shared.cs", recorded.ConflictingPaths);
+    }
+
+    /// <summary>
     /// Instead of blocking B and requiring a from-scratch restart, a reconciliation work unit can be
     /// created that sees both goals' intents and both diverged versions of Shared.cs, and produces
     /// one combined result. This test manually plays the "agent" part (write combined content,
@@ -120,6 +200,11 @@ public class CandidateBranchConflictTests
         var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
+        // Every test here drives validate/review/apply manually — disable ProposeAsync's
+        // background auto-apply so its delayed Task.Run can't race those manual calls (see the
+        // AgentApproval test's fuller comment; the reconciliation work unit's own policy makes
+        // this reachable even when the two goals are HumanRequired).
+        options.AutoApplyOnPropose = false;
 
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
@@ -188,6 +273,11 @@ public class CandidateBranchConflictTests
         var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
+        // Every test here drives validate/review/apply manually — disable ProposeAsync's
+        // background auto-apply so its delayed Task.Run can't race those manual calls (see the
+        // AgentApproval test's fuller comment; the reconciliation work unit's own policy makes
+        // this reachable even when the two goals are HumanRequired).
+        options.AutoApplyOnPropose = false;
 
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
@@ -232,6 +322,11 @@ public class CandidateBranchConflictTests
         var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
+        // Every test here drives validate/review/apply manually — disable ProposeAsync's
+        // background auto-apply so its delayed Task.Run can't race those manual calls (see the
+        // AgentApproval test's fuller comment; the reconciliation work unit's own policy makes
+        // this reachable even when the two goals are HumanRequired).
+        options.AutoApplyOnPropose = false;
 
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
@@ -270,6 +365,14 @@ public class CandidateBranchConflictTests
         var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
+        // This test drives validate/review/apply manually — but AgentApproval goals (unlike the
+        // HumanRequired defaults every other test here uses) also fire ProposeAsync's background
+        // auto-apply, whose delayed Task.Run raced these same manual calls under a loaded thread
+        // pool (a flaky interleaving landed one proposal via the background apply mid-sequence,
+        // so the second manual apply threw for the wrong reason and no conflict was recorded).
+        // The auto-trigger under test lives in the apply path itself, so nothing tested here
+        // depends on WHO calls apply.
+        options.AutoApplyOnPropose = false;
 
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
@@ -306,6 +409,11 @@ public class CandidateBranchConflictTests
         var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
+        // Every test here drives validate/review/apply manually — disable ProposeAsync's
+        // background auto-apply so its delayed Task.Run can't race those manual calls (see the
+        // AgentApproval test's fuller comment; the reconciliation work unit's own policy makes
+        // this reachable even when the two goals are HumanRequired).
+        options.AutoApplyOnPropose = false;
 
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
@@ -355,6 +463,11 @@ public class CandidateBranchConflictTests
         var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
+        // Every test here drives validate/review/apply manually — disable ProposeAsync's
+        // background auto-apply so its delayed Task.Run can't race those manual calls (see the
+        // AgentApproval test's fuller comment; the reconciliation work unit's own policy makes
+        // this reachable even when the two goals are HumanRequired).
+        options.AutoApplyOnPropose = false;
 
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
@@ -403,6 +516,11 @@ public class CandidateBranchConflictTests
         var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
+        // Every test here drives validate/review/apply manually — disable ProposeAsync's
+        // background auto-apply so its delayed Task.Run can't race those manual calls (see the
+        // AgentApproval test's fuller comment; the reconciliation work unit's own policy makes
+        // this reachable even when the two goals are HumanRequired).
+        options.AutoApplyOnPropose = false;
 
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
@@ -443,6 +561,11 @@ public class CandidateBranchConflictTests
         var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
+        // Every test here drives validate/review/apply manually — disable ProposeAsync's
+        // background auto-apply so its delayed Task.Run can't race those manual calls (see the
+        // AgentApproval test's fuller comment; the reconciliation work unit's own policy makes
+        // this reachable even when the two goals are HumanRequired).
+        options.AutoApplyOnPropose = false;
 
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();

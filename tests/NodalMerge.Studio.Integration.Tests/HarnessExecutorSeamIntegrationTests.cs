@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using NodalMerge.Studio.Contracts.Domain;
 using StudioTaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
@@ -131,6 +132,10 @@ public class HarnessExecutorSeamIntegrationTests
 
         await using var app = StudioWebApplication.Build(
             [],
+            // StartAsync below is only needed for the hosted-service scheduler loop — without
+            // UseTestServer it would also bind real Kestrel on the default port 5000, which
+            // collides (AddressInUseException) with any parallel test class doing the same.
+            configureWebHost: webHost => webHost.UseTestServer(),
             llmHttpClient: new HttpClient(new ScriptedLlmHandler()),
             configureServices: services =>
             {
@@ -187,7 +192,16 @@ public class HarnessExecutorSeamIntegrationTests
         // Scheduler bookkeeping: VerifyWorkerProgressAsync must have seen the completed task and
         // treated the run as a genuine success — ReleaseAsync(success: true) removes the item from
         // the pending queue entirely (not parked, not re-queued), and no dead-letter entry exists.
-        var pending = await scheduler.ListPendingAsync();
+        // The task-Completed signal polled above lands BEFORE the release runs, so poll for the
+        // release too rather than asserting it already happened.
+        IReadOnlyList<ScheduledItem> pending = [];
+        var releaseDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < releaseDeadline)
+        {
+            pending = await scheduler.ListPendingAsync();
+            if (!pending.Any(i => i.WorkUnitId == wu.WorkUnitId)) break;
+            await Task.Delay(25);
+        }
         Assert.DoesNotContain(pending, i => i.WorkUnitId == wu.WorkUnitId);
         var deadLetterEntry = await deadLetter.GetLatestForWorkUnitAsync(wu.WorkUnitId);
         Assert.Null(deadLetterEntry);

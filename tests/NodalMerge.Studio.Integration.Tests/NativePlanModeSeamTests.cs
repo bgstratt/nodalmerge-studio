@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -24,6 +25,10 @@ public class NativePlanModeSeamTests
     {
         await using var app = StudioWebApplication.Build(
             [],
+            // StartAsync below is only needed for the hosted-service scheduler loop — without
+            // UseTestServer it would also bind real Kestrel on the default port 5000, which
+            // collides (AddressInUseException) with any parallel test class doing the same.
+            configureWebHost: webHost => webHost.UseTestServer(),
             llmHttpClient: new HttpClient(new FanOutLlmHandler()),
             configureServices: services =>
             {
@@ -56,7 +61,18 @@ public class NativePlanModeSeamTests
         Assert.NotNull(planArtifact);
         Assert.Contains("s1", planArtifact!.Body);
 
-        var pending = await scheduler.ListPendingAsync();
+        // The Plan artifact (polled above) is recorded BEFORE RunScheduledWorkerAsync's
+        // ReleaseAsync(success: true) removes the queue item, so the item can legitimately still
+        // be visible (leased) for a moment — poll for the release instead of asserting it
+        // already happened the instant the artifact appeared.
+        IReadOnlyList<ScheduledItem> pending = [];
+        var releaseDeadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while (DateTimeOffset.UtcNow < releaseDeadline)
+        {
+            pending = await scheduler.ListPendingAsync();
+            if (!pending.Any(i => i.WorkUnitId == wu.WorkUnitId)) break;
+            await Task.Delay(25);
+        }
         Assert.DoesNotContain(pending, i => i.WorkUnitId == wu.WorkUnitId);
         var deadLetterEntry = await deadLetter.GetLatestForWorkUnitAsync(wu.WorkUnitId);
         Assert.Null(deadLetterEntry);
@@ -70,6 +86,8 @@ public class NativePlanModeSeamTests
         // needsExecuteFallback case InMemoryAgentRuntimeService's caller-side check handles.
         await using var app = StudioWebApplication.Build(
             [],
+            // Same UseTestServer rationale as the first test — avoid binding real Kestrel :5000.
+            configureWebHost: webHost => webHost.UseTestServer(),
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services =>
             {
