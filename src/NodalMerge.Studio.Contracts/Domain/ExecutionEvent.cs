@@ -84,4 +84,11 @@ public enum ExecutionEventKind
     // tool call during an external executor run. Emitted so a misconfigured allowlist is
     // diagnosable from the dashboard, not buried in the harness's own transcript.
     HarnessPermissionDenied,
+
+    // plans/phase-d-implementation.md D1.b — a Plan-mode CLI run edited a file outside
+    // .workspace/ despite the plan-mode kickoff/allowlist saying "implement nothing, write only
+    // .workspace/plan.json". The diff is discarded (never proposed/merged) rather than failing
+    // the run outright — the plan itself may still be valid — but the drift needs to be
+    // diagnosable instead of silently vanishing.
+    HarnessPlanDiffDiscarded,
 }

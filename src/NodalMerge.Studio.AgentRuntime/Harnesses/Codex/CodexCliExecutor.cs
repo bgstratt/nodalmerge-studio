@@ -36,11 +36,14 @@ internal sealed class CodexCliExecutor(
     // `codex exec resume <thread_id>` verified working (capture-5-resume, same thread_id echoed,
     // context retained) -> SupportsResume true. SupportsMcp is NOT verified by any capture in this
     // session — left false rather than assumed from codex's public docs (the task's own ground rule:
-    // no training-data assumptions about the CLI). SupportsHooks/SupportsSubagents/
-    // SupportsPlanningMode: no equivalent observed in any capture either.
+    // no training-data assumptions about the CLI). SupportsHooks/SupportsSubagents: no equivalent
+    // observed in any capture either. plans/phase-d-implementation.md D1.b — SupportsPlanningMode
+    // flips true: writing a JSON file (.workspace/plan.json) is within codex's verified abilities
+    // (it already writes files under `-s workspace-write`/`danger-full-access`); no new CLI feature
+    // is assumed, unlike hooks/subagents/MCP above which would be.
     public HarnessCapabilities Capabilities { get; } = new(
         SupportsTurnTelemetry: true, SupportsResume: true, SupportsHooks: false,
-        SupportsSubagents: false, SupportsMcp: false, SupportsPlanningMode: false);
+        SupportsSubagents: false, SupportsMcp: false, SupportsPlanningMode: true);
 
     // WorkUnit.Metadata key the codex CLI's own thread id is persisted under between runs — mirrors
     // ClaudeCodeExecutor's "claudeCodeSessionId" convention (additive Metadata entry, no new typed
@@ -196,12 +199,27 @@ internal sealed class CodexCliExecutor(
         // prompt: the actual goal/context lives in .workspace/*.md, keeping the CLI-argument-quoting
         // surface free of arbitrary user content. codex has no MCP mount (Capabilities.SupportsMcp is
         // false — unverified), so unlike claude's prompt this never mentions mounted tools.
-        var prompt =
-            "Read .workspace/goal.md, .workspace/workunit.md, and .workspace/state.md in this " +
-            "directory, then complete the work described there. Record any Research/Decision/" +
-            "Constraint knowledge via .workspace/decisions/, and blocking questions via " +
-            ".workspace/inbox/. If you are resuming and were waiting on a question, check " +
-            ".workspace/outbox/ for the answer before asking again.";
+        //
+        // plans/phase-d-implementation.md D1.b — Mode==Plan gets a distinct kickoff, mirroring
+        // ClaudeCodeExecutor's own Plan-mode prompt. Unlike claude-code, codex has no per-path
+        // --settings allowlist to mechanically restrict writes to .workspace/plan.json — this
+        // prompt is the only "implement nothing" enforcement on codex's side, backstopped by
+        // HarnessHarvestPipeline.HarvestPlanAsync discarding any diff it finds anyway.
+        var prompt = request.Mode == HarnessMode.Plan
+            ? "Read .workspace/goal.md, .workspace/workunit.md, and .workspace/state.md in this " +
+              "directory, then decompose the work into slices. Write your plan to " +
+              ".workspace/plan.json as JSON matching this shape exactly: " +
+              "{\"slices\":[{\"sliceId\":\"s1\",\"goal\":\"...\",\"fileScope\":[\"path/to/file\"]," +
+              "\"dependsOn\":[],\"steps\":[\"...\"]}]} — sliceId and goal are required on every " +
+              "slice; fileScope/dependsOn/steps may be empty arrays. Do NOT edit, create, or " +
+              "delete any other file — implement nothing, only plan. Record any Research/" +
+              "Decision/Constraint knowledge via .workspace/decisions/, and blocking questions " +
+              "via .workspace/inbox/."
+            : "Read .workspace/goal.md, .workspace/workunit.md, and .workspace/state.md in this " +
+              "directory, then complete the work described there. Record any Research/Decision/" +
+              "Constraint knowledge via .workspace/decisions/, and blocking questions via " +
+              ".workspace/inbox/. If you are resuming and were waiting on a question, check " +
+              ".workspace/outbox/ for the answer before asking again.";
 
         // Verified invocation shape (codex-probe captures): `codex exec [resume <thread_id>] --json
         // --skip-git-repo-check -C <workdir> -s <sandbox> [-m <model>] [--add-dir <dir>] "<prompt>"`.

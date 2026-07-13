@@ -1344,9 +1344,13 @@ export class GoalWorkspacePanel {
           const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl);
           throw new Error(`Profile "${profileId}" isn't ready — ${reason}.`);
         }
-        if (isCliProvider(cfg.provider) && stage !== 'Execute') {
+        // plans/phase-d-implementation.md D1.a — Plan is now wired through the executor seam
+        // (both registered CLI adapters flip SupportsPlanningMode true), so a CLI provider is
+        // assignable to the Planner role too. Review still isn't (ReviewerAgentLoop stays
+        // native-only on the server).
+        if (isCliProvider(cfg.provider) && stage !== 'Execute' && stage !== 'Plan') {
           throw new Error(
-            `Profile "${profileId}" uses a CLI provider (${cfg.provider}), which only supports the Worker (Execute) role today — assign an API-based profile to the ${stage} stage in Agent Topology.`);
+            `Profile "${profileId}" uses a CLI provider (${cfg.provider}), which only supports the Worker (Execute) and Planner (Plan) roles today — assign an API-based profile to the ${stage} stage in Agent Topology.`);
         }
         stageCredentials[stage] = cfg;
       }

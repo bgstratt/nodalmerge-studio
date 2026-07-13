@@ -62,7 +62,8 @@ public class DomainAgentConfigAndFeedbackRestTests
         Assert.True(nativeCaps.GetProperty("supportsTurnTelemetry").GetBoolean());
         Assert.False(nativeCaps.GetProperty("supportsResume").GetBoolean());
         Assert.False(nativeCaps.GetProperty("supportsMcp").GetBoolean());
-        Assert.False(nativeCaps.GetProperty("supportsPlanningMode").GetBoolean());
+        // plans/phase-d-implementation.md D1.a — native wraps PlannerAgentLoop for Mode==Plan now.
+        Assert.True(nativeCaps.GetProperty("supportsPlanningMode").GetBoolean());
 
         var claudeCode = byName["claude-code"];
         Assert.Equal("claude-cli", claudeCode.GetProperty("providerKey").GetString());
@@ -72,7 +73,9 @@ public class DomainAgentConfigAndFeedbackRestTests
         Assert.True(claudeCaps.GetProperty("supportsHooks").GetBoolean());
         Assert.True(claudeCaps.GetProperty("supportsSubagents").GetBoolean());
         Assert.True(claudeCaps.GetProperty("supportsMcp").GetBoolean());
-        Assert.False(claudeCaps.GetProperty("supportsPlanningMode").GetBoolean());
+        // plans/phase-d-implementation.md D1.b — Mode==Plan is wired (write .workspace/plan.json,
+        // implement nothing).
+        Assert.True(claudeCaps.GetProperty("supportsPlanningMode").GetBoolean());
     }
 
     [Fact]

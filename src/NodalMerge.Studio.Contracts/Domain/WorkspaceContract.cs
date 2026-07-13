@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using NodalMerge.Studio.Contracts.Projections;
 
 namespace NodalMerge.Studio.Contracts.Domain;
@@ -78,6 +79,28 @@ public sealed record WorkspaceContractDecisionEntry(
 public sealed record WorkspaceContractInboxEntry(int Number, string Question);
 
 public sealed record WorkspaceContractOutboxEntry(int Number, string Answer);
+
+/// <summary>
+/// Harness→runtime `.workspace/plan.json` — plans/phase-d-implementation.md D1.b (Phase D
+/// planning mode). Mirrors <c>PlanDocument</c>/<c>PlanSlice</c> (see PlanDocument.cs) field-for-
+/// field, same JSON property names, so a CLI harness's plan.json deserializes into exactly the
+/// same wire shape the native planner already normalizes via
+/// <c>nm_v1_artifact_record_plan</c>/ArtifactRecordPlan — <c>FanOutService.ReadPlanFromArtifactAsync</c>
+/// folds the resulting Plan artifact with zero changes either way. Kept as a distinct type from
+/// PlanDocument (rather than reusing it directly) because this one lives in the versioned,
+/// externally-implementable Workspace Contract surface (docs/contracts/workspace-contract-v1.md)
+/// — PlanDocument is free to evolve as Studio's own internal planning-scheduler shape without
+/// that being a contract-breaking change for an external harness.
+/// </summary>
+public sealed record WorkspaceContractPlan(
+    [property: JsonPropertyName("slices")] IReadOnlyList<WorkspaceContractPlanSlice> Slices);
+
+public sealed record WorkspaceContractPlanSlice(
+    [property: JsonPropertyName("sliceId")] string SliceId,
+    [property: JsonPropertyName("goal")] string Goal,
+    [property: JsonPropertyName("fileScope")] IReadOnlyList<string> FileScope,
+    [property: JsonPropertyName("dependsOn")] IReadOnlyList<string> DependsOn,
+    [property: JsonPropertyName("steps")] IReadOnlyList<string> Steps);
 
 /// <summary>
 /// The full set of runtime→harness files assembled for one work unit's spawn — what

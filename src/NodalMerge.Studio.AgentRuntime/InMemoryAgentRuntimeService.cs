@@ -297,17 +297,17 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 failureKind = FailureKind.MissingCredentials;
             }
             else if ((harnessExecutorResolver?.IsCliProvider(provider) ?? false) &&
-                     profile?.Stage is PipelineStage.Plan or PipelineStage.Review)
+                     profile?.Stage is PipelineStage.Review)
             {
-                // Only the Worker/Execute construction sites are behind the executor seam (B1
-                // scope); Plan/Review still construct native loop classes directly, and those
-                // would hand claude-cli "credentials" to LlmClient. Fail loudly instead of
-                // producing a confusing HTTP error mid-loop. Lifted when Plan/Review modes land
-                // (harness-hosting-architecture.md Phases C/D).
+                // Only the Worker/Execute and Plan construction sites are behind the executor seam
+                // (B1 + plans/phase-d-implementation.md D1.a); Review still constructs the native
+                // loop class directly, and that would hand claude-cli "credentials" to LlmClient.
+                // Fail loudly instead of producing a confusing HTTP error mid-loop. Lifted when
+                // Review mode lands behind the seam.
                 _logger.LogWarning(
-                    "[Agent {AgentId}] Scheduled {Stage} run will NOT start — the claude-cli provider only supports Execute-stage (worker) roles today.",
+                    "[Agent {AgentId}] Scheduled {Stage} run will NOT start — the claude-cli provider only supports Execute/Plan-stage roles today.",
                     agentId, profile.Stage);
-                failureReason = $"The Claude Code CLI provider cannot run {profile.Stage}-stage roles yet — only Execute (worker). Assign an API-based Model Profile to this role.";
+                failureReason = $"The Claude Code CLI provider cannot run {profile.Stage}-stage roles yet — only Execute (worker) and Plan. Assign an API-based Model Profile to this role.";
                 failureKind = FailureKind.MissingCredentials;
             }
             else
@@ -332,16 +332,34 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var workerProgressVerified = true;
                 if (profile?.Stage == PipelineStage.Plan)
                 {
+                    // plans/phase-d-implementation.md D1.a — Plan-stage construction moves behind
+                    // the executor seam, the same way the Worker/Execute branch below already
+                    // does: resolve via provider, build a HarnessRunRequest, let the executor
+                    // construct whatever loop it needs (NativeHarnessExecutor wraps
+                    // PlannerAgentLoop for Mode==Plan; a CLI executor writes .workspace/plan.json).
+                    // A resolved executor that hasn't wired planning mode yet (Capabilities
+                    // .SupportsPlanningMode false) degrades to native rather than failing the item
+                    // over a capability miss — same "never fail on capability miss" posture as the
+                    // CLI-provider gate above.
                     var constraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var promptGuidanceContext = await BuildPromptGuidanceContextAsync(PipelineStage.Plan, ct).ConfigureAwait(false);
                     var engineeringStateContext = await BuildEngineeringStateContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var combinedContext = string.Join("\n\n", new[] { constraintsContext, promptGuidanceContext, engineeringStateContext }.Where(s => s is not null));
-                    var plannerLoop = new PlannerAgentLoop(
-                        agentId, item.WorkUnitId, agentClient,
-                        profile, item.SessionId, a => ReportActivity(agentId, a),
-                        ruleFileContext, combinedContext.Length == 0 ? null : combinedContext,
-                        conversationLog: conversationLog, events: _events, logger: _logger);
-                    completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
+
+                    var planExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
+                    var planExecutor = planExecutorResolver.ResolveForProvider(provider, profile?.Executor);
+                    if (!planExecutor.Capabilities.SupportsPlanningMode)
+                        planExecutor = planExecutorResolver.Resolve("native");
+
+                    var planRequest = new HarnessRunRequest(
+                        HarnessMode.Plan, agentId, item.WorkUnitId, taskId, profile, item.SessionId,
+                        IsResume: item.AttemptCount > 0, ruleFileContext,
+                        PromptGuidanceContext: combinedContext.Length == 0 ? null : combinedContext,
+                        SelfVerifyBuild: false, SelfVerifyTest: false,
+                        OnActivity: a => ReportActivity(agentId, a),
+                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey);
+                    var planResult = await planExecutor.RunAsync(planRequest, cts.Token).ConfigureAwait(false);
+                    completion = planResult.Completion;
 
                     // A Planner that correctly concludes "nothing to decompose here" ends its turn
                     // without recording a Plan artifact — that's Succeeded, not a failure, but
@@ -397,13 +415,15 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var taskStatusBeforeRun = !string.IsNullOrWhiteSpace(taskId) && taskServiceForVerify is not null
                         ? (await taskServiceForVerify.GetAsync(taskId, ct).ConfigureAwait(false))?.Status
                         : null;
-                    // plans/harness-hosting-architecture.md Phase B.1 — Worker-role construction
-                    // goes through the executor seam; Plan/Review above stay on the native loop
-                    // classes directly (out of B1's scope). agentClient/conversationLog built
-                    // above for Plan/Review are unused here — NativeHarnessExecutor resolves its
-                    // own from the request's Provider/Model/BaseUrl/ApiKey. GetRequiredService
-                    // here (unlike the nullable fetch above used only for the gates) — this is the
-                    // real run path, which has always required a registered resolver.
+                    // plans/harness-hosting-architecture.md Phase B.1, extended by
+                    // plans/phase-d-implementation.md D1.a — Worker/Execute and Plan-stage
+                    // construction both go through the executor seam now; Review above still stays
+                    // on the native ReviewerAgentLoop class directly (out of scope so far).
+                    // agentClient/conversationLog built above are unused here (used only by the
+                    // Review branch) — NativeHarnessExecutor resolves its own from the request's
+                    // Provider/Model/BaseUrl/ApiKey. GetRequiredService here (unlike the nullable
+                    // fetch above used only for the gates) — this is the real run path, which has
+                    // always required a registered resolver.
                     var executorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
                     var executor = executorResolver.ResolveForProvider(provider, profile?.Executor);
                     var harnessRequest = new HarnessRunRequest(

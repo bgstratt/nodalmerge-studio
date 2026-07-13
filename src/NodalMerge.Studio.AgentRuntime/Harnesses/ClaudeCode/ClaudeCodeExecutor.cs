@@ -35,12 +35,13 @@ internal sealed class ClaudeCodeExecutor(
 
     // Phase C.1 — turn telemetry (ClaudeTranscriptParser), resume (the CLI's own session_id +
     // --resume, shipped B3), hooks/subagents/MCP (the underlying `claude` binary's own features,
-    // reachable via the generated --settings file today). SupportsPlanningMode stays false until
-    // Phase D actually wires a Plan mode through this adapter — the flag declares what *this
-    // adapter* supports, not the vendor CLI's theoretical ceiling.
+    // reachable via the generated --settings file today). plans/phase-d-implementation.md D1.b —
+    // SupportsPlanningMode flips true now that Mode==Plan is wired: a different kickoff prompt
+    // (write .workspace/plan.json, implement nothing) and a Write-only-plan.json settings
+    // allowlist, both in BuildProcessStartInfo/WriteSettingsFileAsync below.
     public HarnessCapabilities Capabilities { get; } = new(
         SupportsTurnTelemetry: true, SupportsResume: true, SupportsHooks: true,
-        SupportsSubagents: true, SupportsMcp: true, SupportsPlanningMode: false);
+        SupportsSubagents: true, SupportsMcp: true, SupportsPlanningMode: true);
 
     // WorkUnit.Metadata key the claude CLI's own session id is persisted under between runs —
     // additive, no new typed field, matching the "Metadata for genuine ad hoc/future use"
@@ -62,7 +63,8 @@ internal sealed class ClaudeCodeExecutor(
         // (+ .md siblings) — the runtime→harness half of the contract, built in Phase A.
         await workspaceContracts.MaterializeAsync(request.WorkUnitId, ct).ConfigureAwait(false);
 
-        var (settingsPath, addDirRoots) = await WriteSettingsFileAsync(branchId, workDir, wu.ReferenceFiles, ct).ConfigureAwait(false);
+        var (settingsPath, addDirRoots) = await WriteSettingsFileAsync(
+            branchId, workDir, wu.ReferenceFiles, request.Mode, ct).ConfigureAwait(false);
 
         // Resume identity — only reused on an attested resume (IsResume, set by the caller from
         // ScheduledItem.AttemptCount > 0), not on every run, so a fresh first attempt never
@@ -249,24 +251,43 @@ internal sealed class ClaudeCodeExecutor(
     // (Read(//c/Users/.../**) — POSIX-style, lowercase drive letter, no colon) but the permission
     // schema itself is not documented anywhere Studio controls; revisit once exercised against
     // the real CLI end-to-end.
+    //
+    // plans/phase-d-implementation.md D1.b — Mode==Plan gets a narrower allowlist: Read everywhere
+    // in the workdir (a planner needs to see the whole codebase to slice it), Write ONLY
+    // .workspace/plan.json, no Edit, no Bash. This is advisory (the CLI's own permission-prompt
+    // enforcement, same as the Execute allowlist always was), not a sandbox Studio verifies — the
+    // real backstop is HarnessHarvestPipeline.HarvestPlanAsync discarding any diff outside
+    // .workspace/ it finds anyway.
     private async Task<(string SettingsPath, IReadOnlyList<string> AddDirRoots)> WriteSettingsFileAsync(
-        string branchId, string workDir, IReadOnlyList<FileReferenceV1>? referenceFiles, CancellationToken ct)
+        string branchId, string workDir, IReadOnlyList<FileReferenceV1>? referenceFiles, HarnessMode mode, CancellationToken ct)
     {
         var workDirPattern = ToSettingsPattern(workDir);
-        var allow = new List<string>
+        List<string> allow;
+        if (mode == HarnessMode.Plan)
         {
-            $"Edit({workDirPattern}/**)",
-            $"Write({workDirPattern}/**)",
-            $"Read({workDirPattern}/**)",
-        };
+            allow =
+            [
+                $"Read({workDirPattern}/**)",
+                $"Write({workDirPattern}/.workspace/plan.json)",
+            ];
+        }
+        else
+        {
+            allow =
+            [
+                $"Edit({workDirPattern}/**)",
+                $"Write({workDirPattern}/**)",
+                $"Read({workDirPattern}/**)",
+            ];
 
-        var profile = await workspaceProfiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
-        foreach (var root in profile.Roots)
-        {
-            if (root.BuildCommand is { Length: > 0 } build)
-                allow.Add($"Bash({build} *)");
-            if (root.TestCommand is { Length: > 0 } test)
-                allow.Add($"Bash({test} *)");
+            var profile = await workspaceProfiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
+            foreach (var root in profile.Roots)
+            {
+                if (root.BuildCommand is { Length: > 0 } build)
+                    allow.Add($"Bash({build} *)");
+                if (root.TestCommand is { Length: > 0 } test)
+                    allow.Add($"Bash({test} *)");
+            }
         }
 
         // Cross-repo pointers (WorkUnit.ReferenceFiles) live outside the branch workdir entirely —
@@ -329,12 +350,27 @@ internal sealed class ClaudeCodeExecutor(
         // tools. Keeping the -p argument itself short and free of arbitrary user content sidesteps
         // CLI-argument-quoting risk entirely (no goal text, however arbitrary, ever needs to
         // survive a cmd.exe /c round-trip).
-        var prompt =
-            "Read .workspace/goal.md, .workspace/workunit.md, and .workspace/state.md in this " +
-            "directory, then complete the work described there. Record any Research/Decision/" +
-            "Constraint knowledge via .workspace/decisions/, and blocking questions via " +
-            ".workspace/inbox/. If you are resuming and were waiting on a question, check " +
-            ".workspace/outbox/ for the answer before asking again.";
+        //
+        // plans/phase-d-implementation.md D1.b — Mode==Plan gets a distinct kickoff: decompose,
+        // write .workspace/plan.json, implement nothing. The settings allowlist above already
+        // restricts Write to that one path and drops Edit/Bash entirely; this prompt is the
+        // cooperative half of that contract for a CLI that (unlike the settings file) has no
+        // hard-enforced sandbox Studio controls.
+        var prompt = request.Mode == HarnessMode.Plan
+            ? "Read .workspace/goal.md, .workspace/workunit.md, and .workspace/state.md in this " +
+              "directory, then decompose the work into slices. Write your plan to " +
+              ".workspace/plan.json as JSON matching this shape exactly: " +
+              "{\"slices\":[{\"sliceId\":\"s1\",\"goal\":\"...\",\"fileScope\":[\"path/to/file\"]," +
+              "\"dependsOn\":[],\"steps\":[\"...\"]}]} — sliceId and goal are required on every " +
+              "slice; fileScope/dependsOn/steps may be empty arrays. Do NOT edit, create, or " +
+              "delete any other file — implement nothing, only plan. Record any Research/" +
+              "Decision/Constraint knowledge via .workspace/decisions/, and blocking questions " +
+              "via .workspace/inbox/."
+            : "Read .workspace/goal.md, .workspace/workunit.md, and .workspace/state.md in this " +
+              "directory, then complete the work described there. Record any Research/Decision/" +
+              "Constraint knowledge via .workspace/decisions/, and blocking questions via " +
+              ".workspace/inbox/. If you are resuming and were waiting on a question, check " +
+              ".workspace/outbox/ for the answer before asking again.";
 
         // Phase C.4 (phase-c-implementation.md C3) — only mentioned when the mount is actually
         // active (mcpConfigPath non-null), matching --mcp-config below: a harness without the mount

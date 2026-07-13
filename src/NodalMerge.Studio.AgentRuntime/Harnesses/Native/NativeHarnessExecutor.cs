@@ -24,11 +24,14 @@ internal sealed class NativeHarnessExecutor(
     // Turn telemetry is the native loop's own per-cycle ConversationLogRecorder — the one
     // capability it has always had. Resume is ContinueService's conversation reconstruction, not a
     // harness-side session id, so SupportsResume:false is the honest answer at this seam (see
-    // HarnessRunResult.HarnessSessionId's doc comment). No hooks/subagents/MCP/planning-mode
-    // machinery of its own beyond McpToolDispatcher, which every executor can reach identically.
+    // HarnessRunResult.HarnessSessionId's doc comment). No hooks/subagents/MCP machinery of its own
+    // beyond McpToolDispatcher, which every executor can reach identically. plans/phase-d-
+    // implementation.md D1.a — SupportsPlanningMode is true: PlannerAgentLoop is wired through
+    // Mode==Plan below, and native is also the capability-miss fallback target for a CLI executor
+    // that hasn't wired planning mode yet, so it must actually be able to run Plan mode itself.
     public HarnessCapabilities Capabilities { get; } = new(
         SupportsTurnTelemetry: true, SupportsResume: false, SupportsHooks: false,
-        SupportsSubagents: false, SupportsMcp: false, SupportsPlanningMode: false);
+        SupportsSubagents: false, SupportsMcp: false, SupportsPlanningMode: true);
 
     public async Task<HarnessRunResult> RunAsync(HarnessRunRequest request, CancellationToken ct = default)
     {
@@ -39,6 +42,25 @@ internal sealed class NativeHarnessExecutor(
             request.ApiKey ?? string.Empty, llm, dispatcher);
         var conversationLog = serviceProvider.GetRequiredService<IConversationLogService>();
         var events = serviceProvider.GetService<IExecutionEventStream>();
+
+        // plans/phase-d-implementation.md D1.a — moved from InMemoryAgentRuntimeService's own
+        // Plan-stage branch (which now just resolves an executor and builds this request, same as
+        // the Worker branch always did). The caller already built the combined constraints/
+        // prompt-guidance/engineering-state context and threaded it through as
+        // PromptGuidanceContext — identical content PlannerAgentLoop's own constraintsContext
+        // parameter received before this moved. needsExecuteFallback (a Succeeded plan run with no
+        // recorded Plan artifact hands off to Execute) stays the caller's job — that's scheduler
+        // behavior, not executor behavior.
+        if (request.Mode == HarnessMode.Plan)
+        {
+            var plannerLoop = new PlannerAgentLoop(
+                request.AgentId, request.WorkUnitId, agentClient,
+                request.Profile, request.SessionId, request.OnActivity,
+                request.RuleFileContext, request.PromptGuidanceContext,
+                conversationLog: conversationLog, events: events, logger: logger);
+            var planCompletion = await plannerLoop.RunAsync(ct).ConfigureAwait(false);
+            return new HarnessRunResult(planCompletion);
+        }
 
         var loop = new WorkerAgentLoop(
             request.AgentId, request.WorkUnitId, request.TaskId, agentClient, request.Profile,

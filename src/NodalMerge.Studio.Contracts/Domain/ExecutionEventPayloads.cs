@@ -253,3 +253,12 @@ public sealed record HarnessPermissionDeniedPayload(
     string? ToolName,
     string? Reason,
     string RawJson);
+
+// plans/phase-d-implementation.md D1.b — one of these per Plan-mode CLI run whose diff (against
+// the harvest's target branch) was non-empty outside .workspace/ and got discarded instead of
+// proposed. DiffSummary carries IFileWorkspaceService.DiffAsync's own human-readable summary
+// verbatim (added/modified/deleted counts + file list) — enough to diagnose without re-running
+// the harness.
+public sealed record HarnessPlanDiffDiscardedPayload(
+    string AgentId,
+    string DiffSummary);

@@ -144,6 +144,55 @@ Supersession`, matching `ArtifactCommandService.RecordAsync`'s validation.
 
 ## Phase A+ addendum
 
-`plan.json` (Phase D, planning mode) and harness capability flags (`SupportsResume`,
-`SupportsHooks`, … — Phase C.2, distinct from the manifest's *runtime* capabilities above) are not
-part of this v1 surface. They will be added additively when their phases land.
+Harness capability flags (`SupportsResume`, `SupportsHooks`, … — Phase C.2, distinct from the
+manifest's *runtime* capabilities above) are not part of this v1 surface.
+
+### `plan.json` (Phase D.1, planning mode)
+
+Additive per WC-3 — an adapter that predates Phase D simply never writes this file, and a runtime
+that predates Phase D simply never reads it (`.workspace/manifest.json` doesn't gain a new
+capability flag for this; a Plan-stage spawn is itself the signal a harness needs to write one).
+
+`.workspace/plan.json` is harness → runtime, written only on a `Mode == Plan` run (never mixed
+with a normal Execute run's edits — a Plan-mode kickoff instructs "implement nothing, write only
+this file", enforced advisorily via a Write-scoped `--settings` allowlist where the adapter
+supports one). Canonical C# type: `NodalMerge.Studio.Contracts.Domain.WorkspaceContractPlan`
+(`WorkspaceContract.cs`), mirroring `PlanDocument`/`PlanSlice` (`PlanDocument.cs`) field-for-field
+so the runtime's harvest step (`HarnessHarvestPipeline.HarvestPlanAsync`) re-serializes it into
+the exact same shape `nm_v1_artifact_record_plan`/`ArtifactRecordPlan` already normalizes for the
+native planner — `FanOutService.ReadPlanFromArtifactAsync` folds either source identically.
+
+```csharp
+public sealed record WorkspaceContractPlan(IReadOnlyList<WorkspaceContractPlanSlice> Slices);
+
+public sealed record WorkspaceContractPlanSlice(
+    string SliceId, string Goal, IReadOnlyList<string> FileScope,
+    IReadOnlyList<string> DependsOn, IReadOnlyList<string> Steps);
+```
+
+JSON shape (property names are the wire contract, not the C# property names above):
+
+```json
+{
+  "slices": [
+    {
+      "sliceId": "s1",
+      "goal": "Implement Foo.cs",
+      "fileScope": ["src/Foo.cs"],
+      "dependsOn": [],
+      "steps": ["Create Foo.cs"]
+    }
+  ]
+}
+```
+
+Validation (WC-3, tolerant of unknown fields; strict on required ones): every slice needs a
+non-empty `sliceId` and `goal`; `fileScope`/`dependsOn`/`steps` may be empty arrays. Malformed JSON
+or a missing required field fails the run with a clear reason (native replan can pick it up) rather
+than silently folding a partial plan — this is the one place WC-3's "producers may add optional
+fields" principle does not extend to "consumers accept a structurally invalid document."
+
+A non-empty diff outside `.workspace/` on a Plan-mode run (the harness edited a source file despite
+the kickoff/allowlist) is discarded — never proposed, never merged — and recorded as a
+`HarnessPlanDiffDiscarded` execution event rather than failing the run outright; the plan itself
+may still be valid even if the harness also went off-script.

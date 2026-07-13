@@ -15,11 +15,14 @@ namespace NodalMerge.Studio.Core.Services;
 // the full reasoning.
 public enum HarnessMode
 {
-    // Plan/Review are known future values (Phase D folds a Plan mode; PlannerAgentLoop/
-    // ReviewerAgentLoop already exist natively) — not speculative, just not built into the seam
-    // yet. A mode enum grows without breaking existing adapters; a multi-method interface would
-    // force every adapter to answer questions it can't yet.
     Execute,
+
+    // plans/phase-d-implementation.md D1.a — wired through NativeHarnessExecutor (wraps
+    // PlannerAgentLoop) and both CLI adapters (write .workspace/plan.json, implement nothing).
+    // Review is still a known future value (ReviewerAgentLoop exists natively) — not speculative,
+    // just not built into the seam yet. A mode enum grows without breaking existing adapters; a
+    // multi-method interface would force every adapter to answer questions it can't yet.
+    Plan,
 }
 
 public sealed record HarnessRunRequest(
@@ -67,8 +70,10 @@ public sealed record HarnessRunResult(
 // an adapter's own machinery actually supports, so callers (the extension's future executor
 // dropdown, Phase D's plan-mode gating) can branch on real capability rather than string-matching
 // Name. Each flag is honest about the *adapter*, not the underlying vendor CLI's theoretical
-// ceiling — e.g. ClaudeCodeExecutor.SupportsPlanningMode is false because Studio has not wired a
-// Plan mode through this adapter yet (Phase D), even though the `claude` binary itself has one.
+// ceiling — e.g. plans/phase-d-implementation.md D1.b flips ClaudeCodeExecutor/CodexCliExecutor
+// SupportsPlanningMode true once Mode==Plan is actually wired through each adapter (write
+// .workspace/plan.json, implement nothing) — before that, both stayed false even though the
+// underlying vendor CLIs may have their own native planning-ish behavior.
 public sealed record HarnessCapabilities(
     bool SupportsTurnTelemetry,
     bool SupportsResume,

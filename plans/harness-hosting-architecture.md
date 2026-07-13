@@ -17,7 +17,10 @@
 - [ ] Phase C — Transcript ingestion + capability flags + second adapter — C1 (transcript
       ingestion + capability flags) shipped 2026-07-12, 729/729 tests green; see
       `plans/phase-c-implementation.md`'s C1 implementation notes; C2/C3 not started
-- [ ] Phase D — Plan ingestion; scheduler shifts from decomposing to coordinating
+- [ ] Phase D — Plan ingestion; scheduler shifts from decomposing to coordinating — D1 (`Plan`
+      mode through the executor seam + plan.json contract + fold) shipped 2026-07-12, 766/766
+      tests green; see `plans/phase-d-implementation.md`'s D1 implementation notes; D2/D3 not
+      started
 - [ ] Phase E (opportunistic) — hooks-based leasing, file watching, Agent SDK sidecar
 
 Phase A is done. Phase B carries an implementation-ready slice breakdown
