@@ -686,15 +686,16 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
         CancellationTokenSource? cts = null;
         var resolvedProvider = provider ?? "anthropic";
-        // claude-cli needs no baseUrl/apiKey/model (ambient CLI auth, CLI-default model) — but it
-        // only routes through the executor seam for worker spawns; an orchestrator must stay on an
-        // API provider (its coordination loop is native by design — AP-6).
+        // CLI providers need no baseUrl/apiKey/model (ambient CLI auth, CLI-default model) — for
+        // workers they route through the executor seam, and since plans/orchestrator-pure-service.md
+        // M2 an "orchestrator" spawn is just a credential registration + deterministic goal start,
+        // so any provider kind is acceptable there too (a profile is a profile, for any role).
         // GetService, not GetRequiredService: this is a gate that must degrade gracefully rather
         // than throw when a test double's IServiceProvider doesn't carry the resolver (mirrors
         // RunScheduledWorkerAsync's identical gate above).
         var harnessExecutorResolverForSpawnGate = _serviceProvider.GetService<IHarnessExecutorResolver>();
         var canStartLoop = (harnessExecutorResolverForSpawnGate?.IsCliProvider(resolvedProvider) ?? false)
-            ? agentType == "worker"
+            ? agentType is "worker" or "orchestrator"
             : !string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
                 && (!string.IsNullOrWhiteSpace(model)
                     || resolvedProvider.Equals("openai", StringComparison.OrdinalIgnoreCase));
@@ -704,15 +705,20 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         if (!canStartLoop)
             _logger.LogWarning("[Agent {AgentId}] Loop will NOT start — missing credentials or model. baseUrl={BaseUrl} model={Model} provider={Provider}",
                 agentId, baseUrl ?? "(none)", model ?? "(none)", resolvedProvider);
+        var startGoal = false;
         if (canStartLoop)
         {
-            cts = new CancellationTokenSource();
             var loopModel = model ?? string.Empty;
             if (agentType == "orchestrator")
             {
-                StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
+                // plans/orchestrator-pure-service.md M2 — no LLM loop anymore. "Spawning an
+                // orchestrator" now means: register the goal's Default-profile credentials, then
+                // run the deterministic GoalCoordinator start (enqueue planner + one convergence
+                // sweep). The agentType name is kept as an alias so every existing caller
+                // (extension, ExternalGoalTools, ReconciliationAgentService, experiments) works
+                // unchanged.
                 _goalCredentialRegistrations[workUnitId] = new GoalCredentialRegistration(
-                    resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId, autoReviewProfileId,
+                    resolvedProvider, loopModel, baseUrl ?? string.Empty, apiKey ?? string.Empty, profileId, autoReviewProfileId,
                     stageCredentials, enabledDomainAgents, credentialRef);
 
                 _credentialCache.Capture(credentialRef, resolvedProvider, loopModel, baseUrl, apiKey);
@@ -722,20 +728,47 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 // though _goalCredentialRegistrations above (the hot path, with real credentials)
                 // doesn't. See RehydrateGoalRoutingAsync for the read side.
                 var routing = new GoalRoutingConfig(
-                    workUnitId, resolvedProvider, loopModel, baseUrl!, profileId, autoReviewProfileId,
+                    workUnitId, resolvedProvider, loopModel, baseUrl ?? string.Empty, profileId, autoReviewProfileId,
                     credentialRef, stageCredentials, enabledDomainAgents);
                 _goalRouting[workUnitId] = routing;
                 await _nodeStore.WriteNodeAsync(
                     StudioNodeKind.GoalRoutingV1, workUnitId,
                     JsonSerializer.Serialize(routing), cancellationToken).ConfigureAwait(false);
+                startGoal = true;
             }
             else if (agentType == "worker" && taskId is not null)
+            {
+                cts = new CancellationTokenSource();
                 StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl ?? string.Empty, apiKey ?? string.Empty, profile, cts);
-            else
-                cts.Dispose();
+            }
         }
 
         _agents[agentId] = new AgentRecord(agentId, workUnitId, "active", taskId, model, baseUrl, apiKey, provider, cts);
+
+        if (startGoal)
+        {
+            // Awaited inline — the coordinator is deterministic and fast (a scheduler enqueue plus
+            // idempotent sweeps), unlike the LLM loop this replaced, so callers get a settled goal
+            // state back instead of a fire-and-forget race. Failures never fail the spawn itself:
+            // the credentials are registered above, so a manual reinvoke can always recover.
+            try
+            {
+                var coordinator = _serviceProvider.GetService<IGoalCoordinator>();
+                if (coordinator is not null)
+                    await coordinator.StartGoalAsync(workUnitId, ct: cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Agent {AgentId}] Goal start failed for workUnit={WorkUnitId}.", agentId, workUnitId);
+            }
+            finally
+            {
+                if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
+                    _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
+            }
+        }
+
         return agentId;
     }
 
@@ -846,23 +879,22 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? overrideProvider = null,
         string? overrideProfileId = null,
         string? overrideCredentialRef = null,
+        bool ensurePlanner = false,
         CancellationToken cancellationToken = default)
     {
-        var resolved = await ResolveAndPersistCredentialsAsync(
+        // plans/orchestrator-pure-service.md M2 — "reinvoke" no longer spawns an LLM loop; it runs
+        // one deterministic convergence sweep, which needs no credentials of its own. The resolve-
+        // and-persist step is kept purely for its resupply side effect (override params from a
+        // manual recovery action re-warm the registry for later planner/child enqueues) — a null
+        // result no longer aborts the wake-up, which closes the cold-registration-after-restart
+        // silent-no-op bug family for good.
+        await ResolveAndPersistCredentialsAsync(
             workUnitId, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider,
             overrideProfileId, overrideCredentialRef, "Reinvoke", cancellationToken).ConfigureAwait(false);
-        if (resolved is not { } creds)
-            return;
 
-        var agentId = $"orchestrator-{Guid.NewGuid():N}";
-        var cts = new CancellationTokenSource();
-        _agents[agentId] = new AgentRecord(agentId, workUnitId, "active", null, creds.Model, creds.BaseUrl, creds.ApiKey, creds.Provider, cts);
-
-        AgentProfile? profile = creds.ProfileId is not null
-            ? _profileService.GetAsync(creds.ProfileId, cancellationToken).GetAwaiter().GetResult()
-            : null;
-
-        StartOrchestratorLoop(agentId, workUnitId, creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey, profile, cts, sessionId);
+        var coordinator = _serviceProvider.GetService<IGoalCoordinator>();
+        if (coordinator is not null)
+            await coordinator.ConvergeAsync(workUnitId, sessionId, ensurePlanner, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<bool> ResupplyCredentialsAsync(
@@ -931,109 +963,6 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         _goalCredentialRegistrations.TryGetValue(workUnitId, out var reg) ? reg.EnabledDomainAgents
         : _goalRouting.TryGetValue(workUnitId, out var routing) ? routing.EnabledDomainAgents
         : null;
-
-    private void StartOrchestratorLoop(
-        string agentId,
-        string workUnitId,
-        string provider,
-        string model,
-        string baseUrl,
-        string apiKey,
-        AgentProfile? profile,
-        CancellationTokenSource cts,
-        string? sessionId = null)
-    {
-        _logger.LogInformation("[Agent {AgentId}] Starting orchestrator loop — provider={Provider} model={Model} baseUrl={BaseUrl}",
-            agentId, provider, model, baseUrl);
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
-                var llm = _serviceProvider.GetRequiredService<LlmClient>();
-                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
-                var artifactLineage = _serviceProvider.GetRequiredService<IArtifactLineageService>();
-                var projections = _serviceProvider.GetRequiredService<IProjectionManager>();
-                var decisionLog = _serviceProvider.GetRequiredService<IOrchestrationDecisionLogService>();
-                var fanOut = _serviceProvider.GetRequiredService<IFanOutService>();
-                var mergeReconciliation = _serviceProvider.GetRequiredService<IMergeReconciliationService>();
-                var automatedReview = _serviceProvider.GetRequiredService<IAutomatedReviewGateService>();
-                var merge = _serviceProvider.GetRequiredService<IMergeService>();
-                var workUnits = _serviceProvider.GetRequiredService<IWorkUnitService>();
-                var workspaceOptions = _serviceProvider.GetRequiredService<WorkspaceOptions>();
-                var findingsService = _serviceProvider.GetRequiredService<IFindingService>();
-                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
-                var plannerSelection = _serviceProvider.GetService<IPlannerSelectionService>();
-                var loop = new OrchestratorAgentLoop(
-                    agentId, workUnitId, agentClient,
-                    artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, merge, workUnits,
-                    findingsService,
-                    profile, sessionId, workspaceOptions.StallDetectionCycles, a => ReportActivity(agentId, a),
-                    conversationLog: conversationLog, agentControl: this, events: _events,
-                    plannerSelection: plannerSelection, logger: _logger);
-                var completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
-                if (completion is AgentLoopCompletion.MaxIterationsExceeded or AgentLoopCompletion.Stalled)
-                {
-                    var deadLetter = _serviceProvider.GetService<IDeadLetterService>();
-                    if (deadLetter is not null)
-                    {
-                        var reason = completion == AgentLoopCompletion.Stalled
-                            ? $"Stall: no artifact change after {workspaceOptions.StallDetectionCycles} cycles."
-                            : "Max iterations reached";
-                        var kind = completion == AgentLoopCompletion.Stalled
-                            ? FailureKind.Stalled
-                            : FailureKind.MaxIterationsExceeded;
-                        await deadLetter.RecordFailureAsync(
-                            workUnitId,
-                            agentId,
-                            profile?.Stage ?? PipelineStage.Orchestrate,
-                            profile?.AgentProfileId ?? "orchestrator",
-                            reason,
-                            sessionId: sessionId,
-                            model: model,
-                            baseUrl: baseUrl,
-                            apiKey: apiKey,
-                            provider: provider,
-                            kind: kind,
-                            cancellationToken: cts.Token).ConfigureAwait(false);
-                    }
-                }
-                _logger.LogInformation("[Agent {AgentId}] Orchestrator loop completed.", agentId);
-            }
-            catch (OperationCanceledException) { }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "[Agent {AgentId}] Orchestrator loop failed.", agentId);
-                var deadLetter = _serviceProvider.GetService<IDeadLetterService>();
-                if (deadLetter is not null)
-                {
-                    await deadLetter.RecordFailureAsync(
-                        workUnitId,
-                        agentId,
-                        profile?.Stage ?? PipelineStage.Orchestrate,
-                        profile?.AgentProfileId ?? "orchestrator",
-                        ex.Message.Length > 200 ? ex.Message[..200] : ex.Message,
-                        sessionId: sessionId,
-                        model: model,
-                        baseUrl: baseUrl,
-                        apiKey: apiKey,
-                        provider: provider,
-                        cancellationToken: CancellationToken.None).ConfigureAwait(false);
-                }
-                if (_agents.TryGetValue(agentId, out var r))
-                {
-                    var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
-                    _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null, CurrentActivity = null };
-                }
-            }
-            finally
-            {
-                if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
-                    _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
-                cts.Dispose();
-            }
-        }, CancellationToken.None);
-    }
 
     private void StartWorkerLoop(
         string agentId,
@@ -1320,6 +1249,9 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IPlannerSelectionService, PlannerSelectionService>();
         // Slice 20b — inline reviewer for AgentApproval/Hybrid BeforeMerge gate.
         services.AddSingleton<IInlineReviewerService, InlineReviewerService>();
+        // plans/orchestrator-pure-service.md M2 — the deterministic goal coordinator that replaced
+        // the orchestrator LLM loop.
+        services.AddSingleton<IGoalCoordinator, GoalCoordinator>();
         // Slice 21/22 — reactive domain agents, disabled by default (WorkspaceOptions.EnabledDomainAgents).
         services.AddSingleton<IDomainAgentTriggerService, DomainAgentTriggerService>();
         // Phase 1.4 — re-plan-the-slice mechanism for both failure-recovery tracks.

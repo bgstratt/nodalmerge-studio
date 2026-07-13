@@ -368,21 +368,15 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
                 }
             }
 
-            if (orchestratorTarget != workUnitId)
-            {
-                var fanOut = _serviceProvider?.GetService(typeof(IFanOutService)) as IFanOutService;
-                if (fanOut is not null)
-                    await fanOut.TryEnqueueReadyDependentsAsync(orchestratorTarget, sessionId, ct).ConfigureAwait(false);
-
-                var mergeReconciliation = _serviceProvider?.GetService(typeof(IMergeReconciliationService)) as IMergeReconciliationService;
-                if (mergeReconciliation is not null)
-                    await mergeReconciliation.TryReconcileAsync(orchestratorTarget, sessionId, ct).ConfigureAwait(false);
-
-                var automatedReview = _serviceProvider?.GetService(typeof(IAutomatedReviewGateService)) as IAutomatedReviewGateService;
-                if (automatedReview is not null)
-                    await automatedReview.TryEnqueueReviewerAsync(orchestratorTarget, sessionId, ct).ConfigureAwait(false);
-            }
-            else if (string.Equals(profileId, "reviewer", StringComparison.OrdinalIgnoreCase) &&
+            // The fan-out/reconcile/reviewer sweeps that used to run inline here (because the
+            // orchestrator reinvoke below was a heavyweight, credential-gated LLM spawn that could
+            // silently no-op) now ARE the reinvoke: ReinvokeOrchestratorAsync runs the
+            // IGoalCoordinator convergence sweep deterministically and credential-free
+            // (plans/orchestrator-pure-service.md M2), so running them twice here would be
+            // pure duplication. The reviewer-rejection special case keeps its original guard: it
+            // only ever applied to a reviewer item running on the orchestrator's own unit.
+            if (orchestratorTarget == workUnitId &&
+                     string.Equals(profileId, "reviewer", StringComparison.OrdinalIgnoreCase) &&
                      !string.IsNullOrWhiteSpace(taskId))
             {
                 var automatedReview = _serviceProvider?.GetService(typeof(IAutomatedReviewGateService)) as IAutomatedReviewGateService;

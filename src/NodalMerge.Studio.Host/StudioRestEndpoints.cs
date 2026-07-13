@@ -1638,12 +1638,12 @@ public static class StudioRestEndpoints
             return Results.Ok(new { agentId, agentType = body.AgentType, workUnitId = body.WorkUnitId, branchId = wu.BranchId });
         });
 
-        // Manual recovery for a stalled orchestrator — normally ReinvokeOrchestratorAsync fires
-        // automatically whenever a child finishes (WorkSchedulerService.ReleaseAsync's success
-        // path), but that's a silent no-op if credentials aren't resolvable (e.g. right after a
-        // Host restart, before anything has resupplied IRuntimeCredentialCache): every child could
-        // finish and the orchestrator would just never notice. Guarded against double-spawning a
-        // second live orchestrator loop over an already-running one.
+        // Manual recovery for a stalled goal — runs one IGoalCoordinator convergence sweep
+        // (plans/orchestrator-pure-service.md M2: deterministic and credential-free, so the old
+        // 409 already-active and 422 no-credentials outcomes no longer exist). ensurePlanner is
+        // the manual-recovery privilege: a goal with no plan, no children, and no queue item gets
+        // its planner (re)enqueued, which automatic sweeps deliberately never do. The override*
+        // body params re-warm the Default-profile credential registry first when supplied.
         app.MapPost("/studio/workunits/{workUnitId}/reinvoke-orchestrator", async (
             string workUnitId,
             ReinvokeOrchestratorBody? body,
@@ -1655,21 +1655,14 @@ public static class StudioRestEndpoints
             if (wu is null)
                 return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
 
-            var active = await agents.ListActiveAsync(ct).ConfigureAwait(false);
-            if (active.Any(a => a.WorkUnitId == workUnitId))
-                return Results.Conflict(new { error = $"An orchestrator is already active for work unit '{workUnitId}'." });
-
             await agents.ReinvokeOrchestratorAsync(
                 workUnitId,
                 sessionId: null,
                 body?.OverrideModel, body?.OverrideBaseUrl, body?.OverrideApiKey, body?.OverrideProvider,
-                body?.OverrideProfileId, body?.OverrideCredentialRef, ct).ConfigureAwait(false);
+                body?.OverrideProfileId, body?.OverrideCredentialRef,
+                ensurePlanner: true, ct).ConfigureAwait(false);
 
-            var stillActive = await agents.ListActiveAsync(ct).ConfigureAwait(false);
-            var started = stillActive.Any(a => a.WorkUnitId == workUnitId);
-            return started
-                ? Results.Ok(new { workUnitId, status = "reinvoked" })
-                : Results.UnprocessableEntity(new { error = "No credentials resolvable for this orchestrator — resupply via overrideApiKey." });
+            return Results.Ok(new { workUnitId, status = "reinvoked" });
         });
 
         // Manual recovery for a goal stuck at Completed with no top-level proposal — normally

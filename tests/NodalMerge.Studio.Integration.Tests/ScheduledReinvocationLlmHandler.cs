@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -6,25 +5,18 @@ using System.Text.Json;
 namespace NodalMerge.Studio.Integration.Tests;
 
 /// <summary>
-/// Fake HttpMessageHandler for the scheduler-driven re-invocation test. Unlike
-/// <see cref="ScriptedLlmHandler"/>, the orchestrator here calls nm_v1_scheduler_enqueue
-/// (not the legacy nm_v1_agent_spawn) and is expected to be re-invoked by
-/// WorkSchedulerService.ReleaseAsync after the worker completes — a second, independent
-/// OrchestratorAgentLoop.RunAsync call with its own fresh conversation (step resets to 0).
+/// Fake HttpMessageHandler for the scheduler-driven convergence test. Since
+/// plans/orchestrator-pure-service.md M2 there is no orchestrator LLM turn to script — the
+/// deterministic GoalCoordinator enqueues the planner at spawn and runs the convergence sweep on
+/// every scheduler release — so the entry point here is the planner recording a single-slice
+/// plan; fan-out then enqueues the worker through the real scheduler queue.
 ///
-/// Because each conversation looks identical from a pure step-count view, an external
-/// per-work-unit invocation counter distinguishes "first orchestration" from "re-invoked
-/// orchestration" so the two get different scripts:
-///   Invocation 1: workunit.get → task.create → scheduler.enqueue → end_turn
-///   Invocation 2+: projection.get → end_turn (simulating "the proposal already exists, stop")
-///
+/// Planner script: workunit.get → artifact.record_plan(single slice) → end_turn
 /// Worker script is unchanged from ScriptedLlmHandler: task.update(InProgress) → workunit.get →
 /// task.update(Completed) → artifact.record(Research) → merge.propose → merge.validate → end_turn
 /// </summary>
 internal sealed class ScheduledReinvocationLlmHandler : HttpMessageHandler
 {
-    private readonly ConcurrentDictionary<string, int> _orchestratorInvocations = new();
-
     protected override async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken)
     {
@@ -35,8 +27,8 @@ internal sealed class ScheduledReinvocationLlmHandler : HttpMessageHandler
         var step = (messages.GetArrayLength() - 1) / 2;
         var firstMsg = messages[0].GetProperty("content").GetString() ?? "";
 
-        var json = firstMsg.StartsWith("Begin orchestrating")
-            ? OrchestratorStep(step, firstMsg, messages)
+        var json = firstMsg.StartsWith("Plan work unit")
+            ? PlannerStep(step, firstMsg)
             : WorkerStep(step, firstMsg, messages);
 
         return new HttpResponseMessage(HttpStatusCode.OK)
@@ -45,46 +37,36 @@ internal sealed class ScheduledReinvocationLlmHandler : HttpMessageHandler
         };
     }
 
-    // ── Orchestrator ──────────────────────────────────────────────────────────
+    // ── Planner ───────────────────────────────────────────────────────────────
 
-    private string OrchestratorStep(int step, string firstMsg, JsonElement messages)
+    private static string PlannerStep(int step, string firstMsg)
     {
-        var wuId = ParseBetween(firstMsg, "Begin orchestrating work unit ", ". Your agent ID is");
-
-        // A new conversation (step == 0) means a fresh OrchestratorAgentLoop.RunAsync call —
-        // either the original spawn or a re-invocation. Bump the counter once per conversation.
-        var invocation = step == 0
-            ? _orchestratorInvocations.AddOrUpdate(wuId, 1, (_, n) => n + 1)
-            : _orchestratorInvocations.GetOrAdd(wuId, 1);
-
-        return invocation == 1
-            ? FirstInvocation(step, wuId, messages)
-            : ReinvokedInvocation(step, wuId);
+        var wuId = ParseBetween(firstMsg, "Plan work unit ", ". Your agent ID is");
+        var planJson = JsonSerializer.Serialize(new
+        {
+            slices = new object[]
+            {
+                new
+                {
+                    sliceId = "s1",
+                    goal = "Implement the hello world feature",
+                    fileScope = new[] { "src/Hello.cs" },
+                    dependsOn = Array.Empty<string>(),
+                    steps = new[] { "Create Hello.cs" }
+                }
+            }
+        });
+        return step switch
+        {
+            0 => ToolUse("tu-p-1", "nm_v1_workunit_get", new { workUnitId = wuId }),
+            1 => ToolUse("tu-p-2", "nm_v1_artifact_record_plan", new
+            {
+                workUnitId = wuId,
+                planContent = planJson
+            }),
+            _ => EndTurn(),
+        };
     }
-
-    private static string FirstInvocation(int step, string wuId, JsonElement messages) => step switch
-    {
-        0 => ToolUse("tu-o-1", "nm_v1_workunit_get", new { workUnitId = wuId }),
-        1 => ToolUse("tu-o-2", "nm_v1_task_create", new
-        {
-            workUnitId = wuId,
-            title = "Execute the goal",
-            description = "Complete all work required for this work unit"
-        }),
-        2 => ToolUse("tu-o-3", "nm_v1_scheduler_enqueue", new
-        {
-            workUnitId = wuId,
-            profileId = "worker",
-            taskId = ExtractFromToolResult(messages, "taskId") ?? "unknown"
-        }),
-        _ => EndTurn(),
-    };
-
-    private static string ReinvokedInvocation(int step, string wuId) => step switch
-    {
-        0 => ToolUse("tu-o-r1", "nm_v1_projection_get", new { projectionType = "AgentWorkspace", workUnitId = wuId }),
-        _ => EndTurn(),
-    };
 
     // ── Worker (identical script to ScriptedLlmHandler) ─────────────────────────
 

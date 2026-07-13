@@ -1167,15 +1167,14 @@ public interface IAgentControlService
         string? credentialRef = null,
         CancellationToken cancellationToken = default);
 
-    // Re-enters the orchestrator loop for a work unit whose orchestrator was previously
-    // SpawnAsync'd — called automatically whenever a child work unit finishes (WorkSchedulerService.
-    // ReleaseAsync's success path) so the orchestrator notices and decides what's next. Falls back
-    // to the safe rehydrated routing config + IRuntimeCredentialCache when the in-memory
-    // registration is cold (e.g. after a Host restart); if that's also cold, this is a no-op for
-    // the automatic caller (which never passes override params) — but a manual caller (e.g. a
-    // human clicking "Reinvoke Orchestrator" in the goal workspace) can still recover it by
-    // supplying everything itself via the override* params, including a profile for a work unit
-    // whose orchestrator predates routing-config persistence entirely (nothing on record at all).
+    // Runs one deterministic IGoalCoordinator convergence sweep for a goal/orchestrator-type work
+    // unit — called automatically whenever a child work unit finishes (WorkSchedulerService.
+    // ReleaseAsync's success path) so the goal advances. Since plans/orchestrator-pure-service.md
+    // M2 this needs no credentials (there is no LLM loop to restart); the override* params only
+    // (re)persist credentials into the Default-profile registry for later planner/child enqueues.
+    // ensurePlanner additionally enqueues the planner when the goal has no plan, no children, and
+    // no queue item — pass true only from goal start / manual recovery, never from automatic
+    // sweeps (see IGoalCoordinator.ConvergeAsync).
     Task ReinvokeOrchestratorAsync(
         string workUnitId,
         string? sessionId = null,
@@ -1185,6 +1184,7 @@ public interface IAgentControlService
         string? overrideProvider = null,
         string? overrideProfileId = null,
         string? overrideCredentialRef = null,
+        bool ensurePlanner = false,
         CancellationToken cancellationToken = default);
 
     // Requeue Goal's credential half — same resolve-and-persist logic ReinvokeOrchestratorAsync
@@ -1268,6 +1268,35 @@ public interface IAgentControlService
         string? taskId,
         Func<Action<string?>, Task<TResult>> run,
         CancellationToken cancellationToken = default);
+}
+
+// plans/orchestrator-pure-service.md M2 — the deterministic coordinator that replaced the
+// orchestrator LLM loop. Goal-level coordination (enqueue the planner, fan out from plans, run
+// reconciliation/review sweeps, complete the goal) is code, not an agent: it holds no
+// conversation, needs no profile of its own, and its convergence sweep needs no credentials at
+// all — child enqueues resolve their own via IAgentControlService's Default-profile registry.
+public interface IGoalCoordinator
+{
+    /// <summary>
+    /// Kicks off a freshly registered goal (or an orchestrator-type work unit, e.g. a
+    /// reconciliation unit): enqueues the planner with the goal's Plan-stage/Default-profile
+    /// credentials, then runs one convergence sweep. Idempotent — a goal that already has a plan,
+    /// children, or a pending scheduler item gets the sweep only.
+    /// </summary>
+    Task StartGoalAsync(string workUnitId, string? sessionId = null, CancellationToken ct = default);
+
+    /// <summary>
+    /// One idempotent convergence sweep: fan out from a recorded plan (the unit's own and any
+    /// still-open orchestrator-type children's), enqueue ready dependents, attempt merge
+    /// reconciliation, enqueue the automated reviewer, and complete the work unit once its
+    /// reconciled proposal is approved/merged. <paramref name="ensurePlanner"/> additionally
+    /// re-enqueues the planner when nothing exists yet (no plan, no children, no queue item) —
+    /// only goal start and *manual* recovery pass true, so an automatic sweep after a planner
+    /// that legitimately produced no plan can never re-enqueue planners in a loop.
+    /// </summary>
+    Task ConvergeAsync(
+        string workUnitId, string? sessionId = null, bool ensurePlanner = false,
+        CancellationToken ct = default);
 }
 
 public interface IArtifactLineageService

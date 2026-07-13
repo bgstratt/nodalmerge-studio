@@ -395,6 +395,7 @@ public class AutomatedReviewGateServiceTests
             string? overrideProvider = null,
             string? overrideProfileId = null,
             string? overrideCredentialRef = null,
+            bool ensurePlanner = false,
             CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
 

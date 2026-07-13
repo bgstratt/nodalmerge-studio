@@ -11,8 +11,37 @@
       field beside `orchestratorProfileId`, and the CLI-provider baseUrl/apiKey resupply wart
       fixed (blank = ambient CLI auth; `HarnessReviewModeSeamTests` inline-route test now
       registers claude-cli with no placeholder and asserts registration succeeds).
-- [ ] M2 — Delete the orchestrator LLM loop; replace with the deterministic
-      **GoalCoordinator** service (reconciliation work units included)
+- [x] M2 — Delete the orchestrator LLM loop; replace with the deterministic
+      **GoalCoordinator** service (reconciliation work units included) — shipped 2026-07-13,
+      780/780 tests green (net −1: the Projection-Diffing stall dead-letter test died with the
+      stall detector it pinned). Landed as specified, with these notes:
+      - `IGoalCoordinator` (Core) + `GoalCoordinator` (AgentRuntime): `StartGoalAsync` =
+        `ConvergeAsync(ensurePlanner: true)`. The **ensurePlanner guard** is the one new invariant:
+        planner enqueue fires only when a goal has no plan, no children, and no queue item, and
+        only from goal start or *manual* reinvoke — an automatic sweep after a planner that
+        legitimately produced no plan can never re-enqueue planners in a loop.
+      - `SpawnAsync("orchestrator")` kept as an alias: registers Default-profile credentials
+        (CLI providers now valid for it — the AP-6 restriction is gone server-side) and awaits
+        `StartGoalAsync` **inline** (deterministic and fast, unlike the loop) — all four external
+        call sites (extension, ExternalGoalTools, ReconciliationAgentService, experiments) work
+        unchanged, and reconciliation units migrated for free.
+      - `ReinvokeOrchestratorAsync` = optional credential-resupply + credential-free
+        `ConvergeAsync` (new `ensurePlanner` param; REST manual endpoint passes true and lost its
+        409/422 outcomes). The scheduler release path's duplicated inline sweeps were deleted —
+        the reinvoke call IS the sweep now; the plan-stage fast-path fan-out and the
+        reviewer-rejection special case stayed.
+      - Decision log: coordinator records under stable id `goal-coordinator` (SpawnPlanner,
+        AwaitReview/Escalate/NoOp reconciliation outcomes); fan-out keeps recording as `fanout`.
+      - Stalled detector (REST) unchanged: it already keyed off pending queue items + any active
+        agent under the whole root, both of which remain meaningful.
+      - Test migration: AutonomousReviewTests/FullAgentCycleTests/SchedulerReinvocationTests now
+        drive planner → fan-out → worker → review through the real scheduler (scripted handlers
+        gained a planner branch; the orchestrator branches were deleted). FullAgentCycle's human
+        flow is two-stage now: approve the child's proposal, then approve+apply the reconciled
+        workspace proposal (the child's is consumed/Superseded by reconciliation — by design).
+        Tests needing the queue must `agentRuntime.StartAsync` (the old direct-spawn flow
+        didn't). `ScriptedLlmHandler` deliberately kept its dead orchestrator branch out of
+        worker-only tests' way — untouched.
 - [ ] M3 — Extension: Agent Topology relabel, spawn-path swap, AP-6 gate deletion,
       credential-free Reinvoke
 - [ ] M4 — Cleanup: prompts, dead events, stale docs; run the harness-comparison eval

@@ -218,7 +218,7 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
     }
 
     [Fact]
-    public async Task ReinvokeOrchestratorAsync_starts_a_fresh_loop_after_restart_when_credentials_are_resupplied()
+    public async Task ReinvokeOrchestratorAsync_repersists_credentials_after_restart_when_resupplied()
     {
         var app1 = BuildApp();
         var orchestrator1 = app1.Services.GetRequiredService<IOrchestratorService>();
@@ -245,26 +245,23 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
             var agentControl2 = app2.Services.GetRequiredService<IAgentControlService>();
 
             // A human/the extension resupplies credentials — mirrors the goal workspace's manual
-            // "Reinvoke Orchestrator" action.
+            // "Reinvoke Orchestrator" action. Since plans/orchestrator-pure-service.md M2 there is
+            // no loop to restart: the observable outcome is that the credential registry is warm
+            // again (GetGoalDefaultCredentials resolves) and the convergence sweep ran without
+            // spawning any agent.
             await agentControl2.ReinvokeOrchestratorAsync(
                 unit.WorkUnitId, overrideApiKey: "sk-resupplied-after-restart", overrideModel: "fake-model",
                 overrideBaseUrl: "http://fake-llm");
 
-            var active = await agentControl2.ListActiveAsync();
-            var startedAgent = active.SingleOrDefault(a => a.WorkUnitId == unit.WorkUnitId);
-            Assert.NotNull(startedAgent);
+            var creds = agentControl2.GetGoalDefaultCredentials(unit.WorkUnitId);
+            Assert.NotNull(creds);
+            Assert.Equal("sk-resupplied-after-restart", creds!.ApiKey);
 
             // Routing (AutoReviewProfileId etc.) is still correct — resupply only touched credentials.
             Assert.Equal("reviewer", agentControl2.GetAutoReviewProfileId(unit.WorkUnitId));
 
-            // The resupply actually started a real (fire-and-forget) orchestrator loop against the
-            // fake LLM handler — explicitly stop it (not just the scheduler poller below) before
-            // disposing, or its own in-flight SQLite/HTTP activity can outlive this test and keep
-            // the temp db file locked past Dispose(), breaking sibling tests that run afterward.
-            // StopAsync only requests cancellation (Cts.Cancel()) — it doesn't join the loop's
-            // background Task, so give it a brief moment to actually unwind before disposing.
-            await agentControl2.StopAsync(startedAgent!.AgentId);
-            await Task.Delay(200);
+            var active = await agentControl2.ListActiveAsync();
+            Assert.DoesNotContain(active, a => a.WorkUnitId == unit.WorkUnitId);
         }
         finally
         {
@@ -276,11 +273,11 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
     [Fact]
     public async Task ReinvokeOrchestratorAsync_recovers_a_work_unit_with_no_registration_or_routing_at_all_when_fully_resupplied()
     {
-        // Covers a work unit whose orchestrator predates GoalRoutingConfig persistence
-        // entirely (spawned before that fix shipped) — there was never anywhere to persist a
-        // profile/routing to, so unlike the "cold cache, warm routing" case above, there's nothing
-        // on record at all. A manual recovery action supplying everything itself (model/baseUrl/
-        // apiKey/provider/profileId) must still be able to start a fresh orchestrator loop.
+        // Covers a work unit whose goal predates GoalRoutingConfig persistence entirely — there
+        // was never anywhere to persist a profile/routing to, so unlike the "cold cache, warm
+        // routing" case above, there's nothing on record at all. A manual recovery action
+        // supplying everything itself (model/baseUrl/apiKey/provider/profileId) must still
+        // register the Default-profile credentials going forward.
         var app = BuildApp();
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
         var agentRuntime = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
@@ -300,22 +297,13 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
                 overrideApiKey: "sk-fresh-recovery-key", overrideProvider: "anthropic",
                 overrideProfileId: "worker");
 
-            var active = await agentControl.ListActiveAsync();
-            var startedAgent = active.SingleOrDefault(a => a.WorkUnitId == unit.WorkUnitId);
-            Assert.NotNull(startedAgent);
-
-            // The recovery should also persist routing going forward, so a *future* restart
-            // doesn't hit this same gap again.
+            // The recovery persists routing going forward, so a *future* restart doesn't hit this
+            // same gap again — and no agent loop is spawned (M2: reinvoke = convergence sweep).
             Assert.Equal("worker", agentControl.GetGoalDefaultProfileId(unit.WorkUnitId));
+            Assert.NotNull(agentControl.GetGoalDefaultCredentials(unit.WorkUnitId));
 
-            // ReinvokeOrchestratorAsync actually started a real (fire-and-forget) orchestrator loop
-            // against the fake LLM handler — explicitly stop it before disposing, or its own
-            // in-flight SQLite/HTTP activity can outlive this test and keep the temp db file locked
-            // past Dispose(), breaking sibling tests in this class that run afterward. StopAsync
-            // only requests cancellation — it doesn't join the loop's background Task, so give it a
-            // brief moment to actually unwind before disposing.
-            await agentControl.StopAsync(startedAgent!.AgentId);
-            await Task.Delay(200);
+            var active = await agentControl.ListActiveAsync();
+            Assert.DoesNotContain(active, a => a.WorkUnitId == unit.WorkUnitId);
         }
         finally
         {

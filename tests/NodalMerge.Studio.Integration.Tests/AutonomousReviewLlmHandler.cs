@@ -5,13 +5,17 @@ using System.Text.Json;
 namespace NodalMerge.Studio.Integration.Tests;
 
 /// <summary>
-/// Fake HttpMessageHandler for AgentApproval/Hybrid review-policy scenarios. Identical
-/// orchestrator/worker scripts to <see cref="ScriptedLlmHandler"/> (copied rather than shared —
-/// see <see cref="ScheduledReinvocationLlmHandler"/> for the established precedent of one handler
-/// class per scenario), plus a third branch for the inline reviewer agent
-/// (<c>ReviewerAgentLoop</c>'s first message: "Review merge proposal {id} for work unit {id}...").
+/// Fake HttpMessageHandler for AgentApproval/Hybrid review-policy scenarios. Worker script
+/// identical to <see cref="ScriptedLlmHandler"/> (copied rather than shared — see
+/// <see cref="ScheduledReinvocationLlmHandler"/> for the established precedent of one handler
+/// class per scenario), plus a branch for the reviewer agent (<c>ReviewerAgentLoop</c>'s first
+/// message: "Review merge proposal {id} for work unit {id}...").
 ///
-/// Orchestrator script: workunit.get → task.create → agent.spawn → end_turn
+/// Since plans/orchestrator-pure-service.md M2 there is no orchestrator LLM turn to script: the
+/// deterministic GoalCoordinator enqueues the planner at spawn, so the entry point here is the
+/// planner producing a single-slice plan; fan-out then enqueues the worker.
+///
+/// Planner script: workunit.get → artifact.record_plan(single slice) → end_turn
 /// Worker script: task.update(InProgress) → workunit.get → task.update(Completed)
 ///                → artifact.record(Research) → merge.propose → merge.validate → end_turn
 /// Reviewer script: merge.validate → merge.review(automated=true, decision, verificationResults)
@@ -34,8 +38,8 @@ internal sealed class AutonomousReviewLlmHandler(string reviewerDecision, string
         var step = (messages.GetArrayLength() - 1) / 2;
         var firstMsg = messages[0].GetProperty("content").GetString() ?? "";
 
-        var json = firstMsg.StartsWith("Begin orchestrating")
-            ? OrchestratorStep(step, firstMsg, messages)
+        var json = firstMsg.StartsWith("Plan work unit")
+            ? PlannerStep(step, firstMsg)
             : firstMsg.StartsWith("Review merge proposal")
                 ? ReviewerStep(step, firstMsg)
                 : WorkerStep(step, firstMsg, messages);
@@ -46,28 +50,32 @@ internal sealed class AutonomousReviewLlmHandler(string reviewerDecision, string
         };
     }
 
-    // ── Orchestrator ──────────────────────────────────────────────────────────
+    // ── Planner ───────────────────────────────────────────────────────────────
 
-    private static string OrchestratorStep(int step, string firstMsg, JsonElement messages)
+    private static string PlannerStep(int step, string firstMsg)
     {
-        var wuId = ParseBetween(firstMsg, "Begin orchestrating work unit ", ". Your agent ID is");
+        var wuId = ParseBetween(firstMsg, "Plan work unit ", ". Your agent ID is");
+        var planJson = JsonSerializer.Serialize(new
+        {
+            slices = new object[]
+            {
+                new
+                {
+                    sliceId = "s1",
+                    goal = "Implement the hello world feature",
+                    fileScope = new[] { "src/Hello.cs" },
+                    dependsOn = Array.Empty<string>(),
+                    steps = new[] { "Create Hello.cs" }
+                }
+            }
+        });
         return step switch
         {
-            0 => ToolUse("tu-o-1", "nm_v1_workunit_get", new { workUnitId = wuId }),
-            1 => ToolUse("tu-o-2", "nm_v1_task_create", new
+            0 => ToolUse("tu-p-1", "nm_v1_workunit_get", new { workUnitId = wuId }),
+            1 => ToolUse("tu-p-2", "nm_v1_artifact_record_plan", new
             {
                 workUnitId = wuId,
-                title = "Execute the goal",
-                description = "Complete all work required for this work unit"
-            }),
-            2 => ToolUse("tu-o-3", "nm_v1_agent_spawn", new
-            {
-                agentType = "worker",
-                workUnitId = wuId,
-                taskId = ExtractFromToolResult(messages, "taskId") ?? "unknown",
-                model = "fake-model",
-                baseUrl = "http://fake-llm",
-                apiKey = "fake-key"
+                planContent = planJson
             }),
             _ => EndTurn()
         };
