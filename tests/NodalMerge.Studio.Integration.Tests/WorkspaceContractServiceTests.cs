@@ -47,6 +47,14 @@ public class WorkspaceContractServiceTests
         Assert.Equal(root.Goal, bundle.Goal.Goal);
         Assert.Equal(child.WorkUnitId, bundle.WorkUnit.WorkUnitId);
         Assert.Equal(WorkspaceContractCapabilities.All, bundle.Manifest.Capabilities);
+
+        // Regression (found live 2026-07-13): goal.md only ever carries the root/session goal —
+        // for a fanned-out child that's every sibling's task text, not just this one's. Without
+        // its own Goal on workunit.md, a claude-cli worker had nothing on disk naming its actual
+        // slice and tried to do every task goal.md mentioned. bundle.WorkUnit.Goal must be the
+        // CHILD's own scoped goal, distinct from the root's.
+        Assert.Equal(child.Goal, bundle.WorkUnit.Goal);
+        Assert.NotEqual(root.Goal, bundle.WorkUnit.Goal);
     }
 
     [Fact]
@@ -76,6 +84,33 @@ public class WorkspaceContractServiceTests
         Assert.NotNull(await fileWorkspace.ReadAsync(wu.BranchId, ".workspace/state.md"));
         Assert.NotNull(await fileWorkspace.ReadAsync(wu.BranchId, ".workspace/constraints.json"));
         Assert.NotNull(await fileWorkspace.ReadAsync(wu.BranchId, ".workspace/review-policy.json"));
+    }
+
+    [Fact]
+    public async Task MaterializeAsync_writes_the_child_own_goal_not_the_root_session_goal_into_workunit_md()
+    {
+        await using var app = BuildTestApp();
+        await app.StartAsync();
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var workUnits = app.Services.GetRequiredService<IWorkUnitService>();
+        var contracts = app.Services.GetRequiredService<IWorkspaceContractService>();
+        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+
+        var root = await orchestrator.CreateWorkUnitAsync(
+            "Complete ALL 4 tasks below.\n\nTask 1: fix the discount bug.\nTask 2: rename BuyerId.",
+            "user");
+        var child = await workUnits.CreateAsync(new WorkUnit(
+            "WU-Child-OwnGoal", "Fix the discount bug", root.BranchId, WorkUnitStatus.Created,
+            DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "test", null, null, null,
+            ParentWorkUnitId: root.WorkUnitId, DependsOn: [], FileScope: []));
+        await fileWorkspace.InitBranchAsync(child.BranchId);
+
+        await contracts.MaterializeAsync(child.WorkUnitId);
+
+        var workUnitMd = await fileWorkspace.ReadAsync(child.BranchId, ".workspace/workunit.md");
+        Assert.Contains("Fix the discount bug", workUnitMd);
+        Assert.DoesNotContain("Task 2: rename BuyerId", workUnitMd);
     }
 
     [Fact]

@@ -45,7 +45,9 @@ public sealed record WorkspaceContractWorkUnit(
     string BranchId,
     IReadOnlyList<string> FileScope,
     IReadOnlyList<string> DependsOn,
-    string? ParentWorkUnitId);
+    string? ParentWorkUnitId,
+    string Goal,
+    string? SuccessCriteria);
 
 /// <summary>What the AP-4 gate will check. TaskReviewPolicy/WorkspaceReviewPolicy mirror the same
 /// fields on WorkUnit — see its doc comments for the child-vs-top-level distinction.

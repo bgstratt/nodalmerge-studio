@@ -38,9 +38,16 @@ public sealed class WorkspaceContractService(
 
         var manifest = new WorkspaceContractManifest(
             ContractVersion, RuntimeVersion(), root.WorkUnitId, wu.WorkUnitId, WorkspaceContractCapabilities.All);
+        // root.Goal is the whole-session goal (context only, in a fanned-out run this may list
+        // every sibling task) — found live 2026-07-13: with nothing else on disk naming a leaf
+        // work unit's own slice, a claude-cli worker read goal.md and tried to do every task in
+        // it. wu.Goal/wu.SuccessCriteria (this work unit's own scoped fields, set by the planner's
+        // fan-out) now travel on WorkspaceContractWorkUnit so workunit.md can say "your task" —
+        // the actual instruction a fanned-out worker must follow — distinctly from the root
+        // session goal.
         var goal = new WorkspaceContractGoal(root.WorkUnitId, root.Goal, root.SuccessCriteria, ParentGoalId: null);
         var workUnit = new WorkspaceContractWorkUnit(
-            wu.WorkUnitId, wu.BranchId, wu.FileScope, wu.DependsOn, wu.ParentWorkUnitId);
+            wu.WorkUnitId, wu.BranchId, wu.FileScope, wu.DependsOn, wu.ParentWorkUnitId, wu.Goal, wu.SuccessCriteria);
         var reviewPolicy = new WorkspaceContractReviewPolicy(
             wu.TaskReviewPolicy.ToString(), wu.WorkspaceReviewPolicy.ToString(),
             SelfVerifyBuildRequired: workspaceOptions?.RequireBuildBeforeProposal ?? false,
@@ -264,6 +271,14 @@ public sealed class WorkspaceContractService(
     private static string RenderWorkUnitMarkdown(WorkspaceContractWorkUnit w) =>
         $"""
         # Work unit {w.WorkUnitId}
+
+        ## Your task
+
+        {w.Goal}
+        {(string.IsNullOrWhiteSpace(w.SuccessCriteria) ? "" : $"\nSuccess criteria: {w.SuccessCriteria}\n")}
+        This is the specific slice assigned to you — goal.md is the whole session's goal for
+        background only. Do not attempt other tasks mentioned there; if this work unit's own
+        scope looks incomplete, ask via the inbox instead of expanding scope.
 
         - Branch: {w.BranchId}
         - Parent work unit: {w.ParentWorkUnitId ?? "(none)"}
