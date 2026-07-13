@@ -328,6 +328,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var ruleFileContext = await BuildRuleFileContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
 
                 AgentLoopCompletion completion;
+                string? harnessFailureReason = null;
                 var workerProgressVerified = true;
                 if (profile?.Stage == PipelineStage.Plan)
                 {
@@ -359,6 +360,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey);
                     var planResult = await planExecutor.RunAsync(planRequest, cts.Token).ConfigureAwait(false);
                     completion = planResult.Completion;
+                    harnessFailureReason = planResult.FailureReason;
 
                     // A Planner that correctly concludes "nothing to decompose here" ends its turn
                     // without recording a Plan artifact — that's Succeeded, not a failure, but
@@ -399,6 +401,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey);
                     var reviewResult = await reviewExecutor.RunAsync(reviewRequest, cts.Token).ConfigureAwait(false);
                     completion = reviewResult.Completion;
+                    harnessFailureReason = reviewResult.FailureReason;
                 }
                 else
                 {
@@ -450,6 +453,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey);
                     var harnessResult = await executor.RunAsync(harnessRequest, cts.Token).ConfigureAwait(false);
                     completion = harnessResult.Completion;
+                    harnessFailureReason = harnessResult.FailureReason;
 
                     if (completion == AgentLoopCompletion.Succeeded)
                     {
@@ -484,6 +488,18 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 {
                     failureReason = "Agent ended its turn without completing the task or producing a merge proposal.";
                     failureKind = FailureKind.ProgressNotVerified;
+                }
+                else if (completion == AgentLoopCompletion.Stalled)
+                {
+                    // Previously fell through silently: not success, not dead-lettered — the item
+                    // just released as a failure with no visible record anywhere, so a goal whose
+                    // CLI harness exited nonzero (or produced no plan/verdict) looked simply
+                    // "stuck" in the UI with nothing to act on (found live 2026-07-13). The
+                    // executor's own reason (exit code, stderr tail, missing-contract-file detail)
+                    // is the actionable part — carry it into the dead-letter entry.
+                    failureReason = harnessFailureReason
+                        ?? "Harness run stalled without producing its expected output.";
+                    failureKind = FailureKind.Stalled;
                 }
             }
 
@@ -935,10 +951,18 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             return null;
 
         var cached = _credentialCache.TryGet(routing.CredentialRef);
-        if (cached is null)
-            return null;
+        if (cached is not null)
+            return new GoalDefaultCredentials(cached.Provider, cached.Model, cached.BaseUrl, cached.ApiKey, routing.ProfileId, routing.CredentialRef);
 
-        return new GoalDefaultCredentials(cached.Provider, cached.Model, cached.BaseUrl, cached.ApiKey, routing.ProfileId, routing.CredentialRef);
+        // CLI providers reconstruct from the persisted routing alone: blank key IS the credential
+        // (ambient CLI login), and RuntimeCredentialCache deliberately never stores blank-key
+        // tuples — so after a restart the cache is a guaranteed miss for them and, without this,
+        // every CLI-provider goal's credential resolution (planner enqueues, fan-out inheritance,
+        // review routing) silently died on the first restart (found live 2026-07-13).
+        if (IsCliProviderSafe(routing.Provider))
+            return new GoalDefaultCredentials(routing.Provider, routing.Model, routing.BaseUrl, string.Empty, routing.ProfileId, routing.CredentialRef);
+
+        return null;
     }
 
     public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage)
@@ -951,8 +975,18 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             return null;
 
         var cached = _credentialCache.TryGet(stageRouting.CredentialRef);
-        return cached is null ? null : stageRouting with { ApiKey = cached.ApiKey };
+        if (cached is not null)
+            return stageRouting with { ApiKey = cached.ApiKey };
+
+        // Same CLI reconstruction as GetGoalDefaultCredentials above.
+        return IsCliProviderSafe(stageRouting.Provider) ? stageRouting with { ApiKey = string.Empty } : null;
     }
+
+    // GetService, not GetRequiredService — same degrade-gracefully posture as every other gate
+    // that consults the resolver (test doubles may not register one; no CLI executors registered
+    // simply means "not a CLI provider").
+    private bool IsCliProviderSafe(string? provider) =>
+        _serviceProvider.GetService<IHarnessExecutorResolver>()?.IsCliProvider(provider) ?? false;
 
     // Pure routing data — safe to persist in full, so this resolves correctly right after a
     // restart with zero credential resupply needed. This is what fixes review routing silently

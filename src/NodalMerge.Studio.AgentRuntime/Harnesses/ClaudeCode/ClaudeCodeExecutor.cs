@@ -125,6 +125,12 @@ internal sealed class ClaudeCodeExecutor(
         // the run it was minted for.
         try
         {
+            // Drained concurrently with stdout — stderr is redirected (so it doesn't leak to the
+            // Host console) and a full pipe buffer would otherwise deadlock the child. Its content
+            // is the ONLY diagnostic a failed CLI run produces (a nonzero exit emits no stream-json
+            // at all), so it must reach the failure reason, not the void (found live 2026-07-13:
+            // a failing `claude` spawn surfaced as a bare "exited with code 1").
+            var stderrTask = process.StandardError.ReadToEndAsync(cts.Token);
             try
             {
                 string? line;
@@ -156,11 +162,14 @@ internal sealed class ClaudeCodeExecutor(
 
             if (process.ExitCode != 0)
             {
+                var stderrTail = await ReadStderrTailAsync(stderrTask).ConfigureAwait(false);
                 logger.LogWarning(
-                    "[claude-code] workUnitId={WorkUnitId} exited with code {ExitCode}", request.WorkUnitId, process.ExitCode);
+                    "[claude-code] workUnitId={WorkUnitId} exited with code {ExitCode}. stderr: {Stderr}",
+                    request.WorkUnitId, process.ExitCode, stderrTail ?? "(empty)");
                 return new HarnessRunResult(
                     AgentLoopCompletion.Stalled,
-                    $"claude CLI exited with code {process.ExitCode}.",
+                    $"claude CLI exited with code {process.ExitCode}." +
+                        (stderrTail is null ? "" : $" stderr: {stderrTail}"),
                     summary.ResultText, summary.InputTokens, summary.OutputTokens, summary.TotalCostUsd, summary.SessionId);
             }
 
@@ -262,6 +271,22 @@ internal sealed class ClaudeCodeExecutor(
     {
         try { process.Kill(entireProcessTree: true); }
         catch { /* best-effort — the process may have already exited */ }
+    }
+
+    // Bounded so a chatty CLI can't balloon a dead-letter reason; trimmed to the first ~500 chars
+    // because CLI errors (auth, bad flag, missing binary) always front-load the useful line.
+    internal static async Task<string?> ReadStderrTailAsync(Task<string> stderrTask)
+    {
+        try
+        {
+            var stderr = (await stderrTask.ConfigureAwait(false)).Trim();
+            if (stderr.Length == 0) return null;
+            return stderr.Length <= 500 ? stderr : stderr[..500] + "…";
+        }
+        catch
+        {
+            return null; // diagnostics only — never fail the failure path itself
+        }
     }
 
     // Generated allowlist — Edit/Write/Read scoped to the branch workdir, Bash only for the

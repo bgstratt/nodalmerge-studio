@@ -104,6 +104,9 @@ internal sealed class CodexCliExecutor(
 
         var parser = CodexTranscriptParser.Create(request.OnActivity);
 
+        // Drained concurrently with stdout — same rationale as ClaudeCodeExecutor: stderr is the
+        // only diagnostic a nonzero exit produces, and an undrained redirected pipe can deadlock.
+        var stderrTask = process.StandardError.ReadToEndAsync(cts.Token);
         try
         {
             string? line;
@@ -132,9 +135,14 @@ internal sealed class CodexCliExecutor(
         // process exit code, per the task brief's verified findings. CostUsd stays null throughout.
         if (process.ExitCode != 0)
         {
-            logger.LogWarning("[codex] workUnitId={WorkUnitId} exited with code {ExitCode}", request.WorkUnitId, process.ExitCode);
+            var stderrTail = await ClaudeCodeExecutor.ReadStderrTailAsync(stderrTask).ConfigureAwait(false);
+            logger.LogWarning(
+                "[codex] workUnitId={WorkUnitId} exited with code {ExitCode}. stderr: {Stderr}",
+                request.WorkUnitId, process.ExitCode, stderrTail ?? "(empty)");
             return new HarnessRunResult(
-                AgentLoopCompletion.Stalled, $"codex CLI exited with code {process.ExitCode}.",
+                AgentLoopCompletion.Stalled,
+                $"codex CLI exited with code {process.ExitCode}." +
+                    (stderrTail is null ? "" : $" stderr: {stderrTail}"),
                 summary.ResultText, summary.InputTokens, summary.OutputTokens, CostUsd: null, summary.ThreadId);
         }
 
