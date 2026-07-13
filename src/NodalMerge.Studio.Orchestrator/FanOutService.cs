@@ -121,7 +121,7 @@ public sealed class FanOutService : IFanOutService
             }
 
             var creds = _agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Execute)
-                ?? _agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+                ?? _agentControl.GetGoalDefaultCredentials(parentWorkUnitId);
             var children = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
             foreach (var child in children)
             {
@@ -427,7 +427,7 @@ public sealed class FanOutService : IFanOutService
     private async Task<bool> EnqueueChildWorkerAsync(
         WorkUnit child,
         string parentWorkUnitId,
-        OrchestratorCredentials? creds,
+        GoalDefaultCredentials? creds,
         string? sessionId,
         CancellationToken ct)
     {

@@ -280,9 +280,9 @@ public sealed class InMemoryDeadLetterService(
         }
 
         var creds = agentControl.GetCredentialsForStage(unit.WorkUnitId, entry.Stage)
-            ?? agentControl.GetOrchestratorCredentials(unit.WorkUnitId)
+            ?? agentControl.GetGoalDefaultCredentials(unit.WorkUnitId)
             ?? (unit.ParentWorkUnitId is { } parentId
-                ? agentControl.GetCredentialsForStage(parentId, entry.Stage) ?? agentControl.GetOrchestratorCredentials(parentId)
+                ? agentControl.GetCredentialsForStage(parentId, entry.Stage) ?? agentControl.GetGoalDefaultCredentials(parentId)
                 : null);
         return (creds?.Model, creds?.BaseUrl, creds?.ApiKey, creds?.Provider, creds?.CredentialRef);
     }

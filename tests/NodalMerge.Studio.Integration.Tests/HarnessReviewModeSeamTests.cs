@@ -229,13 +229,14 @@ public class HarnessReviewModeSeamTests : IDisposable
         var inlineReviewer = services.GetRequiredService<IInlineReviewerService>();
         var merge = services.GetRequiredService<IMergeService>();
 
-        // The user's Agent Topology choice: a claude-cli Model Profile on this goal. The resupply
-        // registration path requires a non-blank baseUrl/apiKey (it predates CLI providers), but
-        // the CLI adapter never uses them — what matters is provider="claude-cli" routing the
-        // inline reviewer to ClaudeCodeExecutor instead of DefaultAgentToolClient's garbage HTTP.
-        await agentControl.ResupplyCredentialsAsync(
-            wu.WorkUnitId, overrideModel: "", overrideBaseUrl: "http://unused-cli",
-            overrideApiKey: "unused", overrideProvider: "claude-cli");
+        // The user's Agent Topology choice: a claude-cli Model Profile on this goal. No baseUrl
+        // and no apiKey — blank means ambient CLI auth, and registration must accept that for CLI
+        // providers (plans/orchestrator-pure-service.md M1 removed the placeholder-baseUrl
+        // requirement). What matters is provider="claude-cli" routing the inline reviewer to
+        // ClaudeCodeExecutor instead of DefaultAgentToolClient's garbage HTTP.
+        var registered = await agentControl.ResupplyCredentialsAsync(
+            wu.WorkUnitId, overrideModel: "", overrideProvider: "claude-cli");
+        Assert.True(registered);
 
         var inlineResult = await inlineReviewer.ReviewAsync(wu.WorkUnitId, proposal.ProposalId);
 

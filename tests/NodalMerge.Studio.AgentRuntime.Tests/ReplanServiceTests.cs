@@ -100,11 +100,11 @@ public class ReplanServiceTests
 
     private sealed class FakeAgentControlService : IAgentControlService
     {
-        public OrchestratorCredentials? CredentialsToReturn;
+        public GoalDefaultCredentials? CredentialsToReturn;
 
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
-            string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
             IReadOnlyList<string>? enabledDomainAgents = null, string? credentialRef = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
@@ -114,10 +114,10 @@ public class ReplanServiceTests
             Task.FromResult(false);
 
         public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
-        public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => CredentialsToReturn;
-        public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => CredentialsToReturn;
+        public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => CredentialsToReturn;
+        public GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId) => CredentialsToReturn;
         public string? GetAutoReviewProfileId(string workUnitId) => null;
-        public string? GetOrchestratorProfileId(string workUnitId) => null;
+        public string? GetGoalDefaultProfileId(string workUnitId) => null;
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task ResumeAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task StopAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;

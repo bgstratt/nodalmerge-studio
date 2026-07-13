@@ -77,7 +77,7 @@ public class RequeueGoalTests
     }
 
     [Fact]
-    public async Task RequeueAsync_resupplies_credentials_so_GetOrchestratorCredentials_resolves_again()
+    public async Task RequeueAsync_resupplies_credentials_so_GetGoalDefaultCredentials_resolves_again()
     {
         var app = StudioWebApplication.Build(
             [],
@@ -95,14 +95,14 @@ public class RequeueGoalTests
         // Host restart wipes IRuntimeCredentialCache, so nothing is resolvable without the
         // requester (the webview's Requeue button, resolving from settings.json + the saved
         // credential store) supplying overrides.
-        Assert.Null(agentControl.GetOrchestratorCredentials(unit.WorkUnitId));
+        Assert.Null(agentControl.GetGoalDefaultCredentials(unit.WorkUnitId));
 
         await workUnitCommands.RequeueAsync(
             unit.WorkUnitId,
             overrideModel: "claude-sonnet-5", overrideBaseUrl: "https://api.anthropic.com",
             overrideApiKey: "sk-test-key", overrideProvider: "anthropic");
 
-        var creds = agentControl.GetOrchestratorCredentials(unit.WorkUnitId);
+        var creds = agentControl.GetGoalDefaultCredentials(unit.WorkUnitId);
         Assert.NotNull(creds);
         Assert.Equal("claude-sonnet-5", creds!.Model);
         Assert.Equal("sk-test-key", creds.ApiKey);

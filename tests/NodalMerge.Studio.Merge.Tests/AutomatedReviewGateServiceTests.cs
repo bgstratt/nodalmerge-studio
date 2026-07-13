@@ -362,11 +362,11 @@ public class AutomatedReviewGateServiceTests
     private sealed class FakeAgentControlService(string autoReviewProfileId) : IAgentControlService
     {
         public string? GetAutoReviewProfileId(string workUnitId) => autoReviewProfileId;
-        public string? GetOrchestratorProfileId(string workUnitId) => null;
+        public string? GetGoalDefaultProfileId(string workUnitId) => null;
 
-        public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
+        public GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId) => null;
 
-        public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
+        public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
 
         public Task<string> SpawnAsync(
             string agentType,
@@ -378,7 +378,7 @@ public class AutomatedReviewGateServiceTests
             string? provider = null,
             string? profileId = null,
             string? autoReviewProfileId = null,
-            IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
             IReadOnlyList<string>? enabledDomainAgents = null,
             string? credentialRef = null,
             CancellationToken cancellationToken = default) =>

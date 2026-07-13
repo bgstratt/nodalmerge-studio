@@ -152,9 +152,9 @@ public static class StudioRestEndpoints
         string? ProfileId = null,
         string? CredentialRef = null)
     {
-        public OrchestratorCredentials? ToCredentials() =>
+        public GoalDefaultCredentials? ToCredentials() =>
             !string.IsNullOrWhiteSpace(Model) && !string.IsNullOrWhiteSpace(BaseUrl)
-                ? new OrchestratorCredentials(Provider ?? "anthropic", Model, BaseUrl, ApiKey ?? string.Empty, ProfileId, CredentialRef)
+                ? new GoalDefaultCredentials(Provider ?? "anthropic", Model, BaseUrl, ApiKey ?? string.Empty, ProfileId, CredentialRef)
                 : null;
     }
 
@@ -1619,14 +1619,14 @@ public static class StudioRestEndpoints
             if (wu is null)
                 return Results.NotFound(new { error = $"Work unit '{body.WorkUnitId}' not found." });
 
-            IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null;
+            IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null;
             if (body.StageCredentials is { Count: > 0 })
             {
-                var resolved = new Dictionary<PipelineStage, OrchestratorCredentials>();
+                var resolved = new Dictionary<PipelineStage, GoalDefaultCredentials>();
                 foreach (var (key, dto) in body.StageCredentials)
                 {
                     if (Enum.TryParse<PipelineStage>(key, ignoreCase: true, out var stage))
-                        resolved[stage] = new OrchestratorCredentials(dto.Provider, dto.Model, dto.BaseUrl, dto.ApiKey, null, dto.CredentialRef);
+                        resolved[stage] = new GoalDefaultCredentials(dto.Provider, dto.Model, dto.BaseUrl, dto.ApiKey, null, dto.CredentialRef);
                 }
                 stageCredentials = resolved;
             }
@@ -3962,7 +3962,10 @@ public static class StudioRestEndpoints
                         parkedReason,
                         parkedWorkUnitIds = (IReadOnlyList<string>?)parkedIds ?? [],
                         orchestratorStalled,
-                        orchestratorProfileId = orchestratorStalled ? agents.GetOrchestratorProfileId(g.WorkUnitId) : null
+                        // orchestratorProfileId is the legacy name for defaultProfileId — both ship
+                        // until the extension reads the new one (plans/orchestrator-pure-service.md M3).
+                        orchestratorProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null,
+                        defaultProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null
                     });
                 }
                 return Results.Ok(new { goals, source = "goal-store" });
@@ -3994,7 +3997,9 @@ public static class StudioRestEndpoints
                     parkedReason,
                     parkedWorkUnitIds = (IReadOnlyList<string>?)parkedIds ?? [],
                     orchestratorStalled,
-                    orchestratorProfileId = orchestratorStalled ? agents.GetOrchestratorProfileId(wu.WorkUnitId) : null,
+                    // Legacy + new name pair — see the goal-store branch above.
+                    orchestratorProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(wu.WorkUnitId) : null,
+                    defaultProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(wu.WorkUnitId) : null,
                 };
             }).ToList();
             return Results.Ok(new { goals = fallback, source = "work-units" });

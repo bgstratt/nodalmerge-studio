@@ -55,7 +55,7 @@ public sealed class DomainAgentTriggerService(
     {
         try
         {
-            var creds = agentControl.GetOrchestratorCredentials(workUnitId);
+            var creds = agentControl.GetGoalDefaultCredentials(workUnitId);
 
             // Child work units spawned by fan-out have credentials registered on the parent.
             if (creds is null)
@@ -65,7 +65,7 @@ public sealed class DomainAgentTriggerService(
                 {
                     var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
                     if (wu?.ParentWorkUnitId is { } parentId)
-                        creds = agentControl.GetOrchestratorCredentials(parentId);
+                        creds = agentControl.GetGoalDefaultCredentials(parentId);
                 }
             }
 

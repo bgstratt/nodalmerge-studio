@@ -258,7 +258,7 @@ public sealed class WorkUnitCommandService(
         // had to step in), which wipes the in-memory credential cache the inline reviewer and any
         // re-enqueued worker below both depend on. Resupplying onto workUnitId itself covers every
         // descendant processed below too, via the same one-level-up-to-parent fallback
-        // GetOrchestratorCredentials/GetCredentialsForStage callers already use. Does not spawn an
+        // GetGoalDefaultCredentials/GetCredentialsForStage callers already use. Does not spawn an
         // orchestrator loop — see IAgentControlService.ResupplyCredentialsAsync's doc comment.
         await agentControl.ResupplyCredentialsAsync(
             workUnitId, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider,
@@ -307,9 +307,9 @@ public sealed class WorkUnitCommandService(
             if (!isFanOutParent)
             {
                 var creds = agentControl.GetCredentialsForStage(member.WorkUnitId, PipelineStage.Execute)
-                    ?? agentControl.GetOrchestratorCredentials(member.WorkUnitId)
+                    ?? agentControl.GetGoalDefaultCredentials(member.WorkUnitId)
                     ?? (member.ParentWorkUnitId is { } executeParentId
-                        ? agentControl.GetCredentialsForStage(executeParentId, PipelineStage.Execute) ?? agentControl.GetOrchestratorCredentials(executeParentId)
+                        ? agentControl.GetCredentialsForStage(executeParentId, PipelineStage.Execute) ?? agentControl.GetGoalDefaultCredentials(executeParentId)
                         : null);
 
                 if (!string.IsNullOrWhiteSpace(notes))

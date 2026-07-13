@@ -46,7 +46,7 @@ public sealed class AutomatedReviewGateService(
         }
 
         var creds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Review)
-            ?? agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+            ?? agentControl.GetGoalDefaultCredentials(parentWorkUnitId);
         await scheduler.EnqueueAsync(
             parentWorkUnitId,
             profileId,
@@ -90,7 +90,7 @@ public sealed class AutomatedReviewGateService(
                 ? "Automated review rejected the reconciled proposal."
                 : $"Automated review rejected: {proposal.VerificationResults}";
             var failedCreds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Review)
-                ?? agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+                ?? agentControl.GetGoalDefaultCredentials(parentWorkUnitId);
 
             await deadLetter.RecordFailureAsync(
                 parentWorkUnitId,
@@ -121,7 +121,7 @@ public sealed class AutomatedReviewGateService(
 
         var children = await workUnits.GetChildrenAsync(parentWorkUnitId, cancellationToken).ConfigureAwait(false);
         var creds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Execute)
-            ?? agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+            ?? agentControl.GetGoalDefaultCredentials(parentWorkUnitId);
         foreach (var child in children)
         {
             if (child.Status is not WorkUnitStatus.Proposed and not WorkUnitStatus.Merged)
@@ -238,9 +238,9 @@ public sealed class AutomatedReviewGateService(
             : updatedWorkUnit.ExecutionInfo!.HumanReviewRejectionCount;
 
         var creds = agentControl.GetCredentialsForStage(workUnitId, PipelineStage.Execute)
-            ?? agentControl.GetOrchestratorCredentials(workUnitId)
+            ?? agentControl.GetGoalDefaultCredentials(workUnitId)
             ?? (workUnit.ParentWorkUnitId is { } executeParentId
-                ? agentControl.GetCredentialsForStage(executeParentId, PipelineStage.Execute) ?? agentControl.GetOrchestratorCredentials(executeParentId)
+                ? agentControl.GetCredentialsForStage(executeParentId, PipelineStage.Execute) ?? agentControl.GetGoalDefaultCredentials(executeParentId)
                 : null);
 
         // The max-attempts cap exists to stop AGENTS from spinning — an automated reviewer

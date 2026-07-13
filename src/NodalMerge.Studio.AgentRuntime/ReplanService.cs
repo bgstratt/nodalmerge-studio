@@ -69,7 +69,7 @@ public sealed class ReplanService(
         // entirely and its provider/model/profile win outright, same as OrchestratorAgentLoop's
         // InjectSpawnCredentialsAsync.
         var stageCreds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Plan);
-        var creds = stageCreds ?? agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+        var creds = stageCreds ?? agentControl.GetGoalDefaultCredentials(parentWorkUnitId);
         if (creds is null)
         {
             return new ReplanResult(

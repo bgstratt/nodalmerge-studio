@@ -36,7 +36,7 @@ internal sealed class PlannerSelectionService(
         "markdown, no extra text: {\"profileId\": \"<id>\", \"explanation\": \"<short reason>\"}.";
 
     public async Task<ProfileSelectionResult> SelectPlannerAsync(
-        WorkUnit goalUnit, OrchestratorCredentials? credentials, CancellationToken ct = default)
+        WorkUnit goalUnit, GoalDefaultCredentials? credentials, CancellationToken ct = default)
     {
         if (!options.UsePlannerExecutorSelection)
             return Heuristic("Planner executor selection is disabled; using the requested planner profile.");

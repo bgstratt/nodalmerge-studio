@@ -93,9 +93,9 @@ public class PlannerExecutorRoutingTests
         var parent = await orchestratorSvc.CreateWorkUnitAsync(
             "Build the API", "test", fileScope: ["src/api/foo.py"]);
 
-        var stageCredentials = new Dictionary<PipelineStage, OrchestratorCredentials>
+        var stageCredentials = new Dictionary<PipelineStage, GoalDefaultCredentials>
         {
-            [PipelineStage.Plan] = new OrchestratorCredentials(
+            [PipelineStage.Plan] = new GoalDefaultCredentials(
                 "override-provider", "override-model", "http://override", "override-key", null),
         };
 

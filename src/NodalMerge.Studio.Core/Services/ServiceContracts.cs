@@ -245,7 +245,7 @@ public interface ICandidateReconciliationTrigger
     // supplied, is passed straight through to ReconciliationRequest.Credentials — see that field's
     // own comment for why this takes priority over best-effort source-goal credential inheritance.
     Task<WorkUnit?> TryTriggerAsync(
-        string conflictId, string? steeringNotes = null, OrchestratorCredentials? credentials = null, CancellationToken ct = default);
+        string conflictId, string? steeringNotes = null, GoalDefaultCredentials? credentials = null, CancellationToken ct = default);
 
     // Writes resolvedContent directly onto the candidate branch for each conflicting path, records
     // a synthetic Merged MergeProposal representing the human's resolution (so it flows through the
@@ -290,7 +290,7 @@ public interface ITaskConflictService
 public interface ITaskReconciliationTrigger
 {
     Task<WorkUnit?> TryTriggerAsync(
-        string conflictId, string? steeringNotes = null, OrchestratorCredentials? credentials = null, CancellationToken ct = default);
+        string conflictId, string? steeringNotes = null, GoalDefaultCredentials? credentials = null, CancellationToken ct = default);
 
     Task<MergeProposal?> TryResolveManuallyAsync(
         string conflictId, IReadOnlyDictionary<string, string> resolvedContent, CancellationToken ct = default);
@@ -352,7 +352,7 @@ public sealed record ReconciliationRequest(
     // goal happens to still have a live registration in this process (lost on host restart, and
     // never present at all for a fan-out task's own work unit, only its top-level parent), so it
     // silently no-ops far too often for something advertised as "one-click."
-    OrchestratorCredentials? Credentials = null);
+    GoalDefaultCredentials? Credentials = null);
 
 // Creates an ordinary top-level WorkUnit whose goal carries full reconciliation context (every
 // source proposal's owning goal text + the conflicting paths' diverged content) directly in the
@@ -1122,11 +1122,11 @@ public interface IParticipantEventBus
     IReadOnlyList<string> GetRegisteredEventTypes();
 }
 
-public sealed record OrchestratorCredentials(
+public sealed record GoalDefaultCredentials(
     string Provider,
     string Model,
     string BaseUrl,
-    // Never persisted — see OrchestratorRoutingConfig, the safe subset of this shape that actually
+    // Never persisted — see GoalRoutingConfig, the safe subset of this shape that actually
     // gets written to IStudioNodeStore. ApiKey only ever lives in-memory (the live orchestrator
     // registry) or in IRuntimeCredentialCache, keyed by CredentialRef.
     string ApiKey,
@@ -1134,12 +1134,12 @@ public sealed record OrchestratorCredentials(
     string? CredentialRef = null);
 
 // The safe-to-persist projection of an orchestrator's registration — everything
-// InMemoryAgentRuntimeService's in-memory-only _orchestratorRegistrations needs to survive a Host
+// InMemoryAgentRuntimeService's in-memory-only _goalCredentialRegistrations needs to survive a Host
 // restart, minus every ApiKey. Written to IStudioNodeStore at SpawnAsync("orchestrator", ...) time
 // and rehydrated on startup, so GetAutoReviewProfileId/GetEnabledDomainAgents work immediately after
-// a restart with no credential resupply needed at all; GetOrchestratorCredentials/
+// a restart with no credential resupply needed at all; GetGoalDefaultCredentials/
 // GetCredentialsForStage additionally need IRuntimeCredentialCache to have CredentialRef's entry.
-public sealed record OrchestratorRoutingConfig(
+public sealed record GoalRoutingConfig(
     string WorkUnitId,
     string Provider,
     string Model,
@@ -1147,7 +1147,7 @@ public sealed record OrchestratorRoutingConfig(
     string? ProfileId,
     string? AutoReviewProfileId,
     string? CredentialRef,
-    IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? StageCredentials = null,
+    IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? StageCredentials = null,
     IReadOnlyList<string>? EnabledDomainAgents = null);
 
 public interface IAgentControlService
@@ -1162,7 +1162,7 @@ public interface IAgentControlService
         string? provider = null,
         string? profileId = null,
         string? autoReviewProfileId = null,
-        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+        IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
         IReadOnlyList<string>? enabledDomainAgents = null,
         string? credentialRef = null,
         CancellationToken cancellationToken = default);
@@ -1191,7 +1191,7 @@ public interface IAgentControlService
     // uses (registration hot path, then rehydrated routing + IRuntimeCredentialCache, then the
     // override* params), but without spawning a new orchestrator loop. A requeued goal whose
     // in-flight work is already done (just needs one more reconcile/review pass) doesn't need an
-    // ongoing planning loop — it just needs GetOrchestratorCredentials/GetCredentialsForStage to
+    // ongoing planning loop — it just needs GetGoalDefaultCredentials/GetCredentialsForStage to
     // resolve again for whatever one-shot call (inline reviewer, a re-enqueued worker) needs them
     // next. Returns true if credentials are resolvable (and now persisted) after this call, false
     // if nothing was resolvable (same "no-op, caller can supply overrides" contract as reinvoke).
@@ -1209,14 +1209,14 @@ public interface IAgentControlService
     /// Returns LLM credentials captured when an orchestrator was first spawned for a work unit.
     /// Used by fan-out to enqueue child workers with the same credentials.
     /// </summary>
-    OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId);
+    GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId);
 
     /// <summary>
     /// Per-stage credential override captured at orchestrator spawn time (e.g. a different model
     /// for Plan vs Execute vs Review), or null if no override was configured for that stage —
-    /// callers fall back to <see cref="GetOrchestratorCredentials"/> in that case.
+    /// callers fall back to <see cref="GetGoalDefaultCredentials"/> in that case.
     /// </summary>
-    OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage);
+    GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage);
 
     /// <summary>
     /// Profile ID for the automated reviewer pre-gate, captured at orchestrator spawn time.
@@ -1225,12 +1225,12 @@ public interface IAgentControlService
 
     /// <summary>
     /// The orchestrator's own dispatch profile ID, captured at spawn time — routing data, not a
-    /// credential, so unlike <see cref="GetOrchestratorCredentials"/> this resolves purely from the
+    /// credential, so unlike <see cref="GetGoalDefaultCredentials"/> this resolves purely from the
     /// rehydrated routing config and survives a restart with zero credential resupply needed. Lets
     /// a caller (e.g. a manual "Reinvoke Orchestrator" action) know which profile to resolve fresh
     /// credentials for without first needing a live ApiKey.
     /// </summary>
-    string? GetOrchestratorProfileId(string workUnitId);
+    string? GetGoalDefaultProfileId(string workUnitId);
 
     /// <summary>
     /// Per-work-unit override of which domain agents (by name, e.g. "Security"/"Architecture")
@@ -1760,7 +1760,7 @@ public interface IProfileSelectionService
     /// </summary>
     Task<ProfileSelectionResult> SelectProfileAsync(
         WorkUnit childUnit,
-        OrchestratorCredentials? credentials,
+        GoalDefaultCredentials? credentials,
         CancellationToken ct = default);
 }
 
@@ -1781,7 +1781,7 @@ public interface IPlannerSelectionService
     /// </summary>
     Task<ProfileSelectionResult> SelectPlannerAsync(
         WorkUnit goalUnit,
-        OrchestratorCredentials? credentials,
+        GoalDefaultCredentials? credentials,
         CancellationToken ct = default);
 }
 

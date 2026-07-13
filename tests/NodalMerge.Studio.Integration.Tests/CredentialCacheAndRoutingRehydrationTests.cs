@@ -11,8 +11,8 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// <summary>
 /// Covers the fix for: after a Host restart, resumed goals silently fell back to human review
 /// because AutoReviewProfileId lived only in InMemoryAgentRuntimeService's in-memory
-/// _orchestratorRegistrations, and the "obvious" fix of persisting that record wholesale would
-/// have written a raw ApiKey to disk. OrchestratorRoutingConfig (the safe subset) now survives a
+/// _goalCredentialRegistrations, and the "obvious" fix of persisting that record wholesale would
+/// have written a raw ApiKey to disk. GoalRoutingConfig (the safe subset) now survives a
 /// restart on its own; ApiKey never touches IStudioNodeStore at all — see
 /// IRuntimeCredentialCache's doc comment.
 /// </summary>
@@ -75,7 +75,7 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
 
         var app2 = BuildApp();
         // Mirrors production startup: InMemoryAgentRuntimeService.StartAsync rehydrates
-        // OrchestratorRoutingConfig before anything else runs.
+        // GoalRoutingConfig before anything else runs.
         var agentRuntime2 = app2.Services.GetRequiredService<InMemoryAgentRuntimeService>();
         await agentRuntime2.StartAsync(CancellationToken.None);
         try
@@ -96,6 +96,40 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
     }
 
     [Fact]
+    public async Task Routing_persisted_under_the_legacy_orchestrator_kind_still_rehydrates()
+    {
+        // plans/orchestrator-pure-service.md M1 — goals in flight across the GoalRoutingV1 rename
+        // have their routing stored under the legacy OrchestratorRoutingV1 kind. Rehydration must
+        // read both (writes only ever use the new kind now).
+        var app1 = BuildApp();
+        var orchestrator1 = app1.Services.GetRequiredService<IOrchestratorService>();
+        var nodeStore1 = app1.Services.GetRequiredService<IStudioNodeStore>();
+
+        var unit = await orchestrator1.CreateWorkUnitAsync("Build the thing", "test");
+        var legacyRouting = new GoalRoutingConfig(
+            unit.WorkUnitId, "anthropic", "fake-model", "http://fake-llm",
+            ProfileId: "orchestrator", AutoReviewProfileId: "reviewer", CredentialRef: null);
+        await nodeStore1.WriteNodeAsync(
+            StudioNodeKind.OrchestratorRoutingV1, unit.WorkUnitId,
+            System.Text.Json.JsonSerializer.Serialize(legacyRouting));
+        await app1.DisposeAsync();
+
+        var app2 = BuildApp();
+        var agentRuntime2 = app2.Services.GetRequiredService<InMemoryAgentRuntimeService>();
+        await agentRuntime2.StartAsync(CancellationToken.None);
+        try
+        {
+            var agentControl2 = app2.Services.GetRequiredService<IAgentControlService>();
+            Assert.Equal("reviewer", agentControl2.GetAutoReviewProfileId(unit.WorkUnitId));
+            Assert.Equal("orchestrator", agentControl2.GetGoalDefaultProfileId(unit.WorkUnitId));
+        }
+        finally
+        {
+            await agentRuntime2.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task Orchestrator_credentials_are_null_after_restart_until_something_resupplies_them()
     {
         var app1 = BuildApp();
@@ -109,8 +143,8 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
             model: "fake-model", baseUrl: "http://fake-llm", apiKey: "sk-super-secret-123",
             autoReviewProfileId: "reviewer");
 
-        // The persisted OrchestratorRoutingConfig record must never contain the raw key.
-        var routingRecords = await nodeStore1.ReadAllNodesAsync(StudioNodeKind.OrchestratorRoutingV1);
+        // The persisted GoalRoutingConfig record must never contain the raw key.
+        var routingRecords = await nodeStore1.ReadAllNodesAsync(StudioNodeKind.GoalRoutingV1);
         Assert.Contains(routingRecords, r => r.EntityId == unit.WorkUnitId);
         Assert.All(routingRecords, r => Assert.DoesNotContain("sk-super-secret-123", r.PayloadJson));
 
@@ -132,7 +166,7 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
 
             // Nobody has resupplied credentials in this fresh process — the cache is cold, so this
             // must come back null rather than an empty/garbage credential.
-            Assert.Null(agentControl2.GetOrchestratorCredentials(unit.WorkUnitId));
+            Assert.Null(agentControl2.GetGoalDefaultCredentials(unit.WorkUnitId));
         }
         finally
         {
@@ -242,7 +276,7 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
     [Fact]
     public async Task ReinvokeOrchestratorAsync_recovers_a_work_unit_with_no_registration_or_routing_at_all_when_fully_resupplied()
     {
-        // Covers a work unit whose orchestrator predates OrchestratorRoutingConfig persistence
+        // Covers a work unit whose orchestrator predates GoalRoutingConfig persistence
         // entirely (spawned before that fix shipped) — there was never anywhere to persist a
         // profile/routing to, so unlike the "cold cache, warm routing" case above, there's nothing
         // on record at all. A manual recovery action supplying everything itself (model/baseUrl/
@@ -256,9 +290,9 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
             var agentControl = app.Services.GetRequiredService<IAgentControlService>();
 
             // Created directly, never spawned as an orchestrator at all — nothing in either
-            // _orchestratorRegistrations or the rehydrated routing config for this work unit.
+            // _goalCredentialRegistrations or the rehydrated routing config for this work unit.
             var unit = await orchestrator.CreateWorkUnitAsync("Orphaned goal", "test");
-            Assert.Null(agentControl.GetOrchestratorProfileId(unit.WorkUnitId));
+            Assert.Null(agentControl.GetGoalDefaultProfileId(unit.WorkUnitId));
 
             await agentControl.ReinvokeOrchestratorAsync(
                 unit.WorkUnitId,
@@ -272,7 +306,7 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
 
             // The recovery should also persist routing going forward, so a *future* restart
             // doesn't hit this same gap again.
-            Assert.Equal("worker", agentControl.GetOrchestratorProfileId(unit.WorkUnitId));
+            Assert.Equal("worker", agentControl.GetGoalDefaultProfileId(unit.WorkUnitId));
 
             // ReinvokeOrchestratorAsync actually started a real (fire-and-forget) orchestrator loop
             // against the fake LLM handler — explicitly stop it before disposing, or its own

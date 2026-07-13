@@ -240,7 +240,7 @@ public class ControlPlaneIdempotencyTests
 
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
-            string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
             IReadOnlyList<string>? enabledDomainAgents = null,
             string? credentialRef = null,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
@@ -254,10 +254,10 @@ public class ControlPlaneIdempotencyTests
         public Task<bool> ResupplyCredentialsAsync(string workUnitId, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
             Task.FromResult(false);
 
-        public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
-        public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
+        public GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId) => null;
+        public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
         public string? GetAutoReviewProfileId(string workUnitId) => null;
-        public string? GetOrchestratorProfileId(string workUnitId) => null;
+        public string? GetGoalDefaultProfileId(string workUnitId) => null;
         public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
 
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();

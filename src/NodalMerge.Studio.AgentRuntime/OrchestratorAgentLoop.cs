@@ -418,7 +418,7 @@ internal sealed class OrchestratorAgentLoop(
             var goalUnit = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
             if (goalUnit is not null)
             {
-                var credsForSelection = agentControl?.GetOrchestratorCredentials(workUnitId);
+                var credsForSelection = agentControl?.GetGoalDefaultCredentials(workUnitId);
                 var selection = await plannerSelection
                     .SelectPlannerAsync(goalUnit, credsForSelection, ct).ConfigureAwait(false);
                 if (!string.Equals(selection.ProfileId, profileId, StringComparison.Ordinal))

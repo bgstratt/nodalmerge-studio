@@ -23,7 +23,7 @@ public sealed class InlineReviewerService(
         // Topology — the same tier AutomatedReviewGateService's enqueue path resolves), then the
         // orchestrator registration as the fallback it always was.
         var creds = agentControl.GetCredentialsForStage(workUnitId, PipelineStage.Review)
-            ?? agentControl.GetOrchestratorCredentials(workUnitId);
+            ?? agentControl.GetGoalDefaultCredentials(workUnitId);
 
         // When the work unit is a child worker spawned by fan-out, the orchestrator
         // credentials are registered on the parent, not the child. Walk up to find them.
@@ -36,7 +36,7 @@ public sealed class InlineReviewerService(
                 if (wu?.ParentWorkUnitId is { } parentId)
                 {
                     creds = agentControl.GetCredentialsForStage(parentId, PipelineStage.Review)
-                        ?? agentControl.GetOrchestratorCredentials(parentId);
+                        ?? agentControl.GetGoalDefaultCredentials(parentId);
                 }
             }
         }

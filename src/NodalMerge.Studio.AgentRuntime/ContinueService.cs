@@ -83,7 +83,7 @@ public sealed class ContinueService(
         if (apiKey is null)
         {
             var creds = agentControl.GetCredentialsForStage(entry.WorkUnitId, entry.Stage)
-                ?? agentControl.GetOrchestratorCredentials(entry.WorkUnitId);
+                ?? agentControl.GetGoalDefaultCredentials(entry.WorkUnitId);
             model = creds?.Model;
             baseUrl = creds?.BaseUrl;
             apiKey = creds?.ApiKey;

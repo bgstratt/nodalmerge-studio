@@ -80,9 +80,9 @@ public class ReplanExecutorSeamTests : IDisposable
         // Explicit Plan-stage Agent Topology assignment naming the claude-cli provider — the
         // override that wins outright regardless of WorkspaceOptions.UsePlannerExecutorSelection
         // (off here, the default), same precedence D2 established.
-        var stageCredentials = new Dictionary<PipelineStage, OrchestratorCredentials>
+        var stageCredentials = new Dictionary<PipelineStage, GoalDefaultCredentials>
         {
-            [PipelineStage.Plan] = new OrchestratorCredentials("claude-cli", "", "", "", null),
+            [PipelineStage.Plan] = new GoalDefaultCredentials("claude-cli", "", "", "", null),
         };
 
         await agentControl.SpawnAsync(

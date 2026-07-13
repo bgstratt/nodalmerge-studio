@@ -14,11 +14,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 {
     private readonly ConcurrentDictionary<(string AgentId, string WorkUnitId), ExecutionSnapshot> _snapshots = new();
     private readonly ConcurrentDictionary<string, AgentRecord> _agents = new();
-    private readonly ConcurrentDictionary<string, OrchestratorRegistration> _orchestratorRegistrations = new();
-    // Safe-to-persist subset of OrchestratorRegistration (no ApiKey anywhere), rehydrated from
-    // IStudioNodeStore on startup — this is what survives a Host restart. _orchestratorRegistrations
+    private readonly ConcurrentDictionary<string, GoalCredentialRegistration> _goalCredentialRegistrations = new();
+    // Safe-to-persist subset of GoalCredentialRegistration (no ApiKey anywhere), rehydrated from
+    // IStudioNodeStore on startup — this is what survives a Host restart. _goalCredentialRegistrations
     // above is checked first (same-process hot path, has real credentials); this is the fallback.
-    private readonly ConcurrentDictionary<string, OrchestratorRoutingConfig> _orchestratorRouting = new();
+    private readonly ConcurrentDictionary<string, GoalRoutingConfig> _goalRouting = new();
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<InMemoryAgentRuntimeService> _logger;
     private readonly IAgentProfileService _profileService;
@@ -76,9 +76,9 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     // Captured at SpawnAsync("orchestrator", ...) time so ReinvokeOrchestratorAsync can restart
     // the loop with the same credentials/profile later, without the caller (WorkSchedulerService)
     // needing to remember or re-supply them.
-    private sealed record OrchestratorRegistration(
+    private sealed record GoalCredentialRegistration(
         string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? AutoReviewProfileId,
-        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? StageCredentials = null,
+        IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? StageCredentials = null,
         IReadOnlyList<string>? EnabledDomainAgents = null,
         string? CredentialRef = null);
 
@@ -86,7 +86,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        await RehydrateOrchestratorRoutingAsync(cancellationToken).ConfigureAwait(false);
+        await RehydrateGoalRoutingAsync(cancellationToken).ConfigureAwait(false);
         await RehydrateInterruptedAgentsAsync(cancellationToken).ConfigureAwait(false);
         _pollCts = new CancellationTokenSource();
         _ = Task.Run(() => PollSchedulerAsync(_pollCts.Token), CancellationToken.None);
@@ -94,24 +94,28 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
     // Restores the safe (no-ApiKey) subset of every orchestrator's registration so
     // GetAutoReviewProfileId/GetEnabledDomainAgents/routing work immediately after a restart, with
-    // zero credential resupply required — _orchestratorRegistrations itself (with real credentials)
+    // zero credential resupply required — _goalCredentialRegistrations itself (with real credentials)
     // intentionally stays empty until something re-spawns or resupplies via the Resume flow.
-    private async Task RehydrateOrchestratorRoutingAsync(CancellationToken ct)
+    private async Task RehydrateGoalRoutingAsync(CancellationToken ct)
     {
         try
         {
-            var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.OrchestratorRoutingV1, ct)
-                .ConfigureAwait(false);
-            foreach (var (entityId, payloadJson) in records)
+            // Legacy kind first, current kind second — a goal that was re-persisted after the
+            // GoalRoutingV1 rename has records under both, and the current one must win.
+            foreach (var kind in new[] { StudioNodeKind.OrchestratorRoutingV1, StudioNodeKind.GoalRoutingV1 })
             {
-                var routing = JsonSerializer.Deserialize<OrchestratorRoutingConfig>(payloadJson);
-                if (routing is not null)
-                    _orchestratorRouting[entityId] = routing;
+                var records = await _nodeStore.ReadAllNodesAsync(kind, ct).ConfigureAwait(false);
+                foreach (var (entityId, payloadJson) in records)
+                {
+                    var routing = JsonSerializer.Deserialize<GoalRoutingConfig>(payloadJson);
+                    if (routing is not null)
+                        _goalRouting[entityId] = routing;
+                }
             }
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "[Rehydration] Failed to restore orchestrator routing config.");
+            _logger.LogWarning(ex, "[Rehydration] Failed to restore goal routing config.");
         }
     }
 
@@ -669,7 +673,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? provider = null,
         string? profileId = null,
         string? autoReviewProfileId = null,
-        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+        IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
         IReadOnlyList<string>? enabledDomainAgents = null,
         string? credentialRef = null,
         CancellationToken cancellationToken = default)
@@ -707,7 +711,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             if (agentType == "orchestrator")
             {
                 StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
-                _orchestratorRegistrations[workUnitId] = new OrchestratorRegistration(
+                _goalCredentialRegistrations[workUnitId] = new GoalCredentialRegistration(
                     resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId, autoReviewProfileId,
                     stageCredentials, enabledDomainAgents, credentialRef);
 
@@ -715,14 +719,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
                 // The safe subset — no ApiKey anywhere in this record — persisted so
                 // GetAutoReviewProfileId/GetEnabledDomainAgents/routing survive a Host restart even
-                // though _orchestratorRegistrations above (the hot path, with real credentials)
-                // doesn't. See RehydrateOrchestratorRoutingAsync for the read side.
-                var routing = new OrchestratorRoutingConfig(
+                // though _goalCredentialRegistrations above (the hot path, with real credentials)
+                // doesn't. See RehydrateGoalRoutingAsync for the read side.
+                var routing = new GoalRoutingConfig(
                     workUnitId, resolvedProvider, loopModel, baseUrl!, profileId, autoReviewProfileId,
                     credentialRef, stageCredentials, enabledDomainAgents);
-                _orchestratorRouting[workUnitId] = routing;
+                _goalRouting[workUnitId] = routing;
                 await _nodeStore.WriteNodeAsync(
-                    StudioNodeKind.OrchestratorRoutingV1, workUnitId,
+                    StudioNodeKind.GoalRoutingV1, workUnitId,
                     JsonSerializer.Serialize(routing), cancellationToken).ConfigureAwait(false);
             }
             else if (agentType == "worker" && taskId is not null)
@@ -735,7 +739,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         return agentId;
     }
 
-    private readonly record struct ResolvedOrchestratorCredentials(
+    private readonly record struct ResolvedGoalDefaultCredentials(
         string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? CredentialRef);
 
     // Shared by ReinvokeOrchestratorAsync and ResupplyCredentialsAsync — both need the exact same
@@ -744,7 +748,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     // restart/lookup recovers it too. The only difference between the two callers is whether an
     // orchestrator loop then gets spawned on top of this — see ResupplyCredentialsAsync's own doc
     // comment on IAgentControlService for why a requeue doesn't always want that.
-    private async Task<ResolvedOrchestratorCredentials?> ResolveAndPersistCredentialsAsync(
+    private async Task<ResolvedGoalDefaultCredentials?> ResolveAndPersistCredentialsAsync(
         string workUnitId,
         string? overrideModel, string? overrideBaseUrl, string? overrideApiKey, string? overrideProvider,
         string? overrideProfileId, string? overrideCredentialRef,
@@ -754,18 +758,18 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? provider = overrideProvider, model = overrideModel, baseUrl = overrideBaseUrl;
         string? apiKey = overrideApiKey, profileId = overrideProfileId, credentialRef = overrideCredentialRef;
         string? autoReviewProfileId = null;
-        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null;
+        IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null;
         IReadOnlyList<string>? enabledDomainAgents = null;
 
         // Same-process hot path first (real ApiKey already in memory, no cache lookup needed).
-        if (_orchestratorRegistrations.TryGetValue(workUnitId, out var reg))
+        if (_goalCredentialRegistrations.TryGetValue(workUnitId, out var reg))
         {
             provider ??= reg.Provider; model ??= reg.Model; baseUrl ??= reg.BaseUrl; apiKey ??= reg.ApiKey;
             profileId ??= reg.ProfileId; credentialRef ??= reg.CredentialRef;
             autoReviewProfileId = reg.AutoReviewProfileId;
             stageCredentials = reg.StageCredentials; enabledDomainAgents = reg.EnabledDomainAgents;
         }
-        else if (_orchestratorRouting.TryGetValue(workUnitId, out var routing))
+        else if (_goalRouting.TryGetValue(workUnitId, out var routing))
         {
             // Rehydrated-safe fields survive a restart with no credential resupply needed;
             // ApiKey never does (by design — see IRuntimeCredentialCache's doc comment), so this
@@ -782,7 +786,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             model ??= cached?.Model; baseUrl ??= cached?.BaseUrl; provider ??= cached?.Provider;
         }
         // No registration and no routing at all — this work unit's orchestrator predates both
-        // (spawned before OrchestratorRoutingConfig persistence existed at all, so there's
+        // (spawned before GoalRoutingConfig persistence existed at all, so there's
         // nothing on record to recover from). Automatic reinvocation (WorkSchedulerService.
         // ReleaseAsync's success path) never passes override params, so for that caller this
         // correctly falls straight through to the apiKey-is-null no-op below, same as before.
@@ -790,7 +794,18 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         // prompting for a profile when none is on record) can still recover it by supplying
         // everything needed itself.
 
-        if (string.IsNullOrWhiteSpace(baseUrl) || apiKey is null)
+        // CLI providers (claude-cli, codex-cli, …) legitimately have no baseUrl and no ApiKey —
+        // blank key means ambient CLI auth by design, and the adapters ignore baseUrl entirely.
+        // The blank-baseUrl gate below predates CLI providers and used to refuse to register
+        // anything for them, forcing callers to invent placeholder baseUrls
+        // (plans/orchestrator-pure-service.md M1 closes that wart).
+        var isCliProvider = _serviceProvider.GetService<IHarnessExecutorResolver>()?.IsCliProvider(provider) ?? false;
+        if (isCliProvider)
+        {
+            baseUrl ??= string.Empty;
+            apiKey ??= string.Empty;
+        }
+        else if (string.IsNullOrWhiteSpace(baseUrl) || apiKey is null)
         {
             _logger.LogWarning(
                 "[Orchestrator] {ActionName} for workUnit={WorkUnitId} skipped — no credentials resolvable " +
@@ -804,22 +819,22 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         model ??= string.Empty;
         _credentialCache.Capture(credentialRef, provider, model, baseUrl, apiKey);
 
-        // Re-warm the hot path so subsequent same-process calls (GetOrchestratorCredentials,
+        // Re-warm the hot path so subsequent same-process calls (GetGoalDefaultCredentials,
         // GetAutoReviewProfileId, another ReinvokeOrchestratorAsync/ResupplyCredentialsAsync, ...)
         // skip the cache lookup — and (re)persist the safe routing config, so a *future* restart
         // can recover this orchestrator too, closing the gap that got it here in the first place.
-        _orchestratorRegistrations[workUnitId] = new OrchestratorRegistration(
+        _goalCredentialRegistrations[workUnitId] = new GoalCredentialRegistration(
             provider, model, baseUrl, apiKey, profileId, autoReviewProfileId,
             stageCredentials, enabledDomainAgents, credentialRef);
-        var routingToPersist = new OrchestratorRoutingConfig(
+        var routingToPersist = new GoalRoutingConfig(
             workUnitId, provider, model, baseUrl, profileId, autoReviewProfileId,
             credentialRef, stageCredentials, enabledDomainAgents);
-        _orchestratorRouting[workUnitId] = routingToPersist;
+        _goalRouting[workUnitId] = routingToPersist;
         await _nodeStore.WriteNodeAsync(
-            StudioNodeKind.OrchestratorRoutingV1, workUnitId,
+            StudioNodeKind.GoalRoutingV1, workUnitId,
             JsonSerializer.Serialize(routingToPersist), cancellationToken).ConfigureAwait(false);
 
-        return new ResolvedOrchestratorCredentials(provider, model, baseUrl, apiKey, profileId, credentialRef);
+        return new ResolvedGoalDefaultCredentials(provider, model, baseUrl, apiKey, profileId, credentialRef);
     }
 
     public async Task ReinvokeOrchestratorAsync(
@@ -871,27 +886,27 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     // return anything non-null after a Host restart — and only once something has resupplied the
     // credential (e.g. the Resume flow). A cache miss there means a genuinely missing credential,
     // not a bug: the caller (e.g. AutomatedReviewGateService) already treats null as "not enabled."
-    public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId)
+    public GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId)
     {
-        if (_orchestratorRegistrations.TryGetValue(workUnitId, out var reg))
-            return new OrchestratorCredentials(reg.Provider, reg.Model, reg.BaseUrl, reg.ApiKey, reg.ProfileId, reg.CredentialRef);
+        if (_goalCredentialRegistrations.TryGetValue(workUnitId, out var reg))
+            return new GoalDefaultCredentials(reg.Provider, reg.Model, reg.BaseUrl, reg.ApiKey, reg.ProfileId, reg.CredentialRef);
 
-        if (!_orchestratorRouting.TryGetValue(workUnitId, out var routing))
+        if (!_goalRouting.TryGetValue(workUnitId, out var routing))
             return null;
 
         var cached = _credentialCache.TryGet(routing.CredentialRef);
         if (cached is null)
             return null;
 
-        return new OrchestratorCredentials(cached.Provider, cached.Model, cached.BaseUrl, cached.ApiKey, routing.ProfileId, routing.CredentialRef);
+        return new GoalDefaultCredentials(cached.Provider, cached.Model, cached.BaseUrl, cached.ApiKey, routing.ProfileId, routing.CredentialRef);
     }
 
-    public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage)
+    public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage)
     {
-        if (_orchestratorRegistrations.TryGetValue(workUnitId, out var reg))
+        if (_goalCredentialRegistrations.TryGetValue(workUnitId, out var reg))
             return reg.StageCredentials?.GetValueOrDefault(stage);
 
-        if (!_orchestratorRouting.TryGetValue(workUnitId, out var routing) ||
+        if (!_goalRouting.TryGetValue(workUnitId, out var routing) ||
             routing.StageCredentials?.GetValueOrDefault(stage) is not { } stageRouting)
             return null;
 
@@ -903,18 +918,18 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     // restart with zero credential resupply needed. This is what fixes review routing silently
     // falling back to human review after a Host restart.
     public string? GetAutoReviewProfileId(string workUnitId) =>
-        _orchestratorRegistrations.TryGetValue(workUnitId, out var reg) ? reg.AutoReviewProfileId
-        : _orchestratorRouting.TryGetValue(workUnitId, out var routing) ? routing.AutoReviewProfileId
+        _goalCredentialRegistrations.TryGetValue(workUnitId, out var reg) ? reg.AutoReviewProfileId
+        : _goalRouting.TryGetValue(workUnitId, out var routing) ? routing.AutoReviewProfileId
         : null;
 
-    public string? GetOrchestratorProfileId(string workUnitId) =>
-        _orchestratorRegistrations.TryGetValue(workUnitId, out var reg) ? reg.ProfileId
-        : _orchestratorRouting.TryGetValue(workUnitId, out var routing) ? routing.ProfileId
+    public string? GetGoalDefaultProfileId(string workUnitId) =>
+        _goalCredentialRegistrations.TryGetValue(workUnitId, out var reg) ? reg.ProfileId
+        : _goalRouting.TryGetValue(workUnitId, out var routing) ? routing.ProfileId
         : null;
 
     public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) =>
-        _orchestratorRegistrations.TryGetValue(workUnitId, out var reg) ? reg.EnabledDomainAgents
-        : _orchestratorRouting.TryGetValue(workUnitId, out var routing) ? routing.EnabledDomainAgents
+        _goalCredentialRegistrations.TryGetValue(workUnitId, out var reg) ? reg.EnabledDomainAgents
+        : _goalRouting.TryGetValue(workUnitId, out var routing) ? routing.EnabledDomainAgents
         : null;
 
     private void StartOrchestratorLoop(

@@ -136,7 +136,7 @@ public sealed class ReconciliationAgentService(
     // credentials, then (if it's itself a fan-out child) the same two lookups on its parent. Tries
     // every source participant in order — any one of the conflicting goals' own credentials working
     // is enough to get the reconciliation agent started.
-    private OrchestratorCredentials? ResolveCredentials(IEnumerable<WorkUnit?> owners)
+    private GoalDefaultCredentials? ResolveCredentials(IEnumerable<WorkUnit?> owners)
     {
         foreach (var owner in owners)
         {
@@ -144,10 +144,10 @@ public sealed class ReconciliationAgentService(
                 continue;
 
             var creds = agentControl!.GetCredentialsForStage(owner.WorkUnitId, PipelineStage.Execute)
-                ?? agentControl.GetOrchestratorCredentials(owner.WorkUnitId)
+                ?? agentControl.GetGoalDefaultCredentials(owner.WorkUnitId)
                 ?? (owner.ParentWorkUnitId is { } parentId
                     ? agentControl.GetCredentialsForStage(parentId, PipelineStage.Execute)
-                        ?? agentControl.GetOrchestratorCredentials(parentId)
+                        ?? agentControl.GetGoalDefaultCredentials(parentId)
                     : null);
             if (creds is not null)
                 return creds;
