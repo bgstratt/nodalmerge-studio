@@ -134,13 +134,13 @@ export function init(ctx) {
       resumeParkedBtn.style.display = 'none';
     }
 
-    // No live agent and nothing parked — most commonly every child finished while the
-    // orchestrator's registration was cold after a restart, so it was never woken back up to
-    // notice and decide what's next (or finalize the goal). Mutually exclusive with the parked
-    // badge above by construction (server only sets orchestratorStalled when nothing is parked).
+    // No live agent, no queued work, and nothing parked — nothing is driving the goal forward.
+    // Mutually exclusive with the parked badge above by construction (server only sets
+    // orchestratorStalled when nothing is parked). The Reinvoke button runs the server's
+    // credential-free convergence sweep (plans/orchestrator-pure-service.md M2).
     var orchestratorStalled = !!(session && session.orchestratorStalled);
     if (orchestratorStalled) {
-      stalledBadge.title = 'No orchestrator is running for this goal and nothing is blocking it — it likely never got reinvoked after a Host restart. Click Reinvoke Orchestrator to wake it back up.';
+      stalledBadge.title = 'Nothing is driving this goal forward — no running agent, no queued work, and nothing blocked. Click Reinvoke to run a convergence sweep (it re-enqueues the planner if the goal never got one).';
       stalledBadge.style.display = '';
       reinvokeBtn.style.display = '';
     } else {

@@ -42,8 +42,24 @@
         Tests needing the queue must `agentRuntime.StartAsync` (the old direct-spawn flow
         didn't). `ScriptedLlmHandler` deliberately kept its dead orchestrator branch out of
         worker-only tests' way — untouched.
-- [ ] M3 — Extension: Agent Topology relabel, spawn-path swap, AP-6 gate deletion,
-      credential-free Reinvoke
+- [x] M3 — Extension: Agent Topology relabel, AP-6 gate deletion, credential-free Reinvoke —
+      shipped 2026-07-13 (tsc + esbuild + webview-smoke all green). Notes:
+      - Topology UI says **Default** everywhere ("Default Profile" column/label, "— inherit
+        Default —"); the template wire field stays `orchestrator` so stored templates round-trip
+        (per resolved question 1's read-both posture — display-only relabel client-side).
+      - Built-in Default profile relabeled ("Default", still `id: 'orchestrator'`, still
+        vscode-lm per resolved question 2).
+      - ArtifactExplorerPanel's AP-6 CLI block deleted (any provider valid for the Default
+        profile); `handleReinvokeOrchestrator` lost the profile picker — reinvoke is
+        credential-free, sends resolvable Default-profile creds along only as a registry re-warm;
+        button relabeled "↺ Reinvoke", stalled tooltip reworded to convergence-sweep language.
+      - `defaultProfileId` read from GET /studio/goals with fallback to the legacy
+        `orchestratorProfileId`.
+      - No spawn-path change was needed: POST /studio/agents/spawn with agentType
+        "orchestrator" is the kept alias (M2).
+      - Pending manual smoke (do alongside M4's eval): create a goal with a claude-cli Default
+        profile and nothing else configured → plan → fan-out → work → agent review → merge →
+        workspace review → materialized, no API key anywhere.
 - [ ] M4 — Cleanup: prompts, dead events, stale docs; run the harness-comparison eval
       (now genuinely end-to-end on any profile)
 

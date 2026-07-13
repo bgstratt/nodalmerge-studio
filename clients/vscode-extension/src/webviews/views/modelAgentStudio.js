@@ -133,7 +133,7 @@ export function init(ctx) {
         '</select></div>' +
       '<div id="pf-cli-note" class="field muted' + (isCli ? '' : ' hidden') + '">' +
         'Runs the role via the local <code>' + esc(cliDisplayName(curProvider)) + '</code> CLI in the branch working ' +
-        'directory (assignable to the Worker, Planner, and Reviewer roles — the Orchestrator never delegates to a CLI). Auth comes from that CLI\'s own login; ' +
+        'directory (assignable to any role, or as the topology\'s Default profile). Auth comes from that CLI\'s own login; ' +
         'storing an API key below is optional and switches that role to key-based auth. ' +
         'Leave Model blank to use the CLI\'s default.' +
       '</div>' +
@@ -188,7 +188,7 @@ export function init(ctx) {
       if (cli) {
         noteEl.innerHTML =
           'Runs the role via the local <code>' + esc(cliDisplayName(this.value)) + '</code> CLI in the branch ' +
-          'working directory (assignable to the Worker, Planner, and Reviewer roles — the Orchestrator never delegates to a CLI). Auth comes from that CLI\'s own login; ' +
+          'working directory (assignable to any role, or as the topology\'s Default profile). Auth comes from that CLI\'s own login; ' +
           'storing an API key below is optional and switches that role to key-based auth. ' +
           'Leave Model blank to use the CLI\'s default.';
       }
@@ -307,7 +307,7 @@ export function init(ctx) {
 
   // ── Agent Topology ───────────────────────────────────────────────────────────
   function profileLabel(profileId) {
-    if (!profileId) { return '— inherit Orchestrator —'; }
+    if (!profileId) { return '— inherit Default —'; }
     const p = profiles.find(function(pr) { return pr.id === profileId; });
     return p ? p.label : profileId;
   }
@@ -356,7 +356,7 @@ export function init(ctx) {
   }
 
   function profileOptions(selected, includeInherit) {
-    const lead = includeInherit ? '<option value="">— inherit Orchestrator —</option>' : '';
+    const lead = includeInherit ? '<option value="">— inherit Default —</option>' : '';
     return lead + profiles.map(function(p) {
       const sel = p.id === selected ? ' selected' : '';
       return '<option value="' + esc(p.id) + '"' + sel + '>' + esc(p.label) + ' (' + esc(p.domain) + ')</option>';
@@ -372,15 +372,15 @@ export function init(ctx) {
       '<h3>' + (isNew ? 'Add Topology' : 'Edit Topology') + '</h3>' +
       '<div class="field"><label>Name</label>' +
         '<input type="text" id="tmpl-name" value="' + esc(t.name) + '" placeholder="e.g. Default"></div>' +
-      '<div class="field"><label>Orchestrator Profile</label>' +
+      '<div class="field"><label>Default Profile <span style="opacity:0.6">(the goal\'s credential anchor — every unset role inherits it)</span></label>' +
         '<select id="tmpl-orch">' + profileOptions(t.orchestrator, false) + '</select></div>' +
-      '<div class="field"><label>Planner Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+      '<div class="field"><label>Planner Profile <span style="opacity:0.6">(optional — falls back to Default)</span></label>' +
         '<select id="tmpl-planner">' + profileOptions(t.planner, true) + '</select></div>' +
-      '<div class="field"><label>Worker Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+      '<div class="field"><label>Worker Profile <span style="opacity:0.6">(optional — falls back to Default)</span></label>' +
         '<select id="tmpl-worker">' + profileOptions(t.worker, true) + '</select></div>' +
-      '<div class="field"><label>Reviewer Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+      '<div class="field"><label>Reviewer Profile <span style="opacity:0.6">(optional — falls back to Default)</span></label>' +
         '<select id="tmpl-reviewer">' + profileOptions(t.reviewer, true) + '</select></div>' +
-      '<div class="field"><label>Reconciler Profile <span style="opacity:0.6">(optional — falls back to Orchestrator; used to spawn conflict-reconciliation goals)</span></label>' +
+      '<div class="field"><label>Reconciler Profile <span style="opacity:0.6">(optional — falls back to Default; used to spawn conflict-reconciliation goals)</span></label>' +
         '<select id="tmpl-reconciler">' + profileOptions(t.reconciler, true) + '</select></div>' +
       '<div class="form-actions">' +
         '<button id="tmpl-save">Save</button>' +
@@ -394,7 +394,7 @@ export function init(ctx) {
       const worker     = $('tmpl-worker').value;
       const reviewer   = $('tmpl-reviewer').value;
       const reconciler = $('tmpl-reconciler').value;
-      if (!name || !orch) { alert('Name and Orchestrator Profile are required.'); return; }
+      if (!name || !orch) { alert('Name and Default Profile are required.'); return; }
       const tmpl = {
         name: name,
         orchestrator: orch,

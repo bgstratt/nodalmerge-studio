@@ -40,16 +40,20 @@ export interface AgentProfile {
 
 export interface TopologyTemplate {
   name:         string;
+  // The goal's Default profile — displayed as "Default" everywhere since
+  // plans/orchestrator-pure-service.md M3 (the orchestrator LLM role no longer exists; this is
+  // purely the credential anchor every unset role inherits). The field name stays `orchestrator`
+  // on the wire so stored templates keep round-tripping.
   orchestrator: string;
   // Optional per-stage credential profile overrides — when unset, that stage inherits the
-  // orchestrator's profile (today's behavior). Profile ids reference entries from getProfiles().
+  // Default profile. Profile ids reference entries from getProfiles().
   planner?:     string;
   worker?:      string;
   reviewer?:    string;
   // Profile used to spawn the reconciliation agent when a candidate-branch or task-level conflict
-  // is Reconciled. Distinct from all four stage roles above: reconciliation work units aren't part
-  // of any goal's own Plan/Execute/Review pipeline, so there's no natural "inherit" fallback among
-  // them — falls back to the orchestrator profile only if unset, same as the others.
+  // is Reconciled. Distinct from all three stage roles above: reconciliation work units aren't
+  // part of any goal's own Plan/Execute/Review pipeline, so there's no natural "inherit" fallback
+  // among them — falls back to the Default profile only if unset, same as the others.
   reconciler?:  string;
 }
 
@@ -75,9 +79,12 @@ export interface SpawnLlmConfig {
   credentialRef: string;
 }
 
+// The out-of-the-box Default profile is vscode-lm on purpose: a fresh install can start a goal
+// with zero credential setup inside VS Code (plans/orchestrator-pure-service.md, resolved
+// question 2). The id stays 'orchestrator' for stored-config round-tripping.
 const DEFAULT_PROFILES: AgentProfile[] = [
-  { id: 'orchestrator', label: 'Orchestrator', domain: 'orchestration', provider: 'vscode-lm', model: '' },
-  { id: 'worker',       label: 'Worker',       domain: 'general',       provider: 'vscode-lm', model: '' },
+  { id: 'orchestrator', label: 'Default', domain: 'orchestration', provider: 'vscode-lm', model: '' },
+  { id: 'worker',       label: 'Worker',  domain: 'general',       provider: 'vscode-lm', model: '' },
 ];
 
 const DEFAULT_TEMPLATES: TopologyTemplate[] = [
