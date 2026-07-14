@@ -63,6 +63,22 @@ public class HarnessReviewModeSeamTests : IDisposable
         return WriteStub("stub-claude.cmd", script);
     }
 
+    // Simulates a model that cd'd into a nested project directory to run tests and never cd'd back:
+    // it writes its verdict to <subdir>/.workspace/review.json instead of the branch-root
+    // .workspace/review.json. Exercises HarnessHarvestPipeline's misplaced-verdict recovery.
+    private string WriteClaudeStubNestedVerdict(string verdictJson, string jsonl)
+    {
+        Directory.CreateDirectory(_stubDir);
+        File.WriteAllText(Path.Combine(_stubDir, "output.jsonl"), jsonl);
+        File.WriteAllText(Path.Combine(_stubDir, "review.json"), verdictJson);
+        var script =
+            "@echo off\r\n" +
+            "if not exist nested\\.workspace mkdir nested\\.workspace\r\n" +
+            "copy /Y \"%~dp0review.json\" \"nested\\.workspace\\review.json\" >nul\r\n" +
+            "type \"%~dp0output.jsonl\"\r\n";
+        return WriteStub("stub-claude-nested.cmd", script);
+    }
+
     private static IServiceProvider BuildApp(Action<IServiceCollection> configure)
     {
         var app = StudioWebApplication.Build(
@@ -117,8 +133,9 @@ public class HarnessReviewModeSeamTests : IDisposable
         var services = BuildApp(s =>
             s.AddSingleton(new ClaudeCodeExecutorOptions { ExecutablePath = stub, TimeoutSeconds = 30 }));
 
-        // AgentApproval: an automated Approved verdict is terminal (Approved), not handed back to
-        // a human — the policy-dependent status AutomatedReviewAsync itself owns.
+        // AgentApproval on a real-repo proposal auto-applies on approval: the verdict lands as
+        // Approved and then immediately merges (the documented "auto-applies on approval"), so the
+        // observable terminal status is Merged with AutoApplied set.
         var (wu, proposal) = await ArrangeProposalAsync(services, ReviewPolicy.AgentApproval);
         var fileWorkspace = services.GetRequiredService<IFileWorkspaceService>();
         var merge = services.GetRequiredService<IMergeService>();
@@ -136,7 +153,8 @@ public class HarnessReviewModeSeamTests : IDisposable
         Assert.Contains("src/A.cs", reviewRequestJson);
 
         var reviewed = await merge.GetAsync(proposal.ProposalId);
-        Assert.Equal(MergeProposalStatus.Approved, reviewed!.Status);
+        Assert.Equal(MergeProposalStatus.Merged, reviewed!.Status);
+        Assert.True(reviewed.AutoApplied);
         Assert.Contains("matches the goal", reviewed.VerificationResults);
         Assert.Equal("agent-claude-review-1", reviewed.ReviewedBy);
     }
@@ -211,7 +229,8 @@ public class HarnessReviewModeSeamTests : IDisposable
 
         Assert.Equal(AgentLoopCompletion.Succeeded, result.Completion);
         var reviewed = await merge.GetAsync(proposal.ProposalId);
-        Assert.Equal(MergeProposalStatus.Approved, reviewed!.Status);
+        Assert.Equal(MergeProposalStatus.Merged, reviewed!.Status);
+        Assert.True(reviewed.AutoApplied);
         Assert.Contains("builds clean", reviewed.VerificationResults);
     }
 
@@ -243,6 +262,35 @@ public class HarnessReviewModeSeamTests : IDisposable
         Assert.True(inlineResult.Approved);
         Assert.Contains("Inline route verified", inlineResult.Notes);
         var reviewed = await merge.GetAsync(proposal.ProposalId);
-        Assert.Equal(MergeProposalStatus.Approved, reviewed!.Status);
+        Assert.Equal(MergeProposalStatus.Merged, reviewed!.Status);
+        Assert.True(reviewed.AutoApplied);
+    }
+
+    [Fact]
+    public async Task Misplaced_verdict_in_nested_workspace_is_recovered_not_stalled()
+    {
+        // The model wrote its verdict to nested/.workspace/review.json (a dir it cd'd into) instead
+        // of the branch-root .workspace/review.json. The harvest must recover it rather than Stall a
+        // review that genuinely produced a verdict.
+        var stub = WriteClaudeStubNestedVerdict(
+            """{"decision":"Approved","verificationResults":"Recovered from nested dir."}""",
+            ClaudeSuccessJsonl("stub-session-nested"));
+        var services = BuildApp(s =>
+            s.AddSingleton(new ClaudeCodeExecutorOptions { ExecutablePath = stub, TimeoutSeconds = 30 }));
+
+        var (wu, proposal) = await ArrangeProposalAsync(services, ReviewPolicy.AgentApproval);
+        var merge = services.GetRequiredService<IMergeService>();
+        var resolver = services.GetRequiredService<IHarnessExecutorResolver>();
+
+        var result = await resolver.Resolve("claude-code")
+            .RunAsync(ReviewRequest(wu, proposal.ProposalId, "agent-claude-review-nested"));
+
+        // Not Stalled: the verdict was recovered from the misplaced nested path and landed the same
+        // way a root-written verdict would (AgentApproval auto-applies → Merged).
+        Assert.Equal(AgentLoopCompletion.Succeeded, result.Completion);
+        var reviewed = await merge.GetAsync(proposal.ProposalId);
+        Assert.Equal(MergeProposalStatus.Merged, reviewed!.Status);
+        Assert.True(reviewed.AutoApplied);
+        Assert.Contains("Recovered from nested dir", reviewed.VerificationResults);
     }
 }

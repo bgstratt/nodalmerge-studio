@@ -153,17 +153,30 @@ internal sealed class GoalCoordinator(IServiceProvider serviceProvider, ILogger<
         if (pending.Any(p => p.WorkUnitId == workUnitId))
             return;
 
+        // A reconciliation work unit (see ReconciliationAgentService.BuildReconciliationGoal) already
+        // carries a single, fully-formed goal — merge these already-completed sibling changes into one
+        // coherent result. It must never go through the Planner: planning would re-decompose that
+        // already-done work into a fresh task list and fan it back out, which is exactly the
+        // re-litigate-everything behavior reconciliation exists to avoid (a single reconciler agent
+        // doing the merge directly, not a planner/fan-out over it again). Route it straight to the
+        // "reconciler" profile instead, on the same enqueue path planning would have used.
+        var isReconciliation = unit.ReconciliationSourceProposalIds is { Count: > 0 };
+
         // Credential injection — ported from OrchestratorAgentLoop.InjectSpawnCredentialsAsync:
         // the Plan-stage Agent Topology override wins; otherwise the goal's Default-profile
         // credentials, with the D2 planner-executor selection consulted only when the Plan stage
-        // is auto/unset (an explicit per-stage assignment is never second-guessed).
+        // is auto/unset (an explicit per-stage assignment is never second-guessed). Reconciliation
+        // units use the Reconcile stage instead and skip planner selection entirely — there is no
+        // planning decision to make.
         var agentControl = serviceProvider.GetService<IAgentControlService>();
-        var stageCreds = agentControl?.GetCredentialsForStage(workUnitId, PipelineStage.Plan);
+        var stageCreds = agentControl?.GetCredentialsForStage(
+            workUnitId, isReconciliation ? PipelineStage.Reconcile : PipelineStage.Plan);
         var defaultCreds = agentControl?.GetGoalDefaultCredentials(workUnitId);
-        var profileId = "planner";
+        var profileId = isReconciliation ? "reconciler" : "planner";
         string? selectedProvider = null;
 
-        if (stageCreds is null && serviceProvider.GetService<IPlannerSelectionService>() is { } plannerSelection)
+        if (!isReconciliation && stageCreds is null
+            && serviceProvider.GetService<IPlannerSelectionService>() is { } plannerSelection)
         {
             var selection = await plannerSelection.SelectPlannerAsync(unit, defaultCreds, ct).ConfigureAwait(false);
             profileId = selection.ProfileId;
@@ -176,9 +189,9 @@ internal sealed class GoalCoordinator(IServiceProvider serviceProvider, ILogger<
             // Same graceful degradation the credential-less spawn path always had: the goal stays
             // visible and a human can supply credentials and reinvoke. Never throw from here.
             logger.LogWarning(
-                "[GoalCoordinator] Planner enqueue for workUnit={WorkUnitId} skipped — no Plan-stage or " +
-                "Default-profile credentials registered. Resupply credentials and reinvoke to start planning.",
-                workUnitId);
+                "[GoalCoordinator] {Profile} enqueue for workUnit={WorkUnitId} skipped — no {Stage}-stage or " +
+                "Default-profile credentials registered. Resupply credentials and reinvoke to start.",
+                profileId, workUnitId, isReconciliation ? "Reconcile" : "Plan");
             return;
         }
 
@@ -194,8 +207,10 @@ internal sealed class GoalCoordinator(IServiceProvider serviceProvider, ILogger<
             ct: ct).ConfigureAwait(false);
 
         await RecordDecisionAsync(
-            workUnitId, OrchestrationAction.SpawnPlanner, [workUnitId],
-            $"Enqueued planner (profile '{profileId}') for goal start.", sessionId, ct).ConfigureAwait(false);
+            workUnitId, isReconciliation ? OrchestrationAction.SpawnWorker : OrchestrationAction.SpawnPlanner,
+            [workUnitId],
+            $"Enqueued {(isReconciliation ? "reconciler" : "planner")} (profile '{profileId}') for goal start.",
+            sessionId, ct).ConfigureAwait(false);
     }
 
     private async Task RecordDecisionAsync(

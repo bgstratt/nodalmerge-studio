@@ -25,7 +25,10 @@ internal sealed class ClaudeCodeExecutor(
     HarnessHarvestPipeline harvest,
     ClaudeCodeExecutorOptions options,
     ILogger<ClaudeCodeExecutor> logger,
-    IExecutionEventStream? events = null) : IHarnessExecutor
+    IExecutionEventStream? events = null,
+    // Optional so direct-construction test call sites keep compiling — when null, Review mode
+    // just falls back to wu.BranchId (today's, occasionally-wrong, behavior).
+    IMergeService? merge = null) : IHarnessExecutor
 {
     public string Name => "claude-code";
 
@@ -57,11 +60,35 @@ internal sealed class ClaudeCodeExecutor(
     // generators below must agree.
     private const string HarnessMcpServerName = "nodalmerge-harness";
 
+    // Must match WorkspaceContractService.MaterializeAsync's own stem list exactly (manifest,
+    // goal, workunit, state, constraints, review-policy) — see this file's RunAsync for why.
+    private static readonly string[] ContractFileStems =
+        ["manifest", "goal", "workunit", "state", "constraints", "review-policy"];
+
     public async Task<HarnessRunResult> RunAsync(HarnessRunRequest request, CancellationToken ct = default)
     {
         var wu = await workUnits.GetAsync(request.WorkUnitId, ct).ConfigureAwait(false)
             ?? throw new InvalidOperationException($"Work unit '{request.WorkUnitId}' was not found.");
         var branchId = wu.BranchId;
+
+        // Reviewing a goal-level RECONCILED proposal: proposal.SourceBranch is
+        // merge/{parentWorkUnitId} — a different branch from the owning work unit's own BranchId
+        // (its pristine, pre-reconciliation content). For an ordinary per-task proposal the two
+        // coincide by construction, so this was invisible there; only reconciled proposals actually
+        // differ. Using wu.BranchId unconditionally materialized the reviewer into the WRONG
+        // directory — one that never received the reconciled changes — producing a false "the file
+        // doesn't exist" rejection even though NodalMerge's own diff engine (proposal.
+        // WorkspaceChanges) correctly showed the content present in the real source branch. Found
+        // live 2026-07-13 on a reconciled welcome-endpoint proposal.
+        if (request.Mode == HarnessMode.Review && merge is not null)
+        {
+            // TaskId doubles as the proposal id for a Review-mode request (see
+            // InlineReviewerService/AutomatedReviewGateService's enqueue call sites — both pass the
+            // MergeProposal's own id positionally where an Execute-mode request would pass a task id).
+            var proposal = await merge.GetAsync(request.TaskId, ct).ConfigureAwait(false);
+            if (proposal is not null)
+                branchId = proposal.SourceBranch;
+        }
 
         // Same "resolve the real on-disk directory" call WorkspaceExecutionService/
         // WorkspaceCacheManager already use — no new plumbing needed for cwd resolution.
@@ -70,7 +97,22 @@ internal sealed class ClaudeCodeExecutor(
 
         // Materializes .workspace/{manifest,goal,workunit,state,constraints,review-policy}.json
         // (+ .md siblings) — the runtime→harness half of the contract, built in Phase A.
+        // IWorkspaceContractService.MaterializeAsync always writes into wu.BranchId internally
+        // (it takes a workUnitId, not a branchId, and has no override) — when branchId above was
+        // redirected to proposal.SourceBranch (a reconciled review), the CLI's actual cwd is a
+        // DIFFERENT directory than the one these contract files just landed in. Confirmed live
+        // 2026-07-13: the reviewer's very first tool call, Read(".workspace/goal.md"), came back
+        // "File does not exist" — it was looking in merge/{parentWorkUnitId} for a file that only
+        // ever gets written to wu.BranchId. Copy the same 12 contract files over so both directories
+        // agree; a no-op when branchId == wu.BranchId (every non-reconciled review).
         await workspaceContracts.MaterializeAsync(request.WorkUnitId, ct).ConfigureAwait(false);
+        if (!string.Equals(branchId, wu.BranchId, StringComparison.Ordinal))
+        {
+            var contractFiles = ContractFileStems
+                .SelectMany(stem => new[] { $".workspace/{stem}.json", $".workspace/{stem}.md" })
+                .ToArray();
+            await fileWorkspace.CopyFilesAsync(wu.BranchId, branchId, contractFiles, ct).ConfigureAwait(false);
+        }
 
         // plans/review-seam-and-clarification-sessions.md S2 — Review mode additionally needs the
         // proposal metadata + diff framing on disk before the CLI spawns; a Review run with no
@@ -88,8 +130,23 @@ internal sealed class ClaudeCodeExecutor(
         // Resume identity — only reused on an attested resume (IsResume, set by the caller from
         // ScheduledItem.AttemptCount > 0), not on every run, so a fresh first attempt never
         // accidentally resumes a stale session left over from an unrelated earlier attempt.
-        var resumeSessionId = request.IsResume && wu.Metadata is { } metadata &&
-            metadata.TryGetValue(HarnessSessionMetadataKey, out var priorSessionId)
+        //
+        // Never for Review mode, though: AttemptCount > 0 is true for every retry after the FIRST
+        // one, forever — there is no separate "genuinely continue" vs. "this is attempt N, start
+        // clean" signal at this layer, so every retry (plain or with added steering context) kept
+        // resuming the exact same original --resume session id. A review's job is "reach one
+        // verdict, write one file"; once the model concludes (even wrongly, e.g. narrating a
+        // verdict without writing .workspace/review.json) that conclusion lives in the CLI's own
+        // session memory and gets carried into every future --resume of it, so a "retry" just
+        // re-confirms the same stale belief ("I already approved this") instead of re-examining
+        // anything. Confirmed live 2026-07-13: three consecutive retries of the same reviewer, same
+        // sessionId, each one increasingly convinced it had "already" written the verdict in a
+        // "prior cycle" it never actually completed. Studio's own Continue path (ContinueService +
+        // ReviewerAgentLoop's priorTurns) already provides a controlled, explicit "resume with
+        // context" for review — that's the correct mechanism for genuine continuation; blind CLI
+        // session resume for Review mode has no upside and this concrete downside.
+        var resumeSessionId = request.Mode != HarnessMode.Review && request.IsResume
+            && wu.Metadata is { } metadata && metadata.TryGetValue(HarnessSessionMetadataKey, out var priorSessionId)
                 ? priorSessionId
                 : null;
 
@@ -181,8 +238,16 @@ internal sealed class ClaudeCodeExecutor(
                     summary.ResultText, summary.InputTokens, summary.OutputTokens, summary.TotalCostUsd, summary.SessionId);
             }
 
+            // branchId, not wu.BranchId: for a reconciled review these differ (branchId was
+            // redirected to proposal.SourceBranch above), and this is the read-back step for the
+            // exact .workspace/review.json the CLI just wrote — HarvestReviewAsync reads from
+            // whatever branch is passed here. Passing wu.BranchId reads the WRONG directory (the
+            // goal's own untouched branch, which never receives this write), so harvest always saw
+            // no file even when the CLI had just written one successfully. Confirmed live
+            // 2026-07-13: an Edit tool call to review.json returned "updated successfully" in the
+            // same run that then dead-lettered with "did not write .workspace/review.json."
             return await harvest.HarvestAsync(
-                request, wu.BranchId, summary.ResultText, summary.InputTokens, summary.OutputTokens,
+                request, branchId, summary.ResultText, summary.InputTokens, summary.OutputTokens,
                 summary.TotalCostUsd, summary.SessionId, Name, "anthropic", ct)
                 .ConfigureAwait(false);
         }
@@ -449,8 +514,13 @@ internal sealed class ClaudeCodeExecutor(
               "contains the PROPOSED state of the branch, and review-request.json carries the " +
               "proposal's summary, files touched, and diff against the target. Inspect the changed " +
               "files, check them against the goal and any recorded constraints, and run the " +
-              "project's build/test commands if available to verify. Then write your verdict to " +
-              ".workspace/review.json as JSON matching this shape exactly: " +
+              "project's build/test commands if available to verify — if that requires a nested " +
+              "project directory, pass it as an argument (e.g. `dotnet test tests/Project` or " +
+              "`npm test --prefix tests/Project`) rather than `cd`-ing into it, since your shell " +
+              "keeps that directory for every later command including your final write below; if " +
+              "you do `cd` anywhere, `cd` back to this root directory before writing your verdict. " +
+              "Then write your verdict to .workspace/review.json (relative to THIS root directory, " +
+              "not any subdirectory you may have cd'd into) as JSON matching this shape exactly: " +
               "{\"decision\":\"Approved\",\"verificationResults\":\"...\"} — decision must be " +
               "\"Approved\" or \"Rejected\"; verificationResults is required, and on Rejected it " +
               "is the ONLY explanation the retried worker will see, so be specific about what to " +

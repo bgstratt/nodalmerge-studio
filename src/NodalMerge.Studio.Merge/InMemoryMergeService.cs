@@ -106,6 +106,12 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     {
         var proposal = GetRequired(proposalId);
 
+        // Idempotent for the already-validated case: a defensive re-validate (e.g. the auto-reviewer
+        // calling validate before checking status) returns the proposal unchanged rather than
+        // erroring. Other non-Draft statuses still can't transition here.
+        if (proposal.Status == MergeProposalStatus.ReadyForReview)
+            return proposal;
+
         if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.ReadyForReview))
         {
             throw new InvalidOperationException(
@@ -517,8 +523,36 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (nextStatus == MergeProposalStatus.Approved)
         {
-            await TryRetriggerParentReconciliationAsync(proposal.WorkUnitId, proposal.SessionId, cancellationToken)
-                .ConfigureAwait(false);
+            // WorkspaceReviewScope.AppliesToRealRepo proposals (the top-level reconciled proposal,
+            // or an independent repo-linked child) have no parent for TryRetriggerParentReconciliationAsync
+            // to fold into — that helper no-ops on ParentWorkUnitId is null. Their only other apply
+            // trigger is MergeReconciliationService's one-shot, fire-and-forget Task.Run at proposal
+            // CREATION time; if that attempt already failed (e.g. the reviewer stalled and this
+            // Approved verdict only arrived later, after retries), nothing else was ever going to
+            // call ApplyAsync again. Do it here so a later-arriving Approved verdict still lands.
+            if (WorkspaceReviewScope.AppliesToRealRepo(owningWorkUnit))
+            {
+                // AgentApproval auto-applies on approval. Hybrid must NOT: its human-override
+                // countdown is owned by AutoReviewRule's BeforeMerge gate (which schedules the
+                // timer and blocks immediate apply), and ReviewTimerService.ProcessExpiredAsync
+                // applies at expiry. A direct low-level apply here under Hybrid bypasses that gate,
+                // merges instantly, and destroys the override window — leave the proposal at
+                // Approved and let the gate that invoked this review schedule the timer on return
+                // (found via AutonomousReviewTests' Hybrid cases).
+                if (effectiveInlinePolicy == ReviewPolicy.AgentApproval)
+                {
+                    try
+                    {
+                        await ApplyAsync(proposalId, cancellationToken, autoApplied: true).ConfigureAwait(false);
+                    }
+                    catch { /* best-effort — the review already succeeded; apply can be retried/inspected separately */ }
+                }
+            }
+            else
+            {
+                await TryRetriggerParentReconciliationAsync(proposal.WorkUnitId, proposal.SessionId, cancellationToken)
+                    .ConfigureAwait(false);
+            }
         }
         else if (nextStatus == MergeProposalStatus.Rejected && owningWorkUnit?.ParentWorkUnitId is not null)
         {
@@ -751,6 +785,16 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // pass, including — trivially — the original one SourceRef would have named.
         if (owningWorkUnit?.ReconciliationSourceProposalIds is { Count: > 0 } sourceProposalIds)
         {
+            // Superseding only ever mutated the proposal object — the losing sibling's owning
+            // WorkUnit (badge status/currentStage) was never told its content actually landed via
+            // a different proposal, so it sat at whatever it was (typically Proposed/Reviewing)
+            // forever even though the goal's Activity Center (reading proposal-level events)
+            // correctly showed the proposal itself as Superseded. Mirror the same "content landed,
+            // flip to Merged" treatment already applied to a reconciliation parent's direct children
+            // further below (child.WorkUnitId -> Merged) — from the work unit's own perspective,
+            // superseded-and-folded-in is indistinguishable from directly merged.
+            var workUnitsForSupersede = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+
             foreach (var sourceProposalId in sourceProposalIds)
             {
                 if (_proposals.TryGetValue(sourceProposalId, out var sourceProposal)
@@ -767,6 +811,30 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                         sourceProposalId,
                         JsonSerializer.Serialize(supersededProposal),
                         cancellationToken).ConfigureAwait(false);
+
+                    if (workUnitsForSupersede is not null && sourceProposal.WorkUnitId is { } sourceWorkUnitId)
+                    {
+                        // Independent try/catch per call — an illegal status transition (e.g. the
+                        // work unit is already terminal some other way) must not also block the
+                        // stage clear; they're unrelated fields and one failing is not a reason to
+                        // skip the other. See the same fix on the direct-child Merged loop below.
+                        try
+                        {
+                            await workUnitsForSupersede.UpdateStatusAsync(
+                                sourceWorkUnitId, WorkUnitStatus.Merged, sourceProposal.SessionId, cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                        catch (InvalidOperationException) { }
+                        catch (KeyNotFoundException) { }
+
+                        try
+                        {
+                            await workUnitsForSupersede.SetCurrentStageAsync(sourceWorkUnitId, null, cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                        catch (InvalidOperationException) { }
+                        catch (KeyNotFoundException) { }
+                    }
                 }
             }
 
@@ -919,9 +987,48 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 try
                 {
                     var mergedUnit = await workUnits.GetAsync(proposal.WorkUnitId, cancellationToken).ConfigureAwait(false);
-                    await workUnits.UpdateStatusAsync(
-                        proposal.WorkUnitId, WorkUnitStatus.Merged, proposal.SessionId, cancellationToken).ConfigureAwait(false);
-                    await workUnits.SetCurrentStageAsync(proposal.WorkUnitId, null, cancellationToken).ConfigureAwait(false);
+
+                    // UpdateStatusAsync and SetCurrentStageAsync are independent try/catches, not one
+                    // — found live 2026-07-13/14: a goal-level reconciled proposal that reaches
+                    // Approved (and is now applied) via a LATER retry, after the goal was already
+                    // marked Completed by an earlier fix (see TryCompleteParentIfAllChildrenTerminalAsync),
+                    // hits an illegal Completed->Merged transition here. That exception used to be
+                    // caught by the try/catch wrapping this ENTIRE block, silently skipping not just
+                    // the stage clear but the fan-out dependent-enqueue and children-Merged loop below
+                    // too — so the goal's badge stayed stuck at "Completed" + currentStage "Review"
+                    // forever even though the merge had genuinely landed on disk. Splitting these
+                    // means a blocked status transition no longer blocks the (unrelated) stage clear
+                    // or anything that follows.
+                    try
+                    {
+                        await workUnits.UpdateStatusAsync(
+                            proposal.WorkUnitId, WorkUnitStatus.Merged, proposal.SessionId, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (InvalidOperationException) { }
+                    catch (KeyNotFoundException) { }
+
+                    try
+                    {
+                        await workUnits.SetCurrentStageAsync(proposal.WorkUnitId, null, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (InvalidOperationException) { }
+                    catch (KeyNotFoundException) { }
+
+                    // Record the repo snapshot that captured this merge's write-back so eviction can
+                    // reason about safety by snapshot identity rather than a CreatedAt-vs-UpdatedAt
+                    // timestamp race. The apply-time resync (BestEffortResyncAsync) stamps that
+                    // snapshot BEFORE this very UpdatedAt bump, so the old "snapshot postdates
+                    // UpdatedAt" heuristic could never hold for a freshly-merged real-repo unit —
+                    // leaving its branch dir un-evictable forever (WorkspaceCacheManagerMultiRepoTests).
+                    if (!string.IsNullOrEmpty(appliedSnapshotId))
+                    {
+                        try
+                        {
+                            await workUnits.SetMetadataAsync(
+                                proposal.WorkUnitId, "appliedSnapshotId", appliedSnapshotId, cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (KeyNotFoundException) { }
+                    }
 
                     // Phase 12 — IsReadyToEnqueueAsync now gates a dependent on its dependency
                     // reaching Merged, not Proposed. The existing trigger for
@@ -980,6 +1087,12 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                             await workUnits.UpdateStatusAsync(
                                 child.WorkUnitId, WorkUnitStatus.Merged, proposal.SessionId, cancellationToken)
                                 .ConfigureAwait(false);
+                        }
+                        catch (InvalidOperationException) { }
+                        catch (KeyNotFoundException) { }
+
+                        try
+                        {
                             await workUnits.SetCurrentStageAsync(child.WorkUnitId, null, cancellationToken)
                                 .ConfigureAwait(false);
                         }
@@ -1031,6 +1144,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         var mergeReconciliation = _serviceProvider?.GetService(typeof(IMergeReconciliationService)) as IMergeReconciliationService;
         var reconciliationOutcome = MergeReconciliationOutcome.NotApplicable;
         string? reconciledProposalId = null;
+        var reconciliationThrew = false;
         if (mergeReconciliation is not null)
         {
             try
@@ -1039,31 +1153,29 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 reconciliationOutcome = reconciliationResult.Outcome;
                 reconciledProposalId = reconciliationResult.ReconciledProposalId;
             }
-            catch { /* best-effort — still fine to mark Completed below if this failed for some other reason */ }
+            catch { reconciliationThrew = true; }
         }
 
-        // A Conflict outcome already moved (or tried to move) the parent to Reviewing itself —
-        // forcing Completed on top of that here would be wrong even when the transition happens to
-        // succeed (it would mask the very problem TryReconcileAsync just flagged).
-        if (reconciliationOutcome == MergeReconciliationOutcome.Conflict)
-            return;
-
-        // A reconciled proposal that hasn't cleared review yet (Draft pending the automated
-        // reviewer, ReadyForReview/UnderReview awaiting a human, or Rejected mid-retry) means the
-        // review gate owns this goal's completion from here — completing now would land the
-        // parent in terminal Completed BEFORE its workspace review finished, and a subsequent
-        // rejection's retry (an Executing write) would silently fail, wedging the goal forever
-        // with a rejected proposal and nothing running (found live 2026-07-13, first real
-        // agent-rejection at the workspace gate). The apply path lands the parent itself when the
-        // proposal merges, and GoalCoordinator's completion check is gated on the same
-        // Approved/Merged condition — this just makes the third completion path agree.
-        if (reconciliationOutcome is MergeReconciliationOutcome.Reconciled or MergeReconciliationOutcome.AlreadyReconciled
-            && reconciledProposalId is not null)
+        // Completion requires POSITIVE confirmation that a "main"-targeted proposal was actually
+        // produced and cleared review — never the absence of a Conflict. WaitingForChildren,
+        // NotApplicable, a null mergeReconciliation service, and a thrown exception all used to
+        // fall through to Completed below (the only outcome that bailed was Conflict, and only
+        // Reconciled/AlreadyReconciled got the approval re-check) — so a goal whose children landed
+        // through several cascading task-conflict reconciliations (each producing its own
+        // merge/{parentWorkUnitId}-targeted proposal, never "main") could reach Completed with
+        // proposalCount 0 and nothing ever written back to the real repo, exactly the trap this
+        // method's own doc comment describes TryReconcileAsync existing to avoid. Found live
+        // 2026-07-13 on a goal stuck at currentStage "Plan" despite showing Completed.
+        if (reconciliationThrew
+            || reconciliationOutcome is not (MergeReconciliationOutcome.Reconciled or MergeReconciliationOutcome.AlreadyReconciled)
+            || reconciledProposalId is null)
         {
-            var reconciledProposal = await GetAsync(reconciledProposalId, ct).ConfigureAwait(false);
-            if (reconciledProposal?.Status is not (MergeProposalStatus.Approved or MergeProposalStatus.Merged))
-                return;
+            return;
         }
+
+        var reconciledProposal = await GetAsync(reconciledProposalId, ct).ConfigureAwait(false);
+        if (reconciledProposal?.Status is not (MergeProposalStatus.Approved or MergeProposalStatus.Merged))
+            return;
 
         try
         {
@@ -1237,6 +1349,17 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             if (checkForDrift)
             {
                 var targetContent = await _fileWorkspace.ReadAsync(effectiveTarget, path, ct).ConfigureAwait(false);
+
+                // Target already has exactly what this proposal wants to write — nothing to land,
+                // and nothing to conflict about. Without this, a proposal that only ever INHERITED
+                // a value (e.g. a fan-out dependent copying a dependency's already-landed edit via
+                // FanOutService.RefreshBranchFromDependenciesAsync, never touching the file itself)
+                // still diffs against its own stale pre-fan-out base and shows the same line range
+                // as "changed" as whatever already landed there — a phantom conflict against
+                // content that was never actually in dispute.
+                if (proposalContent == targetContent)
+                    continue;
+
                 var proposalRanges = LineRangeConflictDetector.ComputeChangedRanges(baseContent, proposalContent);
                 var driftRanges = LineRangeConflictDetector.ComputeChangedRanges(baseContent, targetContent);
 

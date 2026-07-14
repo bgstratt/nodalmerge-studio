@@ -311,6 +311,16 @@ internal sealed class HarnessHarvestPipeline(
             verdictContent = null;
         }
 
+        // Recovery for a misplaced verdict: the review prompt asks the model to cd back to the root
+        // before writing .workspace/review.json, but a model that ran tests from a nested project
+        // dir and forgot leaves the verdict in <subdir>/.workspace/review.json instead — a real
+        // outcome observed live. Rather than Stall a review that genuinely produced a verdict, look
+        // for a stray review.json under any nested .workspace/ and adopt it (most-recent wins).
+        if (string.IsNullOrWhiteSpace(verdictContent))
+        {
+            verdictContent = await TryRecoverMisplacedVerdictAsync(request, branchId, ct).ConfigureAwait(false);
+        }
+
         if (string.IsNullOrWhiteSpace(verdictContent))
         {
             return new HarnessRunResult(
@@ -363,5 +373,51 @@ internal sealed class HarnessHarvestPipeline(
         return new HarnessRunResult(
             AgentLoopCompletion.Succeeded, FailureReason: null,
             resultText, inputTokens, outputTokens, totalCostUsd, sessionId);
+    }
+
+    // Best-effort recovery for a verdict the model wrote from a directory it cd'd into (e.g. a
+    // nested test project) without cd'ing back — it lands in <subdir>/.workspace/review.json rather
+    // than the branch-root .workspace/review.json the settings allowlist permits and the read above
+    // targets. Returns the stray verdict's content (most-recently-written wins) or null if there is
+    // none. Never throws — any failure degrades to the normal missing-verdict Stall.
+    private async Task<string?> TryRecoverMisplacedVerdictAsync(
+        HarnessRunRequest request, string branchId, CancellationToken ct)
+    {
+        try
+        {
+            var workDir = await fileWorkspace.GetWorkingDirectoryAsync(branchId, ct).ConfigureAwait(false);
+            if (string.IsNullOrEmpty(workDir) || !Directory.Exists(workDir))
+                return null;
+
+            var canonicalRoot = Path.GetFullPath(Path.Combine(workDir, ".workspace", "review.json"));
+
+            var stray = Directory.EnumerateFiles(workDir, "review.json", SearchOption.AllDirectories)
+                .Select(Path.GetFullPath)
+                .Where(p => string.Equals(
+                    Path.GetFileName(Path.GetDirectoryName(p)), ".workspace", StringComparison.OrdinalIgnoreCase))
+                .Where(p => !string.Equals(p, canonicalRoot, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+                .FirstOrDefault();
+
+            if (stray is null)
+                return null;
+
+            var content = await File.ReadAllTextAsync(stray, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(content))
+                return null;
+
+            var relative = Path.GetRelativePath(workDir, stray).Replace('\\', '/');
+            logger.LogWarning(
+                "[{AgentId}] Review verdict recovered from misplaced path '{Relative}' — the model did " +
+                "not write it to the branch-root {Canonical}. Adopting it for proposalId={ProposalId}.",
+                request.AgentId, relative, ReviewVerdictFilePath, request.TaskId);
+
+            return content;
+        }
+        catch
+        {
+            // Best-effort — any failure falls through to the normal missing-verdict Stall.
+            return null;
+        }
     }
 }

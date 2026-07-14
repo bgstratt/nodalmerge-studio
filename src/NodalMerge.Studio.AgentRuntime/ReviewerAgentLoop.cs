@@ -77,12 +77,18 @@ internal sealed class ReviewerAgentLoop(
         {
             messages.AddRange(priorTurns);
 
+            // Deliberately doesn't assume WHY the prior attempt didn't finish (iteration limit,
+            // or a CLI-harness run that reasoned to a verdict but never made the actual
+            // nm_v1_merge_review call/file-write) — both land here via ContinueService, and the
+            // instruction is the same either way: stop narrating, call the tool.
             const string continuationNotice =
-                "[Continuing after hitting the iteration limit on a previous review attempt — the " +
-                "turns above are your own prior investigation of this same proposal, not a new " +
-                "reviewer's. Do not re-fetch what you already checked above. You have a fresh " +
-                "iteration budget; use it to reach a decision and call nm_v1_merge_review — that is " +
-                "the one thing the prior attempt never did.]";
+                "[Continuing a previous review attempt of this same proposal that did not finish — " +
+                "the turns above are your own prior investigation, not a new reviewer's. Do not " +
+                "re-fetch what you already checked above. If you already reached a decision in your " +
+                "prior turns above, do not re-derive it — just call nm_v1_merge_review with that same " +
+                "decision now. You have a fresh iteration budget; use it to reach a decision (if you " +
+                "haven't already) and call nm_v1_merge_review — that is the one thing the prior " +
+                "attempt never did.]";
 
             var last = messages[^1];
             if (last.Role == "user")

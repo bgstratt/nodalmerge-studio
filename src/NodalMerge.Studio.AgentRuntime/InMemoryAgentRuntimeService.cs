@@ -562,9 +562,22 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 // still leased would silently no-op instead of scheduling the Execute pass.
                 if (needsExecuteFallback)
                 {
+                    // Re-resolve the Execute-stage (worker) profile rather than reusing the planner's own
+                    // model — the planner and worker are different profile slots. Every other enqueue site
+                    // resolves stage creds this way; this fast path was the lone exception, so a configured
+                    // worker profile was silently ignored for atomic goals. Fall back to the planner's item
+                    // creds only if resolution yields nothing (keeps the pre-restart hot path unchanged).
+                    var execCreds = GetCredentialsForStage(item.WorkUnitId, PipelineStage.Execute)
+                        ?? GetGoalDefaultCredentials(item.WorkUnitId);
                     await _scheduler.EnqueueAsync(
-                        item.WorkUnitId, "worker", item.TaskId, item.Model, item.BaseUrl,
-                        item.ApiKey, item.Provider, item.SessionId, item.CredentialRef, ct).ConfigureAwait(false);
+                        item.WorkUnitId, "worker", item.TaskId,
+                        execCreds?.Model    ?? item.Model,
+                        execCreds?.BaseUrl  ?? item.BaseUrl,
+                        execCreds?.ApiKey   ?? item.ApiKey,
+                        execCreds?.Provider ?? item.Provider,
+                        item.SessionId,
+                        execCreds?.CredentialRef ?? item.CredentialRef,
+                        ct).ConfigureAwait(false);
                     _logger.LogInformation(
                         "[Scheduler] Planner recorded no plan for workUnit={WorkUnitId} — " +
                         "enqueued directly to Execute.", item.WorkUnitId);

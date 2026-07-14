@@ -36,12 +36,22 @@ public sealed class ContinueService(
         if (entry is null)
             return new ContinueResult(ContinueOutcome.NotFound, "Dead-letter entry not found.");
 
-        if (entry.Kind != FailureKind.MaxIterationsExceeded)
+        // Review-stage Stalled is the one other case where resuming the same conversation makes
+        // sense: a CLI-harness reviewer (ClaudeCodeExecutor) that reasons to a real verdict but
+        // narrates it as plain text instead of performing the required .workspace/review.json
+        // write exits with FailureKind.Stalled even though its prior turns already contain a
+        // complete, correct decision — reconstructing that context and nudging it to actually
+        // perform the write is a one-turn fix, not a wasted-conversation restart. Every other
+        // Stalled case (a worker's harness crashing, producing no usable output) still isn't
+        // safe to resume, hence scoping this to Review only rather than opening it for all kinds.
+        var isReviewStageStall = entry.Kind == FailureKind.Stalled && entry.Stage == PipelineStage.Review;
+        if (entry.Kind != FailureKind.MaxIterationsExceeded && !isReviewStageStall)
         {
             return new ContinueResult(
                 ContinueOutcome.NotApplicable,
-                $"Continue only applies to MaxIterationsExceeded failures (this entry's kind: " +
-                $"{entry.Kind}) — use Retry (steer) or Re-plan instead.");
+                $"Continue only applies to MaxIterationsExceeded failures, or a Review-stage " +
+                $"Stalled entry (this entry's kind: {entry.Kind}, stage: {entry.Stage}) — use " +
+                "Retry (steer) or Re-plan instead.");
         }
 
         var workUnit = await workUnits.GetAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
@@ -210,7 +220,11 @@ public sealed class ContinueService(
             baseUrl: baseUrl,
             apiKey: apiKey,
             provider: provider,
-            kind: FailureKind.MaxIterationsExceeded,
+            // Preserve the original kind rather than forcing MaxIterationsExceeded — by this point
+            // entry.Kind is already known to be either MaxIterationsExceeded or a Review-stage
+            // Stalled (the gate above rejects everything else), and a Stalled entry that stalls
+            // again is still Stalled, not suddenly an iteration-budget problem.
+            kind: entry.Kind,
             credentialRef: resolvedCredentialRef,
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
