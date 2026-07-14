@@ -96,6 +96,30 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
     }
 
     [Fact]
+    public void Evict_clears_a_captured_credential_that_a_blank_recapture_cannot_overwrite()
+    {
+        var cache = new RuntimeCredentialCache();
+        cache.Capture("ref-1", "anthropic", "claude", "https://api.anthropic.com", "sk-real-key");
+        Assert.NotNull(cache.TryGet("ref-1"));
+
+        // The stale-key trap: re-capturing the same ref with a blank key (CLI ambient auth) is a
+        // no-op, so the previously-captured real key survives — this is exactly why removing a key
+        // needed a restart before Evict existed.
+        cache.Capture("ref-1", "claude-cli", "", "", "");
+        Assert.NotNull(cache.TryGet("ref-1"));
+
+        // Explicit evict is the only thing that clears it in a running process.
+        cache.Evict("ref-1");
+        Assert.Null(cache.TryGet("ref-1"));
+
+        // Safe/idempotent on already-gone, unknown, and null/blank refs.
+        cache.Evict("ref-1");
+        cache.Evict("never-cached");
+        cache.Evict(null);
+        cache.Evict("");
+    }
+
+    [Fact]
     public async Task Routing_persisted_under_the_legacy_orchestrator_kind_still_rehydrates()
     {
         // plans/orchestrator-pure-service.md M1 — goals in flight across the GoalRoutingV1 rename

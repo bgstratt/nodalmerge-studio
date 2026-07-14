@@ -169,6 +169,28 @@ export class ModelAgentStudioPanel {
         break;
       }
 
+      case 'removeApiKey': {
+        const profileId = msg.profileId as string;
+        const profile   = this.configService.getProfiles().find(p => p.id === profileId);
+        if (profile) {
+          const removedRef = await this.configService.removeApiKey(profile, this.secrets);
+          // Only a persisted key needs host eviction, a toast, and a config-changed signal. When
+          // nothing was stored (the button also serves as "clear the unsaved input"), removedRef is
+          // undefined — skip all that and just refresh the row's key-status below.
+          if (removedRef) {
+            // Evict from the running host's in-memory credential cache — clearing it in settings
+            // alone leaves it cached until a restart (Capture can't express removal).
+            try {
+              await this.post('/studio/credentials/evict', { credentialRef: removedRef });
+            } catch { /* host may not be running — the next spawn re-captures from scratch anyway */ }
+            void vscode.window.showInformationMessage(`NodalMerge: API key removed for profile "${profileId}".`);
+            this.onConfigChanged?.();
+          }
+          void this.panel.webview.postMessage({ type: 'apiKeyRemoved', profileId });
+        }
+        break;
+      }
+
       case 'savePipelineProfile': {
         const p = msg.profile as PipelineProfile;
         const exists = await this.get<unknown>('/studio/agent-profiles/' + p.agentProfileId).then(() => true).catch(() => false);

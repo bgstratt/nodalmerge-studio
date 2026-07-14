@@ -1614,6 +1614,13 @@ public interface IRuntimeCredentialCache
     void Capture(string? credentialRef, string? provider, string? model, string? baseUrl, string? apiKey);
 
     LlmConnectionInfo? TryGet(string? credentialRef);
+
+    // The counterpart to Capture — the only way to force-clear a cached credential in a running
+    // Host. Capture is a no-op for a blank apiKey (a raw key must never be persisted, and CLI
+    // ambient auth legitimately sends blank), so re-supplying a blank key CANNOT overwrite a
+    // previously-captured real one. Removing a profile's key therefore needs an explicit evict, or
+    // the stale key survives until the process dies. No-op on a null/empty or unknown ref.
+    void Evict(string? credentialRef);
 }
 
 public interface IClarificationCommandService

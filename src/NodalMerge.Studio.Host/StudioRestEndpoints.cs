@@ -171,6 +171,10 @@ public static class StudioRestEndpoints
         string? SessionId = null,
         string? CredentialRef = null);
 
+    // POST /studio/credentials/evict payload — the opaque cache key (the extension's SecretStorage
+    // apiKeyRef) whose in-memory credential should be force-cleared when its profile's key is removed.
+    private sealed record EvictCredentialBody(string? CredentialRef = null);
+
     // Optional resupply payload for POST /studio/scheduler/{workUnitId}/resume — present when the
     // caller (typically the VS Code extension, re-reading its own SecretStorage) has live
     // connection details to hand back after a Host restart wiped IRuntimeCredentialCache.
@@ -2566,6 +2570,18 @@ public static class StudioRestEndpoints
                 body.WorkUnitId, body.ProfileId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey, body.Provider, body.SessionId, body.CredentialRef, ct)
                 .ConfigureAwait(false);
             return Results.Ok(new { workUnitId = item.WorkUnitId, profileId = item.ProfileId, taskId = item.TaskId, sessionId = item.SessionId, status = "enqueued" });
+        });
+
+        // Force-clear a cached credential when its profile's key is removed. Capture can't express
+        // removal (a blank apiKey is a no-op, so re-supplying blank leaves the old key cached), so
+        // the extension calls this on explicit Remove-Key. Idempotent — 200 even if nothing was
+        // cached under the ref.
+        app.MapPost("/studio/credentials/evict", (
+            EvictCredentialBody body,
+            IRuntimeCredentialCache credentialCache) =>
+        {
+            credentialCache.Evict(body.CredentialRef);
+            return Results.Ok(new { evicted = true, credentialRef = body.CredentialRef });
         });
     }
 

@@ -157,6 +157,7 @@ export function init(ctx) {
         '<div class="flex-row">' +
           '<input type="password" id="pf-apikey" placeholder="' + (secretMissing ? 'Key missing — paste key to re-store' : p.apiKeyRef ? '(key stored)' : 'Paste key to store') + '" class="grow">' +
           '<button id="pf-store-key" class="ghost">Store Key</button>' +
+          '<button id="pf-remove-key" class="ghost">Remove Key</button>' +
         '</div>' +
         '<div id="pf-key-status" class="' + (secretMissing ? '' : 'muted') + '"' + (secretMissing ? ' style="color:#e5a000"' : '') + '>' +
           (secretMissing
@@ -259,6 +260,20 @@ export function init(ctx) {
       vscode.postMessage({ type: 'setApiKey', profileId: id, key: key });
       $('pf-apikey').value = '';
     });
+
+    var removeKeyBtn = $('pf-remove-key');
+    if (removeKeyBtn) {
+      removeKeyBtn.addEventListener('click', function() {
+        // Always clear the (possibly unsaved) input so "add a key, change your mind, remove it
+        // before saving" works with no round-trip. Also ask the host to drop any *persisted* key
+        // for this profile — a no-op server-side when nothing was ever stored (or the profile is
+        // new and unsaved), so it's safe to fire unconditionally.
+        $('pf-apikey').value = '';
+        const id = $('pf-id').value.trim() || (isNew ? '' : p.id);
+        if (!id) { return; }
+        vscode.postMessage({ type: 'removeApiKey', profileId: id });
+      });
+    }
 
     $('pf-save').addEventListener('click', function() {
       const id           = $('pf-id').value.trim();
@@ -629,6 +644,23 @@ export function init(ctx) {
         if (pi >= 0) { profiles[pi] = Object.assign({}, profiles[pi], { apiKeyRef: msg.apiKeyRef }); }
       }
       credentialStatus[msg.profileId] = 'ok';
+      renderProfiles();
+      return;
+    }
+    if (msg.type === 'apiKeyRemoved') {
+      const statusEl = $('pf-key-status');
+      if (statusEl) {
+        statusEl.textContent = 'No key stored';
+        statusEl.className = 'muted';
+        statusEl.removeAttribute('style');
+      }
+      const pi = profiles.findIndex(function(pr) { return pr.id === msg.profileId; });
+      if (pi >= 0) {
+        var np = Object.assign({}, profiles[pi]);
+        delete np.apiKeyRef;
+        profiles[pi] = np;
+      }
+      delete credentialStatus[msg.profileId];
       renderProfiles();
       return;
     }

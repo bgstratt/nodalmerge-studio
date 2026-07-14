@@ -235,6 +235,28 @@ export class AgentConfigService {
   }
 
   /**
+   * Removes a profile's stored API key: deletes the SecretStorage secret and clears apiKeyRef in
+   * settings.json. Returns the removed ref (the server's credential-cache key) so the caller can
+   * evict it from the running host — clearing settings alone leaves the key cached in the host's
+   * memory until a restart, because Capture cannot express removal (a blank key is a no-op). See
+   * IRuntimeCredentialCache.Evict. Returns undefined when nothing was stored.
+   */
+  async removeApiKey(profile: AgentProfile, secrets: vscode.SecretStorage): Promise<string | undefined> {
+    const ref = profile.apiKeyRef;
+    if (!ref) { return undefined; }
+    await secrets.delete(ref);
+    const profiles = this.getProfiles();
+    const idx = profiles.findIndex(p => p.id === profile.id);
+    if (idx >= 0) {
+      const updated = { ...profiles[idx] };
+      delete updated.apiKeyRef;
+      profiles[idx] = updated;
+      await this.saveProfiles(profiles);
+    }
+    return ref;
+  }
+
+  /**
    * Resolves LLM credentials for spawning an agent loop.
    * VS Code LM uses an empty apiKey (required by the host gate) and the local LM proxy URL.
    */

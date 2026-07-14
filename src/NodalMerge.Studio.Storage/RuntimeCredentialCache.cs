@@ -29,4 +29,11 @@ public sealed class RuntimeCredentialCache : IRuntimeCredentialCache
             return null;
         return _entries.TryGetValue(credentialRef, out var info) ? info : null;
     }
+
+    public void Evict(string? credentialRef)
+    {
+        if (string.IsNullOrWhiteSpace(credentialRef))
+            return;
+        _entries.TryRemove(credentialRef, out _);
+    }
 }
