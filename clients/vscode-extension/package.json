@@ -68,6 +68,10 @@
       {
         "command": "nodalmerge.startLocalRuntime",
         "title": "NodalMerge: Start Local Runtime"
+      },
+      {
+        "command": "nodalmerge.reconcileBlobOrigin",
+        "title": "NodalMerge: Reconcile Blob Origin"
       }
     ],
     "configuration": {

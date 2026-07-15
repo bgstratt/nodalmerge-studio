@@ -980,6 +980,33 @@ public static class StudioRestEndpoints
             return Results.Ok(report);
         });
 
+        // Phase 2 slice 2.3 — CAS reconcile sweep: enumerate live blob hashes, HEAD the remote
+        // origin, and push whatever it's missing. A no-op (zero counts) when no remote push target
+        // is configured — see ICasReconcileService's own doc comment.
+        app.MapPost("/studio/cas/reconcile", async (
+            ICasReconcileService reconcile,
+            ILogger<CasReconcileService> logger,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var result = await reconcile.ReconcileAsync(ct).ConfigureAwait(false);
+                return Results.Ok(result);
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Same fail-closed contract as /studio/cache/gc above — an incomplete live blob
+                // set must never be reported as a completed reconcile; skip this round rather than
+                // crash the host.
+                logger.LogWarning(ex, "Skipping CAS reconcile sweep — the live blob set could not be computed.");
+                return Results.Conflict(new
+                {
+                    error = "Live blob set is incomplete (a cas-tree snapshot's tree failed to resolve) — reconcile skipped this round.",
+                    detail = ex.Message,
+                });
+            }
+        });
+
         app.MapPost("/studio/workspace/symbol/definition", async (
             [FromQuery] string branchId,
             WorkspaceSymbolRequestBody body,

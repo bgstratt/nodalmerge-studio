@@ -14,6 +14,7 @@ export const COMMANDS = {
   OPEN_MERGE_REVIEW_CONFLICT: 'nodalmerge.openMergeReviewConflict',
   OPEN_INSIGHTS:        'nodalmerge.openInsights',
   START_LOCAL_RUNTIME:  'nodalmerge.startLocalRuntime',
+  RECONCILE_BLOB_ORIGIN: 'nodalmerge.reconcileBlobOrigin',
 } as const;
 
 export const HOST_BINARY_NAME = {

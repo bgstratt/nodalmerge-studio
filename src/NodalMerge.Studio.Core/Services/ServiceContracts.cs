@@ -2408,6 +2408,38 @@ public interface IBlobPrefetchService
         string repositoryId, IReadOnlyList<string>? fileScope, CancellationToken ct = default);
 }
 
+/// <summary>
+/// Result of a CAS reconcile sweep — see <see cref="ICasReconcileService"/>.
+/// </summary>
+public sealed record CasReconcileResult(
+    int Scanned,
+    int AlreadyPresent,
+    int Pushed,
+    int Failed,
+    int MissingLocally);
+
+// Phase 2 slice 2.3 — the healing path for the remote push slice 2.2 already wired up (a fresh
+// PutBlobAsync already rides the local->remote chain). This covers what that write-time path
+// can't: blobs written before a remote origin was configured, blobs written during an outage, or
+// any other drift between the local store and the origin. Enumerates the current live blob set
+// (the same fail-closed set IWorkspaceCacheManager.GetLiveBlobHashesAsync computes for GC), HEADs
+// the remote origin for each hash, and pushes whatever the origin is missing.
+//
+// Deliberately free of any NodalMerge.Host.Abstractions type (e.g. IRemoteBlobPushTarget) —
+// Studio.Core doesn't reference that package. The implementation (which does need it) lives in
+// Studio.Storage.
+public interface ICasReconcileService
+{
+    /// <summary>
+    /// Zero-result no-op (every count 0) when no remote blob push target is configured — there is
+    /// nothing to reconcile against. Otherwise computes the live blob set and lets
+    /// IWorkspaceCacheManager.GetLiveBlobHashesAsync's fail-closed exception propagate (an
+    /// incomplete live set must never drive a sweep, same reasoning as blob GC) — callers must
+    /// catch and report, same convention as the /studio/cache/gc endpoint.
+    /// </summary>
+    Task<CasReconcileResult> ReconcileAsync(CancellationToken ct = default);
+}
+
 // Phase 2 — snapshot checkpoint service for the repository op log. One snapshot per goal cycle
 // (created by between-run sync) serves as the replay base; replaying 10–30 ops from the latest
 // snapshot is intentionally fast. SnapshotOnWorkUnitCompletion (Phase 7) and compaction (Phase 6)

@@ -94,6 +94,10 @@ public static class StudioWebApplication
         builder.Services.AddSingleton<IProjectionMaterializer, LocalFilesystemProjectionMaterializer>();
         builder.Services.AddSingleton<IStudioParticipantService, StudioParticipantService>();
         builder.Services.AddHostedService<StudioCrdtSyncBackgroundService>();
+        // Phase 2 slice 2.3 — one-shot startup healing pass for the CAS reconcile sweep. Build-only
+        // (not BuildPeer): a headless peer has no HTTP surface to trigger a manual sweep from, and
+        // this same one-shot startup pass would otherwise run redundantly on every peer too.
+        builder.Services.AddHostedService<CasReconcileBackgroundService>();
 
         configureServices?.Invoke(builder.Services);
 

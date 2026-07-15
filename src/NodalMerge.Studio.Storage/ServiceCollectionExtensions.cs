@@ -336,6 +336,16 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<ISnapshotTreeResolver>(),
             sp.GetService<IBlobStoreProvider>()));
 
+        // Phase 2 slice 2.3 — CAS reconcile sweep: heals gaps in the remote origin. remote is
+        // resolved via GetService (may be null — Studio.Core's ICasReconcileService documents a
+        // zero-result no-op for that case, same optional-collaborator shape as IBlobPrefetchService
+        // above), so registering this always is safe even when no remote origin is configured.
+        services.AddSingleton<ICasReconcileService>(sp => new CasReconcileService(
+            sp.GetRequiredService<IWorkspaceCacheManager>(),
+            sp.GetRequiredService<IBlobStoreProvider>(),
+            sp.GetRequiredService<ILogger<CasReconcileService>>(),
+            sp.GetService<IRemoteBlobPushTarget>()));
+
         services.AddSingleton<IFileWorkspaceService>(sp => new FileSystemWorkspaceService(
             sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions(),
             sp.GetService<IBlobStoreProvider>(),
