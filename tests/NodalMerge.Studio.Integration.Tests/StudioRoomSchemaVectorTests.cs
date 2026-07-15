@@ -139,5 +139,10 @@ public class StudioRoomSchemaVectorTests
         StudioNodeKind.ProjectionSnapshotV1, StudioNodeKind.WorkspaceV1, StudioNodeKind.RepositoryOpV1,
         StudioNodeKind.RepositorySnapshotV1, StudioNodeKind.RepositoryConflictV1, StudioNodeKind.CoModPatternV1,
         StudioNodeKind.BlobIndexEntryV1, StudioNodeKind.CandidateConflictV1, StudioNodeKind.TaskConflictV1,
+        // Phase 5 slice 5.2 — "studio/gc-run/v1". Prefix-invariant check: no existing kind above,
+        // suffixed with "/", is a prefix of it (nearest neighbors "studio/goal/v1" and
+        // "studio/goal-routing/v1" diverge at the character after "studio/g": "c" vs "o"), and it
+        // is not a prefix of any existing kind.
+        StudioNodeKind.GcRunV1,
     ];
 }

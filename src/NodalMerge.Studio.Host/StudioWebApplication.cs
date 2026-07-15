@@ -131,6 +131,13 @@ public static class StudioWebApplication
         // this same one-shot startup pass would otherwise run redundantly on every peer too.
         builder.Services.AddHostedService<CasReconcileBackgroundService>();
 
+        // Phase 5 slice 5.2 — scheduled local blob GC, off by default (BlobGcOptions.
+        // GcIntervalMinutes = 0). Build-only for now, matching CasReconcileBackgroundService's
+        // placement above — a headless peer (BuildPeer) could reasonably also want this
+        // eventually, but nothing in this slice requires it and adding it there is a one-line
+        // follow-up once wanted.
+        builder.Services.AddHostedService<BlobGcBackgroundService>();
+
         configureServices?.Invoke(builder.Services);
 
         var app = builder.Build();

@@ -18,6 +18,7 @@ public sealed class WorkspaceCacheManager(
     IStudioNodeStore nodeStore,
     IRepositoryRegistryService repositories,
     ISnapshotTreeResolver treeResolver,
+    ISnapshotRetentionPolicy retentionPolicy,
     WorkspaceOptions? options = null) : IWorkspaceCacheManager, IHostedService
 {
     private static readonly HashSet<WorkUnitStatus> TerminalEvictableStatuses =
@@ -102,29 +103,67 @@ public sealed class WorkspaceCacheManager(
         return evicted;
     }
 
-    // Slice 1.1 — the live set must include tree-object blobs too (a cas-tree snapshot's root, and
-    // any subtree once v2 exists), not just file blobs. FAIL CLOSED: if any cas-tree snapshot's
-    // tree fails to resolve, the computed live set would be an UNDER-approximation (missing blobs
-    // that are actually still referenced) — silently returning it would let a GC sweep delete live
-    // content. Throwing here instead means an incomplete live set never reaches a sweep; callers
-    // (see the /studio/cache/gc endpoint) must catch this and skip eviction for the round rather
-    // than let it propagate as a host crash.
+    // Phase 5 slice 5.2 — LiveHashSource v2. Live = union of (a) trees+blobs reachable from every
+    // snapshot in the retention policy's RetainedSnapshotIds (Pinned union Active union
+    // unexpired-Intermediate — see ISnapshotRetentionPolicy), (b) blobs referenced by ops not yet
+    // compacted into a snapshot (unchanged from v1), (c) admin pins. (c) needs no separate walk
+    // here: an admin-pinned SnapshotId is classified Pinned by the policy itself, so it is already
+    // inside RetainedSnapshotIds and gets walked via (a) — see SnapshotRetentionPolicy's own admin
+    // pin handling. A snapshot NOT in the retained set is simply not walked at all — its unique
+    // blobs/trees fall out of the live set and become sweep candidates, which is the entire point
+    // of this slice (v1's rule was "every stored snapshot", i.e. permanently zero reclamation).
+    //
+    // FAIL CLOSED, UNCHANGED CONTRACT: any resolution failure on a *retained* snapshot still
+    // throws rather than silently under-report — this now also covers a retained snapshot's own
+    // node failing to deserialize (previously silently skipped for every snapshot regardless of
+    // retention; tightened here because SnapshotRetentionPolicy's own fail-safe bias already
+    // classifies an unparseable snapshot node Active, i.e. retained — so if it lands in
+    // RetainedSnapshotIds, this method must not silently treat it as if it contributed zero
+    // blobs). A non-retained malformed node is skipped exactly like a non-retained snapshot that
+    // parsed cleanly: it isn't walked, consistent with "not in the retained set" either way.
+    // GetReachableHashesAsync's own fail-closed exception (CAS miss / corrupt tree object anywhere
+    // in the walk) is unchanged and still let to propagate as-is.
     public async Task<IReadOnlySet<string>> GetLiveBlobHashesAsync(CancellationToken ct = default)
     {
         var live = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        // Collect all blob hashes from every stored snapshot's tree (inline or cas-tree).
+        var report = await retentionPolicy.ClassifyAsync(ct).ConfigureAwait(false);
+        var retainedIds = report.RetainedSnapshotIds;
+
         var snapshotNodes = await nodeStore.ReadAllNodesAsync(StudioNodeKind.RepositorySnapshotV1, ct)
             .ConfigureAwait(false);
-        foreach (var (_, json) in snapshotNodes)
+        foreach (var (entityId, json) in snapshotNodes)
         {
             RepositorySnapshot? snapshot;
             try
             {
                 snapshot = JsonSerializer.Deserialize<RepositorySnapshot>(json);
             }
-            catch { continue; /* malformed node — skip */ }
-            if (snapshot is null) continue;
+            catch (Exception ex)
+            {
+                if (retainedIds.Contains(entityId))
+                {
+                    throw new InvalidOperationException(
+                        $"Live blob set computation aborted: retained snapshot '{entityId}' failed to " +
+                        "deserialize (malformed JSON) — its live bytes cannot be verified, so a GC sweep " +
+                        "must not run against a partial live set this round.", ex);
+                }
+                continue; // not retained — not walked, same as any other non-retained snapshot
+            }
+
+            if (snapshot is null)
+            {
+                if (retainedIds.Contains(entityId))
+                {
+                    throw new InvalidOperationException(
+                        $"Live blob set computation aborted: retained snapshot '{entityId}' deserialized " +
+                        "to null — its live bytes cannot be verified, so a GC sweep must not run against " +
+                        "a partial live set this round.");
+                }
+                continue;
+            }
+
+            if (!retainedIds.Contains(snapshot.SnapshotId)) continue; // aged out — a sweep candidate, not walked
 
             if (snapshot.TreeEntries is not null)
             {

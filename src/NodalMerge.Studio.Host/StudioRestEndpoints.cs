@@ -3,7 +3,6 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using NodalMerge.Host.Composition;
 using NodalMerge.Studio.AgentRuntime;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -941,43 +940,71 @@ public static class StudioRestEndpoints
             return Results.Ok(new { evicted = count });
         });
 
-        // Run blob GC: collect live hashes from all snapshots and feed to FileBlobGcCoordinator.
-        // dryRun=true (default) only marks/reports candidates; dryRun=false deletes after grace window.
+        // Run blob GC via the staged local sweep (Phase 5 slice 5.2): honors the configured
+        // BlobGcOptions.Mode (DryRun by default) unless an explicit mode override is given.
+        //
+        // Back-compat note: dryRun is the pre-5.2 query parameter. dryRun=true still forces an
+        // explicit DryRun for this call (same as before). dryRun=false (including simply omitting
+        // the parameter, its default) is NO LONGER an implicit live-delete request — it now means
+        // "no override," so the configured mode (DryRun unless an operator has configured
+        // otherwise) governs. Before this slice, a bare POST with no query string ran a real
+        // delete pass; this is a deliberate, documented safety change, not an oversight — flag it
+        // if anything upstream (scripts, the extension) relied on the old bare-POST-deletes
+        // behavior.
         app.MapPost("/studio/cache/gc", async (
-            [FromQuery] bool dryRun,
-            IWorkspaceCacheManager cache,
-            WorkspaceOptions opts,
+            [FromQuery] bool? dryRun,
+            [FromQuery] string? mode,
+            IBlobGcService gc,
             ILogger<WorkspaceCacheManager> logger,
             CancellationToken ct) =>
         {
-            var casRoot = opts.CasRootPath;
-            if (string.IsNullOrEmpty(casRoot))
-                return Results.BadRequest(new { error = "CAS storage is not configured (WorkspaceOptions.CasRootPath is null)." });
+            BlobGcMode? overrideMode = null;
+            if (!string.IsNullOrWhiteSpace(mode))
+            {
+                if (!Enum.TryParse<BlobGcMode>(mode, ignoreCase: true, out var parsed))
+                    return Results.BadRequest(new
+                    {
+                        error = $"Unknown gc mode '{mode}'. Valid values: DryRun, MarkOnly, SweepSoft, SweepHard.",
+                    });
+                overrideMode = parsed;
+            }
+            else if (dryRun == true)
+            {
+                overrideMode = BlobGcMode.DryRun;
+            }
 
-            IReadOnlySet<string> liveHashes;
             try
             {
-                liveHashes = await cache.GetLiveBlobHashesAsync(ct).ConfigureAwait(false);
+                var record = await gc.RunAsync(overrideMode, ct).ConfigureAwait(false);
+                return Results.Ok(record);
+            }
+            catch (BlobGcNotConfiguredException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
             }
             catch (InvalidOperationException ex)
             {
-                // Slice 1.1 — GetLiveBlobHashesAsync fails closed when a cas-tree snapshot's tree
+                // Slice 1.1 — GetLiveBlobHashesAsync fails closed when a retained snapshot's tree
                 // can't be resolved (CAS miss/corrupt): an incomplete live set must never reach a
                 // sweep (it would look like an under-approximation and let live blobs get deleted).
                 // Skip this GC round rather than crash the host; the caller can retry later.
                 logger.LogWarning(ex, "Skipping blob GC this round — the live blob set could not be computed.");
                 return Results.Conflict(new
                 {
-                    error = "Live blob set is incomplete (a cas-tree snapshot's tree failed to resolve) — GC skipped this round.",
+                    error = "Live blob set is incomplete (a retained snapshot's tree failed to resolve) — GC skipped this round.",
                     detail = ex.Message,
                 });
             }
+        });
 
-            var coordinator = new FileBlobGcCoordinator(casRoot);
-            var report = dryRun
-                ? coordinator.DryRun(liveHashes, DateTimeOffset.UtcNow)
-                : coordinator.LiveRun(liveHashes, DateTimeOffset.UtcNow);
-            return Results.Ok(report);
+        // Phase 5 slice 5.2 — the local GC run ledger, most recent first.
+        app.MapGet("/studio/cache/gc/runs", async (
+            [FromQuery] int? limit,
+            IBlobGcService gc,
+            CancellationToken ct) =>
+        {
+            var runs = await gc.GetRecentRunsAsync(limit is null or <= 0 ? 20 : limit.Value, ct).ConfigureAwait(false);
+            return Results.Ok(new { runs, count = runs.Count });
         });
 
         // Phase 2 slice 2.3 — CAS reconcile sweep: enumerate live blob hashes, HEAD the remote
@@ -3608,6 +3635,7 @@ public static class StudioRestEndpoints
             IRepositorySnapshotService snapshots,
             IMaterializationEngine materializer,
             ISnapshotTreeResolver treeResolver,
+            ISnapshotRetentionPolicy retentionPolicy,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(targetPath))
@@ -3619,7 +3647,33 @@ public static class StudioRestEndpoints
 
             var tree = await treeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
             if (tree is null)
+            {
+                // Phase 5 slice 5.2 — a null tree here can mean either a genuine CAS problem
+                // (corrupt blob, or a legacy snapshot that predates tree-entry capture) or a
+                // generation whose bytes were deliberately reclaimed because retention classified
+                // it Intermediate and RetainIntermediateDays elapsed (see
+                // plans/cas-distribution-and-storage.md's retention doctrine: "the node stays;
+                // only bytes are reclaimed"; materializing a retired generation must fail
+                // gracefully, not crash). Distinguish the two with one extra check on the failure
+                // path only (not the happy path) so an operator sees an actionable, retention-
+                // specific message instead of a generic CAS-miss guess whenever the real cause is
+                // "this generation aged out and its bytes are gone, by design."
+                var report = await retentionPolicy.ClassifyAsync(ct).ConfigureAwait(false);
+                if (!report.RetainedSnapshotIds.Contains(snapshotId))
+                {
+                    return Results.Json(new
+                    {
+                        error = $"Snapshot '{snapshotId}' has aged out per retention policy — its tree/blob " +
+                                "bytes were reclaimed by the local GC sweep. The generation is still recorded " +
+                                "in history (append-only); it is no longer materializable.",
+                        snapshotId,
+                        repositoryId = snapshot.RepositoryId,
+                        agedOut = true,
+                    }, statusCode: StatusCodes.Status410Gone);
+                }
+
                 return Results.BadRequest(new { error = $"Snapshot '{snapshotId}' has no resolvable tree — it either predates tree-entry capture, or its CAS tree blob is missing/corrupt (TreeFormat={snapshot.TreeFormat ?? "null"})." });
+            }
 
             var fileCount = await materializer.MaterializeAsync(snapshot, targetPath, ct: ct).ConfigureAwait(false);
             return Results.Ok(new

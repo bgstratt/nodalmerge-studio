@@ -52,6 +52,12 @@ public static class StudioNodeKind
     public const string BlobIndexEntryV1       = "studio/blob-index-entry/v1";
     public const string CandidateConflictV1    = "studio/candidate-conflict/v1";
     public const string TaskConflictV1         = "studio/task-conflict/v1";
+    // Phase 5 slice 5.2 — local blob-GC run ledger (BlobGcRunRecord), one row per run, keyed by a
+    // generated RunId (never reused, so unlike most kinds there is no "latest per entityId"
+    // collapse to worry about). Safe under the STUDIO_ROOM_SCHEMA.md (a) longest-match parsing
+    // rule: "studio/gc-run/v1/" is not a prefix of any other kind above once suffixed with "/",
+    // nor is any other kind a prefix of it (verified by inspection of the full list above).
+    public const string GcRunV1                = "studio/gc-run/v1";
 }
 
 public interface IStudioNodeStore

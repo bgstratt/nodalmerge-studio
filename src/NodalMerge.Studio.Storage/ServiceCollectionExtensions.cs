@@ -246,6 +246,19 @@ public static class ServiceCollectionExtensions
         // Phase 8 — workspace cache manager: eviction, startup orphan sweep, live blob hash enumeration.
         // IHostedService StartAsync fires EvictOrphanedAsync as a best-effort background task so that
         // stale branch dirs from prior runs are cleaned up without blocking the startup chain.
+        // Phase 5 slice 5.1 — snapshot retention classification. No state of its own (unlike
+        // WorkspaceCacheManager it doesn't implement IRehydratable/IHostedService — every read
+        // goes straight through IStudioNodeStore at ClassifyAsync call time). Registered ahead of
+        // WorkspaceCacheManager below because slice 5.2's LiveHashSource v2 now consumes it
+        // directly (registration order doesn't affect factory-based DI resolution, but this keeps
+        // the read order in this file matching the dependency order).
+        services.AddSingleton(new RetentionPolicyOptions());
+        services.AddSingleton<ISnapshotRetentionPolicy>(sp => new SnapshotRetentionPolicy(
+            sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetRequiredService<IRepositoryRegistryService>(),
+            sp.GetService<WorkspaceOptions>(),
+            sp.GetService<RetentionPolicyOptions>()));
+
         services.AddSingleton<WorkspaceCacheManager>(sp => new WorkspaceCacheManager(
             sp.GetRequiredService<IFileWorkspaceService>(),
             sp,
@@ -254,21 +267,24 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IStudioNodeStore>(),
             sp.GetRequiredService<IRepositoryRegistryService>(),
             sp.GetRequiredService<ISnapshotTreeResolver>(),
+            sp.GetRequiredService<ISnapshotRetentionPolicy>(),
             sp.GetService<WorkspaceOptions>()));
         services.AddSingleton<IWorkspaceCacheManager>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
 
-        // Phase 5 slice 5.1 — snapshot retention classification. Pure policy service + tests only:
-        // nothing consumes ISnapshotRetentionPolicy yet (that's slice 5.2's LiveHashSource v2
-        // rewrite of GetLiveBlobHashesAsync above). No state of its own, so unlike
-        // WorkspaceCacheManager it doesn't implement IRehydratable/IHostedService — every read
-        // goes straight through IStudioNodeStore at ClassifyAsync call time.
-        services.AddSingleton(new RetentionPolicyOptions());
-        services.AddSingleton<ISnapshotRetentionPolicy>(sp => new SnapshotRetentionPolicy(
+        // Phase 5 slice 5.2 — staged local blob GC (DryRun/MarkOnly/SweepSoft/SweepHard) + run
+        // ledger. BlobGcOptions default registration mirrors RetentionPolicyOptions above;
+        // NodalMerge.Studio.Host.StudioServiceCollectionExtensions re-registers a config-bound
+        // instance after AddNodalMergeStorage/AddInMemoryStorage runs (last AddSingleton wins).
+        services.AddSingleton(new BlobGcOptions());
+        services.AddSingleton<IBlobGcService>(sp => new BlobGcService(
+            sp.GetRequiredService<IWorkspaceCacheManager>(),
+            sp.GetRequiredService<ISnapshotRetentionPolicy>(),
             sp.GetRequiredService<IStudioNodeStore>(),
-            sp.GetRequiredService<IRepositoryRegistryService>(),
-            sp.GetService<WorkspaceOptions>(),
-            sp.GetService<RetentionPolicyOptions>()));
+            sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions(),
+            sp.GetService<BlobGcOptions>(),
+            sp.GetService<TimeProvider>(),
+            sp.GetService<ILogger<BlobGcService>>()));
 
         services.AddSingleton<RepositorySyncService>();
         services.AddSingleton<IRepositorySyncService>(sp => sp.GetRequiredService<RepositorySyncService>());

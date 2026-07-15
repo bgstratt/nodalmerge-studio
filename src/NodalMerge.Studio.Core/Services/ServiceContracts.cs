@@ -2998,3 +2998,76 @@ public interface ISnapshotRetentionPolicy
 {
     Task<SnapshotRetentionReport> ClassifyAsync(CancellationToken ct = default);
 }
+
+// ── Phase 5 slice 5.2 — staged local blob GC + run ledger ───────────────────────────────────
+//
+// plans/cas-distribution-and-storage.md: "DryRun (default) -> MarkOnly -> SweepSoft -> SweepHard
+// by config." Maps onto the installed NodalMerge.Host.Composition.FileBlobGcCoordinator's own
+// mark-then-grace-then-delete two-phase design (see BlobGcService's own doc comment for the exact
+// mapping and the one honest collapse it forces: the coordinator has no knob to delete a hash the
+// very first time it's observed non-live, only a grace-window length, so "MarkOnly" and
+// "SweepHard" are both expressed as different GraceWindow values over the same LiveRun call, never
+// a distinct coordinator mode).
+public enum BlobGcMode
+{
+    // Compute candidates/report only; never writes a tombstone file or deletes a blob. Maps to
+    // FileBlobGcCoordinator.DryRun, which already computes the exact same Marked/Deleted counts a
+    // live run would act on — this is what makes "DryRun mutates nothing and reports the same
+    // candidate set the live run would act on" true for free, not something this slice re-derives.
+    DryRun,
+
+    // Tombstones newly-non-live blobs (a real, persisted mark this time) but never deletes —
+    // GraceWindow is configured unreachably large so the delete branch never fires.
+    MarkOnly,
+
+    // The coordinator's ordinary two-phase behavior: mark this run, delete only blobs a *previous*
+    // run already tombstoned once GraceHours has elapsed.
+    SweepSoft,
+
+    // Same two-phase shape, but GraceWindow is collapsed to zero: a blob tombstoned in an earlier
+    // call (even moments earlier) is immediately eligible for deletion on the next call. Still
+    // requires two calls to actually reclaim bytes — see BlobGcService's comment for why eliding
+    // that isn't safe to build even under this name.
+    SweepHard,
+}
+
+/// <summary>
+/// One row of the local blob-GC run ledger — see plans/cas-distribution-and-storage.md Phase 5
+/// slice 5.2's "run ledger" requirement. Persisted via <see cref="IStudioNodeStore"/> under
+/// <c>StudioNodeKind.GcRunV1</c>, one row per run, append-only (a run is never rewritten). Field
+/// names deliberately mirror <c>NodalMerge.Host.Composition.FileBlobGcRunReport</c> so a reader
+/// already familiar with that report needs no translation.
+/// </summary>
+public sealed record BlobGcRunRecord(
+    string RunId,
+    BlobGcMode Mode,
+    DateTimeOffset StartedAt,
+    DateTimeOffset FinishedAt,
+    int Scanned,
+    int Marked,
+    int Cleared,
+    int DeleteCandidates,
+    int Deleted,
+    int LiveSetSize,
+    int RetainedSnapshotCount,
+    int AnomalyCount,
+    long DurationMs,
+    bool Success,
+    string? Error = null);
+
+/// <summary>
+/// Runs a staged local blob GC pass (see <see cref="BlobGcMode"/>) against the configured CAS root
+/// and records a <see cref="BlobGcRunRecord"/> for every attempt, successful or not. Fail-closed:
+/// when the live blob set can't be computed (see <see cref="IWorkspaceCacheManager.GetLiveBlobHashesAsync"/>'s
+/// own contract), no coordinator run happens at all — same convention <c>/studio/cache/gc</c> and
+/// <c>/studio/cas/reconcile</c> already establish (the exception propagates for the REST layer to
+/// map to its established 409 shape).
+/// </summary>
+public interface IBlobGcService
+{
+    // modeOverride, when given, wins over the configured BlobGcOptions.Mode for this call only
+    // (the REST endpoint's operator override) — the scheduled background run always passes null.
+    Task<BlobGcRunRecord> RunAsync(BlobGcMode? modeOverride = null, CancellationToken ct = default);
+
+    Task<IReadOnlyList<BlobGcRunRecord>> GetRecentRunsAsync(int limit = 20, CancellationToken ct = default);
+}

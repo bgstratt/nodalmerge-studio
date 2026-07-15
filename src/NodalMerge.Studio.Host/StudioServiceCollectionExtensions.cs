@@ -52,6 +52,27 @@ public static class StudioServiceCollectionExtensions
         });
 
         services.AddNodalMergeStorage();
+
+        // Phase 5 slice 5.2 — bind RetentionPolicyOptions/BlobGcOptions from config, overriding
+        // AddNodalMergeStorage's own default-valued registrations above (last AddSingleton
+        // registration wins — same convention WorkspaceOptions's AddInMemoryStorage comment
+        // documents, and why these two calls must come AFTER AddNodalMergeStorage rather than
+        // alongside WorkspaceOptions's own binding above).
+        services.AddSingleton<RetentionPolicyOptions>(sp =>
+        {
+            var config = sp.GetService<IConfiguration>();
+            var opts   = new RetentionPolicyOptions();
+            config?.GetSection("Retention").Bind(opts);
+            return opts;
+        });
+        services.AddSingleton<BlobGcOptions>(sp =>
+        {
+            var config = sp.GetService<IConfiguration>();
+            var opts   = new BlobGcOptions();
+            config?.GetSection("BlobGc").Bind(opts);
+            return opts;
+        });
+
         services.AddStudioProjections();
         services.AddSingleton<FindingDetectorService>();
         services.AddStudioTasks();
