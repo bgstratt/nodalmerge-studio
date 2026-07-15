@@ -26,8 +26,16 @@
 - [ ] Phase 5 — GC & retention (the answer to snapshot flux)
 - [ ] Phase 6 — Multi-user: replication data plane, room topology & repository identity
 
-Baseline measurement: `tools/measure-cas-baseline.ps1` (run against a real workspace
-data root and record the numbers here — not yet run against a heavy-use workspace).
+Baseline measurement (`tools/measure-cas-baseline.ps1`, run 2026-07-15): no heavy-use
+workspace exists yet — real repos so far are small, so the projected ~400 KB/generation
+inline-map pressure never materialized locally. Active workspace (post-Phase-1 build):
+64 blobs / 49,543 B; 11 snapshot nodes / 23,963 B payload (avg 2,178 B — 4 newest are
+`TreeFormat:"cas-tree"` with `TreeEntries:null`, confirming the new write path live in
+the extension). Largest legacy data root (2026-07-13): 5,727 studio rows / 10.7 MiB
+payload, of which snapshot nodes were only 2 rows / 5,594 B — the bulk of node-store
+growth in practice is *other* node types (tasks/messages/history), which is Phase-5
+retention territory, not tree-map territory. Re-run against a genuinely large repo
+before judging Phase 1/3 wins quantitatively.
 Local packages bumped to **0.2.1** (includes the new host surface + real win-x64/
 linux-x64 native runtimes); stale `nodalmerge-host/` fallback paths in studio fixed
 to `hosts/dotnet/`.

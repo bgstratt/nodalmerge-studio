@@ -66,9 +66,18 @@ function Invoke-NodeQuery([string]$idPrefix) {
     $dll = Get-ChildItem "$PSScriptRoot/../src" -Recurse -Filter Microsoft.Data.Sqlite.dll -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if (-not $dll) { throw 'Neither sqlite3 CLI nor a built Microsoft.Data.Sqlite.dll found. Install sqlite3 or build the Studio host.' }
-    Add-Type -Path $dll.FullName
-    $native = Get-ChildItem $dll.Directory -Recurse -Filter e_sqlite3.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+    $arch = "win-$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString().ToLowerInvariant())"
+    $native = Get-ChildItem $dll.Directory -Recurse -Filter e_sqlite3.dll -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match [regex]::Escape($arch) } | Select-Object -First 1
     if ($native) { $env:PATH = "$($native.Directory);$env:PATH" }
+    # Microsoft.Data.Sqlite requires a SQLitePCLRaw provider to be registered first.
+    foreach ($dep in 'SQLitePCLRaw.core.dll', 'SQLitePCLRaw.provider.e_sqlite3.dll') {
+        $depDll = Get-ChildItem $dll.Directory -Filter $dep -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $depDll) { throw "Missing $dep next to $($dll.FullName)" }
+        Add-Type -Path $depDll.FullName
+    }
+    Add-Type -Path $dll.FullName
+    [SQLitePCL.raw]::SetProvider([SQLitePCL.SQLite3Provider_e_sqlite3]::new())
     $conn = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$dbPath;Mode=ReadOnly")
     try {
         $conn.Open()
