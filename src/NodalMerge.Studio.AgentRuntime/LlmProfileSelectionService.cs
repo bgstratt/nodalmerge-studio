@@ -23,7 +23,7 @@ internal sealed class LlmProfileSelectionService(
         "extra text: {\"profileId\": \"<id>\", \"explanation\": \"<short reason>\"}.";
 
     public async Task<ProfileSelectionResult> SelectProfileAsync(
-        WorkUnit childUnit, OrchestratorCredentials? credentials, CancellationToken ct = default)
+        WorkUnit childUnit, GoalDefaultCredentials? credentials, CancellationToken ct = default)
     {
         if (!options.UseLlmProfileSelection)
             return Heuristic("LLM profile selection is disabled; using heuristic default.");

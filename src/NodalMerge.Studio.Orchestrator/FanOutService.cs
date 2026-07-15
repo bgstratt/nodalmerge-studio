@@ -121,7 +121,7 @@ public sealed class FanOutService : IFanOutService
             }
 
             var creds = _agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Execute)
-                ?? _agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+                ?? _agentControl.GetGoalDefaultCredentials(parentWorkUnitId);
             var children = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
             foreach (var child in children)
             {
@@ -135,7 +135,7 @@ public sealed class FanOutService : IFanOutService
                 if (!await IsReadyToEnqueueAsync(sequenced, ct).ConfigureAwait(false))
                     continue;
 
-                await RefreshBranchFromDependenciesAsync(sequenced, ct).ConfigureAwait(false);
+                await RefreshBranchFromDependenciesAsync(sequenced, parent.BranchId, ct).ConfigureAwait(false);
 
                 if (await EnqueueChildWorkerAsync(sequenced, parentWorkUnitId, creds, sessionId, ct).ConfigureAwait(false))
                 {
@@ -384,17 +384,26 @@ public sealed class FanOutService : IFanOutService
     // since a semantic dependency (a class, schema, contract another slice introduced) may touch
     // files the dependent never declared an interest in.
     //
-    // Deliberately CopyFilesAsync (additive) over each dependency's own FilesTouched, not
+    // Deliberately CopyFilesAsync (additive) over the dependency's changed-file set, not
     // ApplyBranchAsync (the merge-apply primitive): ApplyBranchAsync does a destructive full
     // mirror — it deletes every file in the target that isn't present in the source
     // (FileSystemWorkspaceService.ApplyBranchAsync, "Delete files in target that are absent in
     // source"), which is correct for landing ONE proposal into a target branch but wrong here —
     // with two-or-more dependencies, applying dep2's whole branch after dep1's would wipe out
     // every one of dep1's files that dep2's branch doesn't also happen to contain. Copying only
-    // each dependency's own declared FilesTouched is purely additive: dependency order can only
-    // affect which dependency's content wins on a genuine overlap, never delete an unrelated
-    // dependency's contribution.
-    private async Task RefreshBranchFromDependenciesAsync(WorkUnit child, CancellationToken ct)
+    // the dependency's changed files is purely additive: dependency order can only affect which
+    // dependency's content wins on a genuine overlap, never delete an unrelated dependency's
+    // contribution.
+    //
+    // That changed-file set is computed by diffing dep.BranchId against parentBranchId — the
+    // common ancestor every sibling was seeded from (EnsureChildWorkUnitsAsync) — rather than
+    // reading the dependency's own MergeProposal.FilesTouched. FilesTouched only lists files the
+    // dependency's OWN task wrote; in a multi-hop chain (Task1 -> Task2 -> Task3) a file Task1
+    // changed but Task2 never itself touched still differs between Task2's branch and the common
+    // ancestor (Task2 inherited it via this same method when IT became ready), so the diff
+    // catches it — FilesTouched alone would silently drop it, leaving Task3 on the pre-Task1
+    // value even though Task2's branch already has the fix.
+    private async Task RefreshBranchFromDependenciesAsync(WorkUnit child, string parentBranchId, CancellationToken ct)
     {
         if (child.DependsOn.Count == 0)
             return;
@@ -405,18 +414,8 @@ public sealed class FanOutService : IFanOutService
             if (dep is null)
                 continue;
 
-            var chain = await _artifacts.GetChainAsync(dep.WorkUnitId, ct).ConfigureAwait(false);
-            var proposalRef = chain.LastOrDefault(a => a.Type == ArtifactType.MergeProposal);
-            if (proposalRef is null)
-                continue;
-
-            var proposal = await _merge.GetAsync(proposalRef.ArtifactId, ct).ConfigureAwait(false);
-            if (proposal is null)
-                continue;
-
-            var files = proposal.FilesTouched.Count > 0
-                ? proposal.FilesTouched
-                : await _fileWorkspace.ListAsync(dep.BranchId, ct: ct).ConfigureAwait(false);
+            var diff = await _fileWorkspace.DiffAsync(dep.BranchId, parentBranchId, ct).ConfigureAwait(false);
+            var files = ParseChangedFiles(diff);
             if (files.Count == 0)
                 continue;
 
@@ -424,10 +423,31 @@ public sealed class FanOutService : IFanOutService
         }
     }
 
+    // Mirrors MergeCommandService.ParseFilesTouched's marker convention over DiffAsync's output —
+    // kept local rather than shared since deletions are intentionally excluded here (this method
+    // is additive-only, see RefreshBranchFromDependenciesAsync's own comment) where the merge-side
+    // parser also tracks deletions.
+    private static IReadOnlyList<string> ParseChangedFiles(string diff)
+    {
+        var files = new List<string>();
+        foreach (var rawLine in diff.Split('\n'))
+        {
+            var line = rawLine.TrimEnd('\r');
+            var file =
+                line.StartsWith("+++ ADDED: ", StringComparison.Ordinal)    ? line["+++ ADDED: ".Length..] :
+                line.StartsWith("~~~ MODIFIED: ", StringComparison.Ordinal) ? line["~~~ MODIFIED: ".Length..] :
+                null;
+            if (file is not null)
+                files.Add(file);
+        }
+
+        return files;
+    }
+
     private async Task<bool> EnqueueChildWorkerAsync(
         WorkUnit child,
         string parentWorkUnitId,
-        OrchestratorCredentials? creds,
+        GoalDefaultCredentials? creds,
         string? sessionId,
         CancellationToken ct)
     {

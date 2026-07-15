@@ -102,6 +102,12 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IWorkScheduler>(sp => sp.GetRequiredService<WorkSchedulerService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<WorkSchedulerService>());
 
+        // plans/phase-d-implementation.md D3 — plan-staleness signals, consumed by
+        // ArtifactCommandService (superseding decisions) and InMemoryDeadLetterService
+        // (dead-lettered slices) below. Registered ahead of both so DI resolves it into their
+        // optional constructor parameters.
+        services.AddSingleton<IPlanStalenessService, PlanStalenessService>();
+
         // Slice 15f — shared command services that every transport (MCP/REST/dispatcher) calls.
         services.AddSingleton<ISchedulerCommandService, SchedulerCommandService>();
         services.AddSingleton<IArtifactCommandService, ArtifactCommandService>();
@@ -117,6 +123,11 @@ public static class ServiceCollectionExtensions
         // cheap to recompute and branch directories are recreated identically on InitBranchAsync,
         // so a cold Host just re-detects lazily on first access.
         services.AddSingleton<IWorkspaceProfileService, WorkspaceProfileService>();
+
+        // plans/harness-hosting-architecture.md Phase A.4 — assembled fresh from the
+        // EngineeringState projection + work-unit state on every call; no persistence/rehydration,
+        // same reasoning as IWorkspaceProfileService above.
+        services.AddSingleton<IWorkspaceContractService, WorkspaceContractService>();
 
         // Phase 15a — Roslyn-backed semantic navigation for definition/reference/implementation
         // lookup in branch workspaces. Read-only and recomputed per call; no persistence.

@@ -17,6 +17,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\NodalMerge.Studio.Tasks\NodalMerge.Studio.Tasks.csproj" />
+    <ProjectReference Include="..\..\src\NodalMerge.Studio.McpServer\NodalMerge.Studio.McpServer.csproj" />
   </ItemGroup>
 
 </Project>

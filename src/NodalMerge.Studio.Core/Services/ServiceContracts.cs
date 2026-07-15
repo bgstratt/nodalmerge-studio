@@ -245,7 +245,7 @@ public interface ICandidateReconciliationTrigger
     // supplied, is passed straight through to ReconciliationRequest.Credentials — see that field's
     // own comment for why this takes priority over best-effort source-goal credential inheritance.
     Task<WorkUnit?> TryTriggerAsync(
-        string conflictId, string? steeringNotes = null, OrchestratorCredentials? credentials = null, CancellationToken ct = default);
+        string conflictId, string? steeringNotes = null, GoalDefaultCredentials? credentials = null, CancellationToken ct = default);
 
     // Writes resolvedContent directly onto the candidate branch for each conflicting path, records
     // a synthetic Merged MergeProposal representing the human's resolution (so it flows through the
@@ -290,7 +290,7 @@ public interface ITaskConflictService
 public interface ITaskReconciliationTrigger
 {
     Task<WorkUnit?> TryTriggerAsync(
-        string conflictId, string? steeringNotes = null, OrchestratorCredentials? credentials = null, CancellationToken ct = default);
+        string conflictId, string? steeringNotes = null, GoalDefaultCredentials? credentials = null, CancellationToken ct = default);
 
     Task<MergeProposal?> TryResolveManuallyAsync(
         string conflictId, IReadOnlyDictionary<string, string> resolvedContent, CancellationToken ct = default);
@@ -352,7 +352,7 @@ public sealed record ReconciliationRequest(
     // goal happens to still have a live registration in this process (lost on host restart, and
     // never present at all for a fan-out task's own work unit, only its top-level parent), so it
     // silently no-ops far too often for something advertised as "one-click."
-    OrchestratorCredentials? Credentials = null);
+    GoalDefaultCredentials? Credentials = null);
 
 // Creates an ordinary top-level WorkUnit whose goal carries full reconciliation context (every
 // source proposal's owning goal text + the conflicting paths' diverged content) directly in the
@@ -590,7 +590,50 @@ public enum ReplanOutcome
 public sealed record ReplanResult(
     ReplanOutcome Outcome,
     string? Message = null,
-    IReadOnlyList<string>? NewWorkUnitIds = null);
+    IReadOnlyList<string>? NewWorkUnitIds = null,
+    // plans/phase-d-implementation.md D3 — the manual replan triggers (REST/MCP) surface the
+    // current staleness signal state on the parent (plan-owning) work unit alongside the replan
+    // outcome itself, so a human deciding whether to replan (or having just replanned) can see
+    // "this plan looks stale" in the same response. Null when no parent work unit was resolved
+    // (NotFound/NotApplicable outcomes) or IPlanStalenessService isn't registered.
+    PlanStalenessState? StalenessSignal = null);
+
+// plans/phase-d-implementation.md D3 — staleness *signals* only, never auto-replan (see
+// ExecutionEventKind.PlanStalenessSignalRaised's own doc comment for why automatic replan stays
+// deferred). Evaluated at the two cheapest existing checkpoints where the underlying data already
+// changes — a superseding Decision artifact recorded (IArtifactCommandService.RecordAsync) and a
+// slice transitioning to DeadLettered (IDeadLetterService.RecordFailureAsync) — never a polling
+// timer. Both thresholds are WorkspaceOptions knobs (PlanStalenessSupersedingDecisionThreshold /
+// PlanStalenessDeadLetteredSliceThreshold).
+public interface IPlanStalenessService
+{
+    // Called after a Decision artifact with a non-empty Supersedes list is recorded. Walks the
+    // WorkUnit ancestor chain from decision.OwnedByWorkUnitId for the nearest self-owned Plan
+    // artifact; if found, counts qualifying superseding decisions recorded since that plan across
+    // the plan owner and its immediate fanned-out children, and raises the event when the count
+    // reaches the configured threshold. No-op if decision isn't a superseding Decision or has no
+    // owning work unit.
+    Task NotifySupersedingDecisionRecordedAsync(ArtifactRef decision, CancellationToken ct = default);
+
+    // Called after workUnitId transitions to DeadLettered. Counts sibling slices (children of
+    // workUnitId's immediate parent) currently DeadLettered and raises the event when the count
+    // reaches the configured threshold. No-op if workUnitId has no parent.
+    Task NotifySliceDeadLetteredAsync(string workUnitId, CancellationToken ct = default);
+
+    // On-demand read of the current signal state for planOwnerWorkUnitId — used by the manual
+    // replan triggers to attach staleness state to their response regardless of whether a
+    // Notify* call most recently raised the event (an operator may check well after the
+    // triggering decision/dead-letter, or before either has happened again).
+    Task<PlanStalenessState> GetStateAsync(string planOwnerWorkUnitId, CancellationToken ct = default);
+}
+
+public sealed record PlanStalenessState(
+    bool IsStale,
+    int SupersedingDecisionCount,
+    int SupersedingDecisionThreshold,
+    int DeadLetteredSliceCount,
+    int DeadLetteredSliceThreshold,
+    string? PlanArtifactId);
 
 // Continue-track (Phase 1.4 two-track failure/recovery design): reconstructs a dead-lettered
 // work unit's own prior conversation from ConversationLogEntry rows and resumes the SAME work
@@ -663,6 +706,33 @@ public interface IWorkUnitService
         string workUnitId,
         string? blockedReason,
         CancellationToken cancellationToken = default);
+
+    // plans/harness-hosting-architecture.md Phase B3 — external-harness resume identity
+    // (ClaudeCodeExecutor's own CLI session id) needs a durable home; Metadata is the existing
+    // ad hoc/future-use grab-bag (see WorkUnit.cs), already given read-merge-write treatment by
+    // AmendGoalForSteeredRetryAsync below. Generic single-key setter (null value removes the key)
+    // rather than a harness-specific field, so future ad hoc uses don't need their own setter.
+    // Default body (GetAsync + CreateAsync upsert) exists so every existing IWorkUnitService test
+    // fake keeps compiling without a mechanical edit to all of them; InMemoryWorkUnitService
+    // overrides it with the same direct-dictionary read-merge-write every other setter here uses,
+    // avoiding the upsert race IncrementReviewRejectionCountAsync's own comment already warns about.
+    async Task<WorkUnit> SetMetadataAsync(
+        string workUnitId,
+        string key,
+        string? value,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = await GetAsync(workUnitId, cancellationToken).ConfigureAwait(false)
+            ?? throw new KeyNotFoundException($"Work unit '{workUnitId}' was not found.");
+        var metadata = new Dictionary<string, string>(workUnit.Metadata ?? new Dictionary<string, string>());
+        if (value is null)
+            metadata.Remove(key);
+        else
+            metadata[key] = value;
+
+        return await CreateAsync(workUnit with { Metadata = metadata, UpdatedAt = DateTimeOffset.UtcNow }, cancellationToken)
+            .ConfigureAwait(false);
+    }
 
     // Race-safety fix — increments one of the two ExecutionInfo rejection counters via a fresh
     // internal read-merge-write, the same convention every other setter here uses. Replaces the
@@ -1052,24 +1122,32 @@ public interface IParticipantEventBus
     IReadOnlyList<string> GetRegisteredEventTypes();
 }
 
-public sealed record OrchestratorCredentials(
+public sealed record GoalDefaultCredentials(
     string Provider,
     string Model,
     string BaseUrl,
-    // Never persisted — see OrchestratorRoutingConfig, the safe subset of this shape that actually
+    // Never persisted — see GoalRoutingConfig, the safe subset of this shape that actually
     // gets written to IStudioNodeStore. ApiKey only ever lives in-memory (the live orchestrator
     // registry) or in IRuntimeCredentialCache, keyed by CredentialRef.
     string ApiKey,
     string? ProfileId,
-    string? CredentialRef = null);
+    string? CredentialRef = null,
+    // Opt-in per-profile (Model Profile "Tool-call parsing: Lenient") — tolerate a model that
+    // emits its tool call as message text / a ```json fence instead of the structured tool_calls
+    // field, which small quantized local models (e.g. qwen2.5-coder:7b via Ollama) frequently do.
+    // Default false = strict (only the structured field is honored), so every existing profile and
+    // every content-producing worker (documentation, plans, proposals that legitimately embed JSON)
+    // is completely unaffected. Rides StageCredentials into GoalRoutingConfig, so it persists and
+    // resolves per stage exactly like Provider/Model/BaseUrl. See LlmClient.SendOpenAiAsync.
+    bool LenientToolParsing = false);
 
 // The safe-to-persist projection of an orchestrator's registration — everything
-// InMemoryAgentRuntimeService's in-memory-only _orchestratorRegistrations needs to survive a Host
+// InMemoryAgentRuntimeService's in-memory-only _goalCredentialRegistrations needs to survive a Host
 // restart, minus every ApiKey. Written to IStudioNodeStore at SpawnAsync("orchestrator", ...) time
 // and rehydrated on startup, so GetAutoReviewProfileId/GetEnabledDomainAgents work immediately after
-// a restart with no credential resupply needed at all; GetOrchestratorCredentials/
+// a restart with no credential resupply needed at all; GetGoalDefaultCredentials/
 // GetCredentialsForStage additionally need IRuntimeCredentialCache to have CredentialRef's entry.
-public sealed record OrchestratorRoutingConfig(
+public sealed record GoalRoutingConfig(
     string WorkUnitId,
     string Provider,
     string Model,
@@ -1077,8 +1155,12 @@ public sealed record OrchestratorRoutingConfig(
     string? ProfileId,
     string? AutoReviewProfileId,
     string? CredentialRef,
-    IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? StageCredentials = null,
-    IReadOnlyList<string>? EnabledDomainAgents = null);
+    IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? StageCredentials = null,
+    IReadOnlyList<string>? EnabledDomainAgents = null,
+    // The goal's Default-profile lenient-tool-parsing setting — so a role that inherits Default
+    // (no explicit StageCredentials entry) still honors it. Per-stage overrides carry their own
+    // flag inside StageCredentials; this is only the Default fallback. See GetGoalDefaultCredentials.
+    bool LenientToolParsing = false);
 
 public interface IAgentControlService
 {
@@ -1092,20 +1174,22 @@ public interface IAgentControlService
         string? provider = null,
         string? profileId = null,
         string? autoReviewProfileId = null,
-        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+        IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
         IReadOnlyList<string>? enabledDomainAgents = null,
         string? credentialRef = null,
+        // The Default profile's lenient-tool-parsing setting — inherited by any role without an
+        // explicit per-stage override in stageCredentials. See GoalDefaultCredentials.LenientToolParsing.
+        bool lenientToolParsing = false,
         CancellationToken cancellationToken = default);
 
-    // Re-enters the orchestrator loop for a work unit whose orchestrator was previously
-    // SpawnAsync'd — called automatically whenever a child work unit finishes (WorkSchedulerService.
-    // ReleaseAsync's success path) so the orchestrator notices and decides what's next. Falls back
-    // to the safe rehydrated routing config + IRuntimeCredentialCache when the in-memory
-    // registration is cold (e.g. after a Host restart); if that's also cold, this is a no-op for
-    // the automatic caller (which never passes override params) — but a manual caller (e.g. a
-    // human clicking "Reinvoke Orchestrator" in the goal workspace) can still recover it by
-    // supplying everything itself via the override* params, including a profile for a work unit
-    // whose orchestrator predates routing-config persistence entirely (nothing on record at all).
+    // Runs one deterministic IGoalCoordinator convergence sweep for a goal/orchestrator-type work
+    // unit — called automatically whenever a child work unit finishes (WorkSchedulerService.
+    // ReleaseAsync's success path) so the goal advances. Since plans/orchestrator-pure-service.md
+    // M2 this needs no credentials (there is no LLM loop to restart); the override* params only
+    // (re)persist credentials into the Default-profile registry for later planner/child enqueues.
+    // ensurePlanner additionally enqueues the planner when the goal has no plan, no children, and
+    // no queue item — pass true only from goal start / manual recovery, never from automatic
+    // sweeps (see IGoalCoordinator.ConvergeAsync).
     Task ReinvokeOrchestratorAsync(
         string workUnitId,
         string? sessionId = null,
@@ -1115,13 +1199,14 @@ public interface IAgentControlService
         string? overrideProvider = null,
         string? overrideProfileId = null,
         string? overrideCredentialRef = null,
+        bool ensurePlanner = false,
         CancellationToken cancellationToken = default);
 
     // Requeue Goal's credential half — same resolve-and-persist logic ReinvokeOrchestratorAsync
     // uses (registration hot path, then rehydrated routing + IRuntimeCredentialCache, then the
     // override* params), but without spawning a new orchestrator loop. A requeued goal whose
     // in-flight work is already done (just needs one more reconcile/review pass) doesn't need an
-    // ongoing planning loop — it just needs GetOrchestratorCredentials/GetCredentialsForStage to
+    // ongoing planning loop — it just needs GetGoalDefaultCredentials/GetCredentialsForStage to
     // resolve again for whatever one-shot call (inline reviewer, a re-enqueued worker) needs them
     // next. Returns true if credentials are resolvable (and now persisted) after this call, false
     // if nothing was resolvable (same "no-op, caller can supply overrides" contract as reinvoke).
@@ -1139,14 +1224,14 @@ public interface IAgentControlService
     /// Returns LLM credentials captured when an orchestrator was first spawned for a work unit.
     /// Used by fan-out to enqueue child workers with the same credentials.
     /// </summary>
-    OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId);
+    GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId);
 
     /// <summary>
     /// Per-stage credential override captured at orchestrator spawn time (e.g. a different model
     /// for Plan vs Execute vs Review), or null if no override was configured for that stage —
-    /// callers fall back to <see cref="GetOrchestratorCredentials"/> in that case.
+    /// callers fall back to <see cref="GetGoalDefaultCredentials"/> in that case.
     /// </summary>
-    OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage);
+    GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage);
 
     /// <summary>
     /// Profile ID for the automated reviewer pre-gate, captured at orchestrator spawn time.
@@ -1155,12 +1240,12 @@ public interface IAgentControlService
 
     /// <summary>
     /// The orchestrator's own dispatch profile ID, captured at spawn time — routing data, not a
-    /// credential, so unlike <see cref="GetOrchestratorCredentials"/> this resolves purely from the
+    /// credential, so unlike <see cref="GetGoalDefaultCredentials"/> this resolves purely from the
     /// rehydrated routing config and survives a restart with zero credential resupply needed. Lets
     /// a caller (e.g. a manual "Reinvoke Orchestrator" action) know which profile to resolve fresh
     /// credentials for without first needing a live ApiKey.
     /// </summary>
-    string? GetOrchestratorProfileId(string workUnitId);
+    string? GetGoalDefaultProfileId(string workUnitId);
 
     /// <summary>
     /// Per-work-unit override of which domain agents (by name, e.g. "Security"/"Architecture")
@@ -1198,6 +1283,35 @@ public interface IAgentControlService
         string? taskId,
         Func<Action<string?>, Task<TResult>> run,
         CancellationToken cancellationToken = default);
+}
+
+// plans/orchestrator-pure-service.md M2 — the deterministic coordinator that replaced the
+// orchestrator LLM loop. Goal-level coordination (enqueue the planner, fan out from plans, run
+// reconciliation/review sweeps, complete the goal) is code, not an agent: it holds no
+// conversation, needs no profile of its own, and its convergence sweep needs no credentials at
+// all — child enqueues resolve their own via IAgentControlService's Default-profile registry.
+public interface IGoalCoordinator
+{
+    /// <summary>
+    /// Kicks off a freshly registered goal (or an orchestrator-type work unit, e.g. a
+    /// reconciliation unit): enqueues the planner with the goal's Plan-stage/Default-profile
+    /// credentials, then runs one convergence sweep. Idempotent — a goal that already has a plan,
+    /// children, or a pending scheduler item gets the sweep only.
+    /// </summary>
+    Task StartGoalAsync(string workUnitId, string? sessionId = null, CancellationToken ct = default);
+
+    /// <summary>
+    /// One idempotent convergence sweep: fan out from a recorded plan (the unit's own and any
+    /// still-open orchestrator-type children's), enqueue ready dependents, attempt merge
+    /// reconciliation, enqueue the automated reviewer, and complete the work unit once its
+    /// reconciled proposal is approved/merged. <paramref name="ensurePlanner"/> additionally
+    /// re-enqueues the planner when nothing exists yet (no plan, no children, no queue item) —
+    /// only goal start and *manual* recovery pass true, so an automatic sweep after a planner
+    /// that legitimately produced no plan can never re-enqueue planners in a loop.
+    /// </summary>
+    Task ConvergeAsync(
+        string workUnitId, string? sessionId = null, bool ensurePlanner = false,
+        CancellationToken ct = default);
 }
 
 public interface IArtifactLineageService
@@ -1515,6 +1629,13 @@ public interface IRuntimeCredentialCache
     void Capture(string? credentialRef, string? provider, string? model, string? baseUrl, string? apiKey);
 
     LlmConnectionInfo? TryGet(string? credentialRef);
+
+    // The counterpart to Capture — the only way to force-clear a cached credential in a running
+    // Host. Capture is a no-op for a blank apiKey (a raw key must never be persisted, and CLI
+    // ambient auth legitimately sends blank), so re-supplying a blank key CANNOT overwrite a
+    // previously-captured real one. Removing a profile's key therefore needs an explicit evict, or
+    // the stale key survives until the process dies. No-op on a null/empty or unknown ref.
+    void Evict(string? credentialRef);
 }
 
 public interface IClarificationCommandService
@@ -1571,6 +1692,10 @@ public interface IArtifactCommandService
         string title,
         string body,
         string? parentArtifactId = null,
+        // Phase A — artifact IDs this record supersedes. Required (non-empty) when type is
+        // Supersession; optional on Decision/Constraint/Research when the new record also
+        // explicitly retires an ancestor.
+        IReadOnlyList<string>? supersedes = null,
         CancellationToken ct = default);
 
     /// <summary>
@@ -1667,7 +1792,15 @@ public interface IAgentProfileService
 // pick a profile for each child work unit it enqueues; the LLM-calling implementation lives in
 // AgentRuntime (where LlmClient lives), so this interface is the seam that lets Orchestrator
 // depend on the capability without depending on AgentRuntime directly.
-public sealed record ProfileSelectionResult(string ProfileId, string Reason, bool UsedLlm);
+// plans/phase-d-implementation.md D2 — Provider is additive and optional: null (every existing
+// producer of this record — FanOutService's deterministic FileScope tier, LlmProfileSelectionService's
+// heuristic/LLM tiers) means "no executor-routing opinion, use whatever credentials the caller
+// already resolved," so extending the record here changes nothing about their behavior. Only
+// IPlannerSelectionService (below) ever sets it, carrying the CLI executor's ProviderKey (e.g.
+// "claude-cli") the same way every other executor-routing decision already rides the provider
+// channel (see IHarnessExecutorResolver.ResolveForProvider's doc comment) — null still means
+// "no override" there too (native, or selection disabled/heuristic).
+public sealed record ProfileSelectionResult(string ProfileId, string Reason, bool UsedLlm, string? Provider = null);
 
 public interface IProfileSelectionService
 {
@@ -1678,7 +1811,28 @@ public interface IProfileSelectionService
     /// </summary>
     Task<ProfileSelectionResult> SelectProfileAsync(
         WorkUnit childUnit,
-        OrchestratorCredentials? credentials,
+        GoalDefaultCredentials? credentials,
+        CancellationToken ct = default);
+}
+
+// plans/phase-d-implementation.md D2 — "who plans this goal" executor routing. Parallel to
+// IProfileSelectionService but for the Plan stage: picks which profile (and, via
+// ProfileSelectionResult.Provider, which executor) authors a goal's decomposition. Callers must
+// only consult this when the role's Agent Topology assignment for PipelineStage.Plan is
+// auto/unset (see OrchestratorAgentLoop.InjectSpawnCredentialsAsync) — an explicit per-stage
+// Model Profile assignment is the override and must never be second-guessed by this service.
+public interface IPlannerSelectionService
+{
+    /// <summary>
+    /// Picks the agent profile (and optionally the executor provider) that should plan/decompose
+    /// <paramref name="goalUnit"/>. Returns the heuristic default ("planner", no provider
+    /// override) when selection is disabled (WorkspaceOptions.UsePlannerExecutorSelection),
+    /// no Plan-stage candidates are registered, credentials are unavailable, or the LLM tier
+    /// fails/times out/returns an unknown profile id.
+    /// </summary>
+    Task<ProfileSelectionResult> SelectPlannerAsync(
+        WorkUnit goalUnit,
+        GoalDefaultCredentials? credentials,
         CancellationToken ct = default);
 }
 
@@ -1964,6 +2118,18 @@ public interface IFileWorkspaceService
     // "WeatherForecastController.cs" matches as a substring, so callers can find a specific file by
     // name across the whole branch (subPath omitted) without already knowing its directory.
     Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, string? pattern = null, CancellationToken ct = default);
+
+    // plans/harness-hosting-architecture.md Phase A.5 — ListAsync's dot-hidden rule (any
+    // dot-prefixed path segment is treated as hidden) is exactly what keeps `.workspace/` out of
+    // generic content browsing/diff, but it also means ListAsync can never see inside
+    // `.workspace/` itself. This is the read-back counterpart: lists files under subPath
+    // ignoring the dot-hidden rule (only WorkspacePathFilter.IgnoredDirNames' genuine junk dirs —
+    // node_modules/bin/obj/.git/… — are excluded), the same dotfile-inclusive semantics
+    // FileSystemWorkspaceService already uses for branch seeding. Used by
+    // WorkspaceContractService to read back harness-written `.workspace/decisions` and
+    // `.workspace/inbox` entries.
+    Task<IReadOnlyList<string>> ListIncludingDotfilesAsync(
+        string branchId, string subPath, CancellationToken ct = default);
 
     // Content search (grep), as opposed to ListAsync's filename-only matching. query is matched
     // literally unless regex=true; caseSensitive defaults to false. filePattern reuses ListAsync's
@@ -2382,6 +2548,43 @@ public interface IWorkspaceProfileService
     /// the cache would grow forever, keyed by GUID branch ids that no longer exist on disk.
     /// </summary>
     void Invalidate(string branchId);
+}
+
+// plans/harness-hosting-architecture.md Phase A.2.2 — assembly is a service, not a projection.
+// Consumes the EngineeringState projection plus work-unit/review-policy state and emits the
+// Workspace Contract (docs/contracts/workspace-contract-v1.md); does not itself compute
+// projections. RenderEngineeringStateMarkdownAsync is its own method (not folded into
+// MaterializeAsync) because the native loop's kickoff injection (Phase A.5) reuses exactly this
+// rendering — single source of markdown, never hand-duplicated.
+public interface IWorkspaceContractService
+{
+    Task<WorkspaceContractBundle> AssembleAsync(string workUnitId, CancellationToken ct = default);
+
+    /// <summary>Writes `.workspace/*.json` + derived `.md` siblings into the work unit's branch
+    /// workdir via IFileWorkspaceService. Deterministic — the same runtime state materializes
+    /// byte-identical content (contract principle WC-2).</summary>
+    Task MaterializeAsync(string workUnitId, CancellationToken ct = default);
+
+    Task<string> RenderEngineeringStateMarkdownAsync(string workUnitId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Parses `.workspace/decisions/*` (JSON or markdown-with-frontmatter, normalized to
+    /// WorkspaceContractDecisionEntry) and records each as an artifact via IArtifactLineageService
+    /// directly (bypassing IArtifactCommandService, which always mints a fresh ArtifactId).
+    /// Idempotent: each entry's ArtifactId is deterministically derived from its file number, so
+    /// IArtifactLineageService.RecordAsync's existing "second record with the same ArtifactId is a
+    /// no-op" behavior makes re-harvesting after a crash or retry safe without new dedup logic.
+    /// </summary>
+    Task<IReadOnlyList<ArtifactRef>> HarvestDecisionsAsync(string workUnitId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Parses `.workspace/inbox/*` (one blocking question per numbered file) — the harness→runtime
+    /// half of the pause-and-wait flow (plan's resolved "pause-and-wait semantics per executor"
+    /// decision: external executor v1 pauses at run granularity, detected at harvest). Returns the
+    /// parsed entries; the caller (Phase B.3 harvest) is responsible for turning each into an
+    /// IClarificationCommandService.RequestAsync call — this method only reads and parses.
+    /// </summary>
+    Task<IReadOnlyList<WorkspaceContractInboxEntry>> HarvestInboxAsync(string workUnitId, CancellationToken ct = default);
 }
 
 // Slice 16c — shared entry point for workspace execution commands — called by both MCP tools

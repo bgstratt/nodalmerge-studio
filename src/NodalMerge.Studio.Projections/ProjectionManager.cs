@@ -97,6 +97,7 @@ public sealed class ProjectionManager : IProjectionManager
             ProjectionType.RunRetrospective => await BuildRunRetrospectiveAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.HypothesisComparison => await BuildHypothesisComparisonAsync(request, cancellationToken).ConfigureAwait(false),
             ProjectionType.WorkspacePathways => await BuildWorkspacePathwaysAsync(request, cancellationToken).ConfigureAwait(false),
+            ProjectionType.EngineeringState => await BuildEngineeringStateAsync(request, cancellationToken).ConfigureAwait(false),
             _ => throw new ArgumentOutOfRangeException(nameof(request), request.Type, "Unknown projection type.")
         };
 
@@ -1300,6 +1301,112 @@ public sealed class ProjectionManager : IProjectionManager
 
         var orderedNodes = nodes.OrderBy(n => n.OccurredAt).ToList();
         return Serialize(new WorkspacePathwaysProjectionPayload(orderedNodes, edges, DateTimeOffset.UtcNow));
+    }
+
+    // plans/harness-hosting-architecture.md Phase A.1/A2 — folds promoted Decision/Constraint/
+    // Supersession artifacts into "what is currently true." Applied-proposal rule: a work-unit-owned
+    // artifact enters the fold iff its owning work unit has a Merged proposal; a global artifact
+    // (OwnedByWorkUnitId null — e.g. a promoted Knowledge Finding) is already promotion-equivalent
+    // by construction and included unconditionally, same treatment BuildAgentWorkspaceAsync gives
+    // GetGlobalConstraintsAsync. SupersededBy/IsCurrent are derived here, never stored (see
+    // EngineeringStateFact's doc comment) — the reverse index is scoped to candidate (promoted)
+    // artifacts only, so an in-flight work unit's Supersedes claim can never retire a promoted fact.
+    private async Task<string> BuildEngineeringStateAsync(ProjectionRequest request, CancellationToken ct)
+    {
+        var allProposals = await _merges.ListAsync(sourceBranch: null, ct).ConfigureAwait(false);
+        var promotedWorkUnitIds = allProposals
+            .Where(p => p.Status == MergeProposalStatus.Merged && p.WorkUnitId is not null)
+            .Select(p => p.WorkUnitId!)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var decisions = await _artifactLineage.GetByTypeAsync(ArtifactType.Decision, ct).ConfigureAwait(false);
+        var constraints = await _artifactLineage.GetByTypeAsync(ArtifactType.Constraint, ct).ConfigureAwait(false);
+        var supersessions = await _artifactLineage.GetByTypeAsync(ArtifactType.Supersession, ct).ConfigureAwait(false);
+
+        bool IsPromoted(ArtifactRef a) =>
+            a.OwnedByWorkUnitId is null || promotedWorkUnitIds.Contains(a.OwnedByWorkUnitId);
+
+        // Found live 2026-07-13: this had no scope at all — every promoted fact from every goal in
+        // every registered repository folded into every work unit's state.md/constraints.md. A
+        // stale "all 4 tasks already done" claim from an EARLIER, cancelled run of the same demo
+        // prompt (individual task slices had reached Merged before the goal itself was cancelled —
+        // its changes never actually reached the real repo) leaked into a brand-new, unrelated
+        // goal's planning context, convincing the planner to skip 3 of 4 tasks it was actually
+        // asked to do. Owned facts (a work unit's own research/decisions about ITS OWN goal) now
+        // only fold in for requests within that same goal's root lineage — an unrelated goal, even
+        // in the same repository, no longer sees them. Facts with no owning work unit (
+        // OwnedByWorkUnitId null — e.g. a promoted Knowledge Finding) are unchanged: those are
+        // already the "applies everywhere" tier by construction (see this method's own doc comment
+        // above), not per-goal narrative.
+        var requestRootId = request.WorkUnitId is { } requestingWorkUnitId
+            ? await ResolveRootWorkUnitIdAsync(requestingWorkUnitId, ct).ConfigureAwait(false)
+            : null;
+        var rootCache = new Dictionary<string, string?>(StringComparer.Ordinal);
+
+        async Task<bool> IsInGoalScopeAsync(ArtifactRef a)
+        {
+            if (a.OwnedByWorkUnitId is not { } ownerId)
+                return true;
+            // No specific work unit named in the request (or it couldn't be resolved) — this is a
+            // global/dashboard-style query, not a goal's own kickoff-contract materialization
+            // (which always names a real WorkUnitId). Preserve the old unscoped behavior there
+            // rather than going empty.
+            if (requestRootId is null)
+                return true;
+            if (!rootCache.TryGetValue(ownerId, out var ownerRootId))
+            {
+                ownerRootId = await ResolveRootWorkUnitIdAsync(ownerId, ct).ConfigureAwait(false);
+                rootCache[ownerId] = ownerRootId;
+            }
+            return ownerRootId == requestRootId;
+        }
+
+        var candidates = new List<ArtifactRef>();
+        foreach (var a in decisions.Concat(constraints).Concat(supersessions))
+        {
+            if (IsPromoted(a) && await IsInGoalScopeAsync(a).ConfigureAwait(false))
+                candidates.Add(a);
+        }
+
+        var reverseIndex = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var candidate in candidates)
+        {
+            foreach (var supersededId in candidate.Supersedes)
+            {
+                if (!reverseIndex.TryGetValue(supersededId, out var supersededByList))
+                    reverseIndex[supersededId] = supersededByList = [];
+                supersededByList.Add(candidate.ArtifactId);
+            }
+        }
+
+        var facts = candidates
+            .Select(a => new EngineeringStateFact(
+                a.ArtifactId, a.Type, a.Title, a.Body, a.Status, a.CreatedAt, a.OwnedByWorkUnitId,
+                a.Supersedes,
+                SupersededBy: reverseIndex.TryGetValue(a.ArtifactId, out var by) ? by : [],
+                IsCurrent: a.Status != ArtifactStatus.Invalidated && !reverseIndex.ContainsKey(a.ArtifactId)))
+            .OrderBy(f => f.CreatedAt)
+            .ThenBy(f => f.ArtifactId, StringComparer.Ordinal)
+            .ToList();
+
+        return Serialize(new EngineeringStateProjectionPayload(facts, DateTimeOffset.UtcNow));
+    }
+
+    // Walks ParentWorkUnitId to the top — same walk WorkspaceContractService.ResolveRootAsync does
+    // for goal.md — but returns just the id (not the full WorkUnit) since BuildEngineeringStateAsync
+    // only needs it for a same-goal-lineage comparison. Returns null if the work unit itself can't
+    // be found (deleted/never existed), which IsInGoalScopeAsync treats as "can't prove same scope."
+    private async Task<string?> ResolveRootWorkUnitIdAsync(string workUnitId, CancellationToken ct)
+    {
+        var current = await _workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+        if (current is null) return null;
+        while (current!.ParentWorkUnitId is { } parentId)
+        {
+            var parent = await _workUnits.GetAsync(parentId, ct).ConfigureAwait(false);
+            if (parent is null) break;
+            current = parent;
+        }
+        return current.WorkUnitId;
     }
 
     // Mirrors the anonymous-object shape RepositorySyncService.SyncCoreAsync serializes into

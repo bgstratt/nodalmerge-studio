@@ -11,8 +11,8 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// <summary>
 /// Covers the fix for: after a Host restart, resumed goals silently fell back to human review
 /// because AutoReviewProfileId lived only in InMemoryAgentRuntimeService's in-memory
-/// _orchestratorRegistrations, and the "obvious" fix of persisting that record wholesale would
-/// have written a raw ApiKey to disk. OrchestratorRoutingConfig (the safe subset) now survives a
+/// _goalCredentialRegistrations, and the "obvious" fix of persisting that record wholesale would
+/// have written a raw ApiKey to disk. GoalRoutingConfig (the safe subset) now survives a
 /// restart on its own; ApiKey never touches IStudioNodeStore at all — see
 /// IRuntimeCredentialCache's doc comment.
 /// </summary>
@@ -75,7 +75,7 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
 
         var app2 = BuildApp();
         // Mirrors production startup: InMemoryAgentRuntimeService.StartAsync rehydrates
-        // OrchestratorRoutingConfig before anything else runs.
+        // GoalRoutingConfig before anything else runs.
         var agentRuntime2 = app2.Services.GetRequiredService<InMemoryAgentRuntimeService>();
         await agentRuntime2.StartAsync(CancellationToken.None);
         try
@@ -96,6 +96,64 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
     }
 
     [Fact]
+    public void Evict_clears_a_captured_credential_that_a_blank_recapture_cannot_overwrite()
+    {
+        var cache = new RuntimeCredentialCache();
+        cache.Capture("ref-1", "anthropic", "claude", "https://api.anthropic.com", "sk-real-key");
+        Assert.NotNull(cache.TryGet("ref-1"));
+
+        // The stale-key trap: re-capturing the same ref with a blank key (CLI ambient auth) is a
+        // no-op, so the previously-captured real key survives — this is exactly why removing a key
+        // needed a restart before Evict existed.
+        cache.Capture("ref-1", "claude-cli", "", "", "");
+        Assert.NotNull(cache.TryGet("ref-1"));
+
+        // Explicit evict is the only thing that clears it in a running process.
+        cache.Evict("ref-1");
+        Assert.Null(cache.TryGet("ref-1"));
+
+        // Safe/idempotent on already-gone, unknown, and null/blank refs.
+        cache.Evict("ref-1");
+        cache.Evict("never-cached");
+        cache.Evict(null);
+        cache.Evict("");
+    }
+
+    [Fact]
+    public async Task Routing_persisted_under_the_legacy_orchestrator_kind_still_rehydrates()
+    {
+        // plans/orchestrator-pure-service.md M1 — goals in flight across the GoalRoutingV1 rename
+        // have their routing stored under the legacy OrchestratorRoutingV1 kind. Rehydration must
+        // read both (writes only ever use the new kind now).
+        var app1 = BuildApp();
+        var orchestrator1 = app1.Services.GetRequiredService<IOrchestratorService>();
+        var nodeStore1 = app1.Services.GetRequiredService<IStudioNodeStore>();
+
+        var unit = await orchestrator1.CreateWorkUnitAsync("Build the thing", "test");
+        var legacyRouting = new GoalRoutingConfig(
+            unit.WorkUnitId, "anthropic", "fake-model", "http://fake-llm",
+            ProfileId: "orchestrator", AutoReviewProfileId: "reviewer", CredentialRef: null);
+        await nodeStore1.WriteNodeAsync(
+            StudioNodeKind.OrchestratorRoutingV1, unit.WorkUnitId,
+            System.Text.Json.JsonSerializer.Serialize(legacyRouting));
+        await app1.DisposeAsync();
+
+        var app2 = BuildApp();
+        var agentRuntime2 = app2.Services.GetRequiredService<InMemoryAgentRuntimeService>();
+        await agentRuntime2.StartAsync(CancellationToken.None);
+        try
+        {
+            var agentControl2 = app2.Services.GetRequiredService<IAgentControlService>();
+            Assert.Equal("reviewer", agentControl2.GetAutoReviewProfileId(unit.WorkUnitId));
+            Assert.Equal("orchestrator", agentControl2.GetGoalDefaultProfileId(unit.WorkUnitId));
+        }
+        finally
+        {
+            await agentRuntime2.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task Orchestrator_credentials_are_null_after_restart_until_something_resupplies_them()
     {
         var app1 = BuildApp();
@@ -109,8 +167,8 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
             model: "fake-model", baseUrl: "http://fake-llm", apiKey: "sk-super-secret-123",
             autoReviewProfileId: "reviewer");
 
-        // The persisted OrchestratorRoutingConfig record must never contain the raw key.
-        var routingRecords = await nodeStore1.ReadAllNodesAsync(StudioNodeKind.OrchestratorRoutingV1);
+        // The persisted GoalRoutingConfig record must never contain the raw key.
+        var routingRecords = await nodeStore1.ReadAllNodesAsync(StudioNodeKind.GoalRoutingV1);
         Assert.Contains(routingRecords, r => r.EntityId == unit.WorkUnitId);
         Assert.All(routingRecords, r => Assert.DoesNotContain("sk-super-secret-123", r.PayloadJson));
 
@@ -132,7 +190,7 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
 
             // Nobody has resupplied credentials in this fresh process — the cache is cold, so this
             // must come back null rather than an empty/garbage credential.
-            Assert.Null(agentControl2.GetOrchestratorCredentials(unit.WorkUnitId));
+            Assert.Null(agentControl2.GetGoalDefaultCredentials(unit.WorkUnitId));
         }
         finally
         {
@@ -184,7 +242,7 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
     }
 
     [Fact]
-    public async Task ReinvokeOrchestratorAsync_starts_a_fresh_loop_after_restart_when_credentials_are_resupplied()
+    public async Task ReinvokeOrchestratorAsync_repersists_credentials_after_restart_when_resupplied()
     {
         var app1 = BuildApp();
         var orchestrator1 = app1.Services.GetRequiredService<IOrchestratorService>();
@@ -211,26 +269,23 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
             var agentControl2 = app2.Services.GetRequiredService<IAgentControlService>();
 
             // A human/the extension resupplies credentials — mirrors the goal workspace's manual
-            // "Reinvoke Orchestrator" action.
+            // "Reinvoke Orchestrator" action. Since plans/orchestrator-pure-service.md M2 there is
+            // no loop to restart: the observable outcome is that the credential registry is warm
+            // again (GetGoalDefaultCredentials resolves) and the convergence sweep ran without
+            // spawning any agent.
             await agentControl2.ReinvokeOrchestratorAsync(
                 unit.WorkUnitId, overrideApiKey: "sk-resupplied-after-restart", overrideModel: "fake-model",
                 overrideBaseUrl: "http://fake-llm");
 
-            var active = await agentControl2.ListActiveAsync();
-            var startedAgent = active.SingleOrDefault(a => a.WorkUnitId == unit.WorkUnitId);
-            Assert.NotNull(startedAgent);
+            var creds = agentControl2.GetGoalDefaultCredentials(unit.WorkUnitId);
+            Assert.NotNull(creds);
+            Assert.Equal("sk-resupplied-after-restart", creds!.ApiKey);
 
             // Routing (AutoReviewProfileId etc.) is still correct — resupply only touched credentials.
             Assert.Equal("reviewer", agentControl2.GetAutoReviewProfileId(unit.WorkUnitId));
 
-            // The resupply actually started a real (fire-and-forget) orchestrator loop against the
-            // fake LLM handler — explicitly stop it (not just the scheduler poller below) before
-            // disposing, or its own in-flight SQLite/HTTP activity can outlive this test and keep
-            // the temp db file locked past Dispose(), breaking sibling tests that run afterward.
-            // StopAsync only requests cancellation (Cts.Cancel()) — it doesn't join the loop's
-            // background Task, so give it a brief moment to actually unwind before disposing.
-            await agentControl2.StopAsync(startedAgent!.AgentId);
-            await Task.Delay(200);
+            var active = await agentControl2.ListActiveAsync();
+            Assert.DoesNotContain(active, a => a.WorkUnitId == unit.WorkUnitId);
         }
         finally
         {
@@ -242,11 +297,11 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
     [Fact]
     public async Task ReinvokeOrchestratorAsync_recovers_a_work_unit_with_no_registration_or_routing_at_all_when_fully_resupplied()
     {
-        // Covers a work unit whose orchestrator predates OrchestratorRoutingConfig persistence
-        // entirely (spawned before that fix shipped) — there was never anywhere to persist a
-        // profile/routing to, so unlike the "cold cache, warm routing" case above, there's nothing
-        // on record at all. A manual recovery action supplying everything itself (model/baseUrl/
-        // apiKey/provider/profileId) must still be able to start a fresh orchestrator loop.
+        // Covers a work unit whose goal predates GoalRoutingConfig persistence entirely — there
+        // was never anywhere to persist a profile/routing to, so unlike the "cold cache, warm
+        // routing" case above, there's nothing on record at all. A manual recovery action
+        // supplying everything itself (model/baseUrl/apiKey/provider/profileId) must still
+        // register the Default-profile credentials going forward.
         var app = BuildApp();
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
         var agentRuntime = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
@@ -256,9 +311,9 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
             var agentControl = app.Services.GetRequiredService<IAgentControlService>();
 
             // Created directly, never spawned as an orchestrator at all — nothing in either
-            // _orchestratorRegistrations or the rehydrated routing config for this work unit.
+            // _goalCredentialRegistrations or the rehydrated routing config for this work unit.
             var unit = await orchestrator.CreateWorkUnitAsync("Orphaned goal", "test");
-            Assert.Null(agentControl.GetOrchestratorProfileId(unit.WorkUnitId));
+            Assert.Null(agentControl.GetGoalDefaultProfileId(unit.WorkUnitId));
 
             await agentControl.ReinvokeOrchestratorAsync(
                 unit.WorkUnitId,
@@ -266,22 +321,13 @@ public class CredentialCacheAndRoutingRehydrationTests : IDisposable
                 overrideApiKey: "sk-fresh-recovery-key", overrideProvider: "anthropic",
                 overrideProfileId: "worker");
 
+            // The recovery persists routing going forward, so a *future* restart doesn't hit this
+            // same gap again — and no agent loop is spawned (M2: reinvoke = convergence sweep).
+            Assert.Equal("worker", agentControl.GetGoalDefaultProfileId(unit.WorkUnitId));
+            Assert.NotNull(agentControl.GetGoalDefaultCredentials(unit.WorkUnitId));
+
             var active = await agentControl.ListActiveAsync();
-            var startedAgent = active.SingleOrDefault(a => a.WorkUnitId == unit.WorkUnitId);
-            Assert.NotNull(startedAgent);
-
-            // The recovery should also persist routing going forward, so a *future* restart
-            // doesn't hit this same gap again.
-            Assert.Equal("worker", agentControl.GetOrchestratorProfileId(unit.WorkUnitId));
-
-            // ReinvokeOrchestratorAsync actually started a real (fire-and-forget) orchestrator loop
-            // against the fake LLM handler — explicitly stop it before disposing, or its own
-            // in-flight SQLite/HTTP activity can outlive this test and keep the temp db file locked
-            // past Dispose(), breaking sibling tests in this class that run afterward. StopAsync
-            // only requests cancellation — it doesn't join the loop's background Task, so give it a
-            // brief moment to actually unwind before disposing.
-            await agentControl.StopAsync(startedAgent!.AgentId);
-            await Task.Delay(200);
+            Assert.DoesNotContain(active, a => a.WorkUnitId == unit.WorkUnitId);
         }
         finally
         {

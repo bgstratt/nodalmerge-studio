@@ -9,17 +9,18 @@ using NodalMerge.Studio.Storage;
 namespace NodalMerge.Studio.Integration.Tests;
 
 /// <summary>
-/// Proves the orchestrator re-invocation fix (Phase 4 prerequisite, see
-/// plans/phase-3-foundations.md's Deferred Work Tracker): unlike FullAgentCycleTests, the
-/// orchestrator here drives the worker through the real scheduler queue
-/// (nm_v1_scheduler_enqueue), not the legacy direct nm_v1_agent_spawn — so this is the only
-/// test exercising WorkSchedulerService.ReleaseAsync's new ReinvokeOrchestratorAsync call.
+/// Proves the scheduler-release convergence chain end-to-end (plans/orchestrator-pure-service.md
+/// M2): GoalCoordinator enqueues the planner at spawn; the planner's release fans out the plan
+/// through the real scheduler queue; the worker's release triggers
+/// WorkSchedulerService.ReleaseAsync → ReinvokeOrchestratorAsync → GoalCoordinator.ConvergeAsync
+/// — and the sweeps are idempotent: no duplicate planner enqueues, tasks, or proposals appear no
+/// matter how many releases converge the same goal.
 /// </summary>
 [Trait("Category", "Integration")]
 public class SchedulerReinvocationTests
 {
     [Fact]
-    public async Task SchedulerDrivenRun_ReinvokesOrchestrator_AndConvergesWithoutDuplication()
+    public async Task SchedulerDrivenRun_ConvergesWithoutDuplication()
     {
         var fakeHandler = new ScheduledReinvocationLlmHandler();
 
@@ -33,6 +34,7 @@ public class SchedulerReinvocationTests
         var agentRuntime    = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
         var merge           = app.Services.GetRequiredService<IMergeService>();
         var tasks           = app.Services.GetRequiredService<ITaskService>();
+        var workUnits       = app.Services.GetRequiredService<IWorkUnitService>();
         var decisionLog     = app.Services.GetRequiredService<IOrchestrationDecisionLogService>();
 
         // Drives WorkSchedulerService's poll loop (PollSchedulerAsync) so an enqueued worker
@@ -64,27 +66,25 @@ public class SchedulerReinvocationTests
             }
             Assert.NotNull(proposal);
 
-            // Poll for re-invocation: a second, distinct orchestrator agent making a decision for
-            // the same work unit proves ReleaseAsync's ReinvokeOrchestratorAsync call fired and a
-            // fresh OrchestratorAgentLoop actually ran (not just that the method was called).
-            IReadOnlyList<OrchestrationEvent> decisions = [];
-            var reinvokeDeadline = DateTimeOffset.UtcNow.AddSeconds(10);
-            while (DateTimeOffset.UtcNow < reinvokeDeadline)
-            {
-                decisions = await decisionLog.GetEventsAsync(wu.WorkUnitId);
-                if (decisions.Select(d => d.OrchestratorAgentId).Distinct().Count() >= 2) break;
-                await Task.Delay(100);
-            }
+            // The whole run was coordinated by the deterministic GoalCoordinator — every decision
+            // in the log carries its stable author id, and exactly one SpawnPlanner decision
+            // exists even though the planner's and the worker's releases each ran a full
+            // convergence sweep afterward (the ensurePlanner guard makes automatic sweeps unable
+            // to re-enqueue planners).
+            var decisions = await decisionLog.GetEventsAsync(wu.WorkUnitId);
+            Assert.NotEmpty(decisions);
+            // Deterministic authors only — the coordinator plus fan-out's own Enqueue records;
+            // no LLM orchestrator agent ids appear anywhere.
+            Assert.All(decisions, d =>
+                Assert.Contains(d.OrchestratorAgentId, new[] { "goal-coordinator", "fanout" }));
+            Assert.Single(decisions, d =>
+                d.Action == OrchestrationAction.SpawnPlanner && d.OrchestratorAgentId == "goal-coordinator");
 
-            Assert.True(
-                decisions.Select(d => d.OrchestratorAgentId).Distinct().Count() >= 2,
-                "Expected a second orchestrator agent to have recorded a decision after re-invocation.");
+            // Convergence without duplication: one fan-out child, one task on it, one proposal.
+            var children = await workUnits.GetChildrenAsync(wu.WorkUnitId);
+            var child = Assert.Single(children);
 
-            // Convergence: the re-invoked orchestrator recognized the work was already done and
-            // did not re-enqueue — exactly one Enqueue decision, one task, one proposal total.
-            Assert.Single(decisions, d => d.Action == OrchestrationAction.Enqueue);
-
-            var allTasks = await tasks.ListAsync(wu.WorkUnitId);
+            var allTasks = await tasks.ListAsync(child.WorkUnitId);
             Assert.Single(allTasks);
             Assert.Contains(allTasks, t => t.Status == StudioTaskStatus.Completed);
 
@@ -95,5 +95,37 @@ public class SchedulerReinvocationTests
         {
             await agentRuntime.StopAsync(CancellationToken.None);
         }
+    }
+
+    /// <summary>
+    /// Regression (found live 2026-07-13): a dead-lettered ROOT goal that gets driven again (a
+    /// dead-letter retry re-enqueued its planner, or a human hit Reinvoke) stayed badged
+    /// DeadLettered while its children ran to completion underneath it — nothing ever transitioned
+    /// the root back. GoalCoordinator.ConvergeAsync now repairs it to Executing (via the new
+    /// DeadLettered → Executing transition edge) on the next sweep.
+    /// </summary>
+    [Fact]
+    public async Task Converge_repairs_a_dead_lettered_root_back_to_Executing()
+    {
+        var app = StudioWebApplication.Build(
+            [],
+            llmHttpClient: new HttpClient(new ScheduledReinvocationLlmHandler()),
+            configureServices: services => services.AddInMemoryStorage());
+
+        var orchestratorSvc = app.Services.GetRequiredService<IOrchestratorService>();
+        var agentControl    = app.Services.GetRequiredService<IAgentControlService>();
+        var workUnits       = app.Services.GetRequiredService<IWorkUnitService>();
+
+        var wu = await orchestratorSvc.CreateWorkUnitAsync("Goal that dead-lettered", "integration-test");
+        await workUnits.UpdateStatusAsync(wu.WorkUnitId, WorkUnitStatus.Queued, cancellationToken: default);
+        await workUnits.UpdateStatusAsync(wu.WorkUnitId, WorkUnitStatus.Executing, cancellationToken: default);
+        await workUnits.UpdateStatusAsync(wu.WorkUnitId, WorkUnitStatus.DeadLettered, cancellationToken: default);
+
+        // Credential-free reinvoke = one convergence sweep (no scheduler poller needed for the
+        // repair itself — EnsurePlanner isn't requested, and the sweeps are all no-ops here).
+        await agentControl.ReinvokeOrchestratorAsync(wu.WorkUnitId);
+
+        var repaired = await workUnits.GetAsync(wu.WorkUnitId);
+        Assert.Equal(WorkUnitStatus.Executing, repaired!.Status);
     }
 }

@@ -12,6 +12,12 @@ export interface PipelineProfile {
   // Slice 14c — glob patterns (e.g. "src/**/*.tsx") declaring this profile's file-scope
   // specialty. Empty = no declared specialty, routing falls through to heuristic/LLM selection.
   fileScopePatterns: string[];
+  // Harness-hosting-architecture Phase B1 — which IHarnessExecutor runs this role. Not exposed
+  // in the webview: the user-facing selection is provider-driven (a "claude-cli" Model Profile
+  // assigned via Agent Topology routes the role to ClaudeCodeExecutor server-side). These fields
+  // exist so values set directly over REST survive a UI edit's PUT round-trip.
+  executor?: string;
+  injectApiKeyEnv?: boolean;
 }
 
 export interface DomainAgentInfo {
@@ -55,7 +61,13 @@ export class ModelAgentStudioPanel {
     let tick = 0;
     const timer = setInterval(() => {
       void this.sendParticipants();
-      if (++tick % 3 === 0) { void this.sendConfig(); }
+      // Only refresh SERVER-derived data on the timer (pipeline profiles, domain agents, CLI
+      // providers) — never re-push profiles/templates/defaultTopology. Those live in VS Code
+      // settings, are available synchronously at activate(), and change only when the user saves
+      // from this panel. A periodic full 'config' push used to wholesale-overwrite the webview's
+      // in-memory profiles/templates, silently discarding an in-progress topology edit the user
+      // hadn't saved yet (looked like "the topology keeps resetting to Default").
+      if (++tick % 3 === 0) { void this.sendServerData(); }
     }, 10_000);
     this.panel.onDidDispose(() => clearInterval(timer));
   }
@@ -95,6 +107,57 @@ export class ModelAgentStudioPanel {
       pipelineProfiles,
       domainAgents,
       enabledDomainAgents,
+      cliProviders: await this.fetchCliProviders(),
+    });
+  }
+
+  // plans/harness-hosting-architecture.md Phase C.3 (phase-c-implementation.md C2) — the Model
+  // Profile provider dropdown's CLI entries are data-driven from GET /studio/executors (shipped in
+  // C1) rather than one hardcoded <option> per adapter, so a third CLI adapter needs no extension
+  // edit. The three API providers (vscode-lm/openai/anthropic) stay static in modelAgentStudio.js —
+  // they aren't IHarnessExecutor-backed, so there's nothing for that endpoint to describe about
+  // them. Falls back to the known static CLI list if the endpoint can't be reached (server down).
+  private async fetchCliProviders(): Promise<Array<{ providerKey: string; displayName: string }>> {
+    try {
+      const executors = await this.get<Array<{ providerKey?: string | null; displayName: string }>>('/studio/executors');
+      const cli = executors
+        .filter((e): e is { providerKey: string; displayName: string } => !!e.providerKey)
+        .map(e => ({ providerKey: e.providerKey, displayName: e.displayName }));
+      return cli.length > 0 ? cli : this.staticCliProviders();
+    } catch {
+      return this.staticCliProviders();
+    }
+  }
+
+  private staticCliProviders(): Array<{ providerKey: string; displayName: string }> {
+    return [
+      { providerKey: 'claude-cli', displayName: 'Claude Code CLI' },
+      { providerKey: 'codex-cli', displayName: 'Codex CLI' },
+    ];
+  }
+
+  // The timer-driven counterpart to sendConfig(): pushes only the server-derived slices, so a
+  // periodic refresh (surfacing data that wasn't ready at activate()) can never clobber the
+  // user's unsaved profile/topology edits held in the webview. The webview's 'serverData' handler
+  // updates just these fields and re-renders their sections, leaving profiles/templates untouched.
+  private async sendServerData(): Promise<void> {
+    let pipelineProfiles: PipelineProfile[] = [];
+    let domainAgents: DomainAgentInfo[] = [];
+    let enabledDomainAgents: string[] = [];
+    try {
+      [pipelineProfiles, domainAgents] = await Promise.all([
+        this.get<PipelineProfile[]>('/studio/agent-profiles'),
+        this.get<DomainAgentInfo[]>('/studio/domain-agents'),
+      ]);
+      const opts = await this.get<{ enabledDomainAgents?: string[] }>('/studio/options');
+      enabledDomainAgents = opts.enabledDomainAgents ?? [];
+    } catch { /* server may not be running yet */ }
+    void this.panel.webview.postMessage({
+      type: 'serverData',
+      pipelineProfiles,
+      domainAgents,
+      enabledDomainAgents,
+      cliProviders: await this.fetchCliProviders(),
     });
   }
 
@@ -137,14 +200,36 @@ export class ModelAgentStudioPanel {
         break;
       }
 
+      case 'removeApiKey': {
+        const profileId = msg.profileId as string;
+        const profile   = this.configService.getProfiles().find(p => p.id === profileId);
+        if (profile) {
+          const removedRef = await this.configService.removeApiKey(profile, this.secrets);
+          // Only a persisted key needs host eviction, a toast, and a config-changed signal. When
+          // nothing was stored (the button also serves as "clear the unsaved input"), removedRef is
+          // undefined — skip all that and just refresh the row's key-status below.
+          if (removedRef) {
+            // Evict from the running host's in-memory credential cache — clearing it in settings
+            // alone leaves it cached until a restart (Capture can't express removal).
+            try {
+              await this.post('/studio/credentials/evict', { credentialRef: removedRef });
+            } catch { /* host may not be running — the next spawn re-captures from scratch anyway */ }
+            void vscode.window.showInformationMessage(`NodalMerge: API key removed for profile "${profileId}".`);
+            this.onConfigChanged?.();
+          }
+          void this.panel.webview.postMessage({ type: 'apiKeyRemoved', profileId });
+        }
+        break;
+      }
+
       case 'savePipelineProfile': {
         const p = msg.profile as PipelineProfile;
         const exists = await this.get<unknown>('/studio/agent-profiles/' + p.agentProfileId).then(() => true).catch(() => false);
         const endpoint = '/studio/agent-profiles' + (exists ? '/' + p.agentProfileId : '');
         const method   = exists ? 'PUT' : 'POST';
         const body = exists
-          ? { name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns }
-          : { agentProfileId: p.agentProfileId, name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns };
+          ? { name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv ?? false }
+          : { agentProfileId: p.agentProfileId, name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv ?? false };
         await (method === 'PUT'
           ? fetch(this.baseUrl + endpoint, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
           : this.post(endpoint, body));
@@ -220,6 +305,25 @@ export class ModelAgentStudioPanel {
         'claude-3-5-sonnet-20241022',
         'claude-3-5-haiku-20241022',
       ];
+    }
+    if (provider === 'claude-cli') {
+      // The CLI accepts aliases as well as full model ids; blank (manual entry left empty)
+      // means "use the CLI's own configured default", so this list is suggestions only.
+      return [
+        'sonnet',
+        'opus',
+        'haiku',
+        'claude-fable-5',
+        'claude-opus-4-8',
+        'claude-sonnet-4-6',
+        'claude-haiku-4-5-20251001',
+      ];
+    }
+    if (provider === 'codex-cli') {
+      // Suggestions only, same as claude-cli — the CLI accepts aliases and full model ids, and
+      // blank (manual entry left empty) means "use codex's own configured default". Not fetched
+      // from a live endpoint (codex has no local model-listing API this extension calls today).
+      return ['gpt-5-codex', 'o4-mini', '(blank = CLI default)'];
     }
     if (provider === 'openai' && baseUrl) {
       try {

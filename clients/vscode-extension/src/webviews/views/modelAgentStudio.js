@@ -20,6 +20,18 @@ export function init(ctx) {
   let templates = [];
   let defaultTopology = '';
   var onModelsLoaded = null;
+  // plans/harness-hosting-architecture.md Phase C.3 (phase-c-implementation.md C2) — CLI provider
+  // options for the Model Profile dropdown, sent by AgentConfigPanel.sendConfig() from
+  // GET /studio/executors (data-driven, falls back to a static claude-cli/codex-cli list
+  // server-side if that endpoint can't be reached) instead of one hardcoded <option> per adapter.
+  var cliProviders = [];
+  function isCliProviderKey(key) {
+    return cliProviders.some(function(cp) { return cp.providerKey === key; });
+  }
+  function cliDisplayName(key) {
+    var found = cliProviders.find(function(cp) { return cp.providerKey === key; });
+    return found ? found.displayName : key;
+  }
 
   // ── Tab switching ──────────────────────────────────────────────────────────
   root.querySelectorAll('.tab-btn').forEach(function(btn) {
@@ -91,11 +103,16 @@ export function init(ctx) {
       : profiles[idx];
     const curProvider = p.provider || 'anthropic';
     const isVsLm = curProvider === 'vscode-lm';
+    const isCli = isCliProviderKey(curProvider);
     const secretMissing = !isNew && credentialStatus[p.id] === 'secret-missing';
     const area = $('profile-form-area');
     const modelRowClass = 'field';
-    const baseUrlRowClass = isVsLm ? 'field hidden' : 'field';
+    const baseUrlRowClass = (isVsLm || isCli) ? 'field hidden' : 'field';
     const apiKeyRowClass = isVsLm ? 'field hidden' : 'field';
+    const cliOptionsHtml = cliProviders.map(function(cp) {
+      return '<option value="' + esc(cp.providerKey) + '"' + (curProvider === cp.providerKey ? ' selected' : '') +
+        '>' + esc(cp.displayName) + ' (local binary — uses your CLI login)</option>';
+    }).join('');
     area.innerHTML =
       '<div class="form-box">' +
       '<h3>' + (isNew ? 'Add Profile' : 'Edit Profile') + '</h3>' +
@@ -111,8 +128,15 @@ export function init(ctx) {
         '<select id="pf-provider">' +
           '<option value="vscode-lm"' + (curProvider === 'vscode-lm' ? ' selected' : '') + '>VS Code LM (Copilot / Cursor — no key needed)</option>' +
           '<option value="openai"'    + (curProvider === 'openai'    ? ' selected' : '') + '>OpenAI compatible (OpenAI, DeepSeek, Azure, LM Studio, etc.)</option>' +
-          '<option value="anthropic"' + (curProvider === 'anthropic' ? ' selected' : '') + '>Anthropic (claude-*)</option>' +
+          '<option value="anthropic"' + (curProvider === 'anthropic' ? ' selected' : '') + '>Anthropic API (claude-*)</option>' +
+          cliOptionsHtml +
         '</select></div>' +
+      '<div id="pf-cli-note" class="field muted' + (isCli ? '' : ' hidden') + '">' +
+        'Runs the role via the local <code>' + esc(cliDisplayName(curProvider)) + '</code> CLI in the branch working ' +
+        'directory (assignable to any role, or as the topology\'s Default profile). Auth comes from that CLI\'s own login; ' +
+        'storing an API key below is optional and switches that role to key-based auth. ' +
+        'Leave Model blank to use the CLI\'s default.' +
+      '</div>' +
       '<div id="pf-model-row" class="field">' +
         '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">' +
           '<label style="margin:0;flex:1;font-size:0.8em;opacity:0.6">Model</label>' +
@@ -121,7 +145,7 @@ export function init(ctx) {
         '<select id="pf-model-select"><option value="__custom__">— enter manually —</option>' +
           (p.model ? '<option value="' + esc(p.model) + '" selected>' + esc(p.model) + '</option>' : '') +
         '</select>' +
-        '<input type="text" id="pf-model-custom" style="margin-top:4px;' + (p.model ? 'display:none;' : '') + '" value="' + esc(p.model || '') + '" placeholder="' + (isVsLm ? 'blank = active VS Code model' : 'e.g. claude-sonnet-4-6') + '">' +
+        '<input type="text" id="pf-model-custom" style="margin-top:4px;' + (p.model ? 'display:none;' : '') + '" value="' + esc(p.model || '') + '" placeholder="' + (isVsLm ? 'blank = active VS Code model' : isCli ? 'blank = CLI default (or a CLI-specific alias/model id)' : 'e.g. claude-sonnet-4-6') + '">' +
         '<div id="pf-model-loading" class="muted hidden" style="font-size:0.8em;padding:2px 0">Fetching models…</div>' +
       '</div>' +
       '<div id="pf-baseurl-row" class="' + baseUrlRowClass + '">' +
@@ -133,6 +157,7 @@ export function init(ctx) {
         '<div class="flex-row">' +
           '<input type="password" id="pf-apikey" placeholder="' + (secretMissing ? 'Key missing — paste key to re-store' : p.apiKeyRef ? '(key stored)' : 'Paste key to store') + '" class="grow">' +
           '<button id="pf-store-key" class="ghost">Store Key</button>' +
+          '<button id="pf-remove-key" class="ghost">Remove Key</button>' +
         '</div>' +
         '<div id="pf-key-status" class="' + (secretMissing ? '' : 'muted') + '"' + (secretMissing ? ' style="color:#e5a000"' : '') + '>' +
           (secretMissing
@@ -148,6 +173,14 @@ export function init(ctx) {
       (isVsLm ? '<div class="field muted">Uses your VS Code Copilot or Cursor subscription — no API key required.</div>' : '') +
       '<div class="field"><label>System Prompt (optional)</label>' +
         '<textarea id="pf-prompt">' + esc(p.systemPrompt || p.systemPromptHint || '') + '</textarea></div>' +
+      '<div class="field"><label>Tool-call parsing</label>' +
+        '<select id="pf-toolcall-parsing">' +
+          '<option value="strict"' + ((p.toolCallParsing || 'strict') === 'strict' ? ' selected' : '') + '>Strict — only structured tool_calls (default)</option>' +
+          '<option value="lenient"' + (p.toolCallParsing === 'lenient' ? ' selected' : '') + '>Lenient — also accept a tool call emitted as message text</option>' +
+        '</select>' +
+        '<div class="muted" style="font-size:0.8em;padding-top:2px">Enable Lenient only for small/low-quant local models (e.g. qwen2.5-coder:7b) that write their ' +
+        'tool call as text instead of the structured field. Leave Strict for API models and any role that produces documents or JSON content.</div>' +
+      '</div>' +
       '<div class="form-actions">' +
         '<button id="pf-save">Save</button>' +
         '<button class="ghost" id="pf-cancel">Cancel</button>' +
@@ -156,11 +189,23 @@ export function init(ctx) {
     // Toggle field visibility when provider changes. Keep model visible; update its placeholder.
     $('pf-provider').addEventListener('change', function() {
       const isVs = this.value === 'vscode-lm';
-      $('pf-baseurl-row').classList.toggle('hidden', isVs);
+      const cli  = isCliProviderKey(this.value);
+      $('pf-baseurl-row').classList.toggle('hidden', isVs || cli);
       $('pf-apikey-row').classList.toggle('hidden', isVs);
+      const noteEl = $('pf-cli-note');
+      noteEl.classList.toggle('hidden', !cli);
+      if (cli) {
+        noteEl.innerHTML =
+          'Runs the role via the local <code>' + esc(cliDisplayName(this.value)) + '</code> CLI in the branch ' +
+          'working directory (assignable to any role, or as the topology\'s Default profile). Auth comes from that CLI\'s own login; ' +
+          'storing an API key below is optional and switches that role to key-based auth. ' +
+          'Leave Model blank to use the CLI\'s default.';
+      }
       const m = $('pf-model-custom');
       if (m) {
-        m.setAttribute('placeholder', isVs ? 'blank = active VS Code model' : 'e.g. claude-sonnet-4-6 or gpt-4o');
+        m.setAttribute('placeholder', isVs ? 'blank = active VS Code model'
+          : cli ? 'blank = CLI default (or a CLI-specific alias/model id)'
+          : 'e.g. claude-sonnet-4-6 or gpt-4o');
       }
       requestModels();
     });
@@ -224,6 +269,20 @@ export function init(ctx) {
       $('pf-apikey').value = '';
     });
 
+    var removeKeyBtn = $('pf-remove-key');
+    if (removeKeyBtn) {
+      removeKeyBtn.addEventListener('click', function() {
+        // Always clear the (possibly unsaved) input so "add a key, change your mind, remove it
+        // before saving" works with no round-trip. Also ask the host to drop any *persisted* key
+        // for this profile — a no-op server-side when nothing was ever stored (or the profile is
+        // new and unsaved), so it's safe to fire unconditionally.
+        $('pf-apikey').value = '';
+        const id = $('pf-id').value.trim() || (isNew ? '' : p.id);
+        if (!id) { return; }
+        vscode.postMessage({ type: 'removeApiKey', profileId: id });
+      });
+    }
+
     $('pf-save').addEventListener('click', function() {
       const id           = $('pf-id').value.trim();
       const label        = $('pf-label').value.trim();
@@ -231,8 +290,9 @@ export function init(ctx) {
       const provider     = $('pf-provider').value;
       const deployMode   = $('pf-deploy-mode').value;
       const model        = getModelValue();
-      const baseUrl      = provider === 'vscode-lm' ? '' : $('pf-baseurl').value.trim();
+      const baseUrl      = (provider === 'vscode-lm' || isCliProviderKey(provider)) ? '' : $('pf-baseurl').value.trim();
       const prompt       = $('pf-prompt').value.trim();
+      const toolCallParsing = $('pf-toolcall-parsing') ? $('pf-toolcall-parsing').value : 'strict';
       if (!id || !label || !domain) { alert('ID, Label, and Domain are required.'); return; }
       const keyEl     = $('pf-apikey');
       const pendingKey = (keyEl && provider !== 'vscode-lm') ? keyEl.value.trim() : '';
@@ -247,6 +307,7 @@ export function init(ctx) {
         baseUrl:          baseUrl || undefined,
         apiKeyRef:        apiKeyRef,
         systemPrompt:     prompt  || undefined,
+        toolCallParsing:  toolCallParsing === 'lenient' ? 'lenient' : undefined,
       };
       if (isNew) { profiles.push(profile); }
       else       { profiles[idx] = profile; }
@@ -271,7 +332,7 @@ export function init(ctx) {
 
   // ── Agent Topology ───────────────────────────────────────────────────────────
   function profileLabel(profileId) {
-    if (!profileId) { return '— inherit Orchestrator —'; }
+    if (!profileId) { return '— inherit Default —'; }
     const p = profiles.find(function(pr) { return pr.id === profileId; });
     return p ? p.label : profileId;
   }
@@ -320,7 +381,7 @@ export function init(ctx) {
   }
 
   function profileOptions(selected, includeInherit) {
-    const lead = includeInherit ? '<option value="">— inherit Orchestrator —</option>' : '';
+    const lead = includeInherit ? '<option value="">— inherit Default —</option>' : '';
     return lead + profiles.map(function(p) {
       const sel = p.id === selected ? ' selected' : '';
       return '<option value="' + esc(p.id) + '"' + sel + '>' + esc(p.label) + ' (' + esc(p.domain) + ')</option>';
@@ -336,15 +397,15 @@ export function init(ctx) {
       '<h3>' + (isNew ? 'Add Topology' : 'Edit Topology') + '</h3>' +
       '<div class="field"><label>Name</label>' +
         '<input type="text" id="tmpl-name" value="' + esc(t.name) + '" placeholder="e.g. Default"></div>' +
-      '<div class="field"><label>Orchestrator Profile</label>' +
+      '<div class="field"><label>Default Profile <span style="opacity:0.6">(the goal\'s credential anchor — every unset role inherits it)</span></label>' +
         '<select id="tmpl-orch">' + profileOptions(t.orchestrator, false) + '</select></div>' +
-      '<div class="field"><label>Planner Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+      '<div class="field"><label>Planner Profile <span style="opacity:0.6">(optional — falls back to Default)</span></label>' +
         '<select id="tmpl-planner">' + profileOptions(t.planner, true) + '</select></div>' +
-      '<div class="field"><label>Worker Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+      '<div class="field"><label>Worker Profile <span style="opacity:0.6">(optional — falls back to Default)</span></label>' +
         '<select id="tmpl-worker">' + profileOptions(t.worker, true) + '</select></div>' +
-      '<div class="field"><label>Reviewer Profile <span style="opacity:0.6">(optional — falls back to Orchestrator)</span></label>' +
+      '<div class="field"><label>Reviewer Profile <span style="opacity:0.6">(optional — falls back to Default)</span></label>' +
         '<select id="tmpl-reviewer">' + profileOptions(t.reviewer, true) + '</select></div>' +
-      '<div class="field"><label>Reconciler Profile <span style="opacity:0.6">(optional — falls back to Orchestrator; used to spawn conflict-reconciliation goals)</span></label>' +
+      '<div class="field"><label>Reconciler Profile <span style="opacity:0.6">(optional — falls back to Default; used to spawn conflict-reconciliation goals)</span></label>' +
         '<select id="tmpl-reconciler">' + profileOptions(t.reconciler, true) + '</select></div>' +
       '<div class="form-actions">' +
         '<button id="tmpl-save">Save</button>' +
@@ -358,7 +419,7 @@ export function init(ctx) {
       const worker     = $('tmpl-worker').value;
       const reviewer   = $('tmpl-reviewer').value;
       const reconciler = $('tmpl-reconciler').value;
-      if (!name || !orch) { alert('Name and Orchestrator Profile are required.'); return; }
+      if (!name || !orch) { alert('Name and Default Profile are required.'); return; }
       const tmpl = {
         name: name,
         orchestrator: orch,
@@ -501,7 +562,9 @@ export function init(ctx) {
       if (!id || !name) { alert('Profile ID and Name are required.'); return; }
       const allowedTools = toolsRaw ? toolsRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
       const fileScopePatterns = fileScopeRaw ? fileScopeRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
-      const profile = { agentProfileId: id, name: name, stage: stage, systemPrompt: prompt, allowedTools: allowedTools, maxIterations: maxIter, fileScopePatterns: fileScopePatterns };
+      // executor/injectApiKeyEnv are not editable here (provider-driven via Model Profiles +
+      // Agent Topology), but REST-set values must survive this form's PUT round-trip.
+      const profile = { agentProfileId: id, name: name, stage: stage, systemPrompt: prompt, allowedTools: allowedTools, maxIterations: maxIter, fileScopePatterns: fileScopePatterns, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv };
       vscode.postMessage({ type: 'savePipelineProfile', profile: profile });
       $('pipeline-profile-form-area').innerHTML = '';
     });
@@ -566,6 +629,7 @@ export function init(ctx) {
       templates        = msg.templates       || [];
       defaultTopology  = msg.defaultTopology || '';
       pipelineProfiles = msg.pipelineProfiles || [];
+      cliProviders     = msg.cliProviders || [];
       renderProfiles();
       renderTemplates();
       renderPipelineProfiles();
@@ -575,6 +639,18 @@ export function init(ctx) {
       if (workspaceRpSel && msg.defaultWorkspaceReviewPolicy) { workspaceRpSel.value = msg.defaultWorkspaceReviewPolicy; }
       domainAgents = msg.domainAgents || [];
       enabledDomainAgents = msg.enabledDomainAgents || [];
+      renderDomainAgentToggles();
+      return;
+    }
+    if (msg.type === 'serverData') {
+      // Timer-driven refresh of SERVER-derived data only. Deliberately does NOT touch profiles,
+      // templates, or defaultTopology — those are the user's local editing state and overwriting
+      // them here would discard an in-progress topology edit (the "keeps resetting" bug).
+      pipelineProfiles = msg.pipelineProfiles || pipelineProfiles;
+      cliProviders     = msg.cliProviders || cliProviders;
+      domainAgents         = msg.domainAgents || domainAgents;
+      enabledDomainAgents  = msg.enabledDomainAgents || enabledDomainAgents;
+      renderPipelineProfiles();
       renderDomainAgentToggles();
       return;
     }
@@ -590,6 +666,23 @@ export function init(ctx) {
         if (pi >= 0) { profiles[pi] = Object.assign({}, profiles[pi], { apiKeyRef: msg.apiKeyRef }); }
       }
       credentialStatus[msg.profileId] = 'ok';
+      renderProfiles();
+      return;
+    }
+    if (msg.type === 'apiKeyRemoved') {
+      const statusEl = $('pf-key-status');
+      if (statusEl) {
+        statusEl.textContent = 'No key stored';
+        statusEl.className = 'muted';
+        statusEl.removeAttribute('style');
+      }
+      const pi = profiles.findIndex(function(pr) { return pr.id === msg.profileId; });
+      if (pi >= 0) {
+        var np = Object.assign({}, profiles[pi]);
+        delete np.apiKeyRef;
+        profiles[pi] = np;
+      }
+      delete credentialStatus[msg.profileId];
       renderProfiles();
       return;
     }

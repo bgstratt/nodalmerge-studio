@@ -56,9 +56,13 @@ public static class StudioRestEndpoints
         // Opaque client-derived cache key (e.g. the VS Code extension's SecretStorage apiKeyRef) —
         // never a secret itself. Lets the server re-resolve ApiKey from IRuntimeCredentialCache
         // after a restart instead of ever persisting it. See IRuntimeCredentialCache's doc comment.
-        string? CredentialRef = null);
+        string? CredentialRef = null,
+        // The Default profile's lenient-tool-parsing setting (from the extension's orchCfg). Any role
+        // that inherits Default — no per-stage entry in StageCredentials — picks this up. Per-stage
+        // overrides carry their own flag inside StageCredentials.
+        bool LenientToolParsing = false);
 
-    private sealed record StageCredentialDto(string Provider, string Model, string BaseUrl, string ApiKey, string? CredentialRef = null);
+    private sealed record StageCredentialDto(string Provider, string Model, string BaseUrl, string ApiKey, string? CredentialRef = null, bool LenientToolParsing = false);
 
     // Optional resupply payload for POST /studio/workunits/{workUnitId}/reinvoke-orchestrator —
     // mirrors ResumeBody/ContinueBody. Present when the caller (typically the VS Code extension,
@@ -112,7 +116,9 @@ public static class StudioRestEndpoints
         string SystemPrompt,
         IReadOnlyList<string> AllowedTools,
         int MaxIterations,
-        IReadOnlyList<string>? FileScopePatterns = null);
+        IReadOnlyList<string>? FileScopePatterns = null,
+        string? Executor = null,
+        bool InjectApiKeyEnv = false);
 
     private sealed record UpdateAgentProfileBody(
         string Name,
@@ -120,7 +126,9 @@ public static class StudioRestEndpoints
         string SystemPrompt,
         IReadOnlyList<string> AllowedTools,
         int MaxIterations,
-        IReadOnlyList<string>? FileScopePatterns = null);
+        IReadOnlyList<string>? FileScopePatterns = null,
+        string? Executor = null,
+        bool InjectApiKeyEnv = false);
 
     private sealed record MarkKnownGoodBody(
         string BranchId,
@@ -148,9 +156,9 @@ public static class StudioRestEndpoints
         string? ProfileId = null,
         string? CredentialRef = null)
     {
-        public OrchestratorCredentials? ToCredentials() =>
+        public GoalDefaultCredentials? ToCredentials() =>
             !string.IsNullOrWhiteSpace(Model) && !string.IsNullOrWhiteSpace(BaseUrl)
-                ? new OrchestratorCredentials(Provider ?? "anthropic", Model, BaseUrl, ApiKey ?? string.Empty, ProfileId, CredentialRef)
+                ? new GoalDefaultCredentials(Provider ?? "anthropic", Model, BaseUrl, ApiKey ?? string.Empty, ProfileId, CredentialRef)
                 : null;
     }
 
@@ -166,6 +174,10 @@ public static class StudioRestEndpoints
         string? Provider = null,
         string? SessionId = null,
         string? CredentialRef = null);
+
+    // POST /studio/credentials/evict payload — the opaque cache key (the extension's SecretStorage
+    // apiKeyRef) whose in-memory credential should be force-cleared when its profile's key is removed.
+    private sealed record EvictCredentialBody(string? CredentialRef = null);
 
     // Optional resupply payload for POST /studio/scheduler/{workUnitId}/resume — present when the
     // caller (typically the VS Code extension, re-reading its own SecretStorage) has live
@@ -1563,6 +1575,19 @@ public static class StudioRestEndpoints
                 keywords = d.Keywords,
             })));
 
+        // plans/harness-hosting-architecture.md Phase C.1 (phase-c-implementation.md C1.c) — lets
+        // a caller discover registered IHarnessExecutors and what each actually supports, without
+        // hardcoding executor names. The extension does not consume this yet (that's a later
+        // slice's dropdown work); the data exists here because it's produced here.
+        app.MapGet("/studio/executors", (IEnumerable<IHarnessExecutor> executors) =>
+            Results.Ok(executors.Select(e => new
+            {
+                name = e.Name,
+                providerKey = e.ProviderKey,
+                displayName = e.DisplayName,
+                capabilities = e.Capabilities,
+            })));
+
         app.MapGet("/studio/agents", async (
             [FromQuery] bool all,
             [FromQuery] string? sessionId,
@@ -1602,14 +1627,14 @@ public static class StudioRestEndpoints
             if (wu is null)
                 return Results.NotFound(new { error = $"Work unit '{body.WorkUnitId}' not found." });
 
-            IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null;
+            IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null;
             if (body.StageCredentials is { Count: > 0 })
             {
-                var resolved = new Dictionary<PipelineStage, OrchestratorCredentials>();
+                var resolved = new Dictionary<PipelineStage, GoalDefaultCredentials>();
                 foreach (var (key, dto) in body.StageCredentials)
                 {
                     if (Enum.TryParse<PipelineStage>(key, ignoreCase: true, out var stage))
-                        resolved[stage] = new OrchestratorCredentials(dto.Provider, dto.Model, dto.BaseUrl, dto.ApiKey, null, dto.CredentialRef);
+                        resolved[stage] = new GoalDefaultCredentials(dto.Provider, dto.Model, dto.BaseUrl, dto.ApiKey, null, dto.CredentialRef, dto.LenientToolParsing);
                 }
                 stageCredentials = resolved;
             }
@@ -1617,16 +1642,16 @@ public static class StudioRestEndpoints
             var agentId = await agents.SpawnAsync(
                 body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey,
                 body.Provider, body.ProfileId, body.AutoReviewProfileId, stageCredentials,
-                body.EnabledDomainAgents, body.CredentialRef, ct).ConfigureAwait(false);
+                body.EnabledDomainAgents, body.CredentialRef, body.LenientToolParsing, ct).ConfigureAwait(false);
             return Results.Ok(new { agentId, agentType = body.AgentType, workUnitId = body.WorkUnitId, branchId = wu.BranchId });
         });
 
-        // Manual recovery for a stalled orchestrator — normally ReinvokeOrchestratorAsync fires
-        // automatically whenever a child finishes (WorkSchedulerService.ReleaseAsync's success
-        // path), but that's a silent no-op if credentials aren't resolvable (e.g. right after a
-        // Host restart, before anything has resupplied IRuntimeCredentialCache): every child could
-        // finish and the orchestrator would just never notice. Guarded against double-spawning a
-        // second live orchestrator loop over an already-running one.
+        // Manual recovery for a stalled goal — runs one IGoalCoordinator convergence sweep
+        // (plans/orchestrator-pure-service.md M2: deterministic and credential-free, so the old
+        // 409 already-active and 422 no-credentials outcomes no longer exist). ensurePlanner is
+        // the manual-recovery privilege: a goal with no plan, no children, and no queue item gets
+        // its planner (re)enqueued, which automatic sweeps deliberately never do. The override*
+        // body params re-warm the Default-profile credential registry first when supplied.
         app.MapPost("/studio/workunits/{workUnitId}/reinvoke-orchestrator", async (
             string workUnitId,
             ReinvokeOrchestratorBody? body,
@@ -1638,21 +1663,14 @@ public static class StudioRestEndpoints
             if (wu is null)
                 return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
 
-            var active = await agents.ListActiveAsync(ct).ConfigureAwait(false);
-            if (active.Any(a => a.WorkUnitId == workUnitId))
-                return Results.Conflict(new { error = $"An orchestrator is already active for work unit '{workUnitId}'." });
-
             await agents.ReinvokeOrchestratorAsync(
                 workUnitId,
                 sessionId: null,
                 body?.OverrideModel, body?.OverrideBaseUrl, body?.OverrideApiKey, body?.OverrideProvider,
-                body?.OverrideProfileId, body?.OverrideCredentialRef, ct).ConfigureAwait(false);
+                body?.OverrideProfileId, body?.OverrideCredentialRef,
+                ensurePlanner: true, ct).ConfigureAwait(false);
 
-            var stillActive = await agents.ListActiveAsync(ct).ConfigureAwait(false);
-            var started = stillActive.Any(a => a.WorkUnitId == workUnitId);
-            return started
-                ? Results.Ok(new { workUnitId, status = "reinvoked" })
-                : Results.UnprocessableEntity(new { error = "No credentials resolvable for this orchestrator — resupply via overrideApiKey." });
+            return Results.Ok(new { workUnitId, status = "reinvoked" });
         });
 
         // Manual recovery for a goal stuck at Completed with no top-level proposal — normally
@@ -2557,6 +2575,18 @@ public static class StudioRestEndpoints
                 .ConfigureAwait(false);
             return Results.Ok(new { workUnitId = item.WorkUnitId, profileId = item.ProfileId, taskId = item.TaskId, sessionId = item.SessionId, status = "enqueued" });
         });
+
+        // Force-clear a cached credential when its profile's key is removed. Capture can't express
+        // removal (a blank apiKey is a no-op, so re-supplying blank leaves the old key cached), so
+        // the extension calls this on explicit Remove-Key. Idempotent — 200 even if nothing was
+        // cached under the ref.
+        app.MapPost("/studio/credentials/evict", (
+            EvictCredentialBody body,
+            IRuntimeCredentialCache credentialCache) =>
+        {
+            credentialCache.Evict(body.CredentialRef);
+            return Results.Ok(new { evicted = true, credentialRef = body.CredentialRef });
+        });
     }
 
     // ScheduledItem.ApiKey is already [JsonIgnore]d (never persisted, never serialized by
@@ -3125,7 +3155,9 @@ public static class StudioRestEndpoints
                 body.SystemPrompt ?? string.Empty,
                 body.AllowedTools ?? [],
                 body.MaxIterations > 0 ? body.MaxIterations : 20,
-                body.FileScopePatterns ?? []);
+                body.FileScopePatterns ?? [],
+                body.Executor,
+                body.InjectApiKeyEnv);
             var created = await profiles.CreateAsync(profile, ct).ConfigureAwait(false);
             return Results.Ok(created);
         });
@@ -3147,7 +3179,9 @@ public static class StudioRestEndpoints
                     body.SystemPrompt ?? string.Empty,
                     body.AllowedTools ?? [],
                     body.MaxIterations > 0 ? body.MaxIterations : 20,
-                    body.FileScopePatterns ?? []);
+                    body.FileScopePatterns ?? [],
+                    body.Executor,
+                    body.InjectApiKeyEnv);
                 var updated = await profiles.UpdateAsync(profile, ct).ConfigureAwait(false);
                 return Results.Ok(updated);
             }
@@ -3229,7 +3263,8 @@ public static class StudioRestEndpoints
         string Type,
         string Title,
         string Body,
-        string? ParentArtifactId = null);
+        string? ParentArtifactId = null,
+        IReadOnlyList<string>? Supersedes = null);
 
     private sealed record PlanArtifactBody(
         string WorkUnitId,
@@ -3304,7 +3339,7 @@ public static class StudioRestEndpoints
             try
             {
                 var recorded = await artifactCommands.RecordAsync(
-                    body.WorkUnitId, body.Type, body.Title, body.Body, body.ParentArtifactId, ct).ConfigureAwait(false);
+                    body.WorkUnitId, body.Type, body.Title, body.Body, body.ParentArtifactId, body.Supersedes, ct).ConfigureAwait(false);
                 return Results.Ok(recorded);
             }
             catch (ArgumentException ex)
@@ -3940,7 +3975,10 @@ public static class StudioRestEndpoints
                         parkedReason,
                         parkedWorkUnitIds = (IReadOnlyList<string>?)parkedIds ?? [],
                         orchestratorStalled,
-                        orchestratorProfileId = orchestratorStalled ? agents.GetOrchestratorProfileId(g.WorkUnitId) : null
+                        // orchestratorProfileId is the legacy name for defaultProfileId — both ship
+                        // until the extension reads the new one (plans/orchestrator-pure-service.md M3).
+                        orchestratorProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null,
+                        defaultProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null
                     });
                 }
                 return Results.Ok(new { goals, source = "goal-store" });
@@ -3972,7 +4010,9 @@ public static class StudioRestEndpoints
                     parkedReason,
                     parkedWorkUnitIds = (IReadOnlyList<string>?)parkedIds ?? [],
                     orchestratorStalled,
-                    orchestratorProfileId = orchestratorStalled ? agents.GetOrchestratorProfileId(wu.WorkUnitId) : null,
+                    // Legacy + new name pair — see the goal-store branch above.
+                    orchestratorProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(wu.WorkUnitId) : null,
+                    defaultProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(wu.WorkUnitId) : null,
                 };
             }).ToList();
             return Results.Ok(new { goals = fallback, source = "work-units" });

@@ -20,13 +20,28 @@ public sealed class AutomatedReviewGateService(
         string? sessionId = null,
         CancellationToken cancellationToken = default)
     {
-        var profileId = agentControl.GetAutoReviewProfileId(parentWorkUnitId);
-        if (string.IsNullOrWhiteSpace(profileId))
-            return new AutomatedReviewGateResult(AutomatedReviewGateOutcome.NotEnabled);
-
         var proposal = await FindReviewableProposalAsync(parentWorkUnitId, cancellationToken).ConfigureAwait(false);
         if (proposal is null)
             return new AutomatedReviewGateResult(AutomatedReviewGateOutcome.NotApplicable);
+
+        // Agent review is enabled when the review POLICY calls for it (AgentApproval/Hybrid) OR an
+        // auto-review profile was explicitly configured. The policy arm is the fix: previously this gated
+        // ONLY on GetAutoReviewProfileId, so every goal-creation path that didn't send an autoReviewProfileId
+        // (MCP nms_v1_goal_run, REST, the extension pre-fix) silently never reviewed AgentApproval goals that
+        // depend on this scheduled gate — atomic no-plan goals, which have no reconciliation → inline-review
+        // path. The autoReviewProfileId arm preserves agent PRE-review: a HumanRequired goal with a reviewer
+        // configured still gets VerificationResults added here, while the human gate decides the apply
+        // (AutomatedReviewAsync respects the policy for auto-apply downstream — see AutoReviewRule/Fix 1).
+        // Effective policy mirrors AutoReviewRule (the inline gate): real-repo apply → WorkspaceReviewPolicy,
+        // otherwise TaskReviewPolicy.
+        var autoReviewProfileId = agentControl.GetAutoReviewProfileId(parentWorkUnitId);
+        var wu = await workUnits.GetAsync(parentWorkUnitId, cancellationToken).ConfigureAwait(false);
+        var policy = (WorkspaceReviewScope.AppliesToRealRepo(wu)
+            ? wu?.WorkspaceReviewPolicy
+            : wu?.TaskReviewPolicy) ?? ReviewPolicy.HumanRequired;
+        if (policy is not (ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid)
+            && string.IsNullOrWhiteSpace(autoReviewProfileId))
+            return new AutomatedReviewGateResult(AutomatedReviewGateOutcome.NotEnabled);
 
         if (proposal.Status == MergeProposalStatus.UnderReview)
         {
@@ -34,6 +49,18 @@ public sealed class AutomatedReviewGateService(
                 AutomatedReviewGateOutcome.AlreadyEnqueued,
                 proposal.ProposalId);
         }
+
+        var creds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Review)
+            ?? agentControl.GetGoalDefaultCredentials(parentWorkUnitId);
+
+        // Which profile the reviewer runs under: an explicitly-assigned reviewer wins; otherwise walk to
+        // the goal's Default profile (inherit-default — a profile is a profile, any role inherits Default),
+        // then a bare "reviewer" slot as a last resort so the scheduler item is always well-formed. The
+        // reviewer's credentials resolve independently above (Review-stage override, else the goal default),
+        // so this id is only the scheduler's profile slot, not the credential source.
+        var profileId = autoReviewProfileId
+            ?? creds?.ProfileId
+            ?? "reviewer";
 
         var pending = await scheduler.ListPendingAsync(cancellationToken).ConfigureAwait(false);
         if (pending.Any(p =>
@@ -45,8 +72,6 @@ public sealed class AutomatedReviewGateService(
                 proposal.ProposalId);
         }
 
-        var creds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Review)
-            ?? agentControl.GetOrchestratorCredentials(parentWorkUnitId);
         await scheduler.EnqueueAsync(
             parentWorkUnitId,
             profileId,
@@ -90,7 +115,7 @@ public sealed class AutomatedReviewGateService(
                 ? "Automated review rejected the reconciled proposal."
                 : $"Automated review rejected: {proposal.VerificationResults}";
             var failedCreds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Review)
-                ?? agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+                ?? agentControl.GetGoalDefaultCredentials(parentWorkUnitId);
 
             await deadLetter.RecordFailureAsync(
                 parentWorkUnitId,
@@ -121,7 +146,7 @@ public sealed class AutomatedReviewGateService(
 
         var children = await workUnits.GetChildrenAsync(parentWorkUnitId, cancellationToken).ConfigureAwait(false);
         var creds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Execute)
-            ?? agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+            ?? agentControl.GetGoalDefaultCredentials(parentWorkUnitId);
         foreach (var child in children)
         {
             if (child.Status is not WorkUnitStatus.Proposed and not WorkUnitStatus.Merged)
@@ -238,9 +263,9 @@ public sealed class AutomatedReviewGateService(
             : updatedWorkUnit.ExecutionInfo!.HumanReviewRejectionCount;
 
         var creds = agentControl.GetCredentialsForStage(workUnitId, PipelineStage.Execute)
-            ?? agentControl.GetOrchestratorCredentials(workUnitId)
+            ?? agentControl.GetGoalDefaultCredentials(workUnitId)
             ?? (workUnit.ParentWorkUnitId is { } executeParentId
-                ? agentControl.GetCredentialsForStage(executeParentId, PipelineStage.Execute) ?? agentControl.GetOrchestratorCredentials(executeParentId)
+                ? agentControl.GetCredentialsForStage(executeParentId, PipelineStage.Execute) ?? agentControl.GetGoalDefaultCredentials(executeParentId)
                 : null);
 
         // The max-attempts cap exists to stop AGENTS from spinning — an automated reviewer

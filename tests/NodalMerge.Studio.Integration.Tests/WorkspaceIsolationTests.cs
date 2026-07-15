@@ -113,6 +113,12 @@ public class WorkspaceIsolationTests
         public Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, string? pattern = null, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<string>>(_branches.TryGetValue(branchId, out var files) ? files.Keys.ToList() : []);
 
+        public Task<IReadOnlyList<string>> ListIncludingDotfilesAsync(string branchId, string subPath, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<string>>(
+                _branches.TryGetValue(branchId, out var files)
+                    ? files.Keys.Where(k => k.StartsWith(subPath, StringComparison.Ordinal)).ToList()
+                    : []);
+
         public Task<(IReadOnlyList<WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(
             string branchId, string query, string? subPath = null, string? filePattern = null,
             bool regex = false, bool caseSensitive = false, int contextLines = 3, int maxResults = 200,

@@ -7,7 +7,7 @@ using StudioTaskStatus = NodalMerge.Studio.Contracts.Domain.TaskStatus;
 
 namespace NodalMerge.Studio.McpServer.Tools;
 
-public sealed class TaskTools(ITaskCommandService taskCommands)
+public sealed class TaskTools(ITaskCommandService taskCommands, IWorkUnitService workUnits)
 {
     [McpServerTool(Name = McpToolNames.TaskCreate), Description("Create a task for a work unit and record an artifact-lineage entry for it.")]
     public async Task<string> CreateAsync(
@@ -41,6 +41,14 @@ public sealed class TaskTools(ITaskCommandService taskCommands)
         }
         catch (KeyNotFoundException)
         {
+            // Direct-execution (no-plan) path: the worker has no task record, but the generic
+            // worker prompt still tells it to update one, so it passes its workUnitId as the taskId.
+            // Treat that as a clean no-op success rather than a misleading "not found" error — the
+            // work unit is real, there's simply no task to move. A genuinely unknown id still errors.
+            var wu = await workUnits.GetAsync(taskId, cancellationToken).ConfigureAwait(false);
+            if (wu is not null)
+                return McpJson.Ok(new { updated = false, reason = "No task record for this work unit; nothing to update." });
+
             return McpJson.Error(McpToolNames.TaskUpdate, $"Task '{taskId}' was not found.");
         }
         catch (InvalidOperationException ex)

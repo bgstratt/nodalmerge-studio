@@ -84,6 +84,7 @@ public sealed class ExternalGoalTools(
         [Description("ID of a previously registered repository to work in. Use nms_v1_repo_list to find IDs.")] string? repositoryId = null,
         [Description("Optional success criteria to guide the agent.")] string? successCriteria = null,
         [Description("Worker agent profile ID. Defaults to 'worker'.")] string? workerProfileId = null,
+        [Description("Review policy for both gates (task + workspace): 'HumanRequired' (a human applies), 'AgentApproval' (an agent reviews and auto-applies on approval — fully autonomous), or 'Hybrid' (agent approves, human can override for a window). Omit to use the server's configured default (Workspace:DefaultTaskReviewPolicy).")] string? reviewPolicy = null,
         CancellationToken cancellationToken = default)
     {
         try
@@ -91,12 +92,27 @@ public sealed class ExternalGoalTools(
             if (string.IsNullOrWhiteSpace(goal))
                 return McpJson.Error(McpServerToolNames.GoalRun, "goal is required.");
 
+            // Per-call override of the server default (WorkspaceOptions.DefaultTaskReviewPolicy). Null
+            // leaves the command's policies null, so CreateWorkUnitAsync applies the server default —
+            // the "default, but any caller can override per goal" model the UI already uses.
+            ReviewPolicy? parsedPolicy = null;
+            if (!string.IsNullOrWhiteSpace(reviewPolicy))
+            {
+                if (!Enum.TryParse<ReviewPolicy>(reviewPolicy, ignoreCase: true, out var p))
+                    return McpJson.Error(
+                        McpServerToolNames.GoalRun,
+                        $"Invalid reviewPolicy '{reviewPolicy}'. Use HumanRequired, AgentApproval, or Hybrid.");
+                parsedPolicy = p;
+            }
+
             var workUnit = await workUnitCommands.CreateAsync(
                 new WorkUnitCreateCommand(
                     goal,
                     "mcp-external",
                     SuccessCriteria: successCriteria,
-                    RepositoryId: repositoryId),
+                    RepositoryId: repositoryId,
+                    TaskReviewPolicy: parsedPolicy,
+                    WorkspaceReviewPolicy: parsedPolicy),
                 cancellationToken).ConfigureAwait(false);
 
             var goalNode = new GoalNode(
@@ -284,8 +300,15 @@ public sealed class ExternalGoalTools(
                 case "replan":
                 {
                     var result = await replan.ReplanFailedSliceAsync(entry.EntryId, cancellationToken).ConfigureAwait(false);
+                    // plans/phase-d-implementation.md D3 — stalenessSignal rides the response
+                    // regardless of outcome (when resolvable) so a human sees "this plan looks
+                    // stale" alongside the replan result itself.
                     return result.Outcome == ReplanOutcome.Replanned
-                        ? McpJson.Ok(new { goalId, action, outcome = result.Outcome.ToString(), newWorkUnitIds = result.NewWorkUnitIds })
+                        ? McpJson.Ok(new
+                        {
+                            goalId, action, outcome = result.Outcome.ToString(),
+                            newWorkUnitIds = result.NewWorkUnitIds, stalenessSignal = result.StalenessSignal,
+                        })
                         : McpJson.Error(McpServerToolNames.GoalRecover, result.Message ?? $"Re-plan failed: {result.Outcome}.");
                 }
                 default:

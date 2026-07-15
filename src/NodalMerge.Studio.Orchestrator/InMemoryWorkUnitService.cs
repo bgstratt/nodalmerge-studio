@@ -170,6 +170,30 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return updated;
     }
 
+    public async Task<WorkUnit> SetMetadataAsync(
+        string workUnitId,
+        string key,
+        string? value,
+        CancellationToken cancellationToken = default)
+    {
+        var workUnit = GetRequired(workUnitId);
+        var metadata = new Dictionary<string, string>(workUnit.Metadata ?? new Dictionary<string, string>());
+        if (value is null)
+            metadata.Remove(key);
+        else
+            metadata[key] = value;
+
+        var updated = workUnit with { Metadata = metadata, UpdatedAt = DateTimeOffset.UtcNow };
+        _workUnits[workUnitId] = updated;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1,
+            workUnitId,
+            JsonSerializer.Serialize(updated),
+            cancellationToken).ConfigureAwait(false);
+
+        return updated;
+    }
+
     public async Task<WorkUnit> IncrementReviewRejectionCountAsync(
         string workUnitId,
         bool automated,
@@ -397,8 +421,12 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             FanOutInfo: fanOutInfo,
             BranchedFromProposalId: branchedFromProposalId,
             ForkType: forkType,
-            TaskReviewPolicy: taskReviewPolicy ?? ReviewPolicy.HumanRequired,
-            WorkspaceReviewPolicy: workspaceReviewPolicy ?? ReviewPolicy.HumanRequired,
+            // Fall back to the server-level default (WorkspaceOptions, configured at startup) rather
+            // than a hardcoded HumanRequired, so non-UI callers that send no policy (MCP/REST/eval-
+            // harness) honor the operator's default. An explicit per-call policy still wins. The
+            // extension always sends its own policy, so this only changes uncredentialed callers.
+            TaskReviewPolicy: taskReviewPolicy ?? _workspaceOptions.DefaultTaskReviewPolicy,
+            WorkspaceReviewPolicy: workspaceReviewPolicy ?? _workspaceOptions.DefaultWorkspaceReviewPolicy,
             TaskReviewHybridTimeoutMinutes: taskReviewHybridTimeoutMinutes,
             WorkspaceReviewHybridTimeoutMinutes: workspaceReviewHybridTimeoutMinutes,
             BypassPromotionBranch: bypassPromotionBranch,

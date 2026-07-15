@@ -157,6 +157,13 @@ public static class WorkUnitTransitions
             // converge. Proposed is the accept-time restore; Merged is the apply-time landing.
             (WorkUnitStatus.DeadLettered, WorkUnitStatus.Proposed) => true,
             (WorkUnitStatus.DeadLettered, WorkUnitStatus.Merged) => true,
+            // A dead-letter retry re-enqueues work for the unit (planner or worker) — the enqueue
+            // path's best-effort Queued write and GoalCoordinator's convergence repair (Executing)
+            // must both be legal, or a retried ROOT goal stays badged DeadLettered while its
+            // children run to completion underneath it (found live 2026-07-13: the retried 4-task
+            // goal's planner + all slices ran and merged with the root still showing DeadLettered).
+            (WorkUnitStatus.DeadLettered, WorkUnitStatus.Queued) => true,
+            (WorkUnitStatus.DeadLettered, WorkUnitStatus.Executing) => true,
             (WorkUnitStatus.Proposed, WorkUnitStatus.Reviewing) => true,
             // A fan-out parent is the orchestrator's own work unit, spawned via the legacy
             // direct-spawn path (IAgentControlService.SpawnAsync("orchestrator", ...)) — it never

@@ -10,7 +10,9 @@ public sealed class ClarificationCommandService(
     IWorkScheduler scheduler,
     IWorkUnitService workUnits,
     IExecutionEventStream events,
-    WorkspaceOptions? workspaceOptions = null) : IClarificationCommandService
+    IFileWorkspaceService fileWorkspace,
+    WorkspaceOptions? workspaceOptions = null,
+    IGoalNodeService? goalNodes = null) : IClarificationCommandService
 {
     private static readonly HashSet<WorkUnitStatus> AbandonedStatuses =
     [
@@ -57,7 +59,12 @@ public sealed class ClarificationCommandService(
             await TryUpdateStatusAsync(workUnitId, WorkUnitStatus.Waiting, resolvedSessionId, ct).ConfigureAwait(false);
         }
 
-        if (resolvedSessionId is not null)
+        // Unconditional — this event is the SOLE source ListActiveRequestsAsync / RespondAsync /
+        // ClarificationTimerService read from. Before 2026-07-13 it was gated on a resolvable
+        // sessionId, so a session-less blocking request parked the work unit (above) while being
+        // invisible in the inbox and unanswerable: a stuck goal with no visible cause (found by the
+        // C3 real-CLI smoke — see plans/review-seam-and-clarification-sessions.md S1).
+        // ResolveSessionIdAsync now never returns null (synthetic wu-{workUnitId} last resort).
         {
             await events.AppendAsync(
                 resolvedSessionId,
@@ -219,6 +226,12 @@ public sealed class ClarificationCommandService(
         {
             await scheduler.ApproveResumeAsync(workUnitId, ct).ConfigureAwait(false);
             await TryUpdateStatusAsync(workUnitId, WorkUnitStatus.Queued, requested.SessionId, ct).ConfigureAwait(false);
+            // plans/harness-hosting-architecture.md Phase B3 — the outbox half of the pause/resume
+            // loop. Harmless for a native worker (it never reads .workspace/outbox); a respawned
+            // ClaudeCodeExecutor's kickoff prompt tells it to check here for the answer before
+            // asking again. Unconditional (not executor-specific) — the same posture as inbox
+            // harvesting, which also runs regardless of which executor a work unit uses.
+            await WriteOutboxAnswerAsync(workUnitId, response, ct).ConfigureAwait(false);
         }
 
         if (requested.SessionId is not null)
@@ -245,13 +258,62 @@ public sealed class ClarificationCommandService(
             Status: resume ? "resumed" : "response_recorded");
     }
 
-    private async Task<string?> ResolveSessionIdAsync(string workUnitId, string? explicitSessionId, CancellationToken ct)
+    // Numbered files, same convention as .workspace/inbox and .workspace/decisions
+    // (WorkspaceContractService) — no frontmatter needed, the whole file content is the answer.
+    private async Task WriteOutboxAnswerAsync(string workUnitId, string response, CancellationToken ct)
+    {
+        var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+        if (wu is null)
+            return;
+
+        var existing = await fileWorkspace
+            .ListIncludingDotfilesAsync(wu.BranchId, ".workspace/outbox", ct)
+            .ConfigureAwait(false);
+        var next = existing
+            .Select(f => int.TryParse(Path.GetFileNameWithoutExtension(f), out var n) ? n : (int?)null)
+            .Where(n => n.HasValue)
+            .Select(n => n!.Value)
+            .DefaultIfEmpty(0)
+            .Max() + 1;
+
+        await fileWorkspace.WriteAsync(wu.BranchId, $".workspace/outbox/{next:0000}.md", response, ct)
+            .ConfigureAwait(false);
+    }
+
+    private async Task<string> ResolveSessionIdAsync(string workUnitId, string? explicitSessionId, CancellationToken ct)
     {
         if (!string.IsNullOrWhiteSpace(explicitSessionId))
             return explicitSessionId;
 
         var pending = await scheduler.ListPendingAsync(ct).ConfigureAwait(false);
-        return pending.FirstOrDefault(i => i.WorkUnitId == workUnitId)?.SessionId;
+        var pendingSessionId = pending.FirstOrDefault(i => i.WorkUnitId == workUnitId)?.SessionId;
+        if (!string.IsNullOrWhiteSpace(pendingSessionId))
+            return pendingSessionId;
+
+        // Fall back to the owning goal's session: walk ParentWorkUnitId to the root (fanned-out
+        // children carry no goal node of their own), then match the goal node on WorkUnitId.
+        if (goalNodes is not null)
+        {
+            var rootId = workUnitId;
+            for (var depth = 0; depth < 32; depth++)
+            {
+                var unit = await workUnits.GetAsync(rootId, ct).ConfigureAwait(false);
+                if (unit?.ParentWorkUnitId is not { } parentId)
+                    break;
+                rootId = parentId;
+            }
+
+            var goal = (await goalNodes.ListAsync(ct).ConfigureAwait(false))
+                .FirstOrDefault(g => string.Equals(g.WorkUnitId, rootId, StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrWhiteSpace(goal?.SessionId))
+                return goal.SessionId;
+        }
+
+        // Never-null last resort: a synthetic per-work-unit session. A valid ExecutionEventStream
+        // key like any other — everything that consumes ClarificationRequested/Responded events
+        // queries by kind across sessions, so the request stays fully listable/answerable even
+        // when nothing upstream carried a real session (see this file's RequestAsync comment).
+        return $"wu-{workUnitId}";
     }
 
     private async Task TryUpdateStatusAsync(

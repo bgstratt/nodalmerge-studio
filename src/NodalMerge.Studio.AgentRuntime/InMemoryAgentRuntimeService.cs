@@ -14,11 +14,11 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 {
     private readonly ConcurrentDictionary<(string AgentId, string WorkUnitId), ExecutionSnapshot> _snapshots = new();
     private readonly ConcurrentDictionary<string, AgentRecord> _agents = new();
-    private readonly ConcurrentDictionary<string, OrchestratorRegistration> _orchestratorRegistrations = new();
-    // Safe-to-persist subset of OrchestratorRegistration (no ApiKey anywhere), rehydrated from
-    // IStudioNodeStore on startup — this is what survives a Host restart. _orchestratorRegistrations
+    private readonly ConcurrentDictionary<string, GoalCredentialRegistration> _goalCredentialRegistrations = new();
+    // Safe-to-persist subset of GoalCredentialRegistration (no ApiKey anywhere), rehydrated from
+    // IStudioNodeStore on startup — this is what survives a Host restart. _goalCredentialRegistrations
     // above is checked first (same-process hot path, has real credentials); this is the fallback.
-    private readonly ConcurrentDictionary<string, OrchestratorRoutingConfig> _orchestratorRouting = new();
+    private readonly ConcurrentDictionary<string, GoalRoutingConfig> _goalRouting = new();
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<InMemoryAgentRuntimeService> _logger;
     private readonly IAgentProfileService _profileService;
@@ -76,17 +76,18 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     // Captured at SpawnAsync("orchestrator", ...) time so ReinvokeOrchestratorAsync can restart
     // the loop with the same credentials/profile later, without the caller (WorkSchedulerService)
     // needing to remember or re-supply them.
-    private sealed record OrchestratorRegistration(
+    private sealed record GoalCredentialRegistration(
         string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? AutoReviewProfileId,
-        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? StageCredentials = null,
+        IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? StageCredentials = null,
         IReadOnlyList<string>? EnabledDomainAgents = null,
-        string? CredentialRef = null);
+        string? CredentialRef = null,
+        bool LenientToolParsing = false);
 
     // ── IHostedService ─────────────────────────────────────────────────────
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        await RehydrateOrchestratorRoutingAsync(cancellationToken).ConfigureAwait(false);
+        await RehydrateGoalRoutingAsync(cancellationToken).ConfigureAwait(false);
         await RehydrateInterruptedAgentsAsync(cancellationToken).ConfigureAwait(false);
         _pollCts = new CancellationTokenSource();
         _ = Task.Run(() => PollSchedulerAsync(_pollCts.Token), CancellationToken.None);
@@ -94,24 +95,28 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
     // Restores the safe (no-ApiKey) subset of every orchestrator's registration so
     // GetAutoReviewProfileId/GetEnabledDomainAgents/routing work immediately after a restart, with
-    // zero credential resupply required — _orchestratorRegistrations itself (with real credentials)
+    // zero credential resupply required — _goalCredentialRegistrations itself (with real credentials)
     // intentionally stays empty until something re-spawns or resupplies via the Resume flow.
-    private async Task RehydrateOrchestratorRoutingAsync(CancellationToken ct)
+    private async Task RehydrateGoalRoutingAsync(CancellationToken ct)
     {
         try
         {
-            var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.OrchestratorRoutingV1, ct)
-                .ConfigureAwait(false);
-            foreach (var (entityId, payloadJson) in records)
+            // Legacy kind first, current kind second — a goal that was re-persisted after the
+            // GoalRoutingV1 rename has records under both, and the current one must win.
+            foreach (var kind in new[] { StudioNodeKind.OrchestratorRoutingV1, StudioNodeKind.GoalRoutingV1 })
             {
-                var routing = JsonSerializer.Deserialize<OrchestratorRoutingConfig>(payloadJson);
-                if (routing is not null)
-                    _orchestratorRouting[entityId] = routing;
+                var records = await _nodeStore.ReadAllNodesAsync(kind, ct).ConfigureAwait(false);
+                foreach (var (entityId, payloadJson) in records)
+                {
+                    var routing = JsonSerializer.Deserialize<GoalRoutingConfig>(payloadJson);
+                    if (routing is not null)
+                        _goalRouting[entityId] = routing;
+                }
             }
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "[Rehydration] Failed to restore orchestrator routing config.");
+            _logger.LogWarning(ex, "[Rehydration] Failed to restore goal routing config.");
         }
     }
 
@@ -245,34 +250,60 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             var baseUrl  = item.BaseUrl  ?? string.Empty;
             var apiKey   = item.ApiKey;
             var taskId   = item.TaskId   ?? string.Empty;
+            // GetService, not GetRequiredService: this resolver is only used below for the
+            // canRun/Plan-Review CLI-provider gates, which must degrade gracefully (no CLI
+            // providers registered) rather than throw when a test double's IServiceProvider
+            // doesn't carry it — the real executor resolution a few lines down still uses
+            // GetRequiredService since it's on the actual run path, not a gate.
+            var harnessExecutorResolver = _serviceProvider.GetService<IHarnessExecutorResolver>();
 
             // item.ApiKey is [JsonIgnore]d out of persistence — a rehydrated item (Host restart)
             // deserializes it as null. Re-resolve from the shared cache via CredentialRef before
             // falling through to the "missing credentials" failure path below. A cache miss here
             // (nobody has resupplied yet) parks the item rather than dead-lettering it — it's not
             // actually broken, it just needs a human/the extension to click Resume.
+            //
+            // CLI providers are the exception and must never park for a blank key: blank IS the
+            // credential (ambient CLI login; storing a key is the opt-in to key-based auth), and
+            // RuntimeCredentialCache.Capture deliberately stores nothing for a blank-key/blank-
+            // baseUrl registration — so a claude-cli item with a credentialRef would otherwise
+            // ALWAYS park (found live 2026-07-13: the GoalCoordinator's planner enqueue threads
+            // credentialRef through, which the old orchestrator-LLM enqueue never did, making
+            // this gate reachable for CLI items for the first time).
             if (string.IsNullOrEmpty(apiKey) && !string.IsNullOrWhiteSpace(item.CredentialRef))
             {
                 var cached = _credentialCache.TryGet(item.CredentialRef);
-                if (cached is null)
-                {
-                    awaitingCredentials = true;
-                }
-                else
+                if (cached is not null)
                 {
                     apiKey = cached.ApiKey;
                     if (!string.IsNullOrEmpty(cached.Provider)) provider = cached.Provider;
                     if (!string.IsNullOrEmpty(cached.Model)) model = cached.Model;
                     if (!string.IsNullOrEmpty(cached.BaseUrl)) baseUrl = cached.BaseUrl;
                 }
+                else if (!(harnessExecutorResolver?.IsCliProvider(provider) ?? false))
+                {
+                    awaitingCredentials = true;
+                }
             }
             apiKey ??= string.Empty;
 
+            // Lenient tool-call parsing is a per-profile opt-in that rides the stage's credential
+            // (GoalDefaultCredentials.LenientToolParsing). Resolve it for the stage this loop is
+            // about to run — falling back to the goal's Default-profile credentials for a stage that
+            // inherits Default — and default to false (strict) whenever nothing is registered.
+            var lenientToolParsing =
+                (GetCredentialsForStage(item.WorkUnitId, profile?.Stage ?? PipelineStage.Execute)
+                 ?? GetGoalDefaultCredentials(item.WorkUnitId))?.LenientToolParsing ?? false;
+
             _agents[agentId] = new AgentRecord(agentId, item.WorkUnitId, "active", taskId, model, baseUrl, apiKey, provider, cts);
 
-            var canRun = !awaitingCredentials && !string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
-                && (!string.IsNullOrWhiteSpace(model)
-                    || provider.Equals("openai", StringComparison.OrdinalIgnoreCase));
+            // claude-cli needs no baseUrl/apiKey (ambient CLI auth; blank model = the CLI's own
+            // default) — its only gate is not being parked for a credential-cache re-resolve.
+            var canRun = !awaitingCredentials &&
+                ((harnessExecutorResolver?.IsCliProvider(provider) ?? false)
+                    || (!string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
+                        && (!string.IsNullOrWhiteSpace(model)
+                            || provider.Equals("openai", StringComparison.OrdinalIgnoreCase))));
 
             if (awaitingCredentials)
             {
@@ -298,25 +329,57 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         ct: ct).ConfigureAwait(false);
                 }
 
-                var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
-                var llm = _serviceProvider.GetRequiredService<LlmClient>();
-                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
-                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
+                // All three stage branches below (Plan, Review, Worker/Execute) now construct via
+                // the executor seam (plans/review-seam-and-clarification-sessions.md S2 closed the
+                // last one, Review) — NativeHarnessExecutor builds its own DefaultAgentToolClient
+                // from the request's Provider/Model/BaseUrl/ApiKey, so nothing here constructs an
+                // LLM client anymore.
                 var ruleFileContext = await BuildRuleFileContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
 
+                // The work unit's OWN goal, inlined into the native worker/planner kickoff (see
+                // HarnessRunRequest.Goal). This is WorkUnit.Goal — a child's slice goal or an atomic
+                // goal's full text — NOT the unbounded root goal the removed BuildOriginalGoalContextAsync
+                // pushed into every sibling (see the Execute branch comment below). Null-safe: a unit test
+                // with a hand-rolled service provider gets null and the kickoff falls back to task-only.
+                var goalText = _serviceProvider.GetService<IWorkUnitService>() is { } goalWuSvc
+                    ? (await goalWuSvc.GetAsync(item.WorkUnitId, ct).ConfigureAwait(false))?.Goal
+                    : null;
+
                 AgentLoopCompletion completion;
+                string? harnessFailureReason = null;
                 var workerProgressVerified = true;
                 if (profile?.Stage == PipelineStage.Plan)
                 {
+                    // plans/phase-d-implementation.md D1.a — Plan-stage construction moves behind
+                    // the executor seam, the same way the Worker/Execute branch below already
+                    // does: resolve via provider, build a HarnessRunRequest, let the executor
+                    // construct whatever loop it needs (NativeHarnessExecutor wraps
+                    // PlannerAgentLoop for Mode==Plan; a CLI executor writes .workspace/plan.json).
+                    // A resolved executor that hasn't wired planning mode yet (Capabilities
+                    // .SupportsPlanningMode false) degrades to native rather than failing the item
+                    // over a capability miss — same "never fail on capability miss" posture as the
+                    // CLI-provider gate above.
                     var constraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var promptGuidanceContext = await BuildPromptGuidanceContextAsync(PipelineStage.Plan, ct).ConfigureAwait(false);
-                    var combinedContext = string.Join("\n\n", new[] { constraintsContext, promptGuidanceContext }.Where(s => s is not null));
-                    var plannerLoop = new PlannerAgentLoop(
-                        agentId, item.WorkUnitId, agentClient,
-                        profile, item.SessionId, a => ReportActivity(agentId, a),
-                        ruleFileContext, combinedContext.Length == 0 ? null : combinedContext,
-                        conversationLog: conversationLog, events: _events, logger: _logger);
-                    completion = await plannerLoop.RunAsync(cts.Token).ConfigureAwait(false);
+                    var engineeringStateContext = await BuildEngineeringStateContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                    var combinedContext = string.Join("\n\n", new[] { constraintsContext, promptGuidanceContext, engineeringStateContext }.Where(s => s is not null));
+
+                    var planExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
+                    var planExecutor = planExecutorResolver.ResolveForProvider(provider, profile?.Executor);
+                    if (!planExecutor.Capabilities.SupportsPlanningMode)
+                        planExecutor = planExecutorResolver.Resolve("native");
+
+                    var planRequest = new HarnessRunRequest(
+                        HarnessMode.Plan, agentId, item.WorkUnitId, taskId, profile, item.SessionId,
+                        IsResume: item.AttemptCount > 0, ruleFileContext,
+                        PromptGuidanceContext: combinedContext.Length == 0 ? null : combinedContext,
+                        SelfVerifyBuild: false, SelfVerifyTest: false,
+                        OnActivity: a => ReportActivity(agentId, a),
+                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey,
+                        Goal: goalText, LenientToolParsing: lenientToolParsing);
+                    var planResult = await planExecutor.RunAsync(planRequest, cts.Token).ConfigureAwait(false);
+                    completion = planResult.Completion;
+                    harnessFailureReason = planResult.FailureReason;
 
                     // A Planner that correctly concludes "nothing to decompose here" ends its turn
                     // without recording a Plan artifact — that's Succeeded, not a failure, but
@@ -336,12 +399,29 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 }
                 else if (profile?.Stage == PipelineStage.Review)
                 {
+                    // plans/review-seam-and-clarification-sessions.md S2 — Review-stage
+                    // construction moves behind the executor seam, same as Plan (D1.a) and
+                    // Worker (B1): resolve via provider, degrade to native on a capability miss
+                    // (never fail over one). TaskId carries the proposalId — the convention this
+                    // branch always used. This is what lets a claude-cli/codex-cli Reviewer
+                    // profile actually run instead of hitting the (now deleted) loud-fail gate.
                     var proposalId = string.IsNullOrWhiteSpace(taskId) ? string.Empty : taskId;
-                    var reviewerLoop = new ReviewerAgentLoop(
-                        agentId, item.WorkUnitId, proposalId, agentClient,
-                        profile, item.SessionId, a => ReportActivity(agentId, a),
-                        conversationLog: conversationLog, events: _events, logger: _logger);
-                    completion = await reviewerLoop.RunAsync(cts.Token).ConfigureAwait(false);
+                    var reviewExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
+                    var reviewExecutor = reviewExecutorResolver.ResolveForProvider(provider, profile?.Executor);
+                    if (!reviewExecutor.Capabilities.SupportsReviewMode)
+                        reviewExecutor = reviewExecutorResolver.Resolve("native");
+
+                    var reviewRequest = new HarnessRunRequest(
+                        HarnessMode.Review, agentId, item.WorkUnitId, proposalId, profile, item.SessionId,
+                        IsResume: item.AttemptCount > 0, ruleFileContext,
+                        PromptGuidanceContext: null,
+                        SelfVerifyBuild: false, SelfVerifyTest: false,
+                        OnActivity: a => ReportActivity(agentId, a),
+                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey,
+                        LenientToolParsing: lenientToolParsing);
+                    var reviewResult = await reviewExecutor.RunAsync(reviewRequest, cts.Token).ConfigureAwait(false);
+                    completion = reviewResult.Completion;
+                    harnessFailureReason = reviewResult.FailureReason;
                 }
                 else
                 {
@@ -362,7 +442,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     // both pull context only when actually needed instead of pushing it to everyone.
                     var workerConstraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, ct).ConfigureAwait(false);
-                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
+                    var workerEngineeringState = await BuildEngineeringStateContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerEngineeringState }.Where(s => s is not null));
                     // Snapshotted before the loop runs: if the task was already Completed coming
                     // in (e.g. re-queued after a rejection, before the underlying task got reset —
                     // see AutomatedReviewGateService), the agent can't legitimately transition it
@@ -371,15 +452,29 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var taskStatusBeforeRun = !string.IsNullOrWhiteSpace(taskId) && taskServiceForVerify is not null
                         ? (await taskServiceForVerify.GetAsync(taskId, ct).ConfigureAwait(false))?.Status
                         : null;
-                    var loop = new WorkerAgentLoop(
-                        agentId, item.WorkUnitId, taskId, agentClient,
-                        profile, item.SessionId, a => ReportActivity(agentId, a),
-                        isResume: item.AttemptCount > 0, ruleFileContext: ruleFileContext,
-                        selfVerifyBuild: _options.RequireBuildBeforeProposal,
-                        selfVerifyTest: _options.RequireTestBeforeProposal,
-                        promptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
-                        conversationLog: conversationLog, events: _events, logger: _logger);
-                    completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
+                    // plans/harness-hosting-architecture.md Phase B.1, extended by
+                    // plans/phase-d-implementation.md D1.a — Worker/Execute and Plan-stage
+                    // construction both go through the executor seam now; Review above still stays
+                    // on the native ReviewerAgentLoop class directly (out of scope so far).
+                    // agentClient/conversationLog built above are unused here (used only by the
+                    // Review branch) — NativeHarnessExecutor resolves its own from the request's
+                    // Provider/Model/BaseUrl/ApiKey. GetRequiredService here (unlike the nullable
+                    // fetch above used only for the gates) — this is the real run path, which has
+                    // always required a registered resolver.
+                    var executorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
+                    var executor = executorResolver.ResolveForProvider(provider, profile?.Executor);
+                    var harnessRequest = new HarnessRunRequest(
+                        HarnessMode.Execute, agentId, item.WorkUnitId, taskId, profile, item.SessionId,
+                        IsResume: item.AttemptCount > 0, ruleFileContext,
+                        PromptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
+                        SelfVerifyBuild: _options.RequireBuildBeforeProposal,
+                        SelfVerifyTest: _options.RequireTestBeforeProposal,
+                        OnActivity: a => ReportActivity(agentId, a),
+                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey,
+                        Goal: goalText, LenientToolParsing: lenientToolParsing);
+                    var harnessResult = await executor.RunAsync(harnessRequest, cts.Token).ConfigureAwait(false);
+                    completion = harnessResult.Completion;
+                    harnessFailureReason = harnessResult.FailureReason;
 
                     if (completion == AgentLoopCompletion.Succeeded)
                     {
@@ -414,6 +509,18 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 {
                     failureReason = "Agent ended its turn without completing the task or producing a merge proposal.";
                     failureKind = FailureKind.ProgressNotVerified;
+                }
+                else if (completion == AgentLoopCompletion.Stalled)
+                {
+                    // Previously fell through silently: not success, not dead-lettered — the item
+                    // just released as a failure with no visible record anywhere, so a goal whose
+                    // CLI harness exited nonzero (or produced no plan/verdict) looked simply
+                    // "stuck" in the UI with nothing to act on (found live 2026-07-13). The
+                    // executor's own reason (exit code, stderr tail, missing-contract-file detail)
+                    // is the actionable part — carry it into the dead-letter entry.
+                    failureReason = harnessFailureReason
+                        ?? "Harness run stalled without producing its expected output.";
+                    failureKind = FailureKind.Stalled;
                 }
             }
 
@@ -476,9 +583,22 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 // still leased would silently no-op instead of scheduling the Execute pass.
                 if (needsExecuteFallback)
                 {
+                    // Re-resolve the Execute-stage (worker) profile rather than reusing the planner's own
+                    // model — the planner and worker are different profile slots. Every other enqueue site
+                    // resolves stage creds this way; this fast path was the lone exception, so a configured
+                    // worker profile was silently ignored for atomic goals. Fall back to the planner's item
+                    // creds only if resolution yields nothing (keeps the pre-restart hot path unchanged).
+                    var execCreds = GetCredentialsForStage(item.WorkUnitId, PipelineStage.Execute)
+                        ?? GetGoalDefaultCredentials(item.WorkUnitId);
                     await _scheduler.EnqueueAsync(
-                        item.WorkUnitId, "worker", item.TaskId, item.Model, item.BaseUrl,
-                        item.ApiKey, item.Provider, item.SessionId, item.CredentialRef, ct).ConfigureAwait(false);
+                        item.WorkUnitId, "worker", item.TaskId,
+                        execCreds?.Model    ?? item.Model,
+                        execCreds?.BaseUrl  ?? item.BaseUrl,
+                        execCreds?.ApiKey   ?? item.ApiKey,
+                        execCreds?.Provider ?? item.Provider,
+                        item.SessionId,
+                        execCreds?.CredentialRef ?? item.CredentialRef,
+                        ct).ConfigureAwait(false);
                     _logger.LogInformation(
                         "[Scheduler] Planner recorded no plan for workUnit={WorkUnitId} — " +
                         "enqueued directly to Execute.", item.WorkUnitId);
@@ -611,9 +731,10 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? provider = null,
         string? profileId = null,
         string? autoReviewProfileId = null,
-        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+        IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
         IReadOnlyList<string>? enabledDomainAgents = null,
         string? credentialRef = null,
+        bool lenientToolParsing = false,
         CancellationToken cancellationToken = default)
     {
         var agentId = $"{agentType}-{Guid.NewGuid():N}";
@@ -624,51 +745,93 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
         CancellationTokenSource? cts = null;
         var resolvedProvider = provider ?? "anthropic";
-        var canStartLoop = !string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
-            && (!string.IsNullOrWhiteSpace(model)
-                || resolvedProvider.Equals("openai", StringComparison.OrdinalIgnoreCase));
+        // CLI providers need no baseUrl/apiKey/model (ambient CLI auth, CLI-default model) — for
+        // workers they route through the executor seam, and since plans/orchestrator-pure-service.md
+        // M2 an "orchestrator" spawn is just a credential registration + deterministic goal start,
+        // so any provider kind is acceptable there too (a profile is a profile, for any role).
+        // GetService, not GetRequiredService: this is a gate that must degrade gracefully rather
+        // than throw when a test double's IServiceProvider doesn't carry the resolver (mirrors
+        // RunScheduledWorkerAsync's identical gate above).
+        var harnessExecutorResolverForSpawnGate = _serviceProvider.GetService<IHarnessExecutorResolver>();
+        var canStartLoop = (harnessExecutorResolverForSpawnGate?.IsCliProvider(resolvedProvider) ?? false)
+            ? agentType is "worker" or "orchestrator"
+            : !string.IsNullOrWhiteSpace(baseUrl) && apiKey is not null
+                && (!string.IsNullOrWhiteSpace(model)
+                    || resolvedProvider.Equals("openai", StringComparison.OrdinalIgnoreCase));
         _logger.LogInformation(
             "[Agent {AgentId}] Spawn — agentType={AgentType} provider={Provider} model={Model} baseUrl={BaseUrl} profileId={ProfileId} canStartLoop={CanStart}",
             agentId, agentType, resolvedProvider, model ?? "(none)", baseUrl ?? "(none)", profileId ?? "(none)", canStartLoop);
         if (!canStartLoop)
             _logger.LogWarning("[Agent {AgentId}] Loop will NOT start — missing credentials or model. baseUrl={BaseUrl} model={Model} provider={Provider}",
                 agentId, baseUrl ?? "(none)", model ?? "(none)", resolvedProvider);
+        var startGoal = false;
         if (canStartLoop)
         {
-            cts = new CancellationTokenSource();
             var loopModel = model ?? string.Empty;
             if (agentType == "orchestrator")
             {
-                StartOrchestratorLoop(agentId, workUnitId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
-                _orchestratorRegistrations[workUnitId] = new OrchestratorRegistration(
-                    resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profileId, autoReviewProfileId,
-                    stageCredentials, enabledDomainAgents, credentialRef);
+                // plans/orchestrator-pure-service.md M2 — no LLM loop anymore. "Spawning an
+                // orchestrator" now means: register the goal's Default-profile credentials, then
+                // run the deterministic GoalCoordinator start (enqueue planner + one convergence
+                // sweep). The agentType name is kept as an alias so every existing caller
+                // (extension, ExternalGoalTools, ReconciliationAgentService, experiments) works
+                // unchanged.
+                _goalCredentialRegistrations[workUnitId] = new GoalCredentialRegistration(
+                    resolvedProvider, loopModel, baseUrl ?? string.Empty, apiKey ?? string.Empty, profileId, autoReviewProfileId,
+                    stageCredentials, enabledDomainAgents, credentialRef, lenientToolParsing);
 
                 _credentialCache.Capture(credentialRef, resolvedProvider, loopModel, baseUrl, apiKey);
 
                 // The safe subset — no ApiKey anywhere in this record — persisted so
                 // GetAutoReviewProfileId/GetEnabledDomainAgents/routing survive a Host restart even
-                // though _orchestratorRegistrations above (the hot path, with real credentials)
-                // doesn't. See RehydrateOrchestratorRoutingAsync for the read side.
-                var routing = new OrchestratorRoutingConfig(
-                    workUnitId, resolvedProvider, loopModel, baseUrl!, profileId, autoReviewProfileId,
-                    credentialRef, stageCredentials, enabledDomainAgents);
-                _orchestratorRouting[workUnitId] = routing;
+                // though _goalCredentialRegistrations above (the hot path, with real credentials)
+                // doesn't. See RehydrateGoalRoutingAsync for the read side.
+                var routing = new GoalRoutingConfig(
+                    workUnitId, resolvedProvider, loopModel, baseUrl ?? string.Empty, profileId, autoReviewProfileId,
+                    credentialRef, stageCredentials, enabledDomainAgents, lenientToolParsing);
+                _goalRouting[workUnitId] = routing;
                 await _nodeStore.WriteNodeAsync(
-                    StudioNodeKind.OrchestratorRoutingV1, workUnitId,
+                    StudioNodeKind.GoalRoutingV1, workUnitId,
                     JsonSerializer.Serialize(routing), cancellationToken).ConfigureAwait(false);
+                startGoal = true;
             }
             else if (agentType == "worker" && taskId is not null)
-                StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl!, apiKey ?? string.Empty, profile, cts);
-            else
-                cts.Dispose();
+            {
+                cts = new CancellationTokenSource();
+                StartWorkerLoop(agentId, workUnitId, taskId, resolvedProvider, loopModel, baseUrl ?? string.Empty, apiKey ?? string.Empty, profile, cts);
+            }
         }
 
         _agents[agentId] = new AgentRecord(agentId, workUnitId, "active", taskId, model, baseUrl, apiKey, provider, cts);
+
+        if (startGoal)
+        {
+            // Awaited inline — the coordinator is deterministic and fast (a scheduler enqueue plus
+            // idempotent sweeps), unlike the LLM loop this replaced, so callers get a settled goal
+            // state back instead of a fire-and-forget race. Failures never fail the spawn itself:
+            // the credentials are registered above, so a manual reinvoke can always recover.
+            try
+            {
+                var coordinator = _serviceProvider.GetService<IGoalCoordinator>();
+                if (coordinator is not null)
+                    await coordinator.StartGoalAsync(workUnitId, ct: cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[Agent {AgentId}] Goal start failed for workUnit={WorkUnitId}.", agentId, workUnitId);
+            }
+            finally
+            {
+                if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
+                    _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
+            }
+        }
+
         return agentId;
     }
 
-    private readonly record struct ResolvedOrchestratorCredentials(
+    private readonly record struct ResolvedGoalDefaultCredentials(
         string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? CredentialRef);
 
     // Shared by ReinvokeOrchestratorAsync and ResupplyCredentialsAsync — both need the exact same
@@ -677,7 +840,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     // restart/lookup recovers it too. The only difference between the two callers is whether an
     // orchestrator loop then gets spawned on top of this — see ResupplyCredentialsAsync's own doc
     // comment on IAgentControlService for why a requeue doesn't always want that.
-    private async Task<ResolvedOrchestratorCredentials?> ResolveAndPersistCredentialsAsync(
+    private async Task<ResolvedGoalDefaultCredentials?> ResolveAndPersistCredentialsAsync(
         string workUnitId,
         string? overrideModel, string? overrideBaseUrl, string? overrideApiKey, string? overrideProvider,
         string? overrideProfileId, string? overrideCredentialRef,
@@ -687,18 +850,20 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? provider = overrideProvider, model = overrideModel, baseUrl = overrideBaseUrl;
         string? apiKey = overrideApiKey, profileId = overrideProfileId, credentialRef = overrideCredentialRef;
         string? autoReviewProfileId = null;
-        IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null;
+        IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null;
         IReadOnlyList<string>? enabledDomainAgents = null;
+        var lenientToolParsing = false;
 
         // Same-process hot path first (real ApiKey already in memory, no cache lookup needed).
-        if (_orchestratorRegistrations.TryGetValue(workUnitId, out var reg))
+        if (_goalCredentialRegistrations.TryGetValue(workUnitId, out var reg))
         {
             provider ??= reg.Provider; model ??= reg.Model; baseUrl ??= reg.BaseUrl; apiKey ??= reg.ApiKey;
             profileId ??= reg.ProfileId; credentialRef ??= reg.CredentialRef;
             autoReviewProfileId = reg.AutoReviewProfileId;
             stageCredentials = reg.StageCredentials; enabledDomainAgents = reg.EnabledDomainAgents;
+            lenientToolParsing = reg.LenientToolParsing;
         }
-        else if (_orchestratorRouting.TryGetValue(workUnitId, out var routing))
+        else if (_goalRouting.TryGetValue(workUnitId, out var routing))
         {
             // Rehydrated-safe fields survive a restart with no credential resupply needed;
             // ApiKey never does (by design — see IRuntimeCredentialCache's doc comment), so this
@@ -710,12 +875,13 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             profileId ??= routing.ProfileId; credentialRef ??= routing.CredentialRef;
             autoReviewProfileId = routing.AutoReviewProfileId;
             stageCredentials = routing.StageCredentials; enabledDomainAgents = routing.EnabledDomainAgents;
+            lenientToolParsing = routing.LenientToolParsing;
             var cached = _credentialCache.TryGet(credentialRef);
             apiKey ??= cached?.ApiKey;
             model ??= cached?.Model; baseUrl ??= cached?.BaseUrl; provider ??= cached?.Provider;
         }
         // No registration and no routing at all — this work unit's orchestrator predates both
-        // (spawned before OrchestratorRoutingConfig persistence existed at all, so there's
+        // (spawned before GoalRoutingConfig persistence existed at all, so there's
         // nothing on record to recover from). Automatic reinvocation (WorkSchedulerService.
         // ReleaseAsync's success path) never passes override params, so for that caller this
         // correctly falls straight through to the apiKey-is-null no-op below, same as before.
@@ -723,7 +889,18 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         // prompting for a profile when none is on record) can still recover it by supplying
         // everything needed itself.
 
-        if (string.IsNullOrWhiteSpace(baseUrl) || apiKey is null)
+        // CLI providers (claude-cli, codex-cli, …) legitimately have no baseUrl and no ApiKey —
+        // blank key means ambient CLI auth by design, and the adapters ignore baseUrl entirely.
+        // The blank-baseUrl gate below predates CLI providers and used to refuse to register
+        // anything for them, forcing callers to invent placeholder baseUrls
+        // (plans/orchestrator-pure-service.md M1 closes that wart).
+        var isCliProvider = _serviceProvider.GetService<IHarnessExecutorResolver>()?.IsCliProvider(provider) ?? false;
+        if (isCliProvider)
+        {
+            baseUrl ??= string.Empty;
+            apiKey ??= string.Empty;
+        }
+        else if (string.IsNullOrWhiteSpace(baseUrl) || apiKey is null)
         {
             _logger.LogWarning(
                 "[Orchestrator] {ActionName} for workUnit={WorkUnitId} skipped — no credentials resolvable " +
@@ -737,22 +914,22 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         model ??= string.Empty;
         _credentialCache.Capture(credentialRef, provider, model, baseUrl, apiKey);
 
-        // Re-warm the hot path so subsequent same-process calls (GetOrchestratorCredentials,
+        // Re-warm the hot path so subsequent same-process calls (GetGoalDefaultCredentials,
         // GetAutoReviewProfileId, another ReinvokeOrchestratorAsync/ResupplyCredentialsAsync, ...)
         // skip the cache lookup — and (re)persist the safe routing config, so a *future* restart
         // can recover this orchestrator too, closing the gap that got it here in the first place.
-        _orchestratorRegistrations[workUnitId] = new OrchestratorRegistration(
+        _goalCredentialRegistrations[workUnitId] = new GoalCredentialRegistration(
             provider, model, baseUrl, apiKey, profileId, autoReviewProfileId,
-            stageCredentials, enabledDomainAgents, credentialRef);
-        var routingToPersist = new OrchestratorRoutingConfig(
+            stageCredentials, enabledDomainAgents, credentialRef, lenientToolParsing);
+        var routingToPersist = new GoalRoutingConfig(
             workUnitId, provider, model, baseUrl, profileId, autoReviewProfileId,
-            credentialRef, stageCredentials, enabledDomainAgents);
-        _orchestratorRouting[workUnitId] = routingToPersist;
+            credentialRef, stageCredentials, enabledDomainAgents, lenientToolParsing);
+        _goalRouting[workUnitId] = routingToPersist;
         await _nodeStore.WriteNodeAsync(
-            StudioNodeKind.OrchestratorRoutingV1, workUnitId,
+            StudioNodeKind.GoalRoutingV1, workUnitId,
             JsonSerializer.Serialize(routingToPersist), cancellationToken).ConfigureAwait(false);
 
-        return new ResolvedOrchestratorCredentials(provider, model, baseUrl, apiKey, profileId, credentialRef);
+        return new ResolvedGoalDefaultCredentials(provider, model, baseUrl, apiKey, profileId, credentialRef);
     }
 
     public async Task ReinvokeOrchestratorAsync(
@@ -764,23 +941,22 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? overrideProvider = null,
         string? overrideProfileId = null,
         string? overrideCredentialRef = null,
+        bool ensurePlanner = false,
         CancellationToken cancellationToken = default)
     {
-        var resolved = await ResolveAndPersistCredentialsAsync(
+        // plans/orchestrator-pure-service.md M2 — "reinvoke" no longer spawns an LLM loop; it runs
+        // one deterministic convergence sweep, which needs no credentials of its own. The resolve-
+        // and-persist step is kept purely for its resupply side effect (override params from a
+        // manual recovery action re-warm the registry for later planner/child enqueues) — a null
+        // result no longer aborts the wake-up, which closes the cold-registration-after-restart
+        // silent-no-op bug family for good.
+        await ResolveAndPersistCredentialsAsync(
             workUnitId, overrideModel, overrideBaseUrl, overrideApiKey, overrideProvider,
             overrideProfileId, overrideCredentialRef, "Reinvoke", cancellationToken).ConfigureAwait(false);
-        if (resolved is not { } creds)
-            return;
 
-        var agentId = $"orchestrator-{Guid.NewGuid():N}";
-        var cts = new CancellationTokenSource();
-        _agents[agentId] = new AgentRecord(agentId, workUnitId, "active", null, creds.Model, creds.BaseUrl, creds.ApiKey, creds.Provider, cts);
-
-        AgentProfile? profile = creds.ProfileId is not null
-            ? _profileService.GetAsync(creds.ProfileId, cancellationToken).GetAwaiter().GetResult()
-            : null;
-
-        StartOrchestratorLoop(agentId, workUnitId, creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey, profile, cts, sessionId);
+        var coordinator = _serviceProvider.GetService<IGoalCoordinator>();
+        if (coordinator is not null)
+            await coordinator.ConvergeAsync(workUnitId, sessionId, ensurePlanner, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<bool> ResupplyCredentialsAsync(
@@ -804,152 +980,69 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     // return anything non-null after a Host restart — and only once something has resupplied the
     // credential (e.g. the Resume flow). A cache miss there means a genuinely missing credential,
     // not a bug: the caller (e.g. AutomatedReviewGateService) already treats null as "not enabled."
-    public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId)
+    public GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId)
     {
-        if (_orchestratorRegistrations.TryGetValue(workUnitId, out var reg))
-            return new OrchestratorCredentials(reg.Provider, reg.Model, reg.BaseUrl, reg.ApiKey, reg.ProfileId, reg.CredentialRef);
+        if (_goalCredentialRegistrations.TryGetValue(workUnitId, out var reg))
+            return new GoalDefaultCredentials(reg.Provider, reg.Model, reg.BaseUrl, reg.ApiKey, reg.ProfileId, reg.CredentialRef, reg.LenientToolParsing);
 
-        if (!_orchestratorRouting.TryGetValue(workUnitId, out var routing))
+        if (!_goalRouting.TryGetValue(workUnitId, out var routing))
             return null;
 
         var cached = _credentialCache.TryGet(routing.CredentialRef);
-        if (cached is null)
-            return null;
+        if (cached is not null)
+            return new GoalDefaultCredentials(cached.Provider, cached.Model, cached.BaseUrl, cached.ApiKey, routing.ProfileId, routing.CredentialRef, routing.LenientToolParsing);
 
-        return new OrchestratorCredentials(cached.Provider, cached.Model, cached.BaseUrl, cached.ApiKey, routing.ProfileId, routing.CredentialRef);
+        // CLI providers reconstruct from the persisted routing alone: blank key IS the credential
+        // (ambient CLI login), and RuntimeCredentialCache deliberately never stores blank-key
+        // tuples — so after a restart the cache is a guaranteed miss for them and, without this,
+        // every CLI-provider goal's credential resolution (planner enqueues, fan-out inheritance,
+        // review routing) silently died on the first restart (found live 2026-07-13).
+        if (IsCliProviderSafe(routing.Provider))
+            return new GoalDefaultCredentials(routing.Provider, routing.Model, routing.BaseUrl, string.Empty, routing.ProfileId, routing.CredentialRef, routing.LenientToolParsing);
+
+        return null;
     }
 
-    public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage)
+    public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage)
     {
-        if (_orchestratorRegistrations.TryGetValue(workUnitId, out var reg))
+        if (_goalCredentialRegistrations.TryGetValue(workUnitId, out var reg))
             return reg.StageCredentials?.GetValueOrDefault(stage);
 
-        if (!_orchestratorRouting.TryGetValue(workUnitId, out var routing) ||
+        if (!_goalRouting.TryGetValue(workUnitId, out var routing) ||
             routing.StageCredentials?.GetValueOrDefault(stage) is not { } stageRouting)
             return null;
 
         var cached = _credentialCache.TryGet(stageRouting.CredentialRef);
-        return cached is null ? null : stageRouting with { ApiKey = cached.ApiKey };
+        if (cached is not null)
+            return stageRouting with { ApiKey = cached.ApiKey };
+
+        // Same CLI reconstruction as GetGoalDefaultCredentials above.
+        return IsCliProviderSafe(stageRouting.Provider) ? stageRouting with { ApiKey = string.Empty } : null;
     }
+
+    // GetService, not GetRequiredService — same degrade-gracefully posture as every other gate
+    // that consults the resolver (test doubles may not register one; no CLI executors registered
+    // simply means "not a CLI provider").
+    private bool IsCliProviderSafe(string? provider) =>
+        _serviceProvider.GetService<IHarnessExecutorResolver>()?.IsCliProvider(provider) ?? false;
 
     // Pure routing data — safe to persist in full, so this resolves correctly right after a
     // restart with zero credential resupply needed. This is what fixes review routing silently
     // falling back to human review after a Host restart.
     public string? GetAutoReviewProfileId(string workUnitId) =>
-        _orchestratorRegistrations.TryGetValue(workUnitId, out var reg) ? reg.AutoReviewProfileId
-        : _orchestratorRouting.TryGetValue(workUnitId, out var routing) ? routing.AutoReviewProfileId
+        _goalCredentialRegistrations.TryGetValue(workUnitId, out var reg) ? reg.AutoReviewProfileId
+        : _goalRouting.TryGetValue(workUnitId, out var routing) ? routing.AutoReviewProfileId
         : null;
 
-    public string? GetOrchestratorProfileId(string workUnitId) =>
-        _orchestratorRegistrations.TryGetValue(workUnitId, out var reg) ? reg.ProfileId
-        : _orchestratorRouting.TryGetValue(workUnitId, out var routing) ? routing.ProfileId
+    public string? GetGoalDefaultProfileId(string workUnitId) =>
+        _goalCredentialRegistrations.TryGetValue(workUnitId, out var reg) ? reg.ProfileId
+        : _goalRouting.TryGetValue(workUnitId, out var routing) ? routing.ProfileId
         : null;
 
     public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) =>
-        _orchestratorRegistrations.TryGetValue(workUnitId, out var reg) ? reg.EnabledDomainAgents
-        : _orchestratorRouting.TryGetValue(workUnitId, out var routing) ? routing.EnabledDomainAgents
+        _goalCredentialRegistrations.TryGetValue(workUnitId, out var reg) ? reg.EnabledDomainAgents
+        : _goalRouting.TryGetValue(workUnitId, out var routing) ? routing.EnabledDomainAgents
         : null;
-
-    private void StartOrchestratorLoop(
-        string agentId,
-        string workUnitId,
-        string provider,
-        string model,
-        string baseUrl,
-        string apiKey,
-        AgentProfile? profile,
-        CancellationTokenSource cts,
-        string? sessionId = null)
-    {
-        _logger.LogInformation("[Agent {AgentId}] Starting orchestrator loop — provider={Provider} model={Model} baseUrl={BaseUrl}",
-            agentId, provider, model, baseUrl);
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
-                var llm = _serviceProvider.GetRequiredService<LlmClient>();
-                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
-                var artifactLineage = _serviceProvider.GetRequiredService<IArtifactLineageService>();
-                var projections = _serviceProvider.GetRequiredService<IProjectionManager>();
-                var decisionLog = _serviceProvider.GetRequiredService<IOrchestrationDecisionLogService>();
-                var fanOut = _serviceProvider.GetRequiredService<IFanOutService>();
-                var mergeReconciliation = _serviceProvider.GetRequiredService<IMergeReconciliationService>();
-                var automatedReview = _serviceProvider.GetRequiredService<IAutomatedReviewGateService>();
-                var merge = _serviceProvider.GetRequiredService<IMergeService>();
-                var workUnits = _serviceProvider.GetRequiredService<IWorkUnitService>();
-                var workspaceOptions = _serviceProvider.GetRequiredService<WorkspaceOptions>();
-                var findingsService = _serviceProvider.GetRequiredService<IFindingService>();
-                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
-                var loop = new OrchestratorAgentLoop(
-                    agentId, workUnitId, agentClient,
-                    artifactLineage, projections, decisionLog, fanOut, mergeReconciliation, automatedReview, merge, workUnits,
-                    findingsService,
-                    profile, sessionId, workspaceOptions.StallDetectionCycles, a => ReportActivity(agentId, a),
-                    conversationLog: conversationLog, agentControl: this, events: _events, logger: _logger);
-                var completion = await loop.RunAsync(cts.Token).ConfigureAwait(false);
-                if (completion is AgentLoopCompletion.MaxIterationsExceeded or AgentLoopCompletion.Stalled)
-                {
-                    var deadLetter = _serviceProvider.GetService<IDeadLetterService>();
-                    if (deadLetter is not null)
-                    {
-                        var reason = completion == AgentLoopCompletion.Stalled
-                            ? $"Stall: no artifact change after {workspaceOptions.StallDetectionCycles} cycles."
-                            : "Max iterations reached";
-                        var kind = completion == AgentLoopCompletion.Stalled
-                            ? FailureKind.Stalled
-                            : FailureKind.MaxIterationsExceeded;
-                        await deadLetter.RecordFailureAsync(
-                            workUnitId,
-                            agentId,
-                            profile?.Stage ?? PipelineStage.Orchestrate,
-                            profile?.AgentProfileId ?? "orchestrator",
-                            reason,
-                            sessionId: sessionId,
-                            model: model,
-                            baseUrl: baseUrl,
-                            apiKey: apiKey,
-                            provider: provider,
-                            kind: kind,
-                            cancellationToken: cts.Token).ConfigureAwait(false);
-                    }
-                }
-                _logger.LogInformation("[Agent {AgentId}] Orchestrator loop completed.", agentId);
-            }
-            catch (OperationCanceledException) { }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "[Agent {AgentId}] Orchestrator loop failed.", agentId);
-                var deadLetter = _serviceProvider.GetService<IDeadLetterService>();
-                if (deadLetter is not null)
-                {
-                    await deadLetter.RecordFailureAsync(
-                        workUnitId,
-                        agentId,
-                        profile?.Stage ?? PipelineStage.Orchestrate,
-                        profile?.AgentProfileId ?? "orchestrator",
-                        ex.Message.Length > 200 ? ex.Message[..200] : ex.Message,
-                        sessionId: sessionId,
-                        model: model,
-                        baseUrl: baseUrl,
-                        apiKey: apiKey,
-                        provider: provider,
-                        cancellationToken: CancellationToken.None).ConfigureAwait(false);
-                }
-                if (_agents.TryGetValue(agentId, out var r))
-                {
-                    var msg = ex.Message.Length > 80 ? ex.Message[..80] : ex.Message;
-                    _agents[agentId] = r with { Status = $"failed:{msg}", Cts = null, CurrentActivity = null };
-                }
-            }
-            finally
-            {
-                if (_agents.TryGetValue(agentId, out var r) && r.Status == "active")
-                    _agents[agentId] = r with { Status = "stopped", Cts = null, CurrentActivity = null };
-                cts.Dispose();
-            }
-        }, CancellationToken.None);
-    }
 
     private void StartWorkerLoop(
         string agentId,
@@ -968,22 +1061,26 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         {
             try
             {
-                var dispatcher = _serviceProvider.GetRequiredService<McpToolDispatcher>();
-                var llm = _serviceProvider.GetRequiredService<LlmClient>();
-                var agentClient = new DefaultAgentToolClient(provider, model, baseUrl, apiKey ?? string.Empty, llm, dispatcher);
-                var conversationLog = _serviceProvider.GetRequiredService<IConversationLogService>();
                 var ruleFileContext = await BuildRuleFileContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerConstraintsContext = await BuildConstraintsContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, cts.Token).ConfigureAwait(false);
-                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance }.Where(s => s is not null));
-                var loop = new WorkerAgentLoop(
-                    agentId, workUnitId, taskId, agentClient, profile,
-                    onActivity: a => ReportActivity(agentId, a), ruleFileContext: ruleFileContext,
-                    selfVerifyBuild: _options.RequireBuildBeforeProposal,
-                    selfVerifyTest: _options.RequireTestBeforeProposal,
-                    promptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
-                    conversationLog: conversationLog, logger: _logger);
-                await loop.RunAsync(cts.Token).ConfigureAwait(false);
+                var workerEngineeringState = await BuildEngineeringStateContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
+                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerEngineeringState }.Where(s => s is not null));
+                // plans/harness-hosting-architecture.md Phase B.1 — same seam as
+                // RunScheduledWorkerAsync's Worker branch. Preserves this site's exact existing
+                // behavior: no sessionId, completion discarded, no scheduler/dead-letter
+                // interaction (zero behavior change is B1's acceptance bar for this path).
+                var harnessExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
+                var executor = harnessExecutorResolver.ResolveForProvider(provider, profile?.Executor);
+                var harnessRequest = new HarnessRunRequest(
+                    HarnessMode.Execute, agentId, workUnitId, taskId, profile, SessionId: null,
+                    IsResume: false, ruleFileContext,
+                    PromptGuidanceContext: workerCombinedGuidance.Length == 0 ? null : workerCombinedGuidance,
+                    SelfVerifyBuild: _options.RequireBuildBeforeProposal,
+                    SelfVerifyTest: _options.RequireTestBeforeProposal,
+                    OnActivity: a => ReportActivity(agentId, a),
+                    Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey);
+                await executor.RunAsync(harnessRequest, cts.Token).ConfigureAwait(false);
                 _logger.LogInformation("[Agent {AgentId}] Worker loop completed.", agentId);
             }
             catch (OperationCanceledException) { }
@@ -1164,6 +1261,33 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         }
     }
 
+    // plans/harness-hosting-architecture.md Phase A.5 — native-loop kickoff injection of the
+    // EngineeringState projection's rendered markdown, so a native worker gets the same "living
+    // timeline" context an external harness reads from .workspace/state.md, without needing a file
+    // read of its own. Same shape as BuildRuleFileContextAsync/BuildConstraintsContextAsync above:
+    // resolved once up front, never throws.
+    //
+    // WorkspaceContractService.RenderEngineeringStateMarkdownAsync always renders something (even
+    // "no facts yet") because MaterializeAsync needs state.md to exist regardless — this sentinel
+    // is how the kickoff-injection caller (which wants null-on-empty, like BuildConstraintsContextAsync)
+    // recognizes the empty case without a second method on the service. Must match
+    // WorkspaceContractService.RenderEngineeringStateMarkdown's empty-Facts branch exactly.
+    private const string NoEngineeringStateFactsMarkdown = "# Engineering state\n\nNo promoted facts yet.\n";
+
+    private async Task<string?> BuildEngineeringStateContextAsync(string workUnitId, CancellationToken ct)
+    {
+        try
+        {
+            var contracts = _serviceProvider.GetRequiredService<IWorkspaceContractService>();
+            var rendered = await contracts.RenderEngineeringStateMarkdownAsync(workUnitId, ct).ConfigureAwait(false);
+            return rendered == NoEngineeringStateFactsMarkdown ? null : rendered;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     // Promoted PromptImprovement findings targeting this stage — stage-scoped, unlike the
     // universal constraints above. Used by loops (Planner, Worker) that have no projection-fetch
     // loop of their own and so resolve this once up front, same shape as the helpers above.
@@ -1200,8 +1324,14 @@ public static class ServiceCollectionExtensions
             new LlmClient(llmHttpClient ?? new HttpClient(), sp.GetRequiredService<ILogger<LlmClient>>()));
         services.AddSingleton<IInsightLlmAnalyzerService, InsightLlmAnalyzerService>();
         services.AddSingleton<IProfileSelectionService, LlmProfileSelectionService>();
+        // plans/phase-d-implementation.md D2 — "who plans this goal" executor routing, off by
+        // default (WorkspaceOptions.UsePlannerExecutorSelection).
+        services.AddSingleton<IPlannerSelectionService, PlannerSelectionService>();
         // Slice 20b — inline reviewer for AgentApproval/Hybrid BeforeMerge gate.
         services.AddSingleton<IInlineReviewerService, InlineReviewerService>();
+        // plans/orchestrator-pure-service.md M2 — the deterministic goal coordinator that replaced
+        // the orchestrator LLM loop.
+        services.AddSingleton<IGoalCoordinator, GoalCoordinator>();
         // Slice 21/22 — reactive domain agents, disabled by default (WorkspaceOptions.EnabledDomainAgents).
         services.AddSingleton<IDomainAgentTriggerService, DomainAgentTriggerService>();
         // Phase 1.4 — re-plan-the-slice mechanism for both failure-recovery tracks.
@@ -1212,6 +1342,30 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IContinueService, ContinueService>();
         // Phase 10 — LLM-backed merge provider (sits inside AgentRuntime where LlmClient lives).
         services.AddSingleton<ILlmMergeProvider, LlmMergeProvider>();
+        // plans/harness-hosting-architecture.md Phase B.1 — the executor seam. NativeHarnessExecutor
+        // wraps the current loop; future adapters (ClaudeCodeExecutor, Phase B.2) register
+        // alongside it as additional IHarnessExecutor implementations, no resolver changes needed.
+        services.AddSingleton<IHarnessExecutor, NativeHarnessExecutor>();
+        services.AddSingleton<IHarnessExecutorResolver, HarnessExecutorResolver>();
+        // phase-c-implementation.md C2 — the harvest block shared by every external CLI adapter
+        // (decisions/inbox harvest, merge.propose + merge.validate, the build/test gate). Registered
+        // once, ahead of the adapters that depend on it.
+        services.AddSingleton<HarnessHarvestPipeline>();
+        // Phase B.2 — the first external adapter. ClaudeCodeExecutorOptions.ExecutablePath
+        // defaults to "claude" (resolved via PATH); tests override to a stub CLI — see
+        // ClaudeCodeExecutorOptions' own doc comment for why the real binary must never run in
+        // automated tests.
+        services.AddSingleton(new ClaudeCodeExecutorOptions());
+        services.AddSingleton<IHarnessExecutor, ClaudeCodeExecutor>();
+        // phase-c-implementation.md C2 — the second external adapter, proving the executor seam
+        // isn't Claude-shaped. CodexCliExecutorOptions.ExecutablePath defaults to "codex" (resolved
+        // via PATH); tests override to a stub CLI — see CodexCliExecutorOptions' own doc comment for
+        // why the real binary must never run in automated tests.
+        services.AddSingleton(new CodexCliExecutorOptions());
+        services.AddSingleton<IHarnessExecutor, CodexCliExecutor>();
+        // Phase C.4 (phase-c-implementation.md C3) — the /mcp-harness bearer-token map. Singleton,
+        // in-memory only; see HarnessMcpTokenService's own doc comment for the restart/resume story.
+        services.AddSingleton<IHarnessMcpTokenService, HarnessMcpTokenService>();
         return services;
     }
 }

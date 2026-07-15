@@ -105,7 +105,7 @@ public class ReconciliationAgentServiceTests
         var goalA = await workUnitCommands.CreateAsync(new WorkUnitCreateCommand("Goal A", "test", SeedFromBranchId: "main"));
         var goalB = await workUnitCommands.CreateAsync(new WorkUnitCreateCommand("Goal B", "test", SeedFromBranchId: "main"));
         fakeAgentControl.CredentialsByWorkUnitId[goalA.WorkUnitId] =
-            new OrchestratorCredentials("anthropic", "claude-x", "https://example.test", "sk-test", "worker");
+            new GoalDefaultCredentials("anthropic", "claude-x", "https://example.test", "sk-test", "worker");
 
         await fileWorkspace.WriteAsync(goalA.BranchId, "Shared.cs", "A\n");
         await fileWorkspace.WriteAsync(goalB.BranchId, "Shared.cs", "B\n");
@@ -172,15 +172,15 @@ public class ReconciliationAgentServiceTests
 
     private sealed class FakeAgentControlService(List<(string AgentType, string WorkUnitId, string? Model)> spawnCalls) : IAgentControlService
     {
-        public Dictionary<string, OrchestratorCredentials> CredentialsByWorkUnitId { get; } = new();
+        public Dictionary<string, GoalDefaultCredentials> CredentialsByWorkUnitId { get; } = new();
 
-        public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) =>
+        public GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId) =>
             CredentialsByWorkUnitId.TryGetValue(workUnitId, out var creds) ? creds : null;
 
-        public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
+        public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
 
         public string? GetAutoReviewProfileId(string workUnitId) => null;
-        public string? GetOrchestratorProfileId(string workUnitId) => null;
+        public string? GetGoalDefaultProfileId(string workUnitId) => null;
 
         public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
 
@@ -194,16 +194,17 @@ public class ReconciliationAgentServiceTests
             string? provider = null,
             string? profileId = null,
             string? autoReviewProfileId = null,
-            IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
             IReadOnlyList<string>? enabledDomainAgents = null,
             string? credentialRef = null,
+            bool lenientToolParsing = false,
             CancellationToken cancellationToken = default)
         {
             spawnCalls.Add((agentType, workUnitId, model));
             return Task.FromResult("agent-fake");
         }
 
-        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
+        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, bool ensurePlanner = false, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
 
         public Task<bool> ResupplyCredentialsAsync(string workUnitId, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>

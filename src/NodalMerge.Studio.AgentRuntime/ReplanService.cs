@@ -16,6 +16,15 @@ namespace NodalMerge.Studio.AgentRuntime;
 //     original failed slice a real terminal "superseded" status instead of lingering DeadLettered.
 // Deliberately does NOT touch or resume the failed work unit itself — nothing here loops or
 // bypasses MaxFailureAttempts, unlike IDeadLetterService.RetryWithContextAsync.
+//
+// plans/phase-d-implementation.md D3 — the planner spawn now goes through the same executor seam
+// D1 put the scheduler-driven Plan-stage branch behind (IHarnessExecutorResolver.ResolveForProvider,
+// capability-miss falls back to native), so an external harness can re-plan too, and un-couples "a
+// plan exists" from "the native orchestrator produced it." A planner-selection call site (mirroring
+// D2's OrchestratorAgentLoop hook) is consulted when the parent's Plan-stage Agent Topology
+// assignment is auto/unset (GetCredentialsForStage returns null) — an explicit assignment still
+// wins outright, and WorkspaceOptions.UsePlannerExecutorSelection off still means zero behavior
+// change, same precedence rules D2 established.
 public sealed class ReplanService(
     IDeadLetterService deadLetter,
     IWorkUnitService workUnits,
@@ -47,21 +56,66 @@ public sealed class ReplanService(
                 "applies to a fanned-out slice, not a top-level goal.");
         }
 
-        var creds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Plan)
-            ?? agentControl.GetOrchestratorCredentials(parentWorkUnitId);
+        // D3 — snapshot the staleness signal state up front (before this replan attempt can change
+        // it) so it rides every returned ReplanResult below, success or failure alike: a human
+        // deciding whether/why to replan wants to see this regardless of the outcome.
+        var planStaleness = serviceProvider.GetService<IPlanStalenessService>();
+        var stalenessSignal = planStaleness is not null
+            ? await planStaleness.GetStateAsync(parentWorkUnitId, cancellationToken).ConfigureAwait(false)
+            : null;
+
+        // stageCreds != null is "topology assignment explicit" (D2's own discovery: "stageCreds is
+        // null IS topology assignment auto/unset") — an explicit override skips the selector
+        // entirely and its provider/model/profile win outright, same as OrchestratorAgentLoop's
+        // InjectSpawnCredentialsAsync.
+        var stageCreds = agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Plan);
+        var creds = stageCreds ?? agentControl.GetGoalDefaultCredentials(parentWorkUnitId);
         if (creds is null)
-            return new ReplanResult(ReplanOutcome.PlanningFailed, "No LLM credentials resolvable for the parent work unit.");
+        {
+            return new ReplanResult(
+                ReplanOutcome.PlanningFailed, "No LLM credentials resolvable for the parent work unit.",
+                StalenessSignal: stalenessSignal);
+        }
+
+        string? provider = stageCreds?.Provider;
+        AgentProfile? profile = null;
+
+        if (stageCreds is null)
+        {
+            var plannerSelection = serviceProvider.GetService<IPlannerSelectionService>();
+            if (plannerSelection is not null)
+            {
+                var goalUnit = await workUnits.GetAsync(parentWorkUnitId, cancellationToken).ConfigureAwait(false);
+                if (goalUnit is not null)
+                {
+                    var selection = await plannerSelection
+                        .SelectPlannerAsync(goalUnit, creds, cancellationToken).ConfigureAwait(false);
+
+                    // selection.Provider is null when selection is disabled (WorkspaceOptions
+                    // .UsePlannerExecutorSelection = false, the default) or the heuristic tier was
+                    // used — in either case provider/profile stay exactly as they were before this
+                    // slice, so the resolved executor below is byte-identical to pre-D3 behavior.
+                    if (selection.Provider is not null)
+                    {
+                        provider = selection.Provider;
+                        var profileService = serviceProvider.GetService<IAgentProfileService>();
+                        if (profileService is not null)
+                        {
+                            profile = await profileService
+                                .GetAsync(selection.ProfileId, cancellationToken).ConfigureAwait(false);
+                        }
+                    }
+                }
+            }
+        }
+
+        provider ??= creds.Provider;
 
         var childrenBefore = await workUnits.GetChildrenAsync(parentWorkUnitId, cancellationToken)
             .ConfigureAwait(false);
         var existingIds = childrenBefore.Select(c => c.WorkUnitId).ToHashSet();
 
         var agentId = $"replanner-{Guid.NewGuid():N}";
-        var dispatcher = serviceProvider.GetRequiredService<McpToolDispatcher>();
-        var llm = serviceProvider.GetRequiredService<LlmClient>();
-        var conversationLog = serviceProvider.GetRequiredService<IConversationLogService>();
-        var events = serviceProvider.GetService<IExecutionEventStream>();
-        var agentClient = new DefaultAgentToolClient(creds.Provider, creds.Model, creds.BaseUrl, creds.ApiKey, llm, dispatcher);
 
         var scopedContext =
             $"[Re-plan request] The slice \"{failed.Goal}\" (work unit {failed.WorkUnitId}, file scope: " +
@@ -83,18 +137,28 @@ public sealed class ReplanService(
             "dependsOn between them so they run in sequence instead of concurrently against the same " +
             "files — do not leave that ordering to be discovered by a file-lease conflict at runtime.";
 
-        var plannerLoop = new PlannerAgentLoop(
-            agentId, parentWorkUnitId, agentClient,
-            profile: null, sessionId: null, onActivity: null,
-            ruleFileContext: null, constraintsContext: scopedContext,
-            conversationLog: conversationLog, events: events);
+        // D3 — resolve an executor through the seam exactly like the scheduler-driven Plan-stage
+        // branch does (InMemoryAgentRuntimeService.RunScheduledWorkerAsync's Plan branch): a
+        // capability miss (a CLI executor that hasn't wired planning mode) falls back to native
+        // rather than failing the replan outright.
+        var executorResolver = serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
+        var executor = executorResolver.ResolveForProvider(provider, profile?.Executor);
+        if (!executor.Capabilities.SupportsPlanningMode)
+            executor = executorResolver.Resolve("native");
 
-        var completion = await plannerLoop.RunAsync(cancellationToken).ConfigureAwait(false);
-        if (completion != AgentLoopCompletion.Succeeded)
+        var planRequest = new HarnessRunRequest(
+            HarnessMode.Plan, agentId, parentWorkUnitId, TaskId: string.Empty, profile, SessionId: null,
+            IsResume: false, RuleFileContext: null, PromptGuidanceContext: scopedContext,
+            SelfVerifyBuild: false, SelfVerifyTest: false, OnActivity: null,
+            Provider: provider, Model: creds.Model, BaseUrl: creds.BaseUrl, ApiKey: creds.ApiKey);
+
+        var planResult = await executor.RunAsync(planRequest, cancellationToken).ConfigureAwait(false);
+        if (planResult.Completion != AgentLoopCompletion.Succeeded)
         {
             return new ReplanResult(
                 ReplanOutcome.PlanningFailed,
-                $"Re-plan attempt did not complete successfully (completion: {completion}).");
+                $"Re-plan attempt did not complete successfully (completion: {planResult.Completion}).",
+                StalenessSignal: stalenessSignal);
         }
 
         await fanOut.TryFanOutFromPlanAsync(parentWorkUnitId, sessionId: null, cancellationToken).ConfigureAwait(false);
@@ -110,7 +174,8 @@ public sealed class ReplanService(
         {
             return new ReplanResult(
                 ReplanOutcome.NoNewSlicesProduced,
-                "Planner completed but no new child work units were created from its plan.");
+                "Planner completed but no new child work units were created from its plan.",
+                StalenessSignal: stalenessSignal);
         }
 
         await workUnits.UpdateStatusAsync(failed.WorkUnitId, WorkUnitStatus.Cancelled, sessionId: null, cancellationToken)
@@ -123,6 +188,6 @@ public sealed class ReplanService(
         foreach (var promotedWorkUnitId in promoted)
             await scheduler.ClearAwaitingFileLeaseAsync(promotedWorkUnitId, cancellationToken).ConfigureAwait(false);
 
-        return new ReplanResult(ReplanOutcome.Replanned, NewWorkUnitIds: newWorkUnitIds);
+        return new ReplanResult(ReplanOutcome.Replanned, NewWorkUnitIds: newWorkUnitIds, StalenessSignal: stalenessSignal);
     }
 }

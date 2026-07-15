@@ -14,7 +14,7 @@ public sealed class CandidateReconciliationTrigger(
     IServiceProvider? serviceProvider = null) : ICandidateReconciliationTrigger
 {
     public async Task<WorkUnit?> TryTriggerAsync(
-        string conflictId, string? steeringNotes = null, OrchestratorCredentials? credentials = null, CancellationToken ct = default)
+        string conflictId, string? steeringNotes = null, GoalDefaultCredentials? credentials = null, CancellationToken ct = default)
     {
         // Atomic Open -> Reconciling transition — returns null (no-op) if another caller already
         // started reconciling this conflict, or it's already Resolved.

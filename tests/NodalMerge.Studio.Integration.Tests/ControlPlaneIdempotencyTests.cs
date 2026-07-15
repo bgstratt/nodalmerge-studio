@@ -240,12 +240,13 @@ public class ControlPlaneIdempotencyTests
 
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
-            string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
             IReadOnlyList<string>? enabledDomainAgents = null,
             string? credentialRef = null,
+            bool lenientToolParsing = false,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
 
-        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default)
+        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, bool ensurePlanner = false, CancellationToken cancellationToken = default)
         {
             ReinvokeCalls.Add((workUnitId, sessionId));
             return Task.CompletedTask;
@@ -254,10 +255,10 @@ public class ControlPlaneIdempotencyTests
         public Task<bool> ResupplyCredentialsAsync(string workUnitId, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
             Task.FromResult(false);
 
-        public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
-        public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
+        public GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId) => null;
+        public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
         public string? GetAutoReviewProfileId(string workUnitId) => null;
-        public string? GetOrchestratorProfileId(string workUnitId) => null;
+        public string? GetGoalDefaultProfileId(string workUnitId) => null;
         public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
 
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
@@ -379,6 +380,7 @@ public class ControlPlaneIdempotencyTests
         public Task DeleteAsync(string b, string p, CancellationToken ct = default) => Task.CompletedTask;
         public Task<bool> ExistsAsync(string b, string p, CancellationToken ct = default) => Task.FromResult(false);
         public Task<IReadOnlyList<string>> ListAsync(string b, string? s = null, string? p = null, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
+        public Task<IReadOnlyList<string>> ListIncludingDotfilesAsync(string b, string s, CancellationToken ct = default) => Task.FromResult<IReadOnlyList<string>>([]);
         public Task<(IReadOnlyList<WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(string b, string query, string? s = null, string? fp = null, bool regex = false, bool cs = false, int cl = 3, int mr = 200, CancellationToken ct = default) => Task.FromResult<(IReadOnlyList<WorkspaceSearchMatch>, bool)>(([], false));
         public Task<WorkspaceReplaceResult> ReplaceAsync(string b, string p, string oldText, string newText, int expectedMatches = 1, CancellationToken ct = default) => Task.FromResult(new WorkspaceReplaceResult(0, 0, 0, string.Empty));
         public Task<string> DiffAsync(string s, string t, CancellationToken ct = default) => Task.FromResult(string.Empty);

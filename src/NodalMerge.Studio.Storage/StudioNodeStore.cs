@@ -19,9 +19,13 @@ public static class StudioNodeKind
     public const string OrchestrationEventV1 = "studio/orchestration-event/v1";
     public const string ChangeIntentV1       = "studio/change-intent/v1";
     public const string DeadLetterV1         = "studio/dead-letter/v1";
-    // Safe-to-persist subset of an orchestrator's registration (no ApiKey — see
-    // InMemoryAgentRuntimeService's OrchestratorRoutingConfig) so AutoReviewProfileId/
+    // Safe-to-persist subset of a goal's Default-profile credential registration (no ApiKey — see
+    // InMemoryAgentRuntimeService's GoalRoutingConfig) so AutoReviewProfileId/
     // EnabledDomainAgents/stage routing survive a Host restart without ever writing a secret.
+    public const string GoalRoutingV1 = "studio/goal-routing/v1";
+    // Legacy alias for GoalRoutingV1 from when this record was named "orchestrator routing"
+    // (plans/orchestrator-pure-service.md M1). Never written anymore; rehydration still reads it
+    // so goals in flight across the upgrade keep their routing. Do not use for new writes.
     public const string OrchestratorRoutingV1 = "studio/orchestrator-routing/v1";
     public const string RuntimeSettingsV1    = "studio/runtime-settings/v1";
     public const string ExecutionResultV1    = "studio/execution-result/v1";

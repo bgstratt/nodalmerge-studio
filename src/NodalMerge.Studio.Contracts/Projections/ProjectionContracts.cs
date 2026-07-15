@@ -23,6 +23,7 @@ public enum ProjectionType
     RunRetrospective,
     HypothesisComparison,
     WorkspacePathways,
+    EngineeringState,
 }
 
 public enum ProjectionLevel
@@ -521,6 +522,36 @@ public sealed record WorkspacePathwaysEdge(
     string FromNodeId,
     string ToNodeId,
     string Kind);
+
+/// <summary>
+/// EngineeringState projection — plans/harness-hosting-architecture.md Phase A.1. The "living
+/// timeline": deterministically folds every *promoted* Decision/Constraint/Supersession artifact
+/// (applied-proposal rule — see ProjectionManager.BuildEngineeringStateAsync) into current-truth
+/// facts. No LLM, no summarization — the same move as projecting files, applied to engineering
+/// state. Distinct from DecisionContext (per-work-unit audit trail, includes unpromoted work) and
+/// from AgentWorkspace.InheritedConstraints (ancestor-chain scoped, not workspace-wide truth).
+/// </summary>
+public sealed record EngineeringStateProjectionPayload(
+    IReadOnlyList<EngineeringStateFact> Facts,
+    DateTimeOffset GeneratedAt);
+
+/// <summary>
+/// SupersededBy and IsCurrent are derived by the fold on every call, never stored back onto the
+/// artifact — the reverse relation is branch-relative (two branches can each promote a different
+/// successor to the same artifact) and so can only be answered by walking a chosen history. See
+/// the architecture doc's "derived means computed, never stored" refinement.
+/// </summary>
+public sealed record EngineeringStateFact(
+    string ArtifactId,
+    ArtifactType Type,
+    string? Title,
+    string? Body,
+    ArtifactStatus Status,
+    DateTimeOffset CreatedAt,
+    string? OwnedByWorkUnitId,
+    IReadOnlyList<string> Supersedes,
+    IReadOnlyList<string> SupersededBy,
+    bool IsCurrent);
 
 public static class ProjectionCatalog
 {

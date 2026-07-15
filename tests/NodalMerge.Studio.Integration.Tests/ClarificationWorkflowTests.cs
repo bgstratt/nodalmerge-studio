@@ -34,14 +34,18 @@ public class ClarificationWorkflowTests : IDisposable
     [Fact]
     public async Task Clarification_request_parks_scheduler_item_and_response_resumes_it()
     {
+        // Deliberately NOT started: this test plays the worker itself (TryAcquireAsync below) and
+        // asserts the resumed item is back at Queued — StartAsync would run the real scheduler
+        // poll loop, which legitimately acquires the resumed item and moves it to Executing
+        // before the assertion reads it. Every service used here resolves without the host running.
         await using var app = BuildTestApp();
-        await app.StartAsync();
 
         var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
         var workUnits = app.Services.GetRequiredService<IWorkUnitService>();
         var scheduler = app.Services.GetRequiredService<IWorkScheduler>();
         var clarifications = app.Services.GetRequiredService<IClarificationCommandService>();
         var events = app.Services.GetRequiredService<IExecutionEventStream>();
+        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
 
         var workUnit = await orchestrator.CreateWorkUnitAsync("Implement feature", "tester");
 
@@ -100,5 +104,14 @@ public class ClarificationWorkflowTests : IDisposable
         Assert.NotNull(respondedPayload);
         Assert.Equal("Should validation be enforced at API or DB layer?", requestedPayload!.Question);
         Assert.Equal("Both", respondedPayload!.Response);
+
+        // plans/harness-hosting-architecture.md Phase B3 — the outbox half of the pause/resume
+        // loop: RespondAsync(resume: true) writes the answer where a respawned ClaudeCodeExecutor
+        // (--resume) is told to look. Harmless for this native-worker scenario; just confirms the
+        // file lands.
+        var outboxFiles = await fileWorkspace.ListIncludingDotfilesAsync(workUnit.BranchId, ".workspace/outbox");
+        var outboxFile = Assert.Single(outboxFiles);
+        var outboxContent = await fileWorkspace.ReadAsync(workUnit.BranchId, outboxFile);
+        Assert.Equal("Both", outboxContent);
     }
 }

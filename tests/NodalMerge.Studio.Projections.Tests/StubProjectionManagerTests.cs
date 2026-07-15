@@ -723,4 +723,140 @@ public class ProjectionManagerTests
         var parentEdge = Assert.Single(payload.Edges, e => e.ToNodeId == "proposal:MP-Parent:integration");
         Assert.Equal("goal:WU-Root", parentEdge.FromNodeId);
     }
+
+    // ── EngineeringState projection ─────────────────────────────────────────
+
+    [Fact]
+    public async Task EngineeringState_decision_on_a_merged_work_unit_is_current()
+    {
+        var merges = new FakeMergeService();
+        merges.Seed(new MergeProposal(
+            "MP-1", "goal/WU-1", "main", "Add auth", "summary", "desc", null, null, null,
+            MergeProposalStatus.Merged, WorkUnitId: "WU-1"));
+        var artifacts = new FakeArtifactLineageService();
+        artifacts.Seed(MakeArtifact("DEC-1", ArtifactType.Decision, "WU-1", "Use JWT", "Reason: stateless"));
+        var manager = BuildManager(merges: merges, artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.EngineeringState, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<EngineeringStateProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var fact = Assert.Single(payload!.Facts);
+        Assert.Equal("DEC-1", fact.ArtifactId);
+        Assert.True(fact.IsCurrent);
+        Assert.Empty(fact.SupersededBy);
+    }
+
+    [Fact]
+    public async Task EngineeringState_decision_on_an_unmerged_work_unit_is_excluded()
+    {
+        var merges = new FakeMergeService();
+        merges.Seed(new MergeProposal(
+            "MP-1", "goal/WU-1", "main", "Add auth", "summary", "desc", null, null, null,
+            MergeProposalStatus.ReadyForReview, WorkUnitId: "WU-1"));
+        var artifacts = new FakeArtifactLineageService();
+        artifacts.Seed(MakeArtifact("DEC-1", ArtifactType.Decision, "WU-1", "Use JWT"));
+        var manager = BuildManager(merges: merges, artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.EngineeringState, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<EngineeringStateProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        Assert.Empty(payload!.Facts);
+    }
+
+    [Fact]
+    public async Task EngineeringState_global_constraint_is_included_unconditionally()
+    {
+        var artifacts = new FakeArtifactLineageService();
+        artifacts.Seed(new ArtifactRef(
+            "CON-1", ArtifactType.Constraint, null, ArtifactStatus.Active, DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null, Title: "No MediatR", Body: "Promoted finding"));
+        var manager = BuildManager(artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.EngineeringState, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<EngineeringStateProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var fact = Assert.Single(payload!.Facts);
+        Assert.Equal("CON-1", fact.ArtifactId);
+        Assert.True(fact.IsCurrent);
+    }
+
+    [Fact]
+    public async Task EngineeringState_supersession_chain_resolves_to_current_truth()
+    {
+        var merges = new FakeMergeService();
+        merges.Seed(new MergeProposal(
+            "MP-1", "goal/WU-1", "main", "Pick ORM", "summary", "desc", null, null, null,
+            MergeProposalStatus.Merged, WorkUnitId: "WU-1"));
+        merges.Seed(new MergeProposal(
+            "MP-2", "goal/WU-2", "main", "Revisit ORM", "summary", "desc", null, null, null,
+            MergeProposalStatus.Merged, WorkUnitId: "WU-2"));
+        var artifacts = new FakeArtifactLineageService();
+        var original = MakeArtifact("DEC-1", ArtifactType.Decision, "WU-1", "Use EF Core");
+        artifacts.Seed(original);
+        var successor = MakeArtifact("DEC-2", ArtifactType.Decision, "WU-2", "Use Dapper") with
+        {
+            CreatedAt = original.CreatedAt.AddMinutes(1),
+            Supersedes = ["DEC-1"],
+        };
+        artifacts.Seed(successor);
+        var manager = BuildManager(merges: merges, artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.EngineeringState, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<EngineeringStateProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        Assert.Equal(2, payload!.Facts.Count);
+        var oldFact = payload.Facts.Single(f => f.ArtifactId == "DEC-1");
+        Assert.False(oldFact.IsCurrent);
+        Assert.Equal(["DEC-2"], oldFact.SupersededBy);
+        var newFact = payload.Facts.Single(f => f.ArtifactId == "DEC-2");
+        Assert.True(newFact.IsCurrent);
+    }
+
+    [Fact]
+    public async Task EngineeringState_supersession_claim_from_an_unmerged_work_unit_does_not_retire_a_promoted_fact()
+    {
+        var merges = new FakeMergeService();
+        merges.Seed(new MergeProposal(
+            "MP-1", "goal/WU-1", "main", "Pick ORM", "summary", "desc", null, null, null,
+            MergeProposalStatus.Merged, WorkUnitId: "WU-1"));
+        merges.Seed(new MergeProposal(
+            "MP-2", "goal/WU-2", "main", "Revisit ORM", "summary", "desc", null, null, null,
+            MergeProposalStatus.ReadyForReview, WorkUnitId: "WU-2"));
+        var artifacts = new FakeArtifactLineageService();
+        artifacts.Seed(MakeArtifact("DEC-1", ArtifactType.Decision, "WU-1", "Use EF Core"));
+        artifacts.Seed(MakeArtifact("DEC-2", ArtifactType.Decision, "WU-2", "Use Dapper") with { Supersedes = ["DEC-1"] });
+        var manager = BuildManager(merges: merges, artifacts: artifacts);
+
+        var result = await manager.GetAsync(new ProjectionRequest(ProjectionType.EngineeringState, ProjectionLevel.Normal));
+
+        var payload = JsonSerializer.Deserialize<EngineeringStateProjectionPayload>(result.DataJson, JsonSerializerOptions.Web);
+        var fact = Assert.Single(payload!.Facts);
+        Assert.Equal("DEC-1", fact.ArtifactId);
+        Assert.True(fact.IsCurrent);
+    }
+
+    [Fact]
+    public async Task EngineeringState_two_calls_produce_the_same_facts_in_the_same_order()
+    {
+        // GeneratedAt legitimately differs per call, so this compares Facts (the deterministic
+        // part — principle 2) rather than raw JSON bytes.
+        var merges = new FakeMergeService();
+        merges.Seed(new MergeProposal(
+            "MP-1", "goal/WU-1", "main", "Add auth", "summary", "desc", null, null, null,
+            MergeProposalStatus.Merged, WorkUnitId: "WU-1"));
+        var artifacts = new FakeArtifactLineageService();
+        artifacts.Seed(MakeArtifact("DEC-1", ArtifactType.Decision, "WU-1", "Use JWT"));
+        var manager = BuildManager(merges: merges, artifacts: artifacts);
+
+        var first = await manager.GetAsync(new ProjectionRequest(ProjectionType.EngineeringState, ProjectionLevel.Normal));
+        var second = await manager.GetAsync(new ProjectionRequest(ProjectionType.EngineeringState, ProjectionLevel.Normal));
+
+        // List<T> has no value equality, so record equality on Facts (which carry List<string>
+        // properties from JSON deserialization) would spuriously differ — compare via
+        // re-serialization instead, which is the actual "byte-identical" property principle 2 cares
+        // about.
+        var firstFacts = JsonSerializer.Deserialize<EngineeringStateProjectionPayload>(first.DataJson, JsonSerializerOptions.Web)!.Facts;
+        var secondFacts = JsonSerializer.Deserialize<EngineeringStateProjectionPayload>(second.DataJson, JsonSerializerOptions.Web)!.Facts;
+        Assert.Equal(JsonSerializer.Serialize(firstFacts), JsonSerializer.Serialize(secondFacts));
+    }
 }

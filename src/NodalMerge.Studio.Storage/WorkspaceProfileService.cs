@@ -13,8 +13,14 @@ namespace NodalMerge.Studio.Storage;
 // correctly.
 internal sealed class WorkspaceProfileService(IFileWorkspaceService fileWorkspace) : IWorkspaceProfileService
 {
+    // Hand-duplicated from WorkspacePathFilter.IgnoredDirNames (same project) — no shared
+    // constant exists between the two call sites today; keep these two lists in sync manually.
+    // Correction 2026-07-12: .git/.nodalmerge/.workspace were added here for parity with
+    // WorkspacePathFilter, but they were never actually a functional gap — IsIgnored below
+    // already treats any dot-prefixed segment as hidden (line ~325), independent of this array,
+    // so build/test-command detection already skipped .workspace before this change too.
     private static readonly string[] IgnoredDirNames =
-        ["node_modules", "bin", "obj", "dist", "build", "target", "__pycache__", "venv"];
+        ["node_modules", "bin", "obj", "dist", "build", "target", "__pycache__", "venv", ".git", ".nodalmerge", ".workspace"];
 
     private readonly ConcurrentDictionary<string, WorkspaceProfile> _cache = new();
 

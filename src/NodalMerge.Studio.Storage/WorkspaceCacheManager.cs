@@ -137,10 +137,27 @@ public sealed class WorkspaceCacheManager(
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    // A Completed/Merged work unit is safe to evict when the latest snapshot post-dates its
-    // last update — i.e., the between-run sync ran after its changes landed in the seed repo.
+    // A work unit is safe to evict when its merged content is captured in a repo snapshot. When a
+    // proposal for this work unit was applied, the apply records the snapshot that captured its own
+    // write-back (appliedSnapshotId metadata) — a direct, race-free proof the content is persisted,
+    // so it's evictable regardless of timestamp ordering. The apply-time resync stamps that snapshot
+    // BEFORE the unit's own status/UpdatedAt bump, so the CreatedAt-postdates-UpdatedAt heuristic
+    // below can never hold for a freshly-applied real-repo unit — it survives only as the fallback
+    // for units with no recorded applied snapshot (resync failed, no snapshot service, or a unit
+    // whose changes reached the repo via a later between-run sync instead). The applied-snapshot
+    // signal is deliberately not gated on WorkUnitStatus.Merged: the metadata is only ever set at
+    // apply time, and the eviction sweep (EvictOrphanedAsync) already restricts itself to terminal
+    // statuses, so on-demand eviction of an applied unit stays correct even if the caller drove the
+    // apply without advancing the unit's own status machine.
     private async Task<bool> PassesSafeEvictionInvariantAsync(WorkUnit wu, CancellationToken ct)
     {
+        if (wu.Metadata is { } metadata
+            && metadata.TryGetValue("appliedSnapshotId", out var appliedSnapshotId)
+            && !string.IsNullOrEmpty(appliedSnapshotId))
+        {
+            return true;
+        }
+
         var repositoryId = await GetRepositoryIdAsync(wu, ct).ConfigureAwait(false);
         var snapshot = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
         if (snapshot?.TreeEntries is null) return false;

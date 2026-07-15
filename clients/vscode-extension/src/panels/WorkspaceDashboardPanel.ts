@@ -461,7 +461,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
             ?? '';
           if (!workUnitId) { return; }
 
-          let spawnBody: Record<string, string> = { agentType, workUnitId };
+          let spawnBody: Record<string, unknown> = { agentType, workUnitId };
           if (this.configService && this.secrets && this.lmProxyBaseUrl) {
             const llm = await this.configService.resolveSpawnLlmConfig(
               agentType, this.secrets, this.lmProxyBaseUrl,
@@ -515,7 +515,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           // credential store client-side, same as Reconcile already does, so requeue doesn't
           // silently land somewhere with no way to actually run anything.
           try {
-            const llm = await this.resolveOrchestratorCredentials();
+            const llm = await this.resolveDefaultProfileCredentials();
             const body = llm
               ? {
                   overrideModel: llm.model, overrideBaseUrl: llm.baseUrl,
@@ -527,7 +527,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
             void vscode.window.showInformationMessage(
               llm
                 ? 'NodalMerge: Requeued with fresh credentials.'
-                : 'NodalMerge: Requeued — no Orchestrator profile configured in Model & Agent Studio → ' +
+                : 'NodalMerge: Requeued — no Default profile configured in Model & Agent Studio → ' +
                   'Agent Topology, so any review/worker step needing credentials may still stall.',
             );
             void this.poll();
@@ -552,7 +552,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           // IRuntimeCredentialCache), re-resolve it from the same profile it was dispatched under
           // and resupply it as part of the resume call — mirrors ArtifactExplorerPanel's Resume
           // action so both surfaces recover the same way.
-          let resumeBody: Record<string, string> = {};
+          let resumeBody: Record<string, unknown> = {};
           if (this.configService && this.secrets) {
             const pending = await this.get<Array<{ workUnitId: string; profileId: string }>>('/studio/scheduler/pending').catch(() => []);
             const item = pending?.find(i => i.workUnitId === resumeWorkUnitId);
@@ -909,7 +909,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
   }
 
   // Resolves the default Agent Topology template's Reconciler profile (falling back to its
-  // Orchestrator profile, same "inherit" convention Planner/Worker/Reviewer already use) into
+  // Default profile, same "inherit" convention Planner/Worker/Reviewer already use) into
   // spawn-ready credentials, so clicking Reconcile is genuinely one-click instead of silently
   // depending on whichever source goal's own in-memory orchestrator registration happens to still
   // be alive server-side (see ReconciliationRequest.Credentials's own comment for why that
@@ -930,12 +930,12 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
     return llm ? { ...llm, profileId } : undefined;
   }
 
-  // Same shape as resolveReconcilerCredentials above, but for the plain Orchestrator profile —
+  // Same shape as resolveReconcilerCredentials above, but for the topology's Default profile —
   // used by Requeue to resupply credentials for a goal whose in-memory registration was wiped by
   // a Host restart (see the 'requeueWorkUnit' case), same "settings.json + saved credential store"
   // source Reconcile already draws from. Returns undefined when nothing is configured, so Requeue
   // still proceeds (same no-op-if-unresolvable contract ResupplyCredentialsAsync has server-side).
-  private async resolveOrchestratorCredentials(): Promise<
+  private async resolveDefaultProfileCredentials(): Promise<
     { provider: string; model: string; baseUrl: string; apiKey: string; profileId: string; credentialRef?: string } | undefined
   > {
     if (!this.configService || !this.secrets || !this.lmProxyBaseUrl) { return undefined; }

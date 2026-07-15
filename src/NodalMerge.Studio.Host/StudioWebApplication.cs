@@ -1,9 +1,12 @@
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using NodalMerge.DotNetHost;
 using NodalMerge.DotNetHost.Runtime;
 using NodalMerge.Host.Composition;
+using NodalMerge.Studio.AgentRuntime;
 using NodalMerge.Studio.Core;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Orchestrator;
@@ -120,6 +123,27 @@ public static class StudioWebApplication
 
         app.MapStudioRestEndpoints();
         app.MapMcp("/mcp");
+        // Phase C.4 (phase-c-implementation.md C3) — same MapMcp infrastructure, routed at a second
+        // pattern; ServiceCollectionExtensions.AddStudioMcpServer's ConfigureSessionOptions callback
+        // swaps in the harness-only tool set for requests under this prefix, leaving "/mcp" above
+        // completely unchanged (see that file's own doc comment for why a second AddMcpServer()
+        // registration can't be used instead).
+        app.MapMcp("/mcp-harness");
+
+        // Phase C.4 (phase-c-implementation.md C3) — ClaudeCodeExecutor needs this process's own
+        // listening address to point the spawned CLI's .workspace/mcp.json back at "/mcp-harness".
+        // Read once the server has actually bound (a pre-bind config guess would be wrong whenever
+        // the port is dynamically assigned via ":0") via IServerAddressesFeature, the same
+        // ASP.NET Core mechanism `dotnet run --urls` diagnostics use. Never fires in BuildPeer's
+        // headless mode (no Kestrel there) — ClaudeCodeExecutorOptions.HarnessMcpBaseUrl stays null,
+        // and RunAsync's own gate treats that as "no MCP mount this run," same as pre-C3 behavior.
+        app.Lifetime.ApplicationStarted.Register(() =>
+        {
+            var address = app.Services.GetRequiredService<IServer>()
+                .Features.Get<IServerAddressesFeature>()?.Addresses.FirstOrDefault();
+            if (address is not null)
+                app.Services.GetRequiredService<ClaudeCodeExecutorOptions>().HarnessMcpBaseUrl = address;
+        });
 
         // Diagnostic: list all registered endpoint patterns (remove once MCP route is confirmed)
         app.MapGet("/debug/routes", (IEnumerable<EndpointDataSource> sources) =>

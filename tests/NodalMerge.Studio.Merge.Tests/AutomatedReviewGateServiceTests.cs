@@ -362,11 +362,11 @@ public class AutomatedReviewGateServiceTests
     private sealed class FakeAgentControlService(string autoReviewProfileId) : IAgentControlService
     {
         public string? GetAutoReviewProfileId(string workUnitId) => autoReviewProfileId;
-        public string? GetOrchestratorProfileId(string workUnitId) => null;
+        public string? GetGoalDefaultProfileId(string workUnitId) => null;
 
-        public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => null;
+        public GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId) => null;
 
-        public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
+        public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
 
         public Task<string> SpawnAsync(
             string agentType,
@@ -378,9 +378,10 @@ public class AutomatedReviewGateServiceTests
             string? provider = null,
             string? profileId = null,
             string? autoReviewProfileId = null,
-            IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
+            IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
             IReadOnlyList<string>? enabledDomainAgents = null,
             string? credentialRef = null,
+            bool lenientToolParsing = false,
             CancellationToken cancellationToken = default) =>
             Task.FromResult("agent");
 
@@ -395,6 +396,7 @@ public class AutomatedReviewGateServiceTests
             string? overrideProvider = null,
             string? overrideProfileId = null,
             string? overrideCredentialRef = null,
+            bool ensurePlanner = false,
             CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
 
@@ -560,6 +562,9 @@ public class AutomatedReviewGateServiceTests
             Task.FromResult(false);
 
         public Task<IReadOnlyList<string>> ListAsync(string branchId, string? subPath = null, string? pattern = null, CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<string>>([]);
+
+        public Task<IReadOnlyList<string>> ListIncludingDotfilesAsync(string branchId, string subPath, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyList<string>>([]);
 
         public Task<(IReadOnlyList<WorkspaceSearchMatch> Matches, bool Truncated)> SearchAsync(
@@ -793,6 +798,7 @@ public class AutomatedReviewGateServiceTests
             string title,
             string body,
             string? parentArtifactId = null,
+            IReadOnlyList<string>? supersedes = null,
             CancellationToken ct = default)
         {
             Recorded.Add((workUnitId, type, title, body));

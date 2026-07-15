@@ -152,4 +152,81 @@ public class StaggeredChildCompletionTests
         var parentAfter = await workUnits.GetAsync(parent.WorkUnitId);
         Assert.NotEqual(WorkUnitStatus.Completed, parentAfter!.Status);
     }
+
+    /// <summary>
+    /// Regression (found live 2026-07-13, first real agent rejection at the workspace gate): when
+    /// the last child's apply makes every child terminal, TryCompleteParentIfAllChildrenTerminalAsync
+    /// reconciles and — pre-fix — marked the parent Completed immediately, even though the freshly
+    /// reconciled workspace proposal was still unreviewed. Completed is terminal, so when the
+    /// reviewer then rejected that proposal, the rejection retry's Executing write silently failed
+    /// and the goal wedged forever: rejected proposal, nothing running, no way back. The parent
+    /// must stay non-Completed until its workspace proposal is Approved/Merged.
+    /// </summary>
+    [Fact]
+    public async Task Parent_is_not_completed_while_its_reconciled_workspace_proposal_awaits_review()
+    {
+        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
+        var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
+        var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
+        var workUnits = app.Services.GetRequiredService<IWorkUnitService>();
+        var merge = app.Services.GetRequiredService<IMergeService>();
+
+        var parent = await workUnitCommands.CreateAsync(new WorkUnitCreateCommand("Parent goal", "test"));
+        await workUnits.UpdateStatusAsync(parent.WorkUnitId, WorkUnitStatus.Queued, cancellationToken: default);
+        await workUnits.UpdateStatusAsync(parent.WorkUnitId, WorkUnitStatus.Executing, cancellationToken: default);
+
+        var siblingA = await workUnitCommands.CreateAsync(new WorkUnitCreateCommand(
+            "Sibling A", "test", ParentWorkUnitId: parent.WorkUnitId, SeedFromBranchId: parent.BranchId));
+        var siblingB = await workUnitCommands.CreateAsync(new WorkUnitCreateCommand(
+            "Sibling B", "test", ParentWorkUnitId: parent.WorkUnitId, SeedFromBranchId: parent.BranchId));
+        foreach (var sibling in new[] { siblingA, siblingB })
+        {
+            await workUnits.UpdateStatusAsync(sibling.WorkUnitId, WorkUnitStatus.Queued, cancellationToken: default);
+            await workUnits.UpdateStatusAsync(sibling.WorkUnitId, WorkUnitStatus.Executing, cancellationToken: default);
+        }
+
+        await fileWorkspace.WriteAsync(siblingA.BranchId, "FileA.cs", "// added by sibling A");
+        await fileWorkspace.WriteAsync(siblingB.BranchId, "FileB.cs", "// added by sibling B");
+
+        // A applies alone first (B not yet proposed, so nothing can combine), same staggered
+        // shape as the first test in this file.
+        var proposalA = await mergeCommands.ProposeAsync(
+            sourceBranch: siblingA.BranchId, targetBranch: parent.BranchId, summary: "Add FileA",
+            workUnitId: siblingA.WorkUnitId);
+        await mergeCommands.ValidateAsync(proposalA.ProposalId);
+        await mergeCommands.ReviewAsync(proposalA.ProposalId, "Approved");
+        await mergeCommands.ApplyAsync(proposalA.ProposalId);
+
+        var proposalB = await mergeCommands.ProposeAsync(
+            sourceBranch: siblingB.BranchId, targetBranch: parent.BranchId, summary: "Add FileB",
+            workUnitId: siblingB.WorkUnitId);
+        await mergeCommands.ValidateAsync(proposalB.ProposalId);
+        await mergeCommands.ReviewAsync(proposalB.ProposalId, "Approved");
+
+        // Two legal interleavings from here (same fork the first test navigates): B's Approve may
+        // have synchronously combined A+B into a reconciled parent proposal (superseding B), or —
+        // the live ordering that exposed the bug — B still applies individually, making every
+        // child terminal, which fires TryCompleteParentIfAllChildrenTerminalAsync and creates the
+        // reconciled proposal there. Pre-fix, the second interleaving marked the parent Completed
+        // with that proposal still unreviewed.
+        var latestB = await merge.GetAsync(proposalB.ProposalId);
+        if (latestB?.Status is not MergeProposalStatus.Superseded)
+            await mergeCommands.ApplyAsync(proposalB.ProposalId);
+
+        // Either way a reconciled parent proposal now exists, unreviewed — and the parent must
+        // NOT be Completed while that review gate is open.
+        var workspaceProposal = (await merge.ListAsync())
+            .FirstOrDefault(p => p.WorkUnitId == parent.WorkUnitId
+                && p.Status is MergeProposalStatus.Draft or MergeProposalStatus.ReadyForReview or MergeProposalStatus.UnderReview);
+        Assert.NotNull(workspaceProposal);
+        var parentPending = await workUnits.GetAsync(parent.WorkUnitId);
+        Assert.NotEqual(WorkUnitStatus.Completed, parentPending!.Status);
+
+        // The reviewer rejects — the live scenario. The parent must still be recoverable
+        // (non-Completed), so the rejection-retry machinery's status writes can actually land.
+        await mergeCommands.ReviewAsync(workspaceProposal!.ProposalId, "Rejected");
+        var parentAfterReject = await workUnits.GetAsync(parent.WorkUnitId);
+        Assert.NotEqual(WorkUnitStatus.Completed, parentAfterReject!.Status);
+    }
 }

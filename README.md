@@ -2,9 +2,9 @@
 
 **Git for agent reasoning and execution** — not Git for files.
 
-NodalMerge Studio is an agent-native collaborative development runtime built on [NodalMerge](https://github.com/nodalmerge/nodalmerge). Humans, AI agents, automation, and MCP tools work together through deterministic projections, coordinated task execution, and human review workflows — all backed by a persistent, branchable, replayable artifact graph.
+NodalMerge Studio is a persistent collaborative runtime for human and AI development work, built on [NodalMerge](https://github.com/nodalmerge/nodalmerge). It provides the execution environment, decision history, artifact lineage, and coordination layer for a shared, evolving workspace — designed so that any agent harness, tool, or human collaborator can contribute, with every contribution reviewed, promoted, and replayable.
 
-Every step an agent takes produces a durable artifact in a DAG. Every artifact can be inspected, branched, replayed, merged, and audited. The durable graph is the product; agents are features of it.
+Every step an agent takes produces a durable artifact in a DAG. Every artifact can be inspected, branched, replayed, merged, and audited. The durable graph is the product; agents are features of it. The harness is just one participant.
 
 ---
 
@@ -390,7 +390,7 @@ NodalMerge Studio exposes an MCP v1 tool surface with **117 `nm_v1_*` tools** (c
 Core namespaces: `nm_v1_projection_*`, `nm_v1_workunit_*`, `nm_v1_task_*`, `nm_v1_branch_*`, `nm_v1_merge_*`, `nm_v1_workspace_*` (file I/O, build/test/run, semantic navigation, profile), `nm_v1_scheduler_*`, `nm_v1_artifact_*`. Phase 6.7+ adds `nm_v1_goal_*`, `nm_v1_decision_*`, `nm_v1_evidence_*`, `nm_v1_trajectory_*`, `nm_v1_hypothesis_*`, `nm_v1_reasoning_*`, `nm_v1_model_*` (none dispatched to agents yet). Phase 7 capabilities (Experiments, Steering, Counterfactuals, Review Policy, Promotion Branches) are REST-only.
 
 Full documentation:
-- [docs/reference/api-reference.md](docs/reference/api-reference.md) — complete 66-tool catalog with dispatch status, REST endpoint parity, and extension coverage analysis
+- [docs/reference/api-reference.md](docs/reference/api-reference.md) — complete 117-tool catalog with dispatch status, REST endpoint parity, and extension coverage analysis
 - [docs/contracts/mcp-v1-contract.md](docs/contracts/mcp-v1-contract.md) — frozen design principles, request/response schemas, error envelope format, and Phase 6.7+/Phase 7 addendum
 
 ---

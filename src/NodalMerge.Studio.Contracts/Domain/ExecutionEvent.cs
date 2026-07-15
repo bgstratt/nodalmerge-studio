@@ -79,4 +79,24 @@ public enum ExecutionEventKind
     // Orchestrator reliability — records a transient-provider-error retry as it happens, not just
     // the terminal dead-letter reason if all retries are exhausted.
     ProviderRetryAttempted,
+
+    // plans/harness-hosting-architecture.md Phase B.3 — a generated --settings allowlist denied a
+    // tool call during an external executor run. Emitted so a misconfigured allowlist is
+    // diagnosable from the dashboard, not buried in the harness's own transcript.
+    HarnessPermissionDenied,
+
+    // plans/phase-d-implementation.md D1.b — a Plan-mode CLI run edited a file outside
+    // .workspace/ despite the plan-mode kickoff/allowlist saying "implement nothing, write only
+    // .workspace/plan.json". The diff is discarded (never proposed/merged) rather than failing
+    // the run outright — the plan itself may still be valid — but the drift needs to be
+    // diagnosable instead of silently vanishing.
+    HarnessPlanDiffDiscarded,
+
+    // plans/phase-d-implementation.md D3 — a plan artifact has accumulated enough superseding
+    // decisions or dead-lettered slices since it was recorded that it may no longer reflect
+    // reality. Signal only — nothing subscribes to this to auto-replan (same reason auto-replan
+    // stays deferred for RetryWithContextAsync-adjacent flows: automatic re-planning needs its own
+    // safety verification first). A human sees this via the dashboard/replan-trigger response and
+    // decides whether to act.
+    PlanStalenessSignalRaised,
 }

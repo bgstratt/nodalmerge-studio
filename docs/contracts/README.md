@@ -27,6 +27,7 @@ The MCP contract is the stable operating-system API for Studio:
 |----------|---------|
 | [mcp-v1-contract.md](./mcp-v1-contract.md) | Frozen MCP tool surface (`nm_v1_*`) |
 | [projection-v1-contract.md](./projection-v1-contract.md) | Projection types, levels, payload shapes |
+| [workspace-contract-v1.md](./workspace-contract-v1.md) | `.workspace/` directory contract for external harnesses (Claude Code, Codex, …) |
 | [../architecture/crdt-vs-cognition-layer.md](../architecture/crdt-vs-cognition-layer.md) | CRDT substrate vs agent cognition layer |
 | [../architecture/v1-architecture-spec.md](../architecture/v1-architecture-spec.md) | Product architecture (the "what") |
 

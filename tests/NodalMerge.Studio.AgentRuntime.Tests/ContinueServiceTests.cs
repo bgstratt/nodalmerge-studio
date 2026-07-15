@@ -101,24 +101,24 @@ public class ContinueServiceTests
 
     private sealed class FakeAgentControlService : IAgentControlService
     {
-        public OrchestratorCredentials? CredentialsToReturn;
+        public GoalDefaultCredentials? CredentialsToReturn;
 
         public Task<string> SpawnAsync(string agentType, string workUnitId, string? taskId = null, string? model = null,
             string? baseUrl = null, string? apiKey = null, string? provider = null, string? profileId = null,
-            string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, OrchestratorCredentials>? stageCredentials = null,
-            IReadOnlyList<string>? enabledDomainAgents = null, string? credentialRef = null, CancellationToken cancellationToken = default) =>
+            string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
+            IReadOnlyList<string>? enabledDomainAgents = null, string? credentialRef = null, bool lenientToolParsing = false, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
 
-        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
+        public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, bool ensurePlanner = false, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;
         public Task<bool> ResupplyCredentialsAsync(string workUnitId, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) =>
             Task.FromResult(false);
 
         public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
-        public OrchestratorCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => CredentialsToReturn;
-        public OrchestratorCredentials? GetOrchestratorCredentials(string workUnitId) => CredentialsToReturn;
+        public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => CredentialsToReturn;
+        public GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId) => CredentialsToReturn;
         public string? GetAutoReviewProfileId(string workUnitId) => null;
-        public string? GetOrchestratorProfileId(string workUnitId) => null;
+        public string? GetGoalDefaultProfileId(string workUnitId) => null;
         public Task PauseAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task ResumeAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;
         public Task StopAsync(string agentId, CancellationToken cancellationToken = default) => Task.CompletedTask;

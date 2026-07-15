@@ -248,17 +248,20 @@ public class InMemoryAgentRuntimeServiceTests
     }
 
     [Fact]
-    public async Task ReinvokeOrchestratorAsync_starts_a_new_agent_for_a_registered_work_unit()
+    public async Task ReinvokeOrchestratorAsync_runs_the_convergence_sweep_without_spawning_an_agent()
     {
+        // plans/orchestrator-pure-service.md M2 — reinvoke is a deterministic GoalCoordinator
+        // sweep, not an LLM loop restart: no new AgentRecord may appear, and the registered
+        // credentials survive untouched for later planner/child enqueues.
         var svc = Build();
         await svc.SpawnAsync("orchestrator", "wu-1", model: "m", baseUrl: "http://fake-llm", apiKey: "k");
 
         await svc.ReinvokeOrchestratorAsync("wu-1");
 
         var all = await svc.ListAllAsync();
-        Assert.Equal(2, all.Count);
-        Assert.All(all, a => Assert.Equal("wu-1", a.WorkUnitId));
-        Assert.NotEqual(all[0].AgentId, all[1].AgentId);
+        Assert.Single(all);
+        Assert.Equal("wu-1", all[0].WorkUnitId);
+        Assert.NotNull(svc.GetGoalDefaultCredentials("wu-1"));
     }
 
     [Fact]

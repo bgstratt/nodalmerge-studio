@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { scopeViewCss } from './sharedWebviewChrome';
-import type { AgentConfigService, SpawnLlmConfig } from '../AgentConfigService';
+import { type AgentConfigService, type SpawnLlmConfig } from '../AgentConfigService';
 import type { ProposalFileChange } from './MergeReviewPanel';
 import { COMMANDS } from '../constants';
 import { resolveRepositoryPath } from '../repositoryPath';
@@ -77,9 +77,10 @@ interface ExecutionSession {
   hasParkedWork?: boolean;
   parkedReason?: string | null;
   parkedWorkUnitIds?: string[];
-  // No live agent and nothing parked underneath — most commonly because every child finished
-  // while the orchestrator's registration was cold after a restart, so it was never woken back up
-  // to notice (ReinvokeOrchestratorAsync silently no-ops without resolvable credentials).
+  // No live agent, no queued work, and nothing parked underneath — nothing is driving the goal
+  // forward. The Reinvoke button runs the server's credential-free convergence sweep
+  // (plans/orchestrator-pure-service.md M2). orchestratorProfileId is the goal's Default-profile
+  // id (legacy wire name; the server also sends it as defaultProfileId).
   orchestratorStalled?: boolean;
   orchestratorProfileId?: string | null;
 }
@@ -433,6 +434,7 @@ export class GoalWorkspacePanel {
         const goalsResp = await this.get<{ goals: Array<{
           workUnitId: string; hasParkedWork?: boolean; parkedReason?: string | null; parkedWorkUnitIds?: string[];
           orchestratorStalled?: boolean; orchestratorProfileId?: string | null;
+          defaultProfileId?: string | null;
         }> }>('/studio/goals');
         const byWorkUnitId = new Map(goalsResp.goals.map(g => [g.workUnitId, g]));
         for (const session of sessions) {
@@ -441,7 +443,8 @@ export class GoalWorkspacePanel {
           session.parkedReason = goal?.parkedReason ?? null;
           session.parkedWorkUnitIds = goal?.parkedWorkUnitIds ?? [];
           session.orchestratorStalled = goal?.orchestratorStalled ?? false;
-          session.orchestratorProfileId = goal?.orchestratorProfileId ?? null;
+          // Prefer the new wire name; fall back to the legacy one until it's removed server-side.
+          session.orchestratorProfileId = goal?.defaultProfileId ?? goal?.orchestratorProfileId ?? null;
         }
       } catch {
         // Non-fatal — sessions still render, just without the parked rollup.
@@ -467,7 +470,15 @@ export class GoalWorkspacePanel {
       const reviewingWorkUnitIds = agents
         .filter(a => a.status === 'active' && a.agentId.startsWith('reviewer-auto-'))
         .map(a => a.workUnitId);
-      void this.panel.webview.postMessage({ type: 'tree', sessionId, workUnits, reviewingWorkUnitIds });
+      // Same live-indicator mechanism as reviewingWorkUnitIds above, for a planner's spawn —
+      // agentId is prefixed with the profile id GoalCoordinator.EnsurePlannerAsync enqueues under
+      // ("planner" by default, or whatever PlannerSelectionService picked), the same convention
+      // Activity Center relies on elsewhere. There's no equivalent "orchestrator" agent to badge
+      // any more — GoalCoordinator is a deterministic in-process sweep, not a spawned agent.
+      const planningWorkUnitIds = agents
+        .filter(a => a.status === 'active' && a.agentId.startsWith('planner-'))
+        .map(a => a.workUnitId);
+      void this.panel.webview.postMessage({ type: 'tree', sessionId, workUnits, reviewingWorkUnitIds, planningWorkUnitIds });
     } catch {
       // session may have just been created and not yet visible
     }
@@ -782,27 +793,15 @@ export class GoalWorkspacePanel {
     if (this.selectedSessionId) { await this.refreshDecisionTree(this.selectedSessionId); }
   }
 
-  // Manual recovery for a stalled orchestrator (see WorkUnit.orchestratorStalled) — resolves fresh
-  // credentials for whichever profile the orchestrator was originally spawned under (returned by
-  // GET /studio/goals as orchestratorProfileId, itself sourced from the rehydrated routing config)
-  // and calls the reinvoke endpoint, which is guarded server-side against double-spawning a second
-  // live orchestrator over an already-running one.
-  //
-  // orchestratorProfileId is null for any orchestrator spawned before the routing-persistence fix
-  // shipped — there was nowhere to persist a profile id yet, so nothing survived the restart to
-  // look one up from. Rather than fail outright, fall back to asking which profile to use, same as
-  // the Steer & Retry "use new profile" picker elsewhere in this panel.
+  // Manual recovery for a stalled goal — since plans/orchestrator-pure-service.md M2 the server's
+  // reinvoke endpoint runs a deterministic, credential-free GoalCoordinator convergence sweep (it
+  // also re-enqueues the planner if the goal never got one), so no profile picker and no
+  // credential resolution are required anymore. When the goal's Default profile is known and its
+  // credentials resolve, send them along anyway — that re-warms the server's credential registry
+  // after a Host restart, which future planner/child enqueues need.
   private async handleReinvokeOrchestrator(workUnitId: string, profileId: string | null): Promise<void> {
-    if (!profileId) {
-      const picked = await this.configService?.pickProfile(
-        'No orchestrator profile is on record for this goal (it predates a fix) — pick one to reinvoke with',
-      );
-      if (!picked) { return; } // user cancelled
-      profileId = picked.id;
-    }
-
-    let body: Record<string, string> = { overrideProfileId: profileId };
-    if (this.configService && this.secrets) {
+    let body: Record<string, string> = {};
+    if (profileId && this.configService && this.secrets) {
       const llm = await this.configService.resolveSpawnLlmConfig(profileId, this.secrets, this.lmProxyBaseUrl ?? '');
       if (llm) {
         body = {
@@ -811,15 +810,12 @@ export class GoalWorkspacePanel {
           overrideApiKey: llm.apiKey, overrideProvider: llm.provider,
           overrideCredentialRef: llm.credentialRef,
         };
-      } else {
-        const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl ?? '');
-        void vscode.window.showWarningMessage('NodalMerge: could not resolve credentials for profile "' + profileId + '" (' + reason + ') — reinvoking without them will likely fail.');
       }
     }
 
     try {
       await this.post('/studio/workunits/' + workUnitId + '/reinvoke-orchestrator', body);
-      void vscode.window.showInformationMessage('NodalMerge: Orchestrator reinvoked.');
+      void vscode.window.showInformationMessage('NodalMerge: Convergence sweep run.');
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: Reinvoke failed — ' + String(err));
     }
@@ -1319,9 +1315,13 @@ export class GoalWorkspacePanel {
         const reason = await this.configService.describeMissingCredentials(template.orchestrator, this.secrets, this.lmProxyBaseUrl);
         throw new Error(`Profile "${template.orchestrator}" isn't ready — ${reason}.`);
       }
+      // Any provider works for the Default profile — a profile is a profile, for any role
+      // (plans/orchestrator-pure-service.md M2/M3). Goal coordination is the server's
+      // deterministic GoalCoordinator, not an LLM loop, so "spawning the orchestrator" below just
+      // registers these as the goal's Default-profile credentials that unset roles inherit.
 
       // Agent Topology — resolve credentials for any stage that has its own profile configured;
-      // unset stages fall back to the Orchestrator's credentials on the backend.
+      // unset stages fall back to the Default profile's credentials on the backend.
       const stageCredentials: Record<string, SpawnLlmConfig> = {};
       const stagePlans: Array<[string, string | undefined]> = [
         ['Plan', template.planner],
@@ -1335,6 +1335,10 @@ export class GoalWorkspacePanel {
           const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl);
           throw new Error(`Profile "${profileId}" isn't ready — ${reason}.`);
         }
+        // Every per-stage role is CLI-assignable: Execute (harness-hosting-architecture.md B1),
+        // Plan (phase-d-implementation.md D1.a), and Review
+        // (review-seam-and-clarification-sessions.md S2 — review-request.json in,
+        // .workspace/review.json verdict out, both CLI adapters flip SupportsReviewMode true).
         stageCredentials[stage] = cfg;
       }
 
@@ -1356,10 +1360,27 @@ export class GoalWorkspacePanel {
         profileIds: [template.orchestrator],
       });
 
+      // The server's scheduled review gate (AutomatedReviewGateService.TryEnqueueReviewerAsync) is
+      // enabled by a non-null autoReviewProfileId — which nothing was sending. Result: the scheduled
+      // reviewer never ran, so AgentApproval/Hybrid goals that rely on that gate (notably atomic
+      // no-plan goals, which have no reconciliation → inline-review path) parked at ReadyForReview
+      // forever with no reviewer. Send the reviewer role's profile: an explicitly-assigned reviewer
+      // wins; "inherit default" (empty) falls back to the Default/orchestrator profile — a profile is
+      // a profile, any role inherits Default (plans/orchestrator-pure-service.md). Only send it when a
+      // policy actually wants an agent to review — HumanRequired must keep waiting for a human. Also
+      // send profileId so the goal records its Default-profile id (was persisting null → the null
+      // defaultProfileId in GET /studio/goals).
+      const effTaskPolicy = taskReviewPolicy ?? this.configService.getDefaultTaskReviewPolicy();
+      const effWorkspacePolicy = workspaceReviewPolicy ?? this.configService.getDefaultWorkspaceReviewPolicy();
+      const wantsAgentReview = [effTaskPolicy, effWorkspacePolicy]
+        .some(p => p === 'AgentApproval' || p === 'Hybrid');
+
       await this.post('/studio/agents/spawn', {
         agentType: 'orchestrator',
         workUnitId: rootWu.workUnitId,
         ...orchCfg,
+        profileId: template.orchestrator,
+        ...(wantsAgentReview ? { autoReviewProfileId: template.reviewer || template.orchestrator } : {}),
         ...(Object.keys(stageCredentials).length > 0 ? { stageCredentials } : {}),
       });
 
@@ -1381,7 +1402,7 @@ export class GoalWorkspacePanel {
   // POST /studio/scheduler/{workUnitId}/resume. Shared by the single-node Resume button and the
   // goal-level "Resume parked work" action so both go through the exact same resolution.
   private async resumeWorkUnit(workUnitId: string): Promise<void> {
-    let body: Record<string, string> = {};
+    let body: Record<string, unknown> = {};
     if (this.configService && this.secrets) {
       // The scheduler queue item (not WorkUnit, which doesn't carry profileId) says which
       // profile this task was dispatched under — re-fetch it here rather than threading it
@@ -1913,7 +1934,7 @@ const GW_HTML = `
         <span id="gw-session-parked-badge" class="badge paused" style="display:none"></span>
         <button id="gw-session-resume-parked" class="ghost" style="display:none;color:var(--nm-warn);border-color:var(--nm-warn);padding:3px 8px;font-size:0.78em">&#x21BA; Resume parked work</button>
         <span id="gw-session-stalled-badge" class="badge paused" style="display:none">stalled</span>
-        <button id="gw-session-reinvoke" class="ghost" title="No orchestrator is running for this goal and nothing is parked — click to wake it back up" style="display:none;color:var(--nm-warn);border-color:var(--nm-warn);padding:3px 8px;font-size:0.78em">&#x21BA; Reinvoke Orchestrator</button>
+        <button id="gw-session-reinvoke" class="ghost" title="Nothing is driving this goal forward — click to run a convergence sweep" style="display:none;color:var(--nm-warn);border-color:var(--nm-warn);padding:3px 8px;font-size:0.78em">&#x21BA; Reinvoke</button>
       </div>
     </div>
     <div class="gw-field">

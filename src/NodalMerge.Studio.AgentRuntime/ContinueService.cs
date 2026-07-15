@@ -36,12 +36,22 @@ public sealed class ContinueService(
         if (entry is null)
             return new ContinueResult(ContinueOutcome.NotFound, "Dead-letter entry not found.");
 
-        if (entry.Kind != FailureKind.MaxIterationsExceeded)
+        // Review-stage Stalled is the one other case where resuming the same conversation makes
+        // sense: a CLI-harness reviewer (ClaudeCodeExecutor) that reasons to a real verdict but
+        // narrates it as plain text instead of performing the required .workspace/review.json
+        // write exits with FailureKind.Stalled even though its prior turns already contain a
+        // complete, correct decision — reconstructing that context and nudging it to actually
+        // perform the write is a one-turn fix, not a wasted-conversation restart. Every other
+        // Stalled case (a worker's harness crashing, producing no usable output) still isn't
+        // safe to resume, hence scoping this to Review only rather than opening it for all kinds.
+        var isReviewStageStall = entry.Kind == FailureKind.Stalled && entry.Stage == PipelineStage.Review;
+        if (entry.Kind != FailureKind.MaxIterationsExceeded && !isReviewStageStall)
         {
             return new ContinueResult(
                 ContinueOutcome.NotApplicable,
-                $"Continue only applies to MaxIterationsExceeded failures (this entry's kind: " +
-                $"{entry.Kind}) — use Retry (steer) or Re-plan instead.");
+                $"Continue only applies to MaxIterationsExceeded failures, or a Review-stage " +
+                $"Stalled entry (this entry's kind: {entry.Kind}, stage: {entry.Stage}) — use " +
+                "Retry (steer) or Re-plan instead.");
         }
 
         var workUnit = await workUnits.GetAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
@@ -83,7 +93,7 @@ public sealed class ContinueService(
         if (apiKey is null)
         {
             var creds = agentControl.GetCredentialsForStage(entry.WorkUnitId, entry.Stage)
-                ?? agentControl.GetOrchestratorCredentials(entry.WorkUnitId);
+                ?? agentControl.GetGoalDefaultCredentials(entry.WorkUnitId);
             model = creds?.Model;
             baseUrl = creds?.BaseUrl;
             apiKey = creds?.ApiKey;
@@ -173,10 +183,15 @@ public sealed class ContinueService(
         if (completion is AgentLoopCompletion.AwaitingFileLease or AgentLoopCompletion.AwaitingClarification)
         {
             var scheduler = serviceProvider.GetRequiredService<IWorkScheduler>();
+            // A real session matters here: if the resumed run asks a blocking clarification, the
+            // ClarificationRequested event is keyed by session — the goal's own session keeps it
+            // grouped with the rest of the goal's timeline instead of falling back to
+            // ClarificationCommandService's synthetic per-work-unit session.
+            var goalSessionId = await ResolveGoalSessionIdAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
             await scheduler.EnqueueAsync(
                 entry.WorkUnitId, entry.ProfileId, taskId: entry.TaskId,
                 model: model, baseUrl: baseUrl, apiKey: apiKey, provider: provider,
-                sessionId: null, credentialRef: resolvedCredentialRef, ct: cancellationToken).ConfigureAwait(false);
+                sessionId: goalSessionId, credentialRef: resolvedCredentialRef, ct: cancellationToken).ConfigureAwait(false);
 
             if (completion == AgentLoopCompletion.AwaitingFileLease)
                 await scheduler.MarkAwaitingFileLeaseAsync(entry.WorkUnitId, cancellationToken).ConfigureAwait(false);
@@ -205,7 +220,11 @@ public sealed class ContinueService(
             baseUrl: baseUrl,
             apiKey: apiKey,
             provider: provider,
-            kind: FailureKind.MaxIterationsExceeded,
+            // Preserve the original kind rather than forcing MaxIterationsExceeded — by this point
+            // entry.Kind is already known to be either MaxIterationsExceeded or a Review-stage
+            // Stalled (the gate above rejects everything else), and a Stalled entry that stalls
+            // again is still Stalled, not suddenly an iteration-budget problem.
+            kind: entry.Kind,
             credentialRef: resolvedCredentialRef,
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
@@ -217,6 +236,29 @@ public sealed class ContinueService(
 
     // Converts each cycle's ConversationLogEntry back into the (assistant, user-tool-results) pair
     // WorkerAgentLoop's own messages list would have held at that point. A tool call's InputJson is
+    // Walks ParentWorkUnitId to the root and returns the owning goal node's SessionId (null when
+    // no goal node exists — e.g. work units created outside the goal flow). Mirrors the goal-node
+    // fallback tier in ClarificationCommandService.ResolveSessionIdAsync.
+    private async Task<string?> ResolveGoalSessionIdAsync(string workUnitId, CancellationToken ct)
+    {
+        var goalNodes = serviceProvider.GetService<NodalMerge.Studio.Storage.IGoalNodeService>();
+        if (goalNodes is null)
+            return null;
+
+        var rootId = workUnitId;
+        for (var depth = 0; depth < 32; depth++)
+        {
+            var unit = await workUnits.GetAsync(rootId, ct).ConfigureAwait(false);
+            if (unit?.ParentWorkUnitId is not { } parentId)
+                break;
+            rootId = parentId;
+        }
+
+        var goal = (await goalNodes.ListAsync(ct).ConfigureAwait(false))
+            .FirstOrDefault(g => string.Equals(g.WorkUnitId, rootId, StringComparison.OrdinalIgnoreCase));
+        return goal?.SessionId;
+    }
+
     // parsed and cloned (JsonElement.Clone()) so it's safe to use after the JsonDocument backing it
     // would otherwise be reclaimed.
     internal static List<NmMessage> ReconstructTurns(IReadOnlyList<ConversationLogEntry> entries)

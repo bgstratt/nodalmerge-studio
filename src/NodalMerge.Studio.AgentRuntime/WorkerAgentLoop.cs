@@ -30,7 +30,11 @@ internal sealed class WorkerAgentLoop(
     IReadOnlyList<NmMessage>? priorTurns = null,
     // Observability-only — see ConversationCompactor. Optional/nullable so call sites and tests
     // that don't wire a logger keep compiling unchanged.
-    ILogger? logger = null)
+    ILogger? logger = null,
+    // The work unit's own goal (see HarnessRunRequest.Goal), inlined into the kickoff so the worker
+    // has the goal in front of it rather than depending on a tool call to fetch it. Null → task-only
+    // kickoff (unchanged). Trailing optional so existing call sites keep compiling.
+    string? goal = null)
 {
     internal static readonly string DefaultSystemPrompt = AgentLoopPrompts.Worker;
 
@@ -58,7 +62,13 @@ internal sealed class WorkerAgentLoop(
 
     public async Task<AgentLoopCompletion> RunAsync(CancellationToken ct)
     {
+        // Base line kept verbatim (fanned-out tooling and test fakes parse taskId/workUnitId/agentId
+        // out of it); the goal is appended so the model has it in front of it without a tool call.
         var kickoff = $"Execute task {taskId} for work unit {workUnitId}. Your agent ID is {agentId}.";
+        if (!string.IsNullOrWhiteSpace(goal))
+            kickoff += $"\n\nGoal: {goal}\n\nComplete this goal directly. If no task record exists, that "
+                + "is expected for a direct-execution goal — proceed from the goal above and do not block "
+                + "on a missing task or an empty workspace when the goal is to create new files.";
         if (isResume)
             kickoff += " This work was previously interrupted (e.g. a host restart) — check " +
                 "existing files (nm_v1_workspace_list/nm_v1_workspace_read) and the task's current " +

@@ -8,18 +8,19 @@ namespace NodalMerge.Studio.McpServer.Tools;
 
 public sealed class ArtifactTools(IArtifactCommandService artifacts)
 {
-    [McpServerTool(Name = McpToolNames.ArtifactRecord), Description("Record a durable knowledge note (Research, Decision, or Constraint) so future work units don't have to rediscover it.")]
+    [McpServerTool(Name = McpToolNames.ArtifactRecord), Description("Record a durable knowledge note (Research, Decision, Constraint, or Supersession) so future work units don't have to rediscover it.")]
     public async Task<string> RecordAsync(
         string workUnitId,
         string type,
         string title,
         string body,
         string? parentArtifactId = null,
+        string[]? supersedes = null,
         CancellationToken cancellationToken = default)
     {
         try
         {
-            var recorded = await artifacts.RecordAsync(workUnitId, type, title, body, parentArtifactId, cancellationToken).ConfigureAwait(false);
+            var recorded = await artifacts.RecordAsync(workUnitId, type, title, body, parentArtifactId, supersedes, cancellationToken).ConfigureAwait(false);
             return McpJson.Ok(new { artifactId = recorded.ArtifactId });
         }
         catch (ArgumentException ex)

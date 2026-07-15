@@ -139,6 +139,14 @@ public class DeadLetterIntegrationTests
                 await Task.Delay(100);
             }
 
+            // Stop the scheduler poll loop BEFORE retrying — otherwise it races the pending-queue
+            // assertion below: a poll tick landing between RetryAsync and ListPendingAsync acquires
+            // the re-enqueued item (and the ExhaustingLlmHandler worker dead-letters it again),
+            // making the item vanish from pending. Idempotent with the finally's StopAsync; the
+            // short delay lets an already-in-flight tick drain past its acquire.
+            await agentRuntime.StopAsync(CancellationToken.None);
+            await Task.Delay(150);
+
             var retry = await deadLetter.RetryAsync(entry!.EntryId);
             Assert.Equal(DeadLetterRetryOutcome.Retried, retry.Outcome);
 
@@ -214,6 +222,10 @@ public class DeadLetterIntegrationTests
                 if (unit?.Status == WorkUnitStatus.DeadLettered) break;
                 await Task.Delay(100);
             }
+
+            // Same scheduler-race guard as Retry_from_dead_letter_re_enqueues_work_unit above.
+            await agentRuntime.StopAsync(CancellationToken.None);
+            await Task.Delay(150);
 
             var retry = await deadLetter.RetryWithContextAsync(
                 entry!.EntryId, "the config lives at repo root, not under src/ — start the search there");

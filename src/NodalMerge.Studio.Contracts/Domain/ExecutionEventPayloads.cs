@@ -243,3 +243,36 @@ public sealed record ProviderRetryAttemptedPayload(
     int MaxAttempts,
     int DelayMs,
     string Reason);
+
+// plans/harness-hosting-architecture.md Phase B.3 — one of these per entry in a ClaudeCodeExecutor
+// run's terminal permission_denials array. RawJson carries the denial verbatim (unverified shape
+// beyond "empty array" as of 2026-07-12 — see the plan's B2 research) so nothing is lost even if
+// the parsed ToolName/Reason fields miss a real field name.
+public sealed record HarnessPermissionDeniedPayload(
+    string AgentId,
+    string? ToolName,
+    string? Reason,
+    string RawJson);
+
+// plans/phase-d-implementation.md D1.b — one of these per Plan-mode CLI run whose diff (against
+// the harvest's target branch) was non-empty outside .workspace/ and got discarded instead of
+// proposed. DiffSummary carries IFileWorkspaceService.DiffAsync's own human-readable summary
+// verbatim (added/modified/deleted counts + file list) — enough to diagnose without re-running
+// the harness.
+public sealed record HarnessPlanDiffDiscardedPayload(
+    string AgentId,
+    string DiffSummary);
+
+// plans/phase-d-implementation.md D3 — one of these per staleness threshold crossed.
+// PlanWorkUnitId is the plan-owning work unit (not the decision/slice that tipped the count over
+// the threshold); Reason is "SupersedingDecisions" or "DeadLetteredSlices", matching
+// IPlanStalenessService's two Notify* signals. Emitted with SessionId = PlanWorkUnitId (no live
+// Studio session exists at either hook point — a decision/dead-letter can originate from any
+// agent's own session) so IExecutionEventStream.GetSessionEventsAsync(planWorkUnitId) finds it
+// alongside IExecutionEventStream.GetEventsByKindAsync for a cross-session dashboard query.
+public sealed record PlanStalenessSignalPayload(
+    string PlanWorkUnitId,
+    string? PlanArtifactId,
+    string Reason,
+    int Count,
+    int Threshold);

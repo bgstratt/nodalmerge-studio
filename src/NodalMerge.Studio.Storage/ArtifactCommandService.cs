@@ -10,7 +10,11 @@ namespace NodalMerge.Studio.Storage;
 public sealed class ArtifactCommandService(
     IArtifactLineageService artifacts,
     IWorkUnitService workUnits,
-    IDomainAgentTriggerService? domainAgentTrigger = null) : IArtifactCommandService
+    IDomainAgentTriggerService? domainAgentTrigger = null,
+    // plans/phase-d-implementation.md D3 — cheapest correct hook for the "superseding decisions"
+    // staleness signal: every Decision artifact with a non-empty Supersedes list passes through
+    // here. Optional/nullable, same convention as domainAgentTrigger above.
+    IPlanStalenessService? planStaleness = null) : IArtifactCommandService
 {
     public async Task<ArtifactRef> RecordAsync(
         string workUnitId,
@@ -18,11 +22,15 @@ public sealed class ArtifactCommandService(
         string title,
         string body,
         string? parentArtifactId = null,
+        IReadOnlyList<string>? supersedes = null,
         CancellationToken ct = default)
     {
         if (!Enum.TryParse<ArtifactType>(type, ignoreCase: true, out var artifactType) ||
-            artifactType is not (ArtifactType.Research or ArtifactType.Decision or ArtifactType.Constraint))
-            throw new ArgumentException("type must be one of: Research, Decision, Constraint.", nameof(type));
+            artifactType is not (ArtifactType.Research or ArtifactType.Decision or ArtifactType.Constraint or ArtifactType.Supersession))
+            throw new ArgumentException("type must be one of: Research, Decision, Constraint, Supersession.", nameof(type));
+
+        if (artifactType == ArtifactType.Supersession && (supersedes is null or { Count: 0 }))
+            throw new ArgumentException("supersedes must be non-empty for a Supersession artifact.", nameof(supersedes));
 
         var artifact = new ArtifactRef(
             $"KA-{Guid.NewGuid():N}",
@@ -33,12 +41,17 @@ public sealed class ArtifactCommandService(
             workUnitId,
             null,
             title,
-            body);
+            body,
+            InvalidatedByArtifactId: null,
+            Supersedes: supersedes);
 
         var recorded = await artifacts.RecordAsync(artifact, ct).ConfigureAwait(false);
 
         if (domainAgentTrigger is not null)
             await domainAgentTrigger.NotifyArtifactRecordedAsync(recorded, ct).ConfigureAwait(false);
+
+        if (planStaleness is not null)
+            await planStaleness.NotifySupersedingDecisionRecordedAsync(recorded, ct).ConfigureAwait(false);
 
         return recorded;
     }

@@ -41,6 +41,43 @@ public class DomainAgentConfigAndFeedbackRestTests
         Assert.Equal(DomainAgentRegistry.All.Select(d => d.Name), names);
     }
 
+    // plans/harness-hosting-architecture.md Phase C.1 (phase-c-implementation.md C1.c).
+    [Fact]
+    public async Task Executors_endpoint_lists_both_registered_executors_with_capabilities()
+    {
+        await using var app = BuildTestApp();
+        await app.StartAsync();
+        var client = app.GetTestClient();
+
+        var executors = await client.GetFromJsonAsync<List<JsonElement>>("/studio/executors");
+
+        Assert.NotNull(executors);
+        var byName = executors!.ToDictionary(e => e.GetProperty("name").GetString()!);
+        Assert.Contains("native", byName.Keys);
+        Assert.Contains("claude-code", byName.Keys);
+
+        var native = byName["native"];
+        Assert.Equal(JsonValueKind.Null, native.GetProperty("providerKey").ValueKind);
+        var nativeCaps = native.GetProperty("capabilities");
+        Assert.True(nativeCaps.GetProperty("supportsTurnTelemetry").GetBoolean());
+        Assert.False(nativeCaps.GetProperty("supportsResume").GetBoolean());
+        Assert.False(nativeCaps.GetProperty("supportsMcp").GetBoolean());
+        // plans/phase-d-implementation.md D1.a — native wraps PlannerAgentLoop for Mode==Plan now.
+        Assert.True(nativeCaps.GetProperty("supportsPlanningMode").GetBoolean());
+
+        var claudeCode = byName["claude-code"];
+        Assert.Equal("claude-cli", claudeCode.GetProperty("providerKey").GetString());
+        var claudeCaps = claudeCode.GetProperty("capabilities");
+        Assert.True(claudeCaps.GetProperty("supportsTurnTelemetry").GetBoolean());
+        Assert.True(claudeCaps.GetProperty("supportsResume").GetBoolean());
+        Assert.True(claudeCaps.GetProperty("supportsHooks").GetBoolean());
+        Assert.True(claudeCaps.GetProperty("supportsSubagents").GetBoolean());
+        Assert.True(claudeCaps.GetProperty("supportsMcp").GetBoolean());
+        // plans/phase-d-implementation.md D1.b — Mode==Plan is wired (write .workspace/plan.json,
+        // implement nothing).
+        Assert.True(claudeCaps.GetProperty("supportsPlanningMode").GetBoolean());
+    }
+
     [Fact]
     public async Task Options_round_trips_EnabledDomainAgents()
     {

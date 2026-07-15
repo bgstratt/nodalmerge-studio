@@ -70,6 +70,25 @@ public class RepositoryImportServiceTests : IDisposable
         Assert.Contains("a.txt", snapshot.TreeEntries!.Keys);
     }
 
+    // plans/harness-hosting-architecture.md Phase A.5 — .workspace is the harness contract
+    // directory, not source content. RepositoryImportService's CAS walk deliberately does not
+    // treat dotfiles as hidden (so .env seeds correctly) — WorkspacePathFilter.IgnoredDirNames must
+    // name .workspace explicitly, or it leaks into RepositorySnapshot and future branch seeds.
+    [Fact]
+    public async Task EnsureBootstrappedAsync_excludes_the_workspace_contract_directory_from_the_snapshot()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_repoPath, "a.txt"), "v1");
+        Directory.CreateDirectory(Path.Combine(_repoPath, ".workspace"));
+        await File.WriteAllTextAsync(Path.Combine(_repoPath, ".workspace", "manifest.json"), "{}");
+        var (import, snapshots) = Build();
+
+        await import.EnsureBootstrappedAsync(RepositoryId, _repoPath);
+
+        var snapshot = await snapshots.GetLatestAsync(RepositoryId);
+        Assert.Contains("a.txt", snapshot!.TreeEntries!.Keys);
+        Assert.DoesNotContain(snapshot.TreeEntries!.Keys, k => k.Contains(".workspace"));
+    }
+
     [Fact]
     public async Task EnsureBootstrappedAsync_called_again_after_a_disk_change_does_not_advance_the_snapshot()
     {

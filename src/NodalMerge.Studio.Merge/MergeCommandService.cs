@@ -281,7 +281,8 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
         // hits the BeforeMerge gate which runs the inline reviewer, so the reviewer fires here
         // rather than requiring the human to click "Apply". Fire-and-forget: errors surface in
         // the proposal status (gate throws InvalidOperationException which is swallowed here).
-        if (workUnitId is not null && policyGate is not null)
+        // WorkspaceOptions.AutoApplyOnPropose (default true) opts out — see its own comment.
+        if (workUnitId is not null && policyGate is not null && (workspaceOptions?.AutoApplyOnPropose ?? true))
         {
             var workUnits = serviceProvider.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
             if (workUnits is not null)

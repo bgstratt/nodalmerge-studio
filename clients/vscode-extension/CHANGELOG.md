@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.1.11 — 2026-07-14
+
+- **Claude CLI and API-key harnesses are at parity.** Any role — planner, worker,
+  or reviewer — can run through a Claude CLI (or Codex) Model Profile or an
+  API-key provider, with equivalent behavior across the whole pipeline:
+  execution, agent review, and reconciliation. A `claude-cli` Model Profile
+  carries the profile's model and uses ambient CLI login by default; storing a
+  key on that profile opts into key-based auth (e.g. for overages), and leaving
+  it blank keeps ambient auth.
+- **The orchestrator is now a deterministic service, not an LLM.** The per-goal
+  orchestration tail (fan-out, reconcile, reviewer enqueue, completion) runs as
+  a pure service with no orchestrator LLM calls — faster and free. The
+  Orchestrator role is now the goal's Default profile, and Reinvoke no longer
+  needs credentials re-supplied.
+- **Remove Key button.** Model & Agent Studio can now clear a profile's stored
+  API key: it deletes the secret, clears the setting, and evicts the running
+  host's cached credential so swapping an api-key profile to a CLI profile takes
+  effect immediately — no host restart. Previously the only way to remove a key
+  was editing `settings.json`, and the host kept the old key cached until
+  restart. The button is always available (works on a fresh add and right after
+  Store Key), and also clears an unsaved key you typed but changed your mind on.
+- **Agent review on any configured harness.** A reviewer agent can run on a CLI
+  provider or an API key. Under `Agent Approval` an approved real-repo proposal
+  auto-applies to merged; under `Hybrid` it keeps its human-override countdown
+  (an agent approval no longer merges instantly, so the override window works).
+  A reviewer that wrote its verdict from a nested directory it `cd`'d into is now
+  recovered instead of stalling the review.
+- **Clarifications are never invisible.** A blocking question raised by an agent
+  with no live session (or on a goal-only session) now surfaces via a synthetic
+  session fallback with threaded session ids, instead of silently disappearing.
+- **Fixes.**
+  - Planning-context isolation: `EngineeringState` facts no longer leak across
+    unrelated goals (which had been corrupting planners' view of the codebase).
+  - A configured worker/Execute-stage profile is now honored on single-file
+    ("atomic") goals — the no-plan fast path was reusing the planner's model.
+  - Merged multi-repo work units are evictable again — their branch directories
+    no longer leak (the apply-time snapshot vs. status-update ordering defeated
+    the old eviction check).
+  - CLI-provider goals with a blank key no longer park "awaiting credentials"
+    forever; restart credential reconstruction, previously-silent stalled runs,
+    and unread CLI stderr are all surfaced now.
+  - CLI harness conversation-log entries record the correct agent role (planner/
+    worker/reviewer) instead of always "worker".
+  - Fanned-out workers get an on-disk record of their own scoped task; goals no
+    longer read `Completed` before workspace review, and stale `DeadLettered`
+    roots repair themselves when work resumes underneath them.
+  - A live "Planning…" pulse badge on the decision tree, mirroring the reviewer
+    indicator.
+  - MCP tool-count in the docs corrected (117, not 66).
+
 ## 0.1.10 — 2026-07-08
 
 - **Pathways is now workspace history, not an agent task list.** The Pathways

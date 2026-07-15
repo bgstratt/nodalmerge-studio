@@ -8,66 +8,15 @@ using NodalMerge.Studio.Storage;
 namespace NodalMerge.Studio.Integration.Tests;
 
 /// <summary>
-/// Phase 5 slice 12b — Projection Diffing / stall detection. An orchestrator that keeps calling
-/// tools without ever changing the artifact chain gets dead-lettered with a "Stall:" reason well
-/// before MaxIterationsExceeded (25 iterations) would fire.
+/// Phase 5 slice 12b originally covered the orchestrator LLM loop's Projection-Diffing stall
+/// detector; plans/orchestrator-pure-service.md M2 deleted that loop (the deterministic
+/// GoalCoordinator cannot stall), so the "Stall:" dead-letter test went with it. What remains are
+/// the two regressions that must stay true under the coordinator: a healthy scripted goal run
+/// never dead-letters, and goal start always records a SpawnPlanner decision.
 /// </summary>
 [Trait("Category", "Integration")]
 public class ProjectionDiffingIntegrationTests
 {
-    [Fact]
-    public async Task Orchestrator_with_no_artifact_change_is_stall_dead_lettered()
-    {
-        // ExhaustingLlmHandler always calls the read-only nm_v1_workunit_get tool and never
-        // produces or changes an artifact — same fake used for the MaxIterationsExceeded path in
-        // DeadLetterIntegrationTests, but here it should trip the much earlier stall threshold.
-        var app = StudioWebApplication.Build(
-            [],
-            llmHttpClient: new HttpClient(new ExhaustingLlmHandler()),
-            configureServices: services => services.AddInMemoryStorage());
-
-        var orchestratorSvc = app.Services.GetRequiredService<IOrchestratorService>();
-        var agentControl    = app.Services.GetRequiredService<IAgentControlService>();
-        var agentRuntime    = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
-        var workUnits       = app.Services.GetRequiredService<IWorkUnitService>();
-        var deadLetter      = app.Services.GetRequiredService<IDeadLetterService>();
-
-        await agentRuntime.StartAsync(CancellationToken.None);
-        try
-        {
-            var wu = await orchestratorSvc.CreateWorkUnitAsync(
-                goal: "Goal that never produces an artifact",
-                owner: "integration-test");
-
-            await agentControl.SpawnAsync(
-                agentType: "orchestrator",
-                workUnitId: wu.WorkUnitId,
-                model: "fake-model",
-                baseUrl: "http://fake-llm",
-                apiKey: "fake-key");
-
-            DeadLetterEntry? entry = null;
-            var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
-            while (DateTimeOffset.UtcNow < deadline)
-            {
-                entry = await deadLetter.GetLatestForWorkUnitAsync(wu.WorkUnitId);
-                if (entry is not null) break;
-                await Task.Delay(100);
-            }
-
-            Assert.NotNull(entry);
-            Assert.StartsWith("Stall:", entry!.Reason, StringComparison.Ordinal);
-            Assert.True(entry.AttemptCount >= 1);
-
-            var unit = await workUnits.GetAsync(wu.WorkUnitId);
-            Assert.NotNull(unit);
-        }
-        finally
-        {
-            await agentRuntime.StopAsync(CancellationToken.None);
-        }
-    }
-
     [Fact]
     public async Task Orchestration_that_keeps_producing_artifacts_is_not_stall_dead_lettered()
     {

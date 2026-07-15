@@ -18,7 +18,7 @@ export function init(ctx) {
   var state = {
     decisionNodes: [], selectedNodeId: null, timelineArtifacts: [], timelineEvents: [], selectedSessionId: '',
     selectedNodeConversation: null, conversationPollTimer: null,
-    referenceFiles: [], reviewingWorkUnitIds: [],
+    referenceFiles: [], reviewingWorkUnitIds: [], planningWorkUnitIds: [],
     // Which node the Decision-tab auto-jump has already fired for (so re-selecting or navigating
     // back to a node doesn't re-jump away from whatever tab the user is reading), and the cached
     // full detail for whichever proposal is currently shown in the Decision tab.
@@ -134,13 +134,13 @@ export function init(ctx) {
       resumeParkedBtn.style.display = 'none';
     }
 
-    // No live agent and nothing parked — most commonly every child finished while the
-    // orchestrator's registration was cold after a restart, so it was never woken back up to
-    // notice and decide what's next (or finalize the goal). Mutually exclusive with the parked
-    // badge above by construction (server only sets orchestratorStalled when nothing is parked).
+    // No live agent, no queued work, and nothing parked — nothing is driving the goal forward.
+    // Mutually exclusive with the parked badge above by construction (server only sets
+    // orchestratorStalled when nothing is parked). The Reinvoke button runs the server's
+    // credential-free convergence sweep (plans/orchestrator-pure-service.md M2).
     var orchestratorStalled = !!(session && session.orchestratorStalled);
     if (orchestratorStalled) {
-      stalledBadge.title = 'No orchestrator is running for this goal and nothing is blocking it — it likely never got reinvoked after a Host restart. Click Reinvoke Orchestrator to wake it back up.';
+      stalledBadge.title = 'Nothing is driving this goal forward — no running agent, no queued work, and nothing blocked. Click Reinvoke to run a convergence sweep (it re-enqueues the planner if the goal never got one).';
       stalledBadge.style.display = '';
       reinvokeBtn.style.display = '';
     } else {
@@ -540,6 +540,11 @@ export function init(ctx) {
       // /studio/agents poll Activity Center already uses; disappears once the review concludes.
       if ((state.reviewingWorkUnitIds || []).indexOf(wu.workUnitId) !== -1) {
         html += '<div class="dn-meta"><span class="pulse"></span><span class="mono">Agent reviewing…</span></div>';
+      }
+      // Same live-indicator mechanism, for the planner's spawn — makes it visible when a Plan
+      // stage is actually running vs. a stalled goal sitting idle at the same "Plan" stage badge.
+      if ((state.planningWorkUnitIds || []).indexOf(wu.workUnitId) !== -1) {
+        html += '<div class="dn-meta"><span class="pulse"></span><span class="mono">Planning…</span></div>';
       }
       // Slice 22c — Experiment parent badges
       var children = (byParent[wu.workUnitId] || []);
@@ -1613,6 +1618,7 @@ export function init(ctx) {
       // rebuild, so only the tree's own subtree is checked.
       if (hasSelectionWithin($('gw-tree'))) { return; }
       state.reviewingWorkUnitIds = msg.reviewingWorkUnitIds || [];
+      state.planningWorkUnitIds = msg.planningWorkUnitIds || [];
       renderDecisionTree(msg.workUnits);
       return;
     }
