@@ -28,6 +28,8 @@
   <ItemGroup>
     <!-- docs/TREE_OBJECT_FORMAT.md golden vectors, consumed by CanonicalTreeSerializerVectorTests. -->
     <None Include="TestData\tree-format-vectors.v1.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- docs/STUDIO_ROOM_SCHEMA.md golden vectors, consumed by StudioRoomSchemaVectorTests. -->
+    <None Include="TestData\studio-room-schema-vectors.v1.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

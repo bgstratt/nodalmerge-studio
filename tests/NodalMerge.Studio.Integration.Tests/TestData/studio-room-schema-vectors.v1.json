@@ -1,0 +1,102 @@
+{
+  "$comment": "Golden vectors for docs/STUDIO_ROOM_SCHEMA.md. Consumers: StudioRoomSchemaVectorTests (NodalMerge.Studio.Integration.Tests). Frozen: these encodings are engine-map values, not content-addressed bytes, so vectors pin JSON *shape* stability (deserialize -> re-serialize -> structurally identical), not byte identity -- see the doc's Vectors section for why that's the correct bar here.",
+  "schema_version": 1,
+  "vectors": [
+    {
+      "id": "studio-map-work-unit",
+      "vector_kind": "studio-map-entry",
+      "comment": "Ordinary studio-node entry: namespace 'studio', key '{kind}/{entityId}', envelope value wrapping the payload as-is (not double-encoded).",
+      "namespace": "studio",
+      "node_kind": "studio/work-unit/v1",
+      "entity_id": "WU-42",
+      "key": "studio/work-unit/v1/WU-42",
+      "value": {
+        "v": 1,
+        "kind": "studio/work-unit/v1",
+        "payload": {
+          "workUnitId": "WU-42",
+          "goalId": "GOAL-7",
+          "repositoryId": "repo-3fa85f6457174562b3fc2c963f66afa6",
+          "branchName": "wu-42-add-retry",
+          "status": "InProgress",
+          "fileScope": ["src/lib/retry.ts", "src/lib/retry.test.ts"]
+        }
+      }
+    },
+    {
+      "id": "studio-map-entity-id-with-slash",
+      "vector_kind": "studio-map-entry",
+      "comment": "entityId containing '/' (base/{proposalId} -- a work unit's pre-attempt branch snapshot, per MergeProposal.cs's own comment). This is the case naive '{kind}/{entityId}' splitting gets wrong: the key must be parsed by matching the known StudioNodeKind prefix, not by any fixed slash position.",
+      "namespace": "studio",
+      "node_kind": "studio/merge-proposal/v1",
+      "entity_id": "base/MP-1",
+      "key": "studio/merge-proposal/v1/base/MP-1",
+      "value": {
+        "v": 1,
+        "kind": "studio/merge-proposal/v1",
+        "payload": {
+          "proposalId": "MP-1",
+          "sourceBranch": "wu-1-fix-flake",
+          "targetBranch": "main",
+          "goal": "Fix the SqliteConnection pool race in Integration.Tests",
+          "status": "Draft",
+          "treeHash": "4b825dc642cb6eb9a060e54bf8d69288fbee4904ab00000000000000000000"
+        }
+      }
+    },
+    {
+      "id": "repositories-map-entry",
+      "vector_kind": "repositories-map-entry",
+      "comment": "Workgroup-room repositories map entry (D1/D2): repoId key, repoRoomId = 'repo/{repoId}', two root SHAs (unrelated-history merge -> a set), one ssh remote normalized from scp-form.",
+      "namespace": "repositories",
+      "key": "repo-3fa85f6457174562b3fc2c963f66afa6",
+      "value": {
+        "v": 1,
+        "label": "nodalmerge-studio",
+        "repoRoomId": "repo/repo-3fa85f6457174562b3fc2c963f66afa6",
+        "hints": {
+          "rootShas": [
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+          ],
+          "remotes": [
+            "github.com/acme/nodalmerge-studio"
+          ]
+        }
+      },
+      "remote_normalization_examples": [
+        {
+          "raw": "git@github.com:acme/nodalmerge-studio.git",
+          "normalized": "github.com/acme/nodalmerge-studio",
+          "comment": "scp-form ssh shorthand"
+        },
+        {
+          "raw": "https://x-access-token:ghp_xxx@github.com/acme/nodalmerge-studio.git",
+          "normalized": "github.com/acme/nodalmerge-studio",
+          "comment": "https with embedded credentials"
+        },
+        {
+          "raw": "ssh://git@github.com:22/acme/nodalmerge-studio.git",
+          "normalized": "github.com/acme/nodalmerge-studio",
+          "comment": "explicit ssh URI form, default port 22 dropped"
+        },
+        {
+          "raw": "https://github.com/acme/nodalmerge-studio/",
+          "normalized": "github.com/acme/nodalmerge-studio",
+          "comment": "trailing slash, no .git suffix"
+        }
+      ]
+    },
+    {
+      "id": "pinned-reference-triple",
+      "vector_kind": "pinned-reference",
+      "comment": "Pinned cross-repo reference (D3): (repoId, generationId, path). path is repo-relative, forward slashes, no leading slash -- same rule as tree-object entry paths.",
+      "value": {
+        "v": 1,
+        "repoId": "repo-3fa85f6457174562b3fc2c963f66afa6",
+        "generationId": "gen-000123",
+        "path": "src/lib/util.ts"
+      }
+    }
+  ]
+}
