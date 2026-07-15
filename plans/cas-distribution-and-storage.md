@@ -22,15 +22,28 @@
       `Accept-Encoding: zstd` GET negotiation live-verified (12 KB payload → 47-byte
       frame on the wire). Note: Rust rejects PUT-with-`Content-Encoding` as 415, .NET
       falls through to 422 hash-mismatch — both contract-conformant ("MAY").
-- [ ] Phase 4 — Delegated S3 / S3-compatible backends with presigned URLs
-      — **sliced 2026-07-15** (4.1 contract → 4.2 Rust backend → 4.3 .NET direct link)
+- [x] Phase 4 — Delegated S3 / S3-compatible backends with presigned URLs
+      — **shipped 2026-07-15** (nodalmerge `blobExpansion`): 4.1 URL-resolution +
+      upload-confirm contract frozen in `BLOB_HTTP_SURFACE.md` + .NET endpoints +
+      vectors (`99c57aa6`; also fixed `blob_gc_sweep` deleting foreign/`.zst` bucket
+      objects), 4.2 `nodalmerge-server-s3` composition binary (Cargo-cycle-imposed,
+      `dev-server` precedent) + both endpoints + MinIO e2e (`cfd864db`), 4.3
+      `S3DirectBlobStoreProvider` + `RemoteBlobLinkAggregator` (3 links, single BLAKE3
+      verify gate) + client-side zstd via `Content-Encoding` object metadata — the
+      `.zst`-key half of layout §8 remains an unbuilt seam, clarified additively in
+      that doc (`537face8`). Extension-settings mapping onto
+      `NodalMerge:Storage:S3Direct:*` is a pending studio-side follow-up.
 - [ ] Phase 5 — GC & retention (the answer to snapshot flux)
       — **sliced 2026-07-15** (5.1 policy → 5.2 live-set v2 + local sweep → 5.3 server
       coordinator, which depends on 6.1/6.3)
 - [ ] Phase 6 — Multi-user: replication data plane, room topology & repository identity
-      — **sliced 2026-07-15** (6.0 schema freeze → 6.1a engine-backed studio store →
-      6.1b bidirectional wire → 6.2–6.5); decision recorded: Studio state rides the
-      engine DAG
+      — **sliced 2026-07-15**; decision recorded: Studio state rides the engine DAG.
+      **6.0 + 6.1a + 6.1b shipped 2026-07-15** (studio `cas-distribution-storage`):
+      6.0 `docs/STUDIO_ROOM_SCHEMA.md` freeze + vectors (`52ef883`), 6.1a engine-backed
+      `NodalMergeStudioNodeStore` + legacy migration (`de64155`; discovered the
+      live-maps↔sync-graph split — see Phase 6 note), 6.1b bidirectional
+      `RoomPeerClient` + retirement of the 30 s promoter tick (`a6085fc`) — two-host
+      replication integration test green. Remaining: 6.2–6.5.
 
 Baseline measurement (`tools/measure-cas-baseline.ps1`, run 2026-07-15): no heavy-use
 workspace exists yet — real repos so far are small, so the projected ~400 KB/generation
@@ -510,6 +523,21 @@ must replay canonical resolution into the live maps or Studio reads see nothing.
 cleaner engine-side fix (e.g. `ImportPack` hydrating maps directly) is a candidate
 engine improvement, deliberately NOT taken in 6.1a/6.1b to avoid an engine release +
 package repack mid-phase; revisit after 6.5.
+
+**Wire reality recorded by 6.1b (2026-07-15):** the server (both runtimes) never sends
+a literal `catch-up-pack` message type — catch-up and live broadcast both use the same
+`{"type":"pack"}` envelope (optional `from` distinguishes). `hello.frontier` is
+consumed as sync-graph tip ids; `welcome.missing` lists ids the server lacks.
+`RequestServerPack{known_ids}` diffs over *every id the graph ever held* (not
+ancestry-aware), so instead of known-ids bookkeeping, outbound push uses
+`HostCommand::MstDone{ids}` as a precise inclusion-based fetch of the just-promoted
+node (`CheckpointPromoted.node_id_hex`). Also fixed: `Build()` (embedded host) now
+registers `RoomPeerClient` — previously only `BuildPeer()` did, confirming the plan's
+"fix, not verify" call. Echo suppression is structural (inbound apply never touches
+the outbound seam). Seams added for later slices: `IStudioReplicationOutbound`
+(outbound notify) and `IStudioNodeStoreReplicationSink` (canonical→live-map replay
+after inbound apply); in-memory service caches still don't see mid-run inbound changes
+— that refresh story is 6.5 territory.
 
 **Decision (2026-07-15): Studio state rides the engine DAG — no parallel replication
 protocol.** `NodalMergeStudioNodeStore` is rewritten to write through the embedded
