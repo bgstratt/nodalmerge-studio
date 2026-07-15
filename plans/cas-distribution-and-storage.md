@@ -28,8 +28,9 @@
 
 Baseline measurement: `tools/measure-cas-baseline.ps1` (run against a real workspace
 data root and record the numbers here — not yet run against a heavy-use workspace).
-Local packages repacked at 0.2.0 (includes the new host surface); stale
-`nodalmerge-host/` fallback paths in studio fixed to `hosts/dotnet/`.
+Local packages bumped to **0.2.1** (includes the new host surface + real win-x64/
+linux-x64 native runtimes); stale `nodalmerge-host/` fallback paths in studio fixed
+to `hosts/dotnet/`.
 
 **Sequencing: this plan follows `harness-hosting-architecture.md`.** Nothing here blocks
 Phases A–E there; conversely, nothing there blocks Phase 1 here (which is local-only and
