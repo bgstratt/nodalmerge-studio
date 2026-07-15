@@ -23,8 +23,14 @@
       frame on the wire). Note: Rust rejects PUT-with-`Content-Encoding` as 415, .NET
       falls through to 422 hash-mismatch — both contract-conformant ("MAY").
 - [ ] Phase 4 — Delegated S3 / S3-compatible backends with presigned URLs
+      — **sliced 2026-07-15** (4.1 contract → 4.2 Rust backend → 4.3 .NET direct link)
 - [ ] Phase 5 — GC & retention (the answer to snapshot flux)
+      — **sliced 2026-07-15** (5.1 policy → 5.2 live-set v2 + local sweep → 5.3 server
+      coordinator, which depends on 6.1/6.3)
 - [ ] Phase 6 — Multi-user: replication data plane, room topology & repository identity
+      — **sliced 2026-07-15** (6.0 schema freeze → 6.1a engine-backed studio store →
+      6.1b bidirectional wire → 6.2–6.5); decision recorded: Studio state rides the
+      engine DAG
 
 Baseline measurement (`tools/measure-cas-baseline.ps1`, run 2026-07-15): no heavy-use
 workspace exists yet — real repos so far are small, so the projected ~400 KB/generation
@@ -360,26 +366,77 @@ Rollout source #2: offload bandwidth from the coordination server.
   self-identifying); server marks the asset `Uploading → Active` per the GC lifecycle
   after a HEAD confirms arrival (contract already in `delegated-storage-gc.md`).
 
-Acceptance: same cold-peer materialization test as 2.2 but bytes flow peer↔bucket, with
-only URL resolution touching the server; server-relay and s3 backends swap by config
-with no Studio-code change.
+**Verified seams (2026-07-15) — more exists than the table above implied:**
+
+- .NET host already exposes presign resolution over HTTP: `GET /sync/blob-url`
+  (`WebApplicationExtensions.HandleBlobUrlAsync` → `IBlobUrlResolverProvider`), backed
+  by `S3DelegatedBlobUrlResolverProvider` (delegate presign protocol v1, retry +
+  circuit breaker, per `BLOB_STORAGE_LAYOUT.md` §7).
+- Rust `server/s3-blobs` crate (`S3BlobStore : BlobPersistence`) is complete: Direct
+  (server mints presigned URLs from IAM creds) *and* Delegate auth modes,
+  `resolve_get_url`/`resolve_put_url`/`verify_uploaded` hooks, MinIO round-trip test.
+  The trait hooks are already consumed by the WS blob flow (`blob-redirect` /
+  `blob-uploaded`).
+- What does **not** exist: the server binary has no way to *select* the S3 backend
+  (`main.rs` wires only the disk store; the crate is never composed in), and the
+  frozen HTTP blob surface (`docs/BLOB_HTTP_SURFACE.md`) has no URL-resolution
+  endpoint — presign redirect today is WS-only.
+
+**Decision (2026-07-15): URL resolution is an explicit endpoint, not a 307 redirect on
+`GET/PUT /blobs/{hash}`.** Redirect-with-body semantics for PUT are fragile across HTTP
+clients (auth headers stripped cross-origin, bodies not reliably replayed on 307), and
+the chained provider's s3-direct link needs the URL as a value anyway (it GETs/PUTs the
+bucket itself). The relay endpoints stay exactly as frozen; URL resolution is a new
+optional capability — servers without a delegated backend answer 501, and clients fall
+back to the relay path. This also keeps relay-only deployments (Phase 2) conformant
+with zero change.
+
+| Slice | Content | Acceptance |
+|---|---|---|
+| 4.1 | **Contract: blob URL resolution over HTTP** — extend `BLOB_HTTP_SURFACE.md` (new §): `GET /blobs/{hash}/url?op=get\|put[&size=&contentType=]` → `{ "url": "...", "expiresAtUtc": "..." }`, plus `POST /blobs/{hash}/uploaded` (upload confirm → server HEADs bucket, flips `Uploading → Active` per `delegated-storage-gc.md`); 501 when the backend can't presign; 400 on malformed hash (same rule as existing endpoints). Align .NET's existing `/sync/blob-url` semantics to the frozen shape (keep the old route as alias or retire — implementer's call, note it in the doc). Freeze bucket object layout in the same §: objects live at `{Prefix}blake3/{hex}[.zst]`, hash of *uncompressed* bytes (v3 rule) — verify `nodalmerge-s3-blobs` key derivation matches and fix if not. Contract vectors added like the S2 ones | Vectors check in both repos' CI; .NET endpoint conforms (`ProviderHttpEndpointTests` extended); doc merged before any server code ships |
+| 4.2 | **Rust server: selectable S3 backend + URL endpoints** — config/CLI (`--blob-backend s3` + endpoint/bucket/prefix/creds via env) composes `Composite(DirPersistence nodes, S3BlobStore blobs)`; implement 4.1's two endpoints on the HTTP origin (`blob_http.rs`) over `resolve_get_url`/`resolve_put_url`/`verify_uploaded`; `HEAD /blobs/{hash}` answers via bucket HEAD; relay `GET/PUT /blobs/{hash}` keep working against the S3 backend (server-proxied — the escape hatch, not the fast path) | MinIO-backed integration test (same pattern as `minio_round_trip.rs`, gated/ignored in default CI): put via presigned URL + confirm → HEAD 200 → get-URL → direct GET returns bytes; disk-backend server answers 501 on `/url` |
+| 4.3 | **.NET s3-direct chain link + client-side zstd** — `S3DirectBlobStoreProvider : IBlobStoreProvider` (resolve URL via origin's 4.1 endpoint → GET/PUT the bucket directly → `POST .../uploaded` confirm after PUT); chain config grows `BlobStorage=ChainedRemote` → `local → server-relay → s3-direct` (order/selection by config; BLAKE3 verify stays only in `ChainedBlobStoreProvider`, unchanged); client-side zstd before presigned PUT (S3 won't compress for you — upload `.zst` bytes + metadata per layout §8, skip-heuristic reused from S3.1a) and decompress-before-verify on GET; `nodalmerge.blobOrigin.*` extension settings extended for the new link | Cold-peer materialization test from 2.2 rerun with bytes flowing peer↔MinIO and only URL resolution touching the server; corrupted bucket object rejected by the chain, never cached; server-relay ↔ s3 swap is config-only, no Studio code change |
 
 ## Phase 5 — GC & retention (the real answer to snapshot flux)
 
 Implements `nodalmerge/docs/delegated-storage-gc.md` for the Studio/repo domain. The
 contracts, lifecycle states, and safety rules are already frozen there; this phase
-supplies the missing product-side pieces:
+supplies the missing product-side pieces.
+
+**Verified seams (2026-07-15) — the machinery is mostly built; the policy is what's
+missing:**
+
+- `IWorkspaceCacheManager.GetLiveBlobHashesAsync` exists (Phase 1.3/2.3 work) with the
+  fail-closed contract already normative (throws on partial scan, never returns a
+  partial set; both `/studio/cache/gc` and the reconcile sweep honor it). Its current
+  liveness rule is **every stored snapshot + every op** — maximally safe, zero
+  reclamation. Phase 5 = replacing that rule with a retention policy.
+- `FileBlobGcCoordinator` (Host.Composition) already does mark → tombstone → grace →
+  delete over the file layout with dry-run/live modes and `MaxDeletesPerRun`.
+- Rust: `core/gc` crate (`GcCoordinator`, contracts, conformance + fault-injection
+  tests) exists; `server/src/gc_adapter.rs` runs it **MarkOnly with noop stores** as a
+  preflight — real deletion still flows through legacy `BlobPersistence::blob_gc_sweep`
+  (tombstone+grace semantics, tested in `blob_gc.rs`). 5.3's job is real inventory/run
+  stores, not a new coordinator.
+
+**Retention doctrine (append-only preserved):** aging out an intermediate generation
+reclaims its *unique blobs and tree objects*, never the snapshot node itself — the DAG
+row stays (AP-5, nodes are never rewritten or deleted by GC). Materializing a retired
+generation fails gracefully with "aged out per retention policy", which is honest: the
+history of *why* is permanent; the bytes of *what* are cache. (Node-store growth from
+tasks/messages/history is a separate, non-CAS retention question — explicitly out of
+scope here; see Out of scope.)
 
 | Slice | Content | Acceptance |
 |---|---|---|
-| 5.1 | **Studio `LiveHashSource`**: reachability = union of (a) trees+blobs reachable from **retained snapshot generations** (see policy), (b) generations referenced as any active work unit's branch seed / merge base, (c) admin pins. Fail closed on partial scan (per spec) | Live-set of a test repo matches hand-computed expectation; unreachable intermediate generation's unique blobs appear as sweep candidates |
-| 5.2 | **Retention policy (the knobs)**: pin **promoted/canonical** generations (those referenced by applied merge proposals + bootstrap) forever by default; intermediate generations on merged/abandoned branches age out after `RetainIntermediateDays` (default e.g. 30); anything referenced by an in-flight work unit is live regardless of age | Promoted-history materialization works after aggressive GC; a retired branch's unique intermediate blobs are reclaimed after grace |
-| 5.3 | **Coordinator wiring**: mark → soft sweep → hard sweep with grace window (24 h prod default), `max_deletes_per_run` ramp, run ledger — per spec; runs on the server (the only place with global reachability) | Dry-run/MarkOnly/SweepSoft/SweepHard staged rollout; re-referenced blob during grace returns to `Active` |
+| 5.1 | **Retention classification (pure policy, no behavior change)**: `ISnapshotRetentionPolicy` classifies every snapshot generation: **Pinned** (bootstrap generation; generations referenced by applied merge proposals — the `appliedSnapshotId` stamp from the apply-time resync; admin pins) — live forever by default; **Active** (referenced as any non-terminal work unit's branch seed or merge base, or the current head of any repo) — live regardless of age; **Intermediate** (everything else) — live until `RetainIntermediateDays` (default 30) past its branch reaching a terminal state. Ships as a service + tests only; nothing consumes it yet | Classification of a seeded test DAG matches hand-computed expectation for all three classes; an in-flight work unit's seed is Active even when >30 d old |
+| 5.2 | **`LiveHashSource` v2 + staged local sweep**: `GetLiveBlobHashesAsync` switches to union of (a) trees+blobs reachable from Pinned ∪ Active ∪ unexpired-Intermediate generations (via `GetReachableHashesAsync`, fail-closed unchanged), (b) op-referenced blobs, (c) pins; `/studio/cache/gc` + a scheduled background run gain staged modes (`DryRun` default → `MarkOnly` → `SweepSoft` → `SweepHard` by config), `MaxDeletesPerRun` ramp, and a run-ledger row per run (mode, counts, duration — queryable) | Promoted-history materialization works after aggressive GC; a retired branch's unique intermediate blobs are reclaimed after grace; a DryRun run mutates nothing and reports the same candidates the live run would delete |
+| 5.3 | **Server-side coordinator (depends on 6.1/6.3 — server must hold the replicated repo rooms)**: server `LiveHashSource` = walk studio snapshot nodes in every repo room it persists (same retention classes, computed from replicated proposal/work-unit nodes) + tree-object walk against its own CAS; replace `gc_adapter`'s noop stores with real `AssetInventoryStore`/`GcRunStore` (server store-backed); full mark → soft → hard with 24 h grace, `require_head_before_delete` during rollout; S3 backend deletes via `BlobObjectStore` HEAD/DELETE (no ListBucket in the nightly path) | Staged `DryRun`/`MarkOnly`/`SweepSoft`/`SweepHard` rollout works by flag; a blob re-referenced during grace returns to `Active` (extends `blob_gc.rs`); fail-closed: a room that fails to scan aborts the run with no deletes |
 
 Standing rule (from the harness plan, restated as normative here): **never build
 anything that assumes a pushed blob can be synchronously deleted.** Offline peers may
 hold references the server hasn't seen; grace windows + the merge-base liveness rule
-(5.1b) are the protection.
+(the Active class in 5.1) are the protection.
 
 This phase is what makes "we snapshot every change" permanently a non-problem: truth is
 the promoted history; everything else is cache with a TTL.
@@ -420,13 +477,48 @@ receivers discard. A connected peer's work units live in its own SQLite DB and n
 leave the process. The headless-peer guide's "replicated to the room" describes intent,
 not code. Slice 6.1 below is the largest single lift in this plan.
 
+**Deeper reality check (verified 2026-07-15) — the two-worlds finding, and why 6.1 is
+tractable:**
+
+- The .NET host's node store today holds **two parallel worlds** that never touch: (1)
+  Studio's own rows — `NodalMergeStudioNodeStore` writes `AcceptedNodeRecord`s with
+  payload kind `"studio"`, node IDs `studio:{kind}:{entityId}:{ticks}` (append-only,
+  LWW-by-latest-tick per entity), **directly** to `INodeStoreProvider`, bypassing the
+  engine entirely; (2) engine CRDT packs — `RuntimeDagPersistenceService` persists
+  payload-kind-`"pack"` rows and replays them into the engine on hydrate. The 30 s
+  promoter broadcasts engine packs — which contain none of Studio's rows. That is the
+  precise mechanism by which "work units never leave the process."
+- The primitives 6.1 needs all exist: engine `HostCommand::MapSet/MapGet/MapAll`
+  (LWW map writes that produce DAG nodes), `ImportPack`/`RequestServerPack{known_ids}`/
+  `InspectPack` (pack exchange + frontier), and the Rust server's WS room protocol
+  already accepts peer `{"type":"pack", nodes: b64}` messages with scope-filtered
+  rebroadcast and frontier catch-up (SpeechSlate-proven). Inbound pack persistence
+  (`PersistInboundPackAsync`) and hydrate-with-compaction already exist on the .NET
+  side.
+
+**Decision (2026-07-15): Studio state rides the engine DAG — no parallel replication
+protocol.** `NodalMergeStudioNodeStore` is rewritten to write through the embedded
+engine (`MapSet{namespace: "studio", key: "{kind}/{entityId}", value: payload
+envelope}`) and read back from engine state; SQLite keeps its existing role as the
+engine's pack persistence (already built). Rationale: the architectural model already
+says the replication plane carries rooms as CRDT packs — this is that doctrine applied,
+not a new invention; per-entity LWW is exactly the semantics the tick-suffixed rows
+have today; and the engine brings pack format, frontier catch-up, scope filtering,
+signing/policy, and MST sync for free, all of it already conformance-tested against the
+Rust server. The alternative (a bespoke studio-record pack protocol beside the engine)
+duplicates every one of those and leaves the two-worlds split in place permanently.
+Migration: one-shot import of legacy `"studio"`-kind rows into engine maps on first
+start (legacy rows stay readable, never rewritten — AP-5).
+
 | Slice | Content | Acceptance |
 |---|---|---|
-| 6.1 | **Replication data plane**: bidirectional pack exchange — outbound push of Studio DAG writes as packs at write time; inbound pack application into the Studio node store; real frontier-based catch-up on connect/reconnect. Retire the 30 s one-way checkpoint broadcast and `RoomPeerClient`'s log-and-discard handling | Work unit created on peer A appears in peer B's store without restart on either side; kill/reconnect B mid-stream → frontier catch-up converges; no polling promoter left in the path |
-| 6.2 | **Workgroup room + repository identity** (D1/D2): repositories map schema (repoId → label, repoRoomId, hints); mint-on-register; hint matching (root-SHA set + normalized remotes, fork tiebreak, one-time disambiguation prompt); binding cached in peer workspace storage; `RepositoryRegistryService` demoted to "local candidate pending workgroup registration" | Two peers with independent clones of the same repo converge on one repoId/room; a fork sharing root SHAs is **not** silently unified; shallow/no-remote clone degrades to prompt, not misfile |
-| 6.3 | **Room-per-repo** (D1/D3): repo-room provisioning at registration; Studio room usage keyed by repoId (delete the hardcoded `"studio"` constant); workgroup room carries cross-repo goal references; pinned `(repoId, generationId, path)` reference resolution via room + CAS | Peer joins only rooms of repos it materializes; a goal spanning two repos = two work units in two rooms + one workgroup goal node; a reference file resolves on a peer with no local clone of the referenced repo |
+| 6.0 | **Schema/encoding freeze (doc-first, like `TREE_OBJECT_FORMAT.md`)**: one note freezing (a) the studio-node→engine-map encoding: namespace/key scheme, payload envelope (payload JSON + kind + schema version), delete/tombstone encoding; (b) the workgroup-room repositories map: fields (`repoId → {label, repoRoomId, hints}`), hint formats (root-commit SHA **set**, remote-URL normalization rules), `repoRoomId` naming (`repo/{repoId}`); (c) the pinned cross-repo reference triple encoding `(repoId, generationId, path)`. Frozen before the first replicated write exists, because the first peer that writes one freezes it | Doc merged + review; encoding vectors (sample records → packed bytes) checked into the parity CI like the S2/S3 vectors |
+| 6.1a | **Studio store on the engine (local-only, no network)**: `NodalMergeStudioNodeStore` v2 writes via `IRuntimeCommandBridge` `MapSet` per 6.0's encoding and reads via `MapGet`/`MapAll` after hydration; one-shot legacy-row migration on first start; `InMemoryStudioNodeStore` stays for tests; the entity-LWW semantics of `ReadAllNodesAsync` (latest per entityId) preserved exactly | Full Studio test suite green with the engine-backed store; restart rehydrates all studio state from packs (existing hydrate path); a workspace created pre-6.1a upgrades in place and loses nothing |
+| 6.1b | **Bidirectional peer wire**: `RoomPeerClient` sends real frontier in `hello` (from engine tips), applies inbound `catch-up-pack`/`pack` via `ImportPack` + `PersistInboundPackAsync`, and pushes outbound delta packs at write time (delta via `RequestServerPack{known_ids: last-acked frontier}` or engine write events — implementer's choice, tested either way). Retire the 30 s `StudioCrdtSyncBackgroundService` promoter and the log-and-discard handler | Work unit created on peer A appears in peer B's store without restart on either side; kill/reconnect B mid-stream → frontier catch-up converges; no polling promoter left in the path |
+| 6.2 | **Workgroup room + repository identity** (D1/D2, encoding per 6.0): repositories map lives in the workgroup room; mint-on-register; hint matching (root-SHA set + normalized remotes, fork tiebreak, one-time disambiguation prompt); binding cached in peer workspace storage; `RepositoryRegistryService` demoted to "local candidate pending workgroup registration" | Two peers with independent clones of the same repo converge on one repoId/room; a fork sharing root SHAs is **not** silently unified; shallow/no-remote clone degrades to prompt, not misfile |
+| 6.3 | **Room-per-repo** (D1/D3): repo-room provisioning at registration; Studio room usage keyed by repoId (delete the hardcoded `"studio"` constant in `NodalMergeStudioNodeStore` + `RuntimeGraphPromoter`'s successor); peer joins/leaves repo rooms on materialize/retire; workgroup room carries cross-repo goal references; pinned `(repoId, generationId, path)` reference resolution via room + CAS | Peer joins only rooms of repos it materializes; a goal spanning two repos = two work units in two rooms + one workgroup goal node; a reference file resolves on a peer with no local clone of the referenced repo |
 | 6.4 | **Mode collapse in extension + peer** (D4): `Room` config section (`HostUri`, `Workgroup`); embedded runtime always includes the room client; `HostManager` always adopts/spawns *its* local peer and passes room config through — delete the `isLocalUri` adopt-guessing and the spawn-shadow-host fallback (third outcome: spawn *and* join room) | Standalone→connected is a settings change + restart with no other local behavior difference; a second developer's window joins the room instead of silently creating an isolated universe |
-| 6.5 | **The multi-user milestone** (previous 6.1–6.3): connected-mode visibility; cold-peer branch materialization via room + chained provider (2.2/4) + local harness; cross-peer `ForceSyncAsync` divergence reconciling through the recorded 3-way base (catch-up merge, not rebase) | Two laptops + one server: work on A appears in B's extension; cold peer B: goal visible → materialize scoped branch → edit → harvest → proposal replicates back; divergent edits on A and B both land and reconcile |
+| 6.5 | **The multi-user milestone**: connected-mode visibility; cold-peer branch materialization via room + chained provider (2.2/4) + local harness; cross-peer `ForceSyncAsync` divergence reconciling through the recorded 3-way base (catch-up merge, not rebase) | Two laptops + one server: work on A appears in B's extension; cold peer B: goal visible → materialize scoped branch → edit → harvest → proposal replicates back; divergent edits on A and B both land and reconcile |
 
 **Explicit boundary:** promotion-ordering authority over the room protocol and
 per-*user/peer* attribution are harness-plan future-state gaps #2 and #3 — *not* this
@@ -437,24 +529,32 @@ is until that design happens.
 ## Rollout order & sizing
 
 ```
-Phase 1 (tree sharing)   — local-only, ship anytime; 1.1 is the urgent half
-Phase 2 (server relay)   — after standalone server exists; the core unlock
-Phase 3 (zstd)           — rides along with 2.1's server store
-Phase 4 (delegated S3)   — when server bandwidth says so
-Phase 5 (GC/retention)   — before any long-lived multi-user deployment
-Phase 6 (multi-user)     — 6.1–6.4 don't depend on 2 and can start early;
-                           the 6.5 milestone needs 2; 4/5 harden it
+Phase 1 (tree sharing)   — shipped 2026-07-15
+Phase 2 (server relay)   — shipped 2026-07-15
+Phase 3 (zstd)           — shipped 2026-07-15
+Phase 4 (delegated S3)   — independent; 4.1 → 4.2 → 4.3 strictly in order
+Phase 5 (GC/retention)   — 5.1 → 5.2 anytime (Studio-side, immediately useful
+                           locally); 5.3 REQUIRES 6.1/6.3 (the server can only
+                           compute reachability over rooms it actually holds)
+Phase 6 (multi-user)     — 6.0 → 6.1a → 6.1b is the critical path; 6.2/6.3
+                           follow 6.1a; 6.4 anytime after 6.1b; 6.5 last
 ```
+
+Recommended interleaving for the 4–6 push (dependency-honest, keeps every slice
+independently landable): **4.1 → 4.2 → 4.3** and **6.0 → 6.1a → 6.1b** can proceed as
+two parallel tracks (different repos/layers, no shared files); then **5.1 → 5.2**
+(Studio-side retention, wants quiet ground after 6.1a's store rewrite); then
+**6.2 → 6.3 → 6.4**; then **5.3** (needs replicated rooms); then **6.5**.
 
 | Phase | Slices | Ships alone? |
 |---|---|---|
-| 1 | 3 | Yes — immediate metadata relief |
-| 2 | 4 | Yes — remote materialization works end-to-end |
-| 3 | 1 | Yes |
-| 4 | ~2 | Yes |
-| 5 | 3 | Yes |
-| 6 | 5 | 6.1–6.4 individually; 6.5 is the multi-user milestone |
-| **Total** | **~18** | comparable to the harness plan |
+| 1 | 3 (shipped) | Yes — immediate metadata relief |
+| 2 | 4 (shipped) | Yes — remote materialization works end-to-end |
+| 3 | 1 (shipped) | Yes |
+| 4 | 3 | Yes |
+| 5 | 3 | 5.1/5.2 yes; 5.3 after 6.1/6.3 |
+| 6 | 7 (6.0, 6.1a, 6.1b, 6.2–6.5) | 6.0–6.4 individually; 6.5 is the multi-user milestone |
+| **Total** | **21** | comparable to the harness plan |
 
 ## Out of scope / not doing
 
@@ -472,22 +572,27 @@ Phase 6 (multi-user)     — 6.1–6.4 don't depend on 2 and can start early;
   accepted model; watcher is opportunistic later.
 - **Thin-client extension mode** (extension → remote server without a local peer) —
   possible someday as a view, not the design center.
+- **Node-store retention for non-CAS node kinds** (tasks, messages, execution events,
+  history — the bulk of real node-store growth per the 2026-07-15 baseline) — a real
+  problem, but a *replication-plane compaction* question, not a CAS/blob one; Phase 5
+  reclaims blob/tree bytes only and never deletes DAG nodes. Design it against the
+  engine's existing pack-compaction machinery when it hurts.
 
-## Open items before starting
+## Open items before starting Phases 4–6
 
-- Confirm the Rust server's existing blob HTTP surface (fixtures/tests exist —
-  `blob_flow_request_upload_and_fetch.json`, `blob_layout_interop.rs`) vs. what 2.1
-  needs; decide reuse vs. thin new endpoint. Single verification task.
-- Canonical tree-object serialization format (1.1/1.2): entry ordering, dir/file
-  markers, empty-dir stance — write the format note *before* the first blob is emitted
-  (it's frozen the moment one peer writes one; treat like the layout vectors).
-- Workgroup-room schema note (6.2): repositories-map fields, hint formats (root-commit
-  SHA set; remote-URL normalization rules), and the pinned-reference triple encoding —
-  same freeze rule: written before the first workgroup room exists, because the first
-  peer that writes one freezes it.
-- Where `ChainedBlobStoreProvider` lives: `NodalMerge.Host.Composition` (alongside
-  `FileBlobStoreProvider`, preferred — any host benefits) vs. Studio-side. Decide at
-  2.2.
-- Baseline measurement task (cheap, do first): count blobs / bytes / snapshot-node
-  bytes in a real workspace after a heavy goal run — gives the before-numbers Phases
-  1/3/5 get judged against.
+(The Phase 1–3 open items — tree format note, blob-surface confirmation, provider
+placement, baseline — are all resolved/shipped as of 2026-07-15.)
+
+- ~~Workgroup-room schema note~~ — promoted to slice 6.0 (now also carries the
+  studio-node→engine-map encoding, which 6.1a needs first).
+- 4.1 decision recorded above: URL resolution is an explicit endpoint, not a redirect.
+- 6.1 decision recorded above: Studio state rides the engine DAG (no parallel
+  replication protocol).
+- Small verification for 4.1's implementer: confirm `nodalmerge-s3-blobs` key
+  derivation (`path_prefix` + hash) against `BLOB_STORAGE_LAYOUT.md` §3/§8 before
+  freezing the bucket-layout §; fix the crate if they diverge (it predates the parity
+  refactor).
+- For 5.1's implementer: confirm the exact field carrying the applied-proposal →
+  snapshot link (`appliedSnapshotId` stamp written by the apply-time resync — see
+  `WorkspaceCacheManager`'s eviction helper comments) and the bootstrap-generation
+  marker before coding the Pinned class.
