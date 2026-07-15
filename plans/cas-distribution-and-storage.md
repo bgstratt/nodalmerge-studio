@@ -2,13 +2,34 @@
 
 ## Status
 
-- [ ] Phase 1 — Tree structural sharing (metadata fix; local-only, no server dependency)
-- [ ] Phase 2 — Remote blob wiring: server-relay endpoint + chained provider (push on
-      import/writeback, resolve-fetch on materialize)
-- [ ] Phase 3 — zstd compression at rest
+- [x] Phase 1 — Tree structural sharing (metadata fix; local-only, no server dependency)
+      — **shipped 2026-07-15** (branch `cas-distribution-storage`): 1.1 tree-as-blob +
+      `ISnapshotTreeResolver` (format frozen in `docs/TREE_OBJECT_FORMAT.md` + vectors),
+      1.2 v2 per-directory sharing (1-leaf change → ≤ depth+1 new tree blobs, verified),
+      1.3 `GetReachableHashesAsync` fail-closed reachability (the Phase-5 seam).
+- [x] Phase 2 — Remote blob wiring — **shipped 2026-07-15** (nodalmerge branch
+      `blobExpansion` + studio): 2.1 `GET/HEAD/PUT /blobs/{hash}` on **both** hosts in
+      parity (contract frozen in nodalmerge `docs/BLOB_HTTP_SURFACE.md` + vectors; the
+      Rust server previously had NO HTTP blob surface — WS-only — so 2.1 built it),
+      2.2 `ChainedBlobStoreProvider` (`BlobStorage=ChainedRemote`, BLAKE3
+      verify-on-fetch in the chain only, extension `nodalmerge.blobOrigin.*` settings),
+      2.3 reconcile sweep (`POST /studio/cas/reconcile`, startup one-shot,
+      `nodalmerge.reconcileBlobOrigin`), 2.4 scope-pruned resolve + prefetch
+      (`POST /studio/repositories/{id}/prefetch`).
+- [x] Phase 3 — zstd compression at rest — **shipped 2026-07-15**: layout contract v3
+      (`BLOB_STORAGE_LAYOUT.md` §8, `blake3/<hex>.zst`, hash always of uncompressed
+      bytes) on both runtimes; server default ON (level 3), local default OFF;
+      `Accept-Encoding: zstd` GET negotiation live-verified (12 KB payload → 47-byte
+      frame on the wire). Note: Rust rejects PUT-with-`Content-Encoding` as 415, .NET
+      falls through to 422 hash-mismatch — both contract-conformant ("MAY").
 - [ ] Phase 4 — Delegated S3 / S3-compatible backends with presigned URLs
 - [ ] Phase 5 — GC & retention (the answer to snapshot flux)
 - [ ] Phase 6 — Multi-user: replication data plane, room topology & repository identity
+
+Baseline measurement: `tools/measure-cas-baseline.ps1` (run against a real workspace
+data root and record the numbers here — not yet run against a heavy-use workspace).
+Local packages repacked at 0.2.0 (includes the new host surface); stale
+`nodalmerge-host/` fallback paths in studio fixed to `hosts/dotnet/`.
 
 **Sequencing: this plan follows `harness-hosting-architecture.md`.** Nothing here blocks
 Phases A–E there; conversely, nothing there blocks Phase 1 here (which is local-only and
