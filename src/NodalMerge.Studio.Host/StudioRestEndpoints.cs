@@ -4752,6 +4752,11 @@ public static class StudioRestEndpoints
     // own no-op stance.
     private sealed record PrefetchScopeBody(IReadOnlyList<string>? FileScope = null);
 
+    // Slice 6.2 — disambiguation resolve body. ChosenRepoId is one of the candidates offered by the
+    // identity GET below, or null/"register-new" to mint a fresh workgroup entry instead (see
+    // IRepositoryRegistryService.ResolveDisambiguationAsync's own doc comment).
+    private sealed record ResolveIdentityDisambiguationBody(string? ChosenRepoId = null);
+
     private static void MapRepositoryEndpoints(WebApplication app)
     {
         // List known repositories (mirrors nm_v1_repository_list) — used by the VS Code extension's
@@ -4857,6 +4862,65 @@ public static class StudioRestEndpoints
         {
             var fetched = await prefetch.PrefetchScopeAsync(repositoryId, body?.FileScope, ct).ConfigureAwait(false);
             return Results.Ok(new { fetched });
+        });
+
+        // Slice 6.2 — workgroup identity disambiguation surface (docs/STUDIO_ROOM_SCHEMA.md (b),
+        // D1/D2). REST-only per the slice's brief: VS Code UI wiring is explicitly out of scope
+        // (6.4/6.5), this is the acceptance boundary. Reports the current binding outcome for a
+        // registered repository — bound (workgroupRepoId set), pending disambiguation (candidates
+        // offered), or neither yet (workgroup services not wired for this host).
+        app.MapGet("/studio/repositories/{repositoryId}/identity", async (
+            string repositoryId,
+            IRepositoryRegistryService repositories,
+            CancellationToken ct) =>
+        {
+            var repository = await repositories.GetAsync(repositoryId, ct).ConfigureAwait(false);
+            if (repository is null)
+                return Results.NotFound(new { error = $"Repository '{repositoryId}' was not found." });
+
+            return Results.Ok(new
+            {
+                repositoryId = repository.RepositoryId,
+                workgroupRepoId = repository.WorkgroupRepoId,
+                pendingDisambiguation = repository.PendingDisambiguation is null
+                    ? null
+                    : new
+                    {
+                        candidates = repository.PendingDisambiguation.Candidates.Select(c => new
+                        {
+                            repoId = c.RepoId,
+                            label = c.Label,
+                            hints = new { rootShas = c.Hints.RootShas, remotes = c.Hints.Remotes }
+                        })
+                    }
+            });
+        });
+
+        // Resolves a pending disambiguation: body.ChosenRepoId must be one of the offered
+        // candidates' repoId, or null/"register-new" to mint a fresh workgroup entry. A no-op
+        // (200, unchanged) if the repository has no pending disambiguation.
+        app.MapPost("/studio/repositories/{repositoryId}/identity/resolve", async (
+            string repositoryId,
+            ResolveIdentityDisambiguationBody? body,
+            IRepositoryRegistryService repositories,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var resolved = await repositories.ResolveDisambiguationAsync(repositoryId, body?.ChosenRepoId, ct).ConfigureAwait(false);
+                if (resolved is null)
+                    return Results.NotFound(new { error = $"Repository '{repositoryId}' was not found." });
+
+                return Results.Ok(new { repositoryId = resolved.RepositoryId, workgroupRepoId = resolved.WorkgroupRepoId });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
         });
     }
 

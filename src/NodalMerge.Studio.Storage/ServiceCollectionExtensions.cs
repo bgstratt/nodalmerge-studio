@@ -23,6 +23,12 @@ public static class ServiceCollectionExtensions
         // room_maps/sync-graph split to bridge, so callers must resolve this as optional.
         services.AddSingleton<IStudioNodeStoreReplicationSink>(sp =>
             (NodalMergeStudioNodeStore)sp.GetRequiredService<IStudioNodeStore>());
+        // Slice 6.2 — workgroup room repositories map (docs/STUDIO_ROOM_SCHEMA.md (b)), engine-backed
+        // like IStudioNodeStore above but a separate room ("workgroup") and namespace
+        // ("repositories") — see WorkgroupRepositoryDirectory's own class comment for what
+        // upstream replication does/doesn't do yet.
+        services.AddSingleton<IWorkgroupRepositoryDirectory, WorkgroupRepositoryDirectory>();
+        services.AddSingleton<IRepositoryIdentityHintsService, GitRepositoryIdentityHintsService>();
         services.AddSingleton<IBranchService, NodalMergeBranchService>();
         services.AddSingleton<IReplayService, ReplayService>();
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
@@ -40,6 +46,11 @@ public static class ServiceCollectionExtensions
         // constructs NodalMergeStudioNodeStore-shaped test doubles directly still needs it resolvable.
         services.AddSingleton<IStudioReplicationOutbound>(NoopStudioReplicationOutbound.Instance);
         services.AddSingleton<IStudioNodeStore, InMemoryStudioNodeStore>();
+        // Slice 6.2 — in-memory workgroup directory (no engine bridge needed here, same reasoning
+        // as InMemoryStudioNodeStore above); GitRepositoryIdentityHintsService itself has no engine
+        // dependency at all (LibGit2Sharp only), so it's the same registration in both DI paths.
+        services.AddSingleton<IWorkgroupRepositoryDirectory>(new InMemoryWorkgroupRepositoryDirectory());
+        services.AddSingleton<IRepositoryIdentityHintsService, GitRepositoryIdentityHintsService>();
         services.AddSingleton<IBranchService, InMemoryBranchService>();
         services.AddSingleton<IReplayService, ReplayService>();
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();

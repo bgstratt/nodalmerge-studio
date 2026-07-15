@@ -178,6 +178,8 @@ public class InMemoryMergeServiceTests
             Task.FromResult(repoId == repositoryId ? new RepositoryV1(repositoryId, path, null, DateTimeOffset.UtcNow) : null);
         public Task<IReadOnlyList<string>> FilterUnregisteredAsync(IReadOnlyList<string> paths, CancellationToken ct = default) =>
             throw new NotSupportedException();
+        public Task<RepositoryV1?> ResolveDisambiguationAsync(string repoId, string? chosenRepoId, CancellationToken ct = default) =>
+            throw new NotSupportedException();
     }
 
     private static (InMemoryMergeService Svc, RecordingEventStream Events, RecordingWorkUnitService WorkUnits, ArtifactLineageService Artifacts) BuildWithLifecycle()

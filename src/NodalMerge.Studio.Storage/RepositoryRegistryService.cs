@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 
@@ -9,6 +10,17 @@ namespace NodalMerge.Studio.Storage;
 public interface IRepositoryRegistryService
 {
     Task<RepositoryV1> RegisterAsync(string path, string? label, CancellationToken ct = default);
+
+    /// <summary>
+    /// Slice 6.2 — resolves a pending workgroup-identity disambiguation
+    /// (<see cref="RepositoryV1.PendingDisambiguation"/>) for an already-registered repository.
+    /// <paramref name="chosenRepoId"/> must be one of the offered candidates' RepoId, or null/
+    /// "register-new" to mint a fresh workgroup entry instead (see
+    /// <see cref="IWorkgroupRepositoryDirectory.RegisterAsync"/>'s preferred-id continuity rule).
+    /// Returns null if <paramref name="repositoryId"/> isn't registered; is a no-op (returns the
+    /// repository unchanged) if it has no pending disambiguation.
+    /// </summary>
+    Task<RepositoryV1?> ResolveDisambiguationAsync(string repositoryId, string? chosenRepoId, CancellationToken ct = default);
 
     /// <summary>
     /// Creates a fresh repository at <paramref name="path"/> (creating the directory if needed),
@@ -53,11 +65,27 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
     private readonly ConcurrentDictionary<string, RepositoryV1> _repositories = new();
     private readonly IStudioNodeStore _nodeStore;
     private readonly IWorkspaceRegistryService _workspaces;
+    // Slice 6.2 — nullable/optional (not GetRequiredService-shaped): every real DI composition
+    // registers both (see ServiceCollectionExtensions), but SnapshotRetentionPolicyTests constructs
+    // this class directly with just the two required collaborators above, and that construction
+    // must keep compiling/working exactly as before 6.2 — workgroup binding degrades to "not
+    // attempted" (WorkgroupRepoId stays null) rather than becoming a hard dependency.
+    private readonly IRepositoryIdentityHintsService? _identityHints;
+    private readonly IWorkgroupRepositoryDirectory? _workgroupDirectory;
+    private readonly ILogger<RepositoryRegistryService>? _logger;
 
-    public RepositoryRegistryService(IStudioNodeStore nodeStore, IWorkspaceRegistryService workspaces)
+    public RepositoryRegistryService(
+        IStudioNodeStore nodeStore,
+        IWorkspaceRegistryService workspaces,
+        IRepositoryIdentityHintsService? identityHints = null,
+        IWorkgroupRepositoryDirectory? workgroupDirectory = null,
+        ILogger<RepositoryRegistryService>? logger = null)
     {
         _nodeStore = nodeStore;
         _workspaces = workspaces;
+        _identityHints = identityHints;
+        _workgroupDirectory = workgroupDirectory;
+        _logger = logger;
     }
 
     public async Task<RepositoryV1> RegisterAsync(string path, string? label, CancellationToken ct = default)
@@ -76,6 +104,12 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
             Label: label,
             RegisteredAt: DateTimeOffset.UtcNow);
 
+        // Slice 6.2 (docs/STUDIO_ROOM_SCHEMA.md (b), D1/D2) — bind this local candidate to the
+        // workgroup repositories map. RepositoryId above stays this repo's permanent local-candidate
+        // identity regardless of outcome (see RepositoryV1's own comment); only WorkgroupRepoId/
+        // PendingDisambiguation change here.
+        repository = await BindToWorkgroupAsync(repository, ct).ConfigureAwait(false);
+
         _repositories[repository.RepositoryId] = repository;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.RepositoryV1, repository.RepositoryId,
@@ -87,6 +121,111 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
         await _workspaces.AttachRepositoryAsync(repository.RepositoryId, ct).ConfigureAwait(false);
 
         return repository;
+    }
+
+    // Slice 6.2 binding flow (docs/STUDIO_ROOM_SCHEMA.md (b) "Matching flow", D2): compute hints
+    // for the local path, ask the workgroup directory to match, and record the outcome. Never
+    // fails registration itself — a hint-computation or matching error degrades to "no workgroup
+    // binding yet" (WorkgroupRepoId stays null, no PendingDisambiguation) rather than blocking
+    // RegisterAsync, since pre-6.2 behavior (register always succeeds) must keep working when the
+    // workgroup services aren't wired or something in the git/engine path throws.
+    private async Task<RepositoryV1> BindToWorkgroupAsync(RepositoryV1 repository, CancellationToken ct)
+    {
+        if (_identityHints is null || _workgroupDirectory is null)
+            return repository;
+
+        try
+        {
+            var hints = await _identityHints.ComputeAsync(repository.Path, ct).ConfigureAwait(false);
+            var match = await _workgroupDirectory.MatchAsync(hints, ct).ConfigureAwait(false);
+
+            switch (match)
+            {
+                case RepositoryMatchResult.Matched matched:
+                    return repository with { WorkgroupRepoId = matched.Entry.RepoId, PendingDisambiguation = null };
+
+                case RepositoryMatchResult.NoMatch:
+                {
+                    var registered = await RegisterWorkgroupEntryAsync(repository, hints, ct).ConfigureAwait(false);
+                    return repository with { WorkgroupRepoId = registered.RepoId, PendingDisambiguation = null };
+                }
+
+                // Degenerate sub-case of NeedsDisambiguation: zero candidates to disambiguate
+                // against (the workgroup map has nothing registered yet, or nothing else shares
+                // any signal). Per D2/6.2's preferred-id continuity rule this is the single-user/
+                // standalone-first-run case — surfacing a prompt with nothing to choose between
+                // would be pure friction, so this mints (reusing RepositoryId as the preferred
+                // workgroup id) exactly like NoMatch.
+                case RepositoryMatchResult.NeedsDisambiguation { Candidates.Count: 0 }:
+                {
+                    var registered = await RegisterWorkgroupEntryAsync(repository, hints, ct).ConfigureAwait(false);
+                    return repository with { WorkgroupRepoId = registered.RepoId, PendingDisambiguation = null };
+                }
+
+                case RepositoryMatchResult.NeedsDisambiguation needsDisambiguation:
+                    return repository with
+                    {
+                        WorkgroupRepoId = null,
+                        PendingDisambiguation = new RepositoryDisambiguationPendingV1(
+                            needsDisambiguation.Candidates
+                                .Select(c => new RepositoryDisambiguationCandidateV1(c.RepoId, c.Label, c.Hints))
+                                .ToList())
+                    };
+
+                default:
+                    return repository;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(
+                ex,
+                "workgroup repository binding failed for '{RepositoryId}' at '{Path}' — registering without a workgroup binding",
+                repository.RepositoryId, repository.Path);
+            return repository;
+        }
+    }
+
+    private Task<WorkgroupRepositoryEntry> RegisterWorkgroupEntryAsync(RepositoryV1 repository, RepositoryIdentityHints hints, CancellationToken ct) =>
+        _workgroupDirectory!.RegisterAsync(repository.Label, hints, preferredRepoId: repository.RepositoryId, ct);
+
+    public async Task<RepositoryV1?> ResolveDisambiguationAsync(string repositoryId, string? chosenRepoId, CancellationToken ct = default)
+    {
+        if (!_repositories.TryGetValue(repositoryId, out var repository))
+            return null;
+
+        if (repository.PendingDisambiguation is null)
+            return repository;
+
+        RepositoryV1 resolved;
+        if (chosenRepoId is null || string.Equals(chosenRepoId, "register-new", StringComparison.OrdinalIgnoreCase))
+        {
+            if (_workgroupDirectory is null)
+                throw new InvalidOperationException("No workgroup repository directory is configured — cannot resolve a disambiguation.");
+
+            var hints = _identityHints is not null
+                ? await _identityHints.ComputeAsync(repository.Path, ct).ConfigureAwait(false)
+                : RepositoryIdentityHints.Empty;
+            var registered = await RegisterWorkgroupEntryAsync(repository, hints, ct).ConfigureAwait(false);
+            resolved = repository with { WorkgroupRepoId = registered.RepoId, PendingDisambiguation = null };
+        }
+        else
+        {
+            // Defends against binding to an arbitrary repoId a client hallucinated — must be one of
+            // the candidates this repository was actually offered.
+            var candidateIds = repository.PendingDisambiguation.Candidates
+                .Select(c => c.RepoId)
+                .ToHashSet(StringComparer.Ordinal);
+            if (!candidateIds.Contains(chosenRepoId))
+                throw new ArgumentException($"'{chosenRepoId}' was not one of the offered disambiguation candidates for '{repositoryId}'.");
+
+            resolved = repository with { WorkgroupRepoId = chosenRepoId, PendingDisambiguation = null };
+        }
+
+        _repositories[repositoryId] = resolved;
+        await _nodeStore.WriteNodeAsync(
+            StudioNodeKind.RepositoryV1, repositoryId, JsonSerializer.Serialize(resolved), ct).ConfigureAwait(false);
+        return resolved;
     }
 
     public async Task<RepositoryV1> CreateAsync(string path, string? label, CancellationToken ct = default)

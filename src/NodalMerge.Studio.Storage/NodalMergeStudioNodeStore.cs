@@ -53,6 +53,13 @@ namespace NodalMerge.Studio.Storage;
 // key inside the "studio" namespace, so it can never collide with the kind keyspace and needs no
 // special-casing in the (a) key-parsing rule) and are never rewritten or deleted (AP-5): a fallback
 // read path against the legacy rows covers anything not present in the engine map.
+//
+// Slice 6.2: the low-level room_maps/sync-graph bridging (promote-then-persist, replay-after-
+// hydrate, outbound notify) is now EngineRoomMap, extracted from this class's original private
+// methods so the workgroup room's repositories map (WorkgroupRepositoryDirectory) can reuse it
+// instead of re-deriving the same engine quirks. This class keeps everything studio-specific: the
+// "studio"/"studio-meta" two-namespace-in-one-room split (the namespace-resolver lambda passed to
+// EngineRoomMap's constructor below), the legacy-row migration, and the legacy fallback read path.
 public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeStoreReplicationSink
 {
     // Engine room every StudioNodeKind is multiplexed into (unchanged from pre-6.1a — room-per-repo
@@ -88,10 +95,8 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         .OrderByDescending(k => k.Length)
         .ToArray();
 
-    private readonly IRuntimeCommandBridge _bridge;
-    private readonly RuntimeDagPersistenceService _dagPersistence;
+    private readonly EngineRoomMap _roomMap;
     private readonly INodeStoreProvider _legacyNodeStore;
-    private readonly IStudioReplicationOutbound _replicationOutbound;
     private readonly ILogger<NodalMergeStudioNodeStore> _logger;
 
     // Guards one-shot hydrate + legacy migration so every public method can call
@@ -108,10 +113,17 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         IStudioReplicationOutbound replicationOutbound,
         ILogger<NodalMergeStudioNodeStore> logger)
     {
-        _bridge = bridge;
-        _dagPersistence = dagPersistence;
+        // ReplayNamespaceFor: canonical-resolution entries carry no namespace of their own (see
+        // ReplayCanonicalResolutionIntoLiveMap's original comment, now on EngineRoomMap) — this room
+        // is the sole writer into two namespaces ("studio" and "studio-meta"), and the only key it
+        // ever puts outside MapNamespace is the single well-known MigrationMarkerKey literal, which
+        // can never collide with a "{kind}/{entityId}" key (every StudioNodeKind constant starts
+        // with "studio/", so BuildKey's output never equals the bare "migrated-v1" literal).
+        _roomMap = new EngineRoomMap(
+            StudioRoomId,
+            key => string.Equals(key, MigrationMarkerKey, StringComparison.Ordinal) ? MetaNamespace : MapNamespace,
+            bridge, dagPersistence, replicationOutbound, logger);
         _legacyNodeStore = legacyNodeStore;
-        _replicationOutbound = replicationOutbound;
         _logger = logger;
     }
 
@@ -122,7 +134,9 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         var key = BuildKey(kind, entityId);
 
         using var payloadDoc = JsonDocument.Parse(payloadJson);
-        var status = SubmitMapSet(MapNamespace, key, new { v = 1, kind, payload = payloadDoc.RootElement });
+        var status = await _roomMap.WriteEntryAsync(
+            MapNamespace, key, new { v = 1, kind, payload = payloadDoc.RootElement }, cancellationToken)
+            .ConfigureAwait(false);
         if (status != AsStatus.Ok)
         {
             _logger.LogWarning(
@@ -131,40 +145,6 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
             throw new InvalidOperationException(
                 $"studio node store MapSet failed for kind={kind} entityId={entityId} status={status}");
         }
-
-        // Durability: simplest-correct for this slice — promote the mutated checkpoint into the sync
-        // graph, then persist a fresh server-pack snapshot, immediately after every write. Promotion
-        // is required (see class comment) for the mutation to reach the pack at all; the persist call
-        // is the same established post-mutation call RuntimeWebSocketLoopRunner already makes for
-        // WS-driven writes (source tag "snapshot-on-mutation" there). No batching/debounce: a process
-        // crash between MapSet and this point would lose that one write, exactly as a crash between
-        // the pre-6.1a PersistAcceptedNodesAsync call and its caller returning would have. 6.1b's
-        // implementer may want to revisit batching once outbound pack emission exists.
-        var (promoteStatus, promotedNodeIdHex) = PromoteLatestCheckpointToGraph();
-        if (promoteStatus != AsStatus.Ok)
-        {
-            _logger.LogWarning(
-                "studio node store checkpoint promotion failed kind={Kind} entityId={EntityId} status={Status} — write is live but may not survive a restart",
-                kind, entityId, promoteStatus);
-        }
-
-        await _dagPersistence.PersistRoomSnapshotAsync(StudioRoomId, cancellationToken).ConfigureAwait(false);
-
-        // Slice 6.1b — outbound replication seam. Best-effort: the write above is already durable
-        // (MapSet + promote + persist all succeeded), so a replication hiccup here never fails the
-        // write itself, only logs. No-op when standalone (NoopStudioReplicationOutbound).
-        if (!string.IsNullOrWhiteSpace(promotedNodeIdHex))
-        {
-            try
-            {
-                await _replicationOutbound.NotifyLocalWriteAsync(StudioRoomId, promotedNodeIdHex, cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "studio node store outbound replication notify failed kind={Kind} entityId={EntityId}", kind, entityId);
-            }
-        }
     }
 
     public async Task<string?> ReadNodeAsync(string kind, string entityId, CancellationToken cancellationToken = default)
@@ -172,7 +152,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
 
         var key = BuildKey(kind, entityId);
-        var envelopeRawJson = TryMapGetValueRawJson(MapNamespace, key);
+        var envelopeRawJson = _roomMap.TryGetValueRawJson(MapNamespace, key);
         if (envelopeRawJson is not null)
             return ExtractPayloadRawText(envelopeRawJson);
 
@@ -198,7 +178,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         var prefix = kind + "/";
         var results = new Dictionary<string, string>(StringComparer.Ordinal);
 
-        foreach (var (mapKey, valueRawJson) in MapAllEntries(MapNamespace))
+        foreach (var (mapKey, valueRawJson) in _roomMap.AllEntries(MapNamespace))
         {
             if (!mapKey.StartsWith(prefix, StringComparison.Ordinal))
                 continue;
@@ -230,12 +210,11 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
             if (_initialized)
                 return;
 
-            await _dagPersistence.HydrateRoomIfNeededAsync(StudioRoomId, cancellationToken).ConfigureAwait(false);
-
-            // See class comment: hydrate only repopulates the sync graph, not the live map MapGet/
-            // MapAll actually read. Bridge that gap before anything (including migration, below)
-            // relies on MapGet/MapAll seeing prior state.
-            ReplayCanonicalResolutionIntoLiveMap();
+            // EngineRoomMap.HydrateAndReplayAsync both hydrates the sync graph from persisted packs
+            // and bridges the room_maps gap (see EngineRoomMap's class comment, quirk 2) by
+            // replaying GetCanonicalResolution's entries back through MapSet — required before
+            // anything (including migration, below) relies on MapGet/MapAll seeing prior state.
+            await _roomMap.HydrateAndReplayAsync(cancellationToken).ConfigureAwait(false);
 
             await MigrateLegacyRowsIfNeededAsync(cancellationToken).ConfigureAwait(false);
 
@@ -252,7 +231,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
     // hydrate path — so this is exactly-once per workspace, not just per process lifetime.
     private async Task MigrateLegacyRowsIfNeededAsync(CancellationToken cancellationToken)
     {
-        if (TryMapGetValueRawJson(MetaNamespace, MigrationMarkerKey) is not null)
+        if (_roomMap.TryGetValueRawJson(MetaNamespace, MigrationMarkerKey) is not null)
         {
             _logger.LogDebug("studio node store legacy migration already recorded — skipping");
             return;
@@ -268,7 +247,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
             // Never clobber an existing engine-side entry with an older legacy snapshot — matters if
             // a prior migration attempt partially completed (wrote some MapSets, crashed before the
             // marker), or if a write already landed on this key between hydrate and migration.
-            if (TryMapGetValueRawJson(MapNamespace, key) is not null)
+            if (_roomMap.TryGetValueRawJson(MapNamespace, key) is not null)
                 continue;
 
             JsonDocument payloadDoc;
@@ -287,7 +266,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
 
             using (payloadDoc)
             {
-                var status = SubmitMapSet(MapNamespace, key, new { v = 1, kind = row.Kind, payload = payloadDoc.RootElement });
+                var status = _roomMap.Set(MapNamespace, key, new { v = 1, kind = row.Kind, payload = payloadDoc.RootElement });
                 if (status == AsStatus.Ok)
                 {
                     migratedCount += 1;
@@ -301,7 +280,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
             }
         }
 
-        var markerStatus = SubmitMapSet(MetaNamespace, MigrationMarkerKey, new
+        var markerStatus = _roomMap.Set(MetaNamespace, MigrationMarkerKey, new
         {
             v = 1,
             migratedAtUtc = DateTimeOffset.UtcNow,
@@ -315,7 +294,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
                 markerStatus);
         }
 
-        var (migrationPromoteStatus, migrationPromotedNodeIdHex) = PromoteLatestCheckpointToGraph();
+        var (migrationPromoteStatus, migrationPromotedNodeIdHex) = _roomMap.PromoteLatestCheckpointToGraph();
         if (migrationPromoteStatus != AsStatus.Ok)
         {
             _logger.LogWarning(
@@ -323,20 +302,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
                 migrationPromoteStatus);
         }
 
-        await _dagPersistence.PersistRoomSnapshotAsync(StudioRoomId, cancellationToken).ConfigureAwait(false);
-
-        if (!string.IsNullOrWhiteSpace(migrationPromotedNodeIdHex))
-        {
-            try
-            {
-                await _replicationOutbound.NotifyLocalWriteAsync(StudioRoomId, migrationPromotedNodeIdHex, cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "studio node store migration outbound replication notify failed");
-            }
-        }
+        await _roomMap.PersistAndReplicateAsync(migrationPromotedNodeIdHex, cancellationToken).ConfigureAwait(false);
 
         _logger.LogInformation(
             "studio node store legacy migration complete legacy_rows_seen={Seen} rows_migrated={Migrated}",
@@ -401,239 +367,15 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         return false;
     }
 
-    // Turns the room's current canonical checkpoint into a sync-graph node — see class comment for
-    // why this is required before PersistRoomSnapshotAsync can export a pack that actually contains
-    // the mutation. Idempotent: re-promoting an unchanged checkpoint returns the existing node
-    // (engine-side promotion_id dedup keyed on room/seq/canonical_hash), so calling this after every
-    // write is cheap when nothing changed (e.g. a concurrent promoter tick already did it).
-    //
-    // Slice 6.1b: also returns the promoted node's own id (CheckpointPromoted.node_id_hex), which
-    // is the exact id the outbound replication seam needs — RoomPeerClient fetches precisely this
-    // one node's bytes via HostCommand::MstDone{ids:[nodeIdHex]} rather than trying to compute a
-    // "known ids" delta itself (HostCommand::RequestServerPack's missing_hashes is a flat diff over
-    // every node id the room's sync graph has ever held, not a frontier/ancestry-aware one, so
-    // tracking a correct cumulative "known" set from the .NET side would require decoding the
-    // pack's binary node list — out of scope; MstDone{ids} sidesteps the problem entirely).
-    private (AsStatus Status, string? NodeIdHex) PromoteLatestCheckpointToGraph()
-    {
-        var commandJson = JsonSerializer.Serialize(new
-        {
-            room_id = StudioRoomId,
-            command = new
-            {
-                PromoteCheckpointToGraph = new { selector = new { selector = "latest" } }
-            }
-        });
-
-        var response = _bridge.ProcessJsonCommand(commandJson);
-        if (response.Status != AsStatus.Ok)
-            return (response.Status, null);
-
-        string? nodeIdHex = null;
-        try
-        {
-            using var eventsDoc = JsonDocument.Parse(response.EventsJson);
-            if (eventsDoc.RootElement.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var evt in eventsDoc.RootElement.EnumerateArray())
-                {
-                    if (evt.ValueKind != JsonValueKind.Object || !evt.TryGetProperty("CheckpointPromoted", out var promoted))
-                        continue;
-                    if (promoted.TryGetProperty("node_id_hex", out var nodeIdEl) && nodeIdEl.ValueKind == JsonValueKind.String)
-                        nodeIdHex = nodeIdEl.GetString();
-                    break;
-                }
-            }
-        }
-        catch (JsonException ex)
-        {
-            _logger.LogWarning(ex, "studio node store failed to parse CheckpointPromoted event — outbound replication will be skipped for this write");
-        }
-
-        return (response.Status, nodeIdHex);
-    }
-
     // IStudioNodeStoreReplicationSink — called by RoomPeerClient after applying an inbound pack
     // (ImportPack + PersistInboundPackAsync) so this peer's own IStudioNodeStore reads reflect the
-    // just-received remote state. See ReplayCanonicalResolutionIntoLiveMap's own comment; this is
-    // just a public, re-runnable entry point into the exact same logic EnsureInitializedAsync uses
-    // once at startup.
+    // just-received remote state. See EngineRoomMap.ReplayCanonicalResolutionIntoLiveMap's own
+    // comment; this is just a public, re-runnable entry point into the exact same logic
+    // EnsureInitializedAsync uses once at startup.
     public Task RehydrateLiveMapFromCanonicalResolutionAsync(CancellationToken cancellationToken = default)
     {
-        ReplayCanonicalResolutionIntoLiveMap();
+        _roomMap.ReplayCanonicalResolutionIntoLiveMap();
         return Task.CompletedTask;
-    }
-
-    // Bridges the room_maps/sync-graph gap described in the class comment: GetCanonicalResolution
-    // resolves correctly off the hydrated sync graph (unlike MapGet/MapAll, which read room_maps —
-    // never touched by ImportPack), so re-issuing MapSet for every resolved entry once per startup
-    // makes MapGet/MapAll correct again without inventing any new wire format.
-    //
-    // Namespace can't be read back from a canonical-resolution entry (canonical rows are keyed by
-    // the bare MapSet `key`, with no namespace of their own — see engine.rs's MapSet handler), so it
-    // is inferred here: this class is the sole writer into the "studio" room, and the only key it
-    // ever puts outside MapNamespace is the single well-known MigrationMarkerKey literal, which can
-    // never collide with a "{kind}/{entityId}" key (every StudioNodeKind constant starts with
-    // "studio/", so BuildKey's output never equals the bare "migrated-v1" literal).
-    private void ReplayCanonicalResolutionIntoLiveMap()
-    {
-        var commandJson = JsonSerializer.Serialize(new
-        {
-            room_id = StudioRoomId,
-            command = "GetCanonicalResolution"
-        });
-
-        var response = _bridge.ProcessJsonCommand(commandJson);
-        if (response.Status != AsStatus.Ok)
-            return;
-
-        using var eventsDoc = JsonDocument.Parse(response.EventsJson);
-        if (eventsDoc.RootElement.ValueKind != JsonValueKind.Array)
-            return;
-
-        foreach (var evt in eventsDoc.RootElement.EnumerateArray())
-        {
-            if (evt.ValueKind != JsonValueKind.Object || !evt.TryGetProperty("CanonicalResolutionQueried", out var queried))
-                continue;
-            if (!queried.TryGetProperty("entries", out var entries) || entries.ValueKind != JsonValueKind.Array)
-                continue;
-
-            foreach (var entry in entries.EnumerateArray())
-            {
-                if (entry.ValueKind != JsonValueKind.Object
-                    || !entry.TryGetProperty("key", out var keyEl)
-                    || !entry.TryGetProperty("value_bytes_b64", out var valueBytesEl))
-                    continue;
-
-                var key = keyEl.GetString();
-                // Engine-internal promotion markers ("_promotion/id", "_promotion/source_snapshot_seq")
-                // are not JSON at all (raw hash/LE-integer bytes) and are never one of this class's
-                // own keys — skip them rather than fail trying to parse them as JSON below.
-                if (string.IsNullOrEmpty(key) || key.StartsWith('_'))
-                    continue;
-
-                var valueBytesB64 = valueBytesEl.GetString();
-                if (string.IsNullOrEmpty(valueBytesB64))
-                    continue;
-
-                string valueJson;
-                try
-                {
-                    valueJson = Encoding.UTF8.GetString(Convert.FromBase64String(valueBytesB64));
-                }
-                catch (FormatException)
-                {
-                    continue;
-                }
-
-                JsonDocument valueDoc;
-                try
-                {
-                    valueDoc = JsonDocument.Parse(valueJson);
-                }
-                catch (JsonException)
-                {
-                    continue;
-                }
-
-                using (valueDoc)
-                {
-                    var @namespace = string.Equals(key, MigrationMarkerKey, StringComparison.Ordinal)
-                        ? MetaNamespace
-                        : MapNamespace;
-                    SubmitMapSet(@namespace, key, valueDoc.RootElement);
-                }
-            }
-
-            return;
-        }
-    }
-
-    private AsStatus SubmitMapSet(string @namespace, string key, object value)
-    {
-        var commandJson = JsonSerializer.Serialize(new
-        {
-            room_id = StudioRoomId,
-            command = new
-            {
-                MapSet = new { @namespace, key, value }
-            }
-        });
-
-        return _bridge.ProcessJsonCommand(commandJson).Status;
-    }
-
-    // Returns the raw JSON text of the map value for (namespace, key), or null if absent. Callers
-    // that need the studio-node envelope's inner payload go through ExtractPayloadRawText.
-    private string? TryMapGetValueRawJson(string @namespace, string key)
-    {
-        var commandJson = JsonSerializer.Serialize(new
-        {
-            room_id = StudioRoomId,
-            command = new
-            {
-                MapGet = new { @namespace, key }
-            }
-        });
-
-        var response = _bridge.ProcessJsonCommand(commandJson);
-        if (response.Status != AsStatus.Ok)
-            return null;
-
-        using var eventsDoc = JsonDocument.Parse(response.EventsJson);
-        if (eventsDoc.RootElement.ValueKind != JsonValueKind.Array)
-            return null;
-
-        foreach (var evt in eventsDoc.RootElement.EnumerateArray())
-        {
-            if (evt.ValueKind != JsonValueKind.Object || !evt.TryGetProperty("MapValueRead", out var read))
-                continue;
-
-            if (!read.TryGetProperty("value", out var valueEl)
-                || valueEl.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
-                return null;
-
-            return valueEl.GetRawText();
-        }
-
-        return null;
-    }
-
-    private IReadOnlyList<(string Key, string ValueRawJson)> MapAllEntries(string @namespace)
-    {
-        var commandJson = JsonSerializer.Serialize(new
-        {
-            room_id = StudioRoomId,
-            command = new
-            {
-                MapAll = new { @namespace }
-            }
-        });
-
-        var response = _bridge.ProcessJsonCommand(commandJson);
-        if (response.Status != AsStatus.Ok)
-            return [];
-
-        using var eventsDoc = JsonDocument.Parse(response.EventsJson);
-        if (eventsDoc.RootElement.ValueKind != JsonValueKind.Array)
-            return [];
-
-        foreach (var evt in eventsDoc.RootElement.EnumerateArray())
-        {
-            if (evt.ValueKind != JsonValueKind.Object || !evt.TryGetProperty("MapEntriesListed", out var listed))
-                continue;
-            if (!listed.TryGetProperty("entries", out var entries) || entries.ValueKind != JsonValueKind.Array)
-                continue;
-
-            return entries.EnumerateArray()
-                .Where(e => e.ValueKind == JsonValueKind.Object
-                    && e.TryGetProperty("key", out _)
-                    && e.TryGetProperty("value", out _))
-                .Select(e => (e.GetProperty("key").GetString()!, e.GetProperty("value").GetRawText()))
-                .ToList();
-        }
-
-        return [];
     }
 
     private static string ExtractPayloadRawText(string envelopeRawJson)
