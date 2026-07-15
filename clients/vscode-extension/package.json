@@ -94,6 +94,16 @@
           "default": "",
           "description": "Absolute path to the repository Studio should operate against (seed branches from, build/test/run in). Empty (default) uses the first folder open in this VS Code window. Set this to point Studio at a different checkout than the one currently open."
         },
+        "nodalmerge.blobOrigin.uri": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Base URL of a blob origin server (docs/BLOB_HTTP_SURFACE.md) the local runtime chains in front of, e.g. `https://blobs.example.com`. Empty (default) is local-only — the runtime's blob store never reaches out to the network."
+        },
+        "nodalmerge.blobOrigin.token": {
+          "type": "string",
+          "default": "",
+          "description": "Optional bearer token sent with every request to nodalmerge.blobOrigin.uri, when that server requires auth."
+        },
         "nodalmerge.agentProfiles": {
           "type": "array",
           "default": [],

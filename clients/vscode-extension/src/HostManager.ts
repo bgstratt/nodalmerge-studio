@@ -248,6 +248,21 @@ export class HostManager implements vscode.Disposable {
       }
     }
 
+    // Chained remote blob origin (docs/BLOB_HTTP_SURFACE.md): only switch the
+    // host's blob provider when a URI is actually configured. Empty URI
+    // leaves blob storage behavior unchanged (local File provider only).
+    const blobOriginConfig = vscode.workspace.getConfiguration('nodalmerge.blobOrigin');
+    const blobOriginUri = blobOriginConfig.get<string>('uri', '');
+    if (blobOriginUri) {
+      hostEnv.NodalMerge__Providers__BlobStorage = 'ChainedRemote';
+      hostEnv.NodalMerge__Storage__RemoteOrigin__BaseUrl = blobOriginUri;
+
+      const blobOriginToken = blobOriginConfig.get<string>('token', '');
+      if (blobOriginToken) {
+        hostEnv.NodalMerge__Storage__RemoteOrigin__AuthToken = blobOriginToken;
+      }
+    }
+
     if (this.context.extensionMode === vscode.ExtensionMode.Development) {
       const repoRoot = path.join(this.context.extensionPath, '..', '..');
       const hostProject = path.join(
