@@ -8,13 +8,54 @@
 - [ ] Phase 3 — zstd compression at rest
 - [ ] Phase 4 — Delegated S3 / S3-compatible backends with presigned URLs
 - [ ] Phase 5 — GC & retention (the answer to snapshot flux)
-- [ ] Phase 6 — Multi-user peer topology enablement (extension host as connected peer)
+- [ ] Phase 6 — Multi-user: replication data plane, room topology & repository identity
 
 **Sequencing: this plan follows `harness-hosting-architecture.md`.** Nothing here blocks
 Phases A–E there; conversely, nothing there blocks Phase 1 here (which is local-only and
 could ship early if snapshot-map growth becomes noticeable first). This plan implements
 "Enumerated gap #1 — CAS blob distribution" from the harness plan's multi-developer
 future state, plus the storage decisions resolved 2026-07-12.
+
+## Architectural model (recorded 2026-07-14)
+
+Principles the rest of this plan is a consequence of. Most of these describe behavior
+the code already has — they're recorded so the design stops being implicit.
+
+1. **The DAG is the authoritative history of observed repository states within a
+   NodalMerge workspace.** Git remains the authoritative persistence mechanism for
+   repositories *outside* NodalMerge; within it, git is one producer and one consumer
+   of observed states. The DAG explains *why* the repository evolved; git serializes
+   states for exchange with the outside world.
+2. **NodalMerge never reinterprets repository history — it only records newly observed
+   states.** A generation produced by `git pull`, cherry-pick, manual edits, rsync, an
+   IDE rename, or a harness run is the same thing: an observed state, one new node.
+   The "user started a goal from a stale branch" case is not an error — it's a branch
+   in the DAG, descended from the older recorded generation, reconciled through the
+   normal proposal/reconciliation path. (This is already how `ForceSyncAsync` behaves;
+   it's doctrine now, not accident.)
+3. **`RepositorySnapshotId` and `TreeHash` are the authoritative identities of a
+   state.** Git SHAs are useful hints but can vanish (rebase, force-push, squash);
+   snapshot IDs and content hashes never have to. Work units carry snapshot identity,
+   not git ancestry.
+4. **Two planes, joined by hashes — and writing vs. fan-out is not a real
+   distinction.** The *replication plane* carries rooms (maps, lists, references) as
+   CRDT packs over WebSocket; a write is ops appended to the local replica plus pack
+   exchange — there is no separate "push API" vs "subscribe channel", and the server
+   is just a peer with more uptime that also persists. The *content plane* carries
+   immutable CAS blobs over HTTP/presigned URLs — big, self-verifying by BLAKE3,
+   pull-on-demand, no ordering or consensus. Rooms hold references; the CAS holds
+   bytes. (Same split SpeechSlate runs in production: board rooms hold button/image
+   references, delegated storage holds the assets.)
+
+```
+Git (outside world)
+   ↕  import / export — observations in, materializations out
+Repository DAG — rooms                 why states evolved: snapshots, work units,
+   │                                   proposals, decisions   [replication plane: ws packs]
+Repository trees — CAS tree objects    what each state was: root TreeHash → dirs → file hashes
+   │
+CAS blobs                              immutable content      [content plane: HTTP / presigned]
+```
 
 ## Decision record (2026-07-12): full blobs, not deltas
 
@@ -76,6 +117,108 @@ Accepted, because the failure mode is benign by construction:
   replay-consistency question exists at this layer.
 - A repo-level `FileSystemWatcher` (continuous discovery) is an opportunistic later
   add-on, same family as harness-plan Phase E's branch-workdir watcher. Not scheduled.
+
+## Decision record (2026-07-14): room topology, repository identity, process modes
+
+Resolves the room-granularity and repo-identity questions Phase 6 previously deferred.
+
+### D1 — Room-per-repository, under a workgroup directory room
+
+```
+workgroup room   (small, cheap, always joined)
+├── repositories map: repoId → { label, repoRoomId, matching hints }
+├── membership / presence
+└── cross-repo references (goals spanning repos, pinned reference files)
+
+repo room        (one per repository — joined only when a peer touches that repo)
+├── snapshot/generation DAG (nodes carry TreeHash, never inline trees — Phase 1)
+├── work units, branches, proposals, decisions, conflicts
+└── artifacts (as CAS references)
+```
+
+A room is simultaneously the **replication boundary** (peers sync only repos they
+materialize), the **auth boundary** (the existing per-room token mint/validate with
+capabilities gives repo-level access control — the future SaaS story is JWT into a
+workgroup, capabilities per repo room), and the **GC-reachability boundary** (Phase 5's
+`LiveHashSource` walks retained snapshot roots per repo room). SpeechSlate's
+user-room → board-room pattern, applied to workgroup → repo.
+
+Repo-scoped state lives in the repo room, full stop; the workgroup room holds only the
+directory and cross-repo *references*. The hardcoded `"studio"` room constant
+(`RuntimeGraphPromoter`) becomes room-per-repo keyed by `repoId`.
+
+### D2 — RepositoryId is minted at registration; git supplies matching hints, never identity
+
+Every derivation candidate fails somewhere: remote URLs rename and multiply; root-commit
+SHAs fail on shallow clones and empty repos, and *collide on forks* — exactly the repos
+that must not be silently unified; content hashes differ per working state; a committed
+marker file writes into the user's repo, which we don't do. So: **the workgroup room's
+repositories map is the authority; `repoId` is minted once at first registration.**
+Consistent with the architectural model — the DAG never derives truth from git, it
+observes git.
+
+Matching flow when a peer comes online with a local folder:
+
+1. Compute hints: the **set** of root-commit SHAs (`git rev-list --max-parents=0 HEAD`
+   — a set, because merged unrelated histories yield several) + normalized remote URLs
+   (strip scheme/credentials/`.git`, lowercase host).
+2. Look up the workgroup repositories map.
+3. Exact root-SHA match → join that repo room. Fork ambiguity (shared root SHAs) →
+   remote-URL tiebreak, else one-time user prompt.
+4. No match → register: mint `repoId`, create the repo room, record hints.
+5. Cache the binding in the peer's local workspace storage — hints are consulted only
+   at first contact, so later rebases or remote renames never re-identify a repo.
+6. Degraded cases (shallow clone, no remote, empty repo) → one-time user prompt
+   ("which registered repo is this, or register new") — honest, because no algorithm
+   can know.
+
+Today's `RepositoryRegistryService` minting `repo-{guid}` keyed by local path becomes
+"local candidate pending workgroup registration", not the end of the story.
+
+### D3 — Work units are single-repository; multi-repo goals fan out
+
+There is no cross-repo atomic merge anywhere (git doesn't have one either), so the
+design doesn't pretend. A goal that touches N repositories is a **workgroup-level goal
+node referencing N work units, one per repo room**, each with its own
+branch/proposal/merge lifecycle; coordination ("all N landed", ordering) is goal-level
+state in the workgroup room. Promotion stays per-repo-DAG.
+
+Cross-repo *read* references become pinned triples `(repoId, generationId, path)` —
+resolved via that repo's room (generation → tree root) + CAS fetch. Strictly better
+than today's `ReadFileAsync` live-disk read: reproducible, works on peers that never
+cloned the referenced repo, prefetchable with the work unit's scope. A multi-root
+VSCode workspace maps naturally: each root folder matches/registers to its own
+`repoId` in the same workgroup.
+
+### D4 — One runtime, always the local peer; connection is config, not a mode
+
+The extension **always spawns the same local peer runtime**, which always owns local
+persistence (workspace storage: DB, CAS cache, materialization dirs) and always serves
+localhost HTTP/MCP for the UI. The extension never talks to a remote server directly —
+one wire contract, local-first preserved, offline works. Standalone vs connected is
+solely the presence of explicit `Room` config — never inferred from URL shape:
+
+```jsonc
+"nodalmerge.room.hostUri":   "wss://team.example.com" | "ws://127.0.0.1:9090" | ""  // "" = standalone
+"nodalmerge.room.workgroup": "acme-platform"
+```
+
+Hosting the server on your own machine is not a special mode — it's
+`hostUri: ws://127.0.0.1:9090` with the server binary run separately. The server is
+never spawned by the extension. This kills `HostManager`'s `isLocalUri` adopt/spawn
+guessing; the user's repo folder stays an external construct that is observed
+(sync-in) and materialized (checkout-out), never used as the store.
+
+### D5 — Server blob origin: no new storage crate, no "S3-compatible server" build
+
+The Rust server's existing blob request/upload/fetch flow + `blob_gc` + the
+parity-refactored global CAS layout **is** the v1 server-relay origin (Phase 2), backed
+by local disk in the shared layout. True S3/MinIO/R2 arrives via the existing presigned
+delegate seam (`IBlobUrlResolverProvider`, `nodalmerge-s3-blobs`) as Phase 4. Clients
+speak `TryGet/Put(hash)` to a chained provider; which link serves the bytes is config.
+One global CAS — content-addressed dedup across repos is automatic and safe; per-repo
+*access* control is a token/capability concern at the endpoint, and GC liveness is
+per-room roots per `delegated-storage-gc.md`.
 
 ## Where the seams already are (verified 2026-07-12)
 
@@ -211,7 +354,7 @@ hold references the server hasn't seen; grace windows + the merge-base liveness 
 This phase is what makes "we snapshot every change" permanently a non-problem: truth is
 the promoted history; everything else is cache with a TTL.
 
-## Phase 6 — Multi-user peer topology enablement
+## Phase 6 — Multi-user: replication data plane, room topology & repository identity
 
 **Decided stance on the "extension as peer vs. integrated client" question
 (2026-07-12): the extension's local embedded host *is* the peer; the extension stays a
@@ -236,18 +379,30 @@ The server's three roles stay cleanly separated: **just another peer** (with mor
 uptime) for replication; **coordination authority** for promotion ordering;
 **well-known blob origin** (Phases 2/4). Nothing else migrates to it.
 
-Slices (thin by design — most of Phase 6 is Phases 1–5 plus existing peer machinery):
+**Reality check (verified 2026-07-14) — Phase 6 is *not* thin.** The room plane today
+is presence plus one-way broadcast, not replication: the embedded `Build()` path never
+registers `RoomPeerClient`/`HeadlessPeerOptions` (only `BuildPeer()` does — the old
+"verify/fix" is confirmed a **fix**); `RoomPeerClient` sends a `hello` with an empty
+frontier and then *logs* inbound `catch-up-pack` messages without applying them;
+nothing ingests packs into `IStudioNodeStore`; outbound, the only flow is the 30-second
+`StudioCrdtSyncBackgroundService` checkpoint promotion broadcast, host→peers, which
+receivers discard. A connected peer's work units live in its own SQLite DB and never
+leave the process. The headless-peer guide's "replicated to the room" describes intent,
+not code. Slice 6.1 below is the largest single lift in this plan.
 
 | Slice | Content | Acceptance |
 |---|---|---|
-| 6.1 | Embedded host in connected mode: `Peer:HostUri` + full HTTP surface coexist (today's guide frames connected mode for headless; verify/fix the embedded `Build` path allows `RoomPeerClient`); extension settings expose "connect to room" | Two laptops + one server: work units/artifacts/proposals created on A appear in B's extension |
-| 6.2 | Branch materialization on a remote peer: B materializes a branch it has never seen — snapshot root via room, trees + blobs via chained provider (2.2/4) — and runs a local harness on it | Cold peer B: goal visible → materialize scoped branch → edit → harvest → proposal replicates back |
-| 6.3 | Sync-on-initiation across peers: `ForceSyncAsync` on any peer produces the next generation from *its* recorded base; concurrent generations from two peers reconcile through the existing proposal/reconciliation path (catch-up merge, not rebase — per harness plan) | Divergent edits on A and B both land; second one reconciles against moved canonical via recorded 3-way base |
+| 6.1 | **Replication data plane**: bidirectional pack exchange — outbound push of Studio DAG writes as packs at write time; inbound pack application into the Studio node store; real frontier-based catch-up on connect/reconnect. Retire the 30 s one-way checkpoint broadcast and `RoomPeerClient`'s log-and-discard handling | Work unit created on peer A appears in peer B's store without restart on either side; kill/reconnect B mid-stream → frontier catch-up converges; no polling promoter left in the path |
+| 6.2 | **Workgroup room + repository identity** (D1/D2): repositories map schema (repoId → label, repoRoomId, hints); mint-on-register; hint matching (root-SHA set + normalized remotes, fork tiebreak, one-time disambiguation prompt); binding cached in peer workspace storage; `RepositoryRegistryService` demoted to "local candidate pending workgroup registration" | Two peers with independent clones of the same repo converge on one repoId/room; a fork sharing root SHAs is **not** silently unified; shallow/no-remote clone degrades to prompt, not misfile |
+| 6.3 | **Room-per-repo** (D1/D3): repo-room provisioning at registration; Studio room usage keyed by repoId (delete the hardcoded `"studio"` constant); workgroup room carries cross-repo goal references; pinned `(repoId, generationId, path)` reference resolution via room + CAS | Peer joins only rooms of repos it materializes; a goal spanning two repos = two work units in two rooms + one workgroup goal node; a reference file resolves on a peer with no local clone of the referenced repo |
+| 6.4 | **Mode collapse in extension + peer** (D4): `Room` config section (`HostUri`, `Workgroup`); embedded runtime always includes the room client; `HostManager` always adopts/spawns *its* local peer and passes room config through — delete the `isLocalUri` adopt-guessing and the spawn-shadow-host fallback (third outcome: spawn *and* join room) | Standalone→connected is a settings change + restart with no other local behavior difference; a second developer's window joins the room instead of silently creating an isolated universe |
+| 6.5 | **The multi-user milestone** (previous 6.1–6.3): connected-mode visibility; cold-peer branch materialization via room + chained provider (2.2/4) + local harness; cross-peer `ForceSyncAsync` divergence reconciling through the recorded 3-way base (catch-up merge, not rebase) | Two laptops + one server: work on A appears in B's extension; cold peer B: goal visible → materialize scoped branch → edit → harvest → proposal replicates back; divergent edits on A and B both land and reconcile |
 
-**Explicit boundary:** promotion-ordering authority over the room protocol and per-peer
-identity/attribution are harness-plan future-state gaps #2 and #3 — *not* this plan.
-Phase 6 makes content and metadata flow to multi-user; who may promote, and as whom,
-stays where it is until that design happens.
+**Explicit boundary:** promotion-ordering authority over the room protocol and
+per-*user/peer* attribution are harness-plan future-state gaps #2 and #3 — *not* this
+plan. (*Repository* identity, by contrast, is in scope here — slice 6.2.) Phase 6 makes
+content and metadata flow to multi-user; who may promote, and as whom, stays where it
+is until that design happens.
 
 ## Rollout order & sizing
 
@@ -257,7 +412,8 @@ Phase 2 (server relay)   — after standalone server exists; the core unlock
 Phase 3 (zstd)           — rides along with 2.1's server store
 Phase 4 (delegated S3)   — when server bandwidth says so
 Phase 5 (GC/retention)   — before any long-lived multi-user deployment
-Phase 6 (peer topology)  — after 2; 4/5 harden it
+Phase 6 (multi-user)     — 6.1–6.4 don't depend on 2 and can start early;
+                           the 6.5 milestone needs 2; 4/5 harden it
 ```
 
 | Phase | Slices | Ships alone? |
@@ -267,8 +423,8 @@ Phase 6 (peer topology)  — after 2; 4/5 harden it
 | 3 | 1 | Yes |
 | 4 | ~2 | Yes |
 | 5 | 3 | Yes |
-| 6 | 3 | Yes — the multi-user milestone |
-| **Total** | **~16** | comparable to the harness plan |
+| 6 | 5 | 6.1–6.4 individually; 6.5 is the multi-user milestone |
+| **Total** | **~18** | comparable to the harness plan |
 
 ## Out of scope / not doing
 
@@ -280,7 +436,8 @@ Phase 6 (peer topology)  — after 2; 4/5 harden it
   character-level merge for code already ruled unsound.
 - **Peer-to-peer blob fetch** — last and maybe never (NAT + availability pain for a
   niche offline-LAN win), unchanged from the harness plan.
-- **Promotion ordering + per-peer identity** — harness-plan future state, not storage.
+- **Promotion ordering + per-user/peer attribution** — harness-plan future state, not
+  storage. (Repository identity is *not* deferred — it's slice 6.2.)
 - **Continuous file watching of external repos** — lazy sync-on-initiation is the
   accepted model; watcher is opportunistic later.
 - **Thin-client extension mode** (extension → remote server without a local peer) —
@@ -294,6 +451,10 @@ Phase 6 (peer topology)  — after 2; 4/5 harden it
 - Canonical tree-object serialization format (1.1/1.2): entry ordering, dir/file
   markers, empty-dir stance — write the format note *before* the first blob is emitted
   (it's frozen the moment one peer writes one; treat like the layout vectors).
+- Workgroup-room schema note (6.2): repositories-map fields, hint formats (root-commit
+  SHA set; remote-URL normalization rules), and the pinned-reference triple encoding —
+  same freeze rule: written before the first workgroup room exists, because the first
+  peer that writes one freezes it.
 - Where `ChainedBlobStoreProvider` lives: `NodalMerge.Host.Composition` (alongside
   `FileBlobStoreProvider`, preferred — any host benefits) vs. Studio-side. Decide at
   2.2.
