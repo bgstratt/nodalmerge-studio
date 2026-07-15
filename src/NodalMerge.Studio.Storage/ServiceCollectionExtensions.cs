@@ -11,7 +11,18 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddNodalMergeStorage(this IServiceCollection services)
     {
+        // Slice 6.1b — default no-op outbound replication; NodalMerge.Studio.Host's
+        // StudioWebApplication registers a real implementation (RoomPeerClient) after calling
+        // AddStudioServices, which wins (last AddSingleton registration wins — see e.g. the
+        // WorkspaceOptions comment in AddInMemoryStorage below for the same pattern/rationale).
+        services.AddSingleton<IStudioReplicationOutbound>(NoopStudioReplicationOutbound.Instance);
         services.AddSingleton<IStudioNodeStore, NodalMergeStudioNodeStore>();
+        // Slice 6.1b — inbound replication seam (see IStudioNodeStoreReplicationSink's own doc
+        // comment). Forwards to the same NodalMergeStudioNodeStore singleton registered above.
+        // Only registered here (not AddInMemoryStorage): InMemoryStudioNodeStore has no
+        // room_maps/sync-graph split to bridge, so callers must resolve this as optional.
+        services.AddSingleton<IStudioNodeStoreReplicationSink>(sp =>
+            (NodalMergeStudioNodeStore)sp.GetRequiredService<IStudioNodeStore>());
         services.AddSingleton<IBranchService, NodalMergeBranchService>();
         services.AddSingleton<IReplayService, ReplayService>();
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
@@ -24,6 +35,10 @@ public static class ServiceCollectionExtensions
 
     public static IServiceCollection AddInMemoryStorage(this IServiceCollection services)
     {
+        // Slice 6.1b — see AddNodalMergeStorage's identical registration above; InMemoryStudioNodeStore
+        // never calls this (no engine bridge to promote/notify through), but every service that
+        // constructs NodalMergeStudioNodeStore-shaped test doubles directly still needs it resolvable.
+        services.AddSingleton<IStudioReplicationOutbound>(NoopStudioReplicationOutbound.Instance);
         services.AddSingleton<IStudioNodeStore, InMemoryStudioNodeStore>();
         services.AddSingleton<IBranchService, InMemoryBranchService>();
         services.AddSingleton<IReplayService, ReplayService>();

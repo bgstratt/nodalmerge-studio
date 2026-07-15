@@ -6,9 +6,18 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Host;
 
+// Slice 6.1b: this class used to own its own RequestServerPack + RuntimeRoomBroker.BroadcastAsync
+// call (the 30 s StudioCrdtSyncBackgroundService promoter's broadcast half, now retired). It now
+// routes through the same IStudioReplicationOutbound seam NodalMergeStudioNodeStore's per-write
+// path uses, so there is exactly one place that knows how to turn a promoted node id into an
+// outbound pack (RoomPeerClient) instead of two. What remains here is purely the promote call
+// itself — still needed for InMemoryWorkUnitService's WorkUnit-completion-boundary safety net
+// (see IStudioGraphPromoter's own doc comment); it is frequently a no-op race against
+// NodalMergeStudioNodeStore's own per-write promote (PromoteCheckpointToGraph is idempotent per
+// checkpoint identity), and when it isn't, the resulting node still needs to reach replication.
 internal sealed class RuntimeGraphPromoter(
     IRuntimeCommandBridge bridge,
-    RuntimeRoomBroker roomBroker,
+    IStudioReplicationOutbound replicationOutbound,
     ILogger<RuntimeGraphPromoter> logger
 ) : IStudioGraphPromoter
 {
@@ -26,24 +35,20 @@ internal sealed class RuntimeGraphPromoter(
         }
     });
 
-    private static readonly string RequestPackCommand = JsonSerializer.Serialize(new
-    {
-        room_id = StudioRoomId,
-        command = new
-        {
-            RequestServerPack = new
-            {
-                known_ids = Array.Empty<string>()
-            }
-        }
-    });
-
     public async Task TryPromoteStudioCheckpointAsync()
     {
         try
         {
-            bridge.ProcessJsonCommand(PromoteCommand);
-            await BroadcastStudioPackAsync(CancellationToken.None).ConfigureAwait(false);
+            var response = bridge.ProcessJsonCommand(PromoteCommand);
+            if (response.Status != AsStatus.Ok)
+                return;
+
+            var nodeIdHex = TryExtractPromotedNodeIdHex(response.EventsJson);
+            if (string.IsNullOrWhiteSpace(nodeIdHex))
+                return;
+
+            await replicationOutbound.NotifyLocalWriteAsync(StudioRoomId, nodeIdHex, CancellationToken.None)
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -51,44 +56,20 @@ internal sealed class RuntimeGraphPromoter(
         }
     }
 
-    internal async Task BroadcastStudioPackAsync(CancellationToken cancellationToken)
+    private static string? TryExtractPromotedNodeIdHex(string eventsJson)
     {
-        try
+        using var eventsDoc = JsonDocument.Parse(eventsJson);
+        if (eventsDoc.RootElement.ValueKind != JsonValueKind.Array)
+            return null;
+
+        foreach (var evt in eventsDoc.RootElement.EnumerateArray())
         {
-            var response = bridge.ProcessJsonCommand(RequestPackCommand);
-            if (response.Status != AsStatus.Ok)
-                return;
-
-            using var eventsDoc = JsonDocument.Parse(response.EventsJson);
-            if (eventsDoc.RootElement.ValueKind != JsonValueKind.Array)
-                return;
-
-            foreach (var evt in eventsDoc.RootElement.EnumerateArray())
-            {
-                if (!evt.TryGetProperty("ServerPackPrepared", out var serverPack))
-                    continue;
-                if (!serverPack.TryGetProperty("nodes_b64", out var nodesB64Node))
-                    continue;
-                var nodesB64 = nodesB64Node.GetString();
-                if (string.IsNullOrWhiteSpace(nodesB64))
-                    continue;
-
-                var packJson = JsonSerializer.Serialize(new
-                {
-                    type = "pack",
-                    room = StudioRoomId,
-                    from = "server",
-                    nodes = nodesB64
-                });
-
-                await roomBroker.BroadcastAsync(StudioRoomId, packJson, cancellationToken: cancellationToken)
-                    .ConfigureAwait(false);
-                return;
-            }
+            if (evt.ValueKind != JsonValueKind.Object || !evt.TryGetProperty("CheckpointPromoted", out var promoted))
+                continue;
+            if (promoted.TryGetProperty("node_id_hex", out var nodeIdEl) && nodeIdEl.ValueKind == JsonValueKind.String)
+                return nodeIdEl.GetString();
         }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "studio pack broadcast failed");
-        }
+
+        return null;
     }
 }

@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using NodalMerge.DotNetHost;
 using NodalMerge.DotNetHost.Runtime;
@@ -51,12 +52,26 @@ public static class StudioWebApplication
                 config.GetSection("Peer").Bind(opts);
                 return opts;
             });
-            services.AddHostedService<RoomPeerClient>();
+            AddRoomPeerClient(services);
 
             configureServices?.Invoke(services);
         });
 
         return builder.Build();
+    }
+
+    // Slice 6.1b — RoomPeerClient is now registered as itself (not just IHostedService) and as
+    // IStudioReplicationOutbound (overriding AddNodalMergeStorage/AddInMemoryStorage's default
+    // no-op — last AddSingleton registration wins, the same pattern AddInMemoryStorage's own
+    // WorkspaceOptions comment documents), so NodalMergeStudioNodeStore's per-write outbound
+    // notification actually reaches a connected room peer. HostUri unset still means the upstream
+    // half is entirely inert (StartAsync no-ops, NotifyLocalWriteAsync only enqueues upstream work
+    // when HostUri is configured) — registering it unconditionally costs nothing in that case.
+    private static void AddRoomPeerClient(IServiceCollection services)
+    {
+        services.AddSingleton<RoomPeerClient>();
+        services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<RoomPeerClient>());
+        services.AddSingleton<IStudioReplicationOutbound>(sp => sp.GetRequiredService<RoomPeerClient>());
     }
 
     public static WebApplication Build(
@@ -93,7 +108,24 @@ public static class StudioWebApplication
         builder.Services.AddSingleton<IParticipantEventBus, InMemoryParticipantEventBus>();
         builder.Services.AddSingleton<IProjectionMaterializer, LocalFilesystemProjectionMaterializer>();
         builder.Services.AddSingleton<IStudioParticipantService, StudioParticipantService>();
-        builder.Services.AddHostedService<StudioCrdtSyncBackgroundService>();
+
+        // Slice 6.1b — the embedded Build() path never registered HeadlessPeerOptions/RoomPeerClient
+        // before this slice (only BuildPeer() did — plans/cas-distribution-and-storage.md's Phase 6
+        // reality check confirmed this was a genuine gap, not a false alarm). The retired 30 s
+        // StudioCrdtSyncBackgroundService/RuntimeGraphPromoter broadcast tick previously covered
+        // "does the embedded host talk to a room at all" only for downstream peers connecting to
+        // its own /ws/{room} endpoint; RoomPeerClient now also covers the upstream half, so the
+        // embedded host gets full slice-6.4-shaped room presence here, ahead of that slice's own
+        // config plumb-through work (6.4 wires the extension's Room settings into this Peer config
+        // section — until then, HostUri stays unset for the embedded host and this is a no-op).
+        builder.Services.AddSingleton<HeadlessPeerOptions>(sp =>
+        {
+            var opts = new HeadlessPeerOptions();
+            builder.Configuration.GetSection("Peer").Bind(opts);
+            return opts;
+        });
+        AddRoomPeerClient(builder.Services);
+
         // Phase 2 slice 2.3 — one-shot startup healing pass for the CAS reconcile sweep. Build-only
         // (not BuildPeer): a headless peer has no HTTP surface to trigger a manual sweep from, and
         // this same one-shot startup pass would otherwise run redundantly on every peer too.

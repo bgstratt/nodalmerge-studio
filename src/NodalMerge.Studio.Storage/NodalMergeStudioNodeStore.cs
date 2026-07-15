@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using NodalMerge.DotNetHost.Ffi;
 using NodalMerge.DotNetHost.Runtime;
 using NodalMerge.Host.Abstractions.Providers;
+using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
@@ -36,11 +37,15 @@ namespace NodalMerge.Studio.Storage;
 //      startup and replaying every non-"_"-prefixed entry back through MapSet before anything else
 //      (including migration, which depends on MapGet seeing prior state) runs. See
 //      ReplayCanonicalResolutionIntoLiveMap's own comment for why namespace can be inferred safely.
-// 6.1b's implementer: this promote-then-persist / replay-after-hydrate pairing is now the
-// established pattern for riding Map state through the pack plane — reuse it rather than
-// rediscovering it, and note that RuntimeGraphPromoter's existing 30 s tick already does the
-// promote half for its own purposes, so this class's per-write promote calls are frequently no-ops
-// (PromoteCheckpointToGraph is idempotent per checkpoint identity) racing harmlessly with it.
+// 6.1b (shipped): the promote-then-persist / replay-after-hydrate pairing above is now also the
+// pattern for bidirectional room replication — RoomPeerClient reuses ReplayCanonicalResolutionInto
+// LiveMap (exposed via IStudioNodeStoreReplicationSink) after applying an inbound pack, and
+// PromoteLatestCheckpointToGraph now returns the promoted node's own id so the outbound seam
+// (IStudioReplicationOutbound, called below) can hand RoomPeerClient exactly the node to push
+// upstream via HostCommand::MstDone, instead of re-deriving a delta. RuntimeGraphPromoter's 30 s
+// broadcast tick (StudioCrdtSyncBackgroundService) is retired; its promote call now routes through
+// the same IStudioReplicationOutbound seam this class uses, so the two no longer duplicate
+// broadcast logic — see RuntimeGraphPromoter's own comment.
 //
 // Legacy rows (payload kind "studio", node id "studio:{kind}:{entityId}:{ticksD20}", written by the
 // pre-6.1a version of this class) are migrated into the engine map exactly once per workspace (a
@@ -48,7 +53,7 @@ namespace NodalMerge.Studio.Storage;
 // key inside the "studio" namespace, so it can never collide with the kind keyspace and needs no
 // special-casing in the (a) key-parsing rule) and are never rewritten or deleted (AP-5): a fallback
 // read path against the legacy rows covers anything not present in the engine map.
-public sealed class NodalMergeStudioNodeStore : IStudioNodeStore
+public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeStoreReplicationSink
 {
     // Engine room every StudioNodeKind is multiplexed into (unchanged from pre-6.1a — room-per-repo
     // is slice 6.3, out of scope here). Kept internal (not referenced elsewhere in this assembly
@@ -86,6 +91,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore
     private readonly IRuntimeCommandBridge _bridge;
     private readonly RuntimeDagPersistenceService _dagPersistence;
     private readonly INodeStoreProvider _legacyNodeStore;
+    private readonly IStudioReplicationOutbound _replicationOutbound;
     private readonly ILogger<NodalMergeStudioNodeStore> _logger;
 
     // Guards one-shot hydrate + legacy migration so every public method can call
@@ -99,11 +105,13 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore
         IRuntimeCommandBridge bridge,
         RuntimeDagPersistenceService dagPersistence,
         INodeStoreProvider legacyNodeStore,
+        IStudioReplicationOutbound replicationOutbound,
         ILogger<NodalMergeStudioNodeStore> logger)
     {
         _bridge = bridge;
         _dagPersistence = dagPersistence;
         _legacyNodeStore = legacyNodeStore;
+        _replicationOutbound = replicationOutbound;
         _logger = logger;
     }
 
@@ -132,7 +140,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore
         // crash between MapSet and this point would lose that one write, exactly as a crash between
         // the pre-6.1a PersistAcceptedNodesAsync call and its caller returning would have. 6.1b's
         // implementer may want to revisit batching once outbound pack emission exists.
-        var promoteStatus = PromoteLatestCheckpointToGraph();
+        var (promoteStatus, promotedNodeIdHex) = PromoteLatestCheckpointToGraph();
         if (promoteStatus != AsStatus.Ok)
         {
             _logger.LogWarning(
@@ -141,6 +149,22 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore
         }
 
         await _dagPersistence.PersistRoomSnapshotAsync(StudioRoomId, cancellationToken).ConfigureAwait(false);
+
+        // Slice 6.1b — outbound replication seam. Best-effort: the write above is already durable
+        // (MapSet + promote + persist all succeeded), so a replication hiccup here never fails the
+        // write itself, only logs. No-op when standalone (NoopStudioReplicationOutbound).
+        if (!string.IsNullOrWhiteSpace(promotedNodeIdHex))
+        {
+            try
+            {
+                await _replicationOutbound.NotifyLocalWriteAsync(StudioRoomId, promotedNodeIdHex, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "studio node store outbound replication notify failed kind={Kind} entityId={EntityId}", kind, entityId);
+            }
+        }
     }
 
     public async Task<string?> ReadNodeAsync(string kind, string entityId, CancellationToken cancellationToken = default)
@@ -291,15 +315,28 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore
                 markerStatus);
         }
 
-        var promoteStatus = PromoteLatestCheckpointToGraph();
-        if (promoteStatus != AsStatus.Ok)
+        var (migrationPromoteStatus, migrationPromotedNodeIdHex) = PromoteLatestCheckpointToGraph();
+        if (migrationPromoteStatus != AsStatus.Ok)
         {
             _logger.LogWarning(
                 "studio node store migration checkpoint promotion failed status={Status} — migrated rows may not survive a restart",
-                promoteStatus);
+                migrationPromoteStatus);
         }
 
         await _dagPersistence.PersistRoomSnapshotAsync(StudioRoomId, cancellationToken).ConfigureAwait(false);
+
+        if (!string.IsNullOrWhiteSpace(migrationPromotedNodeIdHex))
+        {
+            try
+            {
+                await _replicationOutbound.NotifyLocalWriteAsync(StudioRoomId, migrationPromotedNodeIdHex, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "studio node store migration outbound replication notify failed");
+            }
+        }
 
         _logger.LogInformation(
             "studio node store legacy migration complete legacy_rows_seen={Seen} rows_migrated={Migrated}",
@@ -369,7 +406,15 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore
     // the mutation. Idempotent: re-promoting an unchanged checkpoint returns the existing node
     // (engine-side promotion_id dedup keyed on room/seq/canonical_hash), so calling this after every
     // write is cheap when nothing changed (e.g. a concurrent promoter tick already did it).
-    private AsStatus PromoteLatestCheckpointToGraph()
+    //
+    // Slice 6.1b: also returns the promoted node's own id (CheckpointPromoted.node_id_hex), which
+    // is the exact id the outbound replication seam needs — RoomPeerClient fetches precisely this
+    // one node's bytes via HostCommand::MstDone{ids:[nodeIdHex]} rather than trying to compute a
+    // "known ids" delta itself (HostCommand::RequestServerPack's missing_hashes is a flat diff over
+    // every node id the room's sync graph has ever held, not a frontier/ancestry-aware one, so
+    // tracking a correct cumulative "known" set from the .NET side would require decoding the
+    // pack's binary node list — out of scope; MstDone{ids} sidesteps the problem entirely).
+    private (AsStatus Status, string? NodeIdHex) PromoteLatestCheckpointToGraph()
     {
         var commandJson = JsonSerializer.Serialize(new
         {
@@ -380,7 +425,43 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore
             }
         });
 
-        return _bridge.ProcessJsonCommand(commandJson).Status;
+        var response = _bridge.ProcessJsonCommand(commandJson);
+        if (response.Status != AsStatus.Ok)
+            return (response.Status, null);
+
+        string? nodeIdHex = null;
+        try
+        {
+            using var eventsDoc = JsonDocument.Parse(response.EventsJson);
+            if (eventsDoc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var evt in eventsDoc.RootElement.EnumerateArray())
+                {
+                    if (evt.ValueKind != JsonValueKind.Object || !evt.TryGetProperty("CheckpointPromoted", out var promoted))
+                        continue;
+                    if (promoted.TryGetProperty("node_id_hex", out var nodeIdEl) && nodeIdEl.ValueKind == JsonValueKind.String)
+                        nodeIdHex = nodeIdEl.GetString();
+                    break;
+                }
+            }
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "studio node store failed to parse CheckpointPromoted event — outbound replication will be skipped for this write");
+        }
+
+        return (response.Status, nodeIdHex);
+    }
+
+    // IStudioNodeStoreReplicationSink — called by RoomPeerClient after applying an inbound pack
+    // (ImportPack + PersistInboundPackAsync) so this peer's own IStudioNodeStore reads reflect the
+    // just-received remote state. See ReplayCanonicalResolutionIntoLiveMap's own comment; this is
+    // just a public, re-runnable entry point into the exact same logic EnsureInitializedAsync uses
+    // once at startup.
+    public Task RehydrateLiveMapFromCanonicalResolutionAsync(CancellationToken cancellationToken = default)
+    {
+        ReplayCanonicalResolutionIntoLiveMap();
+        return Task.CompletedTask;
     }
 
     // Bridges the room_maps/sync-graph gap described in the class comment: GetCanonicalResolution

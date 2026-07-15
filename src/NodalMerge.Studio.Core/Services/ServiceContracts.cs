@@ -811,6 +811,61 @@ public interface IStudioGraphPromoter
     Task TryPromoteStudioCheckpointAsync();
 }
 
+// Slice 6.1b (plans/cas-distribution-and-storage.md Phase 6) — outbound replication seam.
+// NodalMergeStudioNodeStore.WriteNodeAsync (and its one-shot legacy migration) calls this
+// immediately after a successful per-write checkpoint promotion, handing over the resulting
+// sync-graph node id so a connected room peer client can push it upstream and/or broadcast it to
+// any peer directly connected to this host's own room endpoint. Lives here (not in
+// NodalMerge.Studio.Storage) because the real implementation (RoomPeerClient) lives in
+// NodalMerge.Studio.Host, which Storage cannot reference (layering); Storage only needs the
+// interface to call through. No-op by default (NoopStudioReplicationOutbound, registered by both
+// AddNodalMergeStorage and AddInMemoryStorage) so standalone hosts and every existing test that
+// builds services directly keep working unchanged; NodalMerge.Studio.Host's StudioWebApplication
+// overrides the registration to point at RoomPeerClient.
+//
+// Loop-prevention note (see RoomPeerClient's inbound-pack handling): this is called ONLY from the
+// per-entity write path (NodalMergeStudioNodeStore.WriteNodeAsync / migration), never from inbound
+// pack application. An inbound pack is applied via ImportPack directly against the engine bridge,
+// bypassing WriteNodeAsync entirely — so an inbound-applied write can never re-enter this seam and
+// echo back out. That structural fact, not an origin-tracking flag, is what prevents ping-pong.
+public interface IStudioReplicationOutbound
+{
+    Task NotifyLocalWriteAsync(string roomId, string nodeIdHex, CancellationToken cancellationToken = default);
+}
+
+public sealed class NoopStudioReplicationOutbound : IStudioReplicationOutbound
+{
+    public static readonly NoopStudioReplicationOutbound Instance = new();
+
+    private NoopStudioReplicationOutbound()
+    {
+    }
+
+    public Task NotifyLocalWriteAsync(string roomId, string nodeIdHex, CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+}
+
+// Slice 6.1b — inbound replication seam, the mirror image of IStudioReplicationOutbound. After a
+// room peer client applies an inbound pack (ImportPack against the engine's sync graph +
+// PersistInboundPackAsync for durability), it must also replay canonical resolution back into the
+// engine's live "room_maps" state or IStudioNodeStore reads on this peer would see nothing from
+// the just-imported pack — see NodalMergeStudioNodeStore's class comment for the full room_maps
+// vs. sync-graph split this bridges, and ReplayCanonicalResolutionIntoLiveMap's own comment for why
+// this is safe to re-run at any time (it is namespace-inferring and idempotent). Registered only
+// against the engine-backed NodalMergeStudioNodeStore (NOT InMemoryStudioNodeStore, which has no
+// room_maps/sync-graph split to bridge) — callers must resolve it as optional and log+skip when
+// absent (standalone/in-memory test configurations), the same nullable-optional-collaborator shape
+// IStudioGraphPromoter already uses elsewhere in this codebase.
+//
+// Out-of-scope note carried from the design: any in-memory Studio service with a startup-
+// rehydrated cache (a dictionary populated once at boot from IStudioNodeStore.ReadAllNodesAsync)
+// will NOT observe a mid-run inbound pack — only future ReadNodeAsync/ReadAllNodesAsync calls see
+// it. Making those caches subscribe to a store-changed notification is future work.
+public interface IStudioNodeStoreReplicationSink
+{
+    Task RehydrateLiveMapFromCanonicalResolutionAsync(CancellationToken cancellationToken = default);
+}
+
 public sealed record CausalParentsResult(string[] ParentIdsHex, bool NodeFound);
 public sealed record CanonicalResolutionEntry(string Key, string ValueBytesB64);
 public sealed record CanonicalResolutionResult(IReadOnlyList<CanonicalResolutionEntry> Entries);
