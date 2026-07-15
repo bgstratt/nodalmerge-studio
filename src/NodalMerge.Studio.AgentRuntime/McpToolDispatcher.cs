@@ -37,8 +37,20 @@ internal sealed class McpToolDispatcher(
     // Phase 12 — optional CAS-backed repository tools
     IRepositorySnapshotService? repoSnapshots = null,
     NodalMerge.Host.Abstractions.Providers.IBlobStoreProvider? repoBlobStore = null,
-    IRepositoryOpService? repoOpEmitter = null)
+    IRepositoryOpService? repoOpEmitter = null,
+    // Slice 1.1 — resolves a snapshot's tree map (inline legacy or cas-tree). Null falls back to
+    // direct snapshot.TreeEntries access.
+    ISnapshotTreeResolver? repoTreeResolver = null)
 {
+    private async Task<IReadOnlyDictionary<string, string>?> ResolveTreeAsync(
+        RepositorySnapshot? snapshot, CancellationToken ct)
+    {
+        if (snapshot is null) return null;
+        return repoTreeResolver is not null
+            ? await repoTreeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false)
+            : snapshot.TreeEntries;
+    }
+
     // Phase 9g — read-before-write enforcement. McpToolDispatcher is registered as a singleton
     // (InMemoryAgentRuntimeService.cs) shared across every agent/run, so this cache lives here
     // rather than per-loop: once any agent reads a path in a branch, that path stays "seen" for
@@ -252,13 +264,14 @@ internal sealed class McpToolDispatcher(
         var repositoryId = Str(input, "repositoryId")!;
         var scope = Str(input, "scope");
         var snapshot = await repoSnapshots.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
-        if (snapshot?.TreeEntries is null)
+        var tree = await ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+        if (tree is null)
             return ToError("No snapshot with tree entries found for this repository.");
-        var paths = snapshot.TreeEntries.Keys
+        var paths = tree.Keys
             .Where(p => scope is null || p.StartsWith(scope, StringComparison.Ordinal))
             .Order(StringComparer.Ordinal)
             .ToList();
-        return ToJson(new { paths, count = paths.Count, snapshotId = snapshot.SnapshotId });
+        return ToJson(new { paths, count = paths.Count, snapshotId = snapshot!.SnapshotId });
     }
 
     private async Task<string> RepositoryBlobReadAsync(JsonElement input, CancellationToken ct)
@@ -268,9 +281,10 @@ internal sealed class McpToolDispatcher(
         var repositoryId = Str(input, "repositoryId")!;
         var path = Str(input, "path")!;
         var snapshot = await repoSnapshots.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
-        if (snapshot?.TreeEntries is null)
+        var tree = await ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+        if (tree is null)
             return ToError("No snapshot with tree entries found for this repository.");
-        if (!snapshot.TreeEntries.TryGetValue(path, out var blobId))
+        if (!tree.TryGetValue(path, out var blobId))
             return ToError($"Path '{path}' not found in the latest snapshot.");
         var result = await repoBlobStore.TryGetBlobAsync(blobId, ct).ConfigureAwait(false);
         if (!result.Found || result.Bytes is null)
@@ -295,7 +309,8 @@ internal sealed class McpToolDispatcher(
         var newBlobId = NodalMerge.Studio.Storage.BlobHasher.ComputeHash(bytes);
         await repoBlobStore.PutBlobAsync(newBlobId, bytes, "text/plain", ct).ConfigureAwait(false);
         var snapshot = await repoSnapshots.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
-        var oldBlobId = snapshot?.TreeEntries?.GetValueOrDefault(path);
+        var tree = await ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+        var oldBlobId = tree?.GetValueOrDefault(path);
         var kind = oldBlobId is null ? OperationType.Add : OperationType.Replace;
         var op = new RepositoryOperation(
             OperationId:      $"op-{Guid.NewGuid():N}",
@@ -321,10 +336,11 @@ internal sealed class McpToolDispatcher(
         var scope = Str(input, "scope");
         var maxResults = Int(input, "maxResults") ?? 20;
         var snapshot = await repoSnapshots.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
-        if (snapshot?.TreeEntries is null)
+        var tree = await ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+        if (tree is null)
             return ToError("No snapshot with tree entries found for this repository.");
         var matches = new List<object>();
-        foreach (var (path, blobId) in snapshot.TreeEntries)
+        foreach (var (path, blobId) in tree)
         {
             if (matches.Count >= maxResults) break;
             if (scope is not null && !path.StartsWith(scope, StringComparison.Ordinal)) continue;

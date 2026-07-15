@@ -19,12 +19,15 @@ internal sealed class NullMaterializationEngine : IMaterializationEngine
         => Task.FromResult(0);
 }
 
-// Phase 7 — reconstructs workspace directories from a snapshot's TreeEntries + CAS.
+// Phase 7 — reconstructs workspace directories from a snapshot's tree map + CAS.
 // The skip-already-matching optimization avoids re-fetching blobs for files already on disk
 // with the correct content — critical for partial-eviction recovery.
+// Slice 1.1 — the tree map itself is resolved via ISnapshotTreeResolver (inline legacy TreeEntries
+// or a CAS tree blob keyed by TreeHash), never dereferenced from RepositorySnapshot directly.
 internal sealed class MaterializationEngine(
     IBlobStoreProvider blobStore,
-    WorkspaceOptions options) : IMaterializationEngine
+    WorkspaceOptions options,
+    ISnapshotTreeResolver treeResolver) : IMaterializationEngine
 {
     public async Task<int> MaterializeAsync(
         RepositorySnapshot snapshot,
@@ -32,9 +35,10 @@ internal sealed class MaterializationEngine(
         IReadOnlyList<string>? fileScope = null,
         CancellationToken ct = default)
     {
-        if (snapshot.TreeEntries is null) return 0;
+        var treeEntries = await treeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+        if (treeEntries is null) return 0;
 
-        var entries = FilterByScope(snapshot.TreeEntries, fileScope);
+        var entries = FilterByScope(treeEntries, fileScope);
         var entrySet = entries.Keys.ToHashSet(StringComparer.Ordinal);
 
         Directory.CreateDirectory(targetPath);
@@ -53,12 +57,14 @@ internal sealed class MaterializationEngine(
         IReadOnlyList<string>? fileScope = null,
         CancellationToken ct = default)
     {
-        if (snapshot.TreeEntries is null) return 0;
+        var currentEntries = await treeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+        if (currentEntries is null) return 0;
 
-        var current  = FilterByScope(snapshot.TreeEntries, fileScope);
-        var previous = previousSnapshot.TreeEntries is null
+        var current = FilterByScope(currentEntries, fileScope);
+        var previousEntries = await treeResolver.ResolveTreeAsync(previousSnapshot, ct).ConfigureAwait(false);
+        var previous = previousEntries is null
             ? new Dictionary<string, string>(StringComparer.Ordinal)
-            : FilterByScope(previousSnapshot.TreeEntries, fileScope);
+            : FilterByScope(previousEntries, fileScope);
 
         // Changed or added paths.
         var toWrite = current

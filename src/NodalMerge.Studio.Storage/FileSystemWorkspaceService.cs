@@ -14,8 +14,17 @@ internal sealed class FileSystemWorkspaceService(
     IRepositoryOpService? repoOpService = null,
     IMaterializationEngine? materializer = null,
     IRepositorySnapshotService? snapshotService = null,
-    ILogger<FileSystemWorkspaceService>? logger = null) : IFileWorkspaceService
+    ILogger<FileSystemWorkspaceService>? logger = null,
+    // Slice 1.1 — resolves a snapshot's tree map (inline legacy or cas-tree). Null falls back to
+    // direct snapshot.TreeEntries access, same as pre-slice-1.1 behavior.
+    ISnapshotTreeResolver? treeResolver = null) : IFileWorkspaceService
 {
+    private async Task<IReadOnlyDictionary<string, string>?> ResolveTreeAsync(
+        RepositorySnapshot snapshot, CancellationToken ct) =>
+        treeResolver is not null
+            ? await treeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false)
+            : snapshot.TreeEntries;
+
     // CAS being unconfigured is a legitimate, common, intentional deployment choice — not a
     // misconfiguration — so this is logged once per instance (this class is a singleton, so
     // effectively once per process) at Information, not per-call at Warning. WriteAsync/DeleteAsync
@@ -41,12 +50,13 @@ internal sealed class FileSystemWorkspaceService(
         {
             var repositoryId = Path.GetFullPath(seedForScope);
             var snapshot = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
-            if (snapshot?.TreeEntries is not null)
+            var tree = snapshot is not null ? await ResolveTreeAsync(snapshot, ct).ConfigureAwait(false) : null;
+            if (tree is not null)
             {
                 // Expand work unit glob patterns to materializer prefix paths, and always include
                 // project structure files so WorkspaceProfileService can detect project roots.
                 var materializationScope = ExpandScopeForMaterializer(fileScope);
-                await materializer.MaterializeAsync(snapshot, branchDir, materializationScope, ct)
+                await materializer.MaterializeAsync(snapshot!, branchDir, materializationScope, ct)
                     .ConfigureAwait(false);
                 return;
             }
@@ -71,9 +81,10 @@ internal sealed class FileSystemWorkspaceService(
             {
                 var repositoryId = Path.GetFullPath(seed);
                 var snapshot = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
-                if (snapshot?.TreeEntries is not null)
+                var tree = snapshot is not null ? await ResolveTreeAsync(snapshot, ct).ConfigureAwait(false) : null;
+                if (tree is not null)
                 {
-                    await materializer.MaterializeAsync(snapshot, branchDir, ct: ct).ConfigureAwait(false);
+                    await materializer.MaterializeAsync(snapshot!, branchDir, ct: ct).ConfigureAwait(false);
                     return;
                 }
             }
@@ -771,7 +782,9 @@ internal sealed class FileSystemWorkspaceService(
 
         var repositoryId = Path.GetFullPath(seed);
         var snapshot = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
-        if (snapshot?.TreeEntries is null || !snapshot.TreeEntries.ContainsKey(path))
+        if (snapshot is null) return false;
+        var tree = await ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+        if (tree is null || !tree.ContainsKey(path))
             return false;
 
         var branchDir = BranchDir(branchId);

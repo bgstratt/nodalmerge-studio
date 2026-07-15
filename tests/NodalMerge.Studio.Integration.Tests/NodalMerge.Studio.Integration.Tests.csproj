@@ -25,4 +25,9 @@
     <ProjectReference Include="..\..\src\NodalMerge.Studio.Host\NodalMerge.Studio.Host.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- docs/TREE_OBJECT_FORMAT.md golden vectors, consumed by CanonicalTreeSerializerVectorTests. -->
+    <None Include="TestData\tree-format-vectors.v1.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

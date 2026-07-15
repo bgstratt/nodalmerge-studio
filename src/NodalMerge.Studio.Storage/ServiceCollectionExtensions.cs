@@ -3,6 +3,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage.TreeObjects;
 
 namespace NodalMerge.Studio.Storage;
 
@@ -205,10 +206,14 @@ public static class ServiceCollectionExtensions
 
         // Repository virtualization — Phase 2/6: snapshot service registered before import service.
         // Phase 6: snapshot service receives IRepositoryOpService for ConsiderCompactionAsync.
+        // Slice 1.1: snapshot service receives ISnapshotTreeResolver so CreateAsync can write the
+        // tree map into the CAS when a blob store is configured (registered in AddFileWorkspaceService
+        // below — registration order doesn't matter, DI resolves lazily).
         services.AddSingleton<InMemoryRepositorySnapshotService>(sp =>
             new InMemoryRepositorySnapshotService(
                 sp.GetRequiredService<IStudioNodeStore>(),
-                sp));
+                sp,
+                sp.GetService<ISnapshotTreeResolver>()));
         services.AddSingleton<IRepositorySnapshotService>(sp => sp.GetRequiredService<InMemoryRepositorySnapshotService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryRepositorySnapshotService>());
 
@@ -217,7 +222,9 @@ public static class ServiceCollectionExtensions
             sp.GetService<IRepositorySnapshotService>(),
             sp.GetService<IBlobStoreProvider>(),
             sp.GetService<IRepositoryOpService>(),
-            sp.GetService<WorkspaceOptions>()));
+            sp.GetService<WorkspaceOptions>(),
+            sp.GetService<ISnapshotTreeResolver>(),
+            sp.GetService<ILogger<RepositoryImportService>>()));
         services.AddSingleton<IRepositoryImportService>(sp => sp.GetRequiredService<RepositoryImportService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<RepositoryImportService>());
 
@@ -231,6 +238,7 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IMaterializationEngine>(),
             sp.GetRequiredService<IStudioNodeStore>(),
             sp.GetRequiredService<IRepositoryRegistryService>(),
+            sp.GetRequiredService<ISnapshotTreeResolver>(),
             sp.GetService<WorkspaceOptions>()));
         services.AddSingleton<IWorkspaceCacheManager>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
@@ -298,6 +306,15 @@ public static class ServiceCollectionExtensions
 
     private static void AddFileWorkspaceService(IServiceCollection services)
     {
+        // Slice 1.1 — resolves a snapshot's tree map (inline legacy TreeEntries or a cas-tree CAS
+        // blob) uniformly for every reader below. Always registered (even with no blob store —
+        // CanWrite is false, ResolveTreeAsync falls back to inline-only) so every consumer can take
+        // it as a required dependency instead of null-checking.
+        services.AddSingleton<ISnapshotTreeResolver>(sp => new SnapshotTreeResolver(
+            sp.GetService<IBlobStoreProvider>(),
+            sp.GetService<ILogger<SnapshotTreeResolver>>()
+                ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<SnapshotTreeResolver>.Instance));
+
         // Phase 7 — materializer registered here so it's available to both AddNodalMergeStorage
         // and AddInMemoryStorage; it has no state to rehydrate so it doesn't go through
         // AddRehydratableServices.
@@ -306,7 +323,7 @@ public static class ServiceCollectionExtensions
             var blobStore = sp.GetService<IBlobStoreProvider>();
             var opts      = sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions();
             return blobStore is not null
-                ? new MaterializationEngine(blobStore, opts)
+                ? new MaterializationEngine(blobStore, opts, sp.GetRequiredService<ISnapshotTreeResolver>())
                 : NullMaterializationEngine.Instance;
         });
 
@@ -316,7 +333,8 @@ public static class ServiceCollectionExtensions
             sp.GetService<IRepositoryOpService>(),
             sp.GetService<IMaterializationEngine>(),
             sp.GetService<IRepositorySnapshotService>(),
-            sp.GetService<ILogger<FileSystemWorkspaceService>>()));
+            sp.GetService<ILogger<FileSystemWorkspaceService>>(),
+            sp.GetService<ISnapshotTreeResolver>()));
 
         // Phase 10 — Roslyn C# syntax validator for AstMergeStrategy.
         services.AddSingleton<ISourceValidator, RoslynSourceValidator>();

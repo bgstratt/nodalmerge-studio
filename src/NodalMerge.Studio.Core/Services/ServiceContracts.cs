@@ -2323,6 +2323,40 @@ public interface IMaterializationEngine
         CancellationToken ct = default);
 }
 
+// plans/cas-distribution-and-storage.md Phase 1 slice 1.1 — resolves a RepositorySnapshot's
+// path→blobId map regardless of whether it's stored inline (legacy TreeEntries) or as a CAS tree
+// object (TreeFormat="cas-tree", TreeHash → blob, docs/TREE_OBJECT_FORMAT.md). Every reader that
+// used to dereference RepositorySnapshot.TreeEntries directly goes through this instead, so
+// legacy and cas-tree snapshots resolve identically without ever rewriting old nodes (append-only,
+// AP-5 — see the plan's Phase 1 slice 1.1 acceptance criteria).
+public interface ISnapshotTreeResolver
+{
+    // Precedence: inline TreeEntries (legacy) always wins and is returned directly, no CAS fetch.
+    // Otherwise, TreeFormat == "cas-tree" resolves TreeHash through the blob store (recursively,
+    // for a v2 directory tree once something writes one). Any other snapshot (pre-Phase-2 — neither
+    // TreeEntries nor TreeFormat set) returns null, same as every existing caller already treats a
+    // null map. A CAS miss or a corrupt tree blob also returns null — distinctly logged (miss vs
+    // corrupt) so operators can tell the two apart — never throws, so a stale/incomplete cache
+    // can't crash a caller mid-materialization.
+    Task<IReadOnlyDictionary<string, string>?> ResolveTreeAsync(
+        RepositorySnapshot snapshot, CancellationToken ct = default);
+
+    // Serializes entries as a v1 flat tree object (docs/TREE_OBJECT_FORMAT.md), stores it via the
+    // blob store, and returns its BLAKE3 hash for use as RepositorySnapshot.TreeHash. Throws
+    // InvalidOperationException when CanWrite is false (no blob store configured) — callers must
+    // check CanWrite first if they want to fall back to the legacy inline-TreeEntries write path.
+    Task<string> WriteTreeAsync(
+        IReadOnlyDictionary<string, string> entries, CancellationToken ct = default);
+
+    // Every tree-object blob hash referenced by this snapshot (root, plus every subtree once a v2
+    // directory tree is written) — feeds Phase 1.3's GC reachability walk. Empty for legacy/inline
+    // snapshots (nothing to protect beyond the file blobs already in TreeEntries).
+    Task<IReadOnlyCollection<string>> GetTreeBlobHashesAsync(
+        RepositorySnapshot snapshot, CancellationToken ct = default);
+
+    bool CanWrite { get; }
+}
+
 // Phase 2 — snapshot checkpoint service for the repository op log. One snapshot per goal cycle
 // (created by between-run sync) serves as the replay base; replaying 10–30 ops from the latest
 // snapshot is intentionally fast. SnapshotOnWorkUnitCompletion (Phase 7) and compaction (Phase 6)

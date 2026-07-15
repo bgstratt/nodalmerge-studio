@@ -2,6 +2,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Host.Composition;
 using NodalMerge.Studio.AgentRuntime;
 using NodalMerge.Studio.Contracts.Domain;
@@ -917,7 +918,7 @@ public static class StudioRestEndpoints
         {
             var ok = await cache.MaterializeAsync(workUnitId, ct).ConfigureAwait(false);
             return ok ? Results.Ok(new { workUnitId, materialized = true })
-                      : Results.NotFound(new { error = "No snapshot with TreeEntries found; cannot materialize." });
+                      : Results.NotFound(new { error = "No materializable snapshot found for this work unit (missing snapshot, unresolvable tree — legacy pre-tree-capture or a CAS miss/corrupt tree blob — or no branch directory); cannot materialize." });
         });
 
         // Evict a specific work unit's branch directory.
@@ -946,13 +947,32 @@ public static class StudioRestEndpoints
             [FromQuery] bool dryRun,
             IWorkspaceCacheManager cache,
             WorkspaceOptions opts,
+            ILogger<WorkspaceCacheManager> logger,
             CancellationToken ct) =>
         {
             var casRoot = opts.CasRootPath;
             if (string.IsNullOrEmpty(casRoot))
                 return Results.BadRequest(new { error = "CAS storage is not configured (WorkspaceOptions.CasRootPath is null)." });
 
-            var liveHashes = await cache.GetLiveBlobHashesAsync(ct).ConfigureAwait(false);
+            IReadOnlySet<string> liveHashes;
+            try
+            {
+                liveHashes = await cache.GetLiveBlobHashesAsync(ct).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Slice 1.1 — GetLiveBlobHashesAsync fails closed when a cas-tree snapshot's tree
+                // can't be resolved (CAS miss/corrupt): an incomplete live set must never reach a
+                // sweep (it would look like an under-approximation and let live blobs get deleted).
+                // Skip this GC round rather than crash the host; the caller can retry later.
+                logger.LogWarning(ex, "Skipping blob GC this round — the live blob set could not be computed.");
+                return Results.Conflict(new
+                {
+                    error = "Live blob set is incomplete (a cas-tree snapshot's tree failed to resolve) — GC skipped this round.",
+                    detail = ex.Message,
+                });
+            }
+
             var coordinator = new FileBlobGcCoordinator(casRoot);
             var report = dryRun
                 ? coordinator.DryRun(liveHashes, DateTimeOffset.UtcNow)
@@ -3560,6 +3580,7 @@ public static class StudioRestEndpoints
             [FromQuery] string? targetPath,
             IRepositorySnapshotService snapshots,
             IMaterializationEngine materializer,
+            ISnapshotTreeResolver treeResolver,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(targetPath))
@@ -3568,8 +3589,10 @@ public static class StudioRestEndpoints
             var snapshot = await snapshots.GetAsync(snapshotId, ct).ConfigureAwait(false);
             if (snapshot is null)
                 return Results.NotFound(new { error = $"Repository snapshot '{snapshotId}' was not found." });
-            if (snapshot.TreeEntries is null)
-                return Results.BadRequest(new { error = $"Snapshot '{snapshotId}' predates tree-entry capture and cannot be materialized directly." });
+
+            var tree = await treeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+            if (tree is null)
+                return Results.BadRequest(new { error = $"Snapshot '{snapshotId}' has no resolvable tree — it either predates tree-entry capture, or its CAS tree blob is missing/corrupt (TreeFormat={snapshot.TreeFormat ?? "null"})." });
 
             var fileCount = await materializer.MaterializeAsync(snapshot, targetPath, ct: ct).ConfigureAwait(false);
             return Results.Ok(new

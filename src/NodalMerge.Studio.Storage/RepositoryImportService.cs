@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -9,13 +10,16 @@ namespace NodalMerge.Studio.Storage;
 
 // Phase 5 — one-time CAS bootstrap for the seed repository. Runs at goal start (via
 // RepositorySyncService) before any agent is assigned a branch.
-// Phase 2 — adds between-run sync (Case 2): when a snapshot with TreeEntries already exists,
+// Phase 2 — adds between-run sync (Case 2): when a snapshot with a resolvable tree already exists,
 // diffs the filesystem against the stored map and emits Add/Replace/Delete ops for changes.
 internal sealed class RepositoryImportService(
     IRepositorySnapshotService? snapshotService = null,
     IBlobStoreProvider? blobStore = null,
     IRepositoryOpService? repoOpService = null,
-    WorkspaceOptions? workspaceOptions = null)
+    WorkspaceOptions? workspaceOptions = null,
+    // Slice 1.1 — resolves latest.TreeEntries (legacy) or latest.TreeHash (cas-tree) uniformly.
+    ISnapshotTreeResolver? treeResolver = null,
+    ILogger<RepositoryImportService>? logger = null)
     : IRepositoryImportService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _gates = new(StringComparer.Ordinal);
@@ -102,14 +106,30 @@ internal sealed class RepositoryImportService(
         {
             // Case 1 — no snapshot at all: walk every file, put to CAS, emit Import ops.
             await BootstrapAsync(repositoryId, repositoryPath, ct).ConfigureAwait(false);
+            return;
         }
-        else if (latest.TreeEntries is not null)
+
+        var latestTree = treeResolver is not null
+            ? await treeResolver.ResolveTreeAsync(latest, ct).ConfigureAwait(false)
+            : latest.TreeEntries;
+
+        if (latestTree is not null)
         {
-            // Case 2 — snapshot exists with stored tree: diff filesystem vs stored map,
+            // Case 2 — snapshot exists with a resolvable tree: diff filesystem vs stored map,
             // emit Add/Replace/Delete for changed files, create a successor snapshot.
-            await SyncFromFilesystemAsync(repositoryId, repositoryPath, latest, ct).ConfigureAwait(false);
+            await SyncFromFilesystemAsync(repositoryId, repositoryPath, latest, latestTree, ct).ConfigureAwait(false);
         }
-        // else: pre-Phase-2 bootstrap snapshot (no TreeEntries) — skip sync for now;
+        else if (string.Equals(latest.TreeFormat, "cas-tree", StringComparison.Ordinal))
+        {
+            // cas-tree snapshot whose tree blob failed to resolve (CAS miss or corrupt — the
+            // resolver already logged the specific reason). Distinct from the pre-Phase-2 case
+            // below: this repository HAS a recorded tree, it's just currently unreachable.
+            logger?.LogWarning(
+                "Repository '{RepositoryId}' latest snapshot {SnapshotId} is cas-tree but its tree " +
+                "could not be resolved — skipping Case 2 sync for this cycle.",
+                repositoryId, latest.SnapshotId);
+        }
+        // else: pre-Phase-2 bootstrap snapshot (no TreeEntries, no TreeFormat) — skip sync for now;
         // the next completed work unit will produce a proper successor via Phase 7.
     }
 
@@ -157,9 +177,9 @@ internal sealed class RepositoryImportService(
 
     private async Task SyncFromFilesystemAsync(
         string repositoryId, string repositoryPath,
-        RepositorySnapshot latest, CancellationToken ct)
+        RepositorySnapshot latest, IReadOnlyDictionary<string, string> latestTree, CancellationToken ct)
     {
-        var snapshotTree = new Dictionary<string, string>(latest.TreeEntries!, StringComparer.Ordinal);
+        var snapshotTree = new Dictionary<string, string>(latestTree, StringComparer.Ordinal);
         var diskTree = new Dictionary<string, string>(StringComparer.Ordinal);
 
         // Walk disk — emit Add/Replace for new or changed files.

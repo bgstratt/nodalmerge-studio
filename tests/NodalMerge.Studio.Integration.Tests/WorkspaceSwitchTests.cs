@@ -32,17 +32,6 @@ public class WorkspaceSwitchTests : IDisposable
         if (Directory.Exists(_repoBPath)) Directory.Delete(_repoBPath, recursive: true);
     }
 
-    // No production code anywhere in this repo registers a real IBlobStoreProvider (it's only ever
-    // supplied via the Rust host's FFI bridge) — a minimal fake makes the CAS/snapshot path
-    // actually active for this test, same as RepositoryImportServiceTests.
-    private sealed class FakeBlobStoreProvider : IBlobStoreProvider
-    {
-        public ValueTask<BlobReadResult> TryGetBlobAsync(string hashHex, CancellationToken ct = default) =>
-            ValueTask.FromResult(BlobReadResult.Missing);
-        public ValueTask PutBlobAsync(string hashHex, byte[] bytes, string? contentType, CancellationToken ct = default) =>
-            ValueTask.CompletedTask;
-    }
-
     [Fact]
     public async Task REST_switch_twice_between_two_repos_updates_sync_state_and_the_global_default()
     {
@@ -88,7 +77,7 @@ public class WorkspaceSwitchTests : IDisposable
             configureServices: services =>
             {
                 services.AddInMemoryStorage();
-                services.AddSingleton<IBlobStoreProvider>(new FakeBlobStoreProvider());
+                services.AddSingleton<IBlobStoreProvider>(new InMemoryBlobStoreProvider());
             });
         await app.StartAsync();
         var client = app.GetTestClient();

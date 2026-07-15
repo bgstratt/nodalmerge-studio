@@ -18,7 +18,11 @@ namespace NodalMerge.Studio.Storage;
 // instead of throwing InvalidOperationException as earlier DI versions did.
 internal sealed class InMemoryRepositorySnapshotService(
     IStudioNodeStore nodeStore,
-    IServiceProvider? serviceProvider = null)
+    IServiceProvider? serviceProvider = null,
+    // Slice 1.1 — when CanWrite, CreateAsync stores the tree map in the CAS (TreeEntries: null,
+    // TreeFormat: "cas-tree") instead of inlining it. Null/CanWrite==false preserves today's
+    // behavior exactly (inline TreeEntries, SHA256 ComputeTreeHash).
+    ISnapshotTreeResolver? treeResolver = null)
     : IRepositorySnapshotService, IRehydratable
 {
     // Per-repository gate serializes CreateAsync so two concurrent callers can't produce
@@ -89,18 +93,41 @@ internal sealed class InMemoryRepositorySnapshotService(
                     : 0;
             }
 
-            var treeHash = ComputeTreeHash(treeEntries);
-            var snapshot = new RepositorySnapshot(
-                SnapshotId: Guid.NewGuid().ToString("N"),
-                RepositoryId: repositoryId,
-                TreeHash: treeHash,
-                Generation: nextGeneration,
-                CreatedAt: DateTimeOffset.UtcNow,
-                BaseSnapshotId: baseSnapshotId,
-                GitCommit: gitCommit,
-                WorkUnitId: workUnitId,
-                Source: source,
-                TreeEntries: treeEntries);
+            RepositorySnapshot snapshot;
+            if (treeResolver?.CanWrite == true)
+            {
+                // Slice 1.1 — move the map into the CAS; the node carries only the root hash.
+                var treeHash = await treeResolver.WriteTreeAsync(treeEntries, ct).ConfigureAwait(false);
+                snapshot = new RepositorySnapshot(
+                    SnapshotId: Guid.NewGuid().ToString("N"),
+                    RepositoryId: repositoryId,
+                    TreeHash: treeHash,
+                    Generation: nextGeneration,
+                    CreatedAt: DateTimeOffset.UtcNow,
+                    BaseSnapshotId: baseSnapshotId,
+                    GitCommit: gitCommit,
+                    WorkUnitId: workUnitId,
+                    Source: source,
+                    TreeEntries: null,
+                    TreeFormat: "cas-tree");
+            }
+            else
+            {
+                // No blob store configured — today's behavior exactly: inline TreeEntries, SHA256
+                // ComputeTreeHash, TreeFormat left null.
+                var treeHash = ComputeTreeHash(treeEntries);
+                snapshot = new RepositorySnapshot(
+                    SnapshotId: Guid.NewGuid().ToString("N"),
+                    RepositoryId: repositoryId,
+                    TreeHash: treeHash,
+                    Generation: nextGeneration,
+                    CreatedAt: DateTimeOffset.UtcNow,
+                    BaseSnapshotId: baseSnapshotId,
+                    GitCommit: gitCommit,
+                    WorkUnitId: workUnitId,
+                    Source: source,
+                    TreeEntries: treeEntries);
+            }
 
             await nodeStore.WriteNodeAsync(
                 StudioNodeKind.RepositorySnapshotV1, snapshot.SnapshotId,
@@ -135,7 +162,23 @@ internal sealed class InMemoryRepositorySnapshotService(
 
         if (opsSince.Count < threshold.Value) return null;
 
-        var newEntries = ApplyOps(latest?.TreeEntries, opsSince);
+        IReadOnlyDictionary<string, string>? baseEntries = null;
+        if (latest is not null)
+        {
+            baseEntries = treeResolver is not null
+                ? await treeResolver.ResolveTreeAsync(latest, ct).ConfigureAwait(false)
+                : latest.TreeEntries;
+
+            if (baseEntries is null)
+            {
+                // Never replay ops onto an empty base — the resolver already logged why (CAS
+                // miss/corrupt, or a pre-Phase-2 legacy snapshot with no map at all). Skip
+                // compaction this cycle; the accumulated ops stay pending for a later attempt.
+                return null;
+            }
+        }
+
+        var newEntries = ApplyOps(baseEntries, opsSince);
         return await CreateAsync(
             repositoryId, newEntries,
             baseSnapshotId: latest?.SnapshotId,
