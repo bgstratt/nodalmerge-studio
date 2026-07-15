@@ -40,7 +40,7 @@ param(
     [string]$BumpVersion = '',
     [string[]]$Platforms = @('win-x64'),
     [switch]$SkipDotnet,
-    [string]$NodalMergePackageVersion = '0.1.1'
+    [string]$NodalMergePackageVersion = '0.2.1'
 )
 
 Set-StrictMode -Version Latest
