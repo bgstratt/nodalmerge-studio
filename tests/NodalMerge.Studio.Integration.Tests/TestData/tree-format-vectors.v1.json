@@ -1,0 +1,172 @@
+{
+  "$comment": "Golden vectors for docs/TREE_OBJECT_FORMAT.md. Consumers: CanonicalTreeSerializerVectorTests (NodalMerge.Studio.Integration.Tests). Frozen: any change to expected bytes is a format break and requires a version bump. When Phase 5's server-side reachability walk lands, this file migrates to the nodalmerge repo parity mechanism (engine/commands/) like blob-layout-vectors.v1.json.",
+  "schema_version": 1,
+  "vectors": [
+    {
+      "id": "v1-empty",
+      "kind": "v1",
+      "comment": "Empty tree.",
+      "input_entries": {},
+      "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":1,\"entries\":{}}",
+      "expected_hash": "d66821f204fcd2b851db0f542202fcf4cfa92c9e8e12e258573ffd964a671735"
+    },
+    {
+      "id": "v1-single",
+      "kind": "v1",
+      "comment": "Single file at a nested path.",
+      "input_entries": {
+        "src/main.rs": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":1,\"entries\":{\"src/main.rs\":\"1111111111111111111111111111111111111111111111111111111111111111\"}}",
+      "expected_hash": "11c8f0947f4111695288dfb187b7b65ec3618b0b0c510b2cb25c4b5d4afa34f1"
+    },
+    {
+      "id": "v1-nested",
+      "kind": "v1",
+      "comment": "Multiple entries; byte-wise UTF-8 key ordering (uppercase before lowercase; lib/ before main.ts).",
+      "input_entries": {
+        "src/main.ts": "3333333333333333333333333333333333333333333333333333333333333333",
+        "README.md": "1111111111111111111111111111111111111111111111111111111111111111",
+        "src/lib/util.ts": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":1,\"entries\":{\"README.md\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"src/lib/util.ts\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"src/main.ts\":\"3333333333333333333333333333333333333333333333333333333333333333\"}}",
+      "expected_hash": "d79ba4d19d2264d6704906a4f8c7e532b9c2bbaab8bd9be8a7e4285591b9fac9"
+    },
+    {
+      "id": "v1-escaping",
+      "kind": "v1",
+      "comment": "Path containing a double quote, a backslash, and U+0001 (escaped as backslash-u-0001, lowercase hex).",
+      "input_entries": {
+        "we\"ird\\path\u0001.txt": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":1,\"entries\":{\"we\\\"ird\\\\path\\u0001.txt\":\"1111111111111111111111111111111111111111111111111111111111111111\"}}",
+      "expected_hash": "3aa6aa205c3ce0ba07a10f16bea7737e4f58039832130abaf56bc08f3c706a09"
+    },
+    {
+      "id": "v1-utf8-ordering",
+      "kind": "v1",
+      "comment": "U+FF61 (EF BD A1) sorts before U+10000 (F0 90 80 80) in UTF-8 byte order, though UTF-16 ordinal would reverse them.",
+      "input_entries": {
+        "\uD800\uDC00.txt": "2222222222222222222222222222222222222222222222222222222222222222",
+        "｡.txt": "1111111111111111111111111111111111111111111111111111111111111111",
+        "z.txt": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":1,\"entries\":{\"z.txt\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"｡.txt\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"\uD800\uDC00.txt\":\"2222222222222222222222222222222222222222222222222222222222222222\"}}",
+      "expected_hash": "679d96fefe1b45cfd0abbf8d7662203d70b62cd7c9ac3a1986a0a69b2a033361"
+    },
+    {
+      "id": "v2-empty",
+      "kind": "v2",
+      "comment": "Empty tree: a single root blob with no entries.",
+      "input_entries": {},
+      "expected_blobs": [
+        {
+          "directory": "",
+          "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[]}",
+          "expected_hash": "3c38d74c12d783d8b613811552e230d854fc5814405458e48082b81151c552bb"
+        }
+      ],
+      "expected_root_hash": "3c38d74c12d783d8b613811552e230d854fc5814405458e48082b81151c552bb"
+    },
+    {
+      "id": "v2-single",
+      "kind": "v2",
+      "comment": "Single file in the root directory.",
+      "input_entries": {
+        "main.rs": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected_blobs": [
+        {
+          "directory": "",
+          "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[{\"n\":\"main.rs\",\"k\":\"f\",\"h\":\"1111111111111111111111111111111111111111111111111111111111111111\"}]}",
+          "expected_hash": "bfa4d9a4f421b35eb496fe09f1f810cf7350104be8336ad33151adb19a8ce370"
+        }
+      ],
+      "expected_root_hash": "bfa4d9a4f421b35eb496fe09f1f810cf7350104be8336ad33151adb19a8ce370"
+    },
+    {
+      "id": "v2-nested",
+      "kind": "v2",
+      "comment": "Two-level nesting; blobs listed bottom-up (deepest first, root last).",
+      "input_entries": {
+        "src/main.ts": "3333333333333333333333333333333333333333333333333333333333333333",
+        "README.md": "1111111111111111111111111111111111111111111111111111111111111111",
+        "src/lib/util.ts": "2222222222222222222222222222222222222222222222222222222222222222"
+      },
+      "expected_blobs": [
+        {
+          "directory": "src/lib",
+          "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[{\"n\":\"util.ts\",\"k\":\"f\",\"h\":\"2222222222222222222222222222222222222222222222222222222222222222\"}]}",
+          "expected_hash": "25bb888f86b995601f414177c7537a4d4bd34f5949ab865338414d0bfc901a10"
+        },
+        {
+          "directory": "src",
+          "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[{\"n\":\"lib\",\"k\":\"d\",\"h\":\"25bb888f86b995601f414177c7537a4d4bd34f5949ab865338414d0bfc901a10\"},{\"n\":\"main.ts\",\"k\":\"f\",\"h\":\"3333333333333333333333333333333333333333333333333333333333333333\"}]}",
+          "expected_hash": "935c315a3670381a3b318fc3d997f72903d740310c0709b171929660d3b07d55"
+        },
+        {
+          "directory": "",
+          "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[{\"n\":\"README.md\",\"k\":\"f\",\"h\":\"1111111111111111111111111111111111111111111111111111111111111111\"},{\"n\":\"src\",\"k\":\"d\",\"h\":\"935c315a3670381a3b318fc3d997f72903d740310c0709b171929660d3b07d55\"}]}",
+          "expected_hash": "ff920d5a8238e099bb857e56e81550c44ed9a573a3f8a60e85c0b44a05e5d660"
+        }
+      ],
+      "expected_root_hash": "ff920d5a8238e099bb857e56e81550c44ed9a573a3f8a60e85c0b44a05e5d660"
+    },
+    {
+      "id": "v2-sharing-a",
+      "kind": "v2",
+      "comment": "Sharing pair (a): src/ subtree identical to v2-sharing-b — its blob bytes and hash must be identical.",
+      "input_entries": {
+        "a.txt": "4444444444444444444444444444444444444444444444444444444444444444",
+        "src/lib/util.ts": "2222222222222222222222222222222222222222222222222222222222222222",
+        "src/main.ts": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "expected_blobs": [
+        {
+          "directory": "src/lib",
+          "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[{\"n\":\"util.ts\",\"k\":\"f\",\"h\":\"2222222222222222222222222222222222222222222222222222222222222222\"}]}",
+          "expected_hash": "25bb888f86b995601f414177c7537a4d4bd34f5949ab865338414d0bfc901a10"
+        },
+        {
+          "directory": "src",
+          "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[{\"n\":\"lib\",\"k\":\"d\",\"h\":\"25bb888f86b995601f414177c7537a4d4bd34f5949ab865338414d0bfc901a10\"},{\"n\":\"main.ts\",\"k\":\"f\",\"h\":\"3333333333333333333333333333333333333333333333333333333333333333\"}]}",
+          "expected_hash": "935c315a3670381a3b318fc3d997f72903d740310c0709b171929660d3b07d55"
+        },
+        {
+          "directory": "",
+          "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[{\"n\":\"a.txt\",\"k\":\"f\",\"h\":\"4444444444444444444444444444444444444444444444444444444444444444\"},{\"n\":\"src\",\"k\":\"d\",\"h\":\"935c315a3670381a3b318fc3d997f72903d740310c0709b171929660d3b07d55\"}]}",
+          "expected_hash": "30d89d8c3876ba3b3206ed446a4ffdd6bae33b084e6868af709e8638239dfbe9"
+        }
+      ],
+      "expected_root_hash": "30d89d8c3876ba3b3206ed446a4ffdd6bae33b084e6868af709e8638239dfbe9"
+    },
+    {
+      "id": "v2-sharing-b",
+      "kind": "v2",
+      "comment": "Sharing pair (b): differs from v2-sharing-a only in the root-level file; all src/ subtree blobs identical.",
+      "input_entries": {
+        "b.txt": "5555555555555555555555555555555555555555555555555555555555555555",
+        "src/lib/util.ts": "2222222222222222222222222222222222222222222222222222222222222222",
+        "src/main.ts": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "expected_blobs": [
+        {
+          "directory": "src/lib",
+          "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[{\"n\":\"util.ts\",\"k\":\"f\",\"h\":\"2222222222222222222222222222222222222222222222222222222222222222\"}]}",
+          "expected_hash": "25bb888f86b995601f414177c7537a4d4bd34f5949ab865338414d0bfc901a10"
+        },
+        {
+          "directory": "src",
+          "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[{\"n\":\"lib\",\"k\":\"d\",\"h\":\"25bb888f86b995601f414177c7537a4d4bd34f5949ab865338414d0bfc901a10\"},{\"n\":\"main.ts\",\"k\":\"f\",\"h\":\"3333333333333333333333333333333333333333333333333333333333333333\"}]}",
+          "expected_hash": "935c315a3670381a3b318fc3d997f72903d740310c0709b171929660d3b07d55"
+        },
+        {
+          "directory": "",
+          "expected_bytes": "{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[{\"n\":\"b.txt\",\"k\":\"f\",\"h\":\"5555555555555555555555555555555555555555555555555555555555555555\"},{\"n\":\"src\",\"k\":\"d\",\"h\":\"935c315a3670381a3b318fc3d997f72903d740310c0709b171929660d3b07d55\"}]}",
+          "expected_hash": "bf4746369dbb27f458b16d41209d590f22748eda70e71980a59a667ac1b0a28d"
+        }
+      ],
+      "expected_root_hash": "bf4746369dbb27f458b16d41209d590f22748eda70e71980a59a667ac1b0a28d"
+    }
+  ]
+}
