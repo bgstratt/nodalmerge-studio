@@ -2927,3 +2927,74 @@ public sealed record GitExportResult(
     bool Pushed = false,
     string? PushOutput = null,
     string? Message = null);
+
+// ── Phase 5 slice 5.1 — snapshot retention classification ───────────────────────────────────
+//
+// plans/cas-distribution-and-storage.md Phase 5: "truth is the promoted history; everything
+// else is cache with a TTL." A RepositorySnapshot NODE is never deleted (AP-5, append-only) —
+// this policy only decides which generations' *tree/blob bytes* must stay materializable right
+// now. Pure policy, no behavior change: nothing consumes this yet (that's slice 5.2's
+// LiveHashSource v2 rewrite of IWorkspaceCacheManager.GetLiveBlobHashesAsync).
+public enum SnapshotRetentionClass
+{
+    // Live forever by default: the bootstrap generation of a repository, every generation an
+    // applied merge proposal's write-back resync stamped (WorkUnit.Metadata["appliedSnapshotId"]),
+    // and admin pins.
+    Pinned,
+
+    // Live regardless of age: a repository's current head, or a generation a still-in-flight
+    // (non-terminal) work unit's branch depends on as its seed/merge base.
+    Active,
+
+    // Live only until RetainIntermediateDays past its branch reaching a terminal state (falling
+    // back to the snapshot's own CreatedAt when no better timestamp is available) — everything
+    // that is neither Pinned nor Active.
+    Intermediate
+}
+
+/// <summary>
+/// One snapshot generation's classification. <see cref="RepositoryId"/> is null only for the
+/// fail-safe anomaly case (the RepositorySnapshot node itself failed to deserialize — its
+/// EntityId is still known and reported as <see cref="SnapshotId"/>, but nothing else about it
+/// could be read). <see cref="Reason"/> is a human-readable audit trail, not machine-parsed —
+/// safe to render directly in a debug/REST dump. <see cref="ExpiresAt"/> is set only for
+/// Intermediate entries (null for Pinned/Active, which never expire under this policy).
+/// </summary>
+public sealed record SnapshotRetentionEntry(
+    string SnapshotId,
+    string? RepositoryId,
+    SnapshotRetentionClass Class,
+    string Reason,
+    bool Retained,
+    DateTimeOffset? ExpiresAt);
+
+/// <summary>
+/// Result of <see cref="ISnapshotRetentionPolicy.ClassifyAsync"/>. <see cref="RetainedSnapshotIds"/>
+/// is the set slice 5.2's LiveHashSource v2 will union with op-referenced blobs and pins — every
+/// Pinned and Active snapshot, plus every not-yet-expired Intermediate one. <see cref="Anomalies"/>
+/// carries data-integrity notes that don't map to a single snapshot entry (e.g. a WorkUnit node
+/// that failed to parse, so its own branch-seed/merge-base contribution to <see cref="Snapshots"/>
+/// could not be computed) — fail-safe bias means nothing is ever demoted because of these, but an
+/// operator reading the report should know the input data had gaps.
+/// </summary>
+public sealed record SnapshotRetentionReport(
+    IReadOnlyList<SnapshotRetentionEntry> Snapshots,
+    IReadOnlySet<string> RetainedSnapshotIds,
+    int PinnedCount,
+    int ActiveCount,
+    int IntermediateRetainedCount,
+    int IntermediateExpiredCount,
+    DateTimeOffset EvaluatedAt,
+    IReadOnlyList<string> Anomalies);
+
+/// <summary>
+/// Classifies every stored RepositorySnapshot generation into Pinned/Active/Intermediate — see
+/// plans/cas-distribution-and-storage.md Phase 5 slice 5.1. Deterministic given node-store
+/// contents and the injected clock; a sibling read-model over the same rows
+/// IWorkspaceCacheManager.GetLiveBlobHashesAsync already reads (RepositorySnapshotV1, WorkUnitV1).
+/// Ships as a service + tests only in 5.1 — nothing consumes it until 5.2.
+/// </summary>
+public interface ISnapshotRetentionPolicy
+{
+    Task<SnapshotRetentionReport> ClassifyAsync(CancellationToken ct = default);
+}

@@ -258,6 +258,18 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IWorkspaceCacheManager>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
 
+        // Phase 5 slice 5.1 — snapshot retention classification. Pure policy service + tests only:
+        // nothing consumes ISnapshotRetentionPolicy yet (that's slice 5.2's LiveHashSource v2
+        // rewrite of GetLiveBlobHashesAsync above). No state of its own, so unlike
+        // WorkspaceCacheManager it doesn't implement IRehydratable/IHostedService — every read
+        // goes straight through IStudioNodeStore at ClassifyAsync call time.
+        services.AddSingleton(new RetentionPolicyOptions());
+        services.AddSingleton<ISnapshotRetentionPolicy>(sp => new SnapshotRetentionPolicy(
+            sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetRequiredService<IRepositoryRegistryService>(),
+            sp.GetService<WorkspaceOptions>(),
+            sp.GetService<RetentionPolicyOptions>()));
+
         services.AddSingleton<RepositorySyncService>();
         services.AddSingleton<IRepositorySyncService>(sp => sp.GetRequiredService<RepositorySyncService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<RepositorySyncService>());
