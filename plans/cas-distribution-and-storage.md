@@ -50,7 +50,15 @@
       `NodalMergeStudioNodeStore` + legacy migration (`de64155`; discovered the
       live-maps↔sync-graph split — see Phase 6 note), 6.1b bidirectional
       `RoomPeerClient` + retirement of the 30 s promoter tick (`a6085fc`) — two-host
-      replication integration test green. Remaining: 6.2–6.5.
+      replication integration test green. **6.2 shipped 2026-07-15** (`e765243` +
+      `0c703e4`): `RepositoryIdentityHints` (LibGit2Sharp, frozen normalization),
+      `IWorkgroupRepositoryDirectory` over a generalized `EngineRoomMap`, preferred-id
+      continuity (no dual identities for existing workspaces), REST disambiguation
+      surface; user-approved pre-replication amendment fixed the normalization
+      step order (slash-strip before `.git`-strip). NOTE for 6.3/6.4:
+      `RoomPeerClient` is still single-room — workgroup-room writes are durable
+      locally but not yet pushed upstream; multi-room membership is the gap 6.3
+      closes. Remaining: 6.3–6.5.
 
 Baseline measurement (`tools/measure-cas-baseline.ps1`, run 2026-07-15): no heavy-use
 workspace exists yet — real repos so far are small, so the projected ~400 KB/generation
