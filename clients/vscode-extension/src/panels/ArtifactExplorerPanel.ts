@@ -1360,10 +1360,27 @@ export class GoalWorkspacePanel {
         profileIds: [template.orchestrator],
       });
 
+      // The server's scheduled review gate (AutomatedReviewGateService.TryEnqueueReviewerAsync) is
+      // enabled by a non-null autoReviewProfileId — which nothing was sending. Result: the scheduled
+      // reviewer never ran, so AgentApproval/Hybrid goals that rely on that gate (notably atomic
+      // no-plan goals, which have no reconciliation → inline-review path) parked at ReadyForReview
+      // forever with no reviewer. Send the reviewer role's profile: an explicitly-assigned reviewer
+      // wins; "inherit default" (empty) falls back to the Default/orchestrator profile — a profile is
+      // a profile, any role inherits Default (plans/orchestrator-pure-service.md). Only send it when a
+      // policy actually wants an agent to review — HumanRequired must keep waiting for a human. Also
+      // send profileId so the goal records its Default-profile id (was persisting null → the null
+      // defaultProfileId in GET /studio/goals).
+      const effTaskPolicy = taskReviewPolicy ?? this.configService.getDefaultTaskReviewPolicy();
+      const effWorkspacePolicy = workspaceReviewPolicy ?? this.configService.getDefaultWorkspaceReviewPolicy();
+      const wantsAgentReview = [effTaskPolicy, effWorkspacePolicy]
+        .some(p => p === 'AgentApproval' || p === 'Hybrid');
+
       await this.post('/studio/agents/spawn', {
         agentType: 'orchestrator',
         workUnitId: rootWu.workUnitId,
         ...orchCfg,
+        profileId: template.orchestrator,
+        ...(wantsAgentReview ? { autoReviewProfileId: template.reviewer || template.orchestrator } : {}),
         ...(Object.keys(stageCredentials).length > 0 ? { stageCredentials } : {}),
       });
 
@@ -1385,7 +1402,7 @@ export class GoalWorkspacePanel {
   // POST /studio/scheduler/{workUnitId}/resume. Shared by the single-node Resume button and the
   // goal-level "Resume parked work" action so both go through the exact same resolution.
   private async resumeWorkUnit(workUnitId: string): Promise<void> {
-    let body: Record<string, string> = {};
+    let body: Record<string, unknown> = {};
     if (this.configService && this.secrets) {
       // The scheduler queue item (not WorkUnit, which doesn't carry profileId) says which
       // profile this task was dispatched under — re-fetch it here rather than threading it

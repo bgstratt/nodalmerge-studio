@@ -80,7 +80,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string Provider, string Model, string BaseUrl, string ApiKey, string? ProfileId, string? AutoReviewProfileId,
         IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? StageCredentials = null,
         IReadOnlyList<string>? EnabledDomainAgents = null,
-        string? CredentialRef = null);
+        string? CredentialRef = null,
+        bool LenientToolParsing = false);
 
     // ── IHostedService ─────────────────────────────────────────────────────
 
@@ -286,6 +287,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             }
             apiKey ??= string.Empty;
 
+            // Lenient tool-call parsing is a per-profile opt-in that rides the stage's credential
+            // (GoalDefaultCredentials.LenientToolParsing). Resolve it for the stage this loop is
+            // about to run — falling back to the goal's Default-profile credentials for a stage that
+            // inherits Default — and default to false (strict) whenever nothing is registered.
+            var lenientToolParsing =
+                (GetCredentialsForStage(item.WorkUnitId, profile?.Stage ?? PipelineStage.Execute)
+                 ?? GetGoalDefaultCredentials(item.WorkUnitId))?.LenientToolParsing ?? false;
+
             _agents[agentId] = new AgentRecord(agentId, item.WorkUnitId, "active", taskId, model, baseUrl, apiKey, provider, cts);
 
             // claude-cli needs no baseUrl/apiKey (ambient CLI auth; blank model = the CLI's own
@@ -327,6 +336,15 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 // LLM client anymore.
                 var ruleFileContext = await BuildRuleFileContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
 
+                // The work unit's OWN goal, inlined into the native worker/planner kickoff (see
+                // HarnessRunRequest.Goal). This is WorkUnit.Goal — a child's slice goal or an atomic
+                // goal's full text — NOT the unbounded root goal the removed BuildOriginalGoalContextAsync
+                // pushed into every sibling (see the Execute branch comment below). Null-safe: a unit test
+                // with a hand-rolled service provider gets null and the kickoff falls back to task-only.
+                var goalText = _serviceProvider.GetService<IWorkUnitService>() is { } goalWuSvc
+                    ? (await goalWuSvc.GetAsync(item.WorkUnitId, ct).ConfigureAwait(false))?.Goal
+                    : null;
+
                 AgentLoopCompletion completion;
                 string? harnessFailureReason = null;
                 var workerProgressVerified = true;
@@ -357,7 +375,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         PromptGuidanceContext: combinedContext.Length == 0 ? null : combinedContext,
                         SelfVerifyBuild: false, SelfVerifyTest: false,
                         OnActivity: a => ReportActivity(agentId, a),
-                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey);
+                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey,
+                        Goal: goalText, LenientToolParsing: lenientToolParsing);
                     var planResult = await planExecutor.RunAsync(planRequest, cts.Token).ConfigureAwait(false);
                     completion = planResult.Completion;
                     harnessFailureReason = planResult.FailureReason;
@@ -398,7 +417,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         PromptGuidanceContext: null,
                         SelfVerifyBuild: false, SelfVerifyTest: false,
                         OnActivity: a => ReportActivity(agentId, a),
-                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey);
+                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey,
+                        LenientToolParsing: lenientToolParsing);
                     var reviewResult = await reviewExecutor.RunAsync(reviewRequest, cts.Token).ConfigureAwait(false);
                     completion = reviewResult.Completion;
                     harnessFailureReason = reviewResult.FailureReason;
@@ -450,7 +470,8 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                         SelfVerifyBuild: _options.RequireBuildBeforeProposal,
                         SelfVerifyTest: _options.RequireTestBeforeProposal,
                         OnActivity: a => ReportActivity(agentId, a),
-                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey);
+                        Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey,
+                        Goal: goalText, LenientToolParsing: lenientToolParsing);
                     var harnessResult = await executor.RunAsync(harnessRequest, cts.Token).ConfigureAwait(false);
                     completion = harnessResult.Completion;
                     harnessFailureReason = harnessResult.FailureReason;
@@ -713,6 +734,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
         IReadOnlyList<string>? enabledDomainAgents = null,
         string? credentialRef = null,
+        bool lenientToolParsing = false,
         CancellationToken cancellationToken = default)
     {
         var agentId = $"{agentType}-{Guid.NewGuid():N}";
@@ -756,7 +778,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 // unchanged.
                 _goalCredentialRegistrations[workUnitId] = new GoalCredentialRegistration(
                     resolvedProvider, loopModel, baseUrl ?? string.Empty, apiKey ?? string.Empty, profileId, autoReviewProfileId,
-                    stageCredentials, enabledDomainAgents, credentialRef);
+                    stageCredentials, enabledDomainAgents, credentialRef, lenientToolParsing);
 
                 _credentialCache.Capture(credentialRef, resolvedProvider, loopModel, baseUrl, apiKey);
 
@@ -766,7 +788,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 // doesn't. See RehydrateGoalRoutingAsync for the read side.
                 var routing = new GoalRoutingConfig(
                     workUnitId, resolvedProvider, loopModel, baseUrl ?? string.Empty, profileId, autoReviewProfileId,
-                    credentialRef, stageCredentials, enabledDomainAgents);
+                    credentialRef, stageCredentials, enabledDomainAgents, lenientToolParsing);
                 _goalRouting[workUnitId] = routing;
                 await _nodeStore.WriteNodeAsync(
                     StudioNodeKind.GoalRoutingV1, workUnitId,
@@ -830,6 +852,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         string? autoReviewProfileId = null;
         IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null;
         IReadOnlyList<string>? enabledDomainAgents = null;
+        var lenientToolParsing = false;
 
         // Same-process hot path first (real ApiKey already in memory, no cache lookup needed).
         if (_goalCredentialRegistrations.TryGetValue(workUnitId, out var reg))
@@ -838,6 +861,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             profileId ??= reg.ProfileId; credentialRef ??= reg.CredentialRef;
             autoReviewProfileId = reg.AutoReviewProfileId;
             stageCredentials = reg.StageCredentials; enabledDomainAgents = reg.EnabledDomainAgents;
+            lenientToolParsing = reg.LenientToolParsing;
         }
         else if (_goalRouting.TryGetValue(workUnitId, out var routing))
         {
@@ -851,6 +875,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             profileId ??= routing.ProfileId; credentialRef ??= routing.CredentialRef;
             autoReviewProfileId = routing.AutoReviewProfileId;
             stageCredentials = routing.StageCredentials; enabledDomainAgents = routing.EnabledDomainAgents;
+            lenientToolParsing = routing.LenientToolParsing;
             var cached = _credentialCache.TryGet(credentialRef);
             apiKey ??= cached?.ApiKey;
             model ??= cached?.Model; baseUrl ??= cached?.BaseUrl; provider ??= cached?.Provider;
@@ -895,10 +920,10 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         // can recover this orchestrator too, closing the gap that got it here in the first place.
         _goalCredentialRegistrations[workUnitId] = new GoalCredentialRegistration(
             provider, model, baseUrl, apiKey, profileId, autoReviewProfileId,
-            stageCredentials, enabledDomainAgents, credentialRef);
+            stageCredentials, enabledDomainAgents, credentialRef, lenientToolParsing);
         var routingToPersist = new GoalRoutingConfig(
             workUnitId, provider, model, baseUrl, profileId, autoReviewProfileId,
-            credentialRef, stageCredentials, enabledDomainAgents);
+            credentialRef, stageCredentials, enabledDomainAgents, lenientToolParsing);
         _goalRouting[workUnitId] = routingToPersist;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.GoalRoutingV1, workUnitId,
@@ -958,14 +983,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
     public GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId)
     {
         if (_goalCredentialRegistrations.TryGetValue(workUnitId, out var reg))
-            return new GoalDefaultCredentials(reg.Provider, reg.Model, reg.BaseUrl, reg.ApiKey, reg.ProfileId, reg.CredentialRef);
+            return new GoalDefaultCredentials(reg.Provider, reg.Model, reg.BaseUrl, reg.ApiKey, reg.ProfileId, reg.CredentialRef, reg.LenientToolParsing);
 
         if (!_goalRouting.TryGetValue(workUnitId, out var routing))
             return null;
 
         var cached = _credentialCache.TryGet(routing.CredentialRef);
         if (cached is not null)
-            return new GoalDefaultCredentials(cached.Provider, cached.Model, cached.BaseUrl, cached.ApiKey, routing.ProfileId, routing.CredentialRef);
+            return new GoalDefaultCredentials(cached.Provider, cached.Model, cached.BaseUrl, cached.ApiKey, routing.ProfileId, routing.CredentialRef, routing.LenientToolParsing);
 
         // CLI providers reconstruct from the persisted routing alone: blank key IS the credential
         // (ambient CLI login), and RuntimeCredentialCache deliberately never stores blank-key
@@ -973,7 +998,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         // every CLI-provider goal's credential resolution (planner enqueues, fan-out inheritance,
         // review routing) silently died on the first restart (found live 2026-07-13).
         if (IsCliProviderSafe(routing.Provider))
-            return new GoalDefaultCredentials(routing.Provider, routing.Model, routing.BaseUrl, string.Empty, routing.ProfileId, routing.CredentialRef);
+            return new GoalDefaultCredentials(routing.Provider, routing.Model, routing.BaseUrl, string.Empty, routing.ProfileId, routing.CredentialRef, routing.LenientToolParsing);
 
         return null;
     }

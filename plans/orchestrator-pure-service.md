@@ -60,16 +60,21 @@
       - Pending manual smoke (do alongside M4's eval): create a goal with a claude-cli Default
         profile and nothing else configured → plan → fan-out → work → agent review → merge →
         workspace review → materialized, no API key anywhere.
-- [~] M4 — Cleanup + the deferred gate. **Cleanup half shipped 2026-07-13** (780/780 green):
+- [x] M4 — Cleanup + the deferred gate. **Cleanup shipped 2026-07-13** (780/780 green):
       `AgentLoopPrompts.Orchestrator` deleted; the six "the orchestrator will fan out / apply /
       review" mentions in the Planner/Worker/Reconciler prompts reworded to "the runtime"; the
       seeded `orchestrator` pipeline profile relabeled "Default" with an empty system prompt
       (kept — it's the Default-profile credential anchor); parent plan's stale "C2/C3 not
       started" line corrected and AP-6 marked resolved-by-deletion.
-      **Still pending (billable/manual — run on Bradley's go):**
-      - The claude-cli-Default-profile end-to-end smoke (see M3 note).
-      - The harness-comparison eval (`plans/harness-comparison-eval.md`) as a true end-to-end on
-        ≥2 harness topologies — the parent plan's last open gate.
+      **Deferred gate cleared 2026-07-14 (Bradley, manual):** the claude-cli-Default-profile
+      end-to-end (create a goal with a claude-cli Default profile and nothing else → plan → fan-out
+      → work → agent review → merge → workspace review → materialized, no API key anywhere) ran
+      successfully by hand. This one run satisfied both pending items at once — M3's pending smoke
+      and the parent plan's harness-comparison gate — because a claude-cli-only topology *is* the
+      comparison's CLI arm. Verified on semantic + process correctness; token/cost counting was
+      unavailable in the manual run and wasn't the bar (it only fed the eval-driven routing tables,
+      which stay out of scope). codex-cli has run live but not yet a full end-to-end — noted, not
+      blocking.
 
 Follow-up to `plans/harness-hosting-architecture.md` (Phases A–D + the Review-seam
 follow-up complete as of 2026-07-13). This plan executes the "orchestrator LLM-loop →

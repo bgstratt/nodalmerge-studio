@@ -461,7 +461,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
             ?? '';
           if (!workUnitId) { return; }
 
-          let spawnBody: Record<string, string> = { agentType, workUnitId };
+          let spawnBody: Record<string, unknown> = { agentType, workUnitId };
           if (this.configService && this.secrets && this.lmProxyBaseUrl) {
             const llm = await this.configService.resolveSpawnLlmConfig(
               agentType, this.secrets, this.lmProxyBaseUrl,
@@ -552,7 +552,7 @@ export class ExecutionTimelinePanel implements vscode.Disposable {
           // IRuntimeCredentialCache), re-resolve it from the same profile it was dispatched under
           // and resupply it as part of the resume call — mirrors ArtifactExplorerPanel's Resume
           // action so both surfaces recover the same way.
-          let resumeBody: Record<string, string> = {};
+          let resumeBody: Record<string, unknown> = {};
           if (this.configService && this.secrets) {
             const pending = await this.get<Array<{ workUnitId: string; profileId: string }>>('/studio/scheduler/pending').catch(() => []);
             const item = pending?.find(i => i.workUnitId === resumeWorkUnitId);

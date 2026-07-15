@@ -8,7 +8,8 @@ internal sealed class DefaultAgentToolClient(
     string baseUrl,
     string apiKey,
     LlmClient llm,
-    McpToolDispatcher dispatcher) : IAgentToolClient
+    McpToolDispatcher dispatcher,
+    bool lenientToolParsing = false) : IAgentToolClient
 {
     public string Provider => provider;
     public string Model => model;
@@ -21,7 +22,7 @@ internal sealed class DefaultAgentToolClient(
         string systemPrompt,
         CancellationToken ct = default,
         Func<TransientRetryAttempt, Task>? onTransientRetry = null)
-        => llm.SendAsync(provider, model, baseUrl, apiKey, messages, tools, systemPrompt, ct, onTransientRetry);
+        => llm.SendAsync(provider, model, baseUrl, apiKey, messages, tools, systemPrompt, ct, onTransientRetry, lenientToolParsing);
 
     public Task<string> DispatchAsync(
         string toolName,

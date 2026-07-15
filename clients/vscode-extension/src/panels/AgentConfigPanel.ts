@@ -61,7 +61,13 @@ export class ModelAgentStudioPanel {
     let tick = 0;
     const timer = setInterval(() => {
       void this.sendParticipants();
-      if (++tick % 3 === 0) { void this.sendConfig(); }
+      // Only refresh SERVER-derived data on the timer (pipeline profiles, domain agents, CLI
+      // providers) — never re-push profiles/templates/defaultTopology. Those live in VS Code
+      // settings, are available synchronously at activate(), and change only when the user saves
+      // from this panel. A periodic full 'config' push used to wholesale-overwrite the webview's
+      // in-memory profiles/templates, silently discarding an in-progress topology edit the user
+      // hadn't saved yet (looked like "the topology keeps resetting to Default").
+      if (++tick % 3 === 0) { void this.sendServerData(); }
     }, 10_000);
     this.panel.onDidDispose(() => clearInterval(timer));
   }
@@ -128,6 +134,31 @@ export class ModelAgentStudioPanel {
       { providerKey: 'claude-cli', displayName: 'Claude Code CLI' },
       { providerKey: 'codex-cli', displayName: 'Codex CLI' },
     ];
+  }
+
+  // The timer-driven counterpart to sendConfig(): pushes only the server-derived slices, so a
+  // periodic refresh (surfacing data that wasn't ready at activate()) can never clobber the
+  // user's unsaved profile/topology edits held in the webview. The webview's 'serverData' handler
+  // updates just these fields and re-renders their sections, leaving profiles/templates untouched.
+  private async sendServerData(): Promise<void> {
+    let pipelineProfiles: PipelineProfile[] = [];
+    let domainAgents: DomainAgentInfo[] = [];
+    let enabledDomainAgents: string[] = [];
+    try {
+      [pipelineProfiles, domainAgents] = await Promise.all([
+        this.get<PipelineProfile[]>('/studio/agent-profiles'),
+        this.get<DomainAgentInfo[]>('/studio/domain-agents'),
+      ]);
+      const opts = await this.get<{ enabledDomainAgents?: string[] }>('/studio/options');
+      enabledDomainAgents = opts.enabledDomainAgents ?? [];
+    } catch { /* server may not be running yet */ }
+    void this.panel.webview.postMessage({
+      type: 'serverData',
+      pipelineProfiles,
+      domainAgents,
+      enabledDomainAgents,
+      cliProviders: await this.fetchCliProviders(),
+    });
   }
 
   private async sendParticipants(): Promise<void> {

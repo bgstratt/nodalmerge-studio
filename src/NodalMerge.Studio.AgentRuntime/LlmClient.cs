@@ -96,7 +96,8 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
         IReadOnlyList<LlmToolDef> tools,
         string systemPrompt,
         CancellationToken ct = default,
-        Func<TransientRetryAttempt, Task>? onTransientRetry = null)
+        Func<TransientRetryAttempt, Task>? onTransientRetry = null,
+        bool lenientToolParsing = false)
     {
         var attemptMessages = messages;
         var transientAttempt = 0;
@@ -105,7 +106,7 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
             try
             {
                 return provider.Equals("openai", StringComparison.OrdinalIgnoreCase)
-                    ? await SendOpenAiAsync(model, baseUrl, apiKey, attemptMessages, tools, systemPrompt, ct).ConfigureAwait(false)
+                    ? await SendOpenAiAsync(model, baseUrl, apiKey, attemptMessages, tools, systemPrompt, ct, lenientToolParsing).ConfigureAwait(false)
                     : await SendAnthropicAsync(model, baseUrl, apiKey, attemptMessages, tools, systemPrompt, ct).ConfigureAwait(false);
             }
             catch (MalformedLlmResponseException ex) when (attempt < MaxRetries)
@@ -272,7 +273,8 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
         IReadOnlyList<NmMessage> messages,
         IReadOnlyList<LlmToolDef> tools,
         string systemPrompt,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool lenientToolParsing = false)
     {
         var allMessages = new List<object> { new { role = "system", content = systemPrompt + OutputFormatGuardrail } };
         foreach (var msg in messages)
@@ -352,7 +354,30 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
             }
         }
 
-        var stopReason = choice.FinishReason switch
+        // Lenient fallback (opt-in per Model Profile) — small quantized local models frequently emit
+        // their tool call as message text / a ```json fence instead of the structured tool_calls
+        // field. Only fires when: the profile opted in, the structured field yielded nothing, and the
+        // ENTIRE message (after unfencing) is one or more top-level JSON objects whose "name" each
+        // matches a tool we actually offered. Those two guards — whole-message-only and
+        // registered-name-only — are what keep a content-producing response (documentation, a plan,
+        // or a proposal that merely embeds example JSON, all of which carry surrounding prose) from
+        // being misread as a tool call. See GoalDefaultCredentials.LenientToolParsing.
+        var recoveredToolUse = false;
+        if (lenientToolParsing
+            && !contents.OfType<NmToolUse>().Any()
+            && !string.IsNullOrWhiteSpace(choice.Message.Content)
+            && TryRecoverTextToolCalls(choice.Message.Content!, tools, out var recovered))
+        {
+            contents.RemoveAll(c => c is NmText);   // the JSON WAS the call, not prose — don't keep both
+            foreach (var (name, input) in recovered)
+                contents.Add(new NmToolUse(Guid.NewGuid().ToString("N"), name, input));
+            recoveredToolUse = true;
+            logger?.LogInformation(
+                "Lenient tool-call recovery: parsed {Count} tool call(s) from message text " +
+                "(model did not use structured tool_calls).", recovered.Count);
+        }
+
+        var stopReason = recoveredToolUse ? "tool_use" : choice.FinishReason switch
         {
             "tool_calls" => "tool_use",
             "stop"       => "end_turn",
@@ -370,6 +395,101 @@ internal sealed class LlmClient(HttpClient http, ILogger<LlmClient>? logger = nu
         return new LlmResponse(
             contents, stopReason, raw.Usage?.PromptTokens, raw.Usage?.CompletionTokens,
             raw.Usage?.Estimated ?? false);
+    }
+
+    // Best-effort recovery of tool calls a lenient-mode model wrote into message content instead of
+    // the structured tool_calls field. Returns true ONLY when the entire content (after stripping a
+    // single surrounding ``` fence) is one or more top-level JSON objects, each an object with a
+    // "name" that matches a tool in `tools`. Any surrounding prose, any object whose name isn't an
+    // offered tool, or any malformed object → false (caller keeps the content as plain text). Those
+    // guards are what make lenient mode safe for content-producing roles.
+    // internal (not private) for direct unit testing via InternalsVisibleTo — this is the safety-
+    // critical guard whose false-positive behavior the tests pin down.
+    internal static bool TryRecoverTextToolCalls(
+        string content, IReadOnlyList<LlmToolDef> tools,
+        out List<(string Name, JsonElement Input)> calls)
+    {
+        calls = [];
+        var text = StripCodeFence(content).Trim();
+        if (text.Length == 0 || text[0] != '{') return false;
+
+        var known = new HashSet<string>(tools.Select(t => t.Name), StringComparer.Ordinal);
+        var i = 0;
+        while (i < text.Length)
+        {
+            // Only whitespace may sit between/after objects — any other character means this is prose
+            // that happens to contain JSON, not a bare tool call, so bail and keep it as text.
+            if (char.IsWhiteSpace(text[i])) { i++; continue; }
+            if (text[i] != '{') { calls = []; return false; }
+
+            var end = FindObjectEnd(text, i);
+            if (end < 0) { calls = []; return false; }
+
+            JsonElement obj;
+            try { obj = JsonSerializer.Deserialize<JsonElement>(text[i..(end + 1)], DeserOpts); }
+            catch (JsonException) { calls = []; return false; }
+
+            if (obj.ValueKind != JsonValueKind.Object
+                || !obj.TryGetProperty("name", out var nameEl)
+                || nameEl.ValueKind != JsonValueKind.String
+                || nameEl.GetString() is not { } name
+                || !known.Contains(name))
+            { calls = []; return false; }
+
+            JsonElement input;
+            if (obj.TryGetProperty("arguments", out var argsEl) || obj.TryGetProperty("parameters", out argsEl))
+            {
+                // Some models stringify the arguments object; accept both the object and string forms.
+                if (argsEl.ValueKind == JsonValueKind.String)
+                {
+                    try { input = JsonSerializer.Deserialize<JsonElement>(argsEl.GetString() ?? "{}", DeserOpts); }
+                    catch (JsonException) { calls = []; return false; }
+                }
+                else input = argsEl.Clone();
+            }
+            else input = JsonSerializer.Deserialize<JsonElement>("{}", DeserOpts);
+
+            calls.Add((name, input));
+            i = end + 1;
+        }
+        return calls.Count > 0;
+    }
+
+    // Index of the '}' that closes the object beginning at `start` ('{'), respecting string literals
+    // and escapes so braces inside string values don't miscount. -1 if unbalanced.
+    private static int FindObjectEnd(string s, int start)
+    {
+        var depth = 0;
+        var inStr = false;
+        var esc = false;
+        for (var i = start; i < s.Length; i++)
+        {
+            var c = s[i];
+            if (inStr)
+            {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') inStr = true;
+            else if (c == '{') depth++;
+            else if (c == '}' && --depth == 0) return i;
+        }
+        return -1;
+    }
+
+    // Strips a single leading ```lang / ``` line and its trailing ``` fence when present; leaves
+    // unfenced content untouched.
+    private static string StripCodeFence(string s)
+    {
+        var t = s.Trim();
+        if (!t.StartsWith("```", StringComparison.Ordinal)) return s;
+        var firstNewline = t.IndexOf('\n');
+        if (firstNewline < 0) return s;
+        var body = t[(firstNewline + 1)..];
+        var lastFence = body.LastIndexOf("```", StringComparison.Ordinal);
+        return lastFence >= 0 ? body[..lastFence] : body;
     }
 
     // OpenAI requires one message per tool result; a NmMessage with tool results expands

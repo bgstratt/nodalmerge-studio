@@ -267,6 +267,7 @@ public class WorkUnitLifecycleTests
             string? autoReviewProfileId = null, IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
             IReadOnlyList<string>? enabledDomainAgents = null,
             string? credentialRef = null,
+            bool lenientToolParsing = false,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, bool ensurePlanner = false, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<bool> ResupplyCredentialsAsync(string workUnitId, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, CancellationToken cancellationToken = default) => Task.FromResult(false);

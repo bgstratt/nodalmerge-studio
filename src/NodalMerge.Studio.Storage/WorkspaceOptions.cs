@@ -1,3 +1,5 @@
+using NodalMerge.Studio.Contracts.Domain;
+
 namespace NodalMerge.Studio.Storage;
 
 public sealed class WorkspaceOptions
@@ -61,6 +63,19 @@ public sealed class WorkspaceOptions
     // tests that validate/review/apply manually, where the delayed background apply would race
     // those same calls on the same proposal.
     public bool AutoApplyOnPropose { get; set; } = true;
+
+    // ── Server-level default review policy ───────────────────────────────────
+
+    // Applied to a new goal when the creating call sends no explicit policy — i.e. every non-UI
+    // caller (MCP nms_v1_goal_run, direct REST, the eval-harness). The extension always sends its
+    // own per-goal policies (its default-plus-radio-override UI), so this governs only callers that
+    // send none. Configure at startup via Workspace:DefaultTaskReviewPolicy /
+    // Workspace:DefaultWorkspaceReviewPolicy (values: HumanRequired | AgentApproval | Hybrid) to run
+    // autonomously by default without every caller having to opt in per goal. Defaults to
+    // HumanRequired, so behavior is unchanged until an operator configures otherwise. A per-call
+    // policy always overrides this (WorkUnitCreateCommand.TaskReviewPolicy/WorkspaceReviewPolicy).
+    public ReviewPolicy DefaultTaskReviewPolicy { get; set; } = ReviewPolicy.HumanRequired;
+    public ReviewPolicy DefaultWorkspaceReviewPolicy { get; set; } = ReviewPolicy.HumanRequired;
 
     // ── Expected output kind enforcement ─────────────────────────────────────
 

@@ -197,6 +197,7 @@ public class ReconciliationAgentServiceTests
             IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
             IReadOnlyList<string>? enabledDomainAgents = null,
             string? credentialRef = null,
+            bool lenientToolParsing = false,
             CancellationToken cancellationToken = default)
         {
             spawnCalls.Add((agentType, workUnitId, model));

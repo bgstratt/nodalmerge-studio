@@ -173,6 +173,14 @@ export function init(ctx) {
       (isVsLm ? '<div class="field muted">Uses your VS Code Copilot or Cursor subscription — no API key required.</div>' : '') +
       '<div class="field"><label>System Prompt (optional)</label>' +
         '<textarea id="pf-prompt">' + esc(p.systemPrompt || p.systemPromptHint || '') + '</textarea></div>' +
+      '<div class="field"><label>Tool-call parsing</label>' +
+        '<select id="pf-toolcall-parsing">' +
+          '<option value="strict"' + ((p.toolCallParsing || 'strict') === 'strict' ? ' selected' : '') + '>Strict — only structured tool_calls (default)</option>' +
+          '<option value="lenient"' + (p.toolCallParsing === 'lenient' ? ' selected' : '') + '>Lenient — also accept a tool call emitted as message text</option>' +
+        '</select>' +
+        '<div class="muted" style="font-size:0.8em;padding-top:2px">Enable Lenient only for small/low-quant local models (e.g. qwen2.5-coder:7b) that write their ' +
+        'tool call as text instead of the structured field. Leave Strict for API models and any role that produces documents or JSON content.</div>' +
+      '</div>' +
       '<div class="form-actions">' +
         '<button id="pf-save">Save</button>' +
         '<button class="ghost" id="pf-cancel">Cancel</button>' +
@@ -284,6 +292,7 @@ export function init(ctx) {
       const model        = getModelValue();
       const baseUrl      = (provider === 'vscode-lm' || isCliProviderKey(provider)) ? '' : $('pf-baseurl').value.trim();
       const prompt       = $('pf-prompt').value.trim();
+      const toolCallParsing = $('pf-toolcall-parsing') ? $('pf-toolcall-parsing').value : 'strict';
       if (!id || !label || !domain) { alert('ID, Label, and Domain are required.'); return; }
       const keyEl     = $('pf-apikey');
       const pendingKey = (keyEl && provider !== 'vscode-lm') ? keyEl.value.trim() : '';
@@ -298,6 +307,7 @@ export function init(ctx) {
         baseUrl:          baseUrl || undefined,
         apiKeyRef:        apiKeyRef,
         systemPrompt:     prompt  || undefined,
+        toolCallParsing:  toolCallParsing === 'lenient' ? 'lenient' : undefined,
       };
       if (isNew) { profiles.push(profile); }
       else       { profiles[idx] = profile; }
@@ -629,6 +639,18 @@ export function init(ctx) {
       if (workspaceRpSel && msg.defaultWorkspaceReviewPolicy) { workspaceRpSel.value = msg.defaultWorkspaceReviewPolicy; }
       domainAgents = msg.domainAgents || [];
       enabledDomainAgents = msg.enabledDomainAgents || [];
+      renderDomainAgentToggles();
+      return;
+    }
+    if (msg.type === 'serverData') {
+      // Timer-driven refresh of SERVER-derived data only. Deliberately does NOT touch profiles,
+      // templates, or defaultTopology — those are the user's local editing state and overwriting
+      // them here would discard an in-progress topology edit (the "keeps resetting" bug).
+      pipelineProfiles = msg.pipelineProfiles || pipelineProfiles;
+      cliProviders     = msg.cliProviders || cliProviders;
+      domainAgents         = msg.domainAgents || domainAgents;
+      enabledDomainAgents  = msg.enabledDomainAgents || enabledDomainAgents;
+      renderPipelineProfiles();
       renderDomainAgentToggles();
       return;
     }

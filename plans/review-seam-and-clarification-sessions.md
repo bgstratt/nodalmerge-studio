@@ -118,8 +118,24 @@ Acceptance:
 
 - Orchestrator role behind the seam (separate, pre-existing "orchestrator LLM-loop → pure
   service" direction).
-- An MCP verdict tool for claude (`nm_v1_merge_review` on the harness mount) — file-based verdict
-  ships first; the mount upgrade is a follow-up if verdict fidelity needs it.
+- An MCP verdict tool for claude (`nm_v1_merge_review` on the harness mount). **Considered and
+  declined 2026-07-14** (was previously framed as an optional follow-up "if verdict fidelity needs
+  it"). Three reasons it doesn't clear the bar: (1) **it retires nothing** — file-based
+  `.workspace/review.json` must stay as the universal verdict floor (codex, any `SupportsMcp:false`
+  harness, and claude with MCP disabled all depend on it), so the fragile nested-dir recovery
+  fallback from `review-apply-and-eviction-fixes.md` Fix 4 has to remain regardless; the MCP tool
+  would only *add* a second parallel channel, not remove the first. (2) The file path is **already
+  robust** — Fix 4 recovers a `cd`-drift-misplaced verdict — so the reliability problem the MCP tool
+  targets is already mitigated. (3) **Architectural principle**: the `nm_v1_*` harness-mount tools
+  are method calls with REST parity exposed over an *optional, user-disable-able* transport (the same
+  reason for the `nms_v1`/`nm_v1` split). A review verdict is correctness-critical; routing it through
+  MCP would create environment-dependent behavior divergence (MCP-on vs MCP-off runs landing verdicts
+  differently) for exactly the flow that should stay transport-independent. Clarification's
+  MCP-preferred/file-fallback (C3) is **not** a precedent — its fallback files are written by Studio
+  at Studio-controlled paths and can't be misplaced; the verdict file is written by the harness agent
+  at a relative path, which is the whole source of the fragility. If a claude-with-MCP quality bump is
+  ever wanted, the honest framing is "pure enrichment, file-based stays primary, Fix 4 stays" — not
+  "retires the fragile path."
 - Clarification "agent-first" response-policy tiers (agent answers, then human, then timeout) —
   the three responder paths (human REST/UI, external-MCP agent, timer) all exist; a policy knob
   combining them is future work.

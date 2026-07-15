@@ -413,6 +413,20 @@ needs either a codex-cli fix/config this session didn't find, or a Studio-side w
 running codex inside a container/WSL where the sandbox behaves as documented) — flagged here rather
 than solved, since Studio's own gate-based isolation story means it isn't blocking today.
 
+**Update 2026-07-14 — `SupportsMcp: false` for codex is a settled decision, not pending work.** Codex
+is now fully onboarded and has run live (not yet a full end-to-end). It *does* support MCP, but via a
+*global* `%USERPROFILE%\.codex\config.toml` `[mcp]` section (codex ≥ 0.2.0; native-Windows carries
+known schema-translation-failure and timeout quirks — `MCP_TOOL_TIMEOUT` the workaround, WSL2 the
+common escape hatch) — user-owned, persistent, machine-wide. That is architecturally incompatible with
+Studio's harness mount, which depends on a **per-run generated config file + per-run bearer token**
+carried via claude's `--mcp-config <path>` flag (C3). Codex exposes no per-invocation config-override
+flag to drive off `Capabilities.SupportsMcp` the way claude does; wiring it would force Studio to
+manage the user's global config (racy across concurrent runs, breaks the per-run token scoping the
+mount is built on) — it is not a flag flip. Conclusion: **codex MCP is a developer-environment config
+item, left to the user**; Studio keeps `SupportsMcp: false` and never injects a codex mount. If a
+codex-specific per-run MCP override ever ships in the CLI, revisit — until then this is closed, not
+deferred.
+
 ## C3 — Slim MCP mount
 
 The confirmed C.4 tool list all exists internally (`nm_v1_workspace_symbol_definition/

@@ -34,6 +34,11 @@ export interface AgentProfile {
   apiKeyRef?:       string;
   systemPrompt?:    string;
   tools?:           string[];         // MCP tool allowlist; empty = all permitted
+  // 'strict' (default/undefined) honors only the structured tool_calls field. 'lenient' additionally
+  // tolerates a model that emits its tool call as message text / a ```json fence — the failure mode
+  // of small quantized local models (e.g. qwen2.5-coder:7b via Ollama). Opt-in per profile so normal
+  // profiles, and any content-producing worker, are unaffected. See LlmClient.SendOpenAiAsync.
+  toolCallParsing?: 'strict' | 'lenient';
   /** @deprecated Use systemPrompt */
   systemPromptHint?: string;
 }
@@ -77,6 +82,9 @@ export interface SpawnLlmConfig {
   // instead of ever persisting apiKey itself — see IRuntimeCredentialCache's doc comment on the
   // server side. Never a secret; safe to log or display.
   credentialRef: string;
+  // Mirrors the profile's toolCallParsing === 'lenient'. Rides the per-stage credential into the
+  // server's StageCredentialDto → GoalDefaultCredentials.LenientToolParsing. Omitted when false.
+  lenientToolParsing?: boolean;
 }
 
 // The out-of-the-box Default profile is vscode-lm on purpose: a fresh install can start a goal
@@ -268,6 +276,10 @@ export class AgentConfigService {
     const p = this.getProfiles().find(pr => pr.id === profileId);
     if (!p) { return undefined; }
 
+    // Only meaningful on the openai HTTP path server-side; harmless (ignored) elsewhere. Omit when
+    // false so strict profiles send no extra field.
+    const lenient = p.toolCallParsing === 'lenient' ? { lenientToolParsing: true } : {};
+
     if (p.provider === 'vscode-lm') {
       if (!lmProxyBaseUrl || lmProxyBaseUrl.endsWith(':0')) {
         return undefined;
@@ -278,6 +290,7 @@ export class AgentConfigService {
         baseUrl:  lmProxyBaseUrl,
         apiKey:   '',
         credentialRef: this.resolveCredentialRef(p) ?? '',
+        ...lenient,
       };
     }
 
@@ -293,6 +306,7 @@ export class AgentConfigService {
         baseUrl:  '',
         apiKey:   cliKey ?? '',
         credentialRef: this.resolveCredentialRef(p) ?? '',
+        ...lenient,
       };
     }
 
@@ -308,6 +322,7 @@ export class AgentConfigService {
       baseUrl,
       apiKey,
       credentialRef: this.resolveCredentialRef(p) ?? '',
+      ...lenient,
     };
   }
 

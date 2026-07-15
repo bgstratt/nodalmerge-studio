@@ -381,6 +381,7 @@ public class AutomatedReviewGateServiceTests
             IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
             IReadOnlyList<string>? enabledDomainAgents = null,
             string? credentialRef = null,
+            bool lenientToolParsing = false,
             CancellationToken cancellationToken = default) =>
             Task.FromResult("agent");
 

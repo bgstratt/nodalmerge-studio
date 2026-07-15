@@ -1131,7 +1131,15 @@ public sealed record GoalDefaultCredentials(
     // registry) or in IRuntimeCredentialCache, keyed by CredentialRef.
     string ApiKey,
     string? ProfileId,
-    string? CredentialRef = null);
+    string? CredentialRef = null,
+    // Opt-in per-profile (Model Profile "Tool-call parsing: Lenient") — tolerate a model that
+    // emits its tool call as message text / a ```json fence instead of the structured tool_calls
+    // field, which small quantized local models (e.g. qwen2.5-coder:7b via Ollama) frequently do.
+    // Default false = strict (only the structured field is honored), so every existing profile and
+    // every content-producing worker (documentation, plans, proposals that legitimately embed JSON)
+    // is completely unaffected. Rides StageCredentials into GoalRoutingConfig, so it persists and
+    // resolves per stage exactly like Provider/Model/BaseUrl. See LlmClient.SendOpenAiAsync.
+    bool LenientToolParsing = false);
 
 // The safe-to-persist projection of an orchestrator's registration — everything
 // InMemoryAgentRuntimeService's in-memory-only _goalCredentialRegistrations needs to survive a Host
@@ -1148,7 +1156,11 @@ public sealed record GoalRoutingConfig(
     string? AutoReviewProfileId,
     string? CredentialRef,
     IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? StageCredentials = null,
-    IReadOnlyList<string>? EnabledDomainAgents = null);
+    IReadOnlyList<string>? EnabledDomainAgents = null,
+    // The goal's Default-profile lenient-tool-parsing setting — so a role that inherits Default
+    // (no explicit StageCredentials entry) still honors it. Per-stage overrides carry their own
+    // flag inside StageCredentials; this is only the Default fallback. See GetGoalDefaultCredentials.
+    bool LenientToolParsing = false);
 
 public interface IAgentControlService
 {
@@ -1165,6 +1177,9 @@ public interface IAgentControlService
         IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null,
         IReadOnlyList<string>? enabledDomainAgents = null,
         string? credentialRef = null,
+        // The Default profile's lenient-tool-parsing setting — inherited by any role without an
+        // explicit per-stage override in stageCredentials. See GoalDefaultCredentials.LenientToolParsing.
+        bool lenientToolParsing = false,
         CancellationToken cancellationToken = default);
 
     // Runs one deterministic IGoalCoordinator convergence sweep for a goal/orchestrator-type work

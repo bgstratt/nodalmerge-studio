@@ -53,7 +53,19 @@ public sealed record HarnessRunRequest(
     string? Provider = null,
     string? Model = null,
     string? BaseUrl = null,
-    string? ApiKey = null);
+    string? ApiKey = null,
+    // The work unit's OWN goal (a fanned-out child's slice goal, or an atomic goal's full text) —
+    // inlined into the native worker/planner kickoff so the model doesn't depend on a tool call to
+    // discover what to do (weak local models often don't make that call and stall on an empty
+    // workspace / missing task). Deliberately NOT the unbounded root goal the removed
+    // BuildOriginalGoalContextAsync injected into every sibling; bounded and relevant. CLI adapters
+    // already materialize .workspace/goal.md, so they ignore this. Null → kickoff uses its task-only
+    // form (unchanged behavior).
+    string? Goal = null,
+    // Opt-in leniency for the native openai path — see GoalDefaultCredentials.LenientToolParsing.
+    // Native-only; CLI adapters ignore it (they parse their own vendor stream). Default false =
+    // strict (structured tool_calls only), so every existing run is byte-for-byte unchanged.
+    bool LenientToolParsing = false);
 
 public sealed record HarnessRunResult(
     AgentLoopCompletion Completion,

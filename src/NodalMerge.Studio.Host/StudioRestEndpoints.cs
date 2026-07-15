@@ -56,9 +56,13 @@ public static class StudioRestEndpoints
         // Opaque client-derived cache key (e.g. the VS Code extension's SecretStorage apiKeyRef) —
         // never a secret itself. Lets the server re-resolve ApiKey from IRuntimeCredentialCache
         // after a restart instead of ever persisting it. See IRuntimeCredentialCache's doc comment.
-        string? CredentialRef = null);
+        string? CredentialRef = null,
+        // The Default profile's lenient-tool-parsing setting (from the extension's orchCfg). Any role
+        // that inherits Default — no per-stage entry in StageCredentials — picks this up. Per-stage
+        // overrides carry their own flag inside StageCredentials.
+        bool LenientToolParsing = false);
 
-    private sealed record StageCredentialDto(string Provider, string Model, string BaseUrl, string ApiKey, string? CredentialRef = null);
+    private sealed record StageCredentialDto(string Provider, string Model, string BaseUrl, string ApiKey, string? CredentialRef = null, bool LenientToolParsing = false);
 
     // Optional resupply payload for POST /studio/workunits/{workUnitId}/reinvoke-orchestrator —
     // mirrors ResumeBody/ContinueBody. Present when the caller (typically the VS Code extension,
@@ -1630,7 +1634,7 @@ public static class StudioRestEndpoints
                 foreach (var (key, dto) in body.StageCredentials)
                 {
                     if (Enum.TryParse<PipelineStage>(key, ignoreCase: true, out var stage))
-                        resolved[stage] = new GoalDefaultCredentials(dto.Provider, dto.Model, dto.BaseUrl, dto.ApiKey, null, dto.CredentialRef);
+                        resolved[stage] = new GoalDefaultCredentials(dto.Provider, dto.Model, dto.BaseUrl, dto.ApiKey, null, dto.CredentialRef, dto.LenientToolParsing);
                 }
                 stageCredentials = resolved;
             }
@@ -1638,7 +1642,7 @@ public static class StudioRestEndpoints
             var agentId = await agents.SpawnAsync(
                 body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey,
                 body.Provider, body.ProfileId, body.AutoReviewProfileId, stageCredentials,
-                body.EnabledDomainAgents, body.CredentialRef, ct).ConfigureAwait(false);
+                body.EnabledDomainAgents, body.CredentialRef, body.LenientToolParsing, ct).ConfigureAwait(false);
             return Results.Ok(new { agentId, agentType = body.AgentType, workUnitId = body.WorkUnitId, branchId = wu.BranchId });
         });
 

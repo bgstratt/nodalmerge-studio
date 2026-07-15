@@ -43,7 +43,7 @@ internal sealed class NativeHarnessExecutor(
         var llm = serviceProvider.GetRequiredService<LlmClient>();
         var agentClient = new DefaultAgentToolClient(
             request.Provider ?? "anthropic", request.Model ?? string.Empty, request.BaseUrl ?? string.Empty,
-            request.ApiKey ?? string.Empty, llm, dispatcher);
+            request.ApiKey ?? string.Empty, llm, dispatcher, request.LenientToolParsing);
         var conversationLog = serviceProvider.GetRequiredService<IConversationLogService>();
         var events = serviceProvider.GetService<IExecutionEventStream>();
 
@@ -61,7 +61,8 @@ internal sealed class NativeHarnessExecutor(
                 request.AgentId, request.WorkUnitId, agentClient,
                 request.Profile, request.SessionId, request.OnActivity,
                 request.RuleFileContext, request.PromptGuidanceContext,
-                conversationLog: conversationLog, events: events, logger: logger);
+                conversationLog: conversationLog, events: events, logger: logger,
+                goal: request.Goal);
             var planCompletion = await plannerLoop.RunAsync(ct).ConfigureAwait(false);
             return new HarnessRunResult(planCompletion);
         }
@@ -93,7 +94,8 @@ internal sealed class NativeHarnessExecutor(
             request.AgentId, request.WorkUnitId, request.TaskId, agentClient, request.Profile,
             request.SessionId, request.OnActivity, request.IsResume, request.RuleFileContext,
             request.SelfVerifyBuild, request.SelfVerifyTest, request.PromptGuidanceContext,
-            conversationLog: conversationLog, events: events, logger: logger);
+            conversationLog: conversationLog, events: events, logger: logger,
+            goal: request.Goal);
 
         var completion = await loop.RunAsync(ct).ConfigureAwait(false);
         return new HarnessRunResult(completion);

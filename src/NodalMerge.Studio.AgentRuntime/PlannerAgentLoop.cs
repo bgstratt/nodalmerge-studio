@@ -19,7 +19,11 @@ internal sealed class PlannerAgentLoop(
     IExecutionEventStream? events = null,
     // Observability-only — see ConversationCompactor. Optional/nullable so call sites and tests
     // that don't wire a logger keep compiling unchanged.
-    ILogger? logger = null)
+    ILogger? logger = null,
+    // The work unit's own goal (see HarnessRunRequest.Goal), inlined into the kickoff so the planner
+    // has the goal in front of it rather than depending on a tool call to fetch it. Null → task-only
+    // kickoff (unchanged). Trailing optional so existing call sites keep compiling.
+    string? goal = null)
 {
     internal static readonly string DefaultSystemPrompt = AgentLoopPrompts.Planner;
 
@@ -47,7 +51,13 @@ internal sealed class PlannerAgentLoop(
 
     public async Task<AgentLoopCompletion> RunAsync(CancellationToken ct)
     {
+        // Base line kept verbatim (test fakes distinguish planner turns via StartsWith("Plan work unit")
+        // and parse workUnitId/agentId out of it); the goal is appended so the planner has it in front
+        // of it without a tool call.
         var kickoff = $"Plan work unit {workUnitId}. Your agent ID is {agentId}. Write plan.json when done.";
+        if (!string.IsNullOrWhiteSpace(goal))
+            kickoff += $"\n\nGoal: {goal}\n\nIf the goal is small enough to complete in a single step, it "
+                + "is fine to record no plan.";
         if (constraintsContext is not null)
             kickoff += "\n\n" + constraintsContext;
         if (ruleFileContext is not null)

@@ -8,8 +8,14 @@
       2026-07-12 (722/722 tests green); both items originally deferred out of B3
       (`--add-dir` for cross-repo work units, `--resume`/session-id persistence for steering) were
       closed the same day, 725/725 tests green — see the Phase B3 implementation notes below
-- [ ] **Gate: run the harness-comparison eval** (`plans/harness-comparison-eval.md` — checkouts
-      prepped, never executed) before committing past Phase B
+- [x] **Gate: harness-comparison eval — cleared 2026-07-14 (Bradley, manual).** Run by hand rather
+      than through `plans/harness-comparison-eval.md`'s scripted checkouts. Semantic + process
+      correctness was the bar (token/cost counting was unavailable in the manual run) and is what
+      drove the CLI-vs-apikey parity work for **claude-cli**: a full goal → plan → fan-out → work →
+      review → merge → workspace-review cycle ran end-to-end with process parity to the native/API
+      path. **codex-cli** has run live but not yet a full end-to-end — deferred, not blocking.
+      Eval-driven routing tables stay out of scope (they were always gated on the cost/task-type
+      data this manual run deliberately didn't produce).
 - [x] **UI hook: provider-driven executor selection** — closed 2026-07-12, out-of-band
       B follow-up (not scoped in any phase text — see "Phase B UI gap" note below). A
       `claude-cli` Model Profile provider, assigned per role via Agent Topology, routes the
@@ -1092,8 +1098,10 @@ in CAS snapshot paths too; CLI flags verified against `claude` 2.1.177; construc
 sites in `InMemoryAgentRuntimeService` verified at lines 374/884/979 by grep;
 worker/orchestrator/planner tool-parity audit (three v1 losses → C.4).
 
-Still open (both are single actions, not design work):
+Both closed:
 
-- **One real `claude -p` run** to capture the exact stream-json/usage field shape before
-  writing B3's parser (same open item the eval plan has — one run serves both).
-- **Run the comparison eval** (gate above) — its result sizes how far past Phase B to go.
+- ~~**One real `claude -p` run**~~ — done in B2 (claude 2.1.177 capture, 2026-07-12), which
+  corrected several stream-json/usage-field guesses before B3's parser was written.
+- ~~**Run the comparison eval**~~ — cleared manually 2026-07-14 (see the Gate line at the top of
+  this file): claude-cli verified end-to-end on process + semantic correctness, codex-cli live but
+  not yet a full end-to-end, token/cost unavailable in the manual run.
