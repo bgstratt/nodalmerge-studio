@@ -496,6 +496,21 @@ tractable:**
   (`PersistInboundPackAsync`) and hydrate-with-compaction already exist on the .NET
   side.
 
+**Engine-behavior discovery (6.1a, 2026-07-15, verified empirically):** the engine's
+`MapSet/MapGet/MapAll` live map state and its CRDT *sync graph* (what
+`RequestServerPack`/`ImportPack` export/import, i.e. what pack persistence and packs
+on the wire actually carry) are **separate stores bridged only by explicit commands**:
+a `MapSet` reaches the sync graph only via `PromoteCheckpointToGraph{latest}`, and
+`ImportPack` repopulates only the graph — never the live maps. 6.1a established the
+pattern that bridges this with existing commands (promote-then-persist on every write;
+replay `GetCanonicalResolution` back through `MapSet` once after hydrate — see the
+`NodalMergeStudioNodeStore` class comment, the authoritative writeup). **Consequence
+for 6.1b:** a peer applying an *inbound* pack has the same gap — after `ImportPack` it
+must replay canonical resolution into the live maps or Studio reads see nothing. A
+cleaner engine-side fix (e.g. `ImportPack` hydrating maps directly) is a candidate
+engine improvement, deliberately NOT taken in 6.1a/6.1b to avoid an engine release +
+package repack mid-phase; revisit after 6.5.
+
 **Decision (2026-07-15): Studio state rides the engine DAG — no parallel replication
 protocol.** `NodalMergeStudioNodeStore` is rewritten to write through the embedded
 engine (`MapSet{namespace: "studio", key: "{kind}/{entityId}", value: payload
