@@ -34,8 +34,15 @@
       that doc (`537face8`). Extension-settings mapping onto
       `NodalMerge:Storage:S3Direct:*` is a pending studio-side follow-up.
 - [ ] Phase 5 — GC & retention (the answer to snapshot flux)
-      — **sliced 2026-07-15** (5.1 policy → 5.2 live-set v2 + local sweep → 5.3 server
-      coordinator, which depends on 6.1/6.3)
+      — **5.1 + 5.2 shipped 2026-07-15** (studio `cas-distribution-storage`): 5.1
+      `ISnapshotRetentionPolicy` Pinned/Active/Intermediate classification
+      (`dc617ac`; see 5.1 findings note), 5.2 retention-aware
+      `GetLiveBlobHashesAsync` + staged `BlobGc:Mode`
+      (DryRun-default/MarkOnly/SweepSoft/SweepHard), run ledger
+      (`studio/gc-run/v1` + `GET /studio/cache/gc/runs`), background interval
+      runner, aged-out materialization → 410 Gone (`e22e2f1`; bare
+      `POST /studio/cache/gc` no longer live-deletes — configured mode, DryRun by
+      default). Remaining: 5.3 server coordinator (depends on 6.1/6.3).
 - [ ] Phase 6 — Multi-user: replication data plane, room topology & repository identity
       — **sliced 2026-07-15**; decision recorded: Studio state rides the engine DAG.
       **6.0 + 6.1a + 6.1b shipped 2026-07-15** (studio `cas-distribution-storage`):
@@ -461,6 +468,18 @@ counter).
 | 5.1 | **Retention classification (pure policy, no behavior change)**: `ISnapshotRetentionPolicy` classifies every snapshot generation: **Pinned** (bootstrap generation; generations referenced by applied merge proposals — the `appliedSnapshotId` stamp from the apply-time resync; admin pins) — live forever by default; **Active** (referenced as any non-terminal work unit's branch seed or merge base, or the current head of any repo) — live regardless of age; **Intermediate** (everything else) — live until `RetainIntermediateDays` (default 30) past its branch reaching a terminal state. Ships as a service + tests only; nothing consumes it yet | Classification of a seeded test DAG matches hand-computed expectation for all three classes; an in-flight work unit's seed is Active even when >30 d old |
 | 5.2 | **`LiveHashSource` v2 + staged local sweep**: `GetLiveBlobHashesAsync` switches to union of (a) trees+blobs reachable from Pinned ∪ Active ∪ unexpired-Intermediate generations (via `GetReachableHashesAsync`, fail-closed unchanged), (b) op-referenced blobs, (c) pins; `/studio/cache/gc` + a scheduled background run gain staged modes (`DryRun` default → `MarkOnly` → `SweepSoft` → `SweepHard` by config), `MaxDeletesPerRun` ramp, and a run-ledger row per run (mode, counts, duration — queryable) | Promoted-history materialization works after aggressive GC; a retired branch's unique intermediate blobs are reclaimed after grace; a DryRun run mutates nothing and reports the same candidates the live run would delete |
 | 5.3 | **Server-side coordinator (depends on 6.1/6.3 — server must hold the replicated repo rooms)**: server `LiveHashSource` = walk studio snapshot nodes in every repo room it persists (same retention classes, computed from replicated proposal/work-unit nodes) + tree-object walk against its own CAS; replace `gc_adapter`'s noop stores with real `AssetInventoryStore`/`GcRunStore` (server store-backed); full mark → soft → hard with 24 h grace, `require_head_before_delete` during rollout; S3 backend deletes via `BlobObjectStore` HEAD/DELETE (no ListBucket in the nightly path) | Staged `DryRun`/`MarkOnly`/`SweepSoft`/`SweepHard` rollout works by flag; a blob re-referenced during grace returns to `Active` (extends `blob_gc.rs`); fail-closed: a room that fails to scan aborts the run with no deletes |
+
+**5.2 findings (shipped 2026-07-15, `e22e2f1`) — for 5.3's implementer:** (1) **Op
+protection is the dominant local retention leak**: rule (b) protects every
+`RepositoryOp`'s blob refs forever, so import-driven generations effectively never
+reclaim until op rows are compacted/retired — 5.3 (or a small follow-up) should decide
+whether ops already folded into a snapshot (`ConsiderCompactionAsync`) drop out of the
+live-set contribution. (2) The local `FileBlobGcCoordinator` can't express single-pass
+hard delete (`RequireTombstoneBeforeDelete` always on) — SweepHard is two calls
+(mark, then delete), an intentional safety property; the Rust `core/gc` crate has real
+Mark/Soft/Hard stages, so do NOT copy the local grace-window encoding server-side.
+(3) `SnapshotTreeResolver`'s immutable memo cache can keep a reclaimed generation
+materializable from process memory until restart — benign, documented in tests.
 
 Standing rule (from the harness plan, restated as normative here): **never build
 anything that assumes a pushed blob can be synchronously deleted.** Offline peers may
