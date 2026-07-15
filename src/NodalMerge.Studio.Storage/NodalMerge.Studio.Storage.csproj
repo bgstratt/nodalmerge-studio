@@ -16,10 +16,14 @@
 
   <ItemGroup Condition="'$(NodalMergeUseNuGetPackages)' == 'true'">
     <PackageReference Include="NodalMerge.Host.Abstractions" />
+    <!-- Slice 6.1a — NodalMergeStudioNodeStore rides RuntimeDagPersistenceService/IRuntimeCommandBridge
+         directly instead of only INodeStoreProvider. -->
+    <PackageReference Include="NodalMerge.DotNetHost" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(NodalMergeUseNuGetPackages)' != 'true' AND Exists('$(NodalMergeDotNetHostProject)')">
     <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\..\nodalmerge\hosts\dotnet\src\NodalMerge.Host.Abstractions\NodalMerge.Host.Abstractions.csproj" />
+    <ProjectReference Include="$(NodalMergeDotNetHostProject)" />
   </ItemGroup>
 
   <ItemGroup>
