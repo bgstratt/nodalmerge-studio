@@ -258,11 +258,19 @@ applied in order:
    `https`, `22` for `ssh`/`git`); otherwise keep it as `host:port`. The bare and
    SCP-like forms carry no scheme, so a port is only ever dropped when the URI form's
    explicit scheme confirms it's redundant.
-4. **Strip exactly one trailing `.git` suffix** from `path` (case-sensitive, exact
+4. **Strip one or more trailing `/` characters** from `path`.
+5. **Strip exactly one trailing `.git` suffix** from `path` (case-sensitive, exact
    suffix match), if present.
-5. **Strip one or more trailing `/` characters** from `path`.
 6. **Join** as `host[:port]/path` — no scheme, no credentials, no leading `/` before
    path, single `/` separating host and path.
+
+> **Amendment (2026-07-15, pre-replication):** the original freeze ordered steps 4/5
+> the other way (`.git`-strip before slash-strip), under which
+> `https://host/org/repo.git/` normalized to `org/repo.git` while the slashless form
+> of the same remote normalized to `org/repo` — two hint strings for one remote,
+> defeating the fork tiebreak. Amended while no cross-peer normalized hint existed
+> anywhere (workgroup-room upstream replication lands in 6.3); this is an ordering
+> defect fix in the original freeze, not a format break.
 
 Worked examples:
 
@@ -274,6 +282,7 @@ Worked examples:
 | `ssh://git@github.com:22/acme/nodalmerge-studio.git` | `github.com/acme/nodalmerge-studio` (default ssh port 22 dropped) |
 | `ssh://git@example.com:2222/acme/repo.git` | `example.com:2222/acme/repo` (non-default port kept) |
 | `https://github.com/acme/nodalmerge-studio/` (trailing slash, no `.git`) | `github.com/acme/nodalmerge-studio` |
+| `https://github.com/acme/nodalmerge-studio.git/` (trailing slash after `.git`) | `github.com/acme/nodalmerge-studio` (slash stripped first, then `.git`) |
 | `HTTPS://GitHub.com/Acme/Nodalmerge-Studio.git` | `github.com/Acme/Nodalmerge-Studio` (scheme case-insensitive; host lowercased; path case preserved) |
 
 `hints.remotes` is a set of these normalized strings (one per configured remote —

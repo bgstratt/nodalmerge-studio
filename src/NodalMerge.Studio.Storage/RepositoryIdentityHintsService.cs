@@ -179,17 +179,16 @@ public sealed class GitRepositoryIdentityHintsService(ILogger<GitRepositoryIdent
             path = slashIdx >= 0 ? raw[(slashIdx + 1)..] : "";
         }
 
-        // Step 4: strip exactly one trailing ".git" suffix, if present — applied once, in this
-        // order, before step 5. A path ending in ".git/" (trailing slash *after* the suffix) is
-        // therefore NOT stripped of ".git" by this step (it doesn't end in ".git", it ends in "/")
-        // — only the trailing slash is removed by step 5 below. This is the literal, frozen-order
-        // consequence exercised by the "trailing-slash+.git combined" test vector; it is not a bug,
-        // it's what "steps applied in order, once each" specifies.
+        // Step 4: strip one or more trailing '/' characters — BEFORE the ".git" strip, per the
+        // 2026-07-15 pre-replication amendment in docs/STUDIO_ROOM_SCHEMA.md (b): under the
+        // original order, "org/repo.git/" kept its ".git" while "org/repo.git" lost it, so the
+        // same remote produced two different hint strings on two peers, defeating the fork
+        // tiebreak the hints exist for.
+        path = path.TrimEnd('/');
+
+        // Step 5: strip exactly one trailing ".git" suffix, if present.
         if (path.EndsWith(".git", StringComparison.Ordinal))
             path = path[..^4];
-
-        // Step 5: strip one or more trailing '/' characters.
-        path = path.TrimEnd('/');
 
         // Step 6: join.
         return path.Length == 0 ? hostAndPort : $"{hostAndPort}/{path}";

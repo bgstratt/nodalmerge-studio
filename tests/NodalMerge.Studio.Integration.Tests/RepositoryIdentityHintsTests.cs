@@ -37,16 +37,16 @@ public class RepositoryIdentityHintsTests
             Service.NormalizeRemoteUrl("github.com:acme/nodalmerge-studio.git"));
     }
 
-    // Extra vector #2 (task brief): trailing-slash+".git" combined. The frozen algorithm applies
-    // step 4 (strip ".git") and step 5 (strip trailing "/") once each, IN ORDER — a path ending in
-    // ".git/" doesn't end in literal ".git" (it ends in "/"), so step 4 doesn't fire; step 5 then
-    // strips only the trailing slash, leaving ".git" in the result. This is the literal, specified
-    // behavior of "steps applied once each, in order" — not a bug in this implementation.
+    // Extra vector #2 (task brief): trailing-slash+".git" combined. Per the 2026-07-15
+    // pre-replication amendment in docs/STUDIO_ROOM_SCHEMA.md (b), trailing slashes are stripped
+    // BEFORE the one-shot ".git" strip, so ".git/" and ".git" forms of the same remote normalize
+    // identically — the original freeze's opposite order produced two different hint strings for
+    // one remote, defeating the fork tiebreak.
     [Fact]
-    public void NormalizeRemoteUrl_trailing_slash_after_dot_git_leaves_dot_git_per_frozen_step_order()
+    public void NormalizeRemoteUrl_trailing_slash_after_dot_git_normalizes_same_as_slashless_form()
     {
         Assert.Equal(
-            "github.com/acme/nodalmerge-studio.git",
+            "github.com/acme/nodalmerge-studio",
             Service.NormalizeRemoteUrl("https://github.com/acme/nodalmerge-studio.git/"));
     }
 
