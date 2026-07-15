@@ -19,7 +19,7 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(NodalMergeUseNuGetPackages)' != 'true' AND Exists('$(NodalMergeDotNetHostProject)')">
-    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\..\nodalmerge\nodalmerge-host\src\NodalMerge.Host.Abstractions\NodalMerge.Host.Abstractions.csproj" />
+    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\..\nodalmerge\hosts\dotnet\src\NodalMerge.Host.Abstractions\NodalMerge.Host.Abstractions.csproj" />
   </ItemGroup>
 
   <ItemGroup>
