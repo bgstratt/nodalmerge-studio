@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Linq;
 
 namespace NodalMerge.Studio.Storage.TreeObjects;
 
@@ -35,6 +36,31 @@ internal static class CanonicalTreeSerializer
         }
 
         sb.Append("}}");
+        return Encoding.UTF8.GetBytes(sb.ToString());
+    }
+
+    // v2 — one blob per directory (slice 1.2). See the format doc's "v2 — directory tree" section.
+    // Entries are child files (h = file blob hash) and child directories (h = subtree blob hash),
+    // sorted by name with the same UTF-8 byte comparer as v1's path sort — kind does not
+    // participate in the sort, since a name cannot be both a file and a directory.
+    public static byte[] SerializeDirectory(IReadOnlyList<TreeEntry> entries)
+    {
+        var sb = new StringBuilder();
+        sb.Append("{\"nodalmerge\":\"tree\",\"version\":2,\"entries\":[");
+
+        var first = true;
+        foreach (var entry in entries.OrderBy(e => e.Name, Utf8ByteComparer.Instance))
+        {
+            if (!first) sb.Append(',');
+            first = false;
+            sb.Append("{\"n\":");
+            AppendEscapedString(sb, entry.Name);
+            sb.Append(",\"k\":\"").Append(entry.Kind == TreeEntryKind.File ? 'f' : 'd').Append("\",\"h\":");
+            AppendEscapedString(sb, entry.Hash);
+            sb.Append('}');
+        }
+
+        sb.Append("]}");
         return Encoding.UTF8.GetBytes(sb.ToString());
     }
 

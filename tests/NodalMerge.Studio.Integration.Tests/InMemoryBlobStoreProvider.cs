@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Linq;
 using NodalMerge.Host.Abstractions.Providers;
 
 namespace NodalMerge.Studio.Integration.Tests;
@@ -31,4 +32,12 @@ public sealed class InMemoryBlobStoreProvider : IBlobStoreProvider
     /// <summary>Test hook — removes a blob to simulate a CAS miss (e.g. eviction, corruption) for a
     /// hash that was previously stored, without needing a whole second store implementation.</summary>
     public bool Remove(string hashHex) => _blobs.TryRemove(hashHex, out _);
+
+    /// <summary>Total distinct blobs currently stored — slice 1.2 vector/acceptance tests use this to
+    /// assert the exact number of tree blobs a write produced.</summary>
+    public int Count => _blobs.Count;
+
+    /// <summary>All hashes currently stored, e.g. to snapshot "what existed before generation N" for
+    /// a structural-sharing acceptance test.</summary>
+    public IReadOnlyCollection<string> Hashes => _blobs.Keys.ToList();
 }

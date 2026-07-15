@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Logging.Abstractions;
 using NodalMerge.Studio.Storage;
 using NodalMerge.Studio.Storage.TreeObjects;
 
@@ -25,7 +26,10 @@ public class CanonicalTreeSerializerVectorTests
     private static readonly string VectorsPath =
         Path.Combine(AppContext.BaseDirectory, "TestData", "tree-format-vectors.v1.json");
 
-    private static (IReadOnlyList<V1Vector> V1, IReadOnlyList<V2Vector> V2) LoadVectors()
+    // internal (not private) so other test classes in this assembly — e.g. the sharing-pair write
+    // test in SnapshotTreeResolverV2WriteTests — can reuse the same golden-vector source rather than
+    // re-hardcoding the sharing-pair entries.
+    internal static (IReadOnlyList<V1Vector> V1, IReadOnlyList<V2Vector> V2) LoadVectors()
     {
         using var doc = JsonDocument.Parse(File.ReadAllBytes(VectorsPath));
         var v1 = new List<V1Vector>();
@@ -136,6 +140,31 @@ public class CanonicalTreeSerializerVectorTests
             // Sanity check that BlobHasher (BLAKE3) agrees with the vector's independently
             // computed hash for these exact bytes.
             Assert.Equal(blob.ExpectedHash, BlobHasher.ComputeHash(blob.ExpectedBytes));
+        }
+    }
+
+    // Slice 1.2 — drives the v2 vectors through the real write pipeline (SnapshotTreeResolver ->
+    // CanonicalTreeSerializer.SerializeDirectory -> IBlobStoreProvider.PutBlobAsync) rather than just
+    // the serializer in isolation, so a bug in the directory-trie build or the post-order write walk
+    // (not just the byte encoding) would fail this test too.
+    [Theory]
+    [MemberData(nameof(V2VectorData))]
+    public async Task WriteTreeAsync_produces_every_expected_v2_blob_and_the_expected_root_hash(V2Vector vector)
+    {
+        var store = new InMemoryBlobStoreProvider();
+        var resolver = new SnapshotTreeResolver(store, NullLogger<SnapshotTreeResolver>.Instance);
+
+        var rootHash = await resolver.WriteTreeAsync(vector.InputEntries);
+
+        Assert.Equal(vector.ExpectedRootHash, rootHash);
+        Assert.Equal(vector.ExpectedBlobs.Count, store.Count);
+
+        foreach (var blob in vector.ExpectedBlobs)
+        {
+            var stored = await store.TryGetBlobAsync(blob.ExpectedHash);
+            Assert.True(stored.Found, $"Expected blob for directory '{blob.Directory}' (hash {blob.ExpectedHash}) was not stored.");
+            Assert.Equal(blob.ExpectedBytes, stored.Bytes);
+            Assert.Equal(blob.ExpectedHash, BlobHasher.ComputeHash(stored.Bytes!));
         }
     }
 

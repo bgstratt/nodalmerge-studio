@@ -7,10 +7,12 @@ using NodalMerge.Studio.Storage.TreeObjects;
 namespace NodalMerge.Studio.Integration.Tests;
 
 /// <summary>
-/// Slice 1.1 (plans/cas-distribution-and-storage.md Phase 1) — SnapshotTreeResolver is the one
+/// Slices 1.1/1.2 (plans/cas-distribution-and-storage.md Phase 1) — SnapshotTreeResolver is the one
 /// place that turns a RepositorySnapshot into a path→blobId map, whichever of the three shapes
 /// it's in (legacy inline, cas-tree, or pre-Phase-2). These tests exercise it directly, without a
-/// full Host pipeline, for each precedence branch.
+/// full Host pipeline, for each precedence branch. WriteTreeAsync writes v2 (one blob per
+/// directory) since slice 1.2; a dedicated test below still hand-writes a v1 blob to prove v1 read
+/// support never regresses.
 /// </summary>
 [Trait("Category", "Integration")]
 public class SnapshotTreeResolverTests
@@ -52,7 +54,12 @@ public class SnapshotTreeResolverTests
         var resolver = new SnapshotTreeResolver(store, NullLogger<SnapshotTreeResolver>.Instance);
         var entries = new Dictionary<string, string> { ["a.txt"] = "h1", ["b/c.txt"] = "h2" };
 
+        // Slice 1.2: this writes a v2 tree — a root blob (a.txt + a "d" entry for b) plus a "b"
+        // directory blob (c.txt) — and the recursive read walk must still reassemble the exact
+        // flat map, prefix restored, regardless of how many directory blobs it took.
         var hash = await resolver.WriteTreeAsync(entries);
+        Assert.Equal(2, store.Count);
+
         var snapshot = new RepositorySnapshot(
             SnapshotId: "s1", RepositoryId: "repo", TreeHash: hash, Generation: 0,
             CreatedAt: DateTimeOffset.UtcNow, TreeFormat: "cas-tree");
@@ -63,6 +70,37 @@ public class SnapshotTreeResolverTests
         Assert.Equal(
             entries.OrderBy(kv => kv.Key, StringComparer.Ordinal),
             resolved!.OrderBy(kv => kv.Key, StringComparer.Ordinal));
+    }
+
+    // Mixed-version — slice 1.2's writer defaults to v2, but v1 blobs written by earlier
+    // generations (or by a peer that hasn't upgraded yet) must resolve forever (append-only,
+    // AP-5). Hand-writes a v1 blob directly (bypassing WriteTreeAsync entirely) to prove the read
+    // path's v1 support isn't just exercised incidentally through the writer.
+    [Fact]
+    public async Task ResolveTreeAsync_resolves_a_hand_written_v1_blob_even_though_the_writer_now_emits_v2()
+    {
+        var store = new InMemoryBlobStoreProvider();
+        var resolver = new SnapshotTreeResolver(store, NullLogger<SnapshotTreeResolver>.Instance);
+        var entries = new Dictionary<string, string> { ["a.txt"] = "h1", ["b/c.txt"] = "h2" };
+
+        var v1Bytes = CanonicalTreeSerializer.SerializeFlat(entries);
+        var v1Hash = NodalMerge.Studio.Storage.BlobHasher.ComputeHash(v1Bytes);
+        await store.PutBlobAsync(v1Hash, v1Bytes, "application/vnd.nodalmerge.tree+json");
+
+        var snapshot = new RepositorySnapshot(
+            SnapshotId: "s-v1", RepositoryId: "repo", TreeHash: v1Hash, Generation: 0,
+            CreatedAt: DateTimeOffset.UtcNow, TreeFormat: "cas-tree");
+
+        var resolved = await resolver.ResolveTreeAsync(snapshot);
+
+        Assert.NotNull(resolved);
+        Assert.Equal(
+            entries.OrderBy(kv => kv.Key, StringComparer.Ordinal),
+            resolved!.OrderBy(kv => kv.Key, StringComparer.Ordinal));
+
+        var hashes = await resolver.GetTreeBlobHashesAsync(snapshot);
+        Assert.Single(hashes); // v1 is always a single blob — no subtrees to enumerate.
+        Assert.Contains(v1Hash, hashes);
     }
 
     [Fact]
@@ -129,7 +167,7 @@ public class SnapshotTreeResolverTests
     }
 
     [Fact]
-    public async Task GetTreeBlobHashesAsync_returns_just_the_root_for_a_v1_tree()
+    public async Task GetTreeBlobHashesAsync_returns_just_the_root_when_the_v2_tree_has_no_subdirectories()
     {
         var store = new InMemoryBlobStoreProvider();
         var resolver = new SnapshotTreeResolver(store, NullLogger<SnapshotTreeResolver>.Instance);
@@ -143,6 +181,34 @@ public class SnapshotTreeResolverTests
 
         Assert.Single(hashes);
         Assert.Contains(hash, hashes);
+    }
+
+    // Slice 1.2 — for a v2 tree with subdirectories, GetTreeBlobHashesAsync must return the root
+    // PLUS every subtree hash (the whole set feeds Phase 1.3's GC reachability walk); returning
+    // just the root would let a live subtree blob get collected as unreachable.
+    [Fact]
+    public async Task GetTreeBlobHashesAsync_returns_root_and_every_subtree_hash_for_a_nested_v2_tree()
+    {
+        var store = new InMemoryBlobStoreProvider();
+        var resolver = new SnapshotTreeResolver(store, NullLogger<SnapshotTreeResolver>.Instance);
+        var entries = new Dictionary<string, string>
+        {
+            ["README.md"] = "1111111111111111111111111111111111111111111111111111111111111111",
+            ["src/main.ts"] = "3333333333333333333333333333333333333333333333333333333333333333",
+            ["src/lib/util.ts"] = "2222222222222222222222222222222222222222222222222222222222222222",
+        };
+        var rootHash = await resolver.WriteTreeAsync(entries);
+        Assert.Equal(3, store.Count); // root, src/, src/lib/
+
+        var snapshot = new RepositorySnapshot(
+            SnapshotId: "s1", RepositoryId: "repo", TreeHash: rootHash, Generation: 0,
+            CreatedAt: DateTimeOffset.UtcNow, TreeFormat: "cas-tree");
+
+        var hashes = await resolver.GetTreeBlobHashesAsync(snapshot);
+
+        Assert.Equal(3, hashes.Count);
+        Assert.Contains(rootHash, hashes);
+        Assert.Equal(new HashSet<string>(store.Hashes), new HashSet<string>(hashes));
     }
 
     [Fact]
