@@ -327,6 +327,13 @@ export function init(ctx) {
     }
   }
 
+  $('gw-load-cas').addEventListener('click', function() {
+    var btn = $('gw-load-cas');
+    btn.disabled = true;
+    btn.textContent = '☁ Loading…';
+    vscode.postMessage({ type: 'explorerReconcileCasOrigin' });
+  });
+
   // ── Exploration Settings ─────────────────────────────────────────────────
 
   $('gw-settings-btn').addEventListener('click', function() {
@@ -1797,6 +1804,12 @@ export function init(ctx) {
       if (msg.success) {
         $('gw-goal').value = '';
       }
+      return;
+    }
+    if (msg.type === 'casReconcileDone') {
+      var casBtn = $('gw-load-cas');
+      casBtn.disabled = false;
+      casBtn.textContent = '\u2601 Load to CAS';
       return;
     }
   });

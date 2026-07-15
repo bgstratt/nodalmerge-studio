@@ -26,6 +26,7 @@ export class LauncherViewProvider implements vscode.WebviewViewProvider {
       ['Start Local Runtime', COMMANDS.START_LOCAL_RUNTIME],
       ['Restart Studio Host', COMMANDS.RESTART_HOST],
       ['Show Output', COMMANDS.SHOW_OUTPUT],
+      ['Load Repo to CAS', COMMANDS.RECONCILE_BLOB_ORIGIN],
     ];
 
     const buttonHtml = buttons
