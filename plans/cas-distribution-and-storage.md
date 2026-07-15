@@ -440,6 +440,22 @@ history of *why* is permanent; the bytes of *what* are cache. (Node-store growth
 tasks/messages/history is a separate, non-CAS retention question — explicitly out of
 scope here; see Out of scope.)
 
+**5.1 findings (shipped 2026-07-15, `dc617ac`) — data-model gaps the classification
+works around, recorded for eventual hardening:** (1) No persisted branch-seed /
+merge-base snapshot reference exists (`WorkUnitFanOutInfo.SeedFromBranchId` is a
+BranchId; `RepositorySnapshot.WorkUnitId` is never set by any call site; branch seeding
+is a filesystem copy) — the Active class uses a documented proxy: latest snapshot per
+repo with `CreatedAt <= WorkUnit.CreatedAt` for each non-terminal work unit. Exact
+seed-pinning would require persisting the seed snapshot id at branch-creation time — a
+small, worthwhile hardening candidate before 6.5 relies on merge-base liveness. (2) The
+Intermediate age-out clock falls back to the snapshot's own `CreatedAt` (the intended
+branch-terminal timestamp needs `RepositorySnapshot.WorkUnitId`, unset today). (3)
+Terminal work-unit statuses per `WorkUnitTransitions` are `{Completed, Merged, Failed}`
+— deliberately narrower than the cache-eviction terminal set (`Cancelled`/`DeadLettered`
+have revival edges). Bootstrap marker: `Source == "Bootstrap"`; current head: max
+`Generation` per repo (`RepositorySyncStateV1.Generation` is an unrelated drift
+counter).
+
 | Slice | Content | Acceptance |
 |---|---|---|
 | 5.1 | **Retention classification (pure policy, no behavior change)**: `ISnapshotRetentionPolicy` classifies every snapshot generation: **Pinned** (bootstrap generation; generations referenced by applied merge proposals — the `appliedSnapshotId` stamp from the apply-time resync; admin pins) — live forever by default; **Active** (referenced as any non-terminal work unit's branch seed or merge base, or the current head of any repo) — live regardless of age; **Intermediate** (everything else) — live until `RetainIntermediateDays` (default 30) past its branch reaching a terminal state. Ships as a service + tests only; nothing consumes it yet | Classification of a seeded test DAG matches hand-computed expectation for all three classes; an in-flight work unit's seed is Active even when >30 d old |
