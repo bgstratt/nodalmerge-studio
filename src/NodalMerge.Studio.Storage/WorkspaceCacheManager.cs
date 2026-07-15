@@ -135,18 +135,11 @@ public sealed class WorkspaceCacheManager(
 
             if (string.Equals(snapshot.TreeFormat, "cas-tree", StringComparison.Ordinal))
             {
-                var resolved = await treeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
-                if (resolved is null)
-                {
-                    throw new InvalidOperationException(
-                        $"Repository snapshot '{snapshot.SnapshotId}' is cas-tree (TreeHash={snapshot.TreeHash}) " +
-                        "but its tree could not be resolved (CAS miss or corrupt — see prior warnings). The live " +
-                        "blob set is incomplete and unsafe to use for garbage collection.");
-                }
-
-                var treeBlobHashes = await treeResolver.GetTreeBlobHashesAsync(snapshot, ct).ConfigureAwait(false);
-                foreach (var hash in treeBlobHashes) live.Add(hash);
-                foreach (var blobId in resolved.Values) live.Add(blobId);
+                // Slice 1.3 — GetReachableHashesAsync already implements the exact fail-closed
+                // contract this method needs (throws naming the snapshot + missing hash rather than
+                // returning a partial set), so it's let to propagate as-is rather than re-wrapped.
+                var reachable = await treeResolver.GetReachableHashesAsync(snapshot, ct).ConfigureAwait(false);
+                foreach (var hash in reachable) live.Add(hash);
             }
             // else: pre-Phase-2 legacy snapshot (neither TreeEntries nor TreeFormat) — nothing to add.
         }

@@ -35,7 +35,13 @@ internal sealed class MaterializationEngine(
         IReadOnlyList<string>? fileScope = null,
         CancellationToken ct = default)
     {
-        var treeEntries = await treeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+        // Phase 2 slice 2.4 — passes fileScope into the resolver so a v2 tree walk can prune
+        // subtrees the scope can't reach (bounding CAS reads, not just the local file-write loop
+        // below). FilterByScope is still applied afterward: it's a no-op against an
+        // already-scoped map (same IsInScope predicate) but keeps behavior identical for legacy
+        // snapshots (whose resolver-side filtering is itself just FilterByScope's twin) and for a
+        // null scope (a no-op filter either way).
+        var treeEntries = await treeResolver.ResolveTreeAsync(snapshot, fileScope, ct).ConfigureAwait(false);
         if (treeEntries is null) return 0;
 
         var entries = FilterByScope(treeEntries, fileScope);

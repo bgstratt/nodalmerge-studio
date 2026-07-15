@@ -327,6 +327,15 @@ public static class ServiceCollectionExtensions
                 : NullMaterializationEngine.Instance;
         });
 
+        // Phase 2 slice 2.4 — prefetch warms the local blob cache for a work unit's declared
+        // FileScope ahead of need; registered alongside the materializer/resolver above since it
+        // shares their optional-blob-store shape (no store configured = a no-op service, not a
+        // missing registration every caller has to null-check for).
+        services.AddSingleton<IBlobPrefetchService>(sp => new WorkUnitPrefetchService(
+            sp.GetRequiredService<IRepositorySnapshotService>(),
+            sp.GetRequiredService<ISnapshotTreeResolver>(),
+            sp.GetService<IBlobStoreProvider>()));
+
         services.AddSingleton<IFileWorkspaceService>(sp => new FileSystemWorkspaceService(
             sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions(),
             sp.GetService<IBlobStoreProvider>(),

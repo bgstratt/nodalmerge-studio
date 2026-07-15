@@ -4666,6 +4666,11 @@ public static class StudioRestEndpoints
 
     private sealed record ResyncFilesBody(List<ResyncFileEntry>? Files = null, List<string>? DeletedPaths = null);
 
+    // plans/cas-distribution-and-storage.md Phase 2 slice 2.4 — optional; an empty/omitted body or
+    // a null/empty fileScope makes the call a no-op (0 fetched), matching IBlobPrefetchService's
+    // own no-op stance.
+    private sealed record PrefetchScopeBody(IReadOnlyList<string>? FileScope = null);
+
     private static void MapRepositoryEndpoints(WebApplication app)
     {
         // List known repositories (mirrors nm_v1_repository_list) — used by the VS Code extension's
@@ -4753,6 +4758,24 @@ public static class StudioRestEndpoints
             {
                 return Results.BadRequest(new { error = ex.Message });
             }
+        });
+
+        // Phase 2 slice 2.4 — warms the local blob cache for a declared FileScope ahead of need
+        // (e.g. while connected, before a checkout that will actually require it). repositoryId is
+        // passed straight through to IRepositorySnapshotService.GetLatestAsync, same convention as
+        // the git import/export endpoints below (the snapshot store's key is the physical repo
+        // path, not the registry's opaque id — see WorkspaceCacheManager.GetRepositoryIdAsync's own
+        // comment on that mismatch). No automatic trigger is wired to work-unit creation yet — see
+        // IBlobPrefetchService's own comment; this REST call is the deliberate manual/harness-owned
+        // surface.
+        app.MapPost("/studio/repositories/{repositoryId}/prefetch", async (
+            string repositoryId,
+            PrefetchScopeBody? body,
+            IBlobPrefetchService prefetch,
+            CancellationToken ct) =>
+        {
+            var fetched = await prefetch.PrefetchScopeAsync(repositoryId, body?.FileScope, ct).ConfigureAwait(false);
+            return Results.Ok(new { fetched });
         });
     }
 

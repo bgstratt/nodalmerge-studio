@@ -2337,9 +2337,24 @@ public interface ISnapshotTreeResolver
     // TreeEntries nor TreeFormat set) returns null, same as every existing caller already treats a
     // null map. A CAS miss or a corrupt tree blob also returns null — distinctly logged (miss vs
     // corrupt) so operators can tell the two apart — never throws, so a stale/incomplete cache
-    // can't crash a caller mid-materialization.
+    // can't crash a caller mid-materialization. Delegates to the scoped overload below with a null
+    // fileScope (i.e. "resolve everything").
     Task<IReadOnlyDictionary<string, string>?> ResolveTreeAsync(
         RepositorySnapshot snapshot, CancellationToken ct = default);
+
+    // Phase 2 slice 2.4 — scope-aware resolution: when fileScope is non-null/non-empty, the
+    // returned map contains only entries within scope (mirrors MaterializationEngine's
+    // IsInScope/FilterByScope exact-path-or-directory-prefix semantics — see
+    // MaterializationEngine for the canonical definition both sides must agree on). For a v2
+    // directory tree, a subtree is only fetched from the blob store if it could contain an
+    // in-scope path — this is what bounds CAS reads to the scope instead of the whole tree. For a
+    // v1 flat tree blob or legacy inline TreeEntries, there is no per-directory structure to prune,
+    // so the whole map is resolved (already in memory / a single blob) and then filtered — same
+    // result, just not the same fetch-avoidance. fileScope == null or empty resolves everything
+    // (equivalent to the no-scope overload). Same null/logging/never-throws contract as the no-scope
+    // overload otherwise.
+    Task<IReadOnlyDictionary<string, string>?> ResolveTreeAsync(
+        RepositorySnapshot snapshot, IReadOnlyList<string>? fileScope, CancellationToken ct = default);
 
     // Serializes entries as a v1 flat tree object (docs/TREE_OBJECT_FORMAT.md), stores it via the
     // blob store, and returns its BLAKE3 hash for use as RepositorySnapshot.TreeHash. Throws
@@ -2354,7 +2369,43 @@ public interface ISnapshotTreeResolver
     Task<IReadOnlyCollection<string>> GetTreeBlobHashesAsync(
         RepositorySnapshot snapshot, CancellationToken ct = default);
 
+    // Phase 1 slice 1.3 — the union of every tree-object hash AND file-blob hash reachable from
+    // this snapshot's root; the seam Phase 5's LiveHashSource is built on
+    // (nodalmerge/docs/delegated-storage-gc.md). Inline-legacy snapshots (TreeEntries set) return
+    // just the file hashes — there's no tree-object concept for them to protect. A pre-Phase-2
+    // snapshot (neither TreeEntries nor a cas-tree TreeFormat) returns an empty set — nothing to
+    // protect, same as GetTreeBlobHashesAsync's stance for that case.
+    //
+    // THROWS InvalidOperationException — never returns a partial set — when a cas-tree snapshot
+    // can't be fully resolved (missing blob store, CAS miss, or a corrupt tree object anywhere in
+    // the walk). This is deliberately stricter than ResolveTreeAsync's null-on-failure: a null
+    // return is safe for a materializer (it just fails that one operation), but a partial
+    // reachable-hash set handed to a GC sweep would look like a valid, smaller live set and let the
+    // sweep delete blobs that are still referenced. Fail closed instead — the exception message
+    // names the snapshot id and the specific hash that could not be resolved.
+    Task<IReadOnlySet<string>> GetReachableHashesAsync(
+        RepositorySnapshot snapshot, CancellationToken ct = default);
+
     bool CanWrite { get; }
+}
+
+// Phase 2 slice 2.4 — the prefetch half of scoped fetch. MaterializationEngine already bounds *how
+// many* blobs a checkout touches (FileScope-filtered resolve); this bounds *when* they're fetched:
+// pulling a work unit's declared FileScope into the local blob cache ahead of the materialize call
+// that actually needs it, so a peer that goes offline mid-goal already has what it needs cached
+// (harness plan's "bound offline exposure" stance). A miss for an individual hash is not a failure
+// of the whole prefetch — this is a best-effort warm, not a correctness-bearing fetch.
+public interface IBlobPrefetchService
+{
+    // Resolves repositoryId's latest snapshot, scope-prunes it to fileScope via
+    // ISnapshotTreeResolver's scoped ResolveTreeAsync overload, and warms the local blob cache
+    // (TryGetBlobAsync — through the chained provider this pulls from the remote origin and
+    // writes through to the local cache; the bytes themselves are discarded here) for every
+    // in-scope file hash, bounded to Concurrency requests in flight at once. Returns the count of
+    // hashes that resolved Found. Returns 0 when there is no snapshot yet, or fileScope is
+    // null/empty (nothing declared to prefetch).
+    Task<int> PrefetchScopeAsync(
+        string repositoryId, IReadOnlyList<string>? fileScope, CancellationToken ct = default);
 }
 
 // Phase 2 — snapshot checkpoint service for the repository op log. One snapshot per goal cycle
