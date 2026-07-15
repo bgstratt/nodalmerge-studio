@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -27,7 +28,8 @@ internal sealed class NullMaterializationEngine : IMaterializationEngine
 internal sealed class MaterializationEngine(
     IBlobStoreProvider blobStore,
     WorkspaceOptions options,
-    ISnapshotTreeResolver treeResolver) : IMaterializationEngine
+    ISnapshotTreeResolver treeResolver,
+    ILogger<MaterializationEngine>? logger = null) : IMaterializationEngine
 {
     public async Task<int> MaterializeAsync(
         RepositorySnapshot snapshot,
@@ -111,7 +113,17 @@ internal sealed class MaterializationEngine(
                 try
                 {
                     var result = await blobStore.TryGetBlobAsync(blobId, ct).ConfigureAwait(false);
-                    if (!result.Found || result.Bytes is null) return;
+                    if (!result.Found || result.Bytes is null)
+                    {
+                        // Silently leaving this file unwritten would make the workspace look like the
+                        // path was deleted to any downstream diff (e.g. merge proposal generation) —
+                        // log loudly so a CAS/origin gap is distinguishable from a real deletion.
+                        logger?.LogWarning(
+                            "File blob {BlobId} for {RelativePath} is missing from the blob store " +
+                            "(CAS miss) — leaving the path unwritten; workspace at {TargetPath} will be " +
+                            "incomplete.", blobId, relativePath, targetPath);
+                        return;
+                    }
 
                     Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
                     await File.WriteAllBytesAsync(fullPath, result.Bytes, ct).ConfigureAwait(false);

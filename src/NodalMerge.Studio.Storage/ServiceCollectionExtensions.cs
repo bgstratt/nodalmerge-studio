@@ -323,7 +323,9 @@ public static class ServiceCollectionExtensions
             var blobStore = sp.GetService<IBlobStoreProvider>();
             var opts      = sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions();
             return blobStore is not null
-                ? new MaterializationEngine(blobStore, opts, sp.GetRequiredService<ISnapshotTreeResolver>())
+                ? new MaterializationEngine(
+                    blobStore, opts, sp.GetRequiredService<ISnapshotTreeResolver>(),
+                    sp.GetService<ILogger<MaterializationEngine>>())
                 : NullMaterializationEngine.Instance;
         });
 
