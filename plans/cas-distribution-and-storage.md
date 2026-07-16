@@ -124,6 +124,17 @@ identity portable. It does not wall peers off from shared history.
 | 7.2 | **Portable repository identity for snapshots/workspaces** (studio only — verified: `SeedRepositoryPath` has zero nodalmerge hits; Rust 5.3 parser treats `RepositoryId` as an opaque grouping key, payload field names unchanged): resolution keys on `WorkgroupRepoId` with a per-peer `repoId → local path` binding (the 6.2 cache); `SeedRepositoryPath` demoted to peer-local bootstrap input; the 6.5 smoke's forced-matching-paths accommodation removed; local migration for existing rows; the unhelpful "path not found in latest snapshot" failure replaced with an identity-aware error | Cross-peer test with **different** physical paths on A and B passes the full 6.5 milestone flow; existing single-peer workspaces upgrade in place; smoke guide's path accommodation deleted |
 | 7.3 | **Peer-private room stops replicating** (studio only): the `"studio"` room is peer-local state (settings, profiles, scheduler, registry bindings w/ local paths, gc runs, execution events) — stop joining/pushing it upstream (the join was a pre-6.3 transition artifact); with the collision source gone, revisit 6.5's `RepositoryRegistryService.RefreshAsync` no-op (keep or restore live refresh safely); document that per-peer *roaming* (settings across one user's machines) would be a future `peer/{peerId}` room, deliberately not built now | Two peers against one server no longer share/LWW-collide any `"studio"`-room state (test: peer A's runtime-settings write never appears on B); workgroup/repo-room sharing behavior byte-identical |
 
+**7.1 shipped 2026-07-16** (nodalmerge `00ca67ba`, 0.2.2): `IInboundPackObserver` in
+Host.Abstractions/Providers; new DI-selected ctor (`IEnumerable<>` resolves empty —
+zero changes to existing registrations/signatures, 555-baseline suite untouched);
+fires only on the genuinely-inbound branch (catch-up/relay fan-out proven separate);
+per-observer try/catch. Studio wiring = slice 7.1b.
+**7.2 shipped 2026-07-16** (studio `ecae0b0`): `ResolveCasIdentityAsync` chain
+(sticky continuity for pre-7.2 history → `WorkgroupRepoId` incl. foreign replicated
+candidates → degraded path fallback); no migration needed by construction; milestone
+test now runs A/B on different physical paths; `RepositoryIdentityUnresolvedException`
++ identity-aware 404; smoke-guide accommodation removed. 957 tests green.
+
 Open product decision (recorded, not scheduled): **cross-peer session visibility** —
 execution sessions/events are deliberately local-only (6.3a). If the workgroup should
 see every session (UI defaulting to "my session" as a filter), that's the
