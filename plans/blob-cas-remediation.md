@@ -919,22 +919,63 @@ mkdir failure, copy-fallback failure), permanently orphaning those legacy blobs
 > Neither slice added a *new* bridge (still 9 sites, existing pattern reused) — they changed the **traffic**
 > through it from per-request to per-blob-per-sweep and per-export. Nothing here is a defect in 2.2/2.3;
 > both were correct and bucket-proven. But "defer 6.1" was priced against the old traffic.
+>
+> **Resolved 2026-07-16:** 6.1 shipped (`ac505724`) — one shared runtime, all waits bounded, timeouts
+> classify as backend errors. The *wedge* is gone. What remains of the escalation is the bounded-but-
+> still-blocking caller thread (6.2, now unblocked) and sweep/export I/O shape (6.3 + the export-RSS
+> follow-up).
 
-Confirmed performance/robustness debt. 6.1 is the most impactful (a hung delegate can
-wedge a worker indefinitely) — treat it as near-P1.
+Confirmed performance/robustness debt. ~~6.1 is the most impactful (a hung delegate can
+wedge a worker indefinitely) — treat it as near-P1.~~ 6.1 done; 6.2 is next-most-impactful.
 
-### 6.1 — s3-blobs runtime bridge + timeouts **[NM]** (#11)
-`nodalmerge:server/s3-blobs/src/lib.rs:289` (8 sites). Each S3 op spawns a fresh OS
-thread + a new multi-threaded tokio `Runtime` and blocks on a **timeout-less**
-`mpsc::recv()`, called synchronously from async contexts; the delegate path uses
-`reqwest::Client::new()` with **no timeout**, so a hung endpoint wedges a tokio worker
-forever.
-- Hold **one** shared runtime handle (or a dedicated dispatcher) in `S3BlobStore` and
-  reuse it across all sites; factor the bridge into a single helper (ties to 7.3).
-- Give the delegate `reqwest::Client` an explicit request timeout; add a bounded
-  timeout to the blocking receive.
-- **Validation:** a stalled delegate endpoint fails the op within the timeout instead
-  of pinning a worker; a soak test shows no per-op runtime construction.
+### 6.1 — s3-blobs runtime bridge + timeouts **[NM]** (#11) — ✅ **DONE 2026-07-16** (`ac505724`)
+`nodalmerge:server/s3-blobs/src/lib.rs:289` (8 sites — actual count on dispatch: **9**,
+the plan predated S5.3's `head_key`/`delete_key`). Each S3 op spawned a fresh OS
+thread + a new multi-threaded tokio `Runtime` and blocked on a **timeout-less**
+`mpsc::recv()`; the delegate `reqwest::Client` had no timeout (it was NOT rebuilt
+per-call as suspected — built once in `new()` and cloned, so pooling was fine; only
+timeouts were missing).
+- **Shipped:** all 9 sites route through one `block_on_shared_runtime` helper (name per
+  7.3, which this pre-absorbs) backed by a **process-wide `OnceLock<Runtime>`**, not a
+  store-owned one — dropping a `Runtime` inside an async context panics, and
+  `S3BlobStore` is constructed/dropped freely (server-s3 builds a second instance for
+  `S3BlobObjectStore`). 2 worker threads named `nm-s3-bridge`. Timeouts applied
+  **3-deep** (object_store `ClientOptions`, reqwest builder, bridge
+  `tokio::time::timeout` + `recv_timeout(inner + 15s)`), knobs on `S3BlobStoreConfig`:
+  `op_timeout` 30s / `connect_timeout` 10s / **`sweep_timeout` 15min** (deviation, and
+  correct: `blob_gc_sweep` is ONE bridge call wrapping a whole LIST+PUT+DELETE batch,
+  so `op_timeout` would abort every legitimate large-bucket sweep; each request inside
+  is still individually bounded by `op_timeout`). server-s3 got 3 matching env vars per
+  its env-only convention; no CLI flag duplication touched.
+- **Classification (the load-bearing part):** a timeout is a *backend* error, never
+  absence — `hydrate_blob`→`HydrateError::Backend`, GC `head_key`/`delete_key`→
+  `S3BlobError::Timeout`→`GcError::Backend`, aborted sweep ≡ crashed sweep (two-phase
+  tombstones tolerate it, nothing deletes without an aged persisted tombstone).
+  `has_blob() -> bool` cannot carry an error; `false` is conservative **for its actual
+  callers** (blob_http HEAD-404/PUT-dedupe, where spurious-absent costs a WS fallback
+  and spurious-present would 200 a HEAD it can't serve) and GC liveness never reads it
+  — verified + documented at the method. No trait signatures changed, no frozen
+  contracts touched.
+- **Validation done:** `tests/bridge_timeouts.rs` (7 tests, stalled in-test
+  `TcpListener`): 0/7 pre-fix — every op still running at a 10s watchdog — 7/7 after,
+  each returning via a 750ms configured timeout. Independently re-proven by sabotage
+  (timeouts stripped at all 3 layers → 0/7 at 10.03s; restored → 7/7). Runtime reuse
+  pinned green-side by `bridge_reuses_one_shared_runtime_across_ops`
+  (`BRIDGE_RUNTIMES_BUILT == 1` across stores/auth modes; pre-fix N-runtimes shown by
+  code shape, honestly reported as structural). MinIO 8/8 under `REQUIRE_DOCKER`;
+  blob_gc 12, conformance 13, delegate_gc 2, both binaries build clean.
+- **CI:** `blob-layout-parity.yml` gained the `bridge_timeouts` step + both `paths:`
+  entries (Docker-free by design, so it lives there, not in blob-s3-gc-minio.yml —
+  whose `server/s3-blobs/**` glob already picks up the change).
+- **Follow-ups filed (not fixed here):** (1) the bridge still *blocks the calling
+  thread* up to `op_timeout + 15s` — bounded now, but blob_http handlers still park
+  tokio workers; that IS 6.2, now unblocked. (2) blob_http PUT on a timing-out
+  backend: `has_blob`→false, `persist_blob` times out warn-only, handler still returns
+  **201 with nothing durably stored** — pre-existing void-`persist_blob` shape, same
+  family as 4.2's durability-truthfulness slice (fix it there or in 6.2). (3)
+  object_store's default `RetryConfig` still applies inside the sweep; per-request
+  bounds hold but retries multiply worst-case duration toward `sweep_timeout` — tune in
+  6.3.
 
 ### 6.2 — Move blocking blob work off async workers **[NM]**
 `nodalmerge:server/server/src/blob_http.rs:234`. GET/PUT handlers do blocking
