@@ -108,25 +108,29 @@
       bidirectional goal visibility, cold-peer materialize, propose/merge — all
       observed working over the real wire.
 
-## Next revision — consolidated follow-up ledger (2026-07-15 close-out)
+## Phase 7 — post-milestone hardening (sliced 2026-07-16, pre-ultra-review)
 
-Ranked; the first two are the gaps the 6.5 smoke identified as separating this
-from production multi-user.
+The three production-multi-user gaps from the 6.5 close-out, promoted to slices.
+Sharing doctrine unchanged and restated (2026-07-16 discussion): the **workgroup is
+the sharing boundary** — repo/workgroup data is shared by design; collaboration
+isolation comes from branches + proposals + reconciliation, never from hiding data;
+peers get their own *instanced materialized dirs* (already peer-local disk). Phase 7
+segregates only **peer-private config**, fixes visibility plumbing, and makes
+identity portable. It does not wall peers off from shared history.
 
-1. **Server-role replication bridging** (nodalmerge `RuntimeWebSocketLoopRunner`):
-   a host that is also the room-server never bridges inbound peer-authored packs
-   into its own Studio replication sink/cache refresh. Two-process topology works
-   (proven); the embedded-server topology has the gap.
-2. **Portable repository identity for snapshots/workspaces**:
-   `RepositorySnapshot.RepositoryId` + `SeedRepositoryPath` are keyed by physical
-   path — cross-machine peers currently must fake matching paths. The registry
-   already has `WorkgroupRepoId`; snapshots/workspaces need to move onto it.
-3. **Peer-private room isn't private**: every peer joins the same server-side
-   `"studio"` room (`Peer:RoomId` hardcoded); 6.5 had to no-op
-   `RepositoryRegistryService.RefreshAsync` because live refresh absorbed other
-   peers' registrations. Per-peer room ids (or splitting peer-private kinds out)
-   is the clean fix.
-4. Engine-side `ImportPack` → live-maps hydration (retire the replay-after-import
+| Slice | Content | Acceptance |
+|---|---|---|
+| 7.1 | **Inbound-pack observer hook** (nodalmerge, additive-only): `IInboundPackObserver` (or equivalent) invoked after the server-side WS loop's ImportPack+persist in `RuntimeWebSocketLoopRunner`; NEW overloads only — existing public ctors/`RunAsync` signatures untouched (binary compat preserved; no wire change; no-op when unregistered); lockstep bump 0.2.1→0.2.2. Then studio registers its replication sink + cache refresh on the hook (small studio follow-up once the package lands — dual project-reference mode makes this testable without repack) | Old studio + new package byte-identical behavior; 6.5's documented embedded-server boundary closes: B's proposal becomes visible via A's *service layer* in the in-process two-host test, not just engine MapGet |
+| 7.2 | **Portable repository identity for snapshots/workspaces** (studio only — verified: `SeedRepositoryPath` has zero nodalmerge hits; Rust 5.3 parser treats `RepositoryId` as an opaque grouping key, payload field names unchanged): resolution keys on `WorkgroupRepoId` with a per-peer `repoId → local path` binding (the 6.2 cache); `SeedRepositoryPath` demoted to peer-local bootstrap input; the 6.5 smoke's forced-matching-paths accommodation removed; local migration for existing rows; the unhelpful "path not found in latest snapshot" failure replaced with an identity-aware error | Cross-peer test with **different** physical paths on A and B passes the full 6.5 milestone flow; existing single-peer workspaces upgrade in place; smoke guide's path accommodation deleted |
+| 7.3 | **Peer-private room stops replicating** (studio only): the `"studio"` room is peer-local state (settings, profiles, scheduler, registry bindings w/ local paths, gc runs, execution events) — stop joining/pushing it upstream (the join was a pre-6.3 transition artifact); with the collision source gone, revisit 6.5's `RepositoryRegistryService.RefreshAsync` no-op (keep or restore live refresh safely); document that per-peer *roaming* (settings across one user's machines) would be a future `peer/{peerId}` room, deliberately not built now | Two peers against one server no longer share/LWW-collide any `"studio"`-room state (test: peer A's runtime-settings write never appears on B); workgroup/repo-room sharing behavior byte-identical |
+
+Open product decision (recorded, not scheduled): **cross-peer session visibility** —
+execution sessions/events are deliberately local-only (6.3a). If the workgroup should
+see every session (UI defaulting to "my session" as a filter), that's the
+replication-plane-compaction work — decide after Phase 7 lands.
+
+## Next revision — remaining follow-up ledger (2026-07-15 close-out)
+1. Engine-side `ImportPack` → live-maps hydration (retire the replay-after-import
    pattern; engine release + repack).
 5. 5.3 ledger: WS-upload-path inventory wiring; never-referenced-blob drift job;
    schema-vector payload examples → real-shape fixtures + parity-CI migration;
