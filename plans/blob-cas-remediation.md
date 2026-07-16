@@ -13,9 +13,9 @@ trying to assert a doc comment's claim — see the map below and slice 1.6.
 ## Status
 
 - [x] Phase 0 — Reproduce-first scaffolding (shared harnesses + contract vectors) — **complete 2026-07-16** (0.1 ✅ 0.2 ✅ 0.3 ✅ 0.4 ✅; 10 gated RED tests + shared `blob-conformance` crate; uncommitted on `blobExpansion`)
-- [ ] Phase 1 — GC data-loss & the crash (P0 — can permanently destroy blobs / abort the server) — **1.1 ✅ 1.5 ✅ 1.6 ✅ committed 2026-07-16** (`a4c4a694`, `ef693f39`, `5664c2b1` + studio `58d9a5c`); **1.2 blocked** on 7.5's composition seam, **1.3 blocked** on the MinIO test + time-bounding design, **1.4 open**
+- [ ] Phase 1 — GC data-loss & the crash (P0 — can permanently destroy blobs / abort the server) — **1.1 ✅ 1.5 ✅ 1.6 ✅ 1.4 ⚠️ committed 2026-07-16** (`a4c4a694`, `ef693f39`, `5664c2b1` + studio `58d9a5c`, `20aaba88`); **1.2 blocked** on 7.5's composition seam, **1.3 blocked** on the MinIO test + time-bounding design. **1.4 is only half-shipped — its write-through fix covers `DirPersistence` ONLY and is a no-op on S3 until 1.3 lands. See the 1.4↔1.3 coupling below.**
 - [ ] Phase 2 — Non-hydrating (S3) backend correctness
-- [ ] Phase 3 — Blob integrity & cross-runtime interop
+- [ ] Phase 3 — Blob integrity & cross-runtime interop — **3.1 ✅ committed 2026-07-16** (`6cf2c8fd`)
 - [ ] Phase 4 — HTTP-surface robustness & backward compatibility
 - [ ] Phase 5 — Migration safety
 - [ ] Phase 6 — Runtime, async-safety & efficiency
@@ -218,7 +218,55 @@ the gc-inventory `Active` rows written by the upload-confirm path.
   or deleted, if the real test subsumes it. Do not treat the un-ignore of 0.3(c) as
   sufficient evidence.
 
-### 1.4 — `sweep_blobs` hydration/write-through race **[NM]** (#5)
+### 1.4 — `sweep_blobs` hydration/write-through race **[NM]** (#5) — ⚠️ **HALF-DONE 2026-07-16** (`20aaba88`)
+
+**As shipped.** Bug 1 (hydration race): `Room::hydrated` (`AtomicBool`, set only after every
+hydration stage publishes graph/blobs/lineage) now gates the resident-scan exemption; a
+still-hydrating room falls through to the cold-room scan. Bug 2 (write-through window):
+`MIN_PHYSICAL_GRACE = 1ms` floors the grace handed to `blob_gc_sweep`, so a first sighting only
+ever tombstones and deletion waits for a later, separate sweep call.
+
+> ⚠️ **1.4 ↔ 1.3 coupling — bug 2 is still fully open on S3.** `MIN_PHYSICAL_GRACE` protects the
+> **`DirPersistence` path only**. `S3BlobStore::blob_gc_sweep` (`server/s3-blobs/src/lib.rs:524`)
+> binds `_grace` and never reads it — it is *deliberately* single-phase, on the documented premise
+> that "S3 object versions act as their own grace period, and operators who want hard-delete can
+> disable versioning." So the floor is a **no-op** there, not partial protection. This is not a
+> defect in 1.4: this section's own text already said "…or the S3 path (which 1.3 makes
+> grace-honoring)." But it means **1.4's Validation line is satisfied only for `DirPersistence`,
+> and Phase 1 is not actually closed on the S3 path until 1.3 ships.** Do not read 1.4's ✅ as
+> "the write-through race is fixed."
+>
+> Two things for 1.3 to absorb: (a) that versioning premise holds *only while versioning is
+> enabled*, and the comment actively invites operators to disable it for hard-delete — which
+> silently opts out of the only thing standing in for grace; (b) `NonHydratingBackend::blob_gc_sweep`
+> (`server/stores/blob-conformance/src/lib.rs:125`) is a byte-for-byte port of the same
+> `_grace`-ignoring bug. **That is the 0.3(c) gate hazard already flagged in this plan: it gates a
+> *copy* of the bug, so green there is not evidence.**
+
+**Bug 2 shipped untested against its own regression, then was covered.** 0.3(d) reproduces bug 1
+only (a persisted-before-process-start node; no live write-through during the test), so the
+implementing agent verified bug 2 by hand-tracing `store.rs` alone and said so. Added
+`blob_gc_zero_grace_never_deletes_on_first_sighting`, which does **not** try to test the race by
+racing — a test spawning threads to hit the window between snapshot and sweep would be flaky and
+prove little. It pins the *observable invariant the fix establishes*, which is deterministic and
+concurrency-free: with `grace == 0`, the first sweep must return 0 and leave the bytes on disk; a
+second, separate sweep deletes. RED-proven against the single line under test.
+
+> **Convention worth reusing:** when a fix closes a race, look for the deterministic invariant the
+> fix *establishes* and pin that, rather than trying to reproduce the interleaving. Racing the race
+> makes a flaky test that proves little; asserting "never on first sighting" proves exactly the
+> property that closes the window.
+
+**Known weakness (assessed, not fixed).** The guarantee is stated in **time** (1ms) but the
+invariant actually needed is **two separate sightings**. Nothing in `sweep_blobs` enforces
+separateness — it works only because no caller invokes it twice within 1ms (true in production,
+where the sweeper interval is seconds; true incidentally in tests, via real disk I/O between
+calls). A "first sighting only tombstones" check — consult the tombstone's existence *before*
+creating it, and allow same-call deletion only when the tombstone predates this call — would encode
+the real invariant instead of using wall-clock as a proxy for call count. Not wrong today; worth
+hardening if the sweep cadence ever tightens.
+
+**Original section text follows.**
 `nodalmerge:server/server/src/room.rs:644`. A still-hydrating resident room is treated
 as "covered" (its persisted scan skipped) while its in-memory graph is empty; and a
 blob persisted via write-through after the live snapshot isn't in the set.
@@ -398,7 +446,25 @@ subsume it.
 
 ## Phase 3 — Blob integrity & cross-runtime interop
 
-### 3.1 — .NET accepts unknown-content-size zstd frames **[NM]** (#4)
+### 3.1 — .NET accepts unknown-content-size zstd frames **[NM]** (#4) — ✅ **DONE 2026-07-16** (`6cf2c8fd`)
+
+**As shipped:** `TryDecompress` accepts `written <= buffer.Length` and slices to the real length.
+The hash-verify is untouched — it lives one level up in `FileBlobStoreProvider.TryGetBlobAsync`,
+not in `TryDecompress`, and it is what makes loosening the length check safe. Proven still to
+reject genuine corruption (the existing byte-flip-mid-frame test, magic intact, still yields
+`Found == false`).
+
+**`GetDecompressedSize` on a headerless frame — measured, not assumed** (ZstdSharp.Port 0.8.1):
+returns **131072**, the zstd default window size — an upper bound, *not* zero and *not* an error.
+So `written == buffer.Length` was false by construction for every Rust-encoded frame. Worth
+recording because "returns 0 / errors on unknown size" is the intuitive guess and it is wrong.
+
+> **The 0.1 empty-payload fixture was never RED.** `rust-encode-all-empty-payload.zst` has a
+> 0-byte plaintext, and `GetDecompressedSize` returns 0 for it — matching `buffer.Length` *by
+> coincidence*, so it passed even pre-fix. Only the non-empty fixture ever gated this slice. A
+> reminder that a fixture existing is not a fixture proving anything.
+
+**Original section text follows.**
 `nodalmerge:hosts/dotnet/…/BlobCompression.cs:111`. `TryDecompress` requires
 `written == buffer.Length` after sizing from `GetDecompressedSize`, which returns an
 **upper bound** for frames without the content-size header — i.e. every frame from
@@ -753,21 +819,58 @@ studio-specifics out of the generic crate — the right-altitude version of prin
 
 ## Follow-ups filed (not in this plan's scope)
 
-- ⚠ **Postgres/Mongo node stores have no CI coverage at all** (raised by 1.1, 2026-07-16 —
-  **the highest-value item on this list**). `server/stores/postgres/tests/postgres_round_trip.rs`
-  and `server/stores/mongo/tests/mongo_round_trip.rs` (and `server/stores/conformance/`) are run by
-  **no workflow** — they need Docker/testcontainers, which CI never sets up. This is now
-  safety-critical rather than merely thin: 1.1 makes those two stores assert
-  `can_enumerate_rooms() == true`, which instructs the sweep to **trust** their `known_room_ids()`
-  and proceed with deletes. A regression making either query return empty/partial reintroduces
-  finding #1's permanent blob deletion **with the fail-closed guard vouching for it** — the guard
-  only defends against *absent* enumeration, never *wrong* enumeration. 1.1's implementations were
-  verified only by a local Docker run. Wire a services/testcontainers job.
-- **CI `paths:` filters are hand-maintained and silently under-trigger** (raised by 1.5/1.6). Both
-  Phase 1 CI gaps were the same root cause: coverage depends on a human remembering to list every
-  source file a suite guards. Consider dropping the filters for the correctness workflows (they are
-  cheap), deriving them, or adding a meta-test asserting each named `--test` target's guarded
-  sources appear in its trigger list. Until then, **every slice must re-check its own trigger.**
+- ✅ **RESOLVED 2026-07-16** (`968a215b`) — ~~Postgres/Mongo node stores have no CI coverage at
+  all~~ (raised by 1.1). New `.github/workflows/nodestore-adapter-conformance.yml` runs
+  `dir_persistence`, `postgres_round_trip`, `mongo_round_trip`. Two things learned that generalize:
+  - **Wiring the suites in would have proved nothing.** The shared F7 conformance suite had 7
+    scenarios, none touching `known_room_ids`/`can_enumerate_rooms`, and `run_all(store, room_id)`
+    takes a *single* room — so it structurally *could not* test multi-room enumeration. The CI job
+    would have gone green while testing nothing about finding #1. Added
+    `known_room_ids_is_superset_of_written_rooms` (superset, never exact-set — the call is
+    store-global, so other rooms are legitimately present). RED-proven on both stores against real
+    containers, and deliberately sabotaged *two different ways* — empty enumeration (Postgres) and
+    partial, dropping one room (Mongo) — because the guard's whole weakness is *wrong* rather than
+    *absent* enumeration. **Check that a suite asserts the property before wiring it into CI to
+    guard that property.**
+  - **The tests fail *open*.** Both round-trip tests `eprintln!` + `return` when Docker is
+    unavailable, which the harness reports as **PASS** — correct on a dev laptop, catastrophic in
+    CI, where a broken Docker setup goes green while testing nothing. `NODALMERGE_REQUIRE_DOCKER=1`
+    (set at job level) converts the skip into a panic; local runs keep skipping. Verified in both
+    directions by pointing the image at a nonexistent tag. **Any "skips gracefully" test is a
+    fail-open test the moment CI runs it.**
+  - Still open, one layer down: both stores' `known_room_ids()` `warn!` + return an empty `Vec` on
+    query failure, so a transient DB error is indistinguishable from "no rooms" — the same
+    silent-data-loss shape the conformance scenario now guards against, but a live-traffic version
+    the scenario cannot reach.
+- ⚠ **CI coverage is far thinner than "filters under-trigger" implies** (raised by 1.5/1.6, and
+  substantially widened 2026-07-16 during 3.1 — **now the highest-value item on this list**).
+  The plan has hit this **four** times, escalating each time:
+  1. `studio_gc.rs` — test file existed, **no step ran it** anywhere (fixed, `5664c2b1`).
+  2. `tree_walk.rs` — step existed, **`paths:` filter omitted the source file** it guards (fixed,
+     `ef693f39`).
+  3. `ZstdInteropTests.cs` — **both at once**: listed in `paths:` but no `dotnet test` step ran it,
+     *and* `BlobCompression.cs` — the file 3.1 actually fixed — wasn't in the filter at all. The
+     interop contract was enforced only from the Rust side; a Rust test can never catch a .NET
+     decoder regression (fixed, `6cf2c8fd`).
+  4. **The audit that instance prompted: ~15 Rust integration-test files and ~34 .NET test classes
+     run in ZERO workflows.** Not filters under-triggering — *no step at all*. Includes
+     `server/s3-blobs/tests/minio_round_trip.rs` (the very test 1.3 is blocked on),
+     `persistence.rs`, `idle_eviction.rs`, `rate_limit.rs`, `token_expiry.rs`,
+     `metrics_endpoint.rs`, and — sharpest — `blob_layout_vectors_v3.rs`, a *sibling* of the
+     already-covered `blob_layout_vectors.rs`. Several cross-runtime parity contracts are pinned
+     from **one runtime only**: `SpecAuthVectorsTests.cs`↔`spec_auth_vectors.rs` and
+     `BranchForkVectorsTests.cs`↔`branch_fork_vectors.rs` (neither side runs anywhere);
+     `QueryMaterializationVectorsTests.cs` (Rust side covered, .NET mirror never runs) — the exact
+     one-directional shape that let finding #4 live.
+
+  Some are plausibly uncovered for the same structural reason Postgres/Mongo were (Docker/MinIO/
+  native FFI that CI doesn't set up) — that is a reason to fix the setup, not evidence the gap is
+  benign. **Until this is addressed, "CI is green" carries much less information than it appears
+  to, and every slice must re-check its own trigger *and* that a step exists at all.** The
+  mechanical fix is the same as before (drop filters for the cheap correctness workflows, derive
+  them, or add a meta-test asserting every `tests/*.rs` and test class is named by some workflow) —
+  but the audit says the meta-test is now the load-bearing one, since the failure is absence, not
+  staleness.
 
 - **Unbounded retention of revivable statuses.** After 1.6, `Failed` joins
   `Cancelled`/`DeadLettered` in being retained indefinitely. That is consistent, not new,
