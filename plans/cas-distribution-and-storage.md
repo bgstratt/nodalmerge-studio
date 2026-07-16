@@ -135,6 +135,26 @@ candidates → degraded path fallback); no migration needed by construction; mil
 test now runs A/B on different physical paths; `RepositoryIdentityUnresolvedException`
 + identity-aware 404; smoke-guide accommodation removed. 957 tests green.
 
+**7.3 + 7.1b shipped 2026-07-16** (`3f0f72c`, `1d1d3be`) — **Phase 7 complete.**
+7.3: upstream membership = workgroup + repo rooms only; the private `"studio"` room
+also stops broadcasting downstream (same collision, other direction — proven with a
+raw WS client against the host's own endpoint); the 6.5 registry-refresh no-op is
+RESTORED to live refresh (collision source structurally gone, proven by a
+two-peer no-absorption test); 6.1b's replication tests migrated to the workgroup
+directory. Fixed forward: `ResolveWorkgroupRepoIdAsync` had silently depended on
+cross-peer `"studio"` replication for foreign-candidate resolution — now falls back
+to the workgroup directory (preferred-id-continuity case; the disambiguated-fork
+reverse-index is a recorded follow-up). 7.1b: `StudioInboundPackObserver` (sink
+replay + cache refresh; registered in both build paths) — **A's service layer now
+sees B's proposal in the embedded-server topology**, closing 6.5's documented gap.
+Post-slice housekeeping (`cef4002`): packages repacked at 0.2.2, studio pins bumped,
+and the historical repack footgun root-caused — studio's `NuGet.config` had no local
+feed (cache-only resolution); the sibling-repo feed is now declared. Full solution
+green in default package mode: 960 tests.
+Follow-ups from this pair: `WorkgroupGoalDirectory` has no live-refresh hook in
+`RoomReplicationDispatcher` (only the repository directory does); disambiguated-fork
+foreign-id resolution needs a shared reverse-index.
+
 Open product decision (recorded, not scheduled): **cross-peer session visibility** —
 execution sessions/events are deliberately local-only (6.3a). If the workgroup should
 see every session (UI defaulting to "my session" as a filter), that's the
