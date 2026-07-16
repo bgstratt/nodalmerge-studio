@@ -33,7 +33,7 @@
       `.zst`-key half of layout §8 remains an unbuilt seam, clarified additively in
       that doc (`537face8`). Extension-settings mapping onto
       `NodalMerge:Storage:S3Direct:*` is a pending studio-side follow-up.
-- [ ] Phase 5 — GC & retention (the answer to snapshot flux)
+- [x] Phase 5 — GC & retention (the answer to snapshot flux)
       — **5.1 + 5.2 shipped 2026-07-15** (studio `cas-distribution-storage`): 5.1
       `ISnapshotRetentionPolicy` Pinned/Active/Intermediate classification
       (`dc617ac`; see 5.1 findings note), 5.2 retention-aware
@@ -56,7 +56,7 @@
       payload examples → real-shape fixtures + parity-CI migration, op-compaction
       over-retention refinement, Mongo/Postgres inventory adapters. Phase 5
       complete.
-- [ ] Phase 6 — Multi-user: replication data plane, room topology & repository identity
+- [x] Phase 6 — Multi-user: replication data plane, room topology & repository identity
       — **sliced 2026-07-15**; decision recorded: Studio state rides the engine DAG.
       **6.0 + 6.1a + 6.1b shipped 2026-07-15** (studio `cas-distribution-storage`):
       6.0 `docs/STUDIO_ROOM_SCHEMA.md` freeze + vectors (`52ef883`), 6.1a engine-backed
@@ -98,7 +98,45 @@
       (highest-volume, no 5.3 need — replication-plane-compaction territory).
       Proposal-on-A-visible-on-B verified. **5.3 is unblocked**: everything
       retention classification needs is room-resident.
-      Remaining: 5.3 → 6.5.
+      **6.5 shipped 2026-07-15** (`8bb732d`) — **the plan is complete.** Inbound
+      cache refresh (`IStudioCacheRefreshCoordinator` + per-service `RefreshAsync`;
+      inbound-wins-for-unmodified rule, engine LWW is the only conflict
+      resolution), seed-snapshot pinning (`WorkUnit.SeedSnapshotId`, retention
+      Active class now exact for new rows, proxy kept for legacy), two-peer
+      integration test, and an **executed real-stack smoke** (Rust server + two
+      `dotnet run` hosts, recipe in `docs/guides/multi-user-smoke.md`):
+      bidirectional goal visibility, cold-peer materialize, propose/merge — all
+      observed working over the real wire.
+
+## Next revision — consolidated follow-up ledger (2026-07-15 close-out)
+
+Ranked; the first two are the gaps the 6.5 smoke identified as separating this
+from production multi-user.
+
+1. **Server-role replication bridging** (nodalmerge `RuntimeWebSocketLoopRunner`):
+   a host that is also the room-server never bridges inbound peer-authored packs
+   into its own Studio replication sink/cache refresh. Two-process topology works
+   (proven); the embedded-server topology has the gap.
+2. **Portable repository identity for snapshots/workspaces**:
+   `RepositorySnapshot.RepositoryId` + `SeedRepositoryPath` are keyed by physical
+   path — cross-machine peers currently must fake matching paths. The registry
+   already has `WorkgroupRepoId`; snapshots/workspaces need to move onto it.
+3. **Peer-private room isn't private**: every peer joins the same server-side
+   `"studio"` room (`Peer:RoomId` hardcoded); 6.5 had to no-op
+   `RepositoryRegistryService.RefreshAsync` because live refresh absorbed other
+   peers' registrations. Per-peer room ids (or splitting peer-private kinds out)
+   is the clean fix.
+4. Engine-side `ImportPack` → live-maps hydration (retire the replay-after-import
+   pattern; engine release + repack).
+5. 5.3 ledger: WS-upload-path inventory wiring; never-referenced-blob drift job;
+   schema-vector payload examples → real-shape fixtures + parity-CI migration;
+   op-compaction over-retention; Mongo/Postgres inventory adapters.
+6. Reconcile-sweep multi-target push (relay-only today) + presign-time `.zst` key
+   selection (Phase 4 leftovers).
+7. Extension UI for identity disambiguation (REST surface exists);
+   `ReadFileAsync` callers → pinned refs (needs a generation pin on
+   `FileReferenceV1`); execution-event kinds replication-plane compaction;
+   in-memory cache refresh for kinds beyond the rehydratables.
 
 Baseline measurement (`tools/measure-cas-baseline.ps1`, run 2026-07-15): no heavy-use
 workspace exists yet — real repos so far are small, so the projected ~400 KB/generation
