@@ -13,7 +13,7 @@ trying to assert a doc comment's claim — see the map below and slice 1.6.
 ## Status
 
 - [x] Phase 0 — Reproduce-first scaffolding (shared harnesses + contract vectors) — **complete 2026-07-16** (0.1 ✅ 0.2 ✅ 0.3 ✅ 0.4 ✅; 10 gated RED tests + shared `blob-conformance` crate; uncommitted on `blobExpansion`)
-- [ ] Phase 1 — GC data-loss & the crash (P0 — can permanently destroy blobs / abort the server)
+- [ ] Phase 1 — GC data-loss & the crash (P0 — can permanently destroy blobs / abort the server) — **1.1 ✅ 1.5 ✅ 1.6 ✅ committed 2026-07-16** (`a4c4a694`, `ef693f39`, `5664c2b1` + studio `58d9a5c`); **1.2 blocked** on 7.5's composition seam, **1.3 blocked** on the MinIO test + time-bounding design, **1.4 open**
 - [ ] Phase 2 — Non-hydrating (S3) backend correctness
 - [ ] Phase 3 — Blob integrity & cross-runtime interop
 - [ ] Phase 4 — HTTP-surface robustness & backward compatibility
@@ -138,7 +138,19 @@ The highest-severity cluster: five paths that can permanently delete live blobs,
 one remotely-reachable process abort. Everything here fails **closed** — when the
 system can't prove a blob is dead, it must not delete it.
 
-### 1.1 — `known_room_ids` completeness + fail-closed global sweep **[NM]** (#1)
+### 1.1 — `known_room_ids` completeness + fail-closed global sweep **[NM]** (#1) — ✅ **DONE 2026-07-16** (`a4c4a694`)
+**As shipped:** `can_enumerate_rooms()` defaults `false`; `sweep_blobs` refuses the
+**entire** two-phase sweep (warn + `nodalmerge_blob_gc_skipped_total{reason="cannot_enumerate_rooms"}`
++ 0 deletions) when it is false — not just the physical delete, since tombstoning against a
+known-incomplete live set still starts a deletion clock on possibly-live blobs. Verified no
+production impl is left behind: `Composite` forwards, `Dir`/`Postgres`/`Mongo` return `true`,
+`NoPersistence` is short-circuited by the pre-existing `is_durable()` check. A not-enumerable
+stub test was added alongside 0.3(a), which only covered the forwarding half.
+⚠ **Residual risk — see the CI follow-up below.** The guard makes *absent* enumeration safe, but
+Postgres/Mongo now assert `can_enumerate_rooms() == true`, which tells the sweep to **trust** their
+`known_room_ids()` and delete. A broken/empty result from those queries reintroduces #1's data loss
+*with the guard vouching for it* — and **no CI step runs the Postgres or Mongo suites**. Those two
+impls are the safety-critical path and are covered only by local Docker runs today.
 `nodalmerge:server/server/src/store.rs:291`. The trait default returns an empty
 `Vec`; `Composite<N,B>` (the production server-s3 wiring) doesn't forward it, and
 `PostgresNodeStore`/`MongoNodeStore` never implement it — so the global sweep treats
@@ -219,7 +231,16 @@ blob persisted via write-through after the live snapshot isn't in the set.
   path (which 1.3 makes grace-honoring).
 - **Validation:** 0.3(d) passes, including with `--blob-gc-grace 0`.
 
-### 1.5 — Bound the tree walk (stop the crash) **[NM]** (#9)
+### 1.5 — Bound the tree walk (stop the crash) **[NM]** (#9) — ✅ **DONE 2026-07-16** (`ef693f39`)
+**As shipped:** iterative heap work-stack **and** a `MAX_TREE_DEPTH = 4096` cap returning
+`TreeWalkError::TooDeep`. **Both were required, despite this section's "or" phrasing** — the
+work-stack removes the OS-stack dependence (the crash), but alone it would let an arbitrarily deep
+chain *succeed slowly* rather than fail closed, which the Validation line requires. If this plan is
+reused as a template, tighten that wording. Pre-fix crash independently reproduced against the
+recursive `walk_one` (`STATUS_STACK_OVERFLOW`, exit `0xc00000fd`, no output before the abort), so
+the RED state is an observation, not an inference. Tests: `server/server/tests/tree_walk_depth.rs`
+(50k-deep chain on a 256 KiB-stack thread → `TooDeep`; a 300-deep chain must still succeed, guarding
+against an over-aggressive cap).
 `nodalmerge:server/server/src/tree_walk.rs:133`. `walk_one` recurses once per
 directory level with no depth bound; a chain of distinct single-entry tree blobs
 (uploadable via anonymous PUT) overflows the worker stack and aborts the process.
@@ -246,7 +267,24 @@ directory level with no depth bound; a chain of distinct single-entry tree blobs
   Operators wanting authorization set `auth_token`; deployments needing more can front
   the surface. Do not couple any of this to the crash fix.
 
-### 1.6 — `Failed` is not terminal **[BOTH]** (#30 — found during 0.4)
+### 1.6 — `Failed` is not terminal **[BOTH]** (#30 — found during 0.4) — ✅ **DONE 2026-07-16** (`5664c2b1` + studio `58d9a5c`)
+**As shipped:** `Failed` dropped from `TERMINAL_STATUSES`; doc comment corrected; 0.3(e)
+un-ignored as written; the vacuous sibling given a unique bootstrap tree (proved non-vacuous by
+disabling seed-protection → both tests RED → revert → both green).
+**The load-bearing part was NOT the [NM] one-liner.** studio's
+`WorkUnitStatusVectorTests.cs` bound `terminal_status_names` to `_` — because **0.4 deleted the
+assertion that used it, precisely because that assertion FAILED**, which is how #30 was found.
+1.6 fixed the root cause, so the assertion became true and was **restored**
+(`Every_terminal_status_has_zero_outgoing_transition_edges`, driven off the vector file, with an
+`Assert.NotEmpty` vacuity guard and a `DO NOT DELETE` remark).
+**Why it matters:** nodalmerge's own pin is **circular** — 1.6 edited both Rust `TERMINAL_STATUSES`
+and the vector's `terminal_status_names`, and `terminal_status_ordinals_match_frozen_constants`
+only checks the two mirror each other. Both live in nodalmerge, so it passes for *any* terminal set.
+The studio-side edge assertion is the **only non-circular pin** — it validates the set against the
+real transition graph. Its RED proof isolates exactly `Failed -> Cancelled`: finding #30 as one line
+of test output.
+**Generalizable lesson:** when a slice fixes a root cause, check whether an earlier slice *removed*
+an assertion because of that root cause. A `_`-bound variable is a scar, not an accident.
 `nodalmerge:server/server/src/studio_live_hashes.rs:86-89` documents
 `TERMINAL_STATUSES = [Completed, Failed, Merged]` on the stated grounds that
 `WorkUnitTransitions.CanTransition` "has zero outgoing edges from these three."
@@ -682,6 +720,20 @@ studio-specifics out of the generic crate — the right-altitude version of prin
   own step (`cargo test -p <crate> --test <file>` / `dotnet test --filter
   "FullyQualifiedName~<Class>"`). **A new test file is invisible to CI unless a step is
   added.** Adding the step is part of every slice's definition of done.
+- ⚠ **A step existing is not the same as a step running** (learned the hard way in Phase 1,
+  2026-07-16). Two failure modes this convention originally missed — **check both, every slice**:
+  1. **No step at all.** `server/server/tests/studio_gc.rs` shipped with **no step in any
+     workflow** — so its Phase 0 RED gates for 1.2/1.6 were not "skipped until their slice", they
+     had *never executed in CI*. Fixed in 1.6 (`studio-live-hashes-parity.yml`). When Phase 0 says
+     a gate is committed, verify the file it lives in actually runs.
+  2. **The workflow is `paths:`-filtered.** `blob-layout-parity.yml` triggers only on a hand-listed
+     set of files. It listed `store.rs`/`room.rs`/`blob_http.rs` but **not** `tree_walk.rs` — so
+     1.5's fix would have landed with its own suite never firing. Fixed in 1.5. **Adding a step is
+     half the job; the trigger must also list the source files the suite guards.**
+  - **Root cause, unfixed:** these filters enumerate implementation files *by hand*, so every
+    suite's real coverage depends on someone remembering each file it transitively exercises. Same
+    shape as the missing `.gitattributes` (fixed `10723954`): correct by luck, silent when wrong.
+    See the follow-up below.
 - **Vectors** live flat in `nodalmerge:engine/commands/*.v1.json`; binary goldens in
   `engine/commands/fixtures/`. Rust consumes via `include_str!` → collect failures into
   a `Vec<String>` → one `assert!`. Prefer an **inline** `#[cfg(test)]` vector test over
@@ -700,6 +752,22 @@ studio-specifics out of the generic crate — the right-altitude version of prin
 - **All four of the plan's original open decisions are now resolved.** New ones raised by Phase 0 stay below.
 
 ## Follow-ups filed (not in this plan's scope)
+
+- ⚠ **Postgres/Mongo node stores have no CI coverage at all** (raised by 1.1, 2026-07-16 —
+  **the highest-value item on this list**). `server/stores/postgres/tests/postgres_round_trip.rs`
+  and `server/stores/mongo/tests/mongo_round_trip.rs` (and `server/stores/conformance/`) are run by
+  **no workflow** — they need Docker/testcontainers, which CI never sets up. This is now
+  safety-critical rather than merely thin: 1.1 makes those two stores assert
+  `can_enumerate_rooms() == true`, which instructs the sweep to **trust** their `known_room_ids()`
+  and proceed with deletes. A regression making either query return empty/partial reintroduces
+  finding #1's permanent blob deletion **with the fail-closed guard vouching for it** — the guard
+  only defends against *absent* enumeration, never *wrong* enumeration. 1.1's implementations were
+  verified only by a local Docker run. Wire a services/testcontainers job.
+- **CI `paths:` filters are hand-maintained and silently under-trigger** (raised by 1.5/1.6). Both
+  Phase 1 CI gaps were the same root cause: coverage depends on a human remembering to list every
+  source file a suite guards. Consider dropping the filters for the correctness workflows (they are
+  cheap), deriving them, or adding a meta-test asserting each named `--test` target's guarded
+  sources appear in its trigger list. Until then, **every slice must re-check its own trigger.**
 
 - **Unbounded retention of revivable statuses.** After 1.6, `Failed` joins
   `Cancelled`/`DeadLettered` in being retained indefinitely. That is consistent, not new,
