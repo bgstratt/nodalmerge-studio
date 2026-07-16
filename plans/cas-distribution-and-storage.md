@@ -58,7 +58,22 @@
       step order (slash-strip before `.git`-strip). NOTE for 6.3/6.4:
       `RoomPeerClient` is still single-room — workgroup-room writes are durable
       locally but not yet pushed upstream; multi-room membership is the gap 6.3
-      closes. Remaining: 6.3–6.5.
+      closes. **6.3 shipped 2026-07-15** (`4259cc6`): kind→room routing for the 5
+      direct-`RepositoryId` kinds + marker-guarded lazy-per-room migration,
+      multi-room `RoomPeerClient` (one socket per room — ws_handler binds room from
+      the URL path once, verified no multiplexing), workgroup replication live
+      end-to-end, minimal workgroup goal nodes (`"goals"` namespace), pinned-ref
+      resolver + `POST /studio/references/resolve` (no-local-clone verified). 942
+      tests green. **New gate discovered: ~25 repo-scoped-indirect kinds
+      (`MergeProposalV1`, `TaskV1`, `BranchV1`, …) carry no `RepositoryId` — they
+      remain peer-local until a denormalize-and-route slice (6.3a below) lands;
+      5.3's server-side retention classification cannot see proposals until then.**
+      Remaining: 6.3a → 6.4 → 5.3 → 6.5.
+      - 6.3a (new, gates 5.3): denormalize `RepositoryId` onto the indirect
+        repo-scoped kinds at creation time (the 6.3 report's recommendation over
+        parent-chain walks), route them per 6.3's mechanism, migrate lazily
+        per-room like 6.3 did. `BranchV1` has no linking field at all today —
+        needs the field added, not just copied.
 
 Baseline measurement (`tools/measure-cas-baseline.ps1`, run 2026-07-15): no heavy-use
 workspace exists yet — real repos so far are small, so the projected ~400 KB/generation
