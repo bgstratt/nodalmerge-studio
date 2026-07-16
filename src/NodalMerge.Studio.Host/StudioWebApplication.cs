@@ -6,6 +6,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using NodalMerge.DotNetHost;
 using NodalMerge.DotNetHost.Runtime;
+using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Host.Composition;
 using NodalMerge.Studio.AgentRuntime;
 using NodalMerge.Studio.Core;
@@ -45,6 +46,7 @@ public static class StudioWebApplication
             services.AddNodalMergeHostProviders(config);
             services.AddNodalMergeRuntimeCore(config);
             services.AddStudioServices(llmHttpClient, includeMcpServer: false);
+            AddStudioInboundPackObserver(services);
 
             services.AddSingleton<HeadlessPeerOptions>(sp =>
             {
@@ -78,6 +80,14 @@ public static class StudioWebApplication
         services.AddSingleton<IStudioReplicationOutbound>(sp => sp.GetRequiredService<RoomPeerClient>());
     }
 
+    // Slice 7.1b — registered on both Build() (embedded) and BuildPeer() (headless) paths: either
+    // kind of host can play the room-SERVER role for some room (a peer connecting to ITS OWN
+    // /ws/{room} endpoint), and RuntimeWebSocketLoopRunner's server-side WS handling is the same
+    // code either way. See StudioInboundPackObserver's own doc comment for what this bridges and
+    // why it needs no private-room special-casing.
+    private static void AddStudioInboundPackObserver(IServiceCollection services) =>
+        services.AddSingleton<IInboundPackObserver, StudioInboundPackObserver>();
+
     public static WebApplication Build(
         string[] args,
         Action<IWebHostBuilder>? configureWebHost = null,
@@ -106,6 +116,7 @@ public static class StudioWebApplication
         builder.Services.AddNodalMergeHostProviders(builder.Configuration);
         builder.Services.AddNodalMergeRuntimeCore(builder.Configuration);
         builder.Services.AddStudioServices(llmHttpClient);
+        AddStudioInboundPackObserver(builder.Services);
         builder.Services.AddSingleton<IRuntimeEventBroadcaster, RuntimeRoomEventBroadcaster>();
         builder.Services.AddSingleton<IStudioGraphPromoter, RuntimeGraphPromoter>();
         builder.Services.AddSingleton<IStudioCausalGraphService, RuntimeCausalGraphService>();

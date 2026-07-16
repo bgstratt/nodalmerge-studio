@@ -47,27 +47,32 @@ namespace NodalMerge.Studio.Integration.Tests;
 ///     runs on whichever peer owns the physical clone), B's in the shared repo room's CRDT state
 ///     (durable, and would materialize correctly for any peer that runs a fresh catch-up).
 ///
-/// ── A genuine defect this milestone surfaced, NOT worked around (per this slice's own
-/// instructions: report precisely, don't patch around another repo) ──────────────────────────────
+/// ── 6.5's genuine defect, now CLOSED by slice 7.1b (plans/cas-distribution-and-storage.md
+/// Phase 7) ───────────────────────────────────────────────────────────────────────────────────
 /// Step 3's proposal, though correctly routed into the shared repo room's CRDT state (verified
-/// directly against the engine map below), never becomes visible through peer A's OWN
+/// directly against the engine map below), used to never become visible through peer A's OWN
 /// IMergeService — the last hop the milestone's "proposal replicates back to A" bullet wants. Root
-/// cause, traced precisely while building this test: A plays the ROOM-SERVER role for this room (B
-/// connects to A's own /ws/{room} endpoint); an inbound "pack" arriving at a room *server*'s own
-/// WebSocket endpoint is handled by RuntimeWebSocketLoopRunner (nodalmerge repo,
+/// cause, traced precisely while originally building this test: A plays the ROOM-SERVER role for
+/// this room (B connects to A's own /ws/{room} endpoint); an inbound "pack" arriving at a room
+/// *server*'s own WebSocket endpoint is handled by RuntimeWebSocketLoopRunner (nodalmerge repo,
 /// hosts/dotnet/src/NodalMerge.DotNetHost/Runtime/RuntimeWebSocketLoopRunner.cs) — engine-level
 /// relay only (ImportPack + persist + rebroadcast to other connected peers). The Studio-domain
 /// bridge (replay canonical resolution into the engine's live "room_maps" state, then refresh every
-/// IRehydratable's in-memory cache — this slice's own Part 1) exists ONLY in RoomPeerClient's
-/// client-role receive loop (ApplyInboundPackForRoomAsync), which A never runs for its OWN room
-/// (A has no Room:HostUri — it never connects outward to itself). So a peer-authored write pushed
-/// UPSTREAM to a host that is simultaneously the room's server never reaches that host's own Studio
-/// state or in-memory caches, live or on next read — every existing 6.1b/6.3 test only ever
-/// exercises the opposite direction (the embedded host writes, a connected peer receives), which is
-/// why this never surfaced before. This is a nodalmerge-repo (NodalMerge.DotNetHost) defect, out of
-/// this slice's edit scope by the harness's own instructions — flagged here and in the slice's final
-/// report, not patched around. Consequently this test does NOT assert A ever sees or applies B's
-/// proposal; it stops at proving the proposal is correctly formed and durably shared.
+/// IRehydratable's in-memory cache — 6.5 Part 1) existed ONLY in RoomPeerClient's client-role
+/// receive loop (ApplyInboundPackForRoomAsync), which A never runs for its OWN room (A has no
+/// Room:HostUri — it never connects outward to itself). So a peer-authored write pushed UPSTREAM to
+/// a host that is simultaneously the room's server never reached that host's own Studio state or
+/// in-memory caches, live or on next read — every 6.1b/6.3 test only ever exercised the opposite
+/// direction (the embedded host writes, a connected peer receives), which is why this never
+/// surfaced before 6.5. This was a nodalmerge-repo (NodalMerge.DotNetHost) defect, out of 6.5's own
+/// edit scope, flagged rather than patched around at the time.
+///
+/// 7.1 (nodalmerge, IInboundPackObserver) + 7.1b (this repo, StudioInboundPackObserver) close it:
+/// RuntimeWebSocketLoopRunner now invokes a Studio-registered observer after every genuinely
+/// peer-authored inbound pack on the server-side WS path too, which performs the exact same
+/// sink-replay + cache-refresh RoomPeerClient's client-role loop always did. Below, host A's OWN
+/// IMergeService.GetAsync now observes B's proposal without a restart — the assertion 6.5 couldn't
+/// make.
 ///
 /// ── Slice 7.2 fix (plans/cas-distribution-and-storage.md Phase 7) — portable repository identity
 /// ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -267,10 +272,16 @@ public class MultiUserMilestoneTests : IDisposable
             Assert.NotNull(TryReadEngineMapValue(bridgeB, repoRoomId, "studio", proposalKey));
             Assert.Null(TryReadEngineMapValue(bridgeB, "studio", "studio", proposalKey));
 
-            // NOTE: this is as far as B's proposal can be followed today — see the class-level doc
-            // comment's "genuine defect" section for exactly why peer A's own IMergeService never
-            // observes it, and why that is out of this slice's scope to fix (a nodalmerge-repo
-            // defect in the room-server's own inbound WS handling, not this repo's).
+            // ── Slice 7.1b's own headline assertion — the exact hop 6.5 couldn't make: peer A
+            // plays the room-SERVER role for this room (B connects to A's own /ws/{room}
+            // endpoint), and A's OWN IMergeService now observes B's proposal without a restart,
+            // via StudioInboundPackObserver bridging RuntimeWebSocketLoopRunner's server-side
+            // inbound-pack handling into the same sink-replay + cache-refresh path RoomPeerClient's
+            // client-role loop always used. ─────────────────────────────────────────────────────
+            var mergeServiceA = hostA.Services.GetRequiredService<IMergeService>();
+            var proposalOnA = await PollUntilNotNullAsync(() => mergeServiceA.GetAsync(proposalFromB.ProposalId));
+            Assert.Equal(goalWorkUnit.WorkUnitId, proposalOnA!.WorkUnitId);
+            Assert.Equal(repoA.RepositoryId, proposalOnA.RepositoryId);
 
             // ── (4) A's own divergent, concurrent edit to a DIFFERENT file — proposed, reviewed,
             // and applied through the ordinary command surface. Advances the repository's real
