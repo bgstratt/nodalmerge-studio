@@ -16,6 +16,30 @@ jobs:
         with:
           path: nodalmerge-studio
 
+      # Slice 0.4 (plans/blob-cas-remediation.md, finding #14) — checks out the sibling
+      # nodalmerge repo so WorkUnitStatusVectorTests (NodalMerge.Studio.Contracts.Tests) can read
+      # the shared cross-repo contract vectors at
+      # ../nodalmerge/engine/commands/work-unit-status-vectors.v1.json (matching the
+      # NodalMergeEngineCommandsDir convention in Directory.Build.props, which already assumes a
+      # sibling checkout the same way NodalMergeDotNetHostProject does).
+      #
+      # TODO(blobExpansion-merge): pinned to nodalmerge's `blobExpansion` branch, NOT `main`.
+      # The vector file (engine/commands/work-unit-status-vectors.v1.json) only exists on
+      # `blobExpansion` today — the whole `blob-cas-remediation.md` remediation plan lands there
+      # before merging to nodalmerge's `main`. Pointing this checkout at `main` would leave
+      # studio's CI red (WorkUnitStatusVectorTests failing closed on a missing vectors file) for
+      # the entire multi-phase remediation effort, which trains people to ignore red CI and
+      # contradicts the green-CI convention the RED-first tests in this plan rely on. Flip `ref:`
+      # below to `main` the moment `blobExpansion` merges into nodalmerge's `main` — do not leave
+      # it pointed at `blobExpansion` after that merge lands, or this step will silently keep
+      # tracking a stale/deleted branch instead of `main`'s ongoing history.
+      - name: Checkout nodalmerge (sibling repo — shared vector contracts)
+        uses: actions/checkout@v4
+        with:
+          repository: bgstratt/nodalmerge
+          ref: blobExpansion
+          path: nodalmerge
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
