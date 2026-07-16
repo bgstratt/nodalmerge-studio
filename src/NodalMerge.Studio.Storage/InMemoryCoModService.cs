@@ -65,7 +65,7 @@ internal sealed class InMemoryCoModService(IStudioNodeStore nodeStore) : ICoModS
             patterns.Add(pattern);
 
             var nodeJson = JsonSerializer.Serialize(pattern);
-            await nodeStore.WriteNodeAsync(StudioNodeKind.CoModPatternV1, patternId, nodeJson, ct)
+            await nodeStore.WriteNodeAsync(StudioNodeKind.CoModPatternV1, patternId, nodeJson, pattern.RepositoryId, ct)
                 .ConfigureAwait(false);
         }
 

@@ -57,7 +57,7 @@ public sealed class InMemoryRepositoryOpService : IRepositoryOpService, IRehydra
         }
 
         var json = JsonSerializer.Serialize(op);
-        await _nodeStore.WriteNodeAsync(StudioNodeKind.RepositoryOpV1, op.OperationId, json, ct)
+        await _nodeStore.WriteNodeAsync(StudioNodeKind.RepositoryOpV1, op.OperationId, json, op.RepositoryId, ct)
             .ConfigureAwait(false);
         IndexOp(op);
     }

@@ -317,6 +317,13 @@ public static class StudioRestEndpoints
 
     private sealed record RollbackRequestBody(string KnownGoodStateId);
 
+    // Slice 6.3 (D3, docs/STUDIO_ROOM_SCHEMA.md (c)) — the pinned cross-repo reference triple,
+    // field names matching the frozen canonical JSON form exactly ({repoId, generationId, path}).
+    private sealed record PinnedReferenceRequestBody(
+        string RepoId,
+        string GenerationId,
+        string Path);
+
     private sealed record CreateGoalBody(
         string Goal,
         string? WorkUnitId = null,
@@ -1032,6 +1039,45 @@ public static class StudioRestEndpoints
                     detail = ex.Message,
                 });
             }
+        });
+
+        // Slice 6.3 (D3, docs/STUDIO_ROOM_SCHEMA.md (c)) — resolves a pinned cross-repo reference
+        // triple through the frozen chain (repo room -> generation node -> TreeHash -> CAS walk ->
+        // blob), so the resolution path is exercisable end-to-end over HTTP. Bytes are returned
+        // base64-encoded inside a JSON envelope (not raw) to match every other endpoint in this
+        // file; 404 covers every "can't resolve" case (unknown generation, path not in tree, CAS
+        // miss) — the resolver logs which link broke.
+        app.MapPost("/studio/references/resolve", async (
+            PinnedReferenceRequestBody body,
+            IPinnedReferenceResolver resolver,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.RepoId)
+                || string.IsNullOrWhiteSpace(body.GenerationId)
+                || string.IsNullOrWhiteSpace(body.Path))
+            {
+                return Results.BadRequest(new { error = "repoId, generationId and path are all required." });
+            }
+
+            var bytes = await resolver.ResolveAsync(
+                new PinnedReference(body.RepoId, body.GenerationId, body.Path), ct).ConfigureAwait(false);
+
+            return bytes is null
+                ? Results.NotFound(new
+                {
+                    error = "Pinned reference did not resolve (unknown generation, path not in that generation's tree, or blob unavailable).",
+                    repoId = body.RepoId,
+                    generationId = body.GenerationId,
+                    path = body.Path,
+                })
+                : Results.Ok(new
+                {
+                    repoId = body.RepoId,
+                    generationId = body.GenerationId,
+                    path = body.Path,
+                    sizeBytes = bytes.Length,
+                    contentBase64 = Convert.ToBase64String(bytes),
+                });
         });
 
         app.MapPost("/studio/workspace/symbol/definition", async (

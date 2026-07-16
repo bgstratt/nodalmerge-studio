@@ -115,6 +115,16 @@ public interface IWorkgroupRepositoryDirectory
         string? label, RepositoryIdentityHints hints, string? preferredRepoId = null, CancellationToken cancellationToken = default);
 
     Task<RepositoryMatchResult> MatchAsync(RepositoryIdentityHints hints, CancellationToken cancellationToken = default);
+
+    // Slice 6.3 — replication sink hook for the "workgroup" room, mirroring
+    // IStudioNodeStoreReplicationSink's role for "studio"/repo rooms exactly (see that interface's
+    // own doc comment). Not folded into IStudioNodeStoreReplicationSink itself: one process can
+    // only register one implementation of that interface via DI, and NodalMergeStudioNodeStore
+    // already claims it for "studio" + repo rooms — RoomReplicationDispatcher (NodalMerge.Studio.Storage)
+    // is the single registered sink and routes "workgroup" here instead. Default no-op body: the
+    // in-memory test double has no room_maps/sync-graph split to bridge (same reasoning
+    // InMemoryStudioNodeStore's own lack of a registered sink already documents).
+    Task ReplayCanonicalResolutionIntoLiveMapAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
 }
 
 // In-memory test double — same role as InMemoryStudioNodeStore. Two instances can share one
@@ -254,6 +264,16 @@ public sealed class WorkgroupRepositoryDirectory : IWorkgroupRepositoryDirectory
     {
         var registered = await ListAsync(cancellationToken).ConfigureAwait(false);
         return RepositoryIdentityMatcher.Match(registered, hints);
+    }
+
+    // Slice 6.3 — see the interface member's own doc comment. EnsureInitializedAsync covers the
+    // "this peer has never touched the workgroup room in-process yet" case (hydrates + replays
+    // once); the explicit replay below covers the "already initialized, but a fresh inbound pack
+    // just landed" case, since EnsureInitializedAsync's own hydrate-and-replay only runs once ever.
+    public async Task ReplayCanonicalResolutionIntoLiveMapAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+        _roomMap.ReplayCanonicalResolutionIntoLiveMap();
     }
 
     // docs/STUDIO_ROOM_SCHEMA.md (b) value shape: {v, label, repoRoomId, hints:{rootShas, remotes}}.

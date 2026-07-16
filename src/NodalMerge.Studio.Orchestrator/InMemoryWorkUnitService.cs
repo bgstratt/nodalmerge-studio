@@ -66,6 +66,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnit.WorkUnitId,
             JsonSerializer.Serialize(workUnit),
+            workUnit.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         // The work unit's own ID doubles as its Goal artifact's ID — every other artifact in
@@ -104,6 +105,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         if (sessionId is not null)
@@ -118,7 +120,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
 
         if (status is WorkUnitStatus.Completed or WorkUnitStatus.Merged)
         {
-            _ = GraphPromoter?.TryPromoteStudioCheckpointAsync();
+            _ = GraphPromoter?.TryPromoteStudioCheckpointAsync(updated.RepositoryId);
         }
 
         _eventBus?.Publish(new WorkUnitStatusChangedEvent(workUnitId, previousStatus, status, DateTimeOffset.UtcNow));
@@ -138,6 +140,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         if (_broadcaster is not null)
@@ -165,6 +168,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -189,6 +193,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -211,6 +216,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -232,6 +238,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -256,6 +263,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -287,6 +295,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -317,6 +326,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         if (sessionId is not null)
@@ -455,6 +465,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
     }
 

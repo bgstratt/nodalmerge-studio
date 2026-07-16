@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using NodalMerge.DotNetHost.Ffi;
 using NodalMerge.DotNetHost.Runtime;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Host;
 
@@ -15,31 +16,43 @@ namespace NodalMerge.Studio.Host;
 // (see IStudioGraphPromoter's own doc comment); it is frequently a no-op race against
 // NodalMergeStudioNodeStore's own per-write promote (PromoteCheckpointToGraph is idempotent per
 // checkpoint identity), and when it isn't, the resulting node still needs to reach replication.
+//
+// Slice 6.3 — per the slice's own "what NOT to do" boundary, this class is NOT redesigned: it
+// still does exactly one thing (promote a room's latest checkpoint + notify outbound). What
+// changed is WHICH room: repositoryId resolves via the same BoundRepoRooms helper
+// NodalMergeStudioNodeStore's write path uses, so a repo-scoped WorkUnit's completion safety net
+// promotes that repo's own room instead of unconditionally promoting "studio" — otherwise the
+// safety net would promote the wrong room's checkpoint (or a room the write never touched at all)
+// once WorkUnitV1 writes started routing to repo/{repoId} rooms.
 internal sealed class RuntimeGraphPromoter(
     IRuntimeCommandBridge bridge,
     IStudioReplicationOutbound replicationOutbound,
-    ILogger<RuntimeGraphPromoter> logger
+    ILogger<RuntimeGraphPromoter> logger,
+    IRepositoryRegistryService? repositoryRegistry = null
 ) : IStudioGraphPromoter
 {
     private const string StudioRoomId = "studio";
 
-    private static readonly string PromoteCommand = JsonSerializer.Serialize(new
+    public async Task TryPromoteStudioCheckpointAsync(string? repositoryId = null)
     {
-        room_id = StudioRoomId,
-        command = new
-        {
-            PromoteCheckpointToGraph = new
-            {
-                selector = new { selector = "latest" }
-            }
-        }
-    });
+        var roomId = await BoundRepoRooms.TryResolveRepoRoomIdAsync(repositoryRegistry, repositoryId, CancellationToken.None)
+            .ConfigureAwait(false) ?? StudioRoomId;
 
-    public async Task TryPromoteStudioCheckpointAsync()
-    {
         try
         {
-            var response = bridge.ProcessJsonCommand(PromoteCommand);
+            var promoteCommand = JsonSerializer.Serialize(new
+            {
+                room_id = roomId,
+                command = new
+                {
+                    PromoteCheckpointToGraph = new
+                    {
+                        selector = new { selector = "latest" }
+                    }
+                }
+            });
+
+            var response = bridge.ProcessJsonCommand(promoteCommand);
             if (response.Status != AsStatus.Ok)
                 return;
 
@@ -47,12 +60,12 @@ internal sealed class RuntimeGraphPromoter(
             if (string.IsNullOrWhiteSpace(nodeIdHex))
                 return;
 
-            await replicationOutbound.NotifyLocalWriteAsync(StudioRoomId, nodeIdHex, CancellationToken.None)
+            await replicationOutbound.NotifyLocalWriteAsync(roomId, nodeIdHex, CancellationToken.None)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "studio graph promotion failed; checkpoint not materialized this cycle");
+            logger.LogWarning(ex, "studio graph promotion failed room={Room}; checkpoint not materialized this cycle", roomId);
         }
     }
 

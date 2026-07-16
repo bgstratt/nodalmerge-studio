@@ -131,7 +131,7 @@ internal sealed class InMemoryRepositorySnapshotService(
 
             await nodeStore.WriteNodeAsync(
                 StudioNodeKind.RepositorySnapshotV1, snapshot.SnapshotId,
-                JsonSerializer.Serialize(snapshot), ct).ConfigureAwait(false);
+                JsonSerializer.Serialize(snapshot), snapshot.RepositoryId, ct).ConfigureAwait(false);
 
             lock (_lock)
             {

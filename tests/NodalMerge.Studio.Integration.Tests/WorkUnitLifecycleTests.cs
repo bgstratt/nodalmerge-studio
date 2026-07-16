@@ -207,7 +207,7 @@ public class WorkUnitLifecycleTests
     {
         public int CallCount { get; private set; }
 
-        public Task TryPromoteStudioCheckpointAsync()
+        public Task TryPromoteStudioCheckpointAsync(string? repositoryId = null)
         {
             CallCount++;
             return Task.CompletedTask;

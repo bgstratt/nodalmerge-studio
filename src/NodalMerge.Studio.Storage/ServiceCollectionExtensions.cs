@@ -17,17 +17,24 @@ public static class ServiceCollectionExtensions
         // WorkspaceOptions comment in AddInMemoryStorage below for the same pattern/rationale).
         services.AddSingleton<IStudioReplicationOutbound>(NoopStudioReplicationOutbound.Instance);
         services.AddSingleton<IStudioNodeStore, NodalMergeStudioNodeStore>();
-        // Slice 6.1b — inbound replication seam (see IStudioNodeStoreReplicationSink's own doc
-        // comment). Forwards to the same NodalMergeStudioNodeStore singleton registered above.
-        // Only registered here (not AddInMemoryStorage): InMemoryStudioNodeStore has no
-        // room_maps/sync-graph split to bridge, so callers must resolve this as optional.
-        services.AddSingleton<IStudioNodeStoreReplicationSink>(sp =>
-            (NodalMergeStudioNodeStore)sp.GetRequiredService<IStudioNodeStore>());
         // Slice 6.2 — workgroup room repositories map (docs/STUDIO_ROOM_SCHEMA.md (b)), engine-backed
         // like IStudioNodeStore above but a separate room ("workgroup") and namespace
         // ("repositories") — see WorkgroupRepositoryDirectory's own class comment for what
         // upstream replication does/doesn't do yet.
         services.AddSingleton<IWorkgroupRepositoryDirectory, WorkgroupRepositoryDirectory>();
+        // Slice 6.3 — D3's workgroup-level cross-repo goal node (minimal, deliberately not wired
+        // into goal creation — see WorkgroupGoalDirectory's own class comment).
+        services.AddSingleton<IWorkgroupGoalDirectory, WorkgroupGoalDirectory>();
+        // Slice 6.1b/6.3 — inbound replication seam (see IStudioNodeStoreReplicationSink's own doc
+        // comment). Slice 6.3: routed through RoomReplicationDispatcher rather than
+        // NodalMergeStudioNodeStore directly, since RoomPeerClient now applies inbound packs for
+        // "workgroup" and repo rooms too, and those are owned by WorkgroupRepositoryDirectory and
+        // NodalMergeStudioNodeStore respectively — only registered here (not AddInMemoryStorage):
+        // the in-memory doubles have no room_maps/sync-graph split to bridge, so callers must
+        // resolve this as optional.
+        services.AddSingleton<IStudioNodeStoreReplicationSink>(sp => new RoomReplicationDispatcher(
+            (NodalMergeStudioNodeStore)sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetRequiredService<IWorkgroupRepositoryDirectory>()));
         services.AddSingleton<IRepositoryIdentityHintsService, GitRepositoryIdentityHintsService>();
         services.AddSingleton<IBranchService, NodalMergeBranchService>();
         services.AddSingleton<IReplayService, ReplayService>();
@@ -50,6 +57,8 @@ public static class ServiceCollectionExtensions
         // as InMemoryStudioNodeStore above); GitRepositoryIdentityHintsService itself has no engine
         // dependency at all (LibGit2Sharp only), so it's the same registration in both DI paths.
         services.AddSingleton<IWorkgroupRepositoryDirectory>(new InMemoryWorkgroupRepositoryDirectory());
+        // Slice 6.3 — in-memory workgroup goal directory, same reasoning as the line above.
+        services.AddSingleton<IWorkgroupGoalDirectory>(new InMemoryWorkgroupGoalDirectory());
         services.AddSingleton<IRepositoryIdentityHintsService, GitRepositoryIdentityHintsService>();
         services.AddSingleton<IBranchService, InMemoryBranchService>();
         services.AddSingleton<IReplayService, ReplayService>();
@@ -368,6 +377,18 @@ public static class ServiceCollectionExtensions
             sp.GetService<IBlobStoreProvider>(),
             sp.GetService<ILogger<SnapshotTreeResolver>>()
                 ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<SnapshotTreeResolver>.Instance));
+
+        // Slice 6.3 (D3, docs/STUDIO_ROOM_SCHEMA.md (c)) — pinned cross-repo reference resolution:
+        // repo room -> generation node -> TreeHash -> CAS walk -> blob bytes. Registered for both
+        // DI paths (this method is shared); blob store stays optional (resolver returns null with a
+        // logged warning when absent, same optional-collaborator shape as everything above).
+        services.AddSingleton<IPinnedReferenceResolver>(sp => new PinnedReferenceResolver(
+            sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetRequiredService<IWorkgroupRepositoryDirectory>(),
+            sp.GetRequiredService<ISnapshotTreeResolver>(),
+            sp.GetService<IBlobStoreProvider>(),
+            sp.GetService<ILogger<PinnedReferenceResolver>>()
+                ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<PinnedReferenceResolver>.Instance));
 
         // Phase 7 — materializer registered here so it's available to both AddNodalMergeStorage
         // and AddInMemoryStorage; it has no state to rehydrate so it doesn't go through

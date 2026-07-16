@@ -808,7 +808,13 @@ public interface IWorkUnitService
 // integration tests that build services directly never register an implementation.
 public interface IStudioGraphPromoter
 {
-    Task TryPromoteStudioCheckpointAsync();
+    // Slice 6.3 — repositoryId (the *local-candidate* id, same convention as
+    // IStudioNodeStore.WriteNodeAsync's repositoryId overload) lets this safety net promote the
+    // correct room for a repo-scoped WorkUnit: when it resolves to a bound workgroup room, that
+    // room is promoted instead of the workspace-local "studio" room. Null (the default — every
+    // pre-6.3 call site keeps compiling unchanged) preserves the original "studio"-only behavior,
+    // which is still correct for a WorkUnit with no RepositoryId.
+    Task TryPromoteStudioCheckpointAsync(string? repositoryId = null);
 }
 
 // Slice 6.1b (plans/cas-distribution-and-storage.md Phase 6) — outbound replication seam.
@@ -861,9 +867,16 @@ public sealed class NoopStudioReplicationOutbound : IStudioReplicationOutbound
 // rehydrated cache (a dictionary populated once at boot from IStudioNodeStore.ReadAllNodesAsync)
 // will NOT observe a mid-run inbound pack — only future ReadNodeAsync/ReadAllNodesAsync calls see
 // it. Making those caches subscribe to a store-changed notification is future work.
+// Slice 6.3 — roomId identifies which room's live map to replay: the workspace-local "studio" room,
+// "workgroup", or "repo/{repoId}" for a bound repo room (see StudioNodeKind.RepoScopedKinds and
+// BoundRepoRooms). Pre-6.3 this took no roomId at all — there was only ever one room to replay.
+// Implementations that don't own a given room's EngineRoomMap should dispatch to whichever
+// collaborator does rather than throw; see RoomReplicationDispatcher (NodalMerge.Studio.Storage),
+// registered as the one IStudioNodeStoreReplicationSink so RoomPeerClient's single resolved
+// collaborator can replay any room's live map without knowing which underlying service owns it.
 public interface IStudioNodeStoreReplicationSink
 {
-    Task RehydrateLiveMapFromCanonicalResolutionAsync(CancellationToken cancellationToken = default);
+    Task RehydrateLiveMapFromCanonicalResolutionAsync(string roomId, CancellationToken cancellationToken = default);
 }
 
 public sealed record CausalParentsResult(string[] ParentIdsHex, bool NodeFound);

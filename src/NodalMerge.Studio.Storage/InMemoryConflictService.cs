@@ -25,7 +25,7 @@ public sealed class InMemoryConflictService(IStudioNodeStore nodeStore)
         }
 
         var json = JsonSerializer.Serialize(conflict);
-        await nodeStore.WriteNodeAsync(StudioNodeKind.RepositoryConflictV1, conflict.ConflictId, json, ct)
+        await nodeStore.WriteNodeAsync(StudioNodeKind.RepositoryConflictV1, conflict.ConflictId, json, conflict.RepositoryId, ct)
             .ConfigureAwait(false);
         return conflict;
     }
@@ -96,7 +96,7 @@ public sealed class InMemoryConflictService(IStudioNodeStore nodeStore)
         }
 
         var json = JsonSerializer.Serialize(updated);
-        await nodeStore.WriteNodeAsync(StudioNodeKind.RepositoryConflictV1, conflictId, json, ct)
+        await nodeStore.WriteNodeAsync(StudioNodeKind.RepositoryConflictV1, conflictId, json, updated.RepositoryId, ct)
             .ConfigureAwait(false);
         return updated;
     }
