@@ -14,7 +14,7 @@ trying to assert a doc comment's claim — see the map below and slice 1.6.
 
 - [x] Phase 0 — Reproduce-first scaffolding (shared harnesses + contract vectors) — **complete 2026-07-16** (0.1 ✅ 0.2 ✅ 0.3 ✅ 0.4 ✅; 10 gated RED tests + shared `blob-conformance` crate; uncommitted on `blobExpansion`)
 - [ ] Phase 1 — GC data-loss & the crash (P0 — can permanently destroy blobs / abort the server) — **1.1 ✅ 1.3 ✅ 1.4 ✅ 1.5 ✅ 1.6 ✅ committed 2026-07-16** (`a4c4a694`, `043df73d`, `ef693f39`, `5664c2b1` + studio `58d9a5c`, `20aaba88`); **only 1.2 remains, blocked** on 7.5's composition seam. **1.3 closed the 1.4↔1.3 coupling: the write-through race is now genuinely fixed on BOTH the Dir and S3 paths** (proven end-to-end against a real bucket, not traced).
-- [ ] Phase 2 — Non-hydrating (S3) backend correctness — **2.1 ✅ committed 2026-07-16** (`9fd95355`); 2.2/2.3/2.4 unstarted
+- [ ] Phase 2 — Non-hydrating (S3) backend correctness — **2.1 ✅ 2.2 ✅ 2.3 ✅ committed 2026-07-16** (`9fd95355`, `fe56ad34`, `5f34ab26`); **only 2.4 remains** (explicitly low-priority/latent). `blob_nonhydrating_conformance` has **no gated REDs left** (4 passed/1 ignored → 13 passed/0 ignored). **2.3 made 6.1 urgent — see Phase 6.**
 - [ ] Phase 3 — Blob integrity & cross-runtime interop — **3.1 ✅ committed 2026-07-16** (`6cf2c8fd`); **3.2 code half ✅** (`37374294`) — **its doc half stays deferred until 3.3 lands** (sequencing note in 3.2)
 - [ ] Phase 4 — HTTP-surface robustness & backward compatibility
 - [ ] Phase 5 — Migration safety
@@ -546,7 +546,52 @@ answer "exists?". Rust already has `has_blob`; .NET's `IBlobStoreProvider` has n
   existing blobs as present, not 404.
 - ⚠ compat: additive interface default member — no break for external providers.
 
-### 2.2 — Tree walk on S3 uses a hydrating read or fails loud **[NM]** (#10)
+### 2.2 — Tree walk on S3 uses a hydrating read or fails loud **[NM]** (#10) — ✅ **DONE 2026-07-16** (`fe56ad34`)
+
+**As shipped.** `walk_tree` resolves tree objects through a new
+`BlobPersistence::hydrate_blob` seam. Direct mode does a real bucket GET; Delegate mode (no
+bucket credentials, structurally impossible) fails **loud**: `TreeWalkError::Unresolvable` →
+*"tree walk could not resolve (DEPLOYMENT CONFIGURATION, not data loss)"* naming the mode and
+the remedy, plus `nodalmerge_tree_walk_resolve_failed_total`. Proven not-generic by asserting
+the message does **not** contain `"missing tree/blob object"`.
+
+> **Hydrating the tree walk does not violate the offloading policy** — and the code says so
+> where the next reader will look. `get_blob`'s "S3 never hydrates" contract exists to keep
+> **large file payloads** out of the server process. `walk_tree` only ever fetches **tree
+> objects**: v2 `"f"` entries are inserted and never read, only `"d"` entries are pushed and
+> fetched, v1 entries are terminal. `get_blob`'s contract is untouched — pinned by asserting
+> `get_blob_calls() == 0`, *not* a return value, since a value-only assertion passes against a
+> walk that calls `get_blob` and ignores the answer.
+
+> **`get_blob_hydrates()` is a DECLARATION, not an inference — and this is the slice's most
+> valuable finding.** The tempting inference — `get_blob == None && has_blob == true` ⟹
+> non-hydrating — is **unavailable**: `DirPersistence::has_blob` is pure file existence
+> (`blob_path.is_file() || blob_encoded_path.is_file()`, no verify) while `get_blob` returns
+> `None` for a **corrupt** blob. Corrupt therefore has the *identical signature* to
+> non-hydrating, and inferring would relabel every corrupt file blob as "backend cannot
+> hydrate". **Third sighting of "existence is not integrity"** in this plan, after 2.1's
+> `ExistsAsync` and 3.2's verify-on-read. Never infer; ask, or match on `HydrateError`.
+> *Residual gap, pinned not papered over:* a backend that overrides `get_blob → None` and
+> forgets **both** new methods is still silently `Missing`. The type system can't catch it
+> without breaking external implementors.
+
+**2.1's lesson generalized, unprompted:** `Composite` must forward **both** new methods.
+Inheriting the defaults would report `get_blob_hydrates() == true` for an S3-backed composite,
+call `get_blob` (correctly `None`), and reinstate finding #10 **with `S3BlobStore::hydrate_blob`
+sitting unused and untested** — same shape as the `RemoteBlobLinkAggregator` hole: compiles,
+answers plausibly, silently wrong. Own pin: `composite_forwards_hydration_seam_to_the_blob_half`.
+
+> **The inherited gate was weaker than it looked.** It asserted only `live.is_ok()` — satisfiable
+> by a fix returning an **empty live set**, which is *worse* than #10 (GC would then delete live
+> blobs). Strengthened to assert the tree and file hashes are actually present. **Ask what would
+> catch you being subtly wrong, not just plainly wrong.**
+
+**Not proven:** the metric's **value** is asserted by no test (no precedent in-repo; observing one
+needs a process-global recorder — the same singleton shape as the known `archive_adapter` env-race
+flake). Verified by compile and code-read only.
+
+**Original section text follows.**
+### 2.2 (original) — Tree walk on S3 uses a hydrating read or fails loud **[NM]** (#10)
 `nodalmerge:server/server/src/tree_walk.rs:101`. Tree blobs are fetched via
 `get_blob`, hardwired `None` on S3, so every new-mode GC run over a cas-tree snapshot
 fails closed forever.
@@ -557,7 +602,56 @@ fails closed forever.
 - **Validation:** 0.2 GC-over-cas-tree scenario completes on the non-hydrating stub
   (via the resolve path) instead of erroring every tick.
 
-### 2.3 — Archive export/hydration must not silently drop blobs **[NM]** (#7)
+### 2.3 — Archive export/hydration must not silently drop blobs **[NM]** (#7) — ✅ **DONE 2026-07-16** (`5f34ab26`)
+
+**As shipped.** Export/describe resolve referenced blobs through 2.2's `hydrate_blob`.
+`sha256:af1349b9…` (BLAKE3-of-empty) is finding #7's signature and appeared as `left` in every
+pre-fix failure. Proven RED against a **real MinIO bucket**, with the Dir half passing in the
+same loop — real bucket-vs-disk divergence, not a broken fixture.
+
+> ⚠️ **The plan's "all three call sites want the same policy" is WRONG — `room.rs` wants the
+> opposite, and "fixing" it would be a serious regression.** `room.rs:497` is **room-open
+> hydration, not export**: resolving there would pull every file payload a room references into
+> server memory **on every room open** — exactly what offloading exists to prevent, and what
+> `hydrate_blob`'s own contract tells file-byte callers not to do. Its `filter_map` was **correct
+> behavior with a silence problem**. It keeps its behavior and gains only visibility (asks
+> `get_blob_hydrates()`, logs the skip as a design fact), because `loaded_blobs = 0` was
+> indistinguishable from "the blobs are gone". Pinned non-hydrating via `get_blob_calls()`.
+
+**Policy is split by `HydrateError` variant** — 2.2's distinction proved exactly load-bearing:
+- **`Unhydratable` → FAIL.** A manifest marker still mismatches every Dir peer: #7's damage,
+  annotated. An operator can act on it.
+- **`Backend` (transient) → FAIL.** One 503 would otherwise mint a *signed* manifest permanently
+  disagreeing with every peer. Retry is cheap; a wrong digest is forever.
+- **`Missing` → tolerate, count, warn.** A fact about the **data**, not the backend: every peer
+  sees it and excludes the hash, so digests still agree — the very property #7 is about. Failing
+  would brick export forever for any room with a dangling `SetBlob`, with no operator remedy, and
+  regress Dir behavior #7 doesn't allege is wrong.
+
+**The line: fail on faults an operator can act on; count and continue on facts about the data
+every peer shares.** Delegate mode therefore cannot export or describe at all — a hard, actionable
+failure naming backend, mode and hash. It *can* still `validate` and do `metadata_only` imports.
+
+> **"Digests match" is never asserted as the property — it is satisfied by two EMPTY digests,
+> i.e. the exact bug.** Every digest is pinned against an independently computed expected value,
+> plus `assert_ne!` against the empty digest, plus a sanity assert that expected != empty so the
+> test cannot go vacuous. `dir == s3` is asserted last, as a restatement.
+
+> ⚠️ **A functional regression the plan doesn't mention, hit and fixed during the slice.**
+> `load_archive_from_ref` is shared by **four** entry points and only some want bytes:
+> `archive.validate` **never reads `loaded.blobs` at all**, and `metadata_only` import discards
+> them. Resolving unconditionally is **invisible on Dir** (a wasted local read) but on S3
+> downloads the whole room to throw it away — and on **Delegate turns a working
+> `validate`/`metadata_only` import into a hard failure**. Guarded by `BlobBytesNeed` + two tests
+> RED against the naive version. **Anyone reviewing a "fix all three `filter_map`s" diff should
+> check this specifically: it is silent on every Dir-backed test.**
+
+**Not proven:** the `Backend`-transient path is exercised only via the fake (no real 503 against
+MinIO); `Missing`-via-corruption is reasoned, not tested end-to-end (3.2 owns it); metric names
+are emitted but asserted by no test — "counted" is verified by code-read only.
+
+**Original section text follows.**
+### 2.3 (original) — Archive export/hydration must not silently drop blobs **[NM]** (#7)
 `nodalmerge:server/server/src/archive_adapter.rs:702`, `archive_export.rs:201`,
 `room.rs:497`. All three `filter_map` away `get_blob` `None`, so S3-backed servers
 export archives and compute `blobs_digest` over an empty set with no warning.
@@ -813,6 +907,19 @@ mkdir failure, copy-fallback failure), permanently orphaning those legacy blobs
 
 ## Phase 6 — Runtime, async-safety & efficiency
 
+> ⚠️ **6.1 is no longer comfortably deferrable (escalated by 2.2 and 2.3, 2026-07-16).** The plan
+> already called it "near-P1: the wedge risk"; Phase 2 made it worse in two steps and it should now be
+> scheduled ahead of the rest of Phase 6, and arguably ahead of Phases 4–5:
+> - **2.2** routed the tree walk through the bridge — per tree object, per GC tick. Small JSON, but a
+>   repo with N directories now builds N tokio runtimes and spawns N threads on **every sweep**, serially.
+> - **2.3** routed archive export through it — **full file payloads**, on an operator-triggered path. A
+>   5,000-blob room = 5,000 threads + 5,000 runtimes, serially, and **every bridge site is timeout-less**,
+>   so a hung bucket wedges a tokio worker forever.
+>
+> Neither slice added a *new* bridge (still 9 sites, existing pattern reused) — they changed the **traffic**
+> through it from per-request to per-blob-per-sweep and per-export. Nothing here is a defect in 2.2/2.3;
+> both were correct and bucket-proven. But "defer 6.1" was priced against the old traffic.
+
 Confirmed performance/robustness debt. 6.1 is the most impactful (a hung delegate can
 wedge a worker indefinitely) — treat it as near-P1.
 
@@ -1026,10 +1133,14 @@ contract is not enforced" an explicit, checked rule rather than a habit.
    and **8.2's MinIO wiring should be pulled forward into 1.3**, not left to the phase.
 
 **Next up (as of 2026-07-16), in order of readiness:**
-- **2.2 / 2.3** — unblocked by 2.1, and now the highest-value remaining work. Both need the
-  hydrating-read seam (2.2 first; 2.3 builds on it).
-- **3.3** — unblocks 3.2's doc half, and is required parity work in its own right.
-- **6.1** — near-P1 (the wedge risk); the plan says start it early.
+- **6.1** — ⚠️ **now the highest-priority remaining item.** Already "near-P1: the wedge risk"; 2.2
+  and 2.3 changed the traffic through the timeout-less runtime bridge from per-request to
+  per-blob-per-sweep (GC) and full-file-payload-per-export. See the callout at Phase 6.
+- **3.3** — unblocks 3.2's doc half, and is required parity work in its own right. Also keeps the
+  `.zst`/`key_for` asymmetry latent.
+- **Phase 4 / Phase 5** — independent, unblocked.
+- **2.4** — the last Phase 2 slice; explicitly low-priority/latent, and the plan says to check
+  whether 2.1–2.3's seam already subsumes it before doing it at all.
 - **1.2** — the last Phase 1 slice, still blocked on 7.5's composition seam.
 
 ## Conventions settled during Phase 0
@@ -1116,6 +1227,40 @@ contract is not enforced" an explicit, checked rule rather than a habit.
   that doesn't exist, stub it where it belongs and report it. Note `minio_round_trip.rs`
   should NOT wait for Phase 8: it is what **1.3** is blocked on, and 1.3 should absorb it.
 
+- ⚠ **`archive.import` silently defaults to the WRITE path on a misspelled key** (found by 2.3,
+  because it inverted one of the slice's own tests). `parse_archive_import_request` reads
+  `message["import_mode"]` and `.unwrap_or("full_apply")`; the "must be full_apply|metadata_only"
+  validation runs **after** the default, so it cannot catch a wrong key name. A client sending
+  `"mode": "metadata_only"` gets **`full_apply`** — the destructive option — silently. The safe
+  default for an absent mode is arguably `metadata_only`, or no default at all (reject).
+- ⚠ **`ExportManifestDocument`'s signature does not cover its digests** (found by 2.3, adjacent
+  but out of its scope). `signature_payload` binds format_version / source_room / compatibility
+  window / `payload_digest_policy` / policy timeline — but **not `payload_digest_set`**. So the
+  signature attests to which digest *policy* was used, never to the digest *values*: a signed
+  manifest's blobs digest can be altered without invalidating the signature. Verified by reading
+  `archive_export.rs:356`. This weakens the "a wrong signed digest is forever" reasoning 2.3 used
+  (correctly, for its own purposes) and deserves its own decision.
+- **`ArchiveReasonClass` has no variant for a backend/config failure**, so 2.3's Delegate-mode
+  errors report as `CheckpointNotFound` — actively misleading for a configuration problem. The
+  detail is in `reason_message`. Adding a variant is a **frozen cross-runtime contract change**
+  (`core/crdt/archive_contracts.rs`, `engine/host-core/protocol.rs`,
+  `archive_portability_vectors.rs`) with a .NET parity obligation — hence not absorbed by 2.3.
+- **`S3BlobStore::hydrate_blob`'s `Unhydratable` detail is GC-specific prose** ("the server can
+  never read *tree objects*", "*Studio GC* cannot run in this mode") and now surfaces verbatim in
+  archive-export errors, where it reads oddly. Still accurate about the *cause*. Not changed
+  because `delegate_gc.rs` asserts on that exact wording.
+- **`.zst`-at-rest is invisible to every S3 reader but visible to the sweeper** (found by 2.2,
+  pre-existing). `S3BlobStore::key_for` derives identity-only `blake3/<hex>`, so `has_blob`,
+  `resolve_get_url`, `verify_uploaded` and now `hydrate_blob` never look at `<hex>.zst` — while
+  `blob_gc_sweep` enumerates via `parse_blob_entry_name`, which understands both. 2.2 matched
+  `has_blob`'s derivation deliberately (one derivation for every reader, so hydration can't drift
+  from existence), which is the consistent choice, but it means the sweeper's view and every
+  reader's view genuinely diverge. **3.3 defaulting s3-direct compression OFF keeps this latent
+  rather than live.**
+- **Export holds every blob in memory at once.** `resolve_referenced_blobs` materializes the full
+  map and `canonical_hash` takes it whole, so a 10 GB room means ~10 GB RSS during export.
+  Pre-existing (Dir did it too) but **free on S3 until 2.3**. Not fixable without changing
+  `canonical_hash`'s frozen cross-runtime contract.
 - **Unbounded retention of revivable statuses.** After 1.6, `Failed` joins
   `Cancelled`/`DeadLettered` in being retained indefinitely. That is consistent, not new,
   but three statuses now never age out. If it matters, the fix is a real revival-window
