@@ -42,7 +42,20 @@
       (`studio/gc-run/v1` + `GET /studio/cache/gc/runs`), background interval
       runner, aged-out materialization → 410 Gone (`e22e2f1`; bare
       `POST /studio/cache/gc` no longer live-deletes — configured mode, DryRun by
-      default). Remaining: 5.3 server coordinator (depends on 6.1/6.3).
+      default). **5.3 shipped 2026-07-15** (nodalmerge `c47e6c68`): studio-domain
+      `LiveHashSource` parsing frozen envelopes from `repo/*` rooms (real payloads
+      are PascalCase with integer enum ordinals — the schema doc's illustrative
+      payload examples diverge; envelope shape unaffected), retention semantics
+      mirrored from 5.1 but strictly fail-closed (this component gates deletion),
+      conservative forever-retention for legacy `"studio"`/`"workgroup"` rooms,
+      `SqliteGcStore` inventory/run ledger, local-disk + S3 `BlobObjectStore`,
+      `GcMode off|legacy|dryrun|markonly|sweepsoft|sweephard` (default `legacy` =
+      byte-for-byte today). Follow-ups recorded: WS-upload-path inventory wiring
+      (HTTP path is wired; mark pass covers the gap meanwhile), never-referenced-
+      blob discovery (no ListBucket by contract — needs a drift job), schema-vector
+      payload examples → real-shape fixtures + parity-CI migration, op-compaction
+      over-retention refinement, Mongo/Postgres inventory adapters. Phase 5
+      complete.
 - [ ] Phase 6 — Multi-user: replication data plane, room topology & repository identity
       — **sliced 2026-07-15**; decision recorded: Studio state rides the engine DAG.
       **6.0 + 6.1a + 6.1b shipped 2026-07-15** (studio `cas-distribution-storage`):
