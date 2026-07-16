@@ -13,7 +13,7 @@ trying to assert a doc comment's claim — see the map below and slice 1.6.
 ## Status
 
 - [x] Phase 0 — Reproduce-first scaffolding (shared harnesses + contract vectors) — **complete 2026-07-16** (0.1 ✅ 0.2 ✅ 0.3 ✅ 0.4 ✅; 10 gated RED tests + shared `blob-conformance` crate; uncommitted on `blobExpansion`)
-- [ ] Phase 1 — GC data-loss & the crash (P0 — can permanently destroy blobs / abort the server) — **1.1 ✅ 1.5 ✅ 1.6 ✅ 1.4 ⚠️ committed 2026-07-16** (`a4c4a694`, `ef693f39`, `5664c2b1` + studio `58d9a5c`, `20aaba88`); **1.2 blocked** on 7.5's composition seam, **1.3 blocked** on the MinIO test + time-bounding design. **1.4 is only half-shipped — its write-through fix covers `DirPersistence` ONLY and is a no-op on S3 until 1.3 lands. See the 1.4↔1.3 coupling below.**
+- [ ] Phase 1 — GC data-loss & the crash (P0 — can permanently destroy blobs / abort the server) — **1.1 ✅ 1.3 ✅ 1.4 ✅ 1.5 ✅ 1.6 ✅ committed 2026-07-16** (`a4c4a694`, `043df73d`, `ef693f39`, `5664c2b1` + studio `58d9a5c`, `20aaba88`); **only 1.2 remains, blocked** on 7.5's composition seam. **1.3 closed the 1.4↔1.3 coupling: the write-through race is now genuinely fixed on BOTH the Dir and S3 paths** (proven end-to-end against a real bucket, not traced).
 - [ ] Phase 2 — Non-hydrating (S3) backend correctness — **2.1 ✅ committed 2026-07-16** (`9fd95355`); 2.2/2.3/2.4 unstarted
 - [ ] Phase 3 — Blob integrity & cross-runtime interop — **3.1 ✅ committed 2026-07-16** (`6cf2c8fd`); **3.2 code half ✅** (`37374294`) — **its doc half stays deferred until 3.3 lands** (sequencing note in 3.2)
 - [ ] Phase 4 — HTTP-surface robustness & backward compatibility
@@ -178,7 +178,88 @@ gc inventory is unmarked and swept.
   here and let 7.5 relocate the studio-specific source.
 - **Validation:** 0.3(b) passes under `--gc-mode sweepsoft/sweephard`.
 
-### 1.3 — S3 sweep honors grace + consults inventory **[NM]** (#3)
+### 1.3 — S3 sweep honors grace + consults inventory **[NM]** (#3) — ✅ **DONE 2026-07-16** (`043df73d`)
+
+**As shipped.** Real two-phase grace on S3, tombstones as bucket objects at
+`<prefix>.tombstones/blake3/<hex>.<unix_millis>` — a sibling of `<prefix>blake3/` (never
+enumerated by the blob listing), keyed by bare hex so one tombstone covers `<hex>` and
+`<hex>.zst`. Branch-for-branch `DirPersistence`'s semantics. The bucket-versioning premise is
+**deleted, not preserved** (it was off by default, never checked or set by the crate, the
+comment invited operators to disable the one thing standing in for grace, a noncurrent version
+isn't re-linked when a blob becomes live again, and it silently no-op'd 1.4's floor).
+Versioning remains a fine *backstop*; it is no longer load-bearing.
+
+> **The tombstone time lives in the KEY, not in the object's `last_modified`.** `last_modified`
+> is the **bucket's** clock while `grace` is measured against **this process's**; skew in the
+> unsafe direction (bucket behind) deletes early — exactly the failure this slice exists to
+> prevent. Writing the time into the key means one clock both writes and compares it, and costs
+> one LIST instead of a GET per candidate. A clock stepped back reads as age 0
+> (`saturating_sub`) → wait, never delete. Worth remembering: **the obvious implementation
+> (ask the bucket when the tombstone was written) is the unsafe one.**
+
+**`blob_upload_grace` = 3600s (1h).** **DECIDED 2026-07-16 (user).** The window bounds
+**bytes-exist → referenced-by-a-CRDT-op** — i.e. *client latency*. It is **not the presign
+TTL**, and that is the whole subtlety: both upload paths stamp `last_seen_at` at the moment
+the bytes exist (`blob_http.rs:406` after `verify_uploaded`, `:510` after the hash check), so
+`presign_put_ttl` (15 min) bounds the interval that **ends before this one starts**. The plan's
+original "ideally tied to the presign TTL" instinct conflated two intervals and would have
+reclaimed legitimate slow uploads. 1h coincides with `presign_get_ttl` — a coherent story
+("the longest URL we'd hand out") — but is chosen on its own merits. **Any finite window bounds
+retention** (disk ≈ upload rate × window), so this is a "how slow a client do we tolerate"
+call, not a safety-vs-unbounded one.
+
+> **The knob is on `Rooms`, NOT on `S3BlobStoreConfig`** — a deliberate deviation from this
+> section's original wording, and the right one. `S3BlobStore` has no inventory handle, and the
+> union is on the *server-side legacy live set*, so a field on the S3 config would be read by
+> nothing: **dead config that looks like a knob, on a P0 data-loss path.** On `Rooms` it also
+> protects `DirPersistence` deployments, whose anonymous `PUT /blobs/{hash}` writes the same
+> `Active` rows. Config-struct-only; no CLI surface (7.1's shared bootstrap module owns that).
+
+> **The unbounded-retention hole was shipped on purpose to prove the gate catches it.** With the
+> `last_seen_at` cutoff removed (a naive union of every `Active` row), **exactly one test
+> failed** — `blob_gc_reclaims_unreferenced_upload_once_upload_window_elapses`. The *protection*
+> test passed happily. Reproduced independently before accepting the slice. This is the plan's
+> "without it, this hole ships silently and looks like a fix", made visible: **the reclaim gate,
+> not the protection gate, is what proves you didn't just make everything live forever.**
+
+**Trap 1 (the gate hazard) was avoided, not sidestepped.** The real backend was fixed **first**
+and is asserted by three bucket-touching MinIO tests, verified RED against the *unmodified*
+`S3BlobStore` and a real `minio/minio:latest` container (*"first sighting must only tombstone,
+never delete"*, left: 1, right: 0). The `blob-conformance` fake was then brought back into
+agreement — **updated, not deleted** (deleting it would have taken 0.3(c) and the relay suites'
+S3-shaped fake with it). Its doc now states outright that it can only gate a *copy*, names the
+three MinIO tests as the real gates, and says: *"if this port and `S3BlobStore` ever disagree,
+the MinIO tests are right and this file is wrong."*
+
+**CI:** new `.github/workflows/blob-s3-gc-minio.yml` (`minio_round_trip.rs` previously ran in
+**zero** workflows — the test this slice's correctness rests on). Fail-open closed with
+`NODALMERGE_REQUIRE_DOCKER=1`, verified both directions against a bogus image tag: **without it,
+4 passed while testing nothing.** Also added `gc_store.rs` to `blob-layout-parity.yml`'s
+`paths:` — `blob_gc.rs` now drives a real `SqliteGcStore` and that file could not previously
+trigger the workflow (**fifth** instance of that bite).
+
+**Gates:** `blob_gc` 9 passed/1 ignored → **12 passed / 0 ignored**; MinIO **4 passed**.
+
+**Carried over knowingly (not regressions):**
+- **`collect_recent_upload_hashes` fails *open*** on an inventory read error (`warn!` + empty
+  set), so a transient SQLite error un-protects recent uploads for that tick. Same "a failed
+  query is indistinguishable from an empty result" shape already filed against `known_room_ids()`
+  on Postgres/Mongo — it wants **one** decision across all three, not three. See follow-ups.
+- **1.4's "time as a proxy for call count" gap** applies verbatim to the S3 port: the guarantee
+  is stated in ms but the invariant needed is *two separate sightings*, and nothing enforces
+  separateness. Now in two places; if the sweep cadence ever tightens, both need the same
+  "tombstone must predate this call" hardening.
+- **Two concurrent sweeps can leave two tombstone keys for one hash** — handled fail-closed (age
+  by the *newest* → smallest age → never delete early; all keys removed when the blob goes).
+  No cross-process sweep lock exists; strictly safer than the previous behavior.
+- **`iter_unmarked_candidates` is the only enumeration on `AssetInventoryStore`**, so the union
+  calls it with a sentinel run id to mean "all non-Deleted rows". Works, reads/writes nothing,
+  but is a load-bearing use of a method named for another purpose; an `iter_active_since(cutoff)`
+  would be cleaner. A *defaulted trait method* was deliberately **not** added — that is exactly
+  2.1's `RemoteBlobLinkAggregator` trap (a default that compiles, answers correctly, and hides a
+  missing override).
+
+**Original section text follows.**
 `nodalmerge:server/s3-blobs/src/lib.rs:524`. `blob_gc_sweep` binds `_grace` and
 never reads it (single-pass immediate delete), and the legacy live set never consults
 the gc-inventory `Active` rows written by the upload-confirm path.
@@ -219,7 +300,21 @@ the gc-inventory `Active` rows written by the upload-confirm path.
   or deleted, if the real test subsumes it. Do not treat the un-ignore of 0.3(c) as
   sufficient evidence.
 
-### 1.4 — `sweep_blobs` hydration/write-through race **[NM]** (#5) — ⚠️ **HALF-DONE 2026-07-16** (`20aaba88`)
+### 1.4 — `sweep_blobs` hydration/write-through race **[NM]** (#5) — ✅ **DONE** (`20aaba88` + `043df73d`)
+
+> ✅ **The 1.4↔1.3 coupling is RESOLVED (2026-07-16).** 1.4 shipped half-done — its
+> `MIN_PHYSICAL_GRACE` floor was a **total no-op on S3**, because `S3BlobStore::blob_gc_sweep`
+> bound `_grace` and never read it. **1.3 (`043df73d`) made S3 honor grace, so the floor is now
+> genuinely effective on both paths** — verified end-to-end against a real MinIO bucket
+> (`s3_min_physical_grace_floor_is_effective_end_to_end` drives the production wiring with
+> `--blob-gc-grace 0`; it failed pre-1.3 with *"the S3 path must still never delete on first
+> sighting"* and now tombstones first and deletes only on a second, separate sweep). **Observed,
+> not traced.** The ⚠️ callout below is kept for the record — read it as history, not status.
+>
+> **Worth keeping as a lesson:** 1.4 was reported as complete, and its own Validation line was
+> satisfiable, while the bug it fixed remained fully open on the backend most likely to be in
+> production. A fix that is a no-op one layer down still passes every test written at its own
+> layer.
 
 **As shipped.** Bug 1 (hydration race): `Room::hydrated` (`AtomicBool`, set only after every
 hydration stage publishes graph/blobs/lineage) now gates the resident-scan exemption; a
@@ -900,8 +995,11 @@ of accidental.
 
 ### 8.2 — Close the audit's backlog **[NM]**
 Wire in what 8.1 surfaces, including the CI setup (Docker/MinIO/FFI) that some suites need.
-- **Sequencing note:** `minio_round_trip.rs` is wanted **much earlier** than this phase — it is
-  what **1.3** is blocked on. Do not wait for Phase 8 to run MinIO in CI; 1.3 should absorb it.
+- ✅ **`minio_round_trip.rs` is DONE — 1.3 absorbed it** (`043df73d`, new `blob-s3-gc-minio.yml`,
+  fail-open closed with `NODALMERGE_REQUIRE_DOCKER=1`). Pulled forward deliberately rather than
+  left to this phase, because 1.3's correctness rested on it. **That is the pattern for the rest
+  of this backlog: a suite whose slice needs it gets wired by that slice, not by Phase 8.**
+  Phase 8 is for what no slice happens to touch — which is most of it.
   See the Sequencing summary.
 
 ### 8.3 — Both-directions rule for parity contracts **[NM]**
@@ -928,12 +1026,11 @@ contract is not enforced" an explicit, checked rule rather than a habit.
    and **8.2's MinIO wiring should be pulled forward into 1.3**, not left to the phase.
 
 **Next up (as of 2026-07-16), in order of readiness:**
-- **1.3** — the biggest remaining P0. Blocked on the MinIO test + time-bounding design, and it
-  must also absorb **1.4's S3 no-op** (`_grace` bound-and-never-read at `s3-blobs/src/lib.rs:524`)
-  and the versioning-premise hazard. Its blocker and Phase 8's backlog are **the same work**:
-  `minio_round_trip.rs` runs in no workflow.
-- **2.2/2.3** — unblocked by 2.1; both need the hydrating-read seam (2.2 first, 2.3 builds on it).
+- **2.2 / 2.3** — unblocked by 2.1, and now the highest-value remaining work. Both need the
+  hydrating-read seam (2.2 first; 2.3 builds on it).
 - **3.3** — unblocks 3.2's doc half, and is required parity work in its own right.
+- **6.1** — near-P1 (the wedge risk); the plan says start it early.
+- **1.2** — the last Phase 1 slice, still blocked on 7.5's composition seam.
 
 ## Conventions settled during Phase 0
 
@@ -1005,7 +1102,10 @@ contract is not enforced" an explicit, checked rule rather than a habit.
     (set at job level) converts the skip into a panic; local runs keep skipping. Verified in both
     directions by pointing the image at a nonexistent tag. **Any "skips gracefully" test is a
     fail-open test the moment CI runs it.**
-  - Still open, one layer down: both stores' `known_room_ids()` `warn!` + return an empty `Vec` on
+  - ⚠ **Now THREE instances of one shape — worth a single decision, not three fixes.**
+  `Rooms::collect_recent_upload_hashes` (added by 1.3) `warn!`s and returns an empty set on an
+  inventory read error, so a transient SQLite error silently un-protects recent uploads for that
+  tick. Same shape as, one layer down: both stores' `known_room_ids()` `warn!` + return an empty `Vec` on
     query failure, so a transient DB error is indistinguishable from "no rooms" — the same
     silent-data-loss shape the conformance scenario now guards against, but a live-traffic version
     the scenario cannot reach.
