@@ -128,19 +128,67 @@ public sealed class WorkUnitStatusVectorTests
         }
     }
 
-    // NOTE: an earlier draft of this file also asserted that each
-    // terminal_status_names entry has zero outgoing WorkUnitTransitions
-    // edges, matching studio_live_hashes.rs's doc comment ("`CanTransition`
-    // has zero outgoing edges from these three"). That assertion is real but
-    // FAILS today: `WorkUnitTransitions.CanTransition(Failed, Cancelled)` is
-    // `true` via the `(_, Cancelled) when from is not Completed and not
-    // Merged` human-override rule, which does not exclude `Failed`. That is
-    // a genuine discrepancy between the Rust module's doc comment and this
-    // enum's real transition graph — but it is a *different* contract than
-    // finding #14 (ordinals + casing), it is not something 0.4 was scoped to
-    // fix, and per this slice's own instructions a Phase-0 pinning slice must
-    // ship green today. Removed here and reported separately rather than
-    // silently weakened or left red in the deliverable.
+    /// <summary>
+    /// Asserts the invariant that defines nodalmerge's GC-relevant terminal set: every
+    /// <c>terminal_status_names</c> entry must have ZERO outgoing
+    /// <see cref="WorkUnitTransitions.CanTransition"/> edges. A status with an outgoing edge is
+    /// revivable, so nodalmerge's GC (<c>server/server/src/studio_live_hashes.rs</c>) must not
+    /// retention-age its seed snapshot — it cannot prove the blobs are dead.
+    /// </summary>
+    /// <remarks>
+    /// DO NOT DELETE THIS TEST. It was removed during slice 0.4 because it FAILED —
+    /// <c>CanTransition(Failed, Cancelled)</c> was <c>true</c> via the
+    /// <c>(_, Cancelled) when from is not Completed and not Merged</c> human-override rule (which
+    /// excludes Completed and Merged, but not Failed), while <c>terminal_status_names</c> still
+    /// listed <c>Failed</c>. That failure is exactly how finding #30 was discovered; 0.4 could not
+    /// fix the root cause in scope, so it removed the assertion and filed the finding rather than
+    /// shipping red. Slice 1.6 fixed the root cause the correct way — nodalmerge dropped
+    /// <c>Failed</c> from its terminal set (a failed work unit IS resumable), leaving
+    /// <c>WorkUnit.cs</c>'s transition rules deliberately untouched — so this assertion is now true
+    /// and is restored to enforce it.
+    ///
+    /// This is the ONLY non-circular pin on the terminal set. nodalmerge's own vector test merely
+    /// checks that its Rust <c>TERMINAL_STATUSES</c> mirrors <c>terminal_status_names</c> in the
+    /// shared vector file — both sides of that live in nodalmerge, so it passes for ANY terminal
+    /// set someone picks. This test is what actually validates the set against studio's real
+    /// transition graph, which is the contract's source of truth. Without it,
+    /// <c>terminal_status_names</c> is a decorative field nothing checks — precisely the
+    /// unpinned-hand-mirrored-contract shape finding #14 exists to prevent.
+    /// </remarks>
+    [Fact]
+    public void Every_terminal_status_has_zero_outgoing_transition_edges()
+    {
+        if (!VectorsFileExists()) return; // reported by Vectors_file_is_present
+        var (_, terminalNames, _) = LoadVectors();
+
+        Assert.NotEmpty(terminalNames); // guard: an empty list would make this test vacuous
+
+        var allStatuses = Enum.GetValues<WorkUnitStatus>();
+        var violations = new List<string>();
+
+        foreach (var name in terminalNames)
+        {
+            var from = Enum.Parse<WorkUnitStatus>(name);
+            foreach (var to in allStatuses)
+            {
+                if (WorkUnitTransitions.CanTransition(from, to))
+                {
+                    violations.Add($"{from} -> {to}");
+                }
+            }
+        }
+
+        Assert.True(
+            violations.Count == 0,
+            "Every status in the shared vector file's `terminal_status_names` must have zero outgoing " +
+            "WorkUnitTransitions edges — nodalmerge's GC treats these as terminal and lets their seed " +
+            "snapshots age out under RetainIntermediateDays. A status with an outgoing edge is revivable, " +
+            "so aging its blobs out can destroy a snapshot a human later resumes from (finding #30). " +
+            "Either the transition rule that introduced the edge is wrong, or the status must be removed " +
+            "from `terminal_status_names` in engine/commands/work-unit-status-vectors.v1.json AND from " +
+            "TERMINAL_STATUSES in nodalmerge's server/server/src/studio_live_hashes.rs (both, together). " +
+            $"Offending edges: {string.Join(", ", violations)}");
+    }
 
     [Theory]
     [MemberData(nameof(EnvelopeVectorIds))]
