@@ -14,12 +14,13 @@ trying to assert a doc comment's claim — see the map below and slice 1.6.
 
 - [x] Phase 0 — Reproduce-first scaffolding (shared harnesses + contract vectors) — **complete 2026-07-16** (0.1 ✅ 0.2 ✅ 0.3 ✅ 0.4 ✅; 10 gated RED tests + shared `blob-conformance` crate; uncommitted on `blobExpansion`)
 - [ ] Phase 1 — GC data-loss & the crash (P0 — can permanently destroy blobs / abort the server) — **1.1 ✅ 1.5 ✅ 1.6 ✅ 1.4 ⚠️ committed 2026-07-16** (`a4c4a694`, `ef693f39`, `5664c2b1` + studio `58d9a5c`, `20aaba88`); **1.2 blocked** on 7.5's composition seam, **1.3 blocked** on the MinIO test + time-bounding design. **1.4 is only half-shipped — its write-through fix covers `DirPersistence` ONLY and is a no-op on S3 until 1.3 lands. See the 1.4↔1.3 coupling below.**
-- [ ] Phase 2 — Non-hydrating (S3) backend correctness
-- [ ] Phase 3 — Blob integrity & cross-runtime interop — **3.1 ✅ committed 2026-07-16** (`6cf2c8fd`)
+- [ ] Phase 2 — Non-hydrating (S3) backend correctness — **2.1 ✅ committed 2026-07-16** (`9fd95355`); 2.2/2.3/2.4 unstarted
+- [ ] Phase 3 — Blob integrity & cross-runtime interop — **3.1 ✅ committed 2026-07-16** (`6cf2c8fd`); **3.2 code half ✅** (`37374294`) — **its doc half stays deferred until 3.3 lands** (sequencing note in 3.2)
 - [ ] Phase 4 — HTTP-surface robustness & backward compatibility
 - [ ] Phase 5 — Migration safety
 - [ ] Phase 6 — Runtime, async-safety & efficiency
 - [ ] Phase 7 — Duplication & altitude cleanup
+- [ ] **Phase 8 — CI coverage (DEFERRED)** — the "CI is green" guarantee is much weaker than it looks. Not scheduled; **slices needing a step before this phase lands add the step where they think it belongs and move on** (see the phase for the stub convention).
 
 ## Guiding principles
 
@@ -398,7 +399,46 @@ existence probes. Fix the abstraction rather than each call site: give the blob 
 a real existence check and a hydrating-read path, and make callers that need bytes
 either use it or fail **loudly**. Uses the 0.2 harness throughout.
 
-### 2.1 — Existence probe on the blob abstraction **[NM]**
+### 2.1 — Existence probe on the blob abstraction **[NM]** — ✅ **DONE 2026-07-16** (`9fd95355`)
+
+**As shipped:** `ExistsAsync` added to `IBlobStoreProvider` as a default interface member
+(via `TryGetBlobAsync`), overridden with a real cheap probe on File (`File.Exists`),
+HttpRemote (existing HEAD), S3Direct (bucket HEAD on the same presigned URL), Chained,
+and — see below — `RemoteBlobLinkAggregator`. HEAD and PUT-idempotency route through it.
+The additive-compat guarantee is pinned by a test (`BlobStoreProviderExistsAsyncDefaultTests`),
+not just asserted in the ⚠ note.
+
+> **The aggregator was a hole that would have silently voided this slice.**
+> `RemoteBlobLinkAggregator` **is** the single `remote` argument `ChainedBlobStoreProvider`
+> sees whenever more than one remote link is configured. It implements `IBlobStoreProvider`,
+> so without its own override it inherited the compat default — putting the full remote
+> download + verify + write-back straight back onto the HEAD path for exactly the three-link
+> `local -> relay -> s3-direct` deployment that most needs the probe. **A default interface
+> member makes a missing override invisible: it compiles, it returns the right answer, it is
+> merely expensive** — which is precisely the failure `ExistsAsync` exists to prevent. This
+> is why its tests assert `GetCallCount == 0` rather than asserting the boolean: a
+> boolean-only test passes against the hydrating default and proves nothing. Any future
+> `IBlobStoreProvider` implementation must be checked for the same hole.
+
+**⚠ compat, second and unlisted in the original slice: HEAD no longer sets `Content-Length`.**
+Verified this converges rather than diverges — Rust's `head_blob` has only ever set
+`Content-Type` + `ETag`, and **no** vector in `blob-http-surface-vectors.v1.json` asserts a
+`Content-Length` (checked, not assumed). Keeping it would mean reading and — for zstd-at-rest
+blobs — decompressing the bytes to learn the plaintext length, i.e. paying exactly the cost
+the slice removes; a best-effort value would be inconsistent (present for identity, absent
+for encoded) and self-defeating. The .NET side setting it was the divergence.
+
+**Accepted behavior change: PUT-idempotency loses an accidental self-healing property.**
+The old full read meant a *corrupt* on-disk blob failed the existence check and got silently
+re-stored by a repeat PUT. The cheap probe reports it present, so the repeat PUT is a no-op
+and the corruption persists. This is **parity with Rust** (`blob_http.rs:515` already uses
+`has_blob` here), not a new divergence — but it was undocumented, and it means blob healing
+is now exclusively the reconcile sweep's job on both runtimes. Note 3.2 makes a corrupt
+identity blob read as *Missing* while `ExistsAsync` still reports it *present* — that
+asymmetry is deliberate (existence is not integrity, and a probe that verified would not be
+a probe), but it is worth knowing the two answers can disagree for the same hash.
+
+**Original section text follows.**
 `nodalmerge:hosts/dotnet/…/WebApplicationExtensions.cs:758`. HEAD and PUT-idempotency
 answer existence via a full `TryGetBlobAsync` read; under `ChainedRemote`/`S3Direct`
 that triggers a full remote download + BLAKE3 verify + local write-back just to
@@ -474,7 +514,44 @@ Rust `zstd::stream::encode_all`. Result: all cross-runtime compressed fetches th
   streaming `DecompressionStream`. Keep the existing hash-verify-after-decompress.
 - **Validation:** 0.1 fixture decodes green in both directions.
 
-### 3.2 — Verify-on-read policy for the file provider **[NM]** (#13)
+### 3.2 — Verify-on-read policy for the file provider **[NM]** (#13) — ⚠️ **CODE HALF DONE 2026-07-16** (`37374294`); **doc half deferred to after 3.3**
+
+**As shipped (code half only):** the identity branch of `FileBlobStoreProvider.TryGetBlobAsync`
+hashes on read and, on mismatch, warns and returns `Missing` — matching `store.rs:683`
+exactly: no delete, no throw, and **no fall-through to the `.zst` sibling** (Rust `return`s
+from the identity branch immediately; so does this). `Missing` is what an absent file already
+produces, so the origin answers 404 with no call-site plumbing. RED proven at both levels;
+the HTTP-origin test reported the defect verbatim — *"expected 404 for a tampered identity
+blob, got 200"*.
+
+**The doc half is NOT done and must not be marked done.** Marking the encoded pass-through
+contractually exempt in `BLOB_HTTP_SURFACE.md` / `BLOB_STORAGE_LAYOUT.md` §8 waits on 3.3,
+per the sequencing note below — its premise ("the client verifies after decompress") is still
+false for the web/wasm readers. The encoded path was left untouched. Call graph traced to
+confirm no second unverified identity-serving path hides in `TryGetEncodedBlobAsync`: the GET
+handler serves its result only when `ContentEncoding == "zstd"` and otherwise routes through
+`TryGetBlobAsync`.
+
+> **Five pre-existing tests were only green because the read path never checked.**
+> `ProviderDurabilityTests`, `Row19AutomatedScenarioHarnessTests` and
+> `ProviderHostRestartDurabilityIntegrationTests` each keyed fixture blobs by a **fabricated
+> string** (`"sha256:multi-device-a"`, `"sha256:abc"`, `"sha256:room-a-blob"`), and
+> `BlobLayoutParityTests`' *runtime* identity-preference test reused a **path-derivation
+> vector's placeholder hash**. Verify-on-read turned all five red. Each was fixed by keying on
+> the real content hash — assertions got *stronger*, none were weakened; the Rust counterpart
+> `both_exist_prefers_identity_at_runtime` already used `Hash::of(&payload)` for this exact
+> reason. **Checked before accepting the slice, because the alternative reading would have been
+> serious:** if any *production* caller used opaque keys, verify-on-read would strand live data.
+> It cannot — the only production callers are the origin's GET/PUT, and PUT rejects a
+> non-canonical name (400) and a body disagreeing with its path (422), so every reachable blob
+> is keyed by the BLAKE3 hex of its own bytes. **A fabricated-key fixture is a test that has
+> opted out of content-addressing; the moment a slice enforces it, they all surface at once.**
+
+**Accepted cost:** identity reads now hash every byte on every read — symmetric with the zstd
+path and with Rust, so this is parity, not a .NET-only regression. Correctness over cost, per
+the plan's explicit intent.
+
+**Original section text follows.**
 `nodalmerge:hosts/dotnet/…/FileBlobStoreProvider.cs:38` and the encoded pass-through
 (`get_blob_encoded`, `store.rs:678`). The identity path returns bytes **unverified**
 while the zstd path and Rust `get_blob` both verify; the HTTP origin then serves
@@ -763,18 +840,100 @@ studio-specifics out of the generic crate — the right-altitude version of prin
 
 ---
 
+## Phase 8 — CI coverage (DEFERRED) **[NM]**
+
+**Status: deferred by decision (user, 2026-07-16). Not scheduled, not blocking any slice.**
+Promoted from a follow-up bullet to a phase because it is a body of work with its own design
+question, not a chore — but deliberately parked at the bottom rather than inserted into the
+critical path.
+
+**The problem in one line:** this plan's slices have hit CI coverage gaps **four separate
+times**, escalating each time, and the audit that the fourth prompted found that the failure
+mode is not stale filters — it is **steps that do not exist at all**.
+
+1. `studio_gc.rs` — test file existed, **no step ran it** anywhere (fixed, `5664c2b1`).
+2. `tree_walk.rs` — step existed, **`paths:` omitted the source file it guards** (fixed, `ef693f39`).
+3. `ZstdInteropTests.cs` — **both at once**: listed in `paths:` but no step ran it, *and*
+   `BlobCompression.cs` — the file 3.1 actually fixed — wasn't in the filter at all. The interop
+   contract was enforced only from the Rust side, and a Rust test can never catch a .NET decoder
+   regression.
+4. **The audit: ~15 Rust integration-test files and ~34 .NET test classes run in ZERO workflows.**
+   Includes `server/s3-blobs/tests/minio_round_trip.rs` (**the very test 1.3 is blocked on**),
+   `persistence.rs`, `idle_eviction.rs`, `rate_limit.rs`, `token_expiry.rs`, `metrics_endpoint.rs`,
+   and — sharpest — `blob_layout_vectors_v3.rs`, a *sibling* of the already-covered
+   `blob_layout_vectors.rs`. Several cross-runtime parity contracts are pinned from **one runtime
+   only**: `SpecAuthVectorsTests.cs`↔`spec_auth_vectors.rs` and
+   `BranchForkVectorsTests.cs`↔`branch_fork_vectors.rs` (neither side runs anywhere);
+   `QueryMaterializationVectorsTests.cs` (Rust covered, .NET mirror never runs) — the exact
+   one-directional shape that let finding #4 live.
+
+Some are plausibly uncovered for the same structural reason Postgres/Mongo were (Docker / MinIO /
+native FFI that CI doesn't set up) — **that is a reason to fix the setup, not evidence the gap is
+benign.** Phase 2/3 added several more suites that had run in no workflow
+(`HttpRemoteBlobStoreProviderTests`, `S3DirectBlobStoreProviderTests`, `ChainedBlobStoreProviderTests`,
+`RemoteBlobLinkAggregatorTests`) — each closed only because a slice happened to touch it.
+
+**Until this phase lands, "CI is green" carries much less information than it appears to.**
+
+### 8.0 — The stub convention (IN FORCE NOW, not deferred)
+
+Deferring the phase must not mean slices quietly skip CI wiring in the meantime. So:
+
+- **Every slice still adds its step and its `paths:` entries** — that stays part of the
+  definition of done (see Conventions).
+- **When the right home for a step is unclear, or it needs CI setup that does not exist**
+  (Docker, MinIO, native FFI): **add the step where you believe it should run, with a comment
+  marking it as needing follow-up, and say so in the slice's report.** A stub in roughly the
+  right place is the wanted outcome; silent omission is not. Phase 8 sorts them out.
+- Rationale: a stub is *discoverable* and *movable*. An absent step is neither — which is the
+  entire reason this phase exists.
+
+### 8.1 — Meta-test: every test file is named by some workflow **[NM]**
+The mechanical fixes considered before (drop filters on the cheap correctness workflows, or
+derive them) address staleness. The audit says the **load-bearing** fix is different, because the
+failure is *absence*: a meta-test asserting every `server/**/tests/*.rs` and every .NET test class
+is named by at least one workflow step, failing on any that isn't. An allow-list is fine for
+genuinely-excluded suites — the point is that exclusion becomes **explicit and reviewed** instead
+of accidental.
+- **Validation:** the meta-test, run against the tree as of this phase's start, reproduces the
+  ~15 + ~34 list. That list *is* its RED.
+
+### 8.2 — Close the audit's backlog **[NM]**
+Wire in what 8.1 surfaces, including the CI setup (Docker/MinIO/FFI) that some suites need.
+- **Sequencing note:** `minio_round_trip.rs` is wanted **much earlier** than this phase — it is
+  what **1.3** is blocked on. Do not wait for Phase 8 to run MinIO in CI; 1.3 should absorb it.
+  See the Sequencing summary.
+
+### 8.3 — Both-directions rule for parity contracts **[NM]**
+A cross-runtime contract pinned from one runtime only is not pinned. `QueryMaterializationVectorsTests`
+is the live example, and finding #4 is the proof of what it costs. Make "both sides run, or the
+contract is not enforced" an explicit, checked rule rather than a habit.
+
+---
+
 ## Sequencing summary
 
 1. **Phase 0** unblocks everything (RED tests + harnesses).
 2. **Phase 1** is P0 — schedule immediately after 0.3; each slice ships behind its
    0.3 gate.
 3. **Phase 2** depends on 0.2 and shares the existence/hydration seam — 2.1 first
-   (others build on it).
+   (others build on it). ✅ 2.1 shipped, so **2.2/2.3/2.4 are unblocked**.
 4. **Phases 3–5** are independent of each other; parallelizable across contributors.
+   **Within Phase 3 there is one ordering constraint: 3.2's doc half must follow 3.3.**
 5. **Phase 6** — start **6.1** early (near-P1: the wedge risk); the rest after the
    surface is correct.
 6. **Phase 7** last, behavior-preserving, guarded by earlier tests. 7.5 absorbs the
    1.2 composition seam; 7.3's bridge helper absorbs 6.1's.
+7. **Phase 8** is deferred and unscheduled — but **8.0's stub convention applies from now on**,
+   and **8.2's MinIO wiring should be pulled forward into 1.3**, not left to the phase.
+
+**Next up (as of 2026-07-16), in order of readiness:**
+- **1.3** — the biggest remaining P0. Blocked on the MinIO test + time-bounding design, and it
+  must also absorb **1.4's S3 no-op** (`_grace` bound-and-never-read at `s3-blobs/src/lib.rs:524`)
+  and the versioning-premise hazard. Its blocker and Phase 8's backlog are **the same work**:
+  `minio_round_trip.rs` runs in no workflow.
+- **2.2/2.3** — unblocked by 2.1; both need the hydrating-read seam (2.2 first, 2.3 builds on it).
+- **3.3** — unblocks 3.2's doc half, and is required parity work in its own right.
 
 ## Conventions settled during Phase 0
 
@@ -796,10 +955,18 @@ studio-specifics out of the generic crate — the right-altitude version of prin
      set of files. It listed `store.rs`/`room.rs`/`blob_http.rs` but **not** `tree_walk.rs` — so
      1.5's fix would have landed with its own suite never firing. Fixed in 1.5. **Adding a step is
      half the job; the trigger must also list the source files the suite guards.**
+  3. **A step can exist, run, and still prove nothing.** Wiring Postgres/Mongo in would have gone
+     green while testing nothing about finding #1 — the suite had no scenario for the property
+     (`known_room_ids`), and `run_all(store, room_id)` took a *single* room, so it structurally
+     could not test multi-room enumeration. Both round-trip tests also fail **open** (skip on
+     missing Docker → reported PASS). **Check the suite asserts the property before wiring it in
+     to guard that property**, and that it cannot no-op.
   - **Root cause, unfixed:** these filters enumerate implementation files *by hand*, so every
     suite's real coverage depends on someone remembering each file it transitively exercises. Same
     shape as the missing `.gitattributes` (fixed `10723954`): correct by luck, silent when wrong.
-    See the follow-up below.
+    **Now tracked as Phase 8 (deferred)** — and note **8.0's stub convention is in force now**: if
+    a step's home is unclear or needs CI setup that doesn't exist, add it where you believe it
+    belongs with a follow-up comment and report it. Never omit it silently.
 - **Vectors** live flat in `nodalmerge:engine/commands/*.v1.json`; binary goldens in
   `engine/commands/fixtures/`. Rust consumes via `include_str!` → collect failures into
   a `Vec<String>` → one `assert!`. Prefer an **inline** `#[cfg(test)]` vector test over
@@ -842,35 +1009,12 @@ studio-specifics out of the generic crate — the right-altitude version of prin
     query failure, so a transient DB error is indistinguishable from "no rooms" — the same
     silent-data-loss shape the conformance scenario now guards against, but a live-traffic version
     the scenario cannot reach.
-- ⚠ **CI coverage is far thinner than "filters under-trigger" implies** (raised by 1.5/1.6, and
-  substantially widened 2026-07-16 during 3.1 — **now the highest-value item on this list**).
-  The plan has hit this **four** times, escalating each time:
-  1. `studio_gc.rs` — test file existed, **no step ran it** anywhere (fixed, `5664c2b1`).
-  2. `tree_walk.rs` — step existed, **`paths:` filter omitted the source file** it guards (fixed,
-     `ef693f39`).
-  3. `ZstdInteropTests.cs` — **both at once**: listed in `paths:` but no `dotnet test` step ran it,
-     *and* `BlobCompression.cs` — the file 3.1 actually fixed — wasn't in the filter at all. The
-     interop contract was enforced only from the Rust side; a Rust test can never catch a .NET
-     decoder regression (fixed, `6cf2c8fd`).
-  4. **The audit that instance prompted: ~15 Rust integration-test files and ~34 .NET test classes
-     run in ZERO workflows.** Not filters under-triggering — *no step at all*. Includes
-     `server/s3-blobs/tests/minio_round_trip.rs` (the very test 1.3 is blocked on),
-     `persistence.rs`, `idle_eviction.rs`, `rate_limit.rs`, `token_expiry.rs`,
-     `metrics_endpoint.rs`, and — sharpest — `blob_layout_vectors_v3.rs`, a *sibling* of the
-     already-covered `blob_layout_vectors.rs`. Several cross-runtime parity contracts are pinned
-     from **one runtime only**: `SpecAuthVectorsTests.cs`↔`spec_auth_vectors.rs` and
-     `BranchForkVectorsTests.cs`↔`branch_fork_vectors.rs` (neither side runs anywhere);
-     `QueryMaterializationVectorsTests.cs` (Rust side covered, .NET mirror never runs) — the exact
-     one-directional shape that let finding #4 live.
-
-  Some are plausibly uncovered for the same structural reason Postgres/Mongo were (Docker/MinIO/
-  native FFI that CI doesn't set up) — that is a reason to fix the setup, not evidence the gap is
-  benign. **Until this is addressed, "CI is green" carries much less information than it appears
-  to, and every slice must re-check its own trigger *and* that a step exists at all.** The
-  mechanical fix is the same as before (drop filters for the cheap correctness workflows, derive
-  them, or add a meta-test asserting every `tests/*.rs` and test class is named by some workflow) —
-  but the audit says the meta-test is now the load-bearing one, since the failure is absence, not
-  staleness.
+- ➡ **CI coverage — MOVED to Phase 8 (deferred).** Was the highest-value item on this list;
+  it outgrew a follow-up bullet, so it is now a phase of its own at the bottom of the plan
+  rather than tracked in two places. **Its stub convention (8.0) is in force now, not
+  deferred** — slices still add their step; when a step's home is unclear or needs CI setup
+  that doesn't exist, stub it where it belongs and report it. Note `minio_round_trip.rs`
+  should NOT wait for Phase 8: it is what **1.3** is blocked on, and 1.3 should absorb it.
 
 - **Unbounded retention of revivable statuses.** After 1.6, `Failed` joins
   `Cancelled`/`DeadLettered` in being retained indefinitely. That is consistent, not new,
