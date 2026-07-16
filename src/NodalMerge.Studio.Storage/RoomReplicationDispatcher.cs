@@ -12,10 +12,11 @@ namespace NodalMerge.Studio.Storage;
 // actually owns that room's EngineRoomMap.
 internal sealed class RoomReplicationDispatcher(
     NodalMergeStudioNodeStore studioStore,
-    IWorkgroupRepositoryDirectory workgroupDirectory) : IStudioNodeStoreReplicationSink
+    IWorkgroupRepositoryDirectory workgroupDirectory,
+    RoomOptions roomOptions) : IStudioNodeStoreReplicationSink
 {
     public Task RehydrateLiveMapFromCanonicalResolutionAsync(string roomId, CancellationToken cancellationToken = default) =>
-        string.Equals(roomId, BoundRepoRooms.WorkgroupRoomId, StringComparison.Ordinal)
+        string.Equals(roomId, roomOptions.EffectiveWorkgroupRoomId, StringComparison.Ordinal)
             ? workgroupDirectory.ReplayCanonicalResolutionIntoLiveMapAsync(cancellationToken)
             : studioStore.RehydrateLiveMapFromCanonicalResolutionAsync(roomId, cancellationToken);
 }

@@ -34,7 +34,9 @@ namespace NodalMerge.Studio.Host;
 /// server implementation — this class instead owns one <see cref="RoomConnection"/> (one
 /// WebSocket, one reconnect loop, one outbound queue) per joined room, managed by this single
 /// hosted service. Rooms joined: this peer's own room (`HeadlessPeerOptions.RoomId`, still
-/// literally "studio" pending 6.4's config rename), "workgroup", and every repo room this peer has
+/// literally "studio" — out of 6.4's config-rename scope, which covers HostUri/Workgroup only),
+/// the workgroup room (`RoomOptions.EffectiveWorkgroupRoomId`, config key Room:Workgroup, default
+/// "workgroup" — slice 6.4 replaced the hardcoded literal), and every repo room this peer has
 /// bound (<see cref="BoundRepoRooms"/>) — reconciled on an owned background loop
 /// (<see cref="MembershipLoopAsync"/>) so a repo bound while already connected joins its room
 /// without a restart (D1's membership rule + the slice's own "join/leave follows binding" note).
@@ -71,6 +73,7 @@ namespace NodalMerge.Studio.Host;
 /// </summary>
 public sealed class RoomPeerClient(
     HeadlessPeerOptions options,
+    RoomOptions roomOptions,
     WorkspaceOptions workspaceOptions,
     IServiceProvider services,
     IHostApplicationLifetime appLifetime,
@@ -179,7 +182,7 @@ public sealed class RoomPeerClient(
 
     private async Task ReconcileMembershipAsync(CancellationToken ct)
     {
-        var target = new HashSet<string>(StringComparer.Ordinal) { options.RoomId, BoundRepoRooms.WorkgroupRoomId };
+        var target = new HashSet<string>(StringComparer.Ordinal) { options.RoomId, roomOptions.EffectiveWorkgroupRoomId };
 
         var registry = RepositoryRegistry;
         if (registry is not null)

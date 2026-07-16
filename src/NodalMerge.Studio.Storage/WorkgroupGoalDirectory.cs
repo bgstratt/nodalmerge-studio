@@ -65,9 +65,12 @@ public sealed class WorkgroupGoalDirectory : IWorkgroupGoalDirectory
         IRuntimeCommandBridge bridge,
         RuntimeDagPersistenceService dagPersistence,
         IStudioReplicationOutbound replicationOutbound,
+        RoomOptions roomOptions,
         ILogger<WorkgroupGoalDirectory> logger)
     {
-        _roomMap = new EngineRoomMap(BoundRepoRooms.WorkgroupRoomId, _ => GoalsNamespace, bridge, dagPersistence, replicationOutbound, logger);
+        // Slice 6.4 — workgroup room id is now RoomOptions.EffectiveWorkgroupRoomId (config key
+        // Room:Workgroup) rather than the pre-6.4 BoundRepoRooms.WorkgroupRoomId literal.
+        _roomMap = new EngineRoomMap(roomOptions.EffectiveWorkgroupRoomId, _ => GoalsNamespace, bridge, dagPersistence, replicationOutbound, logger);
     }
 
     private async Task EnsureInitializedAsync(CancellationToken cancellationToken)

@@ -50,6 +50,10 @@ public static class StudioWebApplication
             {
                 var opts = new HeadlessPeerOptions();
                 config.GetSection("Peer").Bind(opts);
+                // Slice 6.4 — HostUri now flows from Room:HostUri (RoomOptions, bound by
+                // AddStudioServices above; Peer:HostUri back-compat + deprecation log handled
+                // there) rather than binding "Peer:HostUri" a second time here.
+                opts.HostUri = sp.GetRequiredService<RoomOptions>().HostUri;
                 return opts;
             });
             AddRoomPeerClient(services);
@@ -115,13 +119,15 @@ public static class StudioWebApplication
         // StudioCrdtSyncBackgroundService/RuntimeGraphPromoter broadcast tick previously covered
         // "does the embedded host talk to a room at all" only for downstream peers connecting to
         // its own /ws/{room} endpoint; RoomPeerClient now also covers the upstream half, so the
-        // embedded host gets full slice-6.4-shaped room presence here, ahead of that slice's own
-        // config plumb-through work (6.4 wires the extension's Room settings into this Peer config
-        // section — until then, HostUri stays unset for the embedded host and this is a no-op).
+        // embedded host gets full room presence here. Slice 6.4 wires the extension's
+        // nodalmerge.room.* settings into Room:HostUri/Room:Workgroup, which this HeadlessPeerOptions
+        // factory now reads (via RoomOptions, bound in AddStudioServices) instead of "Peer:HostUri"
+        // directly — HostUri stays unset (standalone) unless the extension/user actually configures it.
         builder.Services.AddSingleton<HeadlessPeerOptions>(sp =>
         {
             var opts = new HeadlessPeerOptions();
             builder.Configuration.GetSection("Peer").Bind(opts);
+            opts.HostUri = sp.GetRequiredService<RoomOptions>().HostUri;
             return opts;
         });
         AddRoomPeerClient(builder.Services);

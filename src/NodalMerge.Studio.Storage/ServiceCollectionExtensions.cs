@@ -16,6 +16,12 @@ public static class ServiceCollectionExtensions
         // AddStudioServices, which wins (last AddSingleton registration wins — see e.g. the
         // WorkspaceOptions comment in AddInMemoryStorage below for the same pattern/rationale).
         services.AddSingleton<IStudioReplicationOutbound>(NoopStudioReplicationOutbound.Instance);
+        // Slice 6.4 — default-valued RoomOptions (no HostUri, Workgroup="workgroup") so
+        // WorkgroupRepositoryDirectory/WorkgroupGoalDirectory/RoomReplicationDispatcher/
+        // RoomPeerClient always have a room id to bind to, even before NodalMerge.Studio.Host's
+        // config-bound override runs (last-AddSingleton-wins, same pattern as
+        // RetentionPolicyOptions/BlobGcOptions in AddRehydratableServices below).
+        services.AddSingleton(new RoomOptions());
         services.AddSingleton<IStudioNodeStore, NodalMergeStudioNodeStore>();
         // Slice 6.2 — workgroup room repositories map (docs/STUDIO_ROOM_SCHEMA.md (b)), engine-backed
         // like IStudioNodeStore above but a separate room ("workgroup") and namespace
@@ -34,7 +40,8 @@ public static class ServiceCollectionExtensions
         // resolve this as optional.
         services.AddSingleton<IStudioNodeStoreReplicationSink>(sp => new RoomReplicationDispatcher(
             (NodalMergeStudioNodeStore)sp.GetRequiredService<IStudioNodeStore>(),
-            sp.GetRequiredService<IWorkgroupRepositoryDirectory>()));
+            sp.GetRequiredService<IWorkgroupRepositoryDirectory>(),
+            sp.GetRequiredService<RoomOptions>()));
         services.AddSingleton<IRepositoryIdentityHintsService, GitRepositoryIdentityHintsService>();
         services.AddSingleton<IBranchService, NodalMergeBranchService>();
         services.AddSingleton<IReplayService, ReplayService>();
@@ -52,6 +59,11 @@ public static class ServiceCollectionExtensions
         // never calls this (no engine bridge to promote/notify through), but every service that
         // constructs NodalMergeStudioNodeStore-shaped test doubles directly still needs it resolvable.
         services.AddSingleton<IStudioReplicationOutbound>(NoopStudioReplicationOutbound.Instance);
+        // Slice 6.4 — default-valued RoomOptions, same reasoning as AddNodalMergeStorage's
+        // identical registration above; the in-memory doubles below don't consume it themselves,
+        // but it's resolvable for any caller/test that does (e.g. constructing a real RoomPeerClient
+        // against an otherwise in-memory-storage host).
+        services.AddSingleton(new RoomOptions());
         services.AddSingleton<IStudioNodeStore, InMemoryStudioNodeStore>();
         // Slice 6.2 — in-memory workgroup directory (no engine bridge needed here, same reasoning
         // as InMemoryStudioNodeStore above); GitRepositoryIdentityHintsService itself has no engine

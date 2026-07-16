@@ -80,7 +80,17 @@
         "nodalmerge.runtimeUri": {
           "type": "string",
           "default": "",
-          "description": "Base URI of the NodalMerge Studio runtime (e.g. http://192.168.1.10:5080). Empty (default) connects to a locally-managed runtime on 127.0.0.1:5080. Set this to point the extension at a standalone or remote runtime instead."
+          "description": "Base URI the extension's own locally-managed runtime binds to (e.g. http://127.0.0.1:5081). Empty (default) uses 127.0.0.1:5080. The extension always spawns or adopts this local runtime — it never talks to a remote server directly. To connect this local runtime to a shared room on another machine, set nodalmerge.room.hostUri instead."
+        },
+        "nodalmerge.room.hostUri": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "WebSocket base URI of a room server this workspace's local runtime should connect to (e.g. `wss://team.example.com`, `ws://127.0.0.1:9090`). Empty (default) is standalone — no room connection is attempted. Hosting your own server is not a special mode: it's this setting pointed at the server's address, with the server binary run separately — the extension never spawns it."
+        },
+        "nodalmerge.room.workgroup": {
+          "type": "string",
+          "default": "",
+          "description": "Names the workgroup room this workspace's repositories/cross-repo-goal state joins. Empty (default) uses the server-side default (\"workgroup\") — only meaningful once nodalmerge.room.hostUri is also set."
         },
         "nodalmerge.hostPort": {
           "type": "number",
@@ -107,6 +117,11 @@
           "type": "string",
           "default": "",
           "description": "Optional bearer token sent with every request to nodalmerge.blobOrigin.uri, when that server requires auth."
+        },
+        "nodalmerge.blobOrigin.s3Direct.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Adds an s3-direct chain link (peer ↔ bucket, resolved via nodalmerge.blobOrigin.uri's presign endpoints) on top of the server-relay origin. Only meaningful when nodalmerge.blobOrigin.uri is also set. Numeric tuning (timeouts, retries, compression) is host-config-only for now — see NodalMerge:Storage:S3Direct:* in the host's own config."
         },
         "nodalmerge.agentProfiles": {
           "type": "array",

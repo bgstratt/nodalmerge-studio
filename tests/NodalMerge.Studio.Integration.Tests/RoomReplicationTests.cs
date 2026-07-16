@@ -126,6 +126,7 @@ public class RoomReplicationTests : IDisposable
 
         await using var peerTarget = new RoomPeerClient(
             new HeadlessPeerOptions { RoomId = "studio" },
+            appTarget.Services.GetRequiredService<RoomOptions>(),
             appTarget.Services.GetRequiredService<WorkspaceOptions>(),
             appTarget.Services,
             appTarget.Services.GetRequiredService<IHostApplicationLifetime>(),

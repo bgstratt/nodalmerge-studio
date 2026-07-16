@@ -35,16 +35,6 @@ export function getRid(): string {
   throw new Error(`Unsupported platform: ${platform}/${arch}`);
 }
 
-/** Returns true when the URI points at a local loopback address. */
-export function isLocalUri(uri: string): boolean {
-  try {
-    const u = new URL(uri);
-    return u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '::1';
-  } catch {
-    return true; // malformed URI — treat as local to avoid remote-mode behaviour
-  }
-}
-
 /** Converts an http(s) base URL to its ws(s) equivalent for WebSocket connections. */
 export function toWebSocketUrl(httpUri: string): string {
   return httpUri.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');

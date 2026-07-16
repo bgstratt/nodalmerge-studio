@@ -14,7 +14,8 @@ instead of `StudioWebApplication.Build(args)`.
 
 ### Standalone (no room presence)
 
-`Peer:HostUri` is null or omitted. The `RoomPeerClient` service logs "running standalone" and
+`Room:HostUri` is empty or omitted (see the Configuration reference below for the `Peer:HostUri`
+back-compat fallback). The `RoomPeerClient` service logs "running standalone" and
 becomes a no-op. All agent loops execute locally. Agent work units, artifacts, and proposals are
 stored in the peer's own workspace; nothing is replicated to a remote room.
 
@@ -23,7 +24,7 @@ multi-peer room replication is not needed.
 
 ### Connected (room presence)
 
-`Peer:HostUri` is set (e.g., `ws://localhost:5080`). `RoomPeerClient` opens an outbound WebSocket
+`Room:HostUri` is set (e.g., `ws://localhost:5080`). `RoomPeerClient` opens an outbound WebSocket
 connection to `{HostUri}/ws/{RoomId}` and sends a `hello` message identifying itself with
 `peer_id`, `peer_type`, and an empty `frontier`.
 
@@ -77,13 +78,21 @@ Or via env var: `Peer__Enabled=true`.
 
 ## Configuration reference
 
-All keys live under the `"Peer"` section in `appsettings.json`:
+**Slice 6.4 update (2026-07-15):** `HostUri` moved to its own `"Room"` config section, shared
+with the embedded Studio host (`plans/cas-distribution-and-storage.md`, decision D4 — "mode
+collapse": connection is config, not a mode). `Peer:HostUri` still works — it's read as a
+deprecated fallback (with a one-line warning logged) whenever `Room:HostUri` is unset — so
+existing deployments of this guide's config need no changes. New configs should use `Room:HostUri`.
+The rest of the `"Peer"` section (`Enabled`, `RoomId`, `PeerType`, `PeerId`) is unchanged.
 
 ```json
 {
+  "Room": {
+    "HostUri": "ws://localhost:5080",
+    "Workgroup": "workgroup"
+  },
   "Peer": {
     "Enabled": true,
-    "HostUri": "ws://localhost:5080",
     "RoomId": "studio",
     "PeerType": "ephemeral-agent",
     "PeerId": null
@@ -94,8 +103,9 @@ All keys live under the `"Peer"` section in `appsettings.json`:
 | Key | Default | Description |
 |---|---|---|
 | `Peer:Enabled` | `false` | Must be `true` (or use CLI/env override) to activate peer mode |
-| `Peer:HostUri` | `null` | WebSocket base URI of the room host. `null` = standalone mode. |
-| `Peer:RoomId` | `"studio"` | The NodalMerge room to join. Must match the room ID on the host. |
+| `Room:HostUri` | `null`/`""` | WebSocket base URI of the room host. Empty/unset = standalone mode (D4 — never inferred from URL shape). Falls back to `Peer:HostUri` if set and `Room:HostUri` is not (deprecated). |
+| `Room:Workgroup` | `"workgroup"` | Names the workgroup room this peer's repositories-map/cross-repo-goal state joins. The default keeps standalone workgroup state working with a stable local room id even with no server configured. |
+| `Peer:RoomId` | `"studio"` | This peer's own room (distinct from the workgroup room above). Must match the room ID on the host. |
 | `Peer:PeerType` | `"ephemeral-agent"` | `"ephemeral-agent"` for short-lived runs; `"persistent-agent"` for long-running workers. |
 | `Peer:PeerId` | `null` | Stable identity string. When null, a UUID is auto-generated and persisted to `{Workspace:RootPath}/.peer-id` so the same identity is reused on restart. |
 
@@ -232,9 +242,11 @@ observers have nothing to react to.
 
 ```json
 {
+  "Room": {
+    "HostUri": "ws://studio-host:5080"
+  },
   "Peer": {
     "Enabled": true,
-    "HostUri": "ws://studio-host:5080",
     "RoomId": "studio",
     "PeerType": "ephemeral-agent"
   },

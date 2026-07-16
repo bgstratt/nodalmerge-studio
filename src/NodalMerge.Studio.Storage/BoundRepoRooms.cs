@@ -17,10 +17,12 @@ namespace NodalMerge.Studio.Storage;
 // never-guess stance.
 public static class BoundRepoRooms
 {
-    // Re-exported for callers (e.g. RoomReplicationDispatcher, RoomPeerClient) that need the
-    // workgroup room id alongside repo room ids — WorkgroupRepositoryDirectory.WorkgroupRoomId
-    // remains the one place that literal is defined.
-    public const string WorkgroupRoomId = WorkgroupRepositoryDirectory.WorkgroupRoomId;
+    // Slice 6.4 — the workgroup room id used to be re-exported here as a compile-time constant
+    // (WorkgroupRepositoryDirectory.WorkgroupRoomId, literally "workgroup"). It is now
+    // config-driven (RoomOptions.EffectiveWorkgroupRoomId, key Room:Workgroup) — callers that used
+    // to reference BoundRepoRooms.WorkgroupRoomId (RoomReplicationDispatcher, RoomPeerClient,
+    // WorkgroupGoalDirectory) now take RoomOptions directly instead, since a static class with no
+    // DI has nowhere to source the configured value from.
 
     // docs/STUDIO_ROOM_SCHEMA.md (b) "repoRoomId naming" — repo/{repoId}, where repoId is the
     // workgroup-authoritative id (WorkgroupRepositoryEntry.RepoId / RepositoryV1.WorkgroupRepoId),

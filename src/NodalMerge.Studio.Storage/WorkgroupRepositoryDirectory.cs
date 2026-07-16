@@ -177,9 +177,9 @@ public sealed class WorkgroupRepositoryStore
 
 // Engine-backed production implementation — the workgroup room's repositories map ridden through
 // EngineRoomMap exactly as NodalMergeStudioNodeStore rides the "studio" room's "studio" namespace.
-// See docs/STUDIO_ROOM_SCHEMA.md (b) for the frozen room id ("workgroup" — WorkgroupRoomId below is
-// the one place this constant is defined; 6.4 replaces the literal with `Room:Workgroup` config,
-// per that slice's row in plans/cas-distribution-and-storage.md) and value shape.
+// See docs/STUDIO_ROOM_SCHEMA.md (b) for the frozen namespace/value shape. Slice 6.4 replaced the
+// hardcoded "workgroup" room-id literal with RoomOptions.EffectiveWorkgroupRoomId (config key
+// Room:Workgroup, default "workgroup" — see that class's own doc comment).
 //
 // What this class does NOT do (out of scope for 6.2, see the slice's own task brief): join the
 // workgroup room's WS channel upstream. The room is created/hydrated locally on demand and writes
@@ -195,7 +195,6 @@ public sealed class WorkgroupRepositoryStore
 // the same outbound seam), nothing here needs to change when it lands.
 public sealed class WorkgroupRepositoryDirectory : IWorkgroupRepositoryDirectory
 {
-    public const string WorkgroupRoomId = "workgroup";
     private const string RepositoriesNamespace = "repositories";
 
     private readonly EngineRoomMap _roomMap;
@@ -206,12 +205,13 @@ public sealed class WorkgroupRepositoryDirectory : IWorkgroupRepositoryDirectory
         IRuntimeCommandBridge bridge,
         RuntimeDagPersistenceService dagPersistence,
         IStudioReplicationOutbound replicationOutbound,
+        RoomOptions roomOptions,
         ILogger<WorkgroupRepositoryDirectory> logger)
     {
         // Single namespace room today (only "repositories" is defined by the frozen schema for
         // 6.2) — the replay-namespace resolver is a constant, unlike NodalMergeStudioNodeStore's
         // two-namespace ("studio"/"studio-meta") inference.
-        _roomMap = new EngineRoomMap(WorkgroupRoomId, _ => RepositoriesNamespace, bridge, dagPersistence, replicationOutbound, logger);
+        _roomMap = new EngineRoomMap(roomOptions.EffectiveWorkgroupRoomId, _ => RepositoriesNamespace, bridge, dagPersistence, replicationOutbound, logger);
     }
 
     private async Task EnsureInitializedAsync(CancellationToken cancellationToken)

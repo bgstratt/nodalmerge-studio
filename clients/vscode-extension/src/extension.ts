@@ -165,12 +165,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   try {
     await manager.start();
   } catch (err) {
-    const actions = manager.isRemote
-      ? ['Show Output']
-      : ['Show Output', 'Retry'];
+    // The extension always spawns/adopts its own local peer (D4 — no remote-only mode), so a
+    // start() failure is always retryable (e.g. a stale process holding the port).
     const action = await vscode.window.showErrorMessage(
       `NodalMerge Studio failed to connect: ${String(err)}`,
-      ...actions
+      'Show Output', 'Retry'
     );
     if (action === 'Show Output') {
       output.show();
