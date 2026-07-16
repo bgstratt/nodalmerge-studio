@@ -68,7 +68,14 @@
       (`MergeProposalV1`, `TaskV1`, `BranchV1`, …) carry no `RepositoryId` — they
       remain peer-local until a denormalize-and-route slice (6.3a below) lands;
       5.3's server-side retention classification cannot see proposals until then.**
-      Remaining: 6.3a → 6.4 → 5.3 → 6.5.
+      **6.4 shipped 2026-07-15** (`eb69639`): `Room:HostUri`/`Room:Workgroup` config
+      (+ `Peer:HostUri` deprecated fallback), extension `nodalmerge.room.*` +
+      `nodalmerge.blobOrigin.s3Direct.enabled` settings bridged, `isLocalUri`
+      adopt-guessing and remote-mode branch deleted from `HostManager` (single-
+      instance local adoption kept — it's process management, not URL guessing).
+      947 tests green. Note: `Peer:RoomId` (`"studio"`, the peer's own room) stays
+      hardcoded — out of D4's scope; flag at 6.5 if it needs configuring.
+      Remaining: 6.3a → 5.3 → 6.5.
       - 6.3a (new, gates 5.3): denormalize `RepositoryId` onto the indirect
         repo-scoped kinds at creation time (the 6.3 report's recommendation over
         parent-chain walks), route them per 6.3's mechanism, migrate lazily
