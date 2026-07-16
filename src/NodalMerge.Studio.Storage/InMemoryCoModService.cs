@@ -121,6 +121,9 @@ internal sealed class InMemoryCoModService(IStudioNodeStore nodeStore) : ICoModS
         return false;
     }
 
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.CoModPatternV1];
+
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {
         var nodes = await nodeStore.ReadAllNodesAsync(StudioNodeKind.CoModPatternV1, cancellationToken)

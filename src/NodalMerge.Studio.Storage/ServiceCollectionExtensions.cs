@@ -361,6 +361,16 @@ public static class ServiceCollectionExtensions
         // poll loop's StartAsync begins.
         services.AddSingleton<StudioStateRehydrationService>();
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<StudioStateRehydrationService>());
+
+        // Slice 6.5 Part 1 — resolves IEnumerable<IRehydratable> (every registration above),
+        // exactly like StudioStateRehydrationService, but on-demand (called by RoomPeerClient after
+        // an inbound pack) rather than once at startup. Registered in both AddNodalMergeStorage and
+        // AddInMemoryStorage (this method runs from both) so it's resolvable in every test/host
+        // configuration even though only a connected host (RoomPeerClient) ever actually calls it.
+        services.AddSingleton<IStudioCacheRefreshCoordinator>(sp => new RehydratableRefreshCoordinator(
+            sp.GetServices<IRehydratable>(),
+            sp.GetRequiredService<RoomOptions>(),
+            sp.GetRequiredService<ILogger<RehydratableRefreshCoordinator>>()));
     }
 
     // Slice 14a — no state to rehydrate (rules are resolved fresh from DI each time), so this

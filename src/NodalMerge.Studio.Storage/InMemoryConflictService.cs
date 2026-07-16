@@ -60,6 +60,9 @@ public sealed class InMemoryConflictService(IStudioNodeStore nodeStore)
             c => c with { Status = ConflictStatus.Resolved, ResolvedByConflictResolutionOpId = resolutionOpId },
             ct).ConfigureAwait(false);
 
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.RepositoryConflictV1];
+
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {
         var nodes = await nodeStore.ReadAllNodesAsync(StudioNodeKind.RepositoryConflictV1, cancellationToken)
@@ -71,6 +74,40 @@ public sealed class InMemoryConflictService(IStudioNodeStore nodeStore)
                 var conflict = JsonSerializer.Deserialize<RepositoryConflict>(json);
                 if (conflict is not null && !_byId.ContainsKey(conflict.ConflictId))
                     Index(conflict);
+            }
+        }
+    }
+
+    // Slice 6.5 Part 1 — RehydrateAsync's ContainsKey guard is correct for a one-time startup load
+    // (every row is new) but would hide a remote status transition (Dismiss/MarkResolved) on a
+    // conflict this peer already knows about. Overridden here to upsert instead: unchanged for a
+    // brand-new conflict, but a conflict already in _byId gets its value (and _byRepo's list entry)
+    // replaced rather than skipped.
+    public async Task RefreshAsync(CancellationToken cancellationToken = default)
+    {
+        var nodes = await nodeStore.ReadAllNodesAsync(StudioNodeKind.RepositoryConflictV1, cancellationToken)
+            .ConfigureAwait(false);
+        lock (_lock)
+        {
+            foreach (var (_, json) in nodes)
+            {
+                var conflict = JsonSerializer.Deserialize<RepositoryConflict>(json);
+                if (conflict is null)
+                    continue;
+
+                if (!_byId.ContainsKey(conflict.ConflictId))
+                {
+                    Index(conflict);
+                    continue;
+                }
+
+                _byId[conflict.ConflictId] = conflict;
+                if (_byRepo.TryGetValue(conflict.RepositoryId, out var list))
+                {
+                    var idx = list.FindIndex(c => c.ConflictId == conflict.ConflictId);
+                    if (idx >= 0)
+                        list[idx] = conflict;
+                }
             }
         }
     }

@@ -76,6 +76,9 @@ internal sealed class InMemoryKnownGoodStateService : IKnownGoodStateService, IR
         return Task.FromResult(state);
     }
 
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.KnownGoodStateV1];
+
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {
         var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.KnownGoodStateV1, cancellationToken)

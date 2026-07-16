@@ -602,11 +602,47 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
 
         var payloadJson = await ReadStudioRoomOrLegacyPayloadAsync(
             StudioNodeKind.RepositoryV1, repositoryId, cancellationToken).ConfigureAwait(false);
-        if (payloadJson is null)
-            return null;
+        if (payloadJson is not null)
+        {
+            var workgroupRepoId = TryExtractStringProperty(payloadJson, "WorkgroupRepoId");
+            if (workgroupRepoId is not null)
+                return BoundRepoRooms.RoomIdFor(workgroupRepoId);
+        }
 
-        var workgroupRepoId = TryExtractStringProperty(payloadJson, "WorkgroupRepoId");
-        return workgroupRepoId is null ? null : BoundRepoRooms.RoomIdFor(workgroupRepoId);
+        // Slice 6.5 — cross-peer fallback, found while building the multi-user milestone test.
+        // `repositoryId` here is a *peer-local* candidate id (see this method's own comment /
+        // StudioNodeKind.RepoScopedKinds), minted by whichever peer originally registered the
+        // repo. A DIFFERENT peer writing a repo-scoped-indirect entity (MergeProposal/Task/
+        // Decision/...) denormalized from a WorkUnit it did NOT itself create
+        // (RepositoryIdResolution copies that WorkUnit's own RepositoryId string verbatim) has no
+        // RepositoryV1 row of its own keyed by that string — the direct lookup above always
+        // misses, silently misrouting the write into the local "studio" room instead of the shared
+        // repo room the referenced WorkUnit itself already lives in.
+        //
+        // Recover by scanning this peer's own ALREADY-INSTANTIATED repo room maps (never forcing a
+        // new one via GetOrCreateRepoRoomMapAsync — that would deadlock when this method is itself
+        // invoked from inside that method's own migration passes, which resolve repositoryId for
+        // rows they're migrating) for a WorkUnitV1 row carrying this exact repositoryId. If the
+        // WorkUnit is visible there, it replicated correctly and this peer already joined that
+        // room — route the new entity to the same place. This never helps find a room the peer
+        // hasn't already touched, which is fine: that room wouldn't be joined yet regardless.
+        var workUnitPrefix = StudioNodeKind.WorkUnitV1 + "/";
+        foreach (var (roomId, lazyRoomMap) in _repoRoomMaps)
+        {
+            if (!lazyRoomMap.IsValueCreated || lazyRoomMap.Value.Status != TaskStatus.RanToCompletion)
+                continue; // never block on/force a room that isn't already cached
+
+            foreach (var (mapKey, valueRawJson) in lazyRoomMap.Value.Result.AllEntries(MapNamespace))
+            {
+                if (!mapKey.StartsWith(workUnitPrefix, StringComparison.Ordinal))
+                    continue;
+                var candidateRepositoryId = TryExtractStringProperty(ExtractPayloadRawText(valueRawJson), "RepositoryId");
+                if (string.Equals(candidateRepositoryId, repositoryId, StringComparison.Ordinal))
+                    return roomId;
+            }
+        }
+
+        return null;
     }
 
     // Every bound repo room per this store's own RepositoryV1 rows — same source of truth the

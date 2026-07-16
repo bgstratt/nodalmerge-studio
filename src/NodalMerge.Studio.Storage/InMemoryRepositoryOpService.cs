@@ -92,6 +92,9 @@ public sealed class InMemoryRepositoryOpService : IRepositoryOpService, IRehydra
         }
     }
 
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.RepositoryOpV1];
+
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {
         var nodes = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.RepositoryOpV1, cancellationToken)

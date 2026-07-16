@@ -45,6 +45,9 @@ public sealed class DecisionNodeService : IDecisionNodeService, IRehydratable
         return stored;
     }
 
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.DecisionV1];
+
     public async Task RehydrateAsync(CancellationToken ct = default)
     {
         var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.DecisionV1, ct).ConfigureAwait(false);

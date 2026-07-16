@@ -414,10 +414,32 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             resolvedRepositoryId = parentWorkUnitForRepo.RepositoryId;
         }
 
+        // Slice 6.5 Part 2 (plans/cas-distribution-and-storage.md Phase 6) — capture the
+        // repository's actual current-head RepositorySnapshot.SnapshotId at the moment this
+        // branch/work unit is seeded, so SnapshotRetentionPolicy's "Active" classification can pin
+        // the exact seed generation instead of approximating it by CreatedAt timestamp (see that
+        // class's own doc comment and WorkUnit.SeedSnapshotId's). RepositorySnapshot.RepositoryId is
+        // keyed by Path.GetFullPath of the physical repo path — a different id space than the
+        // registry RepositoryId resolved above — so this mirrors
+        // SnapshotRetentionPolicy.ResolveRepositoryIdAsync's exact resolution rather than reusing
+        // resolvedRepositoryId directly. Best-effort: no snapshot service registered, or no
+        // snapshot yet for a brand-new/unbootstrapped repository, both leave this null — the
+        // existing timestamp proxy remains the fallback for those rows, same as every pre-6.5 one.
+        string? seedSnapshotId = null;
+        var snapshotService = _serviceProvider?.GetService<IRepositorySnapshotService>();
+        if (snapshotService is not null)
+        {
+            var snapshotRepositoryPath = await ResolveSnapshotRepositoryPathAsync(resolvedRepositoryId, cancellationToken)
+                .ConfigureAwait(false);
+            var headSnapshot = await snapshotService.GetLatestAsync(snapshotRepositoryPath, cancellationToken)
+                .ConfigureAwait(false);
+            seedSnapshotId = headSnapshot?.SnapshotId;
+        }
+
         var resolvedBranchId = await _branchService
             .CreateBranchAsync(
                 branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, fileScope,
-                repositoryId: resolvedRepositoryId, cancellationToken: cancellationToken)
+                repositoryId: resolvedRepositoryId, seedSnapshotId: seedSnapshotId, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
 
         var fanOutInfo = sliceId is not null || seedFromBranchId is not null
@@ -457,7 +479,8 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             WorkspaceId: workspaceId ?? "workspace-default",
             ReconciliationSourceProposalIds: reconciliationSourceProposalIds,
             ReconciliationTargetPaths: reconciliationTargetPaths,
-            ReconciliationSourceRef: reconciliationSourceRef);
+            ReconciliationSourceRef: reconciliationSourceRef,
+            SeedSnapshotId: seedSnapshotId);
 
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }
@@ -720,6 +743,12 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return (changes, addedLines, null);
     }
 
+    // Slice 6.5 Part 1 — declares the one kind this cache owns, so RehydratableRefreshCoordinator
+    // can skip calling this service's refresh for an inbound pack on a room that could never
+    // contain WorkUnitV1 rows (workgroup-room packs — WorkUnitV1 is repo-scoped or "studio"-local,
+    // never workgroup). See the interface's own doc comment for the full reasoning.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.WorkUnitV1];
+
     // Slice 0a — bypasses CreateAsync's parent-existence check (children can be loaded before
     // their parents) and never re-emits artifacts/events; just repopulates the dictionary from
     // what was already durably written.
@@ -733,6 +762,30 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             if (workUnit is not null)
                 _workUnits[entityId] = workUnit;
         }
+    }
+
+    // Slice 6.5 Part 2 — mirrors SnapshotRetentionPolicy.ResolveRepositoryIdAsync exactly (same
+    // physical-path id space RepositorySnapshot.RepositoryId is keyed by), so the seed snapshot this
+    // resolves against is the same one the retention policy's Active classification means to pin.
+    private async Task<string> ResolveSnapshotRepositoryPathAsync(string? repositoryId, CancellationToken ct)
+    {
+        if (repositoryId is not null)
+        {
+            var repositories = _serviceProvider?.GetService<IRepositoryRegistryService>();
+            var repository = repositories is null
+                ? null
+                : await repositories.GetAsync(repositoryId, ct).ConfigureAwait(false);
+            if (repository is not null)
+                return Path.GetFullPath(repository.Path);
+        }
+
+        // SeedRepositoryPath is commonly "" (not null) as the "no seed configured" convention
+        // elsewhere in this codebase (e.g. WorkspaceOptions' default) — Path.GetFullPath throws on
+        // an empty string, unlike a null one, so this must check IsNullOrEmpty, not just "??".
+        var fallback = string.IsNullOrEmpty(_workspaceOptions.SeedRepositoryPath)
+            ? Directory.GetCurrentDirectory()
+            : _workspaceOptions.SeedRepositoryPath;
+        return Path.GetFullPath(fallback);
     }
 
     private WorkUnit GetRequired(string workUnitId)

@@ -84,6 +84,19 @@ public sealed class RoomPeerClient(
     // NotifyLocalWriteAsync if a write races the membership loop's next tick.
     private readonly ConcurrentDictionary<string, RoomConnection> _connections = new(StringComparer.Ordinal);
 
+    // Slice 6.5 Part 1 — each joined room owns its own RoomConnection with its own independent
+    // receive loop (this class's own comment: "one socket, one room, one reconnect loop"), so this
+    // peer can have several ApplyInboundPackForRoomAsync calls in flight concurrently — one per
+    // room — all sharing the SAME underlying engine bridge/dag-persistence collaborators, which
+    // never had any cross-room serialization before this slice. Serializing it here is a defensive
+    // hardening this slice adds while investigating a real regression the cache-refresh addition
+    // below caused (see RehydratableRefreshCoordinator and RepositoryRegistryService.RefreshAsync
+    // for the actual root cause and fix — a data-model issue, not a concurrency one) — kept because
+    // it closes a genuine, independently-worth-having gap (concurrent inbound-pack application
+    // across rooms was always able to race against itself) even though it turned out not to be
+    // this particular bug's cause.
+    private readonly SemaphoreSlim _inboundApplyGate = new(1, 1);
+
     private static readonly TimeSpan MembershipReconcileInterval = TimeSpan.FromSeconds(5);
 
     private CancellationTokenSource? _lifetimeCts;
@@ -111,6 +124,12 @@ public sealed class RoomPeerClient(
 
     private IStudioNodeStoreReplicationSink? _replicationSink;
     private IStudioNodeStoreReplicationSink? ReplicationSink => _replicationSink ??= services.GetService<IStudioNodeStoreReplicationSink>();
+
+    // Slice 6.5 Part 1 — the cache-refresh half of inbound pack application (see
+    // IStudioCacheRefreshCoordinator's own doc comment). Same lazy-optional-collaborator shape as
+    // every other deferred resolution on this class.
+    private IStudioCacheRefreshCoordinator? _cacheRefreshCoordinator;
+    private IStudioCacheRefreshCoordinator? CacheRefreshCoordinator => _cacheRefreshCoordinator ??= services.GetService<IStudioCacheRefreshCoordinator>();
 
     private RuntimeRoomBroker? _roomBroker;
     private RuntimeRoomBroker? RoomBroker => _roomBroker ??= services.GetService<RuntimeRoomBroker>();
@@ -274,6 +293,21 @@ public sealed class RoomPeerClient(
     // InternalsVisibleTo.
     internal async Task ApplyInboundPackForRoomAsync(string roomId, string json, CancellationToken ct)
     {
+        // See _inboundApplyGate's own doc comment — serializes this against every OTHER room's
+        // concurrent inbound-pack application on this same peer, not just against itself.
+        await _inboundApplyGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await ApplyInboundPackForRoomCoreAsync(roomId, json, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _inboundApplyGate.Release();
+        }
+    }
+
+    private async Task ApplyInboundPackForRoomCoreAsync(string roomId, string json, CancellationToken ct)
+    {
         string? nodesB64;
         try
         {
@@ -324,10 +358,10 @@ public sealed class RoomPeerClient(
         if (replicationSink is not null)
         {
             // Bridges the room_maps/sync-graph split (see NodalMergeStudioNodeStore's class
-            // comment and IStudioNodeStoreReplicationSink's doc comment). NOTE: any in-memory
-            // Studio service with a startup-rehydrated cache will NOT observe this mid-run change
-            // — only future IStudioNodeStore reads do. Subscribing those caches to a store-changed
-            // notification is out of scope for this slice.
+            // comment and IStudioNodeStoreReplicationSink's doc comment). Makes the just-imported
+            // pack visible to a *future* IStudioNodeStore read; the cache-refresh step below is
+            // what makes it visible to a service's *already-populated* in-memory dictionary
+            // without waiting for one.
             try
             {
                 await replicationSink.RehydrateLiveMapFromCanonicalResolutionAsync(roomId, ct).ConfigureAwait(false);
@@ -341,6 +375,24 @@ public sealed class RoomPeerClient(
         {
             logger.LogDebug(
                 "[RoomPeerClient] No IStudioNodeStoreReplicationSink registered — inbound pack applied to the sync graph only room={Room}", roomId);
+        }
+
+        // Slice 6.5 Part 1 — re-pull every IRehydratable service's in-memory cache so this peer's
+        // own REST/UI reads (which never go through IStudioNodeStore directly — see
+        // IStudioCacheRefreshCoordinator's own doc comment) reflect the just-applied inbound pack
+        // without a restart. Awaited inline (not deferred to a background loop) — a real two-process
+        // smoke run (docs/guides/multi-user-smoke.md) confirmed this works correctly end to end.
+        var cacheRefreshCoordinator = CacheRefreshCoordinator;
+        if (cacheRefreshCoordinator is not null)
+        {
+            try
+            {
+                await cacheRefreshCoordinator.RefreshAfterInboundPackAsync(roomId, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "[RoomPeerClient] In-memory cache refresh after inbound pack failed room={Room}", roomId);
+            }
         }
     }
 

@@ -377,6 +377,31 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
         }
     }
 
+    // Slice 6.5 Part 1 — deliberately a no-op, NOT the default "call RehydrateAsync again". Root
+    // cause found while chasing a genuine regression this slice's own live-refresh wiring caused in
+    // RoomPerRepoTests' two-repo scenario: "studio" is not actually a peer-private room the way
+    // RepositoryV1's "peer-local candidate" convention assumes (see StudioNodeKind.RepoScopedKinds'
+    // own comment: "RepositoryV1 itself... stays local by necessity"). A CONNECTED peer's "studio"
+    // room *is* the literal same server-side room as the embedded host it connects to (RoomPeerClient
+    // joins room `options.RoomId`, hardcoded "studio", by opening a WebSocket to that exact room name
+    // on the remote host) — so once replication catches up, THIS peer's own engine-level view of
+    // "studio" also contains every OTHER peer's own RepositoryV1 rows, not just this peer's. A
+    // one-time startup RehydrateAsync (before any connection exists) never sees that — but re-running
+    // it live, after packs have arrived, would silently absorb another peer's own local-candidate
+    // registrations into this peer's _repositories cache as if they were this peer's own. That
+    // corrupts BoundRepoRooms.GetBoundRepoRoomIdsAsync (used by RoomPeerClient's membership loop to
+    // decide which repo rooms to actually JOIN), making a peer that only ever bound to one repo start
+    // joining every repo the OTHER peer happens to have registered — confirmed by direct
+    // instrumentation while building this slice: without this override, a peer bound only to repo R1
+    // ended up also joining R2's and R3's rooms and genuinely receiving their real catch-up content.
+    // No other RehydratedKinds-based partitioning fixes this (RepositoryV1 is correctly a "studio"-
+    // room kind, not repo-scoped — the bug isn't about which room a pack arrived on, it's that this
+    // service's own cache must never re-absorb replicated peer-local rows after startup). Safe to
+    // leave a no-op: nothing else in this codebase needs this peer's registry cache to reflect
+    // another peer's own bindings live — RepositoryRegistryService.RegisterAsync/
+    // ResolveDisambiguationAsync already update _repositories directly for this peer's OWN writes.
+    public Task RefreshAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
     private static string NormalizePath(string path) =>
         path.Replace('\\', '/').TrimEnd('/').ToLowerInvariant();
 }

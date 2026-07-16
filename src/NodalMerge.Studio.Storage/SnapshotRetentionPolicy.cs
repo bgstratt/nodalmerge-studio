@@ -22,19 +22,26 @@ namespace NodalMerge.Studio.Storage;
 //   Metadata["appliedSnapshotId"] (see the SetMetadataAsync call a few lines later) — never onto
 //   the MergeProposal record itself. WorkspaceCacheManager.PassesSafeEvictionInvariantAsync reads
 //   this exact key; this policy reads the same key the same way.
-// - Branch seed / merge base: NO persisted field carries this. WorkUnitFanOutInfo.SeedFromBranchId
-//   is a BranchId, not a RepositorySnapshot id, and FileSystemWorkspaceService.InitBranchAsync
-//   seeds a branch by copying another branch's DIRECTORY, never by recording which CAS generation
-//   it started from. RepositorySnapshot.WorkUnitId exists on the record but no current CreateAsync
-//   call site (RepositoryImportService, InMemoryRepositorySnapshotService.ConsiderCompactionAsync)
-//   ever passes a non-null value for it. Absent a real FK, this policy derives the seed: for a
-//   non-terminal work unit, the protected generation is the latest RepositorySnapshot for its
-//   repository whose CreatedAt is at or before the work unit's own CreatedAt — the generation that
-//   was actually live when the branch was created, which is what RepositorySyncService/
-//   RepositoryImportService would have materialized/diffed against at that moment. "Merge base"
-//   collapses to the same reference: nothing in the current apply/drift-check path
-//   (InMemoryMergeService's drift detection compares against a "base/{proposalId}" file-workspace
-//   branch copy, never a RepositorySnapshot id) tracks a separate proposal-time base generation.
+// - Branch seed / merge base: as of Phase 6 slice 6.5 Part 2, WorkUnit.SeedSnapshotId carries this
+//   exactly — InMemoryWorkUnitService.CreateWorkUnitAsync stamps the repository's actual
+//   current-head RepositorySnapshot.SnapshotId at the moment the branch is seeded. ClassifyAsync
+//   below uses it directly when present. Everything BELOW this line describes the proxy this
+//   policy fell back to before 6.5 landed the real FK, kept verbatim because it is still the exact
+//   fallback for every work unit created before 6.5 (or whose pinned id somehow fails to resolve —
+//   see the pinned-then-fallback branch in the loop below): NO persisted field carried this.
+//   WorkUnitFanOutInfo.SeedFromBranchId is a BranchId, not a RepositorySnapshot id, and
+//   FileSystemWorkspaceService.InitBranchAsync seeds a branch by copying another branch's
+//   DIRECTORY, never by recording which CAS generation it started from. RepositorySnapshot.WorkUnitId
+//   exists on the record but no current CreateAsync call site (RepositoryImportService,
+//   InMemoryRepositorySnapshotService.ConsiderCompactionAsync) ever passes a non-null value for it.
+//   Absent the real FK, this policy derived the seed: for a non-terminal work unit, the protected
+//   generation is the latest RepositorySnapshot for its repository whose CreatedAt is at or before
+//   the work unit's own CreatedAt — the generation that was actually live when the branch was
+//   created, which is what RepositorySyncService/RepositoryImportService would have
+//   materialized/diffed against at that moment. "Merge base" collapses to the same reference:
+//   nothing in the current apply/drift-check path (InMemoryMergeService's drift detection compares
+//   against a "base/{proposalId}" file-workspace branch copy, never a RepositorySnapshot id) tracks
+//   a separate proposal-time base generation.
 // - Terminal work-unit statuses (for both the Active-class non-terminal check and the Intermediate
 //   age-out clock): WorkUnitTransitions.CanTransition's switch has ZERO outgoing edges for
 //   Completed, Merged, and Failed — no code path ever revives a work unit from any of these three,
@@ -164,15 +171,34 @@ public sealed class SnapshotRetentionPolicy(
         foreach (var (repoId, head) in headByRepo)
             AddActive(head.SnapshotId, $"Current head (Generation={head.Generation}) for repository '{repoId}'.");
 
+        var snapshotsById = validSnapshots.ToDictionary(s => s.SnapshotId, StringComparer.Ordinal);
+
         foreach (var wu in validWorkUnits)
         {
             if (TerminalStatuses.Contains(wu.Status)) continue;
 
+            // Slice 6.5 Part 2 — WorkUnit.SeedSnapshotId is the exact FK the class doc comment's
+            // "5.1 findings" flagged as missing: every work unit created since that slice shipped
+            // stamps its repository's actual current-head snapshot id at seed time
+            // (InMemoryWorkUnitService.CreateWorkUnitAsync), so merge-base liveness for it is exact
+            // rather than approximated. A pinned id that doesn't resolve to a known snapshot (should
+            // never happen — snapshots are append-only, AP-5 — but node loss/corruption is exactly
+            // what "fail toward protecting" means here) falls through to the timestamp proxy rather
+            // than silently treating the work unit as having no seed at all.
+            if (wu.SeedSnapshotId is { } pinnedSeedId && snapshotsById.TryGetValue(pinnedSeedId, out var pinnedSeed))
+            {
+                AddActive(pinnedSeed.SnapshotId,
+                    $"Branch seed / merge base for non-terminal work unit '{wu.WorkUnitId}' " +
+                    $"(Status={wu.Status}) — pinned via WorkUnit.SeedSnapshotId (exact, not the CreatedAt proxy).");
+                continue;
+            }
+
             var repositoryId = await ResolveRepositoryIdAsync(wu, ct).ConfigureAwait(false);
 
-            // The generation that was live for this repository at (or just before) the moment
-            // this work unit's branch was created — see the class doc comment for why this is the
-            // best available proxy for "branch seed / merge base" absent a persisted FK.
+            // Legacy proxy (pre-6.5, or a pinned id that failed to resolve above): the generation
+            // that was live for this repository at (or just before) the moment this work unit's
+            // branch was created — see the class doc comment for why this is the best available
+            // approximation of "branch seed / merge base" absent a persisted FK.
             RepositorySnapshot? seed = null;
             foreach (var snap in validSnapshots)
             {
@@ -190,7 +216,7 @@ public sealed class SnapshotRetentionPolicy(
 
             AddActive(seed.SnapshotId,
                 $"Branch seed / merge base for non-terminal work unit '{wu.WorkUnitId}' " +
-                $"(Status={wu.Status}, created {wu.CreatedAt:O}).");
+                $"(Status={wu.Status}, created {wu.CreatedAt:O}) — CreatedAt proxy (no SeedSnapshotId).");
         }
 
         // ── Assemble: Pinned > Active > Intermediate precedence per snapshot. ──────────────────

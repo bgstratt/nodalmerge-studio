@@ -34,6 +34,9 @@ internal sealed class InMemoryRepositorySnapshotService(
     // Phase 14 — snapshotId → snapshot for GetAsync(snapshotId) lookups
     private readonly Dictionary<string, RepositorySnapshot> _byId = new(StringComparer.Ordinal);
 
+    // Slice 6.5 Part 1 — see WorkUnitV1's identical declaration for why this exists.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.RepositorySnapshotV1];
+
     public async Task RehydrateAsync(CancellationToken ct = default)
     {
         var nodes = await nodeStore.ReadAllNodesAsync(StudioNodeKind.RepositorySnapshotV1, ct)

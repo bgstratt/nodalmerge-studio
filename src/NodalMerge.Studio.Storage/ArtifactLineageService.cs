@@ -215,6 +215,9 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
                 .OrderBy(a => a.CreatedAt)
                 .ToList());
 
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.ArtifactRefV1];
+
     public async Task RehydrateAsync(CancellationToken ct = default)
     {
         var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.ArtifactRefV1, ct).ConfigureAwait(false);
@@ -223,6 +226,29 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
             var artifact = JsonSerializer.Deserialize<ArtifactRef>(payloadJson);
             if (artifact is not null && _byId.TryAdd(artifact.ArtifactId, artifact))
                 Index(artifact);
+        }
+    }
+
+    // Slice 6.5 Part 1 — RehydrateAsync's TryAdd guard is correct for startup (every row is new)
+    // but would hide a remote UpdateStatusAsync/InvalidateAsync on an artifact this peer already
+    // knows about. A brand-new artifact is added and indexed exactly as RehydrateAsync does; an
+    // already-known artifact has its value overwritten in place without touching _byWorkUnit/
+    // _byParent — OwnedByWorkUnitId never changes after RecordAsync, and a *remote* ReparentAsync
+    // (the one mutation that does change ParentArtifactId) isn't reconciled by this refresh, a
+    // known gap consistent with this class's existing index-vs-value split.
+    public async Task RefreshAsync(CancellationToken ct = default)
+    {
+        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.ArtifactRefV1, ct).ConfigureAwait(false);
+        foreach (var (_, payloadJson) in records)
+        {
+            var artifact = JsonSerializer.Deserialize<ArtifactRef>(payloadJson);
+            if (artifact is null)
+                continue;
+
+            if (_byId.TryAdd(artifact.ArtifactId, artifact))
+                Index(artifact);
+            else
+                _byId[artifact.ArtifactId] = artifact;
         }
     }
 

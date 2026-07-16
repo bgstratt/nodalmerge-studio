@@ -101,6 +101,9 @@ public sealed class InMemoryCandidateConflictService(IStudioNodeStore nodeStore)
         return updated;
     }
 
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.CandidateConflictV1];
+
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {
         var nodes = await nodeStore.ReadAllNodesAsync(StudioNodeKind.CandidateConflictV1, cancellationToken)
@@ -111,6 +114,24 @@ public sealed class InMemoryCandidateConflictService(IStudioNodeStore nodeStore)
             {
                 var conflict = JsonSerializer.Deserialize<CandidateConflictRecord>(json);
                 if (conflict is not null && !_byId.ContainsKey(conflict.ConflictId))
+                    _byId[conflict.ConflictId] = conflict;
+            }
+        }
+    }
+
+    // Slice 6.5 Part 1 — RehydrateAsync's ContainsKey guard hides a remote status transition
+    // (TryStartReconciling/TryReopen/MarkResolved) on a conflict already known here; unconditional
+    // upsert instead. No secondary index to keep in sync (unlike InMemoryConflictService).
+    public async Task RefreshAsync(CancellationToken cancellationToken = default)
+    {
+        var nodes = await nodeStore.ReadAllNodesAsync(StudioNodeKind.CandidateConflictV1, cancellationToken)
+            .ConfigureAwait(false);
+        lock (_lock)
+        {
+            foreach (var (_, json) in nodes)
+            {
+                var conflict = JsonSerializer.Deserialize<CandidateConflictRecord>(json);
+                if (conflict is not null)
                     _byId[conflict.ConflictId] = conflict;
             }
         }

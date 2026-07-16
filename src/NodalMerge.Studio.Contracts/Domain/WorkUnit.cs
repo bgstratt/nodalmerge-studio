@@ -103,7 +103,19 @@ public sealed record WorkUnit(
     IReadOnlyList<string>? ReconciliationTargetPaths = null,
     // Opaque back-reference the triggering adapter can parse to find its own record, e.g.
     // "candidate-conflict:{conflictId}".
-    string? ReconciliationSourceRef = null);
+    string? ReconciliationSourceRef = null,
+    // Slice 6.5 Part 2 (plans/cas-distribution-and-storage.md Phase 6) — the repository's actual
+    // current-head RepositorySnapshot.SnapshotId at the moment this work unit's branch was seeded
+    // (InMemoryWorkUnitService.CreateWorkUnitAsync resolves and stamps it right before/after
+    // CreateBranchAsync). This is the exact FK SnapshotRetentionPolicy's 5.1 "Active" classification
+    // has been *approximating* since it shipped (see that class's own doc comment: "latest snapshot
+    // per repo with CreatedAt <= WorkUnit.CreatedAt" — a timestamp proxy). Null for every work unit
+    // created before this slice (no generation existed yet, or the repository had no snapshot at
+    // creation time — a brand-new/unbootstrapped repo) and for any work unit that isn't
+    // repository-scoped at all; the timestamp proxy remains the fallback for both cases (never
+    // removed — see SnapshotRetentionPolicy). Never rewritten after creation (AP-5) — a work unit's
+    // seed generation cannot change after the fact, only its *current* branch content can.
+    string? SeedSnapshotId = null);
 
 /// <summary>Failure/rejection counters, previously stored as parsed strings in Metadata.</summary>
 public sealed record WorkUnitExecutionInfo(

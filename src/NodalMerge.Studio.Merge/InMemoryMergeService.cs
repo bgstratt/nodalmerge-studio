@@ -1716,6 +1716,9 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         return updated;
     }
 
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.MergeProposalV1];
+
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {
         var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.MergeProposalV1, cancellationToken)

@@ -232,7 +232,7 @@ public class WorkUnitLifecycleTests
 
     private sealed class NoopBranchService : IBranchService
     {
-        public Task<string> CreateBranchAsync(string name, string? fromBranchId = null, IReadOnlyList<string>? fileScope = null, string? repositoryId = null, CancellationToken cancellationToken = default) =>
+        public Task<string> CreateBranchAsync(string name, string? fromBranchId = null, IReadOnlyList<string>? fileScope = null, string? repositoryId = null, string? seedSnapshotId = null, CancellationToken cancellationToken = default) =>
             throw new NotSupportedException();
         public Task CheckoutBranchAsync(string branchId, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<string>> ListBranchesAsync(CancellationToken cancellationToken = default) => throw new NotSupportedException();

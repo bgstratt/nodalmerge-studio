@@ -183,6 +183,80 @@ public class SnapshotRetentionPolicyTests
         Assert.Empty(report.Anomalies);
     }
 
+    /// <summary>
+    /// Slice 6.5 Part 2 — WorkUnit.SeedSnapshotId, once persisted, pins the EXACT generation a
+    /// branch was seeded from, rather than the timestamp proxy's "latest snapshot with CreatedAt at
+    /// or before the work unit's own CreatedAt" approximation. Proves the two can disagree and the
+    /// persisted field wins: an older generation is deliberately named as the pinned seed even
+    /// though a newer generation also predates the work unit and would otherwise be the proxy's
+    /// pick — only the pinned generation should come out Active; the intervening generation the
+    /// proxy would have chosen instead gets no such protection and is left an ordinary Intermediate.
+    /// </summary>
+    [Fact]
+    public async Task ClassifyAsync_uses_persisted_SeedSnapshotId_to_pin_the_exact_seed_generation_over_the_timestamp_proxy()
+    {
+        var (nodeStore, registry) = await NewStoreAsync();
+
+        var now = new DateTimeOffset(2026, 7, 15, 12, 0, 0, TimeSpan.Zero);
+        var clock = new FixedTimeProvider(now);
+
+        var repoPath = @"C:\fake\repoSeedPin";
+        var repoRegistration = await registry.RegisterAsync(repoPath, "Repo Seed Pin");
+        var repoId = Path.GetFullPath(repoPath);
+
+        // Gen 0 — the TRUE seed generation, 60 days ago. This is what WorkUnit.SeedSnapshotId names.
+        var snapTrueSeed = new RepositorySnapshot(
+            SnapshotId: "snap-true-seed", RepositoryId: repoId, TreeHash: "t0", Generation: 0,
+            CreatedAt: now - TimeSpan.FromDays(60));
+        await WriteSnapshotAsync(nodeStore, snapTrueSeed);
+
+        // Gen 1 — a LATER generation (20 days ago) that still predates the work unit's own
+        // CreatedAt (10 days ago). Absent SeedSnapshotId, the timestamp proxy would pick THIS one
+        // (latest snapshot with CreatedAt <= WorkUnit.CreatedAt) — the exact disagreement this test
+        // exists to prove the pinned field resolves correctly.
+        var snapProxyWouldPick = new RepositorySnapshot(
+            SnapshotId: "snap-proxy-would-pick", RepositoryId: repoId, TreeHash: "t1", Generation: 1,
+            CreatedAt: now - TimeSpan.FromDays(20));
+        await WriteSnapshotAsync(nodeStore, snapProxyWouldPick);
+
+        var wuPinned = new WorkUnit(
+            WorkUnitId: "wu-seed-pinned", Goal: "test", BranchId: "branch-seed-pinned",
+            Status: WorkUnitStatus.Executing,
+            CreatedAt: now - TimeSpan.FromDays(10), UpdatedAt: now - TimeSpan.FromDays(10),
+            Owner: "test", AssignedAgent: null, SuccessCriteria: null, Metadata: null,
+            ParentWorkUnitId: null, DependsOn: [], FileScope: [],
+            RepositoryId: repoRegistration.RepositoryId,
+            SeedSnapshotId: "snap-true-seed");
+        await WriteWorkUnitAsync(nodeStore, wuPinned);
+
+        // Gen 2 — the repository's actual current head, newer than both generations above, so
+        // "snap-proxy-would-pick" (Gen 1) isn't accidentally classified Active as the head itself —
+        // it needs to stand or fall purely on whether anything pins it as a branch seed.
+        var snapHead = new RepositorySnapshot(
+            SnapshotId: "snap-seed-pin-head", RepositoryId: repoId, TreeHash: "t2", Generation: 2,
+            CreatedAt: now - TimeSpan.FromDays(1));
+        await WriteSnapshotAsync(nodeStore, snapHead);
+
+        var policy = new SnapshotRetentionPolicy(
+            nodeStore, registry, options: null,
+            retentionOptions: new RetentionPolicyOptions { RetainIntermediateDays = RetainIntermediateDays },
+            clock: clock);
+
+        var report = await policy.ClassifyAsync();
+        var byId = report.Snapshots.ToDictionary(e => e.SnapshotId);
+
+        Assert.Equal(SnapshotRetentionClass.Active, byId["snap-true-seed"].Class);
+        Assert.True(byId["snap-true-seed"].Retained);
+        Assert.Contains("wu-seed-pinned", byId["snap-true-seed"].Reason);
+        Assert.Contains("SeedSnapshotId", byId["snap-true-seed"].Reason);
+
+        // The generation the timestamp proxy would have picked instead gets no Active protection
+        // from this work unit — nothing else pins it either, so it's an ordinary Intermediate
+        // (well within the 30-day retention window at only 20 days old, so still retained, just not
+        // via the Active class).
+        Assert.Equal(SnapshotRetentionClass.Intermediate, byId["snap-proxy-would-pick"].Class);
+    }
+
     [Fact]
     public async Task ClassifyAsync_classifies_a_malformed_snapshot_node_as_Active_with_an_anomaly_reason()
     {

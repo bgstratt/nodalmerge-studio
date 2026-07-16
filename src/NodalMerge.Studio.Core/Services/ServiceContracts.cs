@@ -10,6 +10,37 @@ namespace NodalMerge.Studio.Core.Services;
 public interface IRehydratable
 {
     Task RehydrateAsync(CancellationToken cancellationToken = default);
+
+    // Slice 6.5 Part 1 (plans/cas-distribution-and-storage.md Phase 6) — invoked by
+    // IStudioCacheRefreshCoordinator after an inbound replication pack is applied to a room, so
+    // this service's in-memory cache reconciles with newly-visible remote state without a process
+    // restart (the gap 6.1b/6.3's own notes flagged: "in-memory service caches still don't see
+    // mid-run inbound changes"). Default implementation just re-runs RehydrateAsync — correct for
+    // the majority pattern every implementer here already uses (`_dict[entityId] = deserialized`,
+    // an unconditional overwrite that is already an update-safe reconcile, not merely an add). A
+    // few implementers instead guard RehydrateAsync with TryAdd/ContainsKey — correct for a
+    // one-time startup load where every row is by definition new, but wrong for a live refresh
+    // where an already-known entity may have changed on the other peer — those override this
+    // method explicitly with an update-safe variant (see ArtifactLineageService,
+    // InMemoryConflictService, InMemoryCandidateConflictService, InMemoryTaskConflictService).
+    //
+    // Reconcile rule: additive/update only — an entity present in the store is upserted into the
+    // dictionary; nothing is ever removed, and an entity this call doesn't see (not yet persisted,
+    // e.g. a local write still in flight — see IStudioCacheRefreshCoordinator's own doc comment)
+    // is left untouched. "Which value wins" for an entity that changed on both sides is already
+    // decided by the engine's CRDT LWW resolution before this ever runs (ImportPack + canonical
+    // resolution replay happen first) — this method just reflects whatever the engine already
+    // decided, it never compares timestamps itself.
+    Task RefreshAsync(CancellationToken cancellationToken = default) => RehydrateAsync(cancellationToken);
+
+    // Slice 6.5 Part 1 — the StudioNodeKind(s) (see that class) this service's cache is populated
+    // from, so IStudioCacheRefreshCoordinator's implementation can skip calling RefreshAsync for an
+    // inbound pack on a room that could never carry that kind (e.g. a repo-scoped-kind owner has
+    // nothing to gain from refreshing on a "workgroup" room pack). Default is empty — "undeclared" —
+    // meaning the coordinator always refreshes this service regardless of room, the original fully
+    // conservative behavior; only services worth the small extra bookkeeping opt in explicitly (see
+    // e.g. InMemoryWorkUnitService.RehydratedKinds).
+    IReadOnlyCollection<string> RehydratedKinds => [];
 }
 
 public interface IProjectionManager
@@ -879,6 +910,27 @@ public interface IStudioNodeStoreReplicationSink
     Task RehydrateLiveMapFromCanonicalResolutionAsync(string roomId, CancellationToken cancellationToken = default);
 }
 
+// Slice 6.5 Part 1 (plans/cas-distribution-and-storage.md Phase 6) — the enabler that makes "work
+// on peer A appears in peer B's extension" actually true. IStudioNodeStoreReplicationSink (above)
+// already bridges an inbound pack into the engine's live room_maps (so a *future*
+// IStudioNodeStore.ReadNodeAsync/ReadAllNodesAsync call sees it); this interface is the missing
+// second half — it re-pulls every IRehydratable service's own in-memory dictionary (what B's
+// REST/UI actually reads) so that future call actually happens, without waiting for a restart.
+// Called by RoomPeerClient (NodalMerge.Studio.Host) immediately after
+// RehydrateLiveMapFromCanonicalResolutionAsync succeeds, once per applied inbound pack.
+//
+// Deliberately conservative rather than kind-scoped: the caller does not attempt to derive which
+// entity kinds a given pack actually touched (MapAll only ever exposes the room's current
+// snapshot, not a diff against pre-pack state — deriving an exact changed-kind set would mean
+// snapshotting every namespace key before and after every ImportPack call, for a benefit that only
+// ever saves a handful of extra in-memory dictionary reads). Every registered IRehydratable
+// refreshes on every inbound pack, regardless of room — see RehydratableRefreshCoordinator
+// (NodalMerge.Studio.Storage) for the concrete upsert semantics this guarantees.
+public interface IStudioCacheRefreshCoordinator
+{
+    Task RefreshAfterInboundPackAsync(string roomId, CancellationToken cancellationToken = default);
+}
+
 public sealed record CausalParentsResult(string[] ParentIdsHex, bool NodeFound);
 public sealed record CanonicalResolutionEntry(string Key, string ValueBytesB64);
 public sealed record CanonicalResolutionResult(IReadOnlyList<CanonicalResolutionEntry> Entries);
@@ -1059,8 +1111,15 @@ public interface IBranchService
     // before this slice) so it routes to its owning repo room. Callers that don't have a repo
     // context in scope (ad hoc/global branches — e.g. the shared "candidate" staging branch) pass
     // null, which keeps the branch in "studio", matching pre-6.3a behavior exactly.
+    // Slice 6.5 Part 2 — optional seedSnapshotId records, on the branch record itself, the
+    // repository's current-head RepositorySnapshot.SnapshotId at the moment this branch is created
+    // — the branch-record half of the same seed-pinning WorkUnit.SeedSnapshotId carries (see that
+    // field's own doc comment). Callers that resolve a repository at all (InMemoryWorkUnitService)
+    // pass it; ad hoc/global branches (e.g. the shared "candidate" staging branch) pass null,
+    // matching repositoryId's own null-for-unscoped convention.
     Task<string> CreateBranchAsync(string name, string? fromBranchId = null,
-        IReadOnlyList<string>? fileScope = null, string? repositoryId = null, CancellationToken cancellationToken = default);
+        IReadOnlyList<string>? fileScope = null, string? repositoryId = null, string? seedSnapshotId = null,
+        CancellationToken cancellationToken = default);
 
     Task CheckoutBranchAsync(string branchId, CancellationToken cancellationToken = default);
 
