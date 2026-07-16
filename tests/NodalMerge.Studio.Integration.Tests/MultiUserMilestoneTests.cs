@@ -69,17 +69,25 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// report, not patched around. Consequently this test does NOT assert A ever sees or applies B's
 /// proposal; it stops at proving the proposal is correctly formed and durably shared.
 ///
-/// ── Another documented cross-peer accommodation (test-only, not a claim this generalizes) ───────
-/// RepositorySnapshot.RepositoryId (and every lookup keyed by it — InMemoryRepositorySnapshotService's
-/// cache, FileSystemWorkspaceService's scoped-materialization fallback) is the *peer-local absolute
-/// filesystem path* of the physical repository (RepositorySyncService.SyncCoreAsync:
-/// `Path.GetFullPath(repositoryPath)`), not the portable WorkgroupRepoId the room-binding itself
-/// uses. Two real laptops with the repo cloned to different paths would never converge on the same
-/// key even though the underlying rows replicate byte-for-byte. This test's single-process topology
-/// can't help but share a filesystem, so it gives B's own `Workspace:SeedRepositoryPath` the
-/// identical literal path A registered — which is what makes the lookup succeed here, but is not
-/// something a real two-laptop deployment can rely on. See this slice's final report for the
-/// recommended follow-up (portable snapshot keying via WorkgroupRepoId).
+/// ── Slice 7.2 fix (plans/cas-distribution-and-storage.md Phase 7) — portable repository identity
+/// ─────────────────────────────────────────────────────────────────────────────────────────────
+/// Pre-7.2, RepositorySnapshot.RepositoryId (and every lookup keyed by it —
+/// InMemoryRepositorySnapshotService's cache, FileSystemWorkspaceService's scoped-materialization
+/// fallback) was always the *peer-local absolute filesystem path* of the physical repository
+/// (RepositorySyncService.SyncCoreAsync: `Path.GetFullPath(repositoryPath)`), not the portable
+/// WorkgroupRepoId the room-binding itself uses. Two real laptops with the repo cloned to different
+/// paths never converged on the same key even though the underlying rows replicated byte-for-byte —
+/// this test used to give B's own `Workspace:SeedRepositoryPath` the identical literal path A
+/// registered to work around exactly that gap.
+///
+/// 7.2 fixed the resolution layer (IRepositoryRegistryService.ResolveCasIdentityAsync): a brand-new
+/// repository's CAS/snapshot key is now the repo's WorkgroupRepoId — resolved via this peer's own
+/// registry entry, or (a FOREIGN local-candidate id this peer never itself registered) a replicated
+/// RepositoryV1 row read directly off the node store. An already-bootstrapped repository keeps
+/// whatever key its existing chain already uses (sticky continuity — never orphans pre-7.2
+/// history). Below, host B uses a genuinely different, non-existent placeholder path
+/// (`clone-placeholder`) and never sets `Workspace:SeedRepositoryPath` at all — proving the fix
+/// rather than working around the gap.
 ///
 /// Work units are deliberately created on A throughout (never on B): WorkUnit.RepositoryId is a
 /// peer-local registry id (RoomPerRepoTests proves A and B mint *different* local ids for the same
@@ -142,17 +150,22 @@ public class MultiUserMilestoneTests : IDisposable
         Assert.NotNull(repoA!.WorkgroupRepoId); // auto-minted, no disambiguation needed for the first registration
         var repoRoomId = $"repo/{repoA.WorkgroupRepoId}";
 
-        var physicalRepositoryId = Path.GetFullPath(repoPath); // RepositorySnapshot's own keying, per the class doc comment
+        // Slice 7.2 — the repository's actual CAS/snapshot key, now the workgroup-portable
+        // WorkgroupRepoId (auto-minted equal to repoA.RepositoryId for this first-ever
+        // registration — 6.2's preferred-id continuity), not a physical path. Both hosts resolve
+        // to this same key without ever sharing a literal filesystem path.
+        var casRepositoryId = repoA.WorkgroupRepoId!;
 
         var snapshotServiceA = hostA.Services.GetRequiredService<IRepositorySnapshotService>();
-        var genesisSnapshot = await snapshotServiceA.GetLatestAsync(physicalRepositoryId);
+        var genesisSnapshot = await snapshotServiceA.GetLatestAsync(casRepositoryId);
         Assert.NotNull(genesisSnapshot); // gen 0, the bootstrap
 
         // ── Peer B: a headless peer (the second laptop), pointed at A's room AND at A's own HTTP
         // endpoint as its remote blob origin. B's local blob cache starts as a brand-new empty
-        // directory — nothing pre-seeded. B's Workspace:SeedRepositoryPath is set to the SAME
-        // literal path A registered — the documented cross-peer accommodation from the class
-        // comment above, not a claim this generalizes past a single shared filesystem. ───────────
+        // directory — nothing pre-seeded. B never sets Workspace:SeedRepositoryPath at all (no
+        // local default clone — the genuinely cold-peer case slice 7.2 makes work) and its own
+        // local registration below uses a placeholder path that never even exists on disk, let
+        // alone matches A's. ─────────────────────────────────────────────────────────────────────
         var rootB = Path.Combine(_tempRoot, "hostB");
         var blobsB = Path.Combine(rootB, "blobs");
         var hostB = StudioWebApplication.BuildPeer(
@@ -164,16 +177,6 @@ public class MultiUserMilestoneTests : IDisposable
                 ["NodalMerge:Storage:FileBlobs:RootPath"] = blobsB,
                 ["NodalMerge:Storage:RemoteOrigin:BaseUrl"] = hostAAddress,
                 ["Workspace:RootPath"] = Path.Combine(rootB, "workspace"),
-                ["Workspace:SeedRepositoryPath"] = repoPath,
-                // StudioWebApplication.ApplyCasRootPath derives FileBlobs:RootPath from
-                // Workspace:SeedRepositoryPath (Combine(seedPath, ".nodalmerge", "cas")) whenever
-                // Workspace:CasRootPath is unset — and since it's applied via a LATER
-                // AddInMemoryCollection than this dictionary's own FileBlobs:RootPath, it would
-                // silently win and redirect B's "local" blob cache into a folder inside the SHARED
-                // repoPath directory instead of blobsB. Pinning CasRootPath explicitly here keeps
-                // B's local cache the empty, host-B-only directory the cold-fetch assertion below
-                // actually inspects.
-                ["Workspace:CasRootPath"] = blobsB,
                 ["Room:HostUri"] = wsUriA,
                 ["Peer:PeerId"] = "peer-b",
             }));
@@ -222,7 +225,7 @@ public class MultiUserMilestoneTests : IDisposable
             // 1's refresh, not a fresh read).
             var snapshotServiceB = hostB.Services.GetRequiredService<IRepositorySnapshotService>();
             var snapshotOnB = await PollUntilNotNullAsync(
-                () => snapshotServiceB.GetLatestAsync(physicalRepositoryId));
+                () => snapshotServiceB.GetLatestAsync(casRepositoryId));
             Assert.Equal(genesisSnapshot!.SnapshotId, snapshotOnB!.SnapshotId);
 
             // ── (2) Cold-peer scoped branch materialization via the chained provider. This is the
@@ -295,7 +298,7 @@ public class MultiUserMilestoneTests : IDisposable
             // (BaseSnapshotId) chains correctly off the bootstrap generation. ───────────────────────
             Assert.Equal("// B v2 — edited on A\n", await File.ReadAllTextAsync(Path.Combine(repoPath, "src", "FileB.cs")));
 
-            var snapshotAfterA = await snapshotServiceA.GetLatestAsync(physicalRepositoryId);
+            var snapshotAfterA = await snapshotServiceA.GetLatestAsync(casRepositoryId);
             Assert.NotNull(snapshotAfterA);
             Assert.True(snapshotAfterA!.Generation > genesisSnapshot.Generation);
             Assert.Equal(genesisSnapshot.SnapshotId, snapshotAfterA.BaseSnapshotId); // gen1's base is gen0

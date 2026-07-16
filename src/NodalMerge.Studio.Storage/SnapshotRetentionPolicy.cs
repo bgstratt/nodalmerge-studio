@@ -193,7 +193,26 @@ public sealed class SnapshotRetentionPolicy(
                 continue;
             }
 
-            var repositoryId = await ResolveRepositoryIdAsync(wu, ct).ConfigureAwait(false);
+            // Slice 7.2 — ResolveRepositoryIdAsync now throws RepositoryIdentityUnresolvedException
+            // for a work unit whose RepositoryId can't be bound anywhere on this peer (rather than
+            // silently guessing the global default). Retention's own fail-safe bias (see the class
+            // doc comment: malformed nodes -> Active, never silently dropped) means an unresolvable
+            // identity here must NOT abort classification for every other repository's snapshots —
+            // it degrades to "this work unit's CreatedAt-proxy seed couldn't be computed this pass",
+            // recorded as an anomaly, exactly like a malformed work-unit node above.
+            string repositoryId;
+            try
+            {
+                repositoryId = await ResolveRepositoryIdAsync(wu, ct).ConfigureAwait(false);
+            }
+            catch (RepositoryIdentityUnresolvedException ex)
+            {
+                anomalies.Add(
+                    $"Work unit '{wu.WorkUnitId}' RepositoryId '{ex.RepositoryId}' could not be " +
+                    "resolved to a CAS identity on this peer — its CreatedAt-proxy branch seed / " +
+                    "merge-base generation could not be computed this pass.");
+                continue;
+            }
 
             // Legacy proxy (pre-6.5, or a pinned id that failed to resolve above): the generation
             // that was live for this repository at (or just before) the moment this work unit's
@@ -292,16 +311,20 @@ public sealed class SnapshotRetentionPolicy(
             now, anomalies);
     }
 
-    // Mirrors WorkspaceCacheManager.GetRepositoryIdAsync exactly: prefers the work unit's own
-    // registered repository (multi-repo goals) over the global default, matching the snapshot
-    // store's actual RepositoryId convention (Path.GetFullPath of the physical repo path).
+    // Slice 7.2 — mirrors WorkspaceCacheManager.GetRepositoryIdAsync exactly: resolves the work
+    // unit's own repository (multi-repo goals) via the workgroup-portable identity chain
+    // (IRepositoryRegistryService.ResolveCasIdentityAsync — sticky to any already-existing chain,
+    // so pre-7.2 single-peer workspaces resolve exactly as before), rather than the old convention
+    // that only ever looked at THIS peer's own registry cache (silently falling back to the global
+    // default for a FOREIGN RepositoryId replicated from a different peer).
     private async Task<string> ResolveRepositoryIdAsync(WorkUnit workUnit, CancellationToken ct)
     {
         if (workUnit.RepositoryId is { } repositoryId)
         {
-            var repository = await repositories.GetAsync(repositoryId, ct).ConfigureAwait(false);
-            if (repository is not null)
-                return Path.GetFullPath(repository.Path);
+            var resolved = await repositories.ResolveCasIdentityAsync(repositoryId, null, ct).ConfigureAwait(false);
+            if (resolved is not null)
+                return resolved;
+            throw new RepositoryIdentityUnresolvedException(repositoryId);
         }
 
         return Path.GetFullPath(options?.SeedRepositoryPath ?? Directory.GetCurrentDirectory());

@@ -145,7 +145,8 @@ public class InMemoryMergeServiceTests
         public bool ThrowOnSync { get; set; }
 
         public Task<PendingExternalSync?> SyncBranchFromRepositoryAsync(
-            string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct = default)
+            string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct = default,
+            string? repositoryId = null)
         {
             Calls.Add((branchId, repositoryPath, trigger));
             if (ThrowOnSync) throw new InvalidOperationException("simulated resync failure");
@@ -180,6 +181,12 @@ public class InMemoryMergeServiceTests
             throw new NotSupportedException();
         public Task<RepositoryV1?> ResolveDisambiguationAsync(string repoId, string? chosenRepoId, CancellationToken ct = default) =>
             throw new NotSupportedException();
+        // Slice 7.2 — no existing snapshot chain and no workgroup binding wired in this fake, so
+        // resolution falls to the degraded local-path fallback (step 3 of the interface member's own
+        // doc comment), same as this fake's other members: purely a path pass-through, since these
+        // tests exercise write-back routing, not CAS identity resolution itself.
+        public Task<string?> ResolveCasIdentityAsync(string? repoId, string? repositoryPath = null, CancellationToken ct = default) =>
+            Task.FromResult(repositoryPath is { Length: > 0 } p ? System.IO.Path.GetFullPath(p) : null);
     }
 
     private static (InMemoryMergeService Svc, RecordingEventStream Events, RecordingWorkUnitService WorkUnits, ArtifactLineageService Artifacts) BuildWithLifecycle()

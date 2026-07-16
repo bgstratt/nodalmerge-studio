@@ -2384,8 +2384,17 @@ public interface IWorkspaceSemanticNavigationService
 
 public interface IRepositorySyncService
 {
+    // Slice 7.2 — repositoryId is the caller's already-resolved local-candidate RepositoryId
+    // (RepositoryV1.RepositoryId) for repositoryPath, when the caller has one in hand (goal
+    // creation, an explicit workspace/switch call). When supplied, the CAS/snapshot-store key
+    // stamped for this repository is resolved via IRepositoryRegistryService.ResolveCasIdentityAsync
+    // (workgroup-portable, sticky to any already-existing chain) instead of the pre-7.2 convention
+    // of always using Path.GetFullPath(repositoryPath) directly — see plans/cas-distribution-and-
+    // storage.md Phase 7, 7.2. Omitting it (null) preserves that exact pre-7.2 behavior, for callers
+    // that never resolved a RepositoryV1 (ad hoc/ungoverned paths).
     Task<PendingExternalSync?> SyncBranchFromRepositoryAsync(
-        string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct = default);
+        string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct = default,
+        string? repositoryId = null);
 
     // Non-mutating lookup — lets a caller find the chain's current tail via
     // LatestExternalChangesetId, mirrors IKnownGoodStateService.GetAsync's role.

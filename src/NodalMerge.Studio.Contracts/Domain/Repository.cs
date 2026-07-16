@@ -63,3 +63,24 @@ public sealed record RepositoryV1(
 // one a work unit is actually seeded from, used for read-only context (style/examples) during a
 // run. Distinct from WorkUnit.FileScope, which gates which files an agent may write to.
 public sealed record FileReferenceV1(string RepositoryId, string Path, string? Note = null);
+
+// Slice 7.2 (plans/cas-distribution-and-storage.md Phase 7) — thrown when a repository's
+// local-candidate RepositoryId (as carried by WorkUnit.RepositoryId, MergeProposal.RepositoryId,
+// etc. — per 6.3a's denormalization, possibly FOREIGN: replicated from a different peer that
+// minted it) cannot be bound to any CAS/snapshot identity on THIS peer: neither an already-existing
+// snapshot chain under a known local disk path, nor a workgroup binding (this peer's own registry
+// entry, or a foreign RepositoryV1 row replicated via the shared "studio" room) resolves it.
+// Distinct from an ordinary "path not found in the latest snapshot" 404 — that means the repository
+// resolved fine and the specific file genuinely isn't in it; this means the repository itself
+// couldn't be identified at all, which needs registration/disambiguation, not a retry. Replaces the
+// pre-7.2 failure mode where an unresolvable identity silently fell back to a physically-unrelated
+// default repository (or a bare `false`) with no indication why.
+public sealed class RepositoryIdentityUnresolvedException(string repositoryId)
+    : Exception(
+        $"Repository '{repositoryId}' could not be bound to a local repository or workgroup " +
+        "binding on this peer. Register the repository locally (POST /studio/repositories) and " +
+        "resolve its workgroup identity (POST /studio/repositories/{repositoryId}/identity/resolve) " +
+        "before retrying.")
+{
+    public string RepositoryId { get; } = repositoryId;
+}

@@ -41,12 +41,21 @@ public class PostMergeResyncIntegrationTests : IDisposable
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
         var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
         var snapshotService = app.Services.GetRequiredService<IRepositorySnapshotService>();
+        var repositories = app.Services.GetRequiredService<IRepositoryRegistryService>();
 
         var workUnit = await workUnitCommands.CreateAsync(
             new WorkUnitCreateCommand("Update the repo", "test", RepositoryPath: _repoPath));
 
-        var repositoryId = Path.GetFullPath(_repoPath);
-        var snapshotBeforeMerge = await snapshotService.GetLatestAsync(repositoryId);
+        // Slice 7.2 — the repository's actual CAS/snapshot key is now the workgroup-portable
+        // WorkgroupRepoId (resolved via IRepositoryRegistryService.ResolveCasIdentityAsync at
+        // bootstrap time), not Path.GetFullPath(_repoPath) — see plans/cas-distribution-and-
+        // storage.md Phase 7, 7.2.
+        var repository = await repositories.GetAsync(workUnit.RepositoryId!);
+        var repositoryId = await repositories.ResolveCasIdentityAsync(workUnit.RepositoryId, _repoPath);
+        Assert.NotNull(repository);
+        Assert.NotNull(repositoryId);
+
+        var snapshotBeforeMerge = await snapshotService.GetLatestAsync(repositoryId!);
         Assert.NotNull(snapshotBeforeMerge); // Case 1 bootstrap ran at goal creation
 
         await fileWorkspace.WriteAsync(workUnit.BranchId, "Program.cs", "// v2 — from agent");
@@ -60,7 +69,7 @@ public class PostMergeResyncIntegrationTests : IDisposable
         // Confirm the write-back itself landed (pre-existing behavior, not what's under test here).
         Assert.Equal("// v2 — from agent", await File.ReadAllTextAsync(Path.Combine(_repoPath, "Program.cs")));
 
-        var snapshotAfterMerge = await snapshotService.GetLatestAsync(repositoryId);
+        var snapshotAfterMerge = await snapshotService.GetLatestAsync(repositoryId!);
         Assert.NotNull(snapshotAfterMerge);
         Assert.NotEqual(snapshotBeforeMerge!.SnapshotId, snapshotAfterMerge!.SnapshotId);
         Assert.True(snapshotAfterMerge.Generation > snapshotBeforeMerge.Generation);

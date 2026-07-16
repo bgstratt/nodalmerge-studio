@@ -452,7 +452,9 @@ public static class ServiceCollectionExtensions
             sp.GetService<IMaterializationEngine>(),
             sp.GetService<IRepositorySnapshotService>(),
             sp.GetService<ILogger<FileSystemWorkspaceService>>(),
-            sp.GetService<ISnapshotTreeResolver>()));
+            sp.GetService<ISnapshotTreeResolver>(),
+            sp.GetService<IRepositoryRegistryService>(),
+            sp));
 
         // Phase 10 — Roslyn C# syntax validator for AstMergeStrategy.
         services.AddSingleton<ISourceValidator, RoslynSourceValidator>();

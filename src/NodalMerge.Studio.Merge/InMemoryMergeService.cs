@@ -756,7 +756,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             && WorkspaceReviewScope.AppliesToRealRepo(owningWorkUnit) && !string.IsNullOrWhiteSpace(writeBackPath))
         {
             await WriteBackToRepositoryAsync(proposal.SourceBranch, writeBackPath, cancellationToken).ConfigureAwait(false);
-            appliedSnapshotId = await BestEffortResyncAsync(writeBackPath, cancellationToken).ConfigureAwait(false);
+            appliedSnapshotId = await BestEffortResyncAsync(owningWorkUnit?.RepositoryId, writeBackPath, cancellationToken).ConfigureAwait(false);
             promotedToDisk = true;
         }
 
@@ -1258,23 +1258,28 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // Group by resolved write-back path (multi-repo support) so each distinct real repo gets
         // exactly one write-back call sourced from candidate's current composed content, not one
         // per proposal (candidate already additively contains every landed proposal's changes).
-        var byWriteBackPath = new Dictionary<string, List<MergeProposal>>(StringComparer.Ordinal);
+        // Slice 7.2 — also carries a representative RepositoryId per group (any proposal sharing the
+        // same writeBackPath resolved from the same registered repository, so they all carry the
+        // same local-candidate RepositoryId) so BestEffortResyncAsync can resolve the same
+        // workgroup-portable CAS key ResolveWriteBackPathAsync's own repository lookup already used,
+        // instead of re-deriving a possibly-inconsistent key from the raw path alone.
+        var byWriteBackPath = new Dictionary<string, (string? RepositoryId, List<MergeProposal> Proposals)>(StringComparer.Ordinal);
         foreach (var (proposal, owningWorkUnit) in pending)
         {
             var writeBackPath = await ResolveWriteBackPathAsync(owningWorkUnit, cancellationToken).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(writeBackPath))
                 continue; // workspace-only session (no repo attached) — the branch mirror above is the whole promotion
 
-            if (!byWriteBackPath.TryGetValue(writeBackPath, out var list))
-                byWriteBackPath[writeBackPath] = list = [];
-            list.Add(proposal);
+            if (!byWriteBackPath.TryGetValue(writeBackPath, out var group))
+                byWriteBackPath[writeBackPath] = group = (owningWorkUnit?.RepositoryId, []);
+            group.Proposals.Add(proposal);
         }
 
-        foreach (var (writeBackPath, _) in byWriteBackPath)
+        foreach (var (writeBackPath, group) in byWriteBackPath)
         {
             await WriteBackToRepositoryAsync(_workspaceOptions.CandidateBranchId, writeBackPath, cancellationToken)
                 .ConfigureAwait(false);
-            await BestEffortResyncAsync(writeBackPath, cancellationToken).ConfigureAwait(false);
+            await BestEffortResyncAsync(group.RepositoryId, writeBackPath, cancellationToken).ConfigureAwait(false);
         }
 
         // Every pending proposal is now promoted, whether or not it individually resolved a real
@@ -1633,28 +1638,38 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     // anchor the MergeApplied event carries), or null when the CAS layer isn't configured or the
     // refresh failed. A failed or skipped resync must never affect the write-back itself, which
     // already succeeded.
-    private async Task<string?> BestEffortResyncAsync(string writeBackPath, CancellationToken ct)
+    private async Task<string?> BestEffortResyncAsync(string? repositoryId, string writeBackPath, CancellationToken ct)
     {
         var isDefaultRepo = string.Equals(writeBackPath, _workspaceOptions.SeedRepositoryPath, StringComparison.Ordinal);
 
         try
         {
+            // Slice 7.2 — resolves the same workgroup-portable CAS key (sticky to any already-
+            // existing chain) RepositorySyncService/RepositoryImportService use for writes, so the
+            // GetLatestAsync read-back below finds what was just written instead of a stale/wrong
+            // key. Falls back to the pre-7.2 Path.GetFullPath(writeBackPath) convention when
+            // _repositories isn't wired at all.
+            var casRepositoryId = _repositories is not null
+                ? await _repositories.ResolveCasIdentityAsync(repositoryId, writeBackPath, ct).ConfigureAwait(false)
+                : null;
+            casRepositoryId ??= Path.GetFullPath(writeBackPath);
+
             if (isDefaultRepo && _repositorySync is not null)
             {
                 // Layer 1 (includes layer 2 internally — RepositorySyncService's own
                 // PostMergeWriteBack path already calls ForceSyncAsync for this repo).
                 await _repositorySync.SyncBranchFromRepositoryAsync(
-                    "main", writeBackPath, SyncTrigger.PostMergeWriteBack, ct).ConfigureAwait(false);
+                    "main", writeBackPath, SyncTrigger.PostMergeWriteBack, ct, repositoryId).ConfigureAwait(false);
             }
             else if (_serviceProvider?.GetService(typeof(IRepositoryImportService)) is IRepositoryImportService import)
             {
                 // Layer 2 only, for non-default repos.
-                await import.ForceSyncAsync(Path.GetFullPath(writeBackPath), writeBackPath, ct).ConfigureAwait(false);
+                await import.ForceSyncAsync(casRepositoryId, writeBackPath, ct).ConfigureAwait(false);
             }
 
             if (_serviceProvider?.GetService(typeof(IRepositorySnapshotService)) is IRepositorySnapshotService snapshots)
             {
-                var latest = await snapshots.GetLatestAsync(Path.GetFullPath(writeBackPath), ct).ConfigureAwait(false);
+                var latest = await snapshots.GetLatestAsync(casRepositoryId, ct).ConfigureAwait(false);
                 return latest?.SnapshotId;
             }
         }

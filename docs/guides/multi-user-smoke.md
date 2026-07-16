@@ -112,8 +112,6 @@ $env:NodalMerge__Providers__BlobStorage = "ChainedRemote"
 $env:NodalMerge__Storage__FileBlobs__RootPath = "C:\temp\smoke-hostB\blobs"
 $env:NodalMerge__Storage__RemoteOrigin__BaseUrl = "http://127.0.0.1:5080"
 $env:Workspace__RootPath = "C:\temp\smoke-hostB\workspace"
-$env:Workspace__SeedRepositoryPath = "C:\temp\smoke-repo"
-$env:Workspace__CasRootPath = "C:\temp\smoke-hostB\blobs"
 $env:Room__HostUri = "ws://127.0.0.1:7878"
 $env:Studio__Urls = "http://127.0.0.1:5090"
 dotnet run --project src/NodalMerge.Studio.Host
@@ -126,18 +124,14 @@ Notes on this configuration, since it differs from host A's in several deliberat
   for content it originally bootstrapped, because that's where the bytes actually live. A real
   deployment would instead point this at whichever origin the team actually designates (often the
   server itself, if blobs are pushed there too — Phase 4's delegated-S3 path is exactly that option).
-- `Workspace:SeedRepositoryPath` **must currently be set** to the same literal path host A used
-  (`C:\temp\smoke-repo`), even though host B has no local clone at that path — this is the exact
-  cross-peer accommodation `MultiUserMilestoneTests`' class comment documents as a known gap
-  (`RepositorySnapshot`/materialize lookups are keyed by the physical repo path, which has no
-  portable identity across peers). Running this recipe genuinely cold (leaving it unset, as a real
-  second laptop with no clone would) reproduces the gap directly: Step 6's materialize-file call
-  below returns `404 Path does not exist in the latest repository snapshot` even though the
-  snapshot *is* correctly replicated into host B's bound repo room — confirmed by hand while writing
-  this guide (see the slice's final report). Setting the (unrealistic, single-machine-only)
-  matching path is the only way to make Step 6 succeed today.
-- Set `Workspace:CasRootPath` explicitly to your intended `FileBlobs:RootPath` value whenever
-  `SeedRepositoryPath` is also set — see the notes section below for why.
+- `Workspace:SeedRepositoryPath` is deliberately **left unset** on host B — it has no local clone of
+  the shared repository at all, and (as of slice 7.2) doesn't need one for the flow below to work.
+  Before 7.2, this had to be forced to the *same literal path* host A used purely so
+  `RepositorySnapshot`/materialize lookups (keyed by physical repo path, which has no portable
+  identity across peers) would happen to match on this single-machine recipe — see "things that bit
+  us" below for the fixed shape of that gap. `Workspace:CasRootPath` is likewise left unset here:
+  it only ever mattered as a defense against `ApplyCasRootPath`'s `SeedRepositoryPath`-triggered
+  redirect (see the notes section below), which no longer applies once `SeedRepositoryPath` is unset.
 
 Confirm host B is up and standalone-cold: `curl http://127.0.0.1:5090/studio/workunits` should
 return `[]`, and `curl http://127.0.0.1:5090/studio/repositories` should return `[]` too (host B
@@ -213,12 +207,16 @@ curl -X POST "http://127.0.0.1:5090/studio/branches/<branchId from Step 5's goal
 **Observe:** `README.md` appears under
 `C:\temp\smoke-hostB\workspace\branches\<branchId>\README.md` with host A's original content, and
 `C:\temp\smoke-hostB\blobs` gains a cached blob file it didn't have a moment ago (the cold fetch
-through the `ChainedRemote` provider against host A's `/blobs/{hash}` endpoint) — **provided**
-`Workspace:SeedRepositoryPath` was set to match host A's path per Step 4's note. Without it, this
-call 404s with "Path does not exist in the latest repository snapshot" even though the snapshot
-already replicated — the precise, reproducible shape of the cross-peer snapshot-keying gap flagged
-above. In the real product, this materialize call happens automatically the moment an agent or the
-extension opens the work unit's files (`WorkspaceCacheManager.MaterializeAsync` /
+through the `ChainedRemote` provider against host A's `/blobs/{hash}` endpoint) — this now works with
+**no** `Workspace:SeedRepositoryPath` configured on host B at all (slice 7.2): `FileSystemWorkspaceService`
+resolves the branch's owning repository via its `WorkUnit.RepositoryId` and
+`IRepositoryRegistryService.ResolveCasIdentityAsync`'s workgroup-portable identity chain instead of
+requiring a local default clone. If the identity genuinely can't be bound anywhere on this peer
+(e.g. host B never completed Step 5's disambiguation), this call now 404s with a message naming the
+unresolved repository id and pointing at registration/disambiguation, not the old unhelpful "Path
+does not exist in the latest repository snapshot" (see "things that bit us" below for the fixed
+shape of this gap). In the real product, this materialize call happens automatically the moment an
+agent or the extension opens the work unit's files (`WorkspaceCacheManager.MaterializeAsync` /
 `IFileWorkspaceService.InitBranchAsync`) — spawning a real agent via `POST /studio/agents/spawn`
 against the work unit exercises the same path with real LLM-driven edits if you want to go further.
 
@@ -264,3 +262,23 @@ writing this guide.)
   equivalent of `Room:HostUri` / `Room:Workgroup` used above — set them in each VS Code window's
   workspace settings (not user/global settings) so two windows on the same machine can point at
   different hosts/ports simultaneously.
+- **[Fixed by slice 7.2]** Earlier revisions of this guide forced host B's `Workspace:SeedRepositoryPath`
+  to the *same literal path* host A registered, purely so `RepositorySnapshot`/materialize lookups
+  (keyed by `Path.GetFullPath(physical repo path)`, with no portable identity across peers) would
+  happen to match — real second laptops obviously don't share a filesystem, so that was a
+  single-machine-only accommodation, not something a genuine two-laptop deployment could rely on.
+  Running the recipe with `SeedRepositoryPath` genuinely unset on host B (as it is above) used to
+  reproduce the gap directly: Step 6's materialize-file call 404'd with the unhelpful "Path does not
+  exist in the latest repository snapshot" even though the snapshot *was* correctly replicated into
+  host B's bound repo room. Slice 7.2 (`plans/cas-distribution-and-storage.md` Phase 7) fixed the
+  resolution layer: a repository's CAS/snapshot identity is now resolved via
+  `IRepositoryRegistryService.ResolveCasIdentityAsync` — the workgroup-portable `WorkgroupRepoId`
+  (this peer's own registry entry, or a foreign `RepositoryV1` row replicated via the shared
+  "studio" room) for a brand-new repository, sticky to whatever key an already-bootstrapped
+  repository's chain already uses otherwise (so no pre-7.2 workspace's history was rewritten or
+  orphaned). `FileSystemWorkspaceService.MaterializeFileAsync`/`InitBranchAsync`'s scoped path now
+  resolve a cold peer's owning repository via the branch's `WorkUnit.RepositoryId` instead of
+  requiring a local default clone at all. An identity that genuinely can't be bound anywhere on a
+  peer now surfaces `RepositoryIdentityUnresolvedException` (an identity-aware 404 naming the
+  unresolved repository id and pointing at registration/disambiguation), not the old unhelpful
+  path-not-found message.

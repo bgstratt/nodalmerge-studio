@@ -58,6 +58,36 @@ public interface IRepositoryRegistryService
     /// re-implementing the registry's own path-identity matching.
     /// </summary>
     Task<IReadOnlyList<string>> FilterUnregisteredAsync(IReadOnlyList<string> paths, CancellationToken ct = default);
+
+    /// <summary>
+    /// Slice 7.2 (plans/cas-distribution-and-storage.md Phase 7) — resolves the workgroup-portable
+    /// CAS/snapshot-store identity for a repository, replacing the pre-7.2 convention where every
+    /// CAS read/write (RepositorySnapshot.RepositoryId, RepositoryOperation.RepositoryId, ...) used
+    /// Path.GetFullPath(local disk path) directly — a value with no meaning across peers whose
+    /// physical clone directories differ (the exact gap the 6.5 multi-user smoke's forced-matching-
+    /// paths accommodation papered over; see docs/guides/multi-user-smoke.md).
+    ///
+    /// At least one of <paramref name="repositoryId"/> (a local-candidate RepositoryV1.RepositoryId
+    /// — as carried by WorkUnit.RepositoryId etc., possibly FOREIGN: minted by a different peer) and
+    /// <paramref name="repositoryPath"/> (a known local disk path) should be supplied. Sticky-
+    /// continuity resolution order (never orphans a repository's existing snapshot chain):
+    ///   1. <paramref name="repositoryPath"/> (or, if omitted, this peer's own registered
+    ///      repository's Path for <paramref name="repositoryId"/>) — if a snapshot chain already
+    ///      exists under that path today, that IS this repository's key, unchanged. Covers every
+    ///      pre-7.2 workspace and the ordinary single-peer/default-repo case.
+    ///   2. The repository's WorkgroupRepoId — resolved via this peer's own registry entry, or (a
+    ///      candidate this peer never itself registered) a FOREIGN RepositoryV1 row replicated onto
+    ///      this peer (the "studio" room is shared upstream pre-7.3), read directly from the node
+    ///      store rather than this peer's own in-memory cache (which deliberately never absorbs
+    ///      other peers' own registrations — see RefreshAsync's own comment). This is what makes a
+    ///      brand-new repository's identity resolvable by a peer with a different (or no) physical
+    ///      clone path.
+    ///   3. The bare local disk path (Path.GetFullPath) — degraded fallback for ad hoc/ungoverned
+    ///      repositories the workgroup directory was never wired to bind.
+    /// Returns null only when nothing above resolves — the caller's cue to surface
+    /// <see cref="RepositoryIdentityUnresolvedException"/> instead of a bare "not found".
+    /// </summary>
+    Task<string?> ResolveCasIdentityAsync(string? repositoryId, string? repositoryPath = null, CancellationToken ct = default);
 }
 
 public sealed class RepositoryRegistryService : IRepositoryRegistryService, IRehydratable
@@ -73,19 +103,26 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
     private readonly IRepositoryIdentityHintsService? _identityHints;
     private readonly IWorkgroupRepositoryDirectory? _workgroupDirectory;
     private readonly ILogger<RepositoryRegistryService>? _logger;
+    // Slice 7.2 — optional/nullable like every other collaborator here: SnapshotRetentionPolicyTests
+    // (and any other direct 2-arg construction) must keep compiling/working exactly as before.
+    // Confirmed no circular DI risk: InMemoryRepositorySnapshotService depends only on
+    // IStudioNodeStore/IServiceProvider?/ISnapshotTreeResolver?, never on IRepositoryRegistryService.
+    private readonly IRepositorySnapshotService? _snapshotService;
 
     public RepositoryRegistryService(
         IStudioNodeStore nodeStore,
         IWorkspaceRegistryService workspaces,
         IRepositoryIdentityHintsService? identityHints = null,
         IWorkgroupRepositoryDirectory? workgroupDirectory = null,
-        ILogger<RepositoryRegistryService>? logger = null)
+        ILogger<RepositoryRegistryService>? logger = null,
+        IRepositorySnapshotService? snapshotService = null)
     {
         _nodeStore = nodeStore;
         _workspaces = workspaces;
         _identityHints = identityHints;
         _workgroupDirectory = workgroupDirectory;
         _logger = logger;
+        _snapshotService = snapshotService;
     }
 
     public async Task<RepositoryV1> RegisterAsync(string path, string? label, CancellationToken ct = default)
@@ -325,6 +362,68 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
     {
         _repositories.TryGetValue(repositoryId, out var repository);
         return Task.FromResult(repository);
+    }
+
+    // See the interface member's own doc comment for the full resolution-order rationale.
+    public async Task<string?> ResolveCasIdentityAsync(string? repositoryId, string? repositoryPath = null, CancellationToken ct = default)
+    {
+        var localPath = repositoryPath;
+        RepositoryV1? own = null;
+        if (localPath is null && repositoryId is not null)
+        {
+            _repositories.TryGetValue(repositoryId, out own);
+            localPath = own?.Path;
+        }
+
+        // 1. Sticky continuity.
+        if (localPath is { Length: > 0 } && _snapshotService is not null)
+        {
+            var pathKey = Path.GetFullPath(localPath);
+            var existing = await _snapshotService.GetLatestAsync(pathKey, ct).ConfigureAwait(false);
+            if (existing is not null)
+                return pathKey;
+        }
+
+        // 2. Workgroup-portable key.
+        if (repositoryId is not null)
+        {
+            var workgroupRepoId = await ResolveWorkgroupRepoIdAsync(repositoryId, own, ct).ConfigureAwait(false);
+            if (workgroupRepoId is not null)
+                return workgroupRepoId;
+        }
+
+        // 3. Degraded local-path fallback.
+        if (localPath is { Length: > 0 })
+            return Path.GetFullPath(localPath);
+
+        return null;
+    }
+
+    // Resolves WorkgroupRepoId for repositoryId — this peer's own registry cache first (the common
+    // case, own is already looked up by the caller when available), falling back to a direct
+    // node-store read for a FOREIGN candidate (a replicated peer's own local-candidate id this peer
+    // never itself registered — visible because the "studio" room is, pre-7.3, shared upstream).
+    private async Task<string?> ResolveWorkgroupRepoIdAsync(string repositoryId, RepositoryV1? own, CancellationToken ct)
+    {
+        if (own is not null)
+            return own.WorkgroupRepoId;
+
+        if (_repositories.TryGetValue(repositoryId, out var local))
+            return local.WorkgroupRepoId;
+
+        var payloadJson = await _nodeStore.ReadNodeAsync(StudioNodeKind.RepositoryV1, repositoryId, ct).ConfigureAwait(false);
+        if (payloadJson is null)
+            return null;
+
+        try
+        {
+            var foreign = JsonSerializer.Deserialize<RepositoryV1>(payloadJson);
+            return foreign?.WorkgroupRepoId;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     public async Task<string?> ReadFileAsync(string repositoryId, string relativePath, CancellationToken ct = default)

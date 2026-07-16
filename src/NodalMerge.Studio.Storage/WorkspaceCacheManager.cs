@@ -240,19 +240,24 @@ public sealed class WorkspaceCacheManager(
         return true;
     }
 
-    // Prefers the work unit's own registered repository (multi-repo goals) over the global
-    // default — matches the snapshot store's actual key convention (Path.GetFullPath of the
-    // physical repo path, not the registry's opaque RepositoryId) used everywhere else
-    // (RepositorySyncService, FileSystemWorkspaceService). Falls back to today's global-default
-    // behavior when RepositoryId is null or the registry lookup misses (stale/deleted entry) —
-    // eviction should degrade safely, not throw.
+    // Slice 7.2 — resolves the work unit's own repository (multi-repo goals) via the workgroup-
+    // portable identity chain (IRepositoryRegistryService.ResolveCasIdentityAsync — sticky to any
+    // already-existing chain, so pre-7.2 single-peer workspaces resolve exactly as before) instead
+    // of the old convention that only ever looked at THIS peer's own registry cache. That old
+    // convention silently fell back to the global default for a work unit whose RepositoryId was a
+    // FOREIGN local-candidate id (replicated from a different peer) — exactly the gap a cold peer
+    // hits materializing another peer's work unit. A RepositoryId that genuinely can't be bound
+    // anywhere on this peer now surfaces RepositoryIdentityUnresolvedException rather than silently
+    // guessing the wrong repository. Falls back to today's global-default behavior only when the
+    // work unit has no RepositoryId at all (preserves pre-7.2 behavior for that case exactly).
     private async Task<string> GetRepositoryIdAsync(WorkUnit workUnit, CancellationToken ct)
     {
         if (workUnit.RepositoryId is { } repositoryId)
         {
-            var repository = await repositories.GetAsync(repositoryId, ct).ConfigureAwait(false);
-            if (repository is not null)
-                return Path.GetFullPath(repository.Path);
+            var resolved = await repositories.ResolveCasIdentityAsync(repositoryId, null, ct).ConfigureAwait(false);
+            if (resolved is not null)
+                return resolved;
+            throw new RepositoryIdentityUnresolvedException(repositoryId);
         }
 
         return Path.GetFullPath(options?.SeedRepositoryPath ?? Directory.GetCurrentDirectory());

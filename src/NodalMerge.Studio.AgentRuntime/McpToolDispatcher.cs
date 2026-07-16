@@ -1351,7 +1351,7 @@ internal sealed class McpToolDispatcher(
 
         var branchId = Str(input, "branchId") ?? "main";
         var pending = await repositorySync.SyncBranchFromRepositoryAsync(
-            branchId, path, SyncTrigger.ManualRefresh, ct).ConfigureAwait(false);
+            branchId, path, SyncTrigger.ManualRefresh, ct, repositoryId: repositoryId).ConfigureAwait(false);
         workspaceOptions.SeedRepositoryPath = path;
 
         return ToJson(new { branchId, repositoryPath = path, sync = pending });

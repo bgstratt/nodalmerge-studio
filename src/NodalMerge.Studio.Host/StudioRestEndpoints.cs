@@ -688,7 +688,7 @@ public static class StudioRestEndpoints
 
             var branchId = body.BranchId ?? "main";
             var pending = await repositorySync.SyncBranchFromRepositoryAsync(
-                branchId, path, SyncTrigger.ManualRefresh, ct).ConfigureAwait(false);
+                branchId, path, SyncTrigger.ManualRefresh, ct, repositoryId: body.RepositoryId).ConfigureAwait(false);
             workspaceOptions.SeedRepositoryPath = path;
 
             return Results.Ok(new { branchId, repositoryPath = path, sync = pending });
@@ -2317,11 +2317,26 @@ public static class StudioRestEndpoints
         {
             if (string.IsNullOrWhiteSpace(path))
                 return Results.BadRequest(new { error = "path query parameter is required." });
-            var found = await fileWorkspace.MaterializeFileAsync(branchId, path, ct).ConfigureAwait(false);
-            return found
-                ? Results.Ok(new { branchId, path, materialized = true })
-                : Results.NotFound(new { branchId, path, materialized = false,
-                    reason = "Path does not exist in the latest repository snapshot." });
+            try
+            {
+                var found = await fileWorkspace.MaterializeFileAsync(branchId, path, ct).ConfigureAwait(false);
+                return found
+                    ? Results.Ok(new { branchId, path, materialized = true })
+                    : Results.NotFound(new { branchId, path, materialized = false,
+                        reason = "Path does not exist in the latest repository snapshot." });
+            }
+            catch (RepositoryIdentityUnresolvedException ex)
+            {
+                // Slice 7.2 — distinct from the "path not found" 404 above: this branch's OWNING
+                // repository couldn't be identified at all on this peer (a cold peer whose local
+                // registry never bound this WorkgroupRepoId), not merely missing this one file from
+                // an otherwise-resolved snapshot.
+                return Results.NotFound(new
+                {
+                    branchId, path, materialized = false,
+                    reason = ex.Message, repositoryId = ex.RepositoryId,
+                });
+            }
         });
 
         // Replays manual on-disk edits (e.g. a human hand-fixing a pending proposal or a merge
