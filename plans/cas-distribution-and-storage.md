@@ -75,12 +75,17 @@
       instance local adoption kept — it's process management, not URL guessing).
       947 tests green. Note: `Peer:RoomId` (`"studio"`, the peer's own room) stays
       hardcoded — out of D4's scope; flag at 6.5 if it needs configuring.
-      Remaining: 6.3a → 5.3 → 6.5.
-      - 6.3a (new, gates 5.3): denormalize `RepositoryId` onto the indirect
-        repo-scoped kinds at creation time (the 6.3 report's recommendation over
-        parent-chain walks), route them per 6.3's mechanism, migrate lazily
-        per-room like 6.3 did. `BranchV1` has no linking field at all today —
-        needs the field added, not just copied.
+      **6.3a shipped 2026-07-15** (`9c7c60c`): `RepositoryId` denormalized at
+      creation (single-hop inheritance — every stored work unit is already
+      resolved, so children never walk further than their parent) onto
+      `MergeProposalV1`/`TaskV1`/`BranchV1`/`KnownGoodStateV1`/`DecisionV1`/
+      `ArtifactRefV1`/`CandidateConflictV1`/`TaskConflictV1`, all routed to repo
+      rooms; second marker generation `repo-migrated-v2/{roomId}` with FK-chain
+      resolution for legacy rows. Execution-event kinds deliberately stay local
+      (highest-volume, no 5.3 need — replication-plane-compaction territory).
+      Proposal-on-A-visible-on-B verified. **5.3 is unblocked**: everything
+      retention classification needs is room-resident.
+      Remaining: 5.3 → 6.5.
 
 Baseline measurement (`tools/measure-cas-baseline.ps1`, run 2026-07-15): no heavy-use
 workspace exists yet — real repos so far are small, so the projected ~400 KB/generation
