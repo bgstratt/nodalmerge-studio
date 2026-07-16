@@ -1,3 +1,5 @@
+using System.Net.WebSockets;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
@@ -10,6 +12,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 using NodalMerge.DotNetHost.Ffi;
+using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Host;
 using NodalMerge.Studio.Storage;
@@ -33,6 +36,24 @@ namespace NodalMerge.Studio.Integration.Tests;
 ///     Rust server does, so no Rust binary is needed) exchanging packs over a real WebSocket
 ///     connection, converging without a restart, and re-converging after a kill/reconnect of the
 ///     downstream peer.
+///
+/// Slice 7.3 (plans/cas-distribution-and-storage.md Phase 7) — the peer's own room
+/// (HeadlessPeerOptions.RoomId, still literally "studio") stops being joined/pushed upstream at
+/// all (see RoomPeerClient's own 7.3 comments): it is peer-private local state, and the pre-6.3
+/// upstream join was a transition artifact that made every peer connected to the same server
+/// collide on that literal room name. Test (3) above therefore migrated its replication vehicle
+/// from the "studio" room to the workgroup room (IWorkgroupRepositoryDirectory — the one
+/// workgroup-room consumer actually wired into RoomReplicationDispatcher's live-refresh path;
+/// see that test's own comment) — same real pack-exchange/reconnect mechanics, no peer-private
+/// state involved. Tests (1)/(2) above still use
+/// "studio" deliberately: they exercise the LOCAL write/inbound-apply mechanics directly (the
+/// outbound-notify seam, and a hand-built RoomPeerClient's HandleInboundPackAsync with no live
+/// socket at all), which is exactly what "studio" stays fully functional for post-7.3 — neither
+/// test ever joins a room or crosses a wire between two peers, so 7.3 doesn't change what they
+/// prove. Three more tests below cover 7.3's own acceptance bar directly: no cross-peer
+/// "studio"-room collision (upstream), no downstream broadcast to a raw peer on this host's own
+/// /ws/studio endpoint, and a proof that RepositoryRegistryService.RefreshAsync's restored live
+/// refresh (also this slice) never absorbs a connected peer's own repository row.
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("Sqlite")]
@@ -172,16 +193,22 @@ public class RoomReplicationTests : IDisposable
         {
             await hostB.StartAsync();
 
-            var storeA = hostA.Services.GetRequiredService<IStudioNodeStore>();
-            var storeB = hostB.Services.GetRequiredService<IStudioNodeStore>();
+            // Slice 7.3 — migrated off the "studio" room (no longer joined/pushed upstream at
+            // all) onto the workgroup room instead, via IWorkgroupRepositoryDirectory — the one
+            // workgroup-room consumer actually wired into RoomReplicationDispatcher's live-refresh
+            // path (it has its own ReplayCanonicalResolutionIntoLiveMapAsync hook the dispatcher
+            // calls on every inbound "workgroup" pack; IWorkgroupGoalDirectory has no such hook —
+            // a separate, pre-existing gap discovered while building this migration, out of this
+            // slice's scope to fix, so not used here). Same real pack-exchange/reconnect mechanics
+            // "studio" used to exercise, and the exact vehicle RoomPerRepoTests' own bidir test
+            // already proves reliable for two-host convergence.
+            var directoryA = hostA.Services.GetRequiredService<IWorkgroupRepositoryDirectory>();
+            var directoryB = hostB.Services.GetRequiredService<IWorkgroupRepositoryDirectory>();
 
-            var payload1 = JsonSerializer.Serialize(new { status = "InProgress", n = 1 });
-            await storeA.WriteNodeAsync(StudioNodeKind.WorkUnitV1, "WU-bidir", payload1);
+            await directoryA.RegisterAsync("before-kill", RepositoryIdentityHints.Empty, preferredRepoId: "repo-bidir-before");
 
-            var readBack1 = await PollUntilAsync(
-                () => storeB.ReadNodeAsync(StudioNodeKind.WorkUnitV1, "WU-bidir"),
-                json => json is not null && JsonNode.DeepEquals(JsonNode.Parse(payload1), JsonNode.Parse(json)));
-            Assert.True(JsonNode.DeepEquals(JsonNode.Parse(payload1), JsonNode.Parse(readBack1)));
+            await PollUntilTrueAsync(async () =>
+                (await directoryB.ListAsync()).Any(e => e.RepoId == "repo-bidir-before"));
 
             // Kill/reconnect B mid-stream: stop just the RoomPeerClient hosted service (simulating
             // a dropped connection), write more on A while B is fully disconnected, then restart
@@ -190,15 +217,238 @@ public class RoomReplicationTests : IDisposable
             var roomPeerClientB = hostB.Services.GetRequiredService<RoomPeerClient>();
             await roomPeerClientB.StopAsync(CancellationToken.None);
 
-            var payload2 = JsonSerializer.Serialize(new { status = "Completed", n = 2 });
-            await storeA.WriteNodeAsync(StudioNodeKind.WorkUnitV1, "WU-bidir", payload2);
+            await directoryA.RegisterAsync("after-reconnect", RepositoryIdentityHints.Empty, preferredRepoId: "repo-bidir-after");
 
             await roomPeerClientB.StartAsync(CancellationToken.None);
 
-            var readBack2 = await PollUntilAsync(
-                () => storeB.ReadNodeAsync(StudioNodeKind.WorkUnitV1, "WU-bidir"),
-                json => json is not null && JsonNode.DeepEquals(JsonNode.Parse(payload2), JsonNode.Parse(json)));
-            Assert.True(JsonNode.DeepEquals(JsonNode.Parse(payload2), JsonNode.Parse(readBack2)));
+            await PollUntilTrueAsync(async () =>
+                (await directoryB.ListAsync()).Any(e => e.RepoId == "repo-bidir-after"));
+        }
+        finally
+        {
+            await hostB.StopAsync();
+            hostB.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Slice 7.3 acceptance bar, upstream half: two peers connected to the same server (hostA
+    /// doubles as the server, same simplification RoomPerRepoTests/this class's own bidir test
+    /// already make) never share or LWW-collide any "studio"-room state. Checked two ways: the
+    /// membership SET directly (fast, deterministic — RoomPeerClient never even opens a
+    /// connection for "studio"), and behaviorally (each peer's own runtime-settings write stays
+    /// exactly its own, even after several membership-reconcile intervals have elapsed).
+    /// </summary>
+    [Fact(Timeout = 30_000)]
+    public async Task Peer_never_joins_or_replicates_the_studio_room_upstream()
+    {
+        await using var hostA = BuildApp("s73-upstream-hostA", configureWebHost: wh => wh.UseUrls("http://127.0.0.1:0"));
+        await hostA.StartAsync();
+
+        var boundAddress = hostA.Services.GetRequiredService<IServer>()
+            .Features.Get<IServerAddressesFeature>()!.Addresses.First();
+        var wsUriA = boundAddress.Replace("http://", "ws://", StringComparison.Ordinal);
+
+        var rootB = Path.Combine(_tempRoot, "s73-upstream-hostB");
+        var hostB = StudioWebApplication.BuildPeer(
+            [],
+            configureConfiguration: cfg => cfg.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["NodalMerge:Storage:Sqlite:DbPath"] = Path.Combine(rootB, "nodes.db"),
+                ["NodalMerge:Storage:FileBlobs:RootPath"] = Path.Combine(rootB, "blobs"),
+                ["Workspace:RootPath"] = Path.Combine(rootB, "workspace"),
+                ["Peer:RoomId"] = "studio",
+                ["Peer:HostUri"] = wsUriA,
+                ["Peer:PeerId"] = "peer-b",
+            }));
+
+        try
+        {
+            await hostB.StartAsync();
+            var roomPeerClientB = hostB.Services.GetRequiredService<RoomPeerClient>();
+
+            // Membership set: "workgroup" is always joined; "studio" never is. Fast/deterministic
+            // — no replication timing involved, this is the actual _connections dictionary.
+            await PollUntilTrueAsync(() => Task.FromResult(roomPeerClientB.HasJoinedRoomForTests("workgroup")));
+            Assert.False(roomPeerClientB.HasJoinedRoomForTests("studio"));
+
+            // Behavioral: RuntimeSettingsV1 is a workspace-global kind that always lives in
+            // "studio" — each peer's own write must stay exactly its own even after several
+            // membership-reconcile intervals (5s each) have elapsed, proving this isn't merely
+            // "hasn't propagated yet" but genuinely never will.
+            var storeA = hostA.Services.GetRequiredService<IStudioNodeStore>();
+            var storeB = hostB.Services.GetRequiredService<IStudioNodeStore>();
+
+            await storeA.WriteNodeAsync(StudioNodeKind.RuntimeSettingsV1, "settings", "{\"owner\":\"A\"}");
+            await storeB.WriteNodeAsync(StudioNodeKind.RuntimeSettingsV1, "settings", "{\"owner\":\"B\"}");
+
+            await Task.Delay(TimeSpan.FromSeconds(7));
+
+            var onA = await storeA.ReadNodeAsync(StudioNodeKind.RuntimeSettingsV1, "settings");
+            var onB = await storeB.ReadNodeAsync(StudioNodeKind.RuntimeSettingsV1, "settings");
+            Assert.Contains("\"A\"", onA);
+            Assert.Contains("\"B\"", onB); // never overwritten/collided by A's value, or vice versa
+        }
+        finally
+        {
+            await hostB.StopAsync();
+            hostB.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Slice 7.3 acceptance bar, downstream half — the reasoning half this slice had to think
+    /// through explicitly: in the embedded-server topology (StudioWebApplication.Build()), this
+    /// host's own /ws/{roomId} endpoint is served by the SAME process that owns "studio"'s local
+    /// state. A downstream peer connecting directly to THIS host's own /ws/studio endpoint (not
+    /// via RoomPeerClient at all — any raw WebSocket client speaking the same wire protocol) would
+    /// be the identical collision the upstream-membership fix addresses, just mirrored: it would
+    /// receive this host's own private settings/profile/etc. writes as ordinary room broadcasts.
+    /// Proven directly against the real WS endpoint with a raw client, not merely by inspecting
+    /// RoomPeerClient's own membership set (which a downstream connection never goes through).
+    /// </summary>
+    [Fact(Timeout = 30_000)]
+    public async Task Local_studio_room_write_is_never_broadcast_downstream_to_a_raw_peer_on_this_hosts_own_ws_endpoint()
+    {
+        await using var hostA = BuildApp("s73-downstream-hostA", configureWebHost: wh => wh.UseUrls("http://127.0.0.1:0"));
+        await hostA.StartAsync();
+
+        var boundAddress = hostA.Services.GetRequiredService<IServer>()
+            .Features.Get<IServerAddressesFeature>()!.Addresses.First();
+        var wsUri = new Uri(boundAddress.Replace("http://", "ws://", StringComparison.Ordinal) + "/ws/studio");
+
+        var store = hostA.Services.GetRequiredService<IStudioNodeStore>();
+
+        // Force the store's lazy EnsureInitializedAsync (and the one-shot legacy migration it
+        // runs, which itself notifies NotifyLocalWriteAsync once even against a brand-new
+        // workspace — see this class's own outbound test) to settle BEFORE the raw socket below
+        // connects, so that unrelated notify can't race the assertion below.
+        await store.WriteNodeAsync(StudioNodeKind.RuntimeSettingsV1, "warmup", "{}");
+
+        using var raw = new ClientWebSocket();
+        await raw.ConnectAsync(wsUri, CancellationToken.None);
+        var hello = JsonSerializer.Serialize(new
+        {
+            type = "hello",
+            room = "studio",
+            pubkey = "raw-downstream",
+            peer_id = "raw-downstream",
+            peer_type = "raw",
+            frontier = Array.Empty<string>()
+        });
+        await raw.SendAsync(Encoding.UTF8.GetBytes(hello), WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
+
+        // Drain the hello response's catch-up burst (RuntimeWebSocketLoopRunner sends "welcome"
+        // then a catch-up "pack" for this one hello frame — but rather than hardcode an exact
+        // count, which is fragile against the server's own message shape, this keeps racing a
+        // single outstanding (never-cancelled) receive against a short timer and re-arming it as
+        // long as messages keep arriving quickly. Never cancels an in-flight ClientWebSocket.
+        // ReceiveAsync — that aborts the WHOLE socket (real .NET behavior) — so a "timed out"
+        // receive is simply left pending and reused directly as the live-check receive below,
+        // rather than started fresh (ClientWebSocket allows only one outstanding receive at a time).
+        var pending = ReceiveOneAsync(raw);
+        while (await Task.WhenAny(pending, Task.Delay(TimeSpan.FromMilliseconds(750))) == pending)
+        {
+            await pending; // consume the drained message
+            pending = ReceiveOneAsync(raw); // re-arm
+        }
+
+        // The write this test actually cares about: made AFTER the raw peer is fully caught up
+        // (no message arrived within the drain window above). If NotifyLocalWriteAsync's
+        // downstream broadcast still fired for "studio", this would arrive as a live "pack"
+        // message on `pending` (already armed) well within the window below.
+        await store.WriteNodeAsync(StudioNodeKind.RuntimeSettingsV1, "live-write", "{\"theme\":\"dark\"}");
+
+        var readBack = await store.ReadNodeAsync(StudioNodeKind.RuntimeSettingsV1, "live-write");
+        Assert.NotNull(readBack); // the write itself still succeeds locally — only broadcast is suppressed
+
+        var liveCompleted = await Task.WhenAny(pending, Task.Delay(TimeSpan.FromSeconds(3)));
+        var liveMessage = liveCompleted == pending ? await pending : null;
+        Assert.Null(liveMessage);
+    }
+
+    /// <summary>
+    /// Slice 7.3's other product decision: with the "studio"-room collision source gone,
+    /// RepositoryRegistryService.RefreshAsync is restored to the default live refresh (see that
+    /// class's own updated comment for why 6.5 Part 1's original no-op is now unnecessary). This
+    /// proves the restore is actually safe: two peers, each with their own unrelated repository
+    /// registration, connected via a SHARED repo room (so a live cache refresh genuinely fires) —
+    /// neither peer's registry cache ever absorbs the other's row, because "studio" (where
+    /// RepositoryV1 rows live) never replicates between them at all anymore.
+    /// </summary>
+    [Fact(Timeout = 60_000)]
+    public async Task RepositoryRegistryService_RefreshAsync_restored_after_73_never_absorbs_a_connected_peers_own_repository_row()
+    {
+        await using var hostA = BuildApp("s73-registry-hostA", configureWebHost: wh => wh.UseUrls("http://127.0.0.1:0"));
+        await hostA.StartAsync();
+
+        var boundAddress = hostA.Services.GetRequiredService<IServer>()
+            .Features.Get<IServerAddressesFeature>()!.Addresses.First();
+        var wsUriA = boundAddress.Replace("http://", "ws://", StringComparison.Ordinal);
+
+        var registryA = hostA.Services.GetRequiredService<IRepositoryRegistryService>();
+        var repoR1 = await registryA.RegisterAsync(Path.Combine(_tempRoot, "s73-registry-r1"), "r1");
+        if (repoR1.WorkgroupRepoId is null)
+            repoR1 = await registryA.ResolveDisambiguationAsync(repoR1.RepositoryId, chosenRepoId: null)
+                ?? throw new InvalidOperationException("disambiguation resolution returned null");
+
+        var rootB = Path.Combine(_tempRoot, "s73-registry-hostB");
+        var hostB = StudioWebApplication.BuildPeer(
+            [],
+            configureConfiguration: cfg => cfg.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["NodalMerge:Storage:Sqlite:DbPath"] = Path.Combine(rootB, "nodes.db"),
+                ["NodalMerge:Storage:FileBlobs:RootPath"] = Path.Combine(rootB, "blobs"),
+                ["Workspace:RootPath"] = Path.Combine(rootB, "workspace"),
+                ["Peer:RoomId"] = "studio",
+                ["Peer:HostUri"] = wsUriA,
+                ["Peer:PeerId"] = "peer-b",
+            }));
+
+        try
+        {
+            await hostB.StartAsync();
+            var registryB = hostB.Services.GetRequiredService<IRepositoryRegistryService>();
+
+            // B registers its OWN, unrelated repository — a distinct local candidate, auto-minted
+            // to a distinct workgroup id (no shared identity hints with R1).
+            var repoOwnB = await registryB.RegisterAsync(Path.Combine(rootB, "s73-registry-own"), "own-on-b");
+            if (repoOwnB.WorkgroupRepoId is null)
+                repoOwnB = await registryB.ResolveDisambiguationAsync(repoOwnB.RepositoryId, chosenRepoId: null)
+                    ?? throw new InvalidOperationException("disambiguation resolution returned null");
+
+            // B also binds a SEPARATE local candidate to the SAME repo A registered (R1) — the
+            // ordinary D2 disambiguation flow — so B ends up joining repo/R1's room too, giving
+            // this test a real repo-room pack to trigger a live cache refresh with.
+            var directoryB = hostB.Services.GetRequiredService<IWorkgroupRepositoryDirectory>();
+            await PollUntilTrueAsync(async () => (await directoryB.ListAsync()).Any(e => e.RepoId == repoR1.WorkgroupRepoId));
+
+            var localR1OnB = await registryB.RegisterAsync(Path.Combine(rootB, "s73-registry-clone-of-r1"), "r1-on-b");
+            Assert.Null(localR1OnB.WorkgroupRepoId);
+            Assert.NotNull(localR1OnB.PendingDisambiguation);
+            localR1OnB = await registryB.ResolveDisambiguationAsync(localR1OnB.RepositoryId, repoR1.WorkgroupRepoId);
+            Assert.Equal(repoR1.WorkgroupRepoId, localR1OnB!.WorkgroupRepoId);
+
+            // A repo-room write on A — B's membership loop already joined repo/R1 above, and the
+            // resulting inbound pack fires RefreshAfterInboundPackAsync("repo/R1"), which (per
+            // RehydratableRefreshCoordinator) runs every undeclared IRehydratable, including
+            // RepositoryRegistryService — the live refresh this test proves is safe.
+            var storeA = hostA.Services.GetRequiredService<IStudioNodeStore>();
+            await storeA.WriteNodeAsync(StudioNodeKind.WorkUnitV1, "WU-s73-registry",
+                JsonSerializer.Serialize(new { WorkUnitId = "WU-s73-registry", RepositoryId = repoR1.RepositoryId }),
+                repoR1.RepositoryId);
+
+            var storeB = hostB.Services.GetRequiredService<IStudioNodeStore>();
+            await PollUntilTrueAsync(async () =>
+                await storeB.ReadNodeAsync(StudioNodeKind.WorkUnitV1, "WU-s73-registry") is not null);
+
+            // B's registry contains its own two local candidates, and NEVER A's own local
+            // RepositoryId for R1 — proving the restored live refresh only ever re-absorbs THIS
+            // peer's own "studio" rows, never a connected peer's.
+            var onB = await registryB.ListAsync();
+            Assert.Contains(onB, r => r.RepositoryId == repoOwnB.RepositoryId);
+            Assert.Contains(onB, r => r.RepositoryId == localR1OnB.RepositoryId);
+            Assert.DoesNotContain(onB, r => r.RepositoryId == repoR1.RepositoryId);
         }
         finally
         {
@@ -244,6 +494,40 @@ public class RoomReplicationTests : IDisposable
         }
 
         throw new TimeoutException($"Condition never satisfied within the timeout; last observed value: {last ?? "(null)"}");
+    }
+
+    private static async Task PollUntilTrueAsync(Func<Task<bool>> condition, TimeSpan? timeout = null)
+    {
+        var deadline = DateTimeOffset.UtcNow + (timeout ?? TimeSpan.FromSeconds(20));
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (await condition())
+                return;
+            await Task.Delay(100);
+        }
+
+        throw new TimeoutException("Condition never satisfied within the timeout.");
+    }
+
+    // Slice 7.3's downstream-broadcast test only — reads exactly one full WebSocket text message,
+    // unbounded (no cancellation token). Deliberately never cancellation-bounded: cancelling an
+    // in-flight ClientWebSocket.ReceiveAsync aborts the whole socket (real .NET behavior), which
+    // would make the socket unusable for whatever the caller does next.
+    private static async Task<string> ReceiveOneAsync(ClientWebSocket socket)
+    {
+        var buffer = new byte[16 * 1024];
+        using var messageBuffer = new MemoryStream();
+        WebSocketReceiveResult result;
+        do
+        {
+            result = await socket.ReceiveAsync(buffer, CancellationToken.None);
+            if (result.MessageType == WebSocketMessageType.Close)
+                throw new InvalidOperationException("Socket closed while a message was expected.");
+            messageBuffer.Write(buffer, 0, result.Count);
+        }
+        while (!result.EndOfMessage);
+
+        return Encoding.UTF8.GetString(messageBuffer.ToArray());
     }
 
     private sealed class RecordingOutbound(List<(string RoomId, string NodeIdHex)> recorded) : IStudioReplicationOutbound

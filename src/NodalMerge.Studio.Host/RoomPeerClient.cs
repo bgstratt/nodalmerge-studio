@@ -33,15 +33,26 @@ namespace NodalMerge.Studio.Host;
 /// exactly one room for its whole lifetime. So "one socket, N rooms" is not an option on either
 /// server implementation — this class instead owns one <see cref="RoomConnection"/> (one
 /// WebSocket, one reconnect loop, one outbound queue) per joined room, managed by this single
-/// hosted service. Rooms joined: this peer's own room (`HeadlessPeerOptions.RoomId`, still
-/// literally "studio" — out of 6.4's config-rename scope, which covers HostUri/Workgroup only),
-/// the workgroup room (`RoomOptions.EffectiveWorkgroupRoomId`, config key Room:Workgroup, default
-/// "workgroup" — slice 6.4 replaced the hardcoded literal), and every repo room this peer has
-/// bound (<see cref="BoundRepoRooms"/>) — reconciled on an owned background loop
-/// (<see cref="MembershipLoopAsync"/>) so a repo bound while already connected joins its room
-/// without a restart (D1's membership rule + the slice's own "join/leave follows binding" note).
-/// Leave-on-unbind is out of scope — there is no "unbind a repo" operation anywhere in this
-/// codebase today, so a joined room is never proactively dropped.
+/// hosted service. Rooms joined: the workgroup room (`RoomOptions.EffectiveWorkgroupRoomId`,
+/// config key Room:Workgroup, default "workgroup" — slice 6.4 replaced the hardcoded literal), and
+/// every repo room this peer has bound (<see cref="BoundRepoRooms"/>) — reconciled on an owned
+/// background loop (<see cref="MembershipLoopAsync"/>) so a repo bound while already connected
+/// joins its room without a restart (D1's membership rule + the slice's own "join/leave follows
+/// binding" note). Leave-on-unbind is out of scope — there is no "unbind a repo" operation
+/// anywhere in this codebase today, so a joined room is never proactively dropped.
+///
+/// Slice 7.3 (plans/cas-distribution-and-storage.md Phase 7) — this peer's OWN room
+/// (`HeadlessPeerOptions.RoomId`, still literally "studio") is deliberately EXCLUDED from the set
+/// above. Pre-7.3 it was joined upstream too — a pre-6.3 transition artifact from when "studio"
+/// was the only room this class knew about — which meant every peer connected to the same server
+/// joined the exact same literal room name for what is actually peer-private local state
+/// (settings, profiles, scheduler, registry bindings w/ local paths, gc runs, execution events):
+/// every peer's own private rows collided/LWW-raced against every other peer's the moment
+/// replication caught up (see `RepositoryRegistryService.RefreshAsync`'s own comment for the
+/// concrete bug this caused, and `ReconcileMembershipAsync`/`NotifyLocalWriteAsync`'s own comments
+/// for the fix). The room stays fully functional as a LOCAL engine room — every read/write/
+/// persistence path through it is unchanged — it is simply never a wire-visible room to any other
+/// peer or server, in either direction.
 ///
 ///   - Inbound (per room connection): both the post-hello catch-up and any live "pack" message
 ///     (same wire type, "pack" — the server never actually sends a "catch-up-pack" type despite
@@ -177,11 +188,12 @@ public sealed class RoomPeerClient(
         _connections.Clear();
     }
 
-    // Slice 6.3 — joins this peer's own room + "workgroup" + every bound repo room, and re-reconciles
-    // periodically so a repo bound after startup joins its room without a restart. Polling (rather
-    // than an event/callback from RepositoryRegistryService) is the simplest correct thing: that
-    // service has no "repo just got bound" notification today, and reconciliation itself is cheap
-    // (an in-memory ConcurrentDictionary scan, per BoundRepoRooms).
+    // Slice 6.3 — joins "workgroup" + every bound repo room, and re-reconciles periodically so a
+    // repo bound after startup joins its room without a restart. Polling (rather than an event/
+    // callback from RepositoryRegistryService) is the simplest correct thing: that service has no
+    // "repo just got bound" notification today, and reconciliation itself is cheap (an in-memory
+    // ConcurrentDictionary scan, per BoundRepoRooms). Slice 7.3 removed this peer's own room
+    // (options.RoomId) from the joined set entirely — see the class comment's 7.3 section.
     private async Task MembershipLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -201,7 +213,11 @@ public sealed class RoomPeerClient(
 
     private async Task ReconcileMembershipAsync(CancellationToken ct)
     {
-        var target = new HashSet<string>(StringComparer.Ordinal) { options.RoomId, roomOptions.EffectiveWorkgroupRoomId };
+        // Slice 7.3 — options.RoomId (this peer's own room, still literally "studio") is
+        // deliberately NOT in this set; see the class comment's 7.3 section and
+        // NotifyLocalWriteAsync's own comment for the matching downstream-broadcast half of the
+        // same fix.
+        var target = new HashSet<string>(StringComparer.Ordinal) { roomOptions.EffectiveWorkgroupRoomId };
 
         var registry = RepositoryRegistry;
         if (registry is not null)
@@ -233,6 +249,24 @@ public sealed class RoomPeerClient(
     // hot path free of I/O latency; the actual send happens on that room's own background loop.
     public Task NotifyLocalWriteAsync(string roomId, string nodeIdHex, CancellationToken cancellationToken = default)
     {
+        // Slice 7.3 — the peer's own room (options.RoomId, still literally "studio") is
+        // peer-private local state; it is never joined or pushed upstream (see
+        // ReconcileMembershipAsync), and for the identical collision reason it must never be
+        // broadcast downstream either. In the embedded-server topology (StudioWebApplication.
+        // Build()), this host's own /ws/{roomId} endpoint is served by the SAME process that also
+        // owns this local "studio" state — a second peer connecting directly to this host's own
+        // /ws/studio endpoint would receive this host's private settings/profile/scheduler/etc.
+        // writes exactly as if it had joined a shared room: the identical collision the upstream-
+        // membership fix above closes, just mirrored on the downstream side of the same process
+        // (a headless BuildPeer() instance normally has no HTTP/WS server at all, but nothing stops
+        // one from being added later, and RuntimeWebSocketLoopRunner's server-side /ws/{roomId}
+        // handling is shared code either way — this guard belongs at the one call site both
+        // topologies share, not duplicated per-host-kind). Both halves below are skipped
+        // unconditionally for the private room; "studio" stays fully functional as a LOCAL engine
+        // room — only replication, in either direction, is severed.
+        if (string.Equals(roomId, options.RoomId, StringComparison.Ordinal))
+            return Task.CompletedTask;
+
         // Downstream: broadcast to any peer directly connected to THIS host's own /ws/{roomId}
         // endpoint. Unconditional regardless of upstream HostUri config — a standalone-upstream
         // embedded host may still serve downstream peers. Best-effort/fire-and-forget: a failure
@@ -513,6 +547,12 @@ public sealed class RoomPeerClient(
     // across every joined room's connection — 0 when none exist, matching the pre-6.3 single-room
     // semantics for tests that never call StartAsync (no connections are ever created).
     internal int PendingOutboundCountForTests => _connections.Values.Sum(c => c.PendingCount);
+
+    // Test hook only (internal — see NodalMerge.Studio.Host.csproj's InternalsVisibleTo). Slice
+    // 7.3 — lets a test assert the upstream membership SET directly (has this peer ever joined a
+    // connection for this room id) rather than inferring it indirectly from replication timing,
+    // which is exactly the fast/deterministic check the "studio" room must now always fail.
+    internal bool HasJoinedRoomForTests(string roomId) => _connections.ContainsKey(roomId);
 
     private readonly record struct OutboundItem(string? NodeIdHex, bool IsFullPackFallback)
     {

@@ -76,12 +76,16 @@ public interface IRepositoryRegistryService
     ///      exists under that path today, that IS this repository's key, unchanged. Covers every
     ///      pre-7.2 workspace and the ordinary single-peer/default-repo case.
     ///   2. The repository's WorkgroupRepoId — resolved via this peer's own registry entry, or (a
-    ///      candidate this peer never itself registered) a FOREIGN RepositoryV1 row replicated onto
-    ///      this peer (the "studio" room is shared upstream pre-7.3), read directly from the node
-    ///      store rather than this peer's own in-memory cache (which deliberately never absorbs
-    ///      other peers' own registrations — see RefreshAsync's own comment). This is what makes a
-    ///      brand-new repository's identity resolvable by a peer with a different (or no) physical
-    ///      clone path.
+    ///      candidate this peer never itself registered) via the shared workgroup directory when
+    ///      <paramref name="repositoryId"/> already equals a registered WorkgroupRepoId (true
+    ///      whenever preferred-id continuity applied at that repo's first registration — see
+    ///      IWorkgroupRepositoryDirectory.RegisterAsync), falling back to a direct "studio"
+    ///      node-store read (pre-7.3 this was the only foreign-candidate path, since "studio" was
+    ///      shared upstream then; post-7.3 it only ever finds THIS peer's own prior rows — see
+    ///      ResolveWorkgroupRepoIdAsync's own comment for the full 7.3 story, including the
+    ///      disambiguated-fork case this does NOT yet cover). This is what makes a brand-new
+    ///      repository's identity resolvable by a peer with a different (or no) physical clone
+    ///      path, in the common (non-forked) case.
     ///   3. The bare local disk path (Path.GetFullPath) — degraded fallback for ad hoc/ungoverned
     ///      repositories the workgroup directory was never wired to bind.
     /// Returns null only when nothing above resolves — the caller's cue to surface
@@ -400,9 +404,31 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
     }
 
     // Resolves WorkgroupRepoId for repositoryId — this peer's own registry cache first (the common
-    // case, own is already looked up by the caller when available), falling back to a direct
-    // node-store read for a FOREIGN candidate (a replicated peer's own local-candidate id this peer
-    // never itself registered — visible because the "studio" room is, pre-7.3, shared upstream).
+    // case, own is already looked up by the caller when available), then two FOREIGN-candidate
+    // fallbacks (a replicated peer's own local-candidate id this peer never itself registered —
+    // e.g. WorkUnit.RepositoryId minted by a different peer, exactly MultiUserMilestoneTests'
+    // "work units are deliberately created on A throughout" scenario):
+    //
+    //   Slice 7.3 (plans/cas-distribution-and-storage.md Phase 7) note: pre-7.3 the ONLY fallback
+    //   here was a direct node-store read of StudioNodeKind.RepositoryV1 keyed by repositoryId —
+    //   safe only because "studio" (RepositoryV1's home room) was, pre-7.3, replicated upstream to
+    //   every connected peer, so a foreign peer's own private row was visible here as a side effect.
+    //   7.3 severs that (the whole point of the slice) — that node-store read now ALWAYS misses for
+    //   a genuinely foreign id, since no peer's "studio" room ever receives another peer's rows
+    //   anymore. Discovered as a real regression while building 7.3 (MultiUserMilestoneTests'
+    //   cold-materialize step, which resolves CAS identity from a WorkUnit.RepositoryId minted by
+    //   the OTHER peer, started failing) — fixed forward here rather than left broken, per this
+    //   slice's own "confirm nothing breaks when studio stops syncing" instruction. The new first
+    //   fallback below covers the common case (preferred-id continuity: a repo's first-ever,
+    //   uncontested registration reuses its own RepositoryId as its WorkgroupRepoId — see
+    //   IWorkgroupRepositoryDirectory.RegisterAsync's own doc comment — so a very common real
+    //   WorkUnit.RepositoryId already IS a valid, workgroup-shared WorkgroupRepoId with no foreign
+    //   row needed at all). The disambiguated-fork case (a repo whose WorkgroupRepoId differs from
+    //   every peer's own local-candidate id) has no shared reverse-index today and is NOT covered —
+    //   flagged as a follow-up (a real cross-peer "which local id maps to which workgroup id" index
+    //   would need new replicated state, out of this slice's scope); the stale node-store read is
+    //   kept only as a harmless same-peer/restart-migration safety net, not a cross-peer mechanism
+    //   anymore.
     private async Task<string?> ResolveWorkgroupRepoIdAsync(string repositoryId, RepositoryV1? own, CancellationToken ct)
     {
         if (own is not null)
@@ -410,6 +436,13 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
 
         if (_repositories.TryGetValue(repositoryId, out var local))
             return local.WorkgroupRepoId;
+
+        if (_workgroupDirectory is not null)
+        {
+            var entries = await _workgroupDirectory.ListAsync(ct).ConfigureAwait(false);
+            if (entries.Any(e => string.Equals(e.RepoId, repositoryId, StringComparison.Ordinal)))
+                return repositoryId;
+        }
 
         var payloadJson = await _nodeStore.ReadNodeAsync(StudioNodeKind.RepositoryV1, repositoryId, ct).ConfigureAwait(false);
         if (payloadJson is null)
@@ -476,30 +509,34 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
         }
     }
 
-    // Slice 6.5 Part 1 — deliberately a no-op, NOT the default "call RehydrateAsync again". Root
-    // cause found while chasing a genuine regression this slice's own live-refresh wiring caused in
-    // RoomPerRepoTests' two-repo scenario: "studio" is not actually a peer-private room the way
-    // RepositoryV1's "peer-local candidate" convention assumes (see StudioNodeKind.RepoScopedKinds'
-    // own comment: "RepositoryV1 itself... stays local by necessity"). A CONNECTED peer's "studio"
-    // room *is* the literal same server-side room as the embedded host it connects to (RoomPeerClient
-    // joins room `options.RoomId`, hardcoded "studio", by opening a WebSocket to that exact room name
-    // on the remote host) — so once replication catches up, THIS peer's own engine-level view of
-    // "studio" also contains every OTHER peer's own RepositoryV1 rows, not just this peer's. A
-    // one-time startup RehydrateAsync (before any connection exists) never sees that — but re-running
-    // it live, after packs have arrived, would silently absorb another peer's own local-candidate
+    // Slice 6.5 Part 1 made this a no-op instead of the default "call RehydrateAsync again". Root
+    // cause at the time: "studio" was not actually a peer-private room the way RepositoryV1's
+    // "peer-local candidate" convention assumes (see StudioNodeKind.RepoScopedKinds' own comment:
+    // "RepositoryV1 itself... stays local by necessity"). A CONNECTED peer's "studio" room *was*
+    // (pre-7.3) the literal same server-side room as the embedded host it connects to (RoomPeerClient
+    // joined room `options.RoomId`, hardcoded "studio", by opening a WebSocket to that exact room name
+    // on the remote host) — so once replication caught up, THIS peer's own engine-level view of
+    // "studio" also contained every OTHER peer's own RepositoryV1 rows, not just this peer's. A
+    // one-time startup RehydrateAsync (before any connection exists) never saw that — but re-running
+    // it live, after packs had arrived, silently absorbed another peer's own local-candidate
     // registrations into this peer's _repositories cache as if they were this peer's own. That
-    // corrupts BoundRepoRooms.GetBoundRepoRoomIdsAsync (used by RoomPeerClient's membership loop to
+    // corrupted BoundRepoRooms.GetBoundRepoRoomIdsAsync (used by RoomPeerClient's membership loop to
     // decide which repo rooms to actually JOIN), making a peer that only ever bound to one repo start
-    // joining every repo the OTHER peer happens to have registered — confirmed by direct
-    // instrumentation while building this slice: without this override, a peer bound only to repo R1
+    // joining every repo the OTHER peer happened to have registered — confirmed by direct
+    // instrumentation while building 6.5 Part 1: without the no-op, a peer bound only to repo R1
     // ended up also joining R2's and R3's rooms and genuinely receiving their real catch-up content.
-    // No other RehydratedKinds-based partitioning fixes this (RepositoryV1 is correctly a "studio"-
-    // room kind, not repo-scoped — the bug isn't about which room a pack arrived on, it's that this
-    // service's own cache must never re-absorb replicated peer-local rows after startup). Safe to
-    // leave a no-op: nothing else in this codebase needs this peer's registry cache to reflect
-    // another peer's own bindings live — RepositoryRegistryService.RegisterAsync/
-    // ResolveDisambiguationAsync already update _repositories directly for this peer's OWN writes.
-    public Task RefreshAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+    //
+    // Slice 7.3 (plans/cas-distribution-and-storage.md Phase 7) restores the default live-refresh
+    // behavior: RoomPeerClient no longer joins or pushes "studio" upstream AT ALL (see that class's
+    // own 7.3 comments) — the room is now genuinely peer-private in the way this convention always
+    // assumed. The root cause above is therefore structurally gone, not merely papered over: no
+    // pack for "studio" can ever arrive on this peer from anywhere but this peer's own writes, so
+    // RehydrateAsync's ReadAllNodesAsync(RepositoryV1) can only ever re-absorb rows THIS peer itself
+    // already wrote — safe to run live, exactly like every other IRehydratable's default. See
+    // RoomReplicationTests' 7.3 no-cross-peer-absorption test for the proof (two peers, each with
+    // their own unrelated local repository registration, connected via a SHARED repo room so a live
+    // refresh actually fires — neither peer's registry cache ever contains the other's row).
+    public Task RefreshAsync(CancellationToken cancellationToken = default) => RehydrateAsync(cancellationToken);
 
     private static string NormalizePath(string path) =>
         path.Replace('\\', '/').TrimEnd('/').ToLowerInvariant();

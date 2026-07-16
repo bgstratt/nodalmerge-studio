@@ -18,23 +18,26 @@ namespace NodalMerge.Studio.Storage;
 // This existed originally as "refresh literally everything on every pack" (no partitioning at all);
 // that version reliably (not merely occasionally) broke an existing, previously-passing test
 // (RoomPerRepoTests' two-repo-rooms room-isolation scenario) once refreshed live. The ACTUAL root
-// cause, found by bisecting down to a single deterministic repro and instrumenting
+// cause at the time, found by bisecting down to a single deterministic repro and instrumenting
 // GetBoundRepoRoomIdsAsync directly: RepositoryRegistryService.RehydrateAsync — an ordinary,
 // undeclared (conservative-refresh) IRehydratable — re-reads StudioNodeKind.RepositoryV1 on every
 // call. RepositoryV1 rows are meant to be strictly peer-local ("stays local by necessity" — see
-// StudioNodeKind.RepoScopedKinds' own comment) — but a connected peer's own "studio" room is not
-// actually private: RoomPeerClient joins room `options.RoomId` (hardcoded "studio") by opening a
-// WebSocket directly to the remote host's OWN "studio" room, so once replication catches up, this
-// peer's local engine view of "studio" also contains every OTHER peer's own RepositoryV1
-// registrations. Re-running RehydrateAsync live (this slice's whole point) silently absorbed those
+// StudioNodeKind.RepoScopedKinds' own comment) — but a connected peer's own "studio" room was (pre-
+// 7.3) not actually private: RoomPeerClient joined room `options.RoomId` (hardcoded "studio") by
+// opening a WebSocket directly to the remote host's OWN "studio" room, so once replication caught
+// up, this peer's local engine view of "studio" also contained every OTHER peer's own RepositoryV1
+// registrations. Re-running RehydrateAsync live (6.5 Part 1's whole point) silently absorbed those
 // other peers' rows into this peer's OWN registry cache — which BoundRepoRooms.GetBoundRepoRoomIdsAsync
 // (consumed by RoomPeerClient's own membership loop) then read as "repos I'm bound to," making a peer
 // bound only to R1 start actually JOINING and receiving R2's/R3's real room content too. Fixed at the
-// source: RepositoryRegistryService.RefreshAsync is overridden to a no-op (see that class's own
-// comment) — its cache is only ever safe to (re)populate once, at startup, before any room
-// connection exists. This partitioning below is kept as an independently-worthwhile reduction of
-// unnecessary cross-room work, not as a fix for that bug (it wasn't one — RepositoryV1 isn't
-// repo-scoped, so this partitioning never touched RepositoryRegistryService's refresh either way).
+// source at the time: RepositoryRegistryService.RefreshAsync was overridden to a no-op.
+//
+// Slice 7.3 (plans/cas-distribution-and-storage.md Phase 7) removed "studio" from RoomPeerClient's
+// upstream membership entirely, making the root cause above structurally impossible — see
+// RepositoryRegistryService.RefreshAsync's own (now-restored) comment. This partitioning below is
+// kept as an independently-worthwhile reduction of unnecessary cross-room work, not as a fix for
+// that bug (it wasn't one — RepositoryV1 isn't repo-scoped, so this partitioning never touched
+// RepositoryRegistryService's refresh either way).
 //
 // One failing service never blocks the rest: each RefreshAsync call is individually try/caught and
 // logged, so a bug in one service's refresh path degrades only that service's freshness (it stays
