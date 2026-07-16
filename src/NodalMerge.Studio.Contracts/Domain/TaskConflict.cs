@@ -30,4 +30,7 @@ public sealed record TaskConflictRecord(
     // for ConflictingPaths — best-effort resolved at record time, same approach as
     // CandidateConflictRecord.WinningProposalId. Feeds IReconciliationAgentService as the second
     // participant alongside ProposalId.
-    string? WinningProposalId = null);
+    string? WinningProposalId = null,
+    // Slice 6.3a — same denormalization as CandidateConflictRecord.RepositoryId, set from
+    // owningWorkUnit at the same construction site in InMemoryMergeService.TryApplyAdditivelyAsync.
+    string? RepositoryId = null);

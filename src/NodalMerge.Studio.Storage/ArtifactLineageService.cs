@@ -15,16 +15,25 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
     private readonly IStudioNodeStore _nodeStore;
     private readonly IExecutionEventStream? _events;
     private readonly IRuntimeEventBroadcaster? _broadcaster;
+    private readonly IServiceProvider? _serviceProvider;
 
-    // events/broadcaster are optional (default to null, silently skipping the audit-trail append /
-    // live broadcast) so the many existing call sites constructing this service directly in tests
-    // don't all need updating — same optional-collaborator convention used throughout this codebase.
+    // events/broadcaster/serviceProvider are optional (default to null, silently skipping the
+    // audit-trail append / live broadcast / RepositoryId resolution) so the many existing call
+    // sites constructing this service directly in tests don't all need updating — same
+    // optional-collaborator convention used throughout this codebase.
+    //
+    // Slice 6.3a — serviceProvider resolves IWorkUnitService LAZILY (never constructor-injected
+    // directly): InMemoryWorkUnitService itself constructor-depends on IArtifactLineageService, so
+    // a direct dependency here would be the exact circular constructor graph InMemoryMergeService
+    // and others already dodge for the same interface via this identical pattern.
     public ArtifactLineageService(
-        IStudioNodeStore nodeStore, IExecutionEventStream? events = null, IRuntimeEventBroadcaster? broadcaster = null)
+        IStudioNodeStore nodeStore, IExecutionEventStream? events = null, IRuntimeEventBroadcaster? broadcaster = null,
+        IServiceProvider? serviceProvider = null)
     {
         _nodeStore = nodeStore;
         _events = events;
         _broadcaster = broadcaster;
+        _serviceProvider = serviceProvider;
     }
 
     public async Task<ArtifactRef> RecordAsync(ArtifactRef artifact, CancellationToken ct = default)
@@ -33,16 +42,30 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
         if (_byId.TryGetValue(artifact.ArtifactId, out var existing))
             return existing;
 
-        _byId[artifact.ArtifactId] = artifact;
-        Index(artifact);
+        // Slice 6.3a — denormalize from OwnedByWorkUnitId's own RepositoryId when the caller didn't
+        // already supply one. Null OwnedByWorkUnitId (global artifacts) or an unresolvable work
+        // unit both fall back to null → "studio", never blocking the record.
+        var stored = artifact;
+        if (stored.RepositoryId is null && stored.OwnedByWorkUnitId is not null)
+        {
+            var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+            var repositoryId = await RepositoryIdResolution
+                .ResolveFromWorkUnitAsync(workUnits, stored.OwnedByWorkUnitId, ct).ConfigureAwait(false);
+            if (repositoryId is not null)
+                stored = stored with { RepositoryId = repositoryId };
+        }
+
+        _byId[stored.ArtifactId] = stored;
+        Index(stored);
 
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.ArtifactRefV1,
-            artifact.ArtifactId,
-            JsonSerializer.Serialize(artifact),
+            stored.ArtifactId,
+            JsonSerializer.Serialize(stored),
+            stored.RepositoryId,
             ct).ConfigureAwait(false);
 
-        return artifact;
+        return stored;
     }
 
     public Task<ArtifactRef?> GetAsync(string artifactId, CancellationToken ct = default)
@@ -69,6 +92,7 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
             StudioNodeKind.ArtifactRefV1,
             artifactId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             ct).ConfigureAwait(false);
 
         return updated;
@@ -100,6 +124,7 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
             StudioNodeKind.ArtifactRefV1,
             artifactId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             ct).ConfigureAwait(false);
 
         return updated;
@@ -122,7 +147,7 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
         var invalidated = target with { Status = ArtifactStatus.Invalidated };
         _byId[artifactId] = invalidated;
         await _nodeStore.WriteNodeAsync(
-            StudioNodeKind.ArtifactRefV1, artifactId, JsonSerializer.Serialize(invalidated), ct)
+            StudioNodeKind.ArtifactRefV1, artifactId, JsonSerializer.Serialize(invalidated), invalidated.RepositoryId, ct)
             .ConfigureAwait(false);
 
         var flaggedIds = new List<string>();
@@ -137,7 +162,7 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
             var flagged = descendant with { InvalidatedByArtifactId = artifactId };
             _byId[descendantId] = flagged;
             await _nodeStore.WriteNodeAsync(
-                StudioNodeKind.ArtifactRefV1, descendantId, JsonSerializer.Serialize(flagged), ct)
+                StudioNodeKind.ArtifactRefV1, descendantId, JsonSerializer.Serialize(flagged), flagged.RepositoryId, ct)
                 .ConfigureAwait(false);
             flaggedIds.Add(descendantId);
 

@@ -405,8 +405,19 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             }
         }
 
+        // Slice 6.3a — inherit RepositoryId from the immediate parent when this work unit didn't
+        // resolve its own (single-hop, per RepositoryIdResolution's own comment: the parent's
+        // stored value is already fully resolved by construction, so one hop suffices).
+        if (resolvedRepositoryId is null && parentWorkUnitId is not null
+            && _workUnits.TryGetValue(parentWorkUnitId, out var parentWorkUnitForRepo))
+        {
+            resolvedRepositoryId = parentWorkUnitForRepo.RepositoryId;
+        }
+
         var resolvedBranchId = await _branchService
-            .CreateBranchAsync(branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, fileScope, cancellationToken)
+            .CreateBranchAsync(
+                branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, fileScope,
+                repositoryId: resolvedRepositoryId, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
 
         var fanOutInfo = sliceId is not null || seedFromBranchId is not null

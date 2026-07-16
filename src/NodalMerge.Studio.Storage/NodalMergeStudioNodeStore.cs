@@ -110,6 +110,53 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
     // MigrateStudioEntriesIntoRepoRoomAsync.
     private const string RepoRoomMigrationMarkerKeyPrefix = "repo-migrated/";
 
+    // Slice 6.3a — a SECOND per-room migration marker generation, "repo-migrated-v2/{roomId}".
+    // Necessary (not just a copy-paste) because the 6.3 marker above already guards
+    // MigrateStudioEntriesIntoRepoRoomAsync for every workspace that upgraded through 6.3 before
+    // 6.3a shipped — that method would otherwise never run again for an already-migrated room, so
+    // the newly-routed kinds (MergeProposalV1, TaskV1, BranchV1, KnownGoodStateV1, DecisionV1,
+    // ArtifactRefV1, CandidateConflictV1, TaskConflictV1) would sit in "studio" forever. This
+    // second pass is guarded independently so it always runs exactly once per room regardless of
+    // whether the first pass's marker is already set. See MigrateIndirectKindsIntoRepoRoomAsync.
+    private const string RepoRoomMigrationMarkerV2KeyPrefix = "repo-migrated-v2/";
+
+    // Slice 6.3a — the kinds MigrateIndirectKindsIntoRepoRoomAsync additionally covers (6.3's
+    // original RepoScopedKinds members were already fully covered by the first-pass marker above,
+    // since every row of those kinds already carried its own RepositoryId property when 6.3
+    // shipped). Kept as an explicit set here (rather than "RepoScopedKinds minus the original 5")
+    // so the second pass's scope reads directly from the code, not by subtraction.
+    private static readonly IReadOnlySet<string> IndirectRoutedKinds = new HashSet<string>(StringComparer.Ordinal)
+    {
+        StudioNodeKind.MergeProposalV1,
+        StudioNodeKind.TaskV1,
+        StudioNodeKind.BranchV1,
+        StudioNodeKind.KnownGoodStateV1,
+        StudioNodeKind.DecisionV1,
+        StudioNodeKind.ArtifactRefV1,
+        StudioNodeKind.CandidateConflictV1,
+        StudioNodeKind.TaskConflictV1,
+    };
+
+    // Slice 6.3a — kind -> JSON property name carrying that kind's foreign key to a WorkUnitId,
+    // used ONLY by the migration below to resolve PRE-6.3a rows (which have no "RepositoryId"
+    // property in their stored payload at all — the C# record didn't carry the field yet). Live
+    // writes/reads never need this: every record created after 6.3a shipped already resolves and
+    // stores its own RepositoryId at creation time (see RepositoryIdResolution), so the generic
+    // "RepositoryId" property parse (TryExtractRepositoryId, used by both migration passes) covers
+    // those rows directly. BranchV1 and KnownGoodStateV1 are deliberately absent — neither carries
+    // a WorkUnitId FK; they're resolved via the branch-name reverse lookup instead (see
+    // MigrateIndirectKindsIntoRepoRoomAsync's own comment).
+    private static readonly IReadOnlyDictionary<string, string> IndirectKindWorkUnitFkProperty =
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [StudioNodeKind.MergeProposalV1] = "WorkUnitId",
+            [StudioNodeKind.TaskV1] = "WorkUnitId",
+            [StudioNodeKind.DecisionV1] = "WorkUnitId",
+            [StudioNodeKind.ArtifactRefV1] = "OwnedByWorkUnitId",
+            [StudioNodeKind.CandidateConflictV1] = "WorkUnitId",
+            [StudioNodeKind.TaskConflictV1] = "ParentWorkUnitId",
+        };
+
     // Legacy AcceptedNodeRecord shape this class wrote pre-6.1a: PayloadKind "studio", node id
     // "studio:{kind}:{entityId}:{ticksD20}".
     private const string LegacyPayloadKind = "studio";
@@ -202,6 +249,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
             var roomMap = new EngineRoomMap(id, _ => MapNamespace, _bridge, _dagPersistence, _replicationOutbound, _logger);
             await roomMap.HydrateAndReplayAsync(cancellationToken).ConfigureAwait(false);
             await MigrateStudioEntriesIntoRepoRoomAsync(roomMap, cancellationToken).ConfigureAwait(false);
+            await MigrateIndirectKindsIntoRepoRoomAsync(roomMap, cancellationToken).ConfigureAwait(false);
             return roomMap;
         }, LazyThreadSafetyMode.ExecutionAndPublication)).Value;
 
@@ -318,6 +366,204 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
 
         _logger.LogInformation(
             "studio node store repo-room migration complete room={Room} entries_migrated={Migrated}",
+            repoRoomMap.RoomId, migratedCount);
+    }
+
+    // Slice 6.3a — second-pass migration for the repo-scoped-indirect kinds (MergeProposalV1,
+    // TaskV1, BranchV1, KnownGoodStateV1, DecisionV1, ArtifactRefV1, CandidateConflictV1,
+    // TaskConflictV1). Runs independently of MigrateStudioEntriesIntoRepoRoomAsync (own marker,
+    // "repo-migrated-v2/{roomId}") because that method's marker is already set for any workspace
+    // that upgraded through 6.3 before this slice shipped — see RepoRoomMigrationMarkerV2KeyPrefix's
+    // own comment.
+    //
+    // The FK-chain wrinkle: pre-6.3a rows of these kinds have NO "RepositoryId" property in their
+    // stored payload at all (the C# record didn't carry the field yet) — so unlike the generic
+    // payload-parse the 6.3-era migration uses, resolution here first tries that same direct parse
+    // (covers any row written after 6.3a shipped but before this room's migration ran) and FALLS
+    // BACK to a kind-specific foreign-key lookup for rows that predate the field entirely:
+    //   - MergeProposalV1/TaskV1/DecisionV1/ArtifactRefV1/CandidateConflictV1/TaskConflictV1 carry a
+    //     WorkUnitId-shaped FK (IndirectKindWorkUnitFkProperty) — resolved via that WorkUnit's own
+    //     RepositoryId.
+    //   - BranchV1/KnownGoodStateV1 carry no WorkUnitId FK at all — resolved via a reverse lookup
+    //     against every known WorkUnit's own BranchId (a branch's entityId IS the branch name;
+    //     KnownGoodState's own BranchId property points at the same name). Derived/scratch branches
+    //     with no matching WorkUnit.BranchId (candidate, base/{proposalId}, merge/{parentId},
+    //     knowngood/{stateId}, task-resolution/{conflictId}) don't resolve via this heuristic and
+    //     correctly stay in "studio" — an honest "chain broken", not a bug.
+    // A broken chain (FK missing, or resolves to nothing / a different room) leaves the row in
+    // "studio" untouched, exactly like the first pass's own unresolvable case — never blocks.
+    //
+    // Deliberately does NOT call the public ReadNodeAsync/ReadAllNodesAsync (which fan out across
+    // EVERY bound repo room via GetOrCreateRepoRoomMapAsync) to build its WorkUnitId->RepositoryId
+    // lookup: this method itself runs INSIDE that same method's Lazy<> factory for repoRoomMap, so a
+    // nested call that re-entered GetOrCreateRepoRoomMapAsync for repoRoomMap's own id would await
+    // its own not-yet-completed Lazy value — a real deadlock, not a re-entrancy inefficiency. Instead
+    // it only ever needs to see (a) repoRoomMap's own current entries (this room already received
+    // every WorkUnit that resolves to it via the first-pass migration or a live write) and (b) the
+    // local "studio" room + (c) legacy rows — sufficient because any WorkUnit actually owned by a
+    // DIFFERENT already-created repo room will correctly resolve when THAT room's own copy of this
+    // same migration runs (triggered lazily whenever a peer next touches it).
+    private async Task MigrateIndirectKindsIntoRepoRoomAsync(EngineRoomMap repoRoomMap, CancellationToken cancellationToken)
+    {
+        var markerKey = RepoRoomMigrationMarkerV2KeyPrefix + repoRoomMap.RoomId;
+        if (_roomMap.TryGetValueRawJson(MetaNamespace, markerKey) is not null)
+            return;
+
+        // WorkUnitId -> RepositoryId, and BranchId -> RepositoryId (reverse lookup for BranchV1/
+        // KnownGoodStateV1), built once from every WorkUnitV1 row visible without a cross-room call
+        // (see method comment for why: repoRoomMap's own entries + "studio" + legacy).
+        var workUnitToRepositoryId = new Dictionary<string, string>(StringComparer.Ordinal);
+        var branchToRepositoryId = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        void IndexWorkUnitRow(string entityId, string payloadJson)
+        {
+            var repositoryId = TryExtractRepositoryId(payloadJson);
+            if (repositoryId is null)
+                return;
+            workUnitToRepositoryId[entityId] = repositoryId;
+
+            var branchId = TryExtractStringProperty(payloadJson, "BranchId");
+            if (branchId is not null)
+                branchToRepositoryId[branchId] = repositoryId;
+        }
+
+        var workUnitPrefix = StudioNodeKind.WorkUnitV1 + "/";
+        foreach (var (mapKey, valueRawJson) in repoRoomMap.AllEntries(MapNamespace))
+        {
+            if (mapKey.StartsWith(workUnitPrefix, StringComparison.Ordinal))
+                IndexWorkUnitRow(mapKey[workUnitPrefix.Length..], ExtractPayloadRawText(valueRawJson));
+        }
+        foreach (var (mapKey, valueRawJson) in _roomMap.AllEntries(MapNamespace))
+        {
+            if (mapKey.StartsWith(workUnitPrefix, StringComparison.Ordinal))
+                IndexWorkUnitRow(mapKey[workUnitPrefix.Length..], ExtractPayloadRawText(valueRawJson));
+        }
+        foreach (var row in await LoadLatestLegacyRowsAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (string.Equals(row.Kind, StudioNodeKind.WorkUnitV1, StringComparison.Ordinal))
+                IndexWorkUnitRow(row.EntityId, row.PayloadJson);
+        }
+
+        // Resolves one candidate row's RepositoryId: direct property first (rows written after
+        // 6.3a shipped), then the kind-specific FK chain (pre-6.3a rows).
+        string? ResolveRepositoryId(string kind, string entityId, string payloadJson)
+        {
+            var direct = TryExtractRepositoryId(payloadJson);
+            if (direct is not null)
+                return direct;
+
+            if (string.Equals(kind, StudioNodeKind.BranchV1, StringComparison.Ordinal))
+                return branchToRepositoryId.GetValueOrDefault(entityId);
+
+            if (string.Equals(kind, StudioNodeKind.KnownGoodStateV1, StringComparison.Ordinal))
+            {
+                var branchId = TryExtractStringProperty(payloadJson, "BranchId");
+                return branchId is null ? null : branchToRepositoryId.GetValueOrDefault(branchId);
+            }
+
+            if (IndirectKindWorkUnitFkProperty.TryGetValue(kind, out var fkProperty))
+            {
+                var fkWorkUnitId = TryExtractStringProperty(payloadJson, fkProperty);
+                return fkWorkUnitId is null ? null : workUnitToRepositoryId.GetValueOrDefault(fkWorkUnitId);
+            }
+
+            return null;
+        }
+
+        var migratedCount = 0;
+
+        async Task TryMigrateRowAsync(string kind, string entityId, string payloadJson)
+        {
+            if (!IndirectRoutedKinds.Contains(kind))
+                return;
+
+            var key = BuildKey(kind, entityId);
+            if (repoRoomMap.TryGetValueRawJson(MapNamespace, key) is not null)
+                return; // already migrated (first pass never touches these kinds, but a live write since might have)
+
+            var repositoryId = ResolveRepositoryId(kind, entityId, payloadJson);
+            if (repositoryId is null)
+                return; // broken chain — leave in "studio", per spec
+
+            var resolvedRoomId = await TryResolveRepoRoomIdCoreAsync(repositoryId, cancellationToken).ConfigureAwait(false);
+            if (!string.Equals(resolvedRoomId, repoRoomMap.RoomId, StringComparison.Ordinal))
+                return; // belongs to a different (or no) bound room — not this room's pass to migrate
+
+            using var payloadDoc = JsonDocument.Parse(payloadJson);
+            var status = repoRoomMap.Set(MapNamespace, key, new { v = 1, kind, payload = payloadDoc.RootElement });
+            if (status == AsStatus.Ok)
+                migratedCount += 1;
+            else
+                _logger.LogWarning(
+                    "studio node store indirect-kind migration MapSet failed room={Room} kind={Kind} entityId={EntityId} status={Status}",
+                    repoRoomMap.RoomId, kind, entityId, status);
+        }
+
+        // Source 1: rows still sitting in the local "studio" engine map.
+        foreach (var (mapKey, valueRawJson) in _roomMap.AllEntries(MapNamespace).ToList())
+        {
+            string? kind = null;
+            string? entityId = null;
+            try
+            {
+                using var envelopeDoc = JsonDocument.Parse(valueRawJson);
+                if (envelopeDoc.RootElement.TryGetProperty("kind", out var kindEl) && kindEl.ValueKind == JsonValueKind.String)
+                    kind = kindEl.GetString();
+            }
+            catch (JsonException) { continue; }
+
+            if (kind is null || !IndirectRoutedKinds.Contains(kind))
+                continue;
+
+            var prefix = kind + "/";
+            if (!mapKey.StartsWith(prefix, StringComparison.Ordinal))
+                continue;
+            entityId = mapKey[prefix.Length..];
+
+            await TryMigrateRowAsync(kind, entityId, ExtractPayloadRawText(valueRawJson)).ConfigureAwait(false);
+        }
+
+        // Source 2: legacy (pre-6.1a) AcceptedNodeRecord rows never yet imported into any engine map.
+        foreach (var row in await LoadLatestLegacyRowsAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (IndirectRoutedKinds.Contains(row.Kind))
+                await TryMigrateRowAsync(row.Kind, row.EntityId, row.PayloadJson).ConfigureAwait(false);
+        }
+
+        if (migratedCount > 0)
+        {
+            var (promoteStatus, promotedNodeIdHex) = repoRoomMap.PromoteLatestCheckpointToGraph();
+            if (promoteStatus != AsStatus.Ok)
+            {
+                _logger.LogWarning(
+                    "studio node store indirect-kind migration checkpoint promotion failed room={Room} status={Status}",
+                    repoRoomMap.RoomId, promoteStatus);
+            }
+
+            await repoRoomMap.PersistAndReplicateAsync(promotedNodeIdHex, cancellationToken).ConfigureAwait(false);
+        }
+
+        var markerStatus = _roomMap.Set(MetaNamespace, markerKey, new
+        {
+            v = 1,
+            migratedAtUtc = DateTimeOffset.UtcNow,
+            entriesMigrated = migratedCount
+        });
+        if (markerStatus == AsStatus.Ok)
+        {
+            var (studioPromoteStatus, studioPromotedNodeIdHex) = _roomMap.PromoteLatestCheckpointToGraph();
+            if (studioPromoteStatus == AsStatus.Ok)
+                await _roomMap.PersistAndReplicateAsync(studioPromotedNodeIdHex, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            _logger.LogWarning(
+                "studio node store indirect-kind migration marker write failed room={Room} status={Status} — migration will re-attempt next room touch",
+                repoRoomMap.RoomId, markerStatus);
+        }
+
+        _logger.LogInformation(
+            "studio node store indirect-kind migration complete room={Room} entries_migrated={Migrated}",
             repoRoomMap.RoomId, migratedCount);
     }
 

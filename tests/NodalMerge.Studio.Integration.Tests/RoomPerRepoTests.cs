@@ -128,6 +128,197 @@ public class RoomPerRepoTests : IDisposable
         Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", unboundKey));
     }
 
+    /// <summary>
+    /// Slice 6.3a (plans/cas-distribution-and-storage.md Phase 6, D1) — denormalize RepositoryId
+    /// onto the repo-scoped-indirect kinds (MergeProposalV1, TaskV1, BranchV1, KnownGoodStateV1,
+    /// DecisionV1, ArtifactRefV1) and route them like 6.3 already routes the 5 direct kinds. Every
+    /// record below is created through its REAL production service (IOrchestratorService,
+    /// ITaskService, IMergeCommandService, IKnownGoodStateService, IDecisionNodeService,
+    /// IArtifactLineageService) — not a synthetic WriteNodeAsync call — so this proves the
+    /// denormalization actually happens on the write paths agents/UI/REST exercise, not just that
+    /// the mechanism *could* work.
+    /// </summary>
+    [Fact]
+    public async Task Indirect_kinds_denormalize_RepositoryId_through_real_services_and_route_to_repo_room()
+    {
+        await using var app = BuildApp("indirect-routing");
+        var repo = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "indirect-repoA"), "repoA");
+        var repoRoomId = $"repo/{repo.WorkgroupRepoId}";
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var parent = await orchestrator.CreateWorkUnitAsync(
+            goal: "parent goal", owner: "tester", repositoryId: repo.RepositoryId);
+        Assert.Equal(repo.RepositoryId, parent.RepositoryId);
+
+        // BranchV1 — previously a bare {id, parentId, createdAt} with no repo linkage at all.
+        var branchKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.BranchV1, parent.BranchId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", branchKey));
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", branchKey));
+
+        // Child work unit: single-hop parent-chain inheritance — no repositoryId passed explicitly.
+        var child = await orchestrator.CreateWorkUnitAsync(
+            goal: "child goal", owner: "tester", parentWorkUnitId: parent.WorkUnitId);
+        Assert.Equal(repo.RepositoryId, child.RepositoryId);
+        var childKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.WorkUnitV1, child.WorkUnitId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", childKey));
+
+        // TaskV1 — denormalized from its (required) WorkUnitId.
+        var tasks = app.Services.GetRequiredService<ITaskService>();
+        var task = await tasks.CreateAsync(new StudioTask(
+            $"TASK-{Guid.NewGuid():N}", parent.WorkUnitId, "title", "desc",
+            NodalMerge.Studio.Contracts.Domain.TaskStatus.Open, null, 0));
+        Assert.Equal(repo.RepositoryId, task.RepositoryId);
+        var taskKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.TaskV1, task.TaskId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", taskKey));
+
+        // MergeProposalV1 — via the real command service, which resolves RepositoryId from the
+        // proposing work unit exactly like the MCP/REST/agent-loop paths do.
+        var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
+        var proposal = await mergeCommands.ProposeAsync(
+            sourceBranch: parent.BranchId, targetBranch: "main", summary: "test proposal",
+            workUnitId: parent.WorkUnitId);
+        Assert.Equal(repo.RepositoryId, proposal.RepositoryId);
+        var proposalKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.MergeProposalV1, proposal.ProposalId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", proposalKey));
+
+        // KnownGoodStateV1 — has no WorkUnitId at all; resolved via its BranchId's own BranchV1.
+        var knownGood = app.Services.GetRequiredService<IKnownGoodStateService>();
+        var state = await knownGood.MarkKnownGoodAsync(new KnownGoodState(
+            $"KGS-{Guid.NewGuid():N}", parent.BranchId, "checkpoint", null, DateTimeOffset.UtcNow, "tester"));
+        Assert.Equal(repo.RepositoryId, state.RepositoryId);
+        var kgsKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.KnownGoodStateV1, state.StateId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", kgsKey));
+
+        // DecisionV1 — denormalized from WorkUnitId.
+        var decisions = app.Services.GetRequiredService<IDecisionNodeService>();
+        var decision = await decisions.RecordAsync(new DecisionNode(
+            $"DEC-{Guid.NewGuid():N}", parent.WorkUnitId, null, DecisionOutcome.Accepted,
+            null, null, null, null, null, DateTimeOffset.UtcNow));
+        Assert.Equal(repo.RepositoryId, decision.RepositoryId);
+        var decisionKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.DecisionV1, decision.DecisionId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", decisionKey));
+
+        // ArtifactRefV1 — CreateWorkUnitAsync already recorded parent's own Goal artifact; confirm
+        // it denormalized and routed too (OwnedByWorkUnitId -> owning work unit's RepositoryId).
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+        var goalArtifact = await artifacts.GetAsync(parent.WorkUnitId);
+        Assert.NotNull(goalArtifact);
+        Assert.Equal(repo.RepositoryId, goalArtifact!.RepositoryId);
+        var artifactKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.ArtifactRefV1, goalArtifact.ArtifactId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", artifactKey));
+
+        // Broken chain: a work unit with no RepositoryId and no parent — everything hanging off it
+        // stays in "studio", never blocked.
+        var orphan = await orchestrator.CreateWorkUnitAsync(goal: "orphan goal", owner: "tester");
+        Assert.Null(orphan.RepositoryId);
+        var orphanTask = await tasks.CreateAsync(new StudioTask(
+            $"TASK-{Guid.NewGuid():N}", orphan.WorkUnitId, "t", "d",
+            NodalMerge.Studio.Contracts.Domain.TaskStatus.Open, null, 0));
+        Assert.Null(orphanTask.RepositoryId);
+        var orphanTaskKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.TaskV1, orphanTask.TaskId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", orphanTaskKey));
+        Assert.Null(TryReadEngineMapValue(bridge, repoRoomId, "studio", orphanTaskKey));
+    }
+
+    /// <summary>
+    /// Migration: pre-6.3a rows of the newly-routed kinds carry NO "RepositoryId" property at all
+    /// (the field didn't exist yet) — the second-pass migration must resolve ownership via the FK
+    /// chain (proposal -> work unit -> repo), leave broken chains in "studio", run exactly once
+    /// (marker-guarded, restart-proof), and leave old rows intact (AP-5). Also covers rehydration
+    /// completeness: after restart, IMergeService's own rehydrated in-memory dictionary must see
+    /// the repo-room-resident proposal — the highest-risk regression this slice calls out.
+    /// </summary>
+    [Fact]
+    public async Task Pre63a_indirect_kind_rows_migrate_via_FK_chain_exactly_once_and_rehydrate_after_restart()
+    {
+        var repoPath = Path.Combine(_tempRoot, "premig-repoA");
+        string workgroupRepoId;
+        string localRepoId;
+
+        await using (var app1 = BuildApp("premig"))
+        {
+            var store1 = app1.Services.GetRequiredService<IStudioNodeStore>();
+            var bridge1 = app1.Services.GetRequiredService<IRuntimeCommandBridge>();
+
+            var repo = await RegisterBoundRepoAsync(app1.Services, repoPath, "repoA");
+            workgroupRepoId = repo.WorkgroupRepoId!;
+            localRepoId = repo.RepositoryId;
+            var repoRoomId = $"repo/{workgroupRepoId}";
+
+            // Simulate a pre-6.3a writer: real domain records, serialized exactly like production
+            // code does (JsonSerializer.Serialize(record), default options — enums as numbers).
+            // WorkUnitV1 already carries RepositoryId (that field existed since 6.3); MergeProposal's
+            // RepositoryId defaults to null, which round-trips identically to "property absent" for
+            // TryExtractRepositoryId's purposes — the exact shape a genuinely pre-6.3a row has. Both
+            // land in "studio" via the room-agnostic 3-arg overload, exactly where every pre-6.3a
+            // row lived.
+            var workUnit = new WorkUnit(
+                "WU-premig", "premig goal", "branch-premig", WorkUnitStatus.Active,
+                DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, "tester", null, null, null, null, [], [],
+                RepositoryId: localRepoId);
+            await store1.WriteNodeAsync(StudioNodeKind.WorkUnitV1, "WU-premig", JsonSerializer.Serialize(workUnit));
+
+            var proposal = new MergeProposal(
+                "MP-premig", "branch-premig", "main", "premig goal", "summary", "change",
+                null, null, null, MergeProposalStatus.Draft, WorkUnitId: "WU-premig");
+            await store1.WriteNodeAsync(StudioNodeKind.MergeProposalV1, "MP-premig", JsonSerializer.Serialize(proposal));
+
+            // Broken-chain row: WorkUnitId points at nothing — must stay in "studio" forever, not
+            // block the migration or get silently dropped.
+            var ghostProposal = new MergeProposal(
+                "MP-ghost", "branch-ghost", "main", "ghost goal", "summary", "change",
+                null, null, null, MergeProposalStatus.Draft, WorkUnitId: "WU-does-not-exist");
+            await store1.WriteNodeAsync(StudioNodeKind.MergeProposalV1, "MP-ghost", JsonSerializer.Serialize(ghostProposal));
+
+            var proposalKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.MergeProposalV1, "MP-premig");
+            var ghostKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.MergeProposalV1, "MP-ghost");
+            Assert.NotNull(TryReadEngineMapValue(bridge1, "studio", "studio", proposalKey));
+
+            // First touch of the repo room (any repo-scoped read triggers GetOrCreateRepoRoomMapAsync,
+            // which now runs BOTH the 6.3 and 6.3a migration passes).
+            var readBack = await store1.ReadNodeAsync(StudioNodeKind.WorkUnitV1, "WU-premig");
+            Assert.NotNull(readBack);
+
+            // The proposal resolved via WU-premig's own RepositoryId and migrated into the repo room.
+            Assert.NotNull(TryReadEngineMapValue(bridge1, repoRoomId, "studio", proposalKey));
+            Assert.NotNull(TryReadEngineMapValue(bridge1, "studio", "studio", proposalKey)); // old row intact (AP-5)
+
+            // The ghost (broken-chain) proposal never resolves — stays in "studio" only.
+            Assert.Null(TryReadEngineMapValue(bridge1, repoRoomId, "studio", ghostKey));
+            Assert.NotNull(TryReadEngineMapValue(bridge1, "studio", "studio", ghostKey));
+
+            var proposalReadBack = await store1.ReadNodeAsync(StudioNodeKind.MergeProposalV1, "MP-premig");
+            Assert.NotNull(proposalReadBack);
+            using var doc = JsonDocument.Parse(proposalReadBack!);
+            Assert.Equal("MP-premig", doc.RootElement.GetProperty("ProposalId").GetString());
+        }
+
+        // Restart: migration must not re-run (v2 marker is durable), must not duplicate/clobber
+        // anything, and rehydration must see the repo-room-resident proposal through the real
+        // IMergeService — the highest-risk regression path (in-memory service rehydration).
+        await using (var app2 = BuildApp("premig"))
+        {
+            // StudioStateRehydrationService is an IHostedService — only StartAsync actually runs
+            // every IRehydratable's RehydrateAsync (including InMemoryMergeService's own).
+            await app2.StartAsync();
+
+            var store2 = app2.Services.GetRequiredService<IStudioNodeStore>();
+            var merge2 = app2.Services.GetRequiredService<IMergeService>();
+
+            var all = await store2.ReadAllNodesAsync(StudioNodeKind.MergeProposalV1);
+            Assert.Single(all, e => e.EntityId == "MP-premig");
+            Assert.Single(all, e => e.EntityId == "MP-ghost");
+
+            var rehydrated = await merge2.GetAsync("MP-premig");
+            Assert.NotNull(rehydrated);
+            Assert.Equal("WU-premig", rehydrated!.WorkUnitId);
+
+            var rehydratedGhost = await merge2.GetAsync("MP-ghost");
+            Assert.NotNull(rehydratedGhost);
+        }
+    }
+
     [Fact]
     public async Task ReadAllNodesAsync_aggregates_across_two_bound_repo_rooms_and_studio()
     {
@@ -310,6 +501,31 @@ public class RoomPerRepoTests : IDisposable
             Assert.Equal(2, goalOnB!.RepoWorkUnits.Count);
             Assert.Contains(goalOnB.RepoWorkUnits, r => r.RepoId == repoR1.WorkgroupRepoId && r.WorkUnitId == "WU-span-r1");
             Assert.Contains(goalOnB.RepoWorkUnits, r => r.RepoId == repoR2.WorkgroupRepoId && r.WorkUnitId == "WU-span-r2");
+
+            // Slice 6.3a's whole point — 5.3's precondition: a MergeProposal created on peer A for a
+            // bound repo (R1) rides the exact same repo-room replication WU-span-r1 used, and becomes
+            // visible on peer B without restart on either side.
+            var proposalPayload = JsonSerializer.Serialize(new
+            {
+                ProposalId = "MP-span-r1",
+                SourceBranch = "WU-span-r1-branch",
+                TargetBranch = "main",
+                Goal = "cross-repo goal, R1 half",
+                Summary = "test proposal",
+                ChangeDescription = "test",
+                Status = "Draft",
+                WorkUnitId = "WU-span-r1",
+                RepositoryId = repoR1.RepositoryId,
+            });
+            await storeA.WriteNodeAsync(
+                StudioNodeKind.MergeProposalV1, "MP-span-r1", proposalPayload, repoR1.RepositoryId);
+
+            await PollUntilAsync(async () =>
+                await storeB.ReadNodeAsync(StudioNodeKind.MergeProposalV1, "MP-span-r1") is not null);
+            var proposalOnB = await storeB.ReadNodeAsync(StudioNodeKind.MergeProposalV1, "MP-span-r1");
+            Assert.NotNull(proposalOnB);
+            using (var proposalDoc = JsonDocument.Parse(proposalOnB!))
+                Assert.Equal("WU-span-r1", proposalDoc.RootElement.GetProperty("WorkUnitId").GetString());
         }
         finally
         {

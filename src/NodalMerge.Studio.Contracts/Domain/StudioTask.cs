@@ -22,7 +22,11 @@ public sealed record StudioTask(
     TaskStatus Status,
     string? Assignee,
     int Priority,
-    string? Domain = null);
+    string? Domain = null,
+    // Slice 6.3a — denormalized at creation from the owning WorkUnit's own RepositoryId (a task
+    // always has exactly one WorkUnitId, so this is a direct copy, never a chain walk). Null when
+    // the work unit itself has no resolvable RepositoryId, or the task predates 6.3a.
+    string? RepositoryId = null);
 
 public static class TaskTransitions
 {

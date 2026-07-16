@@ -15,18 +15,34 @@ public sealed class DecisionNodeService : IDecisionNodeService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, DecisionNode> _decisions = new();
     private readonly IStudioNodeStore _nodeStore;
+    private readonly IWorkUnitService? _workUnits;
 
-    public DecisionNodeService(IStudioNodeStore nodeStore)
+    // workUnits is optional/constructor-injected directly (not via lazy IServiceProvider) — safe
+    // because, unlike IArtifactLineageService/IMergeService/IKnownGoodStateService,
+    // InMemoryWorkUnitService does not itself depend on IDecisionNodeService, so no DI cycle exists.
+    public DecisionNodeService(IStudioNodeStore nodeStore, IWorkUnitService? workUnits = null)
     {
         _nodeStore = nodeStore;
+        _workUnits = workUnits;
     }
 
     public async Task<DecisionNode> RecordAsync(DecisionNode decision, CancellationToken ct = default)
     {
-        _decisions[decision.DecisionId] = decision;
+        // Slice 6.3a — denormalize from WorkUnitId's own RepositoryId when not already supplied.
+        var stored = decision;
+        if (stored.RepositoryId is null)
+        {
+            var repositoryId = await RepositoryIdResolution
+                .ResolveFromWorkUnitAsync(_workUnits, stored.WorkUnitId, ct).ConfigureAwait(false);
+            if (repositoryId is not null)
+                stored = stored with { RepositoryId = repositoryId };
+        }
+
+        _decisions[stored.DecisionId] = stored;
         await _nodeStore.WriteNodeAsync(
-            StudioNodeKind.DecisionV1, decision.DecisionId, JsonSerializer.Serialize(decision), ct).ConfigureAwait(false);
-        return decision;
+            StudioNodeKind.DecisionV1, stored.DecisionId, JsonSerializer.Serialize(stored), stored.RepositoryId, ct)
+            .ConfigureAwait(false);
+        return stored;
     }
 
     public async Task RehydrateAsync(CancellationToken ct = default)

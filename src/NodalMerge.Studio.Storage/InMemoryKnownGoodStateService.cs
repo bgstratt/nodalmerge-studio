@@ -21,19 +21,29 @@ internal sealed class InMemoryKnownGoodStateService : IKnownGoodStateService, IR
 
     public async Task<KnownGoodState> MarkKnownGoodAsync(KnownGoodState state, CancellationToken cancellationToken = default)
     {
+        // Slice 6.3a — resolve via state.BranchId's own stored BranchV1.RepositoryId (a known-good
+        // state has no WorkUnitId to chain through). Null when BranchId itself never resolved one
+        // (ad hoc/global branch, or a pre-6.3a BranchV1 row) — falls back to "studio" like every
+        // other unresolvable case, never blocking the mark.
+        var repositoryId = state.RepositoryId
+            ?? await RepositoryIdResolution.ResolveFromBranchAsync(_nodeStore, state.BranchId, cancellationToken)
+                .ConfigureAwait(false);
+
         // Real point-in-time copy: a snapshot branch seeded from state.BranchId's current files
         // (CreateBranchAsync calls IFileWorkspaceService.InitBranchAsync internally), so a later
         // edit to state.BranchId can't retroactively change what "known good" looked like.
         var snapshotBranchId = await _branches
-            .CreateBranchAsync($"knowngood/{state.StateId}", state.BranchId, cancellationToken: cancellationToken)
+            .CreateBranchAsync(
+                $"knowngood/{state.StateId}", state.BranchId, repositoryId: repositoryId, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
-        var snapshotted = state with { SnapshotBranchId = snapshotBranchId };
+        var snapshotted = state with { SnapshotBranchId = snapshotBranchId, RepositoryId = repositoryId };
 
         _states[snapshotted.StateId] = snapshotted;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.KnownGoodStateV1,
             snapshotted.StateId,
             JsonSerializer.Serialize(snapshotted),
+            snapshotted.RepositoryId,
             cancellationToken).ConfigureAwait(false);
         return snapshotted;
     }

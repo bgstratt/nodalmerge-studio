@@ -15,7 +15,10 @@ public sealed record DecisionNode(
     double? Confidence,
     string? Rationale,
     DateTimeOffset DecidedAt,
-    string? SessionId = null);
+    string? SessionId = null,
+    // Slice 6.3a — denormalized at RecordAsync time from WorkUnitId's own RepositoryId. Null when
+    // the work unit itself has no resolvable RepositoryId, or the decision predates 6.3a.
+    string? RepositoryId = null);
 
 public enum DecisionOutcome
 {

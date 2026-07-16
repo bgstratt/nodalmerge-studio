@@ -85,6 +85,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             StudioNodeKind.MergeProposalV1,
             stored.ProposalId,
             JsonSerializer.Serialize(stored),
+            stored.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         // Snapshot the target branch's current content as this proposal's base state (S0, 10f).
@@ -124,6 +125,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         if (proposal.SessionId is not null)
@@ -165,6 +167,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         EventBus?.Publish(new ReviewCompletedEvent(
@@ -481,6 +484,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         EventBus?.Publish(new ReviewCompletedEvent(
@@ -768,6 +772,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         // A reconciliation work unit's own proposal just landed — generic across every source
@@ -810,6 +815,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                         StudioNodeKind.MergeProposalV1,
                         sourceProposalId,
                         JsonSerializer.Serialize(supersededProposal),
+                        supersededProposal.RepositoryId,
                         cancellationToken).ConfigureAwait(false);
 
                     if (workUnitsForSupersede is not null && sourceProposal.WorkUnitId is { } sourceWorkUnitId)
@@ -946,6 +952,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                             await _nodeStore.WriteNodeAsync(
                                 StudioNodeKind.MergeProposalV1, proposalId,
                                 JsonSerializer.Serialize(rolledBack),
+                                rolledBack.RepositoryId,
                                 CancellationToken.None).ConfigureAwait(false);
 
                             throw new InvalidOperationException(
@@ -1281,6 +1288,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 StudioNodeKind.MergeProposalV1,
                 proposal.ProposalId,
                 JsonSerializer.Serialize(updated),
+                updated.RepositoryId,
                 cancellationToken).ConfigureAwait(false);
             promoted.Add(updated);
         }
@@ -1440,7 +1448,10 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                         proposal.WorkUnitId,
                         conflicts,
                         DateTimeOffset.UtcNow,
-                        WinningProposalId: winningProposal?.ProposalId);
+                        WinningProposalId: winningProposal?.ProposalId,
+                        // Slice 6.3a — owningWorkUnit is already resolved above (the losing
+                        // proposal's own owning work unit), so this is a direct copy.
+                        RepositoryId: owningWorkUnit?.RepositoryId);
                     await _candidateConflicts.RecordAsync(conflictRecord, ct).ConfigureAwait(false);
 
                     reconciliationUnit = await TryAutoTriggerReconciliationAsync(conflictRecord, ct).ConfigureAwait(false);
@@ -1472,7 +1483,8 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                         proposal.WorkUnitId,
                         conflicts,
                         DateTimeOffset.UtcNow,
-                        WinningProposalId: winningSibling?.ProposalId);
+                        WinningProposalId: winningSibling?.ProposalId,
+                        RepositoryId: owningWorkUnit?.RepositoryId);
                     await _taskConflicts.RecordAsync(taskConflictRecord, ct).ConfigureAwait(false);
 
                     reconciliationUnit ??= await TryAutoTriggerTaskReconciliationAsync(taskConflictRecord, ct).ConfigureAwait(false);
@@ -1685,6 +1697,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         if (proposal.WorkUnitId is not null)

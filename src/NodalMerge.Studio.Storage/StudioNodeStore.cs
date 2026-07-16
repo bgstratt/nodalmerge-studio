@@ -68,20 +68,35 @@ public static class StudioNodeKind
     // routes to a per-repo engine room (repo/{repositoryId}) via the WriteNodeAsync(..., repositoryId,
     // ...) overload below; every other kind stays in the workspace-local "studio" room.
     //
-    // Two families were deliberately NOT included despite being conceptually repo-scoped, and are
-    // flagged here rather than silently guessed at (decide from the data, per the slice brief):
-    //   1. REPO-SCOPED-INDIRECT (~25 of the remaining kinds: TaskV1, MergeProposalV1, BranchV1,
-    //      KnownGoodStateV1, GoalV1, DecisionV1, ArtifactRefV1, ... ) carry no RepositoryId field at
-    //      all — only a WorkUnitId/BranchId/ParentWorkUnitId foreign key, and WorkUnit.RepositoryId
-    //      itself is nullable (null for forked/child work units, which inherit repo identity via
-    //      their parent chain instead). Resolving these correctly means either a live WorkUnit
-    //      lookup at every one of ~40 write call sites (risking the exact IStudioNodeStore ->
-    //      IWorkUnitService -> IStudioNodeStore DI cycle NodalMergeStudioNodeStore already has to
-    //      dodge for IRepositoryRegistryService) or a parent-chain walk to find the nearest
-    //      non-null RepositoryId. Both are real design decisions, not a mechanical wire-through —
-    //      left for a follow-up slice (6.4/6.5) rather than rushed here. These kinds remain in
-    //      "studio" for 6.3; BranchV1 in particular has NO stored field of any kind linking it to a
-    //      repo or work unit (it's a bare {id, parentId, createdAt} — see NodalMergeBranchService).
+    // Slice 6.3a — the "repo-scoped-indirect" family 6.3 deliberately deferred (see that slice's own
+    // finding, preserved below) is now ALSO in this set: MergeProposalV1, TaskV1, BranchV1,
+    // KnownGoodStateV1, DecisionV1, ArtifactRefV1, CandidateConflictV1, TaskConflictV1. Each of
+    // these records now carries its OWN `RepositoryId` field too (added by 6.3a, denormalized at
+    // creation time from the owning WorkUnit's already-resolved RepositoryId — see
+    // RepositoryIdResolution and each record's own field comment), so — per 6.3's own recommendation
+    // — no live WorkUnit lookup or parent-chain walk is needed at read/route time; every kind in
+    // this set now satisfies the exact same "direct field" contract uniformly, and
+    // NodalMergeStudioNodeStore's routing/aggregation/migration code (all written generically
+    // against this set + a "RepositoryId" JSON property name) needed ZERO changes to cover them.
+    // BranchV1 in particular had NO stored field of any kind before 6.3a (a bare
+    // {id, parentId, createdAt} — see NodalMergeBranchService) and gained one for this slice.
+    //
+    // Deliberately left OUT of this set (still peer-local, "studio" room), with reasons:
+    //   - GoalV1, goal routing (GoalRoutingV1/OrchestratorRoutingV1), RuntimeSettingsV1,
+    //     WorkspaceV1, SchedulerV1, AgentWorkspaceV1: workgroup/global by design (D1) — a goal can
+    //     span multiple repos (D3), so it is not single-repo-scoped at all.
+    //   - ExecutionSessionV1, ExecutionEventV1, ExecutionResultV1, CommandResultV1: hang off a
+    //     work unit/session but are by far the highest-volume kinds in practice (one row per
+    //     execution event — see the 2026-07-15 baseline note: "bulk of node-store growth... is
+    //     tasks/messages/history", i.e. exactly these). 5.3's retention classification (Pinned/
+    //     Active/Intermediate, 5.1) is computed entirely from snapshots/work-units/branches/
+    //     proposals — it never needs to see these to do its job — and Phase 5's own "Out of scope"
+    //     section already flags non-CAS node-store retention for this family as a *separate*,
+    //     replication-plane-compaction problem, not this slice's. Routing them now would multiply
+    //     per-repo-room replication traffic for no 5.3 benefit; revisit only if/when that
+    //     compaction question is designed.
+    //   - GcRunV1: not per-repo (today's GC run ledger is workspace-wide); out of this slice's
+    //     named target set.
     //   2. Genuinely GLOBAL/cross-repo kinds: BlobIndexEntryV1 and WorkspaceV1 carry `RepositoryIds`
     //      (plural) by design — a blob can be referenced by multiple repos (global CAS dedup, D5),
     //      and the workspace aggregate owns every repo. RepositorySyncStateV1 is keyed by
@@ -96,6 +111,15 @@ public static class StudioNodeKind
         RepositoryOpV1,
         RepositoryConflictV1,
         CoModPatternV1,
+        // Slice 6.3a additions:
+        MergeProposalV1,
+        TaskV1,
+        BranchV1,
+        KnownGoodStateV1,
+        DecisionV1,
+        ArtifactRefV1,
+        CandidateConflictV1,
+        TaskConflictV1,
     };
 }
 

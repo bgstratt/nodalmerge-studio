@@ -337,7 +337,10 @@ public sealed class MergeReconciliationService(
             DiffGeneratedAt: DateTimeOffset.UtcNow,
             WorkUnitId: parent.WorkUnitId,
             FilesTouched: filesTouched,
-            ReconciledFrom: constituentIds);
+            ReconciledFrom: constituentIds,
+            // Slice 6.3a — parent is the reconciliation's own top-level/parent WorkUnit, already
+            // resolved (direct copy, no chain walk needed).
+            RepositoryId: parent.RepositoryId);
 
         await merge.ProposeAsync(reconciled, cancellationToken).ConfigureAwait(false);
         await merge.ValidateAsync(reconciledId, cancellationToken).ConfigureAwait(false);

@@ -114,7 +114,9 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
                     Provider: provider,
                     SessionId: sessionId,
                     WorkUnitId: workUnitId,
-                    FilesTouched: []);
+                    FilesTouched: [],
+                    // Slice 6.3a — proposingWorkUnit is already resolved above.
+                    RepositoryId: proposingWorkUnit?.RepositoryId);
                 var saved = await merge.ProposeAsync(blockedProposal, cancellationToken).ConfigureAwait(false);
 
                 if (commandId is not null)
@@ -175,7 +177,8 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
                     Provider:         provider,
                     SessionId:        sessionId,
                     WorkUnitId:       workUnitId,
-                    FilesTouched:     []);
+                    FilesTouched:     [],
+                    RepositoryId:     proposingWorkUnit?.RepositoryId);
                 var savedRejected = await merge.ProposeAsync(rejectedProposal, cancellationToken).ConfigureAwait(false);
 
                 if (commandId is not null)
@@ -215,7 +218,8 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
             SessionId:        sessionId,
             WorkUnitId:       workUnitId,
             FilesTouched:     filesTouched,
-            NoFileChangesJustification: noFileChangesJustification);
+            NoFileChangesJustification: noFileChangesJustification,
+            RepositoryId:     proposingWorkUnit?.RepositoryId);
         var created = await merge.ProposeAsync(proposal, cancellationToken).ConfigureAwait(false);
 
         // ── Domain event ──────────────────────────────────────────────────────────

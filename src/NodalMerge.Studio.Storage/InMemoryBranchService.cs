@@ -9,8 +9,10 @@ internal sealed class InMemoryBranchService(IFileWorkspaceService fileWorkspace)
 
     private readonly ConcurrentDictionary<string, BranchEntry> _branches = new();
 
+    // repositoryId is accepted (interface parity) but never persisted — this test/dev double has
+    // no node store to route into.
     public async Task<string> CreateBranchAsync(string name, string? fromBranchId = null,
-        IReadOnlyList<string>? fileScope = null, CancellationToken cancellationToken = default)
+        IReadOnlyList<string>? fileScope = null, string? repositoryId = null, CancellationToken cancellationToken = default)
     {
         await fileWorkspace.InitBranchAsync(name, fromBranchId, fileScope, cancellationToken).ConfigureAwait(false);
         var workDir = await fileWorkspace.GetWorkingDirectoryAsync(name, cancellationToken).ConfigureAwait(false) ?? string.Empty;

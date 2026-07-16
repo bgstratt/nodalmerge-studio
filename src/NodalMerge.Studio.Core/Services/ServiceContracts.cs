@@ -1055,8 +1055,12 @@ public interface IKnownGoodStateService
 
 public interface IBranchService
 {
+    // Slice 6.3a — optional repositoryId denormalizes BranchV1 (a bare {id, parentId, createdAt}
+    // before this slice) so it routes to its owning repo room. Callers that don't have a repo
+    // context in scope (ad hoc/global branches — e.g. the shared "candidate" staging branch) pass
+    // null, which keeps the branch in "studio", matching pre-6.3a behavior exactly.
     Task<string> CreateBranchAsync(string name, string? fromBranchId = null,
-        IReadOnlyList<string>? fileScope = null, CancellationToken cancellationToken = default);
+        IReadOnlyList<string>? fileScope = null, string? repositoryId = null, CancellationToken cancellationToken = default);
 
     Task CheckoutBranchAsync(string branchId, CancellationToken cancellationToken = default);
 
