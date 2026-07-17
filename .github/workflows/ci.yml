@@ -45,21 +45,11 @@ jobs:
         with:
           global-json-file: nodalmerge-studio/global.json
 
-      # NodalMerge.* 0.2.x is not published to nuget.org (only 0.2.0 is), so studio's pins
-      # (Directory.Packages.props, currently 0.2.3) can only resolve from the local feed
-      # NuGet.config points at (../nodalmerge/artifacts/nuget-local). Pack it from the sibling
-      # nodalmerge checkout so restore — and the native-gated Integration lane below — work in
-      # CI without a nuget.org publish. On ubuntu the script builds the linux-x64 .so directly
-      # (no WSL) and placeholders the never-loaded win-x64 .dll. Keep -Version in lockstep with
-      # the pins in Directory.Packages.props.
-      - name: Setup Rust (for native FFI build during local pack)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Pack local NodalMerge feed (0.2.3)
-        working-directory: ${{ github.workspace }}
-        shell: pwsh
-        run: nodalmerge/hosts/dotnet/pack-local-nuget.ps1 -Version 0.2.3
-
+      # NodalMerge.* 0.2.3 is published to nuget.org, so studio's pins restore directly from it
+      # — no local pack step (and thus no Rust toolchain) needed in CI. Local testing of an
+      # UNRELEASED NodalMerge.* build still works via scripts/restore-local-nodalmerge.ps1, which
+      # injects a local feed at restore time (RestoreAdditionalProjectSources), independent of
+      # NuGet.config.
       - name: Restore
         run: dotnet restore NodalMerge.Studio.slnx --configfile NuGet.config
 
