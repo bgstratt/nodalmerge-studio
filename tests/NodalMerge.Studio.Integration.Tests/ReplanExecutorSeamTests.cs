@@ -17,6 +17,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// same as D1 did for the scheduler-driven Plan-stage branch.
 /// </summary>
 [Trait("Category", "Integration")]
+[Trait("Requires", "LocalCliProcess")]
 public class ReplanExecutorSeamTests : IDisposable
 {
     private readonly string _stubDir = Path.Combine(Path.GetTempPath(), $"replan-seam-stub-{Guid.NewGuid():N}");

@@ -71,8 +71,14 @@ jobs:
       - name: Test (unit)
         run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category!=Integration"
 
+      # Excludes the CLI-executor harness classes tagged [Trait("Requires","LocalCliProcess")]:
+      # their fixtures spawn Windows-style processes (a stub-claude.cmd batch file, the cmd
+      # builtin `exit`) that fail on the linux runner with Win32Exception. That's test
+      # scaffolding, not product code — the studio assemblies and every CAS/blob/multi-user
+      # integration test are portable and run green here. Making those stubs cross-platform is
+      # filed separately; they still run on Windows/local where the filter is not applied.
       - name: Test (integration)
         if: env.NODALMERGE_NATIVE_AVAILABLE == 'true'
-        run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category=Integration"
+        run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category=Integration&Requires!=LocalCliProcess"
         env:
           NODALMERGE_NATIVE_AVAILABLE: ${{ vars.NODALMERGE_NATIVE_AVAILABLE }}

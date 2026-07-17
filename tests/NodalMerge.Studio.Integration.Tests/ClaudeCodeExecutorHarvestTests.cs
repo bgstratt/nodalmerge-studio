@@ -15,6 +15,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// B3 acceptance text.
 /// </summary>
 [Trait("Category", "Integration")]
+[Trait("Requires", "LocalCliProcess")]
 public class ClaudeCodeExecutorHarvestTests : IDisposable
 {
     private readonly string _stubDir = Path.Combine(Path.GetTempPath(), $"claude-harvest-stub-{Guid.NewGuid():N}");

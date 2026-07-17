@@ -14,6 +14,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// Mirrors ClaudeCodeExecutorPlanModeTests' cases.
 /// </summary>
 [Trait("Category", "Integration")]
+[Trait("Requires", "LocalCliProcess")]
 public class CodexCliExecutorPlanModeTests : IDisposable
 {
     private readonly string _stubDir = Path.Combine(Path.GetTempPath(), $"codex-plan-stub-{Guid.NewGuid():N}");

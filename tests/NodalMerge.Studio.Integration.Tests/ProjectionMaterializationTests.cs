@@ -16,6 +16,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 // captured Payload.Execution always reflects the run that was just requested rather than whatever
 // happened to be "latest" for the branch by the time of a second, separate capture call.
 [Trait("Category", "Integration")]
+[Trait("Requires", "LocalCliProcess")]
 public class ProjectionMaterializationTests
 {
     private static (IOrchestratorService orchestrator, IProjectionSnapshotService snapshots, IServiceProvider services) BuildServices()

@@ -18,6 +18,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// turn.completed with usage tokens and no cost field.
 /// </summary>
 [Trait("Category", "Integration")]
+[Trait("Requires", "LocalCliProcess")]
 public class CodexCliExecutorTests : IDisposable
 {
     private readonly string _stubDir = Path.Combine(Path.GetTempPath(), $"codex-stub-{Guid.NewGuid():N}");

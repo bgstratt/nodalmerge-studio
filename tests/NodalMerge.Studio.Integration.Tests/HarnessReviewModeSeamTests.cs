@@ -17,6 +17,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// routes to the CLI adapter and its Approved verdict satisfies the AgentApproval policy gate.
 /// </summary>
 [Trait("Category", "Integration")]
+[Trait("Requires", "LocalCliProcess")]
 public class HarnessReviewModeSeamTests : IDisposable
 {
     private readonly string _stubDir = Path.Combine(Path.GetTempPath(), $"review-stub-{Guid.NewGuid():N}");
