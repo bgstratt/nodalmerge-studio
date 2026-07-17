@@ -139,9 +139,14 @@ workflows**, plus one-directional parity contracts.
 
 - [x] C1 shipped (nodalmerge `ff7037fc`; script + baseline + ci-coverage-meta.yml. RED: empty
   baseline reproduces 48 gaps = 17 Rust + 27 .NET uncovered + 4 one-sided pairs. Ratchet teeth
-  verified: baselining a covered suite flags STALE; restoring goes green)  · [ ] C2 shipped
-  · [x] C3 shipped (parity-pair rule folded into C1's meta-check; 7 pairs declared, 4 one-sided
-  pinned in baseline with PARITY: tags)  · [ ] C4 done
+  verified: baselining a covered suite flags STALE; restoring goes green)  · [x] C2 shipped
+  (nodalmerge `b226873f` Rust, `ed213f75` .NET managed, `596f2223` .NET FFI + Rust MinIO.
+  Baseline 46→1: Rust 62/62, .NET 61/62, all 7 parity pairs covered. New workflows
+  server-core-suites / dotnet-host-managed-suites / dotnet-host-ffi-suites; rust MinIO added to
+  blob-s3-gc-minio.yml. Every wired suite verified green locally. Only S3DirectMinioEndToEndTests
+  deferred — needs multi-process origin+MinIO orchestration, filed in baseline)
+  · [x] C3 shipped (parity-pair rule folded into C1's meta-check; 7 pairs declared, all now
+  fully covered on both runtimes)  · [ ] C4 done (needs user gh auth — see below)
 
 ## Sequencing
 
@@ -154,3 +159,7 @@ linux-x64 natives, nuget.org 0.2.3, docs-repo bump.
 - 2026-07-17: plan created.
 - 2026-07-17: A ✓, B ✓, C1/C3 ✓ shipped and RED-verified. Publish gate now blocks only on C2
   (burn down the 46-entry baseline) and C4 (studio native CI lane — needs user gh auth).
+- 2026-07-17: C2 ✓ shipped. Baseline 46→1 (Rust 62/62, .NET 61/62, all 7 parity pairs). Only
+  remaining publish-gate item is C4 (flip `NODALMERGE_NATIVE_AVAILABLE` in studio — needs user's
+  gh auth). One suite deferred as its own follow-up slice: S3DirectMinioEndToEndTests
+  (multi-process origin+MinIO orchestration). **Publish gate: A ✓ B ✓ C ✓ except C4.**
