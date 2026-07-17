@@ -1331,7 +1331,36 @@ and assert both runtimes against it.
 - **Validation:** both hosts emit the same room/namespace on the room-agnostic routes;
   a vector pins it.
 
-### 7.5 — Pluggable `LiveHashSource` (altitude) **[NM]**
+### 7.5 — Pluggable `LiveHashSource` (altitude) **[NM]** — ✅ **DONE 2026-07-17** (`e9439a75`)
+- **Shipped:** async `LiveHashCollector` trait in gc_service (core `LiveHashSource`/
+  `GcCoordinator` untouched — collector runs once per tick, wrapped in the existing
+  `PrecomputedLiveHashSource`); threaded as a generic `Arc` function param mirroring
+  the `BlobObjectStore` seam, **not** a `GcServiceConfig` field (config is
+  Debug+Clone data; deviation from the section wording, justified).
+  `GcServiceConfig.retain_intermediate_days` removed — studio-only knob on generic
+  config, the dead-config shape 1.3 condemned; rides the studio collector's ctor,
+  CLI flag unchanged. `StudioLiveHashCollector` at the bottom of
+  studio_live_hashes.rs — **injection-only, not a crate move** (6.4's warm caches
+  ride the shared `Rooms` clone; parity workflow pins the path; move noted as
+  future). gc_service.rs has ZERO compile-time studio references (verified).
+  Injected in server + server-s3 both arms; dev-server never spawns GC.
+- **1.2's seam built:** `UnionLiveHashCollector`, fail-closed on both axes (any
+  member error fails the union — refusing the 5th fail-open instance; zero members
+  = Invariant error, 1.1's refuse-to-delete posture). 1.2 = room-DAG collector +
+  wrap in union + flip its ignored RED.
+- **Behavior-preservation verified:** every GC suite identical, incl. **the 1.2
+  ignored RED still failing with the same panic** (gap preserved, not papered
+  over); zero assertion changes in studio_gc's 11 mechanical call edits
+  (grep-verified). Seam pin structurally unwritable pre-refactor (old signature
+  quoted in suite docs). Fail-closed independently sabotage-proven
+  (`unwrap_or_default` in the union loop → union test red).
+- **CI:** gc_service.rs wasn't a blob-layout-parity paths trigger (12th bite);
+  the `--lib store::` filter had left `gc_service::` unit tests running in NO
+  workflow (same class 8.1's meta-test would catch); **no workflow anywhere
+  compiled `nodalmerge-server-s3`** — build step stubbed into blob-s3-gc-minio,
+  dev-server still builds nowhere (filed).
+
+**Original section text follows.**
 `nodalmerge:server/server/src/gc_service.rs:149` hard-wires the studio-domain
 live-hash source (971 lines of product-specific parsing) into the generic server GC
 service, even though `GcCoordinator` is already generic over `LiveHashSource`. Thread a
