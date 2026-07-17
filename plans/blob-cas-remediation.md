@@ -883,19 +883,47 @@ in-code comment claims "same response shape and status codes" and the CHANGELOG 
 - **Validation:** a golden test asserts the legacy route matches `main`'s response
   byte-shape and status codes; the new routes keep their frozen shape.
 
-### 4.2 — `put_blob` durability truthfulness **[NM]** (#8)
-`nodalmerge:server/server/src/blob_http.rs:519`. The handler upserts the hash `Active`
-in the inventory **before** the write, calls the infallible `persist_blob` (Dir and S3
-both log-and-swallow failures), and returns `201` unconditionally.
-- Make `persist_blob` **fallible** (return `Result`) at the trait level; propagate
-  write failure to the handler, which returns `5xx` and does **not** mark the
-  inventory `Active` unless the write is confirmed durable. Reorder so inventory
-  `Active` follows a confirmed write.
-- **Validation:** a disk-full/S3-failure PUT returns an error status and leaves no
-  `Active` inventory row; a later GET/HEAD is consistent with that.
-- ⚠ compat: server-internal trait change (`persist_blob` signature) — not on the wire,
-  not a published .NET API. The wire change is `201`→`5xx` **only on genuine failure**,
-  which is strictly more correct.
+### 4.2 — `put_blob` durability truthfulness **[NM]** (#8) — ✅ **DONE 2026-07-16** (`fb3bf095`)
+`nodalmerge:server/server/src/blob_http.rs:519`. The handler upserted `Active` before
+the write, called infallible `persist_blob`, returned `201` unconditionally.
+- **Shipped:** `PersistBlobError{Backend→500, Unavailable→503}` at the trait
+  (deliberately NOT a HydrateError mirror — no Missing, no config variant; structural
+  no-ops are `Ok`). All implementors propagate: Dir fs errors → Backend (zstd-encode
+  failure keeps its 3.1b fall-back-to-identity; only the identity write is terminal);
+  S3 Direct bridge Timeout/Bridge → Unavailable, bucket error reply → Backend; S3
+  **Delegate stays `Ok` as a documented structural no-op** (pinned); Composite
+  forwards; conformance port updated AFTER the real backends per 1.3's ordering,
+  MinIO-wins note intact. PUT ordering now `hash → dedupe(200 marks — those bytes
+  exist) → persist(Err: 5xx, NO mark) → mark → 201`, inside 6.2's off_worker boundary:
+  **the Active row can no longer exist for bytes that were never stored**, so the 1.3
+  upload-window union can't protect a phantom. Mark-after-confirmed-write failure
+  stays warn-only (bytes ARE durable) — **4th instance of the fail-open-inventory
+  family, filed on 1.3's ledger; still wants one decision.**
+- **All callers of the newly-fallible method audited, zero silent discards:** WS
+  BlobUpload treats failed persist as not-accepted (not stored/counted/broadcast —
+  the protocol has no per-entry error affordance; matches hash-mismatch treatment) and
+  the `blob-available` broadcast now lists **actually-stored** hashes — pre-4.2 it
+  echoed the raw request, advertising even hash-rejected entries (same lie family,
+  fixed in-slice; frozen envelope unchanged, truthful contents). Archive import:
+  persist failure → ImportRejected (3rd `CheckpointNotFound` reuse — backend-variant
+  gap filed again).
+- **.NET origin checked: already truthful** — `FileBlobStoreProvider.PutBlobAsync`
+  throws, handler `await` is unguarded → 500; `ChainedBlobStoreProvider`'s warn-only
+  remote push is documented design (local durable + reconcile heals), not the lie.
+- **Contract doc:** BLOB_HTTP_SURFACE.md PUT section gains the failure-status
+  bullet (failure-path-only tightening; success statuses/vectors untouched; clients
+  already treat 5xx as retryable per the doc's own client-behavior section).
+- **Validation met + independently reproduced** (revert of blob_http.rs only): 4/9 red —
+  injectable Backend/Unavailable, real Dir with a squatted `blobs/blake3` path, real
+  S3BlobStore vs stalled listener (6.1's filed feeder verbatim) — each `201` where 5xx
+  expected, plus the phantom-`Active`-row half asserted explicitly; 9/9 after. S3
+  store-level classification pinned by sabotage (swallow reintroduced → red). Gates:
+  32 green server targets, s3-blobs full + MinIO 8/8, conformance crate 5→6, builds
+  clean.
+- **CI:** `blob_put_durability` step + paths in blob-layout-parity.yml. **Filed:**
+  `ws_handler.rs` runs in NO blob workflow (no CI gate on the WS persist-failure path,
+  no unit seam — Phase 8 material, pairs with 6.5); archive partial-state-on-mid-loop
+  failure (pre-existing shape).
 
 ### 4.3 — Options validation & URL resolution **[NM]**
 - **`BlobHttpOptions.Validate()`** (`hosts/dotnet/…/BlobHttpOptions.cs:24`): reject
