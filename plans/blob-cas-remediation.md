@@ -1224,7 +1224,40 @@ still park the worker.
 - **Validation:** GC tick cost on a many-cold-room / many-shared-subtree fixture is
   sub-linear in redundant work.
 
-### 6.5 — Inbound-pack observer off the hot path **[BOTH]**
+### 6.5 — Inbound-pack observer off the hot path **[BOTH]** — ✅ **DONE 2026-07-17** (NM `509d5b85`, ST `86e57cb`) — **PHASE 6 COMPLETE**
+- **[NM] shipped:** per-connection bounded channel (512, **DropOldest** + warn +
+  counter) + one consumer task; policy justified by the shipped observer's own
+  contract (ignores pack bytes, idempotent full-store refresh → surviving newest
+  notification heals a drop; WAIT would re-couple receive latency to observer
+  latency — the defect itself). Per-connection receive-order FIFO pinned incl.
+  max-concurrency 1. 30s per-observer timeout via `WaitAsync` (holds against
+  sync-blocking token-ignoring observers). Teardown: TryComplete → 5s drain →
+  hard-cancel → bounded abandon. **`IInboundPackObserver` untouched** (it already
+  took a CancellationToken); CHANGELOG discloses the two behavioral notes.
+- **[ST] shipped:** per-room dirty/running flags + drain-until-clean loop with
+  lost-wakeup re-check — N-pack burst = in-flight + one trailing cycle, lossless
+  (bytes ignored; callees idempotent). Own linked token (dispose + 30s), never the
+  caller's; mid-cycle cancel tears nothing; IAsyncDisposable bounded.
+- **Packaging:** [ST] compiles against published 0.2.2 interface only — halves
+  developed/tested independently, no repack needed; end-to-end pairing lands at the
+  next version repack. (Repack recipe recorded in the slice report: studio
+  `scripts/restore-local-nodalmerge.ps1`; `pack-local-artifacts.ps1` is at nodalmerge
+  repo ROOT, not scripts/.)
+- **REDs, both independently re-proven by orchestrator sabotage:** [NM] 500ms block
+  in `Post` → starvation test fails (pre-fix inline dispatch delayed the last pack
+  to 1603ms; post-fix <750ms); [ST] dirty-mark removed → all 5 observer tests fail.
+  Restored → green. Gates: nodalmerge 660/660; studio full solution 973 green.
+- **CI:** `RuntimeWebSocketLoopRunner` had **zero .NET CI coverage** — the .NET twin
+  of the Rust `ws_handler` gap (4.2, still open) — both runner test classes added to
+  `dotnet-peerlocal-smoke.yml` (11th bite). Studio: solution-wide ci.yml needs no
+  edits; new tests deliberately untraited so they run in the unconditional unit lane.
+- **Filed:** `ControlPlaneDenyMeterCapture` mutates a non-concurrent Dictionary in a
+  MeterListener callback (crashed one baseline run — wants a lock); studio
+  Integration lane still gated on `NODALMERGE_NATIVE_AVAILABLE` (145 classes may
+  never run in CI); DropOldest cross-room staleness corner documented (heals on the
+  room's next pack).
+
+**Original section text follows.**
 `nodalmerge:hosts/dotnet/…/RuntimeWebSocketLoopRunner.cs:273` awaits the
 `IInboundPackObserver` hook **inline** in the WS receive loop; the try/catch isolates
 exceptions but not latency, so a slow/hung observer stalls all further frames on that
