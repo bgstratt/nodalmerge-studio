@@ -918,16 +918,39 @@ both log-and-swallow failures), and returns `201` unconditionally.
   startup; a path-prefixed `BaseUrl` reaches the right path; stale delegate keys emit
   a warning.
 
-### 4.4 — Capability-profile hard-ceiling clamp **[NM]** ⚠ compat (#15)
+### 4.4 — Capability-profile hard-ceiling clamp **[NM→BOTH]** ⚠ compat (#15) — ✅ **DONE 2026-07-16** (`6d2ec2a4`)
 `nodalmerge:server/capability-profile/src/lib.rs:388`. The mint/validate safety caps
-(128 caps, 8 KiB flattened, depth 16, 64 edges) moved from unconditional constants to
-profile-file-supplied `limits` with no clamp — a `limits` block that was an inert
-unknown field on `main` now lifts the RoomToken guard and unbounds the DFS.
-- Clamp `resolved_limits` to the historical hard ceilings: a profile may lower a
-  limit but never raise it past the built-in maximum. Legit profiles (which never set
-  `limits`) are unaffected; the previously-guaranteed ceiling is restored.
-- **Validation:** a profile requesting oversized limits is clamped; DFS depth stays
-  bounded; a no-`limits` profile behaves exactly as on `main`.
+moved from unconditional constants to profile-file-supplied `limits` with no clamp.
+- **Shipped:** `resolved_limits` clamps **five** fields, not the four this section
+  listed — `main` also had `MAX_CAPABILITY_LENGTH = 128` (ceilings pulled from
+  `main:server/jwt-bridge/src/capability_profile.rs:6-10`, verified independently, not
+  trusted from this plan). Lower allowed, raise clamped, per-field warn naming
+  requested-vs-ceiling; no-`limits` profiles behave byte-for-byte as `main`'s
+  constants; file format untouched (oversized values parse, resolution clamps).
+- **Retag [NM]→[BOTH], and the reason matters:** the .NET host does NOT reach this
+  code via FFI — `nm_room_token_mint/validate_json` only sign/verify a
+  caller-supplied cap list AFTER expansion. Expansion happens in a **parallel managed
+  implementation** (`CapabilityProfileExpander.cs`, reached from
+  `RoomTokenEmbeddedAuth.cs` mint AND validate) with the identical unclamped
+  regression — fixed with the same clamp (`ResolveLimits`/`ClampToCeiling`, resolved
+  once per profile load; warn via `Trace` — the .NET host has no logging abstraction
+  repo-wide, filed).
+- **Plan-premise correction:** on `main` only the **mint** path (jwt-bridge) had
+  unconditional constants; the **validate** path already honored profile limits
+  unclamped (the impl A/B asymmetry documented in `docs/CAPCOMP_PARITY_PLAN.md`). The
+  clamp restores B's historical guarantee and tightens A + .NET beyond `main` —
+  intended posture, the ⚠ compat note resolves as strictly-safer.
+- **Validation met:** two additive capcomp parity vectors (`limits-above-ceiling-*`)
+  pin the clamp on BOTH runtimes ($comment + parity doc moved with them per the
+  file's own rule; existing vectors untouched). RED independently reproduced by
+  stash-revert of both prod files: Rust `limits_clamp` 6 failed/4 passed (130-cap
+  expansion and depth-17 chain both returned `Ok` pre-fix under raised limits),
+  shared vectors red on both runtimes, .NET 7 failed. Post-fix: cap-profile
+  lib+vectors+clamp green, jwt-bridge 10, .NET capability filters 59/59.
+- **CI:** `control-plane-capability-parity.yml` gains the .NET clamp-test step +
+  paths; coverage gap found and filled — pre-existing `CapabilityProfileExpanderTests`
+  ran in **no workflow at all** despite its source file being a paths trigger (8th
+  paths-filter bite, logged for Phase 8).
 
 ---
 
