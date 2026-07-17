@@ -1022,13 +1022,40 @@ timeouts were missing).
   bounds hold but retries multiply worst-case duration toward `sweep_timeout` — tune in
   6.3.
 
-### 6.2 — Move blocking blob work off async workers **[NM]**
-`nodalmerge:server/server/src/blob_http.rs:234`. GET/PUT handlers do blocking
+### 6.2 — Move blocking blob work off async workers **[NM]** — ✅ **DONE 2026-07-16** (`c76edf9d`)
+`nodalmerge:server/server/src/blob_http.rs:234`. GET/PUT handlers did blocking
 `std::fs` I/O, up-to-64 MiB BLAKE3 hashing, and zstd encode/decode directly on tokio
-workers; enough concurrent blob ops starve WS/sync traffic sharing the runtime.
-- Wrap the synchronous persistence calls in `spawn_blocking` (or make the persistence
-  API async). Depends on 6.1 for the S3 path.
-- **Validation:** a concurrent-blob load test shows WS latency stays flat.
+workers — plus, post-6.1, S3 bridge calls that block bounded (`op_timeout + 15s`) but
+still park the worker.
+- **Shipped:** one `off_worker` helper (`spawn_blocking` + JoinError→logged 500, never a
+  hang or silent success); every store-touching handler tail (GET/HEAD reads+verify,
+  /url presigns incl. the Delegate-mode HTTP round trip, /uploaded bucket HEAD + SQLite
+  upsert, PUT body-hash + dedupe + persist + inventory mark) runs in ONE blocking
+  closure per request, preserving in-request ordering exactly; the cheap pure prefix
+  (canonical check, auth, parsing) stays async. Sync `BlobPersistence` trait untouched —
+  the async-trait conversion was rejected as blast radius for zero scheduling benefit.
+  PUT's known-lossy 201-on-backend-timeout deliberately preserved (4.2's job).
+- **Validation met (made deterministic):** `tests/blob_http_offload.rs` — 2-worker
+  runtime, 6 concurrent requests on a 500ms-blocking store fake, 200ms heartbeat bound,
+  measurement gated on ≥2 ops in flight so the RED is spawn-order-independent. Pre-fix
+  4/5 failed (heartbeats 1.5–3.0s, 7–15× over bound) — reproduced independently by
+  stash-revert of only blob_http.rs; post-fix 5/5 in ~1s. Panic-in-closure→500 is
+  behavioral too; the /uploaded green-side guard is honestly labeled not-a-RED.
+- **Known pre-existing flake, NOT this slice:**
+  `archive_profile_002_object_manifest_parity_reports_p50_p95` fails under the parallel
+  full-lib run and passes solo — verified to fail identically on the pre-6.2 tree
+  (stash-and-rerun). A timing/percentile test that is load-sensitive; worth a
+  follow-up de-flake (serial marker or wider percentile budget) but do not paper over
+  it inside an unrelated slice.
+- **Filed, not fixed — the same sync-from-async family elsewhere:** WS handlers
+  (`ws_handler.rs:1064` persist_blob on the receive loop — which also base64-decodes and
+  `Hash::of`s inline — `:1100`/`:1171` presign resolutions, `:1220` verify_uploaded); GC
+  (`room.rs:920` blob_gc_sweep inside async sweep_blobs, `room.rs:643` get_blob in
+  live-set collection — 6.3/6.4 territory); archive control-plane
+  (`archive_adapter.rs:320`/`:1360`, `archive_export.rs:269`/`:438`). The WS receive-loop
+  sites pair naturally with 6.5 (inbound-pack observer off the hot path).
+- **CI:** `blob-layout-parity.yml` gained the `blob_http_offload` step + both `paths:`
+  entries (Docker-free, bridge_timeouts-style comment).
 
 ### 6.3 — GC batch/bulk I/O **[NM]**
 - Batch the mark-pass upserts (`nodalmerge:server/server/src/gc_store.rs:223`) into a
