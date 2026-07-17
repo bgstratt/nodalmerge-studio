@@ -989,33 +989,57 @@ moved from unconditional constants to profile-file-supplied `limits` with no cla
 
 ---
 
-## Phase 5 — Migration safety
+## Phase 5 — Migration safety — ✅ **PHASE COMPLETE 2026-07-16** (`3bc843d8`, both slices)
 
-### 5.1 — Rust migration marker only on full success **[NM]**
-`nodalmerge:server/server/src/store.rs:934`. `migrate_legacy_blob_layout` writes the
-`.layout-v2` marker unconditionally even when room dirs were skipped (read-dir error,
-mkdir failure, copy-fallback failure), permanently orphaning those legacy blobs
-(readers only consult `blobs/blake3/`).
-- Track whether any room/entry was skipped; write the marker only on a fully clean
-  pass, otherwise leave it absent so the next startup retries. Log skipped entries.
-- **Validation:** a migration with an injected transient skip does **not** write the
-  marker and re-migrates on the next run.
+### 5.1 — Rust migration marker only on full success **[NM]** — ✅ **DONE 2026-07-16** (`3bc843d8`)
+- **Shipped:** `migrate_legacy_blob_layout` had **12 skip paths, 8 fully silent**
+  (non-Unicode room dir orphaned a whole room; blocked-quarantine left the file in
+  place with the rename `let _ =`'d; read-dir/file-type/mkdir/copy failures all
+  `continue`d) — every deferrable one now warns with path+cause and increments a
+  `deferred` counter; `deferred > 0` ⇒ summary warn + **no marker**, so the next
+  startup retries (sole caller: `DirPersistence::open`, once per process — verified).
+  Successful quarantine remains terminal (pinned by the pre-existing inline test).
+- **Idempotency hazard found beyond the plan (the important part):** a
+  failed/interrupted copy-fallback leaves a *partial dest*, and the dedupe branch
+  (`dest.exists()`) would have **adopted it and deleted the only good copy** on the
+  very retry this slice introduces. Fixed both ways: dedupe now BLAKE3-verifies dest
+  and repairs a partial/corrupt one from the verified legacy bytes; the copy failure
+  path removes its partial file. RED-proven with the data loss visible in the assert
+  diff (`"the only goo"`, 12 bytes of the real payload).
+- **Validation met + independently reproduced** (stash-revert of store.rs only):
+  0/3 pre-fix — incl. the second-run-completes assertion (run 1 defers, run 2
+  migrates the remainder THEN writes the marker, run 3 no-ops); non-Unicode dir
+  constructible on BOTH OSes (Windows unpaired-surrogate via `from_wide`, proven on
+  this machine; Linux invalid UTF-8) — **no test seam needed**.
 
-### 5.2 — .NET migration & write-path hygiene **[NM]**
-`nodalmerge:hosts/dotnet/…/FileBlobStoreProvider.cs`:
-- **Re-quarantine loop (`:203`):** exclude `.migration-skipped` (and dot-dirs) from
-  the `*.blob` enumeration so quarantined files aren't re-discovered and re-quarantined
-  under ever-growing GUID names (matches the Rust migration's skip).
-- **`.tmp` leak (`:132`):** wrap the temp-then-move in `try/finally` (or a
-  best-effort cleanup) so a cancelled/failed write doesn't leak `.{hash}.{guid}.tmp`
-  under `blake3/` — which GC classifies as foreign and never reclaims.
-- **`SanitizeHash` (`:173`) — latent:** mangling non-canonical hashes into storable
-  filenames diverges from Rust's strict `hash_from_hex` and creates GC-invisible,
-  Rust-unreadable entries. No current caller passes non-canonical hashes, so this is
-  a **reject-don't-sanitize** hardening: validate canonical hex at the provider layer
-  and reject, matching `store.rs`. Low urgency; do it while in the file.
-- **Validation:** a crash-before-marker restart doesn't grow quarantine names; a
-  cancelled PUT leaves no `.tmp`; a non-canonical hash is rejected, not stored.
+### 5.2 — .NET migration & write-path hygiene **[NM]** — ✅ **DONE 2026-07-16** (`3bc843d8`)
+- **Shipped, all three:** quarantine scan recurses only into non-`blake3` non-dot
+  dirs (GUID names stable across crash-restarts — pre-fix grew one prefix per
+  restart); temp-then-move in try/finally, best-effort tmp cleanup, write errors
+  still propagate (4.2's truthful PUT preserved); **`SanitizeHash` deleted** —
+  `GetPath` rejects non-64-lowercase-hex (writes throw `ArgumentException`, reads
+  answer Missing/false = Rust's foreign-name-is-absent posture; uppercase rejected,
+  never normalized). `FileBlobGcCoordinator` keeps a local deliberately-lenient fold
+  with rationale (a non-canonical live hash can only over-protect).
+- **Plan claim verified:** no WS/runtime path reaches `IBlobStoreProvider` at all;
+  the HTTP funnel already 400s non-canonical; legacy `/sync/blob-url` loose hashes
+  stop before path math. Zero fixture fallout — 3.2 had already converted the
+  fabricated-hash fixtures.
+- **Validation met + independently reproduced** (stash-revert of provider +
+  coordinator): 6/8 pre-fix (GUID growth captured; `.tmp` leaked under `blake3/`;
+  `sha256:abc`→`sha256_abc`, `../escape`→`.._escape` actually stored), 8/8 after.
+  Deviation (sanctioned): `.tmp` RED injects failure at the move step — genuine
+  mid-write cancellation isn't deterministically forcible.
+- **Gates:** blob_gc 12 / conformance 13 / host_migration_parity 18 unchanged; .NET
+  full **656/656** (648+8). CI: both new test files get steps + both paths lists in
+  blob-layout-parity.yml.
+- **Filed, not fixed:** .NET `MigrateLegacyLayoutIfNeeded` still writes its marker
+  unconditionally — same bug class 5.1 fixed in Rust, plan scoped marker-gating to
+  Rust only (candidate follow-up slice); interrupted compressed run can leave
+  `<hex>` + `<hex>.zst` both present (benign — readers prefer identity — but a §8
+  "exactly one form" wrinkle, same window as the dedupe-verify not considering a
+  `.zst`-only dest); legacy `.tmp` files remain in legacy room dirs forever
+  (harmless leftover).
 
 ---
 
