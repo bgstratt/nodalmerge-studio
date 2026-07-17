@@ -867,21 +867,30 @@ decoding zstd (Chrome 123+/FF 126+ do; Safari and Node/undici do not).
 
 ---
 
-## Phase 4 — HTTP-surface robustness & backward compatibility
+## Phase 4 — HTTP-surface robustness & backward compatibility — ✅ **PHASE COMPLETE 2026-07-16**
 
-### 4.1 — Restore `/sync/blob-url` backward compat **[NM]** ⚠ compat (#12)
-`nodalmerge:hosts/dotnet/…/WebApplicationExtensions.cs:600`. The legacy alias (shipped
-on `main` in 0.2.0) silently changed vs `main`: `expiresAt` (unix seconds) →
-`expiresAtUtc` (ISO-8601), no-backend `404` → `501`, plus new `400`/`401` from
-`ValidateBlobRequest` where `main` accepted any non-empty hash anonymously. The
-in-code comment claims "same response shape and status codes" and the CHANGELOG says
-"no breaking changes" — both untrue.
-- Restore the `main` behavior **on the legacy route only**: emit `expiresAt` (unix
-  seconds), return `404` for no-backend, and keep it anonymous/loose-hash. The new
-  `/blobs/**` routes keep the new shape.
-- Fix the misleading comment and the CHANGELOG entry.
-- **Validation:** a golden test asserts the legacy route matches `main`'s response
-  byte-shape and status codes; the new routes keep their frozen shape.
+### 4.1 — Restore `/sync/blob-url` backward compat **[NM]** ⚠ compat (#12) — ✅ **DONE 2026-07-16** (`f5867ef6`, with 4.3)
+- **Shipped:** dedicated `HandleLegacyBlobUrlAsync` restored byte-for-byte from
+  `main`'s git ground truth (pulled first, not trusted from this section): `expiresAt`
+  unix seconds; registered-resolver-returning-`null` → **404**; any non-empty hash
+  accepted **anonymously** (the route never consults the blob-http auth token — main
+  evidence recorded, pinned with a control assertion against the new route); empty
+  hash → 400 `"hash is required"` (main's distinct wording); `room`/`namespace`
+  defaulting kept. New `/blobs/{hash}/url` untouched.
+- Misleading same-shape claims fixed in BOTH the code comment and
+  `BLOB_HTTP_SURFACE.md`'s deferred-section (which had enshrined the false alias
+  claim); CHANGELOG **0.2.3** entry discloses the actual history — the break shipped
+  silently after 0.2.0's entry was written. Two pre-existing tests that encoded the
+  broken alias behavior as expected were corrected (one pulled forward from the
+  Phase-8 backlog into CI).
+- **Gotcha for the record:** injecting `IBlobUrlResolverProvider` as a minimal-API
+  handler parameter (main's own style) makes ASP.NET infer `[FromBody]` when DI lacks
+  the service — crashing the entire endpoint-matcher build in resolver-less test
+  hosts; resolved via `RequestServices` inside the handler, runtime semantics
+  unchanged.
+- **Validation met + independently reproduced** (stash-revert of
+  WebApplicationExtensions.cs only): golden suite 8/12 red pre-fix (expiresAtUtc/501/
+  400-on-loose-hash captured), 12/12 after.
 
 ### 4.2 — `put_blob` durability truthfulness **[NM]** (#8) — ✅ **DONE 2026-07-16** (`fb3bf095`)
 `nodalmerge:server/server/src/blob_http.rs:519`. The handler upserted `Active` before
@@ -925,26 +934,24 @@ the write, called infallible `persist_blob`, returned `201` unconditionally.
   no unit seam — Phase 8 material, pairs with 6.5); archive partial-state-on-mid-loop
   failure (pre-existing shape).
 
-### 4.3 — Options validation & URL resolution **[NM]**
-- **`BlobHttpOptions.Validate()`** (`hosts/dotnet/…/BlobHttpOptions.cs:24`): reject
-  `MaxBlobBytes <= 0` at startup. Today a negative value throws
-  `ArgumentOutOfRangeException` per chunked PUT (500) and zero silently 413s
-  everything; sibling options all fail fast — make this one match.
-- **Base-URL path resolution** (`hosts/dotnet/…/HttpRemoteBlobStoreProvider.cs:246`,
-  `S3DirectBlobStoreProvider.cs:252/415`): requests use root-relative URIs
-  (`/blobs/{hash}`) that discard any path component of a configured `BaseUrl`
-  (e.g. a reverse-proxy prefix `https://host/nodalmerge`). Build request URIs
-  relative to the full base path, or validate at startup that `BaseUrl` has no path
-  segment.
-- **`S3DelegatedBlobOptions` stale-key guard** (`S3DelegatedBlobOptions.cs:62`):
-  `PutPath`/`GetPath` were removed; old config still setting them is silently ignored
-  and `PresignPath` defaults to `/v1/blobs/presign`, degrading a mis-migrated deploy
-  to the WS fallback with only a warning. Add a startup guard that **warns loudly**
-  (per principle 3 — don't hard-fail a running upgrade) when the removed keys are
-  present, naming the migration.
-- **Validation:** unit tests for each: negative/zero `MaxBlobBytes` rejected at
-  startup; a path-prefixed `BaseUrl` reaches the right path; stale delegate keys emit
-  a warning.
+### 4.3 — Options validation & URL resolution **[NM]** — ✅ **DONE 2026-07-16** (`f5867ef6`, with 4.1)
+- **Shipped, all three:** (1) `BlobHttpOptions.Validate()` fails fast on
+  `MaxBlobBytes <= 0` in sibling style. (2) Base-URL: option (a) resolve-relative
+  taken — `RemoteBlobOriginOptions.ResolveBaseUri()` normalizes the trailing slash
+  (the `new Uri(base, rel)` drop-last-segment trap tested explicitly, both spellings)
+  and both providers now build **absolute** request URIs, decoupling them from
+  ambient `HttpClient.BaseAddress` config as a side benefit. No Rust-side equivalent
+  exists (these are .NET-only client providers). (3) `WarnOnStaleKeys()` reads the
+  raw `IConfiguration` section past the binder (which silently drops removed keys),
+  warns via `Trace` naming keys + migration, never throws (principle 3).
+- **Validation met + independently reproduced** (stash-revert of the two providers
+  only): BaseUrl prefix suite 10/11 red pre-fix (requests hit `/blobs/…` at the bare
+  host), 11/11 after. Options + stale-key suites green post-fix (Validate() didn't
+  exist pre-fix — structural, honestly labeled). Full project **648/648** (614 + 34
+  new; zero flakes on the verification run).
+- **CI:** `blob-layout-parity.yml` paths gained `BlobHttpOptions.cs` +
+  `RemoteBlobOriginOptions.cs` (**previously missing — 9th paths bite**) + steps/paths
+  for 4 new test files and the 2 corrected ones.
 
 ### 4.4 — Capability-profile hard-ceiling clamp **[NM→BOTH]** ⚠ compat (#15) — ✅ **DONE 2026-07-16** (`6d2ec2a4`)
 `nodalmerge:server/capability-profile/src/lib.rs:388`. The mint/validate safety caps
