@@ -146,7 +146,12 @@ workflows**, plus one-directional parity contracts.
   blob-s3-gc-minio.yml. Every wired suite verified green locally. Only S3DirectMinioEndToEndTests
   deferred — needs multi-process origin+MinIO orchestration, filed in baseline)
   · [x] C3 shipped (parity-pair rule folded into C1's meta-check; 7 pairs declared, all now
-  fully covered on both runtimes)  · [ ] C4 done (needs user gh auth — see below)
+  fully covered on both runtimes)  · [~] C4 configured (studio `2296040` ci.yml local-pack step,
+  nodalmerge `ec51e7d8` cross-platform pack fix; repo var `NODALMERGE_NATIVE_AVAILABLE=true` set
+  2026-07-17). **Verification pending a CI run** — needs both branches pushed (nodalmerge
+  `blobExpansion` + studio `cas-distribution-storage`) so studio CI packs the local 0.2.3 feed
+  and runs the native Integration lane. Root cause found: nuget.org has NodalMerge.* only ≤0.2.0,
+  so studio CI could not restore the 0.2.x pins at all until this local-pack step)
 
 ## Sequencing
 
@@ -163,3 +168,6 @@ linux-x64 natives, nuget.org 0.2.3, docs-repo bump.
   remaining publish-gate item is C4 (flip `NODALMERGE_NATIVE_AVAILABLE` in studio — needs user's
   gh auth). One suite deferred as its own follow-up slice: S3DirectMinioEndToEndTests
   (multi-process origin+MinIO orchestration). **Publish gate: A ✓ B ✓ C ✓ except C4.**
+- 2026-07-17: C4 configured — studio ci.yml now packs the local 0.2.3 feed (nuget.org has
+  NodalMerge.* only ≤0.2.0, the real blocker), pack-local-nuget.ps1 made CI-linux-safe,
+  `NODALMERGE_NATIVE_AVAILABLE=true` set. Last step is a verifying CI run (push both branches).
