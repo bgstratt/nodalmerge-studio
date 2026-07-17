@@ -167,16 +167,28 @@ impls are the safety-critical path and are covered only by local Docker runs tod
   not-enumerable.
 - ⚠ compat: internal trait surface only — no wire/package break.
 
-### 1.2 — New coordinator live set unions room-DAG blobs **[NM]** (#2)
-`nodalmerge:server/server/src/studio_live_hashes.rs:638`. `collect_studio_live_hashes`
-filters to `studio/`-prefixed keys, so any ordinary `SetBlob`-referenced blob in the
-gc inventory is unmarked and swept.
-- The coordinator's live set must be the **union** of studio-domain hashes and
-  `blob_hashes_referenced_by` over every room DAG (the protection the legacy sweep
-  already had). Compose the sources rather than replacing one with the other — this
-  dovetails with the pluggable `LiveHashSource` in 7.5, so build the composition seam
-  here and let 7.5 relocate the studio-specific source.
-- **Validation:** 0.3(b) passes under `--gc-mode sweepsoft/sweephard`.
+### 1.2 — New coordinator live set unions room-DAG blobs **[NM]** (#2) — ✅ **DONE 2026-07-17** (`e4e76808`) — **PHASE 1 COMPLETE; ALL CORRECTNESS PHASES (0–6) DONE**
+- **Shipped:** `RoomDagLiveHashCollector` (room.rs) **delegates to 6.4's cached
+  `collect_global_live_blob_hashes`** — semantics verified as a strict additive
+  superset of every-SetBlob-referenced-hash (resident-hydrated via incremental
+  StateGraph refs; cold + resident-unhydrated per 1.4 via version-keyed cached
+  replay; plus 1.3's upload window); no second scan built, 6.4's cache-equivalence
+  coverage carries over unchanged. `None → Err`, never `Ok(empty)` —
+  sabotage-proven fail-closed (the new blob_gc test is the only one that can catch
+  that mapping). Binaries wire `UnionLiveHashCollector::new([studio, room_dag])`
+  — 7.5's seam, both server-s3 arms; dev-server spawns no GC.
+- **Validation met:** the 0.3(b) RED — ignored since Phase 0, verified still
+  failing during 7.5's check — is un-ignored and passes: studio_gc **13/0
+  ignored**, blob_gc 13. Tests strengthened only: `production_live()` (the
+  binaries' exact union) used precisely where the production live set IS the claim
+  (the RED, the reclaim gate — proving 1.2 added protection, not
+  everything-live-forever — and the fail-poison ledger test); studio-only kept
+  elsewhere so a DAG contribution can't mask a classification regression.
+- **Inherited fail-opens NOT absorbed** (recent-upload inventory read;
+  Postgres/Mongo `known_room_ids` warn+empty) — both already on the one-decision
+  ledger; no new instance added.
+- **CI: zero edits needed** — first slice of the plan where every touched file
+  already fired a covering workflow. One stale step-name comment fixed.
 
 ### 1.3 — S3 sweep honors grace + consults inventory **[NM]** (#3) — ✅ **DONE 2026-07-16** (`043df73d`)
 
