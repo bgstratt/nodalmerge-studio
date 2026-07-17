@@ -703,7 +703,15 @@ Rust `zstd::stream::encode_all`. Result: all cross-runtime compressed fetches th
   streaming `DecompressionStream`. Keep the existing hash-verify-after-decompress.
 - **Validation:** 0.1 fixture decodes green in both directions.
 
-### 3.2 — Verify-on-read policy for the file provider **[NM]** (#13) — ⚠️ **CODE HALF DONE 2026-07-16** (`37374294`); **doc half deferred to after 3.3**
+### 3.2 — Verify-on-read policy for the file provider **[NM]** (#13) — ✅ **DONE 2026-07-16** (code `37374294`; doc half `90ed5b80`, after 3.3 made its premise true)
+
+**Doc half (shipped `90ed5b80`):** `BLOB_HTTP_SURFACE.md` now scopes "corrupt → 404,
+never wrong bytes" to identity responses and states the encoded pass-through exemption
+in the Content-encoding section (server structurally cannot verify a frame whose hash is
+of the plaintext; the client completes integrity after decompress — true for all
+reference readers as of 3.3; deliberately no verify-on-encoded-GET option);
+`BLOB_STORAGE_LAYOUT.md` §8 mirrors it with a cross-reference. Wording-only — no status
+codes, shapes, or vectors changed; the docs now say what both runtimes already do.
 
 **As shipped (code half only):** the identity branch of `FileBlobStoreProvider.TryGetBlobAsync`
 hashes on read and, on mismatch, warns and returns `Missing` — matching `store.rs:683`
@@ -713,10 +721,10 @@ produces, so the origin answers 404 with no call-site plumbing. RED proven at bo
 the HTTP-origin test reported the defect verbatim — *"expected 404 for a tampered identity
 blob, got 200"*.
 
-**The doc half is NOT done and must not be marked done.** Marking the encoded pass-through
-contractually exempt in `BLOB_HTTP_SURFACE.md` / `BLOB_STORAGE_LAYOUT.md` §8 waits on 3.3,
-per the sequencing note below — its premise ("the client verifies after decompress") is still
-false for the web/wasm readers. The encoded path was left untouched. Call graph traced to
+~~The doc half is NOT done and must not be marked done.~~ **Done `90ed5b80`** — the
+sequencing held: 3.3 (`2e69b9dd`) made "the client verifies after decompress" true first,
+then the exemption was documented (see the heading note above). The encoded code path was
+left untouched throughout, as decided. Call graph traced to
 confirm no second unverified identity-serving path hides in `TryGetEncodedBlobAsync`: the GET
 handler serves its result only when `ContentEncoding == "zstd"` and otherwise routes through
 `TryGetBlobAsync`.
@@ -771,7 +779,44 @@ corrupt bytes as 200.
 - **Validation:** a tampered identity file returns 404 on the .NET origin, matching
   Rust.
 
-### 3.3 — s3-direct client zstd vs web/wasm readers **[BOTH]** (#6)
+### 3.3 — s3-direct client zstd vs web/wasm readers **[BOTH→NM]** (#6) — ✅ **DONE 2026-07-16** (`2e69b9dd`)
+
+**As shipped (both steps, in the decided order):**
+- **Step 1:** `S3DirectBlobOriginOptions` compression default `Zstd` → `Off`, opt-in
+  stays via `S3Direct:Compression = Zstd`; pinned by 4 new options tests (RED: 2 failed
+  against the old default). Old-default sightings fixed in the provider doc-comment and
+  `BLOB_STORAGE_LAYOUT.md` §8.
+- **Step 2:** the ONE real presigned-GET reader — `fetchBlobViaUrl` in `clients/web/sdk.js`
+  (pre-scoping was right: `bridge-wasm` never fetches; `clients/sdk-js`'s `doc.js` is a
+  generated copy of sdk.js, and its `index.js` runtime client only ingests WS `blob-pack`)
+  — now stores via exported `storeFetchedBlobBytes`: **verify-raw-first** (headers cannot
+  say whether the runtime auto-decoded; `store_blob_bytes`' BLAKE3 throw is the oracle),
+  then decode only on rejection + standard zstd magic, re-verified through the store; a
+  corrupt frame surfaces the *original* integrity error. Decoder = `zstd_decompress` wasm
+  export on the bridge, pure-Rust `ruzstd =0.8.1` (+84 KiB wasm), one code path for
+  Safari/Node/old-browsers instead of feature-detecting `DecompressionStream`/`node:zlib`.
+  Decode stays despite the default flip — pre-flip buckets still hold frames (pinned by a
+  test comment + the Rust-frame test).
+- **Validation met:** Node suite drives the exact shipped function against the REAL wasm
+  bridge with the Phase 0 cross-runtime goldens (ZstdSharp + Rust encoder frames, never
+  ruzstd's own output; anti-vacuous: pinned plaintext lens + BLAKE3s). RED 3 failed
+  pre-fix with the verbatim Safari/Node failure (`blob integrity check failed`);
+  independently re-proven by sabotage (magic sniff disabled → same 3 red, restored →
+  33/33). Bridge native 4/4 (incl. reject-garbage/truncated); .NET full project 589/589.
+- **CI:** new `clients-web-sdk-blob-decode.yml` — the **first workflow running any
+  clients/ test at all** (bridge-native + wasm-pack build + Node suite vs the real
+  bridge); `blob-layout-parity.yml` gains the options-test step + paths.
+- **Corrected premise:** the wasm `pkg/` dirs are NOT checked in (wasm-pack emits a
+  self-gitignore); they were mutually stale local artifacts (`clients/web/pkg` ~6 weeks
+  behind). All three rebuilt in sync; CI drift risk now covered by the new workflow,
+  local pack-time staleness filed to Phase 8-adjacent backlog.
+- **Follow-ups filed:** `docs/sdk.md:10` + `bridge-wasm/README.md:12` stale build-command
+  paths (`bridge` vs `bridge-wasm`); deprecated wasm-bindgen `ready(bytes)` init shape;
+  pre-existing `unused import: TextOp` warning in bridge lib.rs; `nuget-build-push.yml`
+  `wrapper-smoke` doesn't build the bridge crate it embeds (partially mitigated by the
+  new workflow).
+
+**Original section text follows.**
 `nodalmerge:hosts/dotnet/…/S3DirectBlobOriginOptions.cs:86` defaults client-side zstd
 ON; the bucket stores a zstd frame with `Content-Encoding: zstd` object metadata,
 but `clients/web/sdk.js` and `clients/bridge-wasm` hash the raw presigned-GET bytes
