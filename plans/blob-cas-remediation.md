@@ -10,17 +10,25 @@ to review or roll back.
 **Finding #30 was added during Phase 0** (2026-07-16), found by slice 0.4 while
 trying to assert a doc comment's claim — see the map below and slice 1.6.
 
-## Status
+## Status — **PLAN COMPLETE 2026-07-17 except deferred Phase 8**
 
-- [x] Phase 0 — Reproduce-first scaffolding (shared harnesses + contract vectors) — **complete 2026-07-16** (0.1 ✅ 0.2 ✅ 0.3 ✅ 0.4 ✅; 10 gated RED tests + shared `blob-conformance` crate; uncommitted on `blobExpansion`)
-- [ ] Phase 1 — GC data-loss & the crash (P0 — can permanently destroy blobs / abort the server) — **1.1 ✅ 1.3 ✅ 1.4 ✅ 1.5 ✅ 1.6 ✅ committed 2026-07-16** (`a4c4a694`, `043df73d`, `ef693f39`, `5664c2b1` + studio `58d9a5c`, `20aaba88`); **only 1.2 remains, blocked** on 7.5's composition seam. **1.3 closed the 1.4↔1.3 coupling: the write-through race is now genuinely fixed on BOTH the Dir and S3 paths** (proven end-to-end against a real bucket, not traced).
-- [ ] Phase 2 — Non-hydrating (S3) backend correctness — **2.1 ✅ 2.2 ✅ 2.3 ✅ committed 2026-07-16** (`9fd95355`, `fe56ad34`, `5f34ab26`); **only 2.4 remains** (explicitly low-priority/latent). `blob_nonhydrating_conformance` has **no gated REDs left** (4 passed/1 ignored → 13 passed/0 ignored). **2.3 made 6.1 urgent — see Phase 6.**
-- [ ] Phase 3 — Blob integrity & cross-runtime interop — **3.1 ✅ committed 2026-07-16** (`6cf2c8fd`); **3.2 code half ✅** (`37374294`) — **its doc half stays deferred until 3.3 lands** (sequencing note in 3.2)
-- [ ] Phase 4 — HTTP-surface robustness & backward compatibility
-- [ ] Phase 5 — Migration safety
-- [ ] Phase 6 — Runtime, async-safety & efficiency
-- [ ] Phase 7 — Duplication & altitude cleanup
-- [ ] **Phase 8 — CI coverage (DEFERRED)** — the "CI is green" guarantee is much weaker than it looks. Not scheduled; **slices needing a step before this phase lands add the step where they think it belongs and move on** (see the phase for the stub convention).
+Every correctness, robustness, migration, runtime, and cleanup slice is done — all 30
+findings closed. Every slice shipped RED-first with the RED independently reproduced
+(revert or sabotage) before commit. The only remaining work is Phase 8 (CI coverage,
+deferred by decision), whose case has been building all plan long: **13 logged
+instances** of tests/paths that CI silently didn't cover.
+
+- [x] Phase 0 — Reproduce-first scaffolding — complete 2026-07-16
+- [x] Phase 1 — GC data-loss & the crash — complete 2026-07-17 (1.2 last: `e4e76808`)
+- [x] Phase 2 — Non-hydrating (S3) backend correctness — complete 2026-07-17 (2.4 last: `b5137032`)
+- [x] Phase 3 — Blob integrity & cross-runtime interop — complete 2026-07-16 (3.4: `8fc3f776`)
+- [x] Phase 4 — HTTP-surface robustness & backward compat — complete 2026-07-16 (`6d2ec2a4`, `fb3bf095`, `f5867ef6`)
+- [x] Phase 5 — Migration safety — complete 2026-07-16 (`3bc843d8`)
+- [x] Phase 6 — Runtime, async-safety & efficiency — complete 2026-07-17 (6.5 last: NM `509d5b85` + ST `86e57cb`)
+- [x] Phase 7 — Duplication & altitude cleanup — complete 2026-07-17 (7.5 `e9439a75`, 7.1+7.3 `65edcde4`, 7.2+7.4 `ceb5db53`)
+- [ ] **Phase 8 — CI coverage (DEFERRED)** — the one remaining phase. The interim stub
+  convention worked (every slice added its own steps), but the 13-bite ledger says the
+  audit + 8.1's meta-test are worth scheduling.
 
 ## Guiding principles
 
@@ -1322,7 +1330,20 @@ that all three binaries (`server`, `server-s3`, `dev-server`) call.
 - **Validation:** identical CLI behavior across binaries; the duplicated helpers exist
   once.
 
-### 7.2 — One retry/circuit-breaker component **[NM]**
+### 7.2 — One retry/circuit-breaker component **[NM]** — ✅ **DONE 2026-07-17** (`ceb5db53`, with 7.4)
+- **Shipped characterization-first:** 19 pins captured green against UNCHANGED code,
+  then `RetryCircuitBreakerPolicy` extracted (Composition, not Abstractions — only
+  Composition consumes it). **The drift stays drift, now visible as options:**
+  S3Direct alone carries the 501 capability-declined carve-out
+  (`TreatNotImplementedAsCapabilityDeclined`); Delegated alone uses `CallerDecides`
+  breaker polarity — its 4xx and 200-with-JSON-null answers are breaker FAILURES,
+  the inverse of the origin providers (pinned; filed as a deliberate future
+  unification candidate, incl. the healthy-but-empty-delegate-opens-breaker quirk);
+  exhaustion mapping stays caller-side (HttpRemote throws, both S3 providers null).
+  Wiring sabotage-proven three ways (agent ×2 + orchestrator's 501-option flip →
+  exactly the 3 S3Direct-501 pins fail).
+
+**Original section text follows.**
 The retry-classification + circuit-breaker is copied three times in
 `NodalMerge.Host.Composition` (`S3DirectBlobStoreProvider.cs:526`,
 `HttpRemoteBlobStoreProvider.cs`, `S3DelegatedBlobUrlResolverProvider.cs`) and already
@@ -1356,7 +1377,23 @@ options-driven component; map its "exhausted" outcome per caller.
 - **Validation:** each duplicate collapses to a single definition; existing tests
   green.
 
-### 7.4 — Freeze the delegate room-id placeholder **[NM]**
+### 7.4 — Freeze the delegate room-id placeholder **[NM]** — ✅ **DONE 2026-07-17** (`ceb5db53`, with 7.2) — **PHASE 7 COMPLETE**
+- **Decided: `room = "_global"`** (+ `namespace = "blobs"` for hosts sending the
+  OPTIONAL field; Rust's request struct has no namespace field and keeps omitting it
+  — conformant). `_global` was Rust's documented value (mirrors the GC-preflight
+  placeholder) and can't collide with real room ids the way .NET's `"default"`
+  could — which also collided with the legacy route's real-room default.
+- The 0.4-reserved vector slot in `work-unit-status-vectors.v1.json` filled
+  (additive, no schema bump); `DelegatePresignProtocol` constants in Abstractions;
+  §7 gained "The room-agnostic placeholder (frozen)" + a ⚠ change note (a delegate
+  quota/audit keyed on room sees .NET's value change; bytes/keys unaffected).
+- **RED independently reproduced** (WebApplicationExtensions revert): 3/4 failed
+  `Expected "_global" / Actual "default"`; Rust pin green both sides — the
+  asymmetry WAS the finding. Gates: .NET 683/683, Rust vectors 2/2, MinIO 1/1.
+- **13th CI gap closed in-slice:** the entire blob URL-resolution vector family
+  (both hosts' tests + the vector file) ran in NO workflow.
+
+**Original section text follows.**
 `nodalmerge:server/server/src/blob_http.rs:73` sends `room="_global"` while the .NET
 host sends `room="default", ns="blobs"` into the same delegate presign protocol; the
 contract makes room metadata-only (never a key input), so bytes are unaffected, but a
