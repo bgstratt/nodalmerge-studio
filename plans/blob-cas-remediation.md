@@ -1304,7 +1304,17 @@ does real per-pack work (live-map replay + refresh of every `IRehydratable`).
 Quality debt with no behavior change; do last, once the surface is correct. Each slice
 must be behavior-preserving (guard with the tests from earlier phases).
 
-### 7.1 — Shared server CLI/bootstrap module **[NM]**
+### 7.1 — Shared server CLI/bootstrap module **[NM]** — ✅ **DONE 2026-07-17** (`65edcde4`, with 7.3)
+- **Shipped:** `nodalmerge_server::cli_args` — 14 parsers + `parse_gc_sweep_common`
+  (flags, GcServiceConfig, studio-union collector, pin store); main.rs 900→539,
+  server-s3 830→~450; keep-in-sync comment dead. Per-block inventory found NO
+  meaningful parser drift (latent risk, hadn't fired); object-store selection on
+  `--blob-backend` stays binary-local (capability difference, not drift);
+  **dev-server deliberately not switched** (it never had CLI flags — gaining them
+  silently would be a behavior change). Golden check: pre/post binaries × 32 flag
+  matrices × both bins = 0 diffs across 64 captures. 20 parser unit tests.
+
+**Original section text follows.**
 `nodalmerge:server/server-s3/src/main.rs:423` duplicates ~310 lines of flag parsers +
 ~75 lines of GC/blob wiring from `server/server/src/main.rs` (with a "keep in sync by
 hand" comment). Extract a `cli`/`bootstrap` module in the `nodalmerge-server` library
@@ -1321,7 +1331,20 @@ options-driven component; map its "exhausted" outcome per caller.
 - **Validation:** all three providers use it; behavior matches each provider's current
   contract (pin with tests first).
 
-### 7.3 — Shared low-level helpers **[NM]**
+### 7.3 — Shared low-level helpers **[NM]** — ✅ **DONE 2026-07-17** (`65edcde4`, with 7.1)
+- **Shipped:** `date_util.rs` (both copies were already in the same crate) + the
+  long-missing round-trip property test (±150k-day sweep, century pins); the .NET
+  canonical-hash copies — **three** by now, 5.2 added one — merged into
+  `Host.Abstractions.BlobHash.IsCanonical` after verifying identical semantics;
+  `FileBlobGcCoordinator.SanitizeHash` correctly identified as a **deliberate
+  non-duplicate** (lenient fold, over-protection is its safe failure mode) and left
+  untouched; `key_for`/`s3_key_scheme` → one `blake3_object_key`; 6.1's bridge
+  helper confirmed already single (that bullet was pre-absorbed).
+- Behavior-preservation: full gates identical; .NET 660/660 ×2 consecutive; net
+  −700 lines. CI: new modules in paths + dedicated `--lib` steps (the filtered
+  `--lib` blind spot struck again — 8.1's meta-test would catch the class).
+
+**Original section text follows.**
 - One proleptic-Gregorian date module for the two copies in
   `studio_live_hashes.rs:272` and `blob_http.rs:421` (add the round-trip test the
   split copies lack).
