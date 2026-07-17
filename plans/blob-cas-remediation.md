@@ -841,18 +841,29 @@ decoding zstd (Chrome 123+/FF 126+ do; Safari and Node/undici do not).
 - **Validation:** a Safari/Node-style fetch (no auto-decode) round-trips an s3-direct
   blob and passes the integrity check.
 
-### 3.4 — Content-Encoding negotiation correctness **[NM]**
-- Honor `q=0` in `Accept-Encoding` on both hosts
-  (`nodalmerge:server/server/src/blob_http.rs:457`,
-  `hosts/dotnet/…/WebApplicationExtensions.cs:725`) so `zstd;q=0` means "don't send
-  zstd."
-- Reject PUT carrying `Content-Encoding` with **415** on the .NET host to match Rust
-  (`blob_http.rs` returns 415; .NET currently ignores it → 422 or stores a frame as
-  identity). The contract makes this a **MAY**, so this is a parity/robustness fix,
-  not a mandated-status fix — implement it and add a parity vector so the two hosts
-  stay aligned.
-- **Validation:** parity vectors for `q=0` and PUT-with-`Content-Encoding` pass on
-  both hosts.
+### 3.4 — Content-Encoding negotiation correctness **[NM]** — ✅ **DONE 2026-07-16** (`8fc3f776`) — **PHASE 3 COMPLETE**
+- **Shipped:** per-coding `q=0` refusal honored on both hosts (mirrored
+  `coding_accepts_zstd`/`is_qvalue_zero` helpers; RFC 9110 zero-branch spellings
+  `0`/`0.`/`0.0`/`0.00`/`0.000`; `gzip;q=0, zstd` still accepts zstd — params never
+  leak across tokens). Deliberately NOT full qvalue preference ordering — nonzero or
+  absent `q` keeps accept-if-mentioned, pinned by tests on both hosts so a future
+  refactor can't silently add preference math. .NET PUT now 415s on `Content-Encoding`
+  **presence alone** (any value, `identity` included), before body/hash work — verified
+  to match Rust exactly (same `contains_key` check, same body text, same
+  canonical→auth→CE ordering). Pre-fix .NET both failure modes confirmed live: a
+  correct compressed upload 422'd, and wire bytes that happened to hash right were
+  **201'd and stored mislabeled as identity, permanently**.
+- **Vector escape hatch taken:** the frozen `blob-http-surface-vectors.v1.json` schema
+  has **no request-header slot** (pre-existing limitation, noted in 2.1-era comments),
+  so these are paired hand-written tests on both hosts (Rust surface 3→8 + 7 helper
+  unit tests; .NET negotiation 4→17), not forced vector entries. If the vector schema
+  ever grows a request-header slot (v2), fold these three cases in.
+- **RED:** Rust 3 failed / .NET 11 failed pre-fix (415 cases: `Expected
+  UnsupportedMediaType, Actual UnprocessableEntity/Created`), reproduced independently
+  by stash-revert of only the two production files. `gzip;q=0`-then-zstd and nonzero-q
+  pins were green-side (correct-by-accident scoping), honestly labeled.
+- **CI:** no edits needed — all four touched files already had dedicated steps + paths
+  in `blob-layout-parity.yml` (tests were added to existing covered files).
 
 ---
 
