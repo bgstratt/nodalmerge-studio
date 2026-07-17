@@ -662,14 +662,26 @@ export archives and compute `blobs_digest` over an empty set with no warning.
 - **Validation:** 0.2 export scenario either includes the bytes or returns a clear
   error; digest parity between Dir- and S3-backed exports of the same room.
 
-### 2.4 — WS blob-request persistence fallback **[NM]** (latent)
-`nodalmerge:server/server/src/ws_handler.rs:1124`. The fallthrough serves only the
-room's in-memory store with no `persistence.get_blob` fallback. No shipped client
-triggers it today (web/js SDKs always upload), so this is **low priority** — schedule
-it after 2.1–2.3, and only if the existence-probe/hydration seam doesn't already
-subsume it.
-- **Validation:** a peer without direct blob IO can be served a global-CAS blob
-  referenced in an already-open room.
+### 2.4 — WS blob-request persistence fallback **[NM]** (latent) — ✅ **DONE 2026-07-17** (`b5137032`) — **PHASE 2 COMPLETE**
+- **Subsumption check answered first: NOT subsumed** — 2.2's hydration seam is
+  deliberately tree-objects-only (`get_blob` stays `None` for S3 forever), while this
+  is file payloads on the WS serve path.
+- **Shipped:** on in-memory miss the BlobRequest arm serves `persistence.get_blob`
+  in the identical `BlobPackEntry` shape — Dir returns 3.2-verified bytes; S3 is a
+  structural no-op by 2.2's contract (comment at the site points at the F6 redirect
+  path for capable clients). **Deliberately no warming**: `MemoryBlobStore` is an
+  unbounded HashMap with no eviction — warming on fallback would pull the durable
+  CAS into RAM on a busy relay room (asserted: `room.blobs` empty after a fallback
+  serve). In-memory hits trust correctly (store keys by `Hash::of(data)` at write).
+- **Validation met + independently reproduced** (ws_handler.rs revert): pre-fix
+  `blobs=[]` for a durably-stored, node-unreferenced hash; post-fix served. Real-WS
+  harness (axum + tungstenite, host_migration_parity's pattern) — no seam
+  compromise. Non-hydrating pin green both sides, honestly labeled.
+- **CI:** `ws_handler.rs` + the new test added to blob-layout-parity paths/steps —
+  closes the this-path portion of 4.2's filed zero-coverage gap (BlobUpload etc.
+  covered transitively by already-wired suites).
+- **Filed:** WS blob paths still do synchronous store I/O on the async task (6.2 was
+  HTTP-surface-only by scope) — future slice if WS load warrants.
 
 ---
 
