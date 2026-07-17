@@ -1150,14 +1150,65 @@ still park the worker.
 - **CI:** `blob-layout-parity.yml` gained the `blob_http_offload` step + both `paths:`
   entries (Docker-free, bridge_timeouts-style comment).
 
-### 6.3 — GC batch/bulk I/O **[NM]**
-- Batch the mark-pass upserts (`nodalmerge:server/server/src/gc_store.rs:223`) into a
-  single transaction/prepared statement instead of one autocommit per hash (100k
-  hashes = 100k txns today).
-- Parallelize/bulk the S3 sweep deletes (`s3-blobs:556`) via `delete_stream` or
-  `buffer_unordered`, instead of one awaited delete per object (N+1).
-- **Validation:** mark-pass and sweep timings drop by an order of magnitude on a
-  100k-object fixture.
+### 6.3 — GC batch/bulk I/O **[NM]** — ✅ **DONE 2026-07-17** (`5ca7a9d0`, with 6.4)
+- **Shipped:** mark pass = ONE cached-statement txn via new
+  `AssetInventoryStore::upsert_active_seen_batch` (defaulted method loops the per-row
+  one — documented as correct-but-unbatched, not the 2.1 trap; shared SQL const so
+  the two paths can't drift; single txn chosen over chunking: all-or-nothing fails
+  closed before any sweep). Sweep = plan-then-execute, actions via
+  `buffer_unordered(16)`; **`delete_stream` rejected deliberately** — AWS bulk
+  DeleteObjects folds blob+tombstone keys into shared 1000-key batches, erasing the
+  per-object tombstone-PUT-before-delete ordering (cross-object order was never a
+  protocol property; per-object steps stay sequential). RetryConfig tamed
+  (2 retries, `op_timeout + 5s` — **the +5s is load-bearing**: equal bounds made the
+  client race the bridge and reclassified stalled PUTs 503→500, caught by
+  blob_put_durability; closes 6.1's filed follow-up).
+- **Measured (this machine):** mark 100k: 12.88s → 0.878s (**14.7×**); MinIO sweep
+  10k: tombstone pass 71.9s → 9.2s, delete pass 27.8s → 6.3s (Docker-Desktop MinIO's
+  ~1.5k write-ops/s is the remaining ceiling, not the sweep). Benches are
+  `#[ignore]`d, not CI-gating; behavior-equality smokes run in CI.
+- Two-phase semantics untouched: `minio_round_trip.rs` not modified, 8/8; new
+  `minio_sweep_scale` smoke pins two-phase at 50 objects with overlap.
+
+### 6.4 — GC recomputation caching **[NM]** — ✅ **DONE 2026-07-17** (`5ca7a9d0`, with 6.3)
+- **Shipped:** `GcScanCaches` on `Rooms` — cold-room live-blob set + studio-map
+  projection (the filtered `studio/` map, NOT the classified result), keyed on new
+  `NodePersistence::room_nodes_version` (`MAX(seq)`; monotonic by AUTOINCREMENT;
+  version read BEFORE load so a mid-load append costs one wasted rescan, never
+  staleness; `Composite` forwards, pinned; **default `None` = cache disabled = exact
+  pre-6.4 behavior** — Postgres/Mongo are safe-slow until overridden, filed:
+  Postgres is a trivial MAX(seq), Mongo needs design). Rooms absent from
+  enumeration are pruned (deletion can't advance a version). **Everything that
+  changes the live set WITHOUT a seq advance — upload-window rows, grace expiry,
+  `retain_intermediate_days`, pins, inventory transitions — is deliberately NOT
+  cached** and recomputed per tick; pinned by a warm-cache retention-change test.
+- **Plan-premise correction (the big one): "the visited set IS the live output set"
+  is WRONG as stated.** `live` also holds terminal (file) inserts that were never
+  expanded; sharing one set would let an earlier snapshot's file entry suppress a
+  later snapshot's *directory* expansion of the same content-aliased hash — silently
+  dropping that subtree from the live set = GC deleting live data. Two-set design
+  (`live` + `expanded`) via new `walk_tree_into`; strictly ⊇ the old union, and
+  deterministic where the old walk was traversal-order-dependent in the f/d-alias
+  corner. Sets shared per run (CAS makes expansion location-independent), never
+  across runs. Pinned by a suppression test + fetch-counted union-equality.
+- Sweeper's blocking work wrapped in `spawn_blocking` (cold replays incl. signature
+  re-verification, per-room tree walks, the 15-min `blob_gc_sweep` — 6.2's filed
+  site; sweeper is `tokio::spawn`ed on the shared runtime, verified). **In-scope
+  fix:** `resolve_room_studio_map`'s resident fast-path was keyed on residency
+  alone — 1.4's hydration race, second sighting — now gated on `hydrated`.
+- **Teeth proven twice:** agent's planted-stale seams (`assert_ne!` divergence in
+  the dangerous direction, healed by version advance) AND the orchestrator's
+  independent sabotage (constant `room_nodes_version` → 5/8 cache tests fail:
+  both equivalence oracles, both planted-stale tests, the monotonicity pin).
+  Warm tick on 120 cold rooms: 16.37s → 43.5ms, zero re-scans by counter. All GC
+  gates unchanged.
+- **CI:** `core/gc/src/**` was NOT a paths trigger anywhere (**10th bite**) — added;
+  `room.rs` added to studio-live-hashes-parity (new coupling); 2 new steps in
+  blob-layout-parity, 1 in blob-s3-gc-minio.
+- **Filed:** write-through `persist_node` failures are warn-only → a blob referenced
+  only by an unpersisted node is invisible to any persisted-node scan after eviction
+  (wants 4.2-family treatment on node writes); studio scan enumerates non-studio
+  rooms (cheap predicate would skip most); Postgres/Mongo version overrides.
 
 ### 6.4 — GC recomputation caching **[NM]**
 - `sweep_blobs` reloads every cold room's full node history per tick
