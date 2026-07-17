@@ -71,7 +71,7 @@ RED tests (all must fail on current code):
 CI: confirm the test class runs in a workflow step; wire or stub per 8.0 and say which in
 the report.
 
-- [ ] A1 shipped
+- [x] A1 shipped (nodalmerge `9603c9d4`; RED reproduced 4/8 migration tests on revert; host suite 688/688)
 
 ## Phase B — repack 0.2.3 + studio integration verification **[ST]**
 
@@ -98,7 +98,10 @@ Nothing from the remediation plan is live in studio until this happens — studi
   Positive evidence required: observer actually invoked through the dispatcher path
   (log/counter assertion, not just "nothing crashed").
 
-- [ ] B1 shipped  · [ ] B2 green  · [ ] B3 green
+- [x] B1 shipped (studio `9be0f39`; local repack + restore + build clean)  · [x] B2 green
+  (Contracts 24 / Core 42 / Merge 69 / Projections 37 / AgentRuntime 107 / Tasks 14 /
+  Integration 680 — 0 failed on 0.2.3)  · [x] B3 green (MultiUser + StudioInboundPackObserver
+  6/6 on 0.2.3 — the 6.5 end-to-end pairing)
 
 ## Phase C — Phase 8 executed (CI coverage) **[NM]** — the nuget.org publish gate
 
@@ -134,7 +137,11 @@ workflows**, plus one-directional parity contracts.
   runs in CI (`gh variable set` or repo settings — needs user's gh auth), and verify the
   lane provisions/locates the natives it needs.
 
-- [ ] C1 shipped  · [ ] C2 shipped  · [ ] C3 shipped  · [ ] C4 done
+- [x] C1 shipped (nodalmerge `ff7037fc`; script + baseline + ci-coverage-meta.yml. RED: empty
+  baseline reproduces 48 gaps = 17 Rust + 27 .NET uncovered + 4 one-sided pairs. Ratchet teeth
+  verified: baselining a covered suite flags STALE; restoring goes green)  · [ ] C2 shipped
+  · [x] C3 shipped (parity-pair rule folded into C1's meta-check; 7 pairs declared, 4 one-sided
+  pinned in baseline with PARITY: tags)  · [ ] C4 done
 
 ## Sequencing
 
@@ -145,3 +152,5 @@ linux-x64 natives, nuget.org 0.2.3, docs-repo bump.
 ## Status log
 
 - 2026-07-17: plan created.
+- 2026-07-17: A ✓, B ✓, C1/C3 ✓ shipped and RED-verified. Publish gate now blocks only on C2
+  (burn down the 46-entry baseline) and C4 (studio native CI lane — needs user gh auth).
