@@ -15,12 +15,12 @@
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.6.0" />
     <PackageVersion Include="ModelContextProtocol" Version="1.4.0" />
     <PackageVersion Include="ModelContextProtocol.AspNetCore" Version="1.4.0" />
-    <PackageVersion Include="NodalMerge.DotNetHost" Version="0.2.2" />
-    <PackageVersion Include="NodalMerge.DotNetHost.Native.linux-x64" Version="0.2.2" />
-    <PackageVersion Include="NodalMerge.DotNetHost.Native.win-x64" Version="0.2.2" />
-    <PackageVersion Include="NodalMerge.Host.Abstractions" Version="0.2.2" />
+    <PackageVersion Include="NodalMerge.DotNetHost" Version="0.2.3" />
+    <PackageVersion Include="NodalMerge.DotNetHost.Native.linux-x64" Version="0.2.3" />
+    <PackageVersion Include="NodalMerge.DotNetHost.Native.win-x64" Version="0.2.3" />
+    <PackageVersion Include="NodalMerge.Host.Abstractions" Version="0.2.3" />
     <PackageVersion Include="SourceGear.SQLite3" Version="3.50.4.5" />
-    <PackageVersion Include="NodalMerge.Host.Composition" Version="0.2.2" />
+    <PackageVersion Include="NodalMerge.Host.Composition" Version="0.2.3" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
   </ItemGroup>
