@@ -800,13 +800,24 @@ public static class StudioRestEndpoints
         });
 
         // Phase 9d — detected project roots (paths, stacks, resolved build/test/run commands).
+        // A replicated peer branch (e.g. work-<guid> that crossed the room but was never materialized
+        // here) has no local working directory, so detection can't run. That's a normal state for a
+        // peer's work unit, not a server fault — return an empty profile instead of surfacing the
+        // "has no working directory" InvalidOperationException as an unhandled 500.
         app.MapGet("/studio/workspace/profile", async (
             [FromQuery] string branchId,
             IWorkspaceProfileService profiles,
             CancellationToken ct) =>
         {
-            var profile = await profiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
-            return Results.Ok(profile);
+            try
+            {
+                var profile = await profiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
+                return Results.Ok(profile);
+            }
+            catch (InvalidOperationException)
+            {
+                return Results.Ok(new WorkspaceProfile(branchId, [], DateTimeOffset.UtcNow));
+            }
         });
 
         app.MapPost("/studio/workspace/profile/rescan", async (
