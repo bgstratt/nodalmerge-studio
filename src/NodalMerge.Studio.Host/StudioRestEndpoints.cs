@@ -1496,6 +1496,7 @@ public static class StudioRestEndpoints
         app.MapPost("/studio/workunits", async (
             CreateWorkUnitBody body,
             IWorkUnitCommandService workUnitCommands,
+            IGoalNodeService goalNodes,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(body.Goal))
@@ -1515,6 +1516,29 @@ public static class StudioRestEndpoints
                         SeedFromBranchId: body.SeedFromBranchId, ExpectedOutputKind: body.ExpectedOutputKind,
                         RepositoryId: body.RepositoryId, ReferenceFiles: body.ReferenceFiles),
                     ct).ConfigureAwait(false);
+
+                // First-class replicating goal (plans/first-class-goals-and-materialization.md Phase 1):
+                // a ROOT work unit IS a goal. Persist a repo-scoped GoalNode (GoalId == root WorkUnitId,
+                // routed by the work unit's resolved RepositoryId) so the goal REPLICATES to same-repo
+                // peers and carries the goal text/status — instead of being reconstructed per-peer from
+                // the work unit, which never crossed the network. Every run strategy funnels through this
+                // endpoint, so this one seam covers the extension, MCP tools, and the eval harness.
+                // Idempotent by GoalId; never overwrites an existing goal's status/pause state.
+                if (wu.ParentWorkUnitId is null
+                    && await goalNodes.GetAsync(wu.WorkUnitId, ct).ConfigureAwait(false) is null)
+                {
+                    await goalNodes.RecordAsync(new GoalNode(
+                        GoalId: wu.WorkUnitId,
+                        Goal: wu.Goal,
+                        WorkUnitId: wu.WorkUnitId,
+                        BranchId: wu.BranchId,
+                        Status: GoalStatus.Exploring,
+                        CreatedAt: wu.CreatedAt,
+                        UpdatedAt: wu.UpdatedAt,
+                        Owner: wu.Owner,
+                        RepositoryId: wu.RepositoryId), ct).ConfigureAwait(false);
+                }
+
                 return Results.Ok(wu);
             }
             catch (KeyNotFoundException ex)
@@ -4110,66 +4134,78 @@ public static class StudioRestEndpoints
                     : parkedWorkUnitIdsByRoot[root] = []).Add(item.WorkUnitId);
             }
 
+            // First-class replicating goals (plans/first-class-goals-and-materialization.md Phase 1):
+            // return stored goals UNION a synthesized goal for every work unit WITHOUT a stored
+            // GoalNode (deduped by WorkUnitId). This was previously either/or — the moment ANY stored
+            // goal existed, the endpoint returned ONLY stored goals and dropped every work-unit-derived
+            // goal, INCLUDING a peer's replicated work units, so one local goal masked all remote goals.
+            // The union guarantees a replicated peer work unit always surfaces regardless of local goals.
             var storedGoals = await goalNodes.ListAsync(ct).ConfigureAwait(false);
-            if (storedGoals.Count > 0)
+            var goals = new List<object>(storedGoals.Count);
+            var coveredWorkUnitIds = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var g in storedGoals)
             {
+                coveredWorkUnitIds.Add(g.WorkUnitId);
+
                 // Terminal work-unit statuses never flow back into GoalStatus anywhere else
                 // (only Pause/Resume set Paused/Exploring), so goal-store goals otherwise report
                 // "Exploring" forever even after their work unit finished. Derive the effective
                 // terminal status here and lazily write it back so the store converges.
-                var goals = new List<object>(storedGoals.Count);
-                foreach (var g in storedGoals)
+                var effectiveStatus = g.Status;
+                if (workUnitById.TryGetValue(g.WorkUnitId, out var wu))
                 {
-                    var effectiveStatus = g.Status;
-                    if (workUnitById.TryGetValue(g.WorkUnitId, out var wu))
+                    var terminal = wu.Status switch
                     {
-                        var terminal = wu.Status switch
-                        {
-                            WorkUnitStatus.Completed or WorkUnitStatus.Merged => GoalStatus.Converged,
-                            WorkUnitStatus.Cancelled => GoalStatus.Abandoned,
-                            _ => (GoalStatus?)null
-                        };
-                        if (terminal is not null && terminal.Value != g.Status)
-                        {
-                            effectiveStatus = terminal.Value;
-                            var corrected = g with { Status = effectiveStatus, UpdatedAt = DateTimeOffset.UtcNow };
-                            await goalNodes.RecordAsync(corrected, ct).ConfigureAwait(false);
-                        }
+                        WorkUnitStatus.Completed or WorkUnitStatus.Merged => GoalStatus.Converged,
+                        WorkUnitStatus.Cancelled => GoalStatus.Abandoned,
+                        _ => (GoalStatus?)null
+                    };
+                    if (terminal is not null && terminal.Value != g.Status)
+                    {
+                        effectiveStatus = terminal.Value;
+                        var corrected = g with { Status = effectiveStatus, UpdatedAt = DateTimeOffset.UtcNow };
+                        await goalNodes.RecordAsync(corrected, ct).ConfigureAwait(false);
                     }
-
-                    parkedReasonByRoot.TryGetValue(g.WorkUnitId, out var parkedReason);
-                    parkedWorkUnitIdsByRoot.TryGetValue(g.WorkUnitId, out var parkedIds);
-                    var orchestratorStalled = g.ParentGoalId is null
-                        && parkedReason is null
-                        && effectiveStatus is not (GoalStatus.Converged or GoalStatus.Abandoned or GoalStatus.Paused)
-                        && !activeRootIds.Contains(g.WorkUnitId);
-                    goals.Add(new
-                    {
-                        goalId = g.GoalId,
-                        goal = g.Goal,
-                        workUnitId = g.WorkUnitId,
-                        branchId = g.BranchId,
-                        status = effectiveStatus.ToString(),
-                        pauseReason = g.PauseReason,
-                        parentGoalId = g.ParentGoalId,
-                        createdAt = g.CreatedAt,
-                        updatedAt = g.UpdatedAt,
-                        hasParkedWork = parkedReason is not null,
-                        parkedReason,
-                        parkedWorkUnitIds = (IReadOnlyList<string>?)parkedIds ?? [],
-                        orchestratorStalled,
-                        // orchestratorProfileId is the legacy name for defaultProfileId — both ship
-                        // until the extension reads the new one (plans/orchestrator-pure-service.md M3).
-                        orchestratorProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null,
-                        defaultProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null
-                    });
                 }
-                return Results.Ok(new { goals, source = "goal-store" });
+
+                parkedReasonByRoot.TryGetValue(g.WorkUnitId, out var parkedReason);
+                parkedWorkUnitIdsByRoot.TryGetValue(g.WorkUnitId, out var parkedIds);
+                var orchestratorStalled = g.ParentGoalId is null
+                    && parkedReason is null
+                    && effectiveStatus is not (GoalStatus.Converged or GoalStatus.Abandoned or GoalStatus.Paused)
+                    && !activeRootIds.Contains(g.WorkUnitId);
+                goals.Add(new
+                {
+                    goalId = g.GoalId,
+                    goal = g.Goal,
+                    workUnitId = g.WorkUnitId,
+                    branchId = g.BranchId,
+                    status = effectiveStatus.ToString(),
+                    pauseReason = g.PauseReason,
+                    parentGoalId = g.ParentGoalId,
+                    createdAt = g.CreatedAt,
+                    updatedAt = g.UpdatedAt,
+                    hasParkedWork = parkedReason is not null,
+                    parkedReason,
+                    parkedWorkUnitIds = (IReadOnlyList<string>?)parkedIds ?? [],
+                    orchestratorStalled,
+                    // orchestratorProfileId is the legacy name for defaultProfileId — both ship
+                    // until the extension reads the new one (plans/orchestrator-pure-service.md M3).
+                    orchestratorProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null,
+                    defaultProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null
+                });
             }
 
+            // Union: synthesize a goal for any work unit lacking a stored GoalNode. With Phase 1's
+            // server-side auto-goal, a root work unit normally already has one; this still covers
+            // legacy pre-fix work units and any root created without going through the goal path.
             var items = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
-            var fallback = items.Select(wu =>
+            foreach (var wu in items)
             {
+                if (coveredWorkUnitIds.Contains(wu.WorkUnitId))
+                    continue;
+
                 parkedReasonByRoot.TryGetValue(wu.WorkUnitId, out var parkedReason);
                 parkedWorkUnitIdsByRoot.TryGetValue(wu.WorkUnitId, out var parkedIds);
                 // Only meaningful for a root goal (no parent) — a child work unit is never itself
@@ -4178,7 +4214,7 @@ public static class StudioRestEndpoints
                     && parkedReason is null
                     && wu.Status is not (WorkUnitStatus.Completed or WorkUnitStatus.Merged or WorkUnitStatus.Cancelled)
                     && !activeRootIds.Contains(wu.WorkUnitId);
-                return new
+                goals.Add(new
                 {
                     goalId = wu.WorkUnitId,
                     goal = wu.Goal,
@@ -4186,6 +4222,7 @@ public static class StudioRestEndpoints
                     branchId = wu.BranchId,
                     status = wu.Status.ToString(),
                     pauseReason = (string?)null,
+                    parentGoalId = (string?)null,
                     parentWorkUnitId = wu.ParentWorkUnitId,
                     createdAt = wu.CreatedAt,
                     updatedAt = wu.UpdatedAt,
@@ -4196,9 +4233,14 @@ public static class StudioRestEndpoints
                     // Legacy + new name pair — see the goal-store branch above.
                     orchestratorProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(wu.WorkUnitId) : null,
                     defaultProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(wu.WorkUnitId) : null,
-                };
-            }).ToList();
-            return Results.Ok(new { goals = fallback, source = "work-units" });
+                });
+            }
+
+            return Results.Ok(new
+            {
+                goals,
+                source = storedGoals.Count > 0 ? "goal-store+work-units" : "work-units"
+            });
         });
 
         // Pause a goal
