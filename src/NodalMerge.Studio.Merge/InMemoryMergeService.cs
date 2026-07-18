@@ -796,6 +796,15 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
+        // Phase 4 (plans/first-class-goals-and-materialization.md): when this apply promoted the
+        // integrated state to disk, that snapshot IS the goal's latest final state — stamp it onto the
+        // owning goal's GoalNode.FinalSnapshotId (last apply wins → the true final). Best-effort; a
+        // stamping failure must never affect the merge that just succeeded.
+        if (promotedToDisk && !string.IsNullOrEmpty(appliedSnapshotId))
+        {
+            await TryStampGoalFinalSnapshotAsync(owningWorkUnit, appliedSnapshotId, cancellationToken).ConfigureAwait(false);
+        }
+
         // A reconciliation work unit's own proposal just landed — generic across every source
         // (see WorkUnit.ReconciliationSourceProposalIds's own doc comment): supersede every
         // proposal it folds together, then resolve any open conflict record (candidate- or
@@ -1659,6 +1668,45 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     // anchor the MergeApplied event carries), or null when the CAS layer isn't configured or the
     // refresh failed. A failed or skipped resync must never affect the write-back itself, which
     // already succeeded.
+    // Phase 4 (plans/first-class-goals-and-materialization.md): stamp the just-applied integrated
+    // snapshot onto the owning goal's GoalNode.FinalSnapshotId so "materialize the goal's final state"
+    // resolves to a single snapshot id. Walks ParentWorkUnitId to the root (GoalId == root WorkUnitId
+    // by convention). Wholly best-effort — the final-snapshot pointer is a materialization convenience,
+    // never a merge invariant, so any failure here is swallowed (the merge already succeeded).
+    private async Task TryStampGoalFinalSnapshotAsync(
+        WorkUnit? owningWorkUnit, string appliedSnapshotId, CancellationToken ct)
+    {
+        try
+        {
+            if (owningWorkUnit is null)
+                return;
+            if (_serviceProvider?.GetService(typeof(IGoalNodeService)) is not IGoalNodeService goals)
+                return;
+            var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+
+            var root = owningWorkUnit;
+            while (workUnits is not null && root.ParentWorkUnitId is { } parentId)
+            {
+                var parent = await workUnits.GetAsync(parentId, ct).ConfigureAwait(false);
+                if (parent is null)
+                    break;
+                root = parent;
+            }
+
+            var goal = await goals.GetAsync(root.WorkUnitId, ct).ConfigureAwait(false);
+            if (goal is null || goal.FinalSnapshotId == appliedSnapshotId)
+                return;
+
+            await goals.RecordAsync(
+                goal with { FinalSnapshotId = appliedSnapshotId, UpdatedAt = DateTimeOffset.UtcNow }, ct)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // Best-effort — never let a goal-stamp failure surface into the merge that already landed.
+        }
+    }
+
     private async Task<string?> BestEffortResyncAsync(string? repositoryId, string writeBackPath, CancellationToken ct)
     {
         var isDefaultRepo = string.Equals(writeBackPath, _workspaceOptions.SeedRepositoryPath, StringComparison.Ordinal);

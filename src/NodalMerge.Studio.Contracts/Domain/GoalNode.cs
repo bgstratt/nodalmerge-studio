@@ -21,7 +21,15 @@ public sealed record GoalNode(
     // other repo-scoped kinds (StudioNodeStore.RepoScopedKinds) — the mechanism that makes a goal
     // visible to another peer on the same repo. Null for a goal with no resolvable repository (the
     // node then stays in the peer-local "studio" room, the pre-#1 behavior).
-    string? RepositoryId = null)
+    string? RepositoryId = null,
+    // Materialization anchors (plans/first-class-goals-and-materialization.md Phase 4). BaseSnapshotId
+    // = the repo's pre-work state (the root work unit's SeedSnapshotId), denormalized at creation so a
+    // peer can materialize "what this goal started from" without walking the work unit. FinalSnapshotId
+    // = the integrated result, stamped when the goal's winning proposal is applied (the merge's
+    // appliedSnapshotId). Both are RepositorySnapshot ids feedable straight to
+    // POST /studio/repository-snapshots/{id}/materialize. Null until known.
+    string? BaseSnapshotId = null,
+    string? FinalSnapshotId = null)
 {
     public IReadOnlyList<string> ChildGoalIds { get; init; } = ChildGoalIds ?? [];
 }

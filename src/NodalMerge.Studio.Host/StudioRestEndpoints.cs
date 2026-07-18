@@ -1536,7 +1536,11 @@ public static class StudioRestEndpoints
                         CreatedAt: wu.CreatedAt,
                         UpdatedAt: wu.UpdatedAt,
                         Owner: wu.Owner,
-                        RepositoryId: wu.RepositoryId), ct).ConfigureAwait(false);
+                        RepositoryId: wu.RepositoryId,
+                        // Phase 4: the goal's pre-work state = the root work unit's seed snapshot,
+                        // already a real materializable RepositorySnapshot. Null until the repo is
+                        // bootstrapped (no snapshot to seed from yet).
+                        BaseSnapshotId: wu.SeedSnapshotId), ct).ConfigureAwait(false);
                 }
 
                 return Results.Ok(wu);
@@ -1545,6 +1549,63 @@ public static class StudioRestEndpoints
             {
                 return Results.NotFound(new { error = ex.Message });
             }
+        });
+
+        // Materialization anchors (plans/first-class-goals-and-materialization.md Phase 4d) — resolves
+        // the snapshot ids a caller can feed to POST /studio/repository-snapshots/{id}/materialize for
+        // this work unit and its goal: the work unit's base (pre-work seed) and produced (what it
+        // built) states, plus the owning goal's base and final (integrated result) states. A null
+        // anchor simply means that state hasn't been captured yet.
+        app.MapGet("/studio/workunits/{workUnitId}/materialization", async (
+            string workUnitId,
+            IWorkUnitService workUnits,
+            IGoalNodeService goalNodes,
+            IStudioNodeStore nodeStore,
+            CancellationToken ct) =>
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+
+            // Produced = the latest WorkUnitCompletion snapshot attributed to this work unit.
+            string? producedSnapshotId = null;
+            var producedGeneration = -1L;
+            foreach (var (_, json) in await nodeStore
+                .ReadAllNodesAsync(StudioNodeKind.RepositorySnapshotV1, ct).ConfigureAwait(false))
+            {
+                RepositorySnapshot? snap;
+                try { snap = JsonSerializer.Deserialize<RepositorySnapshot>(json); }
+                catch (JsonException) { continue; }
+                if (snap is null
+                    || snap.WorkUnitId != workUnitId
+                    || snap.Source != WorkUnitProducedSnapshotObserver.SnapshotSource)
+                    continue;
+                if (snap.Generation > producedGeneration)
+                {
+                    producedGeneration = snap.Generation;
+                    producedSnapshotId = snap.SnapshotId;
+                }
+            }
+
+            // Goal anchors — walk to the root work unit (GoalId == root WorkUnitId by convention).
+            var root = wu;
+            while (root.ParentWorkUnitId is { } parentId)
+            {
+                var parent = await workUnits.GetAsync(parentId, ct).ConfigureAwait(false);
+                if (parent is null) break;
+                root = parent;
+            }
+            var goal = await goalNodes.GetAsync(root.WorkUnitId, ct).ConfigureAwait(false);
+
+            return Results.Ok(new
+            {
+                workUnitId,
+                baseSnapshotId = wu.SeedSnapshotId,          // this work unit's pre-work state
+                producedSnapshotId,                          // what this work unit built
+                goalId = root.WorkUnitId,
+                goalBaseSnapshotId = goal?.BaseSnapshotId,    // the goal's pre-work state
+                goalFinalSnapshotId = goal?.FinalSnapshotId,  // the goal's integrated result
+            });
         });
 
         // Stop controls — cancels one goal's whole subtree (the work unit plus every descendant

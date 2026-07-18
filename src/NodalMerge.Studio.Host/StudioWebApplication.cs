@@ -124,6 +124,21 @@ public static class StudioWebApplication
         builder.Services.AddSingleton<IProjectionMaterializer, LocalFilesystemProjectionMaterializer>();
         builder.Services.AddSingleton<IStudioParticipantService, StudioParticipantService>();
 
+        // Phase 4 (plans/first-class-goals-and-materialization.md) — mint a per-work-unit "produced
+        // state" snapshot on Proposed. Registered as IHostedService so it's eagerly instantiated and
+        // subscribes to the participant bus at startup (a lazy AddSingleton would never subscribe until
+        // first resolved). Blob store is optional — resolved via GetService so a no-CAS deployment
+        // simply skips minting rather than failing to construct.
+        builder.Services.AddSingleton<WorkUnitProducedSnapshotObserver>(sp => new WorkUnitProducedSnapshotObserver(
+            sp.GetRequiredService<IWorkUnitService>(),
+            sp.GetRequiredService<IFileWorkspaceService>(),
+            sp.GetRequiredService<IRepositorySnapshotService>(),
+            sp.GetRequiredService<IParticipantEventBus>(),
+            sp.GetRequiredService<ILogger<WorkUnitProducedSnapshotObserver>>(),
+            sp.GetService<NodalMerge.Host.Abstractions.Providers.IBlobStoreProvider>(),
+            sp.GetService<IRepositoryRegistryService>()));
+        builder.Services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<WorkUnitProducedSnapshotObserver>());
+
         // Slice 6.1b — the embedded Build() path never registered HeadlessPeerOptions/RoomPeerClient
         // before this slice (only BuildPeer() did — plans/cas-distribution-and-storage.md's Phase 6
         // reality check confirmed this was a genuine gap, not a false alarm). The retired 30 s
