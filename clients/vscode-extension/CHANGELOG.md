@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.13 — 2026-07-18
+
+- **Bundled runtime updated to the published NodalMerge host 0.2.4.** Fixes the
+  snapshot-on-mutation storm: the room server was re-serializing the entire room to a
+  full hydrate snapshot on every applied peer mutation, so seeding or heavily mutating a
+  large room degraded to O(n²) (the symptom behind the two-machine test's disconnects and
+  the peer `studio` room snapshot growing ~100 KB/mutation). The full-room checkpoint is
+  now debounced to at-most-once per window (default 200 mutations or 30 s), with a flush on
+  peer disconnect; the incremental packs remain the authoritative log, so hydration is
+  unchanged. No Studio-side behavior change beyond the runtime it spawns.
+
+## 0.1.12 — 2026-07-17
+
+- **Bundled runtime updated to the published NodalMerge host 0.2.3.** The Studio
+  host the extension ships and spawns now builds on the 0.2.3 CAS/blob runtime
+  (restored from nuget.org), which brings several server-side correctness fixes
+  that matter most for multi-peer and blob-heavy workspaces:
+  - Safer blob-layout migration — the legacy→v2 dedupe pass now verifies the
+    destination before dropping a duplicate and repairs a corrupt copy from the
+    already-verified bytes, and the completion marker is written only after a
+    fully clean pass (a transient failure is retried instead of stranding a file).
+  - Inbound pack notifications no longer run on the WebSocket receive loop, so a
+    slow domain observer can no longer stall frame processing (and relay) on a
+    connection.
+  - The legacy `/sync/blob-url` route is restored to its original response shape
+    and status codes (an internal refactor had silently changed them).
+  - Blob options fail-fast validation, plus a reverse-proxy path-prefix fix for
+    chained remote blob origins.
+- **Multi-user room server, documented end-to-end.** Running one Studio host as a
+  shared room server — so people on different machines collaborate in the same
+  room, each keeping their own local runtime and workspace — now has a
+  step-by-step guide: server bind (`--Studio:Urls=http://0.0.0.0:<port>`),
+  firewall, the client settings (`nodalmerge.room.hostUri`,
+  `nodalmerge.room.workgroup`, `nodalmerge.blobOrigin.uri`), and how to apply them
+  (edit settings → **NodalMerge: Restart Studio Host**, no window reload needed).
+  See the "Multi-user room server" guide in the docs.
+- Version bump to 0.1.12 so a clean install supersedes any older builds still
+  registered in VS Code.
+
 ## 0.1.11 — 2026-07-14
 
 - **Claude CLI and API-key harnesses are at parity.** Any role — planner, worker,

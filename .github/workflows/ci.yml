@@ -45,7 +45,7 @@ jobs:
         with:
           global-json-file: nodalmerge-studio/global.json
 
-      # NodalMerge.* 0.2.3 is published to nuget.org, so studio's pins restore directly from it
+      # NodalMerge.* 0.2.4 is published to nuget.org, so studio's pins restore directly from it
       # — no local pack step (and thus no Rust toolchain) needed in CI. Local testing of an
       # UNRELEASED NodalMerge.* build still works via scripts/restore-local-nodalmerge.ps1, which
       # injects a local feed at restore time (RestoreAdditionalProjectSources), independent of
