@@ -798,11 +798,15 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         // Phase 4 (plans/first-class-goals-and-materialization.md): when this apply promoted the
         // integrated state to disk, that snapshot IS the goal's latest final state — stamp it onto the
-        // owning goal's GoalNode.FinalSnapshotId (last apply wins → the true final). Best-effort; a
-        // stamping failure must never affect the merge that just succeeded.
+        // owning goal's GoalNode.FinalSnapshotId (last apply wins → the true final). Fire-and-forget on
+        // purpose: the stamp is a materialization convenience and must never add latency to the apply
+        // response (an extra repo-scoped node write can be slow on a large room) nor be cancelled when
+        // the caller aborts. Uses CancellationToken.None so it still completes past a client timeout.
         if (promotedToDisk && !string.IsNullOrEmpty(appliedSnapshotId))
         {
-            await TryStampGoalFinalSnapshotAsync(owningWorkUnit, appliedSnapshotId, cancellationToken).ConfigureAwait(false);
+            var stampWorkUnit = owningWorkUnit;
+            var stampSnapshotId = appliedSnapshotId;
+            _ = Task.Run(() => TryStampGoalFinalSnapshotAsync(stampWorkUnit, stampSnapshotId, CancellationToken.None));
         }
 
         // A reconciliation work unit's own proposal just landed — generic across every source

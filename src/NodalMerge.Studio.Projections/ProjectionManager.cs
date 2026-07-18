@@ -32,6 +32,7 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly WorkspaceOptions? _workspaceOptions;
     private readonly ICoModService? _coMod;
     private readonly IExecutionEventStream? _eventStream;
+    private readonly IGoalNodeService? _goals;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
@@ -53,7 +54,8 @@ public sealed class ProjectionManager : IProjectionManager
         IRepositoryOpService? repositoryOps = null,
         WorkspaceOptions? workspaceOptions = null,
         ICoModService? coMod = null,
-        IExecutionEventStream? eventStream = null)
+        IExecutionEventStream? eventStream = null,
+        IGoalNodeService? goalNodes = null)
     {
         _workUnits          = workUnits;
         _tasks              = tasks;
@@ -75,6 +77,7 @@ public sealed class ProjectionManager : IProjectionManager
         _workspaceOptions   = workspaceOptions;
         _coMod              = coMod;
         _eventStream        = eventStream;
+        _goals              = goalNodes;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -1137,6 +1140,37 @@ public sealed class ProjectionManager : IProjectionManager
                 ActorProvider: null,
                 Summary: wu.Goal,
                 OccurredAt: wu.CreatedAt));
+        }
+
+        // plans/first-class-goals-and-materialization.md Phase 2 — also emit a goal node from every
+        // replicated GoalNode not already covered by a local root work unit above. A PEER's goal
+        // replicates as a repo-scoped GoalNode (Phase 1) even when its root work unit isn't in THIS
+        // peer's work-unit view — so without this, another peer's goal surfaces only as bare
+        // work/proposal ids with no readable goal to anchor to. Deduped by goal node id (GoalId ==
+        // root WorkUnitId), so a local goal (which has both a root work unit and a GoalNode) stays a
+        // single node.
+        if (_goals is not null)
+        {
+            foreach (var goal in await _goals.ListAsync(ct).ConfigureAwait(false))
+            {
+                if (goal.ParentGoalId is not null)
+                    continue; // only top-level goals are pathways roots
+                var goalNodeId = GoalNodeId(goal.WorkUnitId);
+                if (!goalNodeIds.Add(goalNodeId))
+                    continue; // already emitted from a local root work unit
+                var isHumanGoal = string.Equals(goal.Owner, "user", StringComparison.OrdinalIgnoreCase);
+                nodes.Add(new WorkspacePathwaysNode(
+                    NodeId: goalNodeId,
+                    Kind: "GoalStarted",
+                    WorkUnitId: goal.WorkUnitId,
+                    BranchId: goal.BranchId,
+                    ActorKind: isHumanGoal ? "Human" : "Agent",
+                    ActorId: isHumanGoal ? goal.Owner : null,
+                    ActorModel: null,
+                    ActorProvider: null,
+                    Summary: goal.Goal,
+                    OccurredAt: goal.CreatedAt));
+            }
         }
 
         // Merge proposals → Integration/Rejection/Superseded nodes. Event-sourced when the
