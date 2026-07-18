@@ -61,6 +61,46 @@ public class InMemoryMergeServiceTests
     private static MergeProposal MakeProposal(string id, string source = "feat/x", string target = "main") =>
         new(id, source, target, "goal", "summary", "desc", null, null, null, MergeProposalStatus.Draft);
 
+    // ── L2.4 (plans/room-persistence-bloat.md) — diff CAS-ref on ProposeAsync ────────────────
+    private sealed class FakeBlobStore : NodalMerge.Host.Abstractions.Providers.IBlobStoreProvider
+    {
+        private readonly Dictionary<string, (byte[] Bytes, string? Ct)> _b = new(StringComparer.Ordinal);
+        public ValueTask<NodalMerge.Host.Abstractions.Providers.BlobReadResult> TryGetBlobAsync(string hashHex, CancellationToken ct = default) =>
+            ValueTask.FromResult(_b.TryGetValue(hashHex, out var e)
+                ? NodalMerge.Host.Abstractions.Providers.BlobReadResult.Hit(e.Bytes, e.Ct)
+                : NodalMerge.Host.Abstractions.Providers.BlobReadResult.Missing);
+        public ValueTask PutBlobAsync(string hashHex, byte[] bytes, string? contentType, CancellationToken ct = default)
+        { _b[hashHex] = (bytes, contentType); return ValueTask.CompletedTask; }
+    }
+
+    [Fact]
+    public async Task ProposeAsync_moves_diff_to_cas_when_blob_store_present()
+    {
+        var store = new InMemoryStudioNodeStore();
+        var blobs = new FakeBlobStore();
+        var svc = new InMemoryMergeService(store, new NoopFileWorkspaceService(), new WorkspaceOptions(),
+            new NoopEventStream(), new ArtifactLineageService(store), blobStore: blobs);
+
+        await svc.ProposeAsync(MakeProposal("MP-1") with { WorkspaceChanges = "a big unified diff" });
+
+        var stored = await svc.GetAsync("MP-1");
+        Assert.Null(stored!.WorkspaceChanges);                 // diff bytes off the replicated node
+        Assert.NotNull(stored.WorkspaceChangesBlobHash);       // only the hash rides replication
+        Assert.Equal("a big unified diff",                     // resolvable back via the CAS blob
+            await new MergeDiffResolverService(blobs).ResolveAsync(stored));
+    }
+
+    [Fact]
+    public async Task ProposeAsync_keeps_diff_inline_when_no_blob_store()
+    {
+        var svc = Build(); // no blob store
+        await svc.ProposeAsync(MakeProposal("MP-1") with { WorkspaceChanges = "inline diff" });
+
+        var stored = await svc.GetAsync("MP-1");
+        Assert.Equal("inline diff", stored!.WorkspaceChanges);
+        Assert.Null(stored.WorkspaceChangesBlobHash);
+    }
+
     // ── Phase 4 slice 11a — MergeProposalStatusChanged events + WorkUnit Merged transition ─
 
     private sealed class RecordingEventStream : NodalMerge.Studio.Core.Services.IExecutionEventStream

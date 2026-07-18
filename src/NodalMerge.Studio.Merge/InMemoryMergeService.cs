@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Storage;
@@ -11,6 +13,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, MergeProposal> _proposals = new();
     private readonly IStudioNodeStore _nodeStore;
+    private readonly IBlobStoreProvider? _blobStore;
     private readonly IFileWorkspaceService _fileWorkspace;
     private readonly WorkspaceOptions _workspaceOptions;
     private readonly IExecutionEventStream _events;
@@ -58,7 +61,9 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         IRepositorySyncService? repositorySync = null,
         ICandidateConflictService? candidateConflicts = null,
         ICandidateConflictResolutionService? candidateConflictResolution = null,
-        ITaskConflictService? taskConflicts = null)
+        ITaskConflictService? taskConflicts = null,
+        // L2.4 — optional: when present, ProposeAsync moves the inlined diff to the CAS content plane.
+        IBlobStoreProvider? blobStore = null)
     {
         _nodeStore                    = nodeStore;
         _fileWorkspace                = fileWorkspace;
@@ -72,6 +77,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         _candidateConflicts           = candidateConflicts;
         _candidateConflictResolution  = candidateConflictResolution;
         _taskConflicts                = taskConflicts;
+        _blobStore                    = blobStore;
     }
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
@@ -80,6 +86,21 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // but the policy-gate-blocked path deliberately proposes straight into Rejected. Forcing Draft
         // here unconditionally used to silently clobber that back to Draft.
         var stored = proposal;
+
+        // L2.4 (plans/room-persistence-bloat.md) — the unified diff is the one repo-scoped payload
+        // that scales with change size, so move its bytes to the CAS content plane (pulled on demand)
+        // and keep only the hash on the replicated node. Only when a blob store exists, the diff is
+        // non-empty, and it isn't already CAS-ref'd (idempotent across re-persists / rehydration).
+        if (_blobStore is not null
+            && !string.IsNullOrEmpty(stored.WorkspaceChanges)
+            && stored.WorkspaceChangesBlobHash is null)
+        {
+            var bytes = Encoding.UTF8.GetBytes(stored.WorkspaceChanges);
+            var hash = BlobHasher.ComputeHash(bytes);
+            await _blobStore.PutBlobAsync(hash, bytes, "text/x-diff", cancellationToken).ConfigureAwait(false);
+            stored = stored with { WorkspaceChangesBlobHash = hash, WorkspaceChanges = null };
+        }
+
         _proposals[proposal.ProposalId] = stored;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.MergeProposalV1,

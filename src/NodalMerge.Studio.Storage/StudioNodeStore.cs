@@ -40,6 +40,11 @@ public static class StudioNodeKind
     public const string SteeringDecisionV1   = "studio/steering-decision/v1";
     public const string FindingV1            = "studio/finding/v1";
     public const string ConversationLogV1    = "studio/conversation-log/v1";
+    // L2.3 (plans/room-persistence-bloat.md) — repo-scoped reference to a peer-visible reasoning
+    // transcript. The bounded transcript body lives in the CAS (pulled on demand); this node carries
+    // only ids + the blob hash + a heuristic label, so it replicates cheaply. This is what makes
+    // another peer's agentic reasoning legible on the same repo without the ConversationLogV1 firehose.
+    public const string ConversationRefV1    = "studio/conversation-ref/v1";
     public const string FileLeaseV1          = "studio/file-lease/v1";
     public const string RepositorySyncStateV1 = "studio/repository-sync-state/v1";
     public const string RepositoryV1          = "studio/repository/v1";
@@ -120,6 +125,16 @@ public static class StudioNodeKind
         ArtifactRefV1,
         CandidateConflictV1,
         TaskConflictV1,
+        // #1 goal replication (plans/repo-identity-convergence.md): a top-level goal is denormalized
+        // with its work unit's RepositoryId (GoalNode.RepositoryId) and routed to that repo's room so
+        // it replicates to peers on the same repo. This deliberately revises the "GoalV1 is
+        // workgroup/global, not single-repo-scoped" note above: a single-repo goal is repo-scoped;
+        // genuinely cross-repo goal fan-out (D3) is a later layer that can override this per-goal.
+        GoalV1,
+        // L2.3 (plans/room-persistence-bloat.md) — the reasoning-transcript reference replicates so a
+        // same-repo peer can trace the "why" behind a decision; the transcript BYTES ride the CAS
+        // content plane (pulled on demand), only this small ref is on the replication plane.
+        ConversationRefV1,
     };
 }
 
@@ -157,14 +172,61 @@ public interface IStudioNodeStore
         string kind, CancellationToken cancellationToken = default);
 }
 
-public sealed class InMemoryStudioNodeStore : IStudioNodeStore
+// Implements IStudioLocalLogStore as well as IStudioNodeStore over the same (kind, id) map so the
+// many tests that construct services directly with `new InMemoryStudioNodeStore()` — or share one
+// store across several services — keep compiling after the four high-volume services switched their
+// dependency to IStudioLocalLogStore (L2.1). Production keeps the two stores separate
+// (NodalMergeStudioNodeStore for the room, FileStudioLocalLogStore for the local log).
+public sealed class InMemoryStudioNodeStore : IStudioNodeStore, IStudioLocalLogStore
 {
     private readonly ConcurrentDictionary<(string Kind, string EntityId), string> _nodes = new();
+    private readonly ConcurrentDictionary<(string Kind, string EntityId), DateTimeOffset> _timestamps = new();
 
     public Task WriteNodeAsync(string kind, string entityId, string payloadJson, CancellationToken cancellationToken = default)
     {
         _nodes[(kind, entityId)] = payloadJson;
         return Task.CompletedTask;
+    }
+
+    // ── IStudioLocalLogStore ─────────────────────────────────────────────────
+    public Task AppendAsync(
+        string kind, string id, string payloadJson, DateTimeOffset occurredAt,
+        CancellationToken cancellationToken = default)
+    {
+        _nodes[(kind, id)] = payloadJson;
+        _timestamps[(kind, id)] = occurredAt;
+        return Task.CompletedTask;
+    }
+
+    public Task<string?> GetAsync(string kind, string id, CancellationToken cancellationToken = default)
+    {
+        _nodes.TryGetValue((kind, id), out var payload);
+        return Task.FromResult(payload);
+    }
+
+    public Task<IReadOnlyList<(string Id, string PayloadJson)>> ReadAllAsync(
+        string kind, CancellationToken cancellationToken = default)
+    {
+        IReadOnlyList<(string Id, string PayloadJson)> results = _nodes
+            .Where(n => n.Key.Kind == kind)
+            .Select(n => (n.Key.EntityId, n.Value))
+            .ToList();
+        return Task.FromResult(results);
+    }
+
+    public Task<int> PruneOlderThanAsync(
+        string kind, DateTimeOffset olderThan, CancellationToken cancellationToken = default)
+    {
+        var toRemove = _timestamps
+            .Where(t => t.Key.Kind == kind && t.Value < olderThan)
+            .Select(t => t.Key)
+            .ToList();
+        foreach (var key in toRemove)
+        {
+            _nodes.TryRemove(key, out _);
+            _timestamps.TryRemove(key, out _);
+        }
+        return Task.FromResult(toRemove.Count);
     }
 
     public Task<string?> ReadNodeAsync(string kind, string entityId, CancellationToken cancellationToken = default)

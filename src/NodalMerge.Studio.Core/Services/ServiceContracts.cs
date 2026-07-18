@@ -123,6 +123,16 @@ public interface ITaskService
         Task<IReadOnlyList<StudioTask>> ListAsync(string? workUnitId = null, CancellationToken cancellationToken = default);
     }
 
+    // L2.4 (plans/room-persistence-bloat.md) — resolves a proposal's unified diff: the inline
+    // WorkspaceChanges when present (legacy proposals / no-CAS configs), else pulls the CAS blob named
+    // by WorkspaceChangesBlobHash. ProposeAsync moves the diff bytes off the replication plane into
+    // the CAS; every consumer that needs the actual diff text goes through this instead of reading
+    // MergeProposal.WorkspaceChanges directly.
+    public interface IMergeDiffResolver
+    {
+        Task<string?> ResolveAsync(MergeProposal proposal, CancellationToken cancellationToken = default);
+    }
+
     public interface IMergeService
 {
     Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default);

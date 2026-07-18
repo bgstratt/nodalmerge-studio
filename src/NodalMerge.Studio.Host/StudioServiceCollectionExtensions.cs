@@ -73,6 +73,36 @@ public static class StudioServiceCollectionExtensions
             return opts;
         });
 
+        // L2.1 (plans/room-persistence-bloat.md) — the studio-owned local append log. Override
+        // AddNodalMergeStorage's default-valued StudioLocalLogOptions (last-AddSingleton-wins). An
+        // explicit NodalMerge:Studio:LocalLog:Directory wins; otherwise anchor the log next to the
+        // node DB (NodalMerge:Storage:Sqlite:DbPath) so it lands in the SAME data dir the VS Code
+        // extension configures with an ABSOLUTE path — not a CWD-relative "data/local-log" that
+        // would diverge from an absolute DbPath.
+        services.AddSingleton<StudioLocalLogOptions>(sp =>
+        {
+            var config = sp.GetService<IConfiguration>();
+            var opts   = new StudioLocalLogOptions();
+
+            var explicitDir = config?["NodalMerge:Studio:LocalLog:Directory"];
+            if (!string.IsNullOrWhiteSpace(explicitDir))
+            {
+                opts.Directory = explicitDir;
+                return opts;
+            }
+
+            var dbPath = config?["NodalMerge:Storage:Sqlite:DbPath"];
+            if (!string.IsNullOrWhiteSpace(dbPath))
+            {
+                var dbDir = Path.GetDirectoryName(dbPath);
+                opts.Directory = string.IsNullOrEmpty(dbDir)
+                    ? "local-log"
+                    : Path.Combine(dbDir, "local-log");
+            }
+
+            return opts;
+        });
+
         // Slice 6.4 (plans/cas-distribution-and-storage.md Phase 6, D4 "mode collapse") — bind
         // RoomOptions from the "Room" config section, overriding AddNodalMergeStorage's own
         // default-valued registration above (last-AddSingleton-wins, same pattern as

@@ -9,20 +9,22 @@ namespace NodalMerge.Studio.Storage;
 public sealed class ProjectionSnapshotService : IProjectionSnapshotService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, ProjectionSnapshot> _snapshots = new();
-    private readonly IStudioNodeStore _nodeStore;
+    private readonly IStudioLocalLogStore _localLog;
     private readonly IProjectionManager _projections;
     private readonly IArtifactLineageService _artifacts;
     private readonly IWorkUnitService _workUnits;
     private readonly IWorkspaceExecutionCommandService _execution;
 
+    // L2.1 — projection snapshots are a rebuildable local cache (largest per-row payload); persist
+    // to the local append log off the CRDT sync graph.
     public ProjectionSnapshotService(
-        IStudioNodeStore nodeStore,
+        IStudioLocalLogStore localLog,
         IProjectionManager projections,
         IArtifactLineageService artifacts,
         IWorkUnitService workUnits,
         IWorkspaceExecutionCommandService execution)
     {
-        _nodeStore = nodeStore;
+        _localLog = localLog;
         _projections = projections;
         _artifacts = artifacts;
         _workUnits = workUnits;
@@ -47,8 +49,9 @@ public sealed class ProjectionSnapshotService : IProjectionSnapshotService, IReh
             CreatedAt: DateTimeOffset.UtcNow);
 
         _snapshots[snapshot.SnapshotId] = snapshot;
-        await _nodeStore.WriteNodeAsync(
-            StudioNodeKind.ProjectionSnapshotV1, snapshot.SnapshotId, JsonSerializer.Serialize(snapshot), ct)
+        await _localLog.AppendAsync(
+            StudioNodeKind.ProjectionSnapshotV1, snapshot.SnapshotId, JsonSerializer.Serialize(snapshot),
+            snapshot.CreatedAt, ct)
             .ConfigureAwait(false);
 
         return snapshot;
@@ -116,8 +119,8 @@ public sealed class ProjectionSnapshotService : IProjectionSnapshotService, IReh
 
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {
-        var records = await _nodeStore
-            .ReadAllNodesAsync(StudioNodeKind.ProjectionSnapshotV1, cancellationToken).ConfigureAwait(false);
+        var records = await _localLog
+            .ReadAllAsync(StudioNodeKind.ProjectionSnapshotV1, cancellationToken).ConfigureAwait(false);
         foreach (var (_, payloadJson) in records)
         {
             var snapshot = JsonSerializer.Deserialize<ProjectionSnapshot>(payloadJson);

@@ -86,7 +86,13 @@ public sealed record MergeProposal(
     // to its repo room (StudioNodeKind.RepoScopedKinds) instead of staying peer-local in "studio".
     // Null when WorkUnitId is null, the owning work unit itself has no resolvable RepositoryId, or
     // this proposal predates 6.3a — all fall back to "studio", never blocking the write.
-    string? RepositoryId = null)
+    string? RepositoryId = null,
+    // L2.4 (plans/room-persistence-bloat.md) — the unified diff is the one repo-scoped (replicating)
+    // payload that scales with change size. On ProposeAsync it is moved to a CAS blob (content plane,
+    // pulled on demand) and this carries its BLAKE3 hash, with WorkspaceChanges nulled so the diff
+    // BYTES no longer ride the replication plane to every peer. Resolve via IMergeDiffResolver, which
+    // returns the inline WorkspaceChanges when present (legacy / no-CAS configs) else pulls this blob.
+    string? WorkspaceChangesBlobHash = null)
 {
     public IReadOnlyList<string> FilesTouched { get; init; } = FilesTouched ?? [];
     public IReadOnlyList<string> ReconciledFrom { get; init; } = ReconciledFrom ?? [];

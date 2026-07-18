@@ -11,9 +11,11 @@ public sealed class ExecutionEventStreamService : IExecutionEventStream, IRehydr
     // sessionId → ordered list of eventIds
     private readonly ConcurrentDictionary<string, List<string>> _sessionIndex = new();
     private readonly Lock _indexLock = new();
-    private readonly IStudioNodeStore _nodeStore;
+    private readonly IStudioLocalLogStore _localLog;
 
-    public ExecutionEventStreamService(IStudioNodeStore nodeStore) => _nodeStore = nodeStore;
+    // L2.1 — the highest-volume peer-local kind (~N writes per tool call); persists to the local
+    // append log off the CRDT sync graph. Retention-windowed via IStudioLocalLogStore.PruneOlderThan.
+    public ExecutionEventStreamService(IStudioLocalLogStore localLog) => _localLog = localLog;
 
     public async Task<ExecutionEvent> AppendAsync<T>(
         string sessionId,
@@ -42,10 +44,11 @@ public sealed class ExecutionEventStreamService : IExecutionEventStream, IRehydr
         _events[id] = ev;
         IndexEvent(sessionId, id);
 
-        await _nodeStore.WriteNodeAsync(
+        await _localLog.AppendAsync(
             StudioNodeKind.ExecutionEventV1,
             id,
             JsonSerializer.Serialize(ev),
+            ev.OccurredAt,
             ct).ConfigureAwait(false);
 
         return ev;
@@ -98,7 +101,7 @@ public sealed class ExecutionEventStreamService : IExecutionEventStream, IRehydr
 
     public async Task RehydrateAsync(CancellationToken ct = default)
     {
-        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.ExecutionEventV1, ct).ConfigureAwait(false);
+        var records = await _localLog.ReadAllAsync(StudioNodeKind.ExecutionEventV1, ct).ConfigureAwait(false);
 
         // Sort by OccurredAt before indexing so _sessionIndex's per-session lists come back in
         // the same chronological order they'd have been appended in during the original run —

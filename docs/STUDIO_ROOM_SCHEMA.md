@@ -193,21 +193,45 @@ record (2026-07-14)").
 
 ### `repoId` mint format
 
-**`repo-{guid:N}`** (32 lowercase hex characters, no dashes) — e.g.
-`repo-3fa85f6457174562b3fc2c963f66afa6`. This matches what
-`RepositoryRegistryService.RegisterAsync` mints **today**
-(`` $"repo-{Guid.NewGuid():N}"`` ), kept unchanged for compatibility: today's registry
-becomes "local candidate pending workgroup registration" per D2/6.2, not a new minting
-scheme — the workgroup repositories map is the new *authority* for the same ID shape,
-not a reformatting of it.
+**`repo-{32 lowercase hex}`** (no dashes) — e.g.
+`repo-3fa85f6457174562b3fc2c963f66afa6`. The *shape* is frozen; the *derivation* has two
+cases (amended 2026-07-17, `plans/repo-identity-convergence.md`, see the D2 amendment
+below):
+
+- **Strong signal (non-empty root-SHA set) → deterministic:**
+  `repo-` + first 32 lowercase hex chars of `sha256(join('\n', sort(distinct(rootShas))))`.
+  Derived from the **root-SHA set alone** — remotes are excluded (two clones of the same
+  repo routinely have different remote sets, so a remote-inclusive key would give them
+  different ids and defeat convergence). Two clones compute this identically, offline, with
+  no coordination — which is the whole point: convergence must not depend on
+  registration-order or replication timing. Implemented as
+  `RepositoryIdentityMatcher.DeterministicRepoId`.
+- **Degraded signal (empty root-SHA set: shallow clone, empty repo, no HEAD) → minted:**
+  `repo-{guid:N}` (`` $"repo-{Guid.NewGuid():N}"`` ), as before. A hash of nothing would
+  wrongly collapse unrelated degraded repos, so these keep the guid + one-time
+  disambiguation path.
+
+**Amendment (2026-07-17):** pre-amendment this was always a fresh `repo-{guid:N}`, with D2's
+"identity is minted, never derived" rule. That is exactly what made two independent clones of
+one repo diverge under a startup race (each minted its own guid before the other's workgroup
+entry replicated), landing them in different repo rooms with no repair path. The deterministic
+derivation for strong-signal repos removes that race; the workgroup map remains the *authority*
+(it still records entries, splits genuine forks, and carries human overrides), and the ID shape
+is unchanged, so this is a derivation change, not a format break.
 
 ### `repoRoomId` naming
 
 **`repo/{repoId}`** — e.g. `repo/repo-3fa85f6457174562b3fc2c963f66afa6`. This is the
 room identifier the repo-scoped state (D1's "repo room": snapshot/generation DAG, work
-units, branches, proposals, decisions, conflicts, artifacts-as-CAS-references) lives
+units, branches, proposals, decisions, conflicts, artifacts-as-CAS-references, and —
+since the "#1 goal replication" change, `plans/repo-identity-convergence.md` — top-level
+**goals** (`GoalV1`), denormalized with their work unit's `RepositoryId`) lives
 under, replacing the hardcoded `"studio"` room constant
-(`NodalMergeStudioNodeStore.StudioRoomId`, `RuntimeGraphPromoter`) per D1/6.3.
+(`NodalMergeStudioNodeStore.StudioRoomId`, `RuntimeGraphPromoter`) per D1/6.3. The
+authoritative per-kind list is `StudioNodeStore.RepoScopedKinds`. Note this revises the
+earlier "GoalV1 is workgroup/global, not single-repo-scoped" stance: a single-repo goal is
+repo-scoped so peers on the same repo see each other's goals; genuinely cross-repo goal
+fan-out (D3) remains a later layer that can override placement per goal.
 
 ### Hint formats
 

@@ -55,6 +55,10 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
                 stored = stored with { RepositoryId = repositoryId };
         }
 
+        // L2.2b — ArtifactRefV1 is repo-scoped (replicates to every peer), so an uncapped Body
+        // (Plan/Research/Decision/RevisionContext free text) would bloat the replication plane.
+        stored = stored with { Body = NodePayloadLimits.Cap(stored.Body) };
+
         _byId[stored.ArtifactId] = stored;
         Index(stored);
 

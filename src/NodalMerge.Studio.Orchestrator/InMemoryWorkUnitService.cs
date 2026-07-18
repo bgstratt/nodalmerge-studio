@@ -12,6 +12,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
     private readonly ConcurrentDictionary<string, WorkUnit> _workUnits = new();
     private readonly IBranchService _branchService;
     private readonly IMergeService _mergeService;
+    private readonly IMergeDiffResolver? _diffResolver;
     private readonly IKnownGoodStateService _knownGoodStateService;
     private readonly IAgentControlService _agentControl;
     private readonly IStudioNodeStore _nodeStore;
@@ -40,10 +41,14 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IRuntimeEventBroadcaster? broadcaster = null,
         IStudioGraphPromoter? graphPromoter = null,
         IParticipantEventBus? eventBus = null,
-        IServiceProvider? serviceProvider = null)
+        IServiceProvider? serviceProvider = null,
+        // L2.4 — optional: resolves a proposal's diff (CAS-ref'd off the replication plane). Null
+        // falls back to the inline WorkspaceChanges (tests / no-CAS configs).
+        IMergeDiffResolver? diffResolver = null)
     {
         _branchService         = branchService;
         _mergeService          = mergeService;
+        _diffResolver          = diffResolver;
         _knownGoodStateService = knownGoodStateService;
         _agentControl          = agentControl;
         _nodeStore             = nodeStore;
@@ -577,7 +582,10 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
                 if (proposal is null)
                     continue;
 
-                var snapshot = BuildProposalSnapshot(proposal, proposalRef.CreatedAt);
+                var diff = _diffResolver is not null
+                    ? await _diffResolver.ResolveAsync(proposal, cancellationToken).ConfigureAwait(false)
+                    : proposal.WorkspaceChanges;
+                var snapshot = BuildProposalSnapshot(proposal, proposalRef.CreatedAt, diff);
                 proposalSnapshots.Add(snapshot);
             }
         }
@@ -586,7 +594,10 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             var proposals = await _mergeService.ListAsync(resolvedBranchId, cancellationToken).ConfigureAwait(false);
             foreach (var proposal in proposals.OrderBy(p => p.DiffGeneratedAt ?? DateTimeOffset.MinValue))
             {
-                proposalSnapshots.Add(BuildProposalSnapshot(proposal, proposal.DiffGeneratedAt ?? DateTimeOffset.MinValue));
+                var diff = _diffResolver is not null
+                    ? await _diffResolver.ResolveAsync(proposal, cancellationToken).ConfigureAwait(false)
+                    : proposal.WorkspaceChanges;
+                proposalSnapshots.Add(BuildProposalSnapshot(proposal, proposal.DiffGeneratedAt ?? DateTimeOffset.MinValue, diff));
             }
         }
 
@@ -664,9 +675,9 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return Task.FromResult<IReadOnlyList<WorkUnit>>(dependents);
     }
 
-    private static (DateTimeOffset SortKey, WorkspaceStatusProposalSummary Summary, IReadOnlyList<WorkspaceStatusFileChange> ChangedFiles) BuildProposalSnapshot(MergeProposal proposal, DateTimeOffset sortKey)
+    private static (DateTimeOffset SortKey, WorkspaceStatusProposalSummary Summary, IReadOnlyList<WorkspaceStatusFileChange> ChangedFiles) BuildProposalSnapshot(MergeProposal proposal, DateTimeOffset sortKey, string? workspaceChanges)
     {
-        var (changedFiles, addedLines, removedLines) = ParseChangedFiles(proposal.ProposalId, proposal.WorkspaceChanges, proposal.FilesTouched);
+        var (changedFiles, addedLines, removedLines) = ParseChangedFiles(proposal.ProposalId, workspaceChanges, proposal.FilesTouched);
         var addedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Added);
         var modifiedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Modified);
         var deletedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Deleted);
@@ -815,7 +826,10 @@ public static class ServiceCollectionExtensions
             sp.GetService<IRuntimeEventBroadcaster>(),
             graphPromoter: null,       // deferred — IStudioGraphPromoter chains to native FFI
             eventBus: sp.GetService<IParticipantEventBus>(),
-            serviceProvider: sp));
+            serviceProvider: sp,
+            // L2.4 — resolves a proposal's diff (now CAS-ref'd off the replicated node) for the
+            // workspace-status changed-files summary.
+            diffResolver: sp.GetService<IMergeDiffResolver>()));
         services.AddSingleton<IWorkUnitService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IOrchestratorService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IWorkspaceService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());

@@ -1291,13 +1291,16 @@ public static class StudioRestEndpoints
         app.MapGet("/studio/workunits/{workUnitId}/conversation-log", async (
             string workUnitId,
             IWorkUnitService workUnits,
-            IConversationLogService conversationLog,
+            IReasoningResolver reasoning,
             CancellationToken ct) =>
         {
             var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
             if (wu is null)
                 return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
-            var entries = await conversationLog.GetEntriesAsync(workUnitId, ct).ConfigureAwait(false);
+            // L2.3 — local ConversationLog when present; else the peer-published reasoning transcript
+            // (ConversationRef → CAS blob), so a peer sees the "why" behind another peer's work unit,
+            // not just its file state. Same ConversationLogEntry[] shape either way (no client change).
+            var entries = await reasoning.GetReasoningAsync(workUnitId, ct).ConfigureAwait(false);
             return Results.Ok(entries);
         });
 
@@ -1967,6 +1970,7 @@ public static class StudioRestEndpoints
         app.MapGet("/studio/merges/{proposalId}/constituents", async (
             string proposalId,
             IMergeService merge,
+            IMergeDiffResolver diffResolver,
             CancellationToken ct) =>
         {
             var proposal = await merge.GetAsync(proposalId, ct).ConfigureAwait(false);
@@ -1977,21 +1981,27 @@ public static class StudioRestEndpoints
             foreach (var id in proposal.ReconciledFrom)
             {
                 var constituent = await merge.GetAsync(id, ct).ConfigureAwait(false);
-                constituents.Add(constituent is null
-                    ? new { proposalId = id, status = "Unknown", goal = (string?)null, summary = (string?)null, model = (string?)null, confidence = (double?)null, rationale = (string?)null }
-                    : new
-                    {
-                        proposalId = constituent.ProposalId,
-                        status = constituent.Status.ToString(),
-                        goal = (string?)constituent.Goal,
-                        summary = (string?)constituent.Summary,
-                        model = (string?)constituent.Model,
-                        provider = (string?)constituent.Provider,
-                        confidence = constituent.Confidence,
-                        rationale = (string?)constituent.ChangeDescription,
-                        agentId = (string?)constituent.AgentId,
-                        workspaceChanges = (string?)constituent.WorkspaceChanges,
-                    });
+                if (constituent is null)
+                {
+                    constituents.Add(new { proposalId = id, status = "Unknown", goal = (string?)null, summary = (string?)null, model = (string?)null, confidence = (double?)null, rationale = (string?)null });
+                    continue;
+                }
+
+                // L2.4 — the diff is CAS-ref'd off the replicated node; resolve it for display.
+                var constituentDiff = await diffResolver.ResolveAsync(constituent, ct).ConfigureAwait(false);
+                constituents.Add(new
+                {
+                    proposalId = constituent.ProposalId,
+                    status = constituent.Status.ToString(),
+                    goal = (string?)constituent.Goal,
+                    summary = (string?)constituent.Summary,
+                    model = (string?)constituent.Model,
+                    provider = (string?)constituent.Provider,
+                    confidence = constituent.Confidence,
+                    rationale = (string?)constituent.ChangeDescription,
+                    agentId = (string?)constituent.AgentId,
+                    workspaceChanges = constituentDiff,
+                });
             }
 
             return Results.Ok(constituents);
@@ -2181,6 +2191,7 @@ public static class StudioRestEndpoints
         app.MapGet("/studio/merges/compare", async (
             [FromQuery] string? ids,
             IMergeService merge,
+            IMergeDiffResolver diffResolver,
             CancellationToken ct) =>
         {
             var idList = (ids ?? string.Empty)
@@ -2198,13 +2209,17 @@ public static class StudioRestEndpoints
 
             var overlapping = a.FilesTouched.Intersect(b.FilesTouched, StringComparer.OrdinalIgnoreCase).ToList();
 
+            // L2.4 — diffs are CAS-ref'd off the replicated node; resolve both for the comparison.
+            var diffA = await diffResolver.ResolveAsync(a, ct).ConfigureAwait(false);
+            var diffB = await diffResolver.ResolveAsync(b, ct).ConfigureAwait(false);
+
             return Results.Ok(new
             {
                 proposalIdA = a.ProposalId,
                 proposalIdB = b.ProposalId,
                 overlappingFiles = overlapping,
-                diffA = a.WorkspaceChanges,
-                diffB = b.WorkspaceChanges,
+                diffA,
+                diffB,
             });
         });
 
@@ -4007,7 +4022,10 @@ public static class StudioRestEndpoints
                 CreatedAt: workUnit.CreatedAt,
                 UpdatedAt: workUnit.UpdatedAt,
                 Owner: workUnit.Owner,
-                ParentGoalId: workUnit.ParentWorkUnitId);
+                ParentGoalId: workUnit.ParentWorkUnitId,
+                // #1 goal replication — denormalize the work unit's repo so the goal routes to and
+                // replicates through the repo room (peers on the same repo see each other's goals).
+                RepositoryId: workUnit.RepositoryId);
             await goalNodes.RecordAsync(goalNode, ct).ConfigureAwait(false);
 
             return Results.Ok(new

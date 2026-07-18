@@ -197,6 +197,35 @@ public sealed class WorkspaceCacheManager(
             catch { /* malformed node — skip */ }
         }
 
+        // L2.3 (plans/room-persistence-bloat.md) — protect published reasoning-transcript blobs. A
+        // ConversationRef is the only thing that references its transcript blob (it isn't in any
+        // snapshot tree or op), so without this pass the transcript a peer needs to trace a decision
+        // would be a GC sweep candidate.
+        var refNodes = await nodeStore.ReadAllNodesAsync(StudioNodeKind.ConversationRefV1, ct)
+            .ConfigureAwait(false);
+        foreach (var (_, json) in refNodes)
+        {
+            try
+            {
+                var cref = JsonSerializer.Deserialize<ConversationRef>(json);
+                if (cref?.TranscriptBlobHash is not null) live.Add(cref.TranscriptBlobHash);
+            }
+            catch { /* malformed node — skip */ }
+        }
+
+        // L2.4 — protect the CAS-ref'd merge-proposal diff blob (the only referent is the proposal).
+        var proposalNodes = await nodeStore.ReadAllNodesAsync(StudioNodeKind.MergeProposalV1, ct)
+            .ConfigureAwait(false);
+        foreach (var (_, json) in proposalNodes)
+        {
+            try
+            {
+                var mp = JsonSerializer.Deserialize<MergeProposal>(json);
+                if (mp?.WorkspaceChangesBlobHash is not null) live.Add(mp.WorkspaceChangesBlobHash);
+            }
+            catch { /* malformed node — skip */ }
+        }
+
         return live;
     }
 

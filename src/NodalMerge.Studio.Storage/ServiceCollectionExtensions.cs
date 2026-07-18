@@ -23,6 +23,28 @@ public static class ServiceCollectionExtensions
         // RetentionPolicyOptions/BlobGcOptions in AddRehydratableServices below).
         services.AddSingleton(new RoomOptions());
         services.AddSingleton<IStudioNodeStore, NodalMergeStudioNodeStore>();
+        // L2.1 (plans/room-persistence-bloat.md) — durable local append log for the four high-volume
+        // peer-local kinds (Conversation/Execution/Orchestration/ProjectionSnapshot), OFF the CRDT
+        // sync graph. Default directory; NodalMerge.Studio.Host binds NodalMerge:Studio:LocalLog:*
+        // over it (last-AddSingleton-wins, same pattern as RoomOptions above).
+        services.AddSingleton(new StudioLocalLogOptions());
+        services.AddSingleton<IStudioLocalLogStore>(sp =>
+            new FileStudioLocalLogStore(sp.GetRequiredService<StudioLocalLogOptions>()));
+        // L2.3 (plans/room-persistence-bloat.md) — reasoning publisher: on a decision, publish the
+        // work unit's bounded reasoning transcript to the CAS + a repo-scoped ConversationRef.
+        // Requires a blob store (the content plane); when none is configured there's nothing to
+        // publish into, so resolve to null and DecisionNodeService's optional dependency skips
+        // publishing. Only registered on the real storage path — AddInMemoryStorage has no blob store.
+        services.AddSingleton<IReasoningPublisher>(sp =>
+        {
+            var blobStore = sp.GetService<IBlobStoreProvider>();
+            return blobStore is null
+                ? null!
+                : new ReasoningPublisherService(
+                    sp.GetRequiredService<IConversationLogService>(),
+                    blobStore,
+                    sp.GetRequiredService<IStudioNodeStore>());
+        });
         // Slice 6.2 — workgroup room repositories map (docs/STUDIO_ROOM_SCHEMA.md (b)), engine-backed
         // like IStudioNodeStore above but a separate room ("workgroup") and namespace
         // ("repositories") — see WorkgroupRepositoryDirectory's own class comment for what
@@ -65,6 +87,10 @@ public static class ServiceCollectionExtensions
         // against an otherwise in-memory-storage host).
         services.AddSingleton(new RoomOptions());
         services.AddSingleton<IStudioNodeStore, InMemoryStudioNodeStore>();
+        // L2.1 — in-memory local log; forward to the same InMemoryStudioNodeStore instance (it
+        // implements both interfaces over one map), matching the direct-construction tests.
+        services.AddSingleton<IStudioLocalLogStore>(sp =>
+            (InMemoryStudioNodeStore)sp.GetRequiredService<IStudioNodeStore>());
         // Slice 6.2 — in-memory workgroup directory (no engine bridge needed here, same reasoning
         // as InMemoryStudioNodeStore above); GitRepositoryIdentityHintsService itself has no engine
         // dependency at all (LibGit2Sharp only), so it's the same registration in both DI paths.
@@ -202,6 +228,19 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ConversationLogService>();
         services.AddSingleton<IConversationLogService>(sp => sp.GetRequiredService<ConversationLogService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<ConversationLogService>());
+
+        // L2.3 (plans/room-persistence-bloat.md) — resolves reasoning for the drawer: local
+        // ConversationLog first, else the peer-published ConversationRef → CAS blob. Blob store is
+        // optional (absent under AddInMemoryStorage / no-CAS configs → local-only resolution).
+        services.AddSingleton<IReasoningResolver>(sp => new ReasoningResolverService(
+            sp.GetRequiredService<IConversationLogService>(),
+            sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetService<IBlobStoreProvider>()));
+
+        // L2.4 (plans/room-persistence-bloat.md) — resolves a proposal's diff (inline when present,
+        // else pulls the CAS blob). Blob store optional (local-only / no-CAS configs return inline).
+        services.AddSingleton<IMergeDiffResolver>(sp =>
+            new MergeDiffResolverService(sp.GetService<IBlobStoreProvider>()));
 
         services.AddSingleton<SteeringDecisionService>();
         services.AddSingleton<ISteeringDecisionService>(sp => sp.GetRequiredService<SteeringDecisionService>());
