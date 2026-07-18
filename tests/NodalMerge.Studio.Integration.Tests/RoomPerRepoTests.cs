@@ -129,6 +129,50 @@ public class RoomPerRepoTests : IDisposable
     }
 
     /// <summary>
+    /// #1 goal replication (plans/repo-identity-convergence.md) — a GoalV1 carrying a bound
+    /// RepositoryId must route into repo/{repoId}'s engine room (so it replicates to another peer on
+    /// the same repo), never the peer-private "studio" room. Before #1, GoalV1 was workspace-global
+    /// and stayed in "studio" (non-replicating post-7.3) — so two peers on one repo each saw only
+    /// their own goals. Mirrors Repo_scoped_write_lands_in_the_repo_room for the work-unit case.
+    /// </summary>
+    [Fact]
+    public async Task Goal_write_with_a_bound_repository_lands_in_the_repo_room_not_studio()
+    {
+        await using var app = BuildApp("goal-routing");
+        var repo = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "goal-repoA"), "repoA");
+        var repoRoomId = $"repo/{repo.WorkgroupRepoId}";
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var goalNodes = app.Services.GetRequiredService<IGoalNodeService>();
+
+        // A goal bound to the repo, exactly as POST /studio/goals sets RepositoryId from the goal's
+        // top-level work unit.
+        var goal = new GoalNode(
+            GoalId: "GOAL-route", Goal: "g", WorkUnitId: "GOAL-route", BranchId: "b",
+            Status: GoalStatus.Exploring, CreatedAt: DateTimeOffset.UtcNow, UpdatedAt: DateTimeOffset.UtcNow,
+            Owner: "tester", RepositoryId: repo.RepositoryId);
+        await goalNodes.RecordAsync(goal);
+
+        var key = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.GoalV1, "GOAL-route");
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", key));
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", key));
+
+        // Room-agnostic read still finds it (bound-room fan-out) — the goal list stays correct.
+        var readBack = await goalNodes.GetAsync("GOAL-route");
+        Assert.NotNull(readBack);
+        Assert.Equal(repo.RepositoryId, readBack!.RepositoryId);
+
+        // A goal with no repository still routes to "studio" (unchanged pre-#1 fallback).
+        var globalGoal = new GoalNode(
+            GoalId: "GOAL-global", Goal: "g", WorkUnitId: "GOAL-global", BranchId: "b",
+            Status: GoalStatus.Exploring, CreatedAt: DateTimeOffset.UtcNow, UpdatedAt: DateTimeOffset.UtcNow,
+            Owner: "tester");
+        await goalNodes.RecordAsync(globalGoal);
+        var globalKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.GoalV1, "GOAL-global");
+        Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", globalKey));
+        Assert.Null(TryReadEngineMapValue(bridge, repoRoomId, "studio", globalKey));
+    }
+
+    /// <summary>
     /// Slice 6.3a (plans/cas-distribution-and-storage.md Phase 6, D1) — denormalize RepositoryId
     /// onto the repo-scoped-indirect kinds (MergeProposalV1, TaskV1, BranchV1, KnownGoodStateV1,
     /// DecisionV1, ArtifactRefV1) and route them like 6.3 already routes the 5 direct kinds. Every

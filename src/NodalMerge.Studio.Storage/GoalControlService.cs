@@ -38,7 +38,8 @@ public sealed class GoalControlService(
             CreatedAt: workUnit.CreatedAt,
             UpdatedAt: workUnit.UpdatedAt,
             Owner: workUnit.Owner,
-            ParentGoalId: workUnit.ParentWorkUnitId);
+            ParentGoalId: workUnit.ParentWorkUnitId,
+            RepositoryId: workUnit.RepositoryId); // #1 goal replication — route to the repo room.
         return await goalNodes.RecordAsync(synthesized, ct).ConfigureAwait(false);
     }
 

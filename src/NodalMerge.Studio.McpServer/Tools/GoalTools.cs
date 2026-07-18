@@ -58,7 +58,8 @@ public sealed class GoalTools(
             CreatedAt: workUnit.CreatedAt,
             UpdatedAt: workUnit.UpdatedAt,
             Owner: workUnit.Owner,
-            ParentGoalId: workUnit.ParentWorkUnitId);
+            ParentGoalId: workUnit.ParentWorkUnitId,
+            RepositoryId: workUnit.RepositoryId); // #1 goal replication — route to the repo room.
         await goalNodes.RecordAsync(goalNode, cancellationToken).ConfigureAwait(false);
 
         return McpJson.Ok(new

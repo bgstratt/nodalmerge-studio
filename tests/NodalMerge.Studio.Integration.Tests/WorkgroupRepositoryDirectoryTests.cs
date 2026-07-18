@@ -43,6 +43,70 @@ public class WorkgroupRepositoryDirectoryTests
         Assert.Single(await peerB.ListAsync());
     }
 
+    // Phase 1 (plans/repo-identity-convergence.md) — the real production race: two peers register
+    // the same repo WITHOUT a shared/replicated workgroup map (separate stores), and with
+    // DIFFERENT remote sets (the eval repo had {local-path,github} on one machine, {github} on the
+    // other). They must still converge on the same repoId, computed from the root-SHA set alone,
+    // with zero replication dependency. RED before Phase 1 (each mints its own guid).
+    [Fact]
+    public async Task Two_peers_registering_independently_without_a_shared_map_converge_on_the_same_id()
+    {
+        var peerA = new InMemoryWorkgroupRepositoryDirectory(new WorkgroupRepositoryStore());
+        var peerB = new InMemoryWorkgroupRepositoryDirectory(new WorkgroupRepositoryStore());
+
+        var sharedRoot = "76dbfae5adf4ae2130fba0f88990ac5cc86ddbd0";
+        // Neither peer's map contains the other's entry yet (the startup race).
+        Assert.IsType<RepositoryMatchResult.NoMatch>(
+            await peerA.MatchAsync(Hints(roots: [sharedRoot], remotes: ["local-path/eval", "github.com/acme/eval"])));
+        Assert.IsType<RepositoryMatchResult.NoMatch>(
+            await peerB.MatchAsync(Hints(roots: [sharedRoot], remotes: ["github.com/acme/eval"])));
+
+        var a = await peerA.RegisterAsync("eval", Hints(roots: [sharedRoot], remotes: ["local-path/eval", "github.com/acme/eval"]));
+        var b = await peerB.RegisterAsync("eval", Hints(roots: [sharedRoot], remotes: ["github.com/acme/eval"]));
+
+        Assert.Equal(a.RepoId, b.RepoId);
+        Assert.Equal(a.RepoRoomId, b.RepoRoomId);
+    }
+
+    // Phase 1 — the deterministic id function is a pure function of the root-SHA set only: stable
+    // across remote differences and clone order, distinct for distinct roots, null when degraded.
+    [Fact]
+    public void DeterministicRepoId_depends_only_on_the_root_sha_set()
+    {
+        var id1 = RepositoryIdentityMatcher.DeterministicRepoId(["r1", "r2"]);
+        var id2 = RepositoryIdentityMatcher.DeterministicRepoId(["r2", "r1"]); // order-insensitive
+        var id3 = RepositoryIdentityMatcher.DeterministicRepoId(["r1", "r2", "r2"]); // dup-insensitive
+        var other = RepositoryIdentityMatcher.DeterministicRepoId(["r3"]);
+
+        Assert.NotNull(id1);
+        Assert.StartsWith("repo-", id1);
+        Assert.Equal(id1, id2);
+        Assert.Equal(id1, id3);
+        Assert.NotEqual(id1, other);
+        Assert.Null(RepositoryIdentityMatcher.DeterministicRepoId([])); // degraded -> no deterministic id
+    }
+
+    // Phase 1 fork-split (D2's real concern preserved): a lone root-matching entry whose remotes
+    // are non-empty and DISJOINT from the local remotes is a possible fork sharing the deterministic
+    // id — must NOT silently unify. RED before Phase 1's matcher change (single root match -> Matched).
+    [Fact]
+    public async Task Single_root_matching_entry_with_disjoint_remotes_needs_disambiguation()
+    {
+        var directory = new InMemoryWorkgroupRepositoryDirectory(new WorkgroupRepositoryStore());
+        var sharedRoot = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        await directory.RegisterAsync("upstream", Hints(roots: [sharedRoot], remotes: ["github.com/acme/repo"]));
+
+        // Same root SHA, a wholly different remote, and it's the ONLY entry — a fork, not this repo.
+        var result = await directory.MatchAsync(Hints(roots: [sharedRoot], remotes: ["github.com/someone/repo"]));
+        Assert.IsType<RepositoryMatchResult.NeedsDisambiguation>(result);
+
+        // But an overlapping remote (or no local remote) is the same repo -> Matched, not split.
+        Assert.IsType<RepositoryMatchResult.Matched>(
+            await directory.MatchAsync(Hints(roots: [sharedRoot], remotes: ["github.com/acme/repo"])));
+        Assert.IsType<RepositoryMatchResult.Matched>(
+            await directory.MatchAsync(Hints(roots: [sharedRoot])));
+    }
+
     [Fact]
     public async Task Fork_sharing_root_shas_is_not_silently_unified_remote_tiebreak_binds_correctly()
     {

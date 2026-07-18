@@ -124,7 +124,8 @@ public sealed class ExternalGoalTools(
                 CreatedAt: workUnit.CreatedAt,
                 UpdatedAt: workUnit.UpdatedAt,
                 Owner: "mcp-external",
-                ParentGoalId: null);
+                ParentGoalId: null,
+                RepositoryId: workUnit.RepositoryId); // #1 goal replication — route to the repo room.
             await goalNodes.RecordAsync(goalNode, cancellationToken).ConfigureAwait(false);
 
             var session = await sessions.CreateAsync(

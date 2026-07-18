@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using NodalMerge.DotNetHost.Ffi;
@@ -57,6 +59,26 @@ public abstract record RepositoryMatchResult
 // entries with no engine/DI machinery at all.
 public static class RepositoryIdentityMatcher
 {
+    // Phase 1 (plans/repo-identity-convergence.md; docs/STUDIO_ROOM_SCHEMA.md (b), amended D2) — the
+    // deterministic default repoId for a strong-signal repo, derived from the **root-SHA set alone**.
+    // Remotes are deliberately excluded: two clones of the same repo routinely have different remote
+    // sets (different auth, a mirror, a local-path origin), so folding remotes into the key would give
+    // them different ids and re-create the very divergence this exists to prevent. Two clones compute
+    // this identically, offline, with no coordination — that is the whole point. Returns null for a
+    // degraded (empty) root-SHA set: a hash of nothing would wrongly collapse unrelated repos, so those
+    // keep the guid-mint + disambiguation path. Genuine forks share a root SHA (hence this id) and are
+    // split by the remote-disjoint check in Match below, not by weakening this key.
+    public static string? DeterministicRepoId(IReadOnlyList<string> rootShas)
+    {
+        if (rootShas is null || rootShas.Count == 0)
+            return null;
+
+        var canonical = string.Join('\n', rootShas.Distinct(StringComparer.Ordinal).OrderBy(s => s, StringComparer.Ordinal));
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
+        // 32 lowercase hex chars — same shape as repo-{guid:N}, per the frozen mint format.
+        return "repo-" + Convert.ToHexString(hash)[..32].ToLowerInvariant();
+    }
+
     public static RepositoryMatchResult Match(IReadOnlyList<WorkgroupRepositoryEntry> registered, RepositoryIdentityHints hints)
     {
         // Degraded input (both hint components empty: shallow clone with no remote, empty repo,
@@ -75,7 +97,21 @@ public static class RepositoryIdentityMatcher
         switch (rootMatches.Count)
         {
             case 1:
-                return new RepositoryMatchResult.Matched(rootMatches[0]);
+            {
+                // Phase 1 fork-split (plans/repo-identity-convergence.md 1.3) — a lone root-matching
+                // entry whose remotes are non-empty and DISJOINT from the local remotes is a possible
+                // fork sharing the deterministic id (same root SHA, different project). Offer a choice
+                // rather than silently unify it into the existing entry's room. Overlapping remotes, or
+                // either side having no remote to compare, is the same repo → Matched. This preserves
+                // D2's real concern under the amended deterministic-default scheme; pre-Phase-1 the
+                // single-match case never consulted remotes at all (it would have unified the fork).
+                var only = rootMatches[0];
+                var localRemotesSet = hints.Remotes.ToHashSet(StringComparer.Ordinal);
+                if (localRemotesSet.Count > 0 && only.Hints.Remotes.Count > 0 && !only.Hints.Remotes.Any(localRemotesSet.Contains))
+                    return new RepositoryMatchResult.NeedsDisambiguation([only]);
+
+                return new RepositoryMatchResult.Matched(only);
+            }
 
             case 0:
                 // No root-SHA match at all. Per D2: a remote-only match is NOT identity — never
@@ -165,9 +201,18 @@ public sealed class WorkgroupRepositoryStore
 
     public WorkgroupRepositoryEntry Register(string? label, RepositoryIdentityHints hints, string? preferredRepoId)
     {
+        // Precedence: a caller-supplied preferred id that is still free (single-user continuity —
+        // the local candidate id becomes the workgroup id) → else the deterministic root-SHA id when
+        // it's still free (strong signal: two clones converge with zero replication) → else a fresh
+        // guid. Register is only reached after a NoMatch/register-new decision, so a deterministic id
+        // that is ALREADY taken means a different logical repo (a fork sharing the root SHA) already
+        // claimed it — mint a guid to split it into its own entry rather than overwrite.
+        var deterministic = RepositoryIdentityMatcher.DeterministicRepoId(hints.RootShas);
         var repoId = preferredRepoId is not null && !_entries.ContainsKey(preferredRepoId)
             ? preferredRepoId
-            : $"repo-{Guid.NewGuid():N}";
+            : deterministic is not null && !_entries.ContainsKey(deterministic)
+                ? deterministic
+                : $"repo-{Guid.NewGuid():N}";
 
         var entry = new WorkgroupRepositoryEntry(repoId, label, $"repo/{repoId}", hints);
         _entries[repoId] = entry;
@@ -250,9 +295,15 @@ public sealed class WorkgroupRepositoryDirectory : IWorkgroupRepositoryDirectory
     {
         await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
 
+        // Precedence mirrors the in-memory store's Register (see WorkgroupRepositoryStore.Register):
+        // free preferred id → free deterministic root-SHA id → guid (a taken deterministic id means a
+        // fork sharing the root SHA already claimed it, so split rather than overwrite).
+        var deterministic = RepositoryIdentityMatcher.DeterministicRepoId(hints.RootShas);
         var repoId = preferredRepoId is not null && _roomMap.TryGetValueRawJson(RepositoriesNamespace, preferredRepoId) is null
             ? preferredRepoId
-            : $"repo-{Guid.NewGuid():N}";
+            : deterministic is not null && _roomMap.TryGetValueRawJson(RepositoriesNamespace, deterministic) is null
+                ? deterministic
+                : $"repo-{Guid.NewGuid():N}";
 
         var entry = new WorkgroupRepositoryEntry(repoId, label, $"repo/{repoId}", hints);
 

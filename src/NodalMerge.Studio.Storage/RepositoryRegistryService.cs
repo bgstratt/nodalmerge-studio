@@ -139,8 +139,38 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
         if (existing is not null)
             return existing;
 
+        // Phase 1 (plans/repo-identity-convergence.md) — compute identity hints ONCE, here, so they
+        // seed both the local RepositoryId and the workgroup binding below. Computed after the
+        // idempotent-by-path short-circuit above so a re-register of a known path never re-consults
+        // git (preserves the "hints consulted only at first contact" contract). Never throws —
+        // degrades to Empty (which yields a guid id + no binding), matching pre-Phase-1 behavior
+        // when the hints service is absent.
+        RepositoryIdentityHints hints;
+        try
+        {
+            hints = _identityHints is not null
+                ? await _identityHints.ComputeAsync(path, ct).ConfigureAwait(false)
+                : RepositoryIdentityHints.Empty;
+        }
+        catch
+        {
+            hints = RepositoryIdentityHints.Empty;
+        }
+
+        // Deterministic local-candidate id from the root-SHA set (strong signal) so two clones of one
+        // repo mint the SAME RepositoryId — which the preferred-id continuity in BindToWorkgroupAsync
+        // then propagates to WorkgroupRepoId, converging both peers on one repo room with zero
+        // replication dependency. Falls back to a guid for a degraded signal, OR when the deterministic
+        // id already names a different local registration (two forks sharing a root SHA cloned on THIS
+        // peer — the local registry is keyed by RepositoryId and must stay collision-free; the second
+        // fork then disambiguates to its own workgroup id below).
+        var deterministicId = RepositoryIdentityMatcher.DeterministicRepoId(hints.RootShas);
+        var repositoryId = deterministicId is not null && !_repositories.ContainsKey(deterministicId)
+            ? deterministicId
+            : $"repo-{Guid.NewGuid():N}";
+
         var repository = new RepositoryV1(
-            RepositoryId: $"repo-{Guid.NewGuid():N}",
+            RepositoryId: repositoryId,
             Path: path,
             Label: label,
             RegisteredAt: DateTimeOffset.UtcNow);
@@ -149,7 +179,7 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
         // workgroup repositories map. RepositoryId above stays this repo's permanent local-candidate
         // identity regardless of outcome (see RepositoryV1's own comment); only WorkgroupRepoId/
         // PendingDisambiguation change here.
-        repository = await BindToWorkgroupAsync(repository, ct).ConfigureAwait(false);
+        repository = await BindToWorkgroupAsync(repository, hints, ct).ConfigureAwait(false);
 
         _repositories[repository.RepositoryId] = repository;
         await _nodeStore.WriteNodeAsync(
@@ -170,14 +200,13 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
     // binding yet" (WorkgroupRepoId stays null, no PendingDisambiguation) rather than blocking
     // RegisterAsync, since pre-6.2 behavior (register always succeeds) must keep working when the
     // workgroup services aren't wired or something in the git/engine path throws.
-    private async Task<RepositoryV1> BindToWorkgroupAsync(RepositoryV1 repository, CancellationToken ct)
+    private async Task<RepositoryV1> BindToWorkgroupAsync(RepositoryV1 repository, RepositoryIdentityHints hints, CancellationToken ct)
     {
         if (_identityHints is null || _workgroupDirectory is null)
             return repository;
 
         try
         {
-            var hints = await _identityHints.ComputeAsync(repository.Path, ct).ConfigureAwait(false);
             var match = await _workgroupDirectory.MatchAsync(hints, ct).ConfigureAwait(false);
 
             switch (match)

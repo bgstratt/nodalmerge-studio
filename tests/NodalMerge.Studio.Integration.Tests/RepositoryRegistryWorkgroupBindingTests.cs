@@ -81,7 +81,13 @@ public class RepositoryRegistryWorkgroupBindingTests
         var repo = await registry.RegisterAsync(@"D:\Repos\Bar", "Bar");
 
         Assert.Equal(seeded.RepoId, repo.WorkgroupRepoId);
-        Assert.NotEqual(repo.RepositoryId, repo.WorkgroupRepoId);
+        // Phase 1 (plans/repo-identity-convergence.md): both the seeded entry's id and this repo's
+        // local RepositoryId are now the SAME deterministic root-SHA id, so binding converges all
+        // three (seeded entry, local candidate, workgroup binding). Pre-Phase-1 the local id was a
+        // guid distinct from the matched entry — the convergence this test now asserts is exactly
+        // the fix.
+        Assert.Equal(seeded.RepoId, repo.RepositoryId);
+        Assert.Equal(repo.RepositoryId, repo.WorkgroupRepoId);
         Assert.Null(repo.PendingDisambiguation);
     }
 

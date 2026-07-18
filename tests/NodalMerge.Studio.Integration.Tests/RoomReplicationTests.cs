@@ -457,6 +457,78 @@ public class RoomReplicationTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// #1 goal replication (plans/repo-identity-convergence.md) — the end-to-end proof of the fix
+    /// for "two peers on one repo each see only their own goal": a GoalV1 created on peer A, bound
+    /// to a repo B has also joined, must surface through B's OWN IGoalNodeService (not just the raw
+    /// node store) — i.e. it replicated into the shared repo room AND the inbound-pack refresh
+    /// coordinator re-read GoalNodeService's cache. Before #1, GoalV1 lived in the peer-private
+    /// "studio" room and never crossed, so this assertion could never hold.
+    /// </summary>
+    [Fact(Timeout = 60_000)]
+    public async Task A_goal_created_on_one_peer_appears_in_another_peers_goal_service_on_the_same_repo()
+    {
+        await using var hostA = BuildApp("goalrepl-hostA", configureWebHost: wh => wh.UseUrls("http://127.0.0.1:0"));
+        await hostA.StartAsync();
+
+        var wsUriA = hostA.Services.GetRequiredService<IServer>()
+            .Features.Get<IServerAddressesFeature>()!.Addresses.First()
+            .Replace("http://", "ws://", StringComparison.Ordinal);
+
+        var registryA = hostA.Services.GetRequiredService<IRepositoryRegistryService>();
+        var repoR1 = await registryA.RegisterAsync(Path.Combine(_tempRoot, "goalrepl-r1"), "r1");
+        if (repoR1.WorkgroupRepoId is null)
+            repoR1 = await registryA.ResolveDisambiguationAsync(repoR1.RepositoryId, chosenRepoId: null)
+                ?? throw new InvalidOperationException("disambiguation resolution returned null");
+
+        var rootB = Path.Combine(_tempRoot, "goalrepl-hostB");
+        var hostB = StudioWebApplication.BuildPeer(
+            [],
+            configureConfiguration: cfg => cfg.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["NodalMerge:Storage:Sqlite:DbPath"] = Path.Combine(rootB, "nodes.db"),
+                ["NodalMerge:Storage:FileBlobs:RootPath"] = Path.Combine(rootB, "blobs"),
+                ["Workspace:RootPath"] = Path.Combine(rootB, "workspace"),
+                ["Peer:RoomId"] = "studio",
+                ["Peer:HostUri"] = wsUriA,
+                ["Peer:PeerId"] = "peer-b",
+            }));
+
+        try
+        {
+            await hostB.StartAsync();
+            var registryB = hostB.Services.GetRequiredService<IRepositoryRegistryService>();
+            var directoryB = hostB.Services.GetRequiredService<IWorkgroupRepositoryDirectory>();
+
+            // B binds its own clone of R1 (D2 disambiguation) → joins repo/{R1} so it receives the
+            // goal pack. Wait for A's repo entry to replicate first.
+            await PollUntilTrueAsync(async () => (await directoryB.ListAsync()).Any(e => e.RepoId == repoR1.WorkgroupRepoId));
+            var localR1OnB = await registryB.RegisterAsync(Path.Combine(rootB, "goalrepl-clone-of-r1"), "r1-on-b");
+            if (localR1OnB.WorkgroupRepoId is null)
+                localR1OnB = await registryB.ResolveDisambiguationAsync(localR1OnB.RepositoryId, repoR1.WorkgroupRepoId)
+                    ?? throw new InvalidOperationException("disambiguation resolution returned null");
+            Assert.Equal(repoR1.WorkgroupRepoId, localR1OnB!.WorkgroupRepoId);
+
+            // A creates a goal bound to R1.
+            var goalNodesA = hostA.Services.GetRequiredService<IGoalNodeService>();
+            await goalNodesA.RecordAsync(new GoalNode(
+                GoalId: "G-repl", Goal: "peer A goal", WorkUnitId: "G-repl", BranchId: "b",
+                Status: GoalStatus.Exploring, CreatedAt: DateTimeOffset.UtcNow, UpdatedAt: DateTimeOffset.UtcNow,
+                Owner: "peer-a", RepositoryId: repoR1.RepositoryId));
+
+            // B's OWN goal service surfaces A's goal — the exact cross-peer visibility that was broken.
+            var goalNodesB = hostB.Services.GetRequiredService<IGoalNodeService>();
+            await PollUntilTrueAsync(async () => (await goalNodesB.ListAsync()).Any(g => g.GoalId == "G-repl"));
+            var onB = await goalNodesB.ListAsync();
+            Assert.Contains(onB, g => g.GoalId == "G-repl" && g.Goal == "peer A goal");
+        }
+        finally
+        {
+            await hostB.StopAsync();
+            hostB.Dispose();
+        }
+    }
+
     private static string? ExtractFullPackNodesB64(IRuntimeCommandBridge bridge, string roomId)
     {
         var response = bridge.ProcessJsonCommand(JsonSerializer.Serialize(new
