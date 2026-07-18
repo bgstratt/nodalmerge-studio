@@ -810,7 +810,29 @@ public sealed class RoomPeerClient(
                     case "pack":
                         // Both the post-hello catch-up pack and any live broadcast arrive with this
                         // same type — see the class comment's wire-reality note.
-                        await owner.ApplyInboundPackForRoomAsync(RoomId, json, ct).ConfigureAwait(false);
+                        //
+                        // Isolate a pack-apply failure from the CONNECTION lifecycle. This await is
+                        // the receive loop's body: an exception escaping it faults the receive task,
+                        // which tears the socket down (RunLoopAsync's Task.WhenAny) and reconnects
+                        // straight back into the SAME catch-up pack — an infinite churn that blocks
+                        // ALL inbound replication for the room while outbound keeps flowing (separate
+                        // loop). A single un-appliable pack (e.g. a large/bloated repo-room pack, or
+                        // one whose ImportPack/PersistInboundPack step throws) must not kill the
+                        // connection: log it and keep receiving so live writes and later packs still
+                        // land. Cancellation still propagates (shutdown/reconnect are intentional).
+                        try
+                        {
+                            await owner.ApplyInboundPackForRoomAsync(RoomId, json, ct).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            owner.Logger.LogWarning(ex,
+                                "[RoomPeerClient] Applying inbound pack failed room={Room} — connection kept alive, this pack skipped", RoomId);
+                        }
                         break;
                     case "participant.stop":
                         try
