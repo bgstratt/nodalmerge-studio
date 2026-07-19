@@ -148,7 +148,7 @@ parked in Follow-ups — revisit only if we want to persist/replicate non-constr
 
 ## 4. Implementation phases
 
-### Phase 0 — Findings replication (ship now, independent of the scope model)
+### Phase 0 — Findings replication — ✅ SHIPPED
 
 Goal: the Insights **Findings queue** is shared among peers on the same repo; the manual
 Export/Import stays (it serves *cross*-workgroup / external sharing, a different job).
@@ -166,7 +166,10 @@ Export/Import stays (it serves *cross*-workgroup / external sharing, a different
 Risk: low. No schema/scope change beyond a `RepositoryId` on findings. Reversible (remove from the
 allowlist).
 
-### Phase 1 — Scope as a first-class property (this is where "global constraint replication" lands)
+### Phase 1 — Scope as a first-class property — ✅ SHIPPED (incl. elevate)
+
+*(1a/1b routing, 1c injection filter, 1d promotion, and elevate all landed. Restrict-to-private is
+folded into the Constraint Management UI below, as the local toggle.)*
 
 - **Add a `Reach { Private, Workgroup }` field** on `ArtifactRef` (`ArtifactRef.cs`) and **reuse the
   existing `RepositoryId`** as the application filter (`null` = all repos). No third enum — the 2×2 in
@@ -193,29 +196,50 @@ allowlist).
 Outcome: a promoted constraint actually replicates to same-repo peers (Repository) or all workgroup
 members (Workgroup), and every peer's agent injection sees the combined, scope-correct set.
 
-### Phase 2 — Leave / unmount + eviction (completes "persistent + leaveable")
+### Phase 2 — Leave / unmount + eviction — ❌ DESCOPED (2026-07-19)
 
-- **Leave-workgroup operation**: a new command that (a) drops the `workgroup` room connection in
-  `RoomPeerClient` (today `_connections` is never shrunk — `RoomPeerClient.cs:41-42,93-95`) and
-  (b) evicts the room's persisted local data.
-- **Per-room eviction API**: a `DropRoomAsync(roomId)` in the persistence layer
-  (`RuntimeDagPersistenceService`) that removes persisted packs/snapshots for a room and invalidates
-  its hydration — none exists today (`InvalidateHydration` only drops a cache;
-  `DeleteAcceptedNodesAsync` is compaction-only).
-- On leave, workgroup-scoped constraints disappear from injection automatically (their room is gone
-  from the fan-out).
-- **Re-join** re-syncs current workgroup state from peers/server. Safe by construction: the human-apply
-  barrier means only deliberately-promoted knowledge is ever there to receive.
+Not building this. Decision: a user who wants different workgroup knowledge simply **connects to a
+different workgroup, or clears the workgroup and restarts the host** — no in-app leave/evict verb, no
+`DropRoomAsync`, no per-room eviction machinery. The "persistent + leaveable" model collapses to
+"persistent; switch workgroups at the host level." This removes the single biggest net-new piece from
+the plan. (The safety concern it addressed — controlling which shared constraints affect *you* — is
+handled far more directly by the local toggle in Phase 3.)
 
-### Phase 3 — Provenance & Import-to-Local (audit trail + safe adoption)
+### Phase 3 — Constraint Management UI (view + local toggle) — the priority
 
-- **Provenance edges.** Today the link is one-way (`Finding.PromotedArtifactId`). Add a stored
-  provenance backlink on the Constraint (e.g. `DerivedFromFindingId`, and the finding's source run
-  ids) so "why do we have this policy?" walks Policy → Finding → runs → logs. This is the audit trail
-  the model promises and is currently absent on the artifact itself.
-- **Import to Local.** An explicit action that copies a Workgroup/Repository constraint into the
-  user's **Local** scope as a new node whose provenance points back to the shared original. Adoption
-  is deliberate and reversible; it never happens implicitly on join.
+This is the headline user-facing feature: on the Insights tab, **see every constraint and turn any of
+them off for yourself**, without affecting other peers. Split the Insights tab into two sub-tabs
+(mirroring Model & Agent Studio's tabbing): **Analysis** (today's RunRetrospective + Findings) and
+**Constraints** (this).
+
+- **View.** A `GET /studio/constraints` (optionally `?repositoryId=`) returning every constraint that
+  applies to the peer/repo, each labeled with its **reach** (Private / Workgroup) and **application**
+  (this repo / all repos), plus its **enabled** state. Grouped in the UI by reach × application.
+- **Local toggle = per-peer suppression.** "Turn off" writes a **local, non-replicated** suppression
+  record keyed by the constraint's `ArtifactId` (a `ConstraintToggleV1` node in the peer-private
+  `"studio"` room — never in `RepoScopedKinds`/`WorkgroupScopedKinds`, so it stays yours). Re-checking
+  removes it. `POST /studio/constraints/{artifactId}/toggle` (or enable/disable).
+- **Injection subtracts suppressed ids.** `ProjectionManager.BuildAgentWorkspaceAsync`'s constraint
+  fold excludes any constraint whose `ArtifactId` is in the local suppression set — so a disabled
+  workgroup/repo constraint stops reaching *this* peer's agents while remaining live for everyone else.
+- This is exactly the "Private-reach override" the fourth 2×2 cell reserved — implemented as a simple
+  on/off suppression rather than a full superseding artifact, which is all a toggle needs.
+
+Backend first (toggle store + view/toggle endpoints + injection filter, all testable headless), then
+the webview sub-tabs.
+
+### Phase 4 — Optional / later
+
+- **Provenance edges** (moved down from the old Phase 3): a stored backlink on the Constraint
+  (`DerivedFromFindingId` + the finding's source run ids) so "why do we have this policy?" walks
+  Policy → Finding → runs → logs. Nice-to-have audit trail; the one-way `Finding.PromotedArtifactId`
+  link exists today.
+- Numbered version UX over the existing `Supersedes`/`Superseded` primitives.
+- Hard policy enforcement: wire approved Constraints into `PolicyGateService` (today a *separate*
+  merge/review gate, not connected to Constraint artifacts) for policies that should *block*, not just
+  advise.
+- ~~Import-to-Local~~ — **dropped.** With no leave/evict and a local toggle, there's no need to
+  permanently copy a shared constraint into a private scope; the toggle already gives per-peer control.
 
 ### Phase 4 — Optional / later
 
@@ -236,12 +260,8 @@ members (Workgroup), and every peer's agent injection sees the combined, scope-c
 
 ## 5. Follow-ups (deferred, not in the phases above)
 
-- **Insights tab: applied / applicable constraints view + local override.** Let a user see which
-  constraints are currently applied/applicable to their agents and **override them locally** — a
-  `Reach=Private` constraint (the fourth 2×2 cell, incl. Private + repo-specific) that supersedes a
-  shared Workgroup one for this peer. `Reach=Private` + the existing `Supersedes` primitive set this
-  up; the UI and the local-override resolution rule are the remaining work. (Raised 2026-07-19; phase
-  after the above.)
+- *(The "applied/applicable constraints view + local override" that was here is now **Phase 3** above —
+  promoted to the priority feature per Brad, 2026-07-19.)*
 - **First-class non-constraint Insight objects** (correlations, perf facts, model-behavior tips) —
   only if we decide to persist/replicate knowledge that isn't a policy.
 - **Export/Import JSON** stays as the external / cross-workgroup sharing path — no change.
