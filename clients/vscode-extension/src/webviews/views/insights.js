@@ -59,6 +59,20 @@ export function init(ctx) {
     vscode.postMessage({ type: 'insightsImportFindings' });
   });
 
+  // ── Tabs (Analysis | Constraints) ──────────────────────────────────────────
+  root.querySelectorAll('.in-tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      var name = tab.getAttribute('data-tab');
+      root.querySelectorAll('.in-tab').forEach(function(t) { t.classList.toggle('in-tab-active', t === tab); });
+      $('in-pane-analysis').style.display = name === 'analysis' ? '' : 'none';
+      $('in-pane-constraints').style.display = name === 'constraints' ? '' : 'none';
+      if (name === 'constraints') {
+        $('in-constraints-list').innerHTML = '<p class="in-empty">Loading&hellip;</p>';
+        vscode.postMessage({ type: 'insightsLoadConstraints' });
+      }
+    });
+  });
+
   function renderHighlights(data) {
     var cards = '';
     cards += '<div class="in-card"><div class="in-card-value">' + data.averageReworkCycles.toFixed(1) + '</div><div class="in-card-label">Avg Rework Cycles</div></div>';
@@ -204,6 +218,58 @@ export function init(ctx) {
     }).join('');
   }
 
+  // ── Constraints tab ────────────────────────────────────────────────────────
+  function constraintGroupLabel(c) {
+    var reach = c.reach || 'Legacy';
+    if (reach === 'Workgroup') { return c.appliesToAllRepos ? 'Workgroup · all repositories' : 'Workgroup · this repository'; }
+    if (reach === 'Private') { return 'Private · local to you'; }
+    return c.appliesToAllRepos ? 'Legacy · all repositories' : 'Legacy · this repository';
+  }
+
+  function renderConstraints(list) {
+    if (!list || !list.length) {
+      return '<p class="in-empty">No constraints yet. Promote a finding on the Analysis tab to create one.</p>';
+    }
+    var groups = {};
+    var order = [];
+    list.forEach(function(c) {
+      var label = constraintGroupLabel(c);
+      if (!groups[label]) { groups[label] = []; order.push(label); }
+      groups[label].push(c);
+    });
+    return order.map(function(label) {
+      var cards = groups[label].map(function(c) {
+        var offClass = c.enabled ? '' : ' in-constraint-off';
+        var badges =
+          '<span class="in-finding-badge">' + esc(c.reach || 'legacy') + '</span>' +
+          '<span class="in-finding-badge">' + (c.appliesToAllRepos ? 'all repos' : 'this repo') + '</span>' +
+          (c.enabled ? '' : '<span class="in-finding-badge">off</span>');
+        return '' +
+          '<div class="in-constraint-card' + offClass + '" data-constraint-id="' + esc(c.artifactId) + '">' +
+            '<input type="checkbox" class="in-constraint-toggle" data-constraint-id="' + esc(c.artifactId) + '"' + (c.enabled ? ' checked' : '') + '>' +
+            '<div class="in-constraint-main">' +
+              '<div class="in-constraint-title">' + esc(c.title || c.artifactId) + '</div>' +
+              (c.body ? '<div class="in-constraint-body">' + esc(c.body) + '</div>' : '') +
+              '<div class="in-constraint-badges">' + badges + '</div>' +
+            '</div>' +
+          '</div>';
+      }).join('');
+      return '<div class="in-constraint-group"><h4>' + esc(label) + '</h4>' + cards + '</div>';
+    }).join('');
+  }
+
+  function bindConstraintToggles() {
+    root.querySelectorAll('.in-constraint-toggle').forEach(function(cb) {
+      cb.addEventListener('change', function() {
+        var id = cb.getAttribute('data-constraint-id');
+        var disabled = !cb.checked;
+        var card = cb.closest('.in-constraint-card');
+        if (card) { card.classList.toggle('in-constraint-off', disabled); }
+        vscode.postMessage({ type: 'insightsToggleConstraint', artifactId: id, disabled: disabled });
+      });
+    });
+  }
+
   function bindFindingActions() {
     root.querySelectorAll('.in-finding-card').forEach(function(card) {
       var findingId = card.getAttribute('data-finding-id');
@@ -264,6 +330,15 @@ export function init(ctx) {
       var btn = $('in-llm-scan-btn');
       btn.disabled = false;
       btn.textContent = 'Run LLM Scan';
+      return;
+    }
+    if (msg.type === 'insightsConstraintsList') {
+      $('in-constraints-list').innerHTML = renderConstraints(msg.constraints || []);
+      bindConstraintToggles();
+      return;
+    }
+    if (msg.type === 'insightsConstraintsError') {
+      $('in-constraints-list').innerHTML = '<p class="in-error">Could not load constraints — ' + esc(msg.message) + '</p>';
       return;
     }
   });

@@ -101,6 +101,19 @@ interface ExportableFinding {
   targetStage?: string | null;
 }
 
+// Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — a row of GET /studio/constraints:
+// a constraint applicable to this peer, labeled with its reach + application scope and whether the
+// local toggle currently has it enabled here.
+interface ConstraintView {
+  artifactId: string;
+  title?: string | null;
+  body?: string | null;
+  reach?: string | null;
+  repositoryId?: string | null;
+  appliesToAllRepos: boolean;
+  enabled: boolean;
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 // Analytics dashboard + Knowledge Promotion review queue for the DAG's run history. Three
@@ -229,8 +242,32 @@ export class InsightsPanel {
         await this.handleImportFindings();
         return;
       }
+      case 'insightsLoadConstraints': {
+        await this.sendConstraints();
+        return;
+      }
+      case 'insightsToggleConstraint': {
+        try {
+          await this.post(`/studio/constraints/${encodeURIComponent(msg.artifactId as string)}/toggle`, {
+            disabled: msg.disabled as boolean,
+          });
+        } catch (err) {
+          void vscode.window.showErrorMessage('NodalMerge: toggling constraint failed — ' + String(err));
+          await this.sendConstraints(); // resync the UI on failure
+        }
+        return;
+      }
       default:
         return;
+    }
+  }
+
+  private async sendConstraints(): Promise<void> {
+    try {
+      const constraints = await this.get<ConstraintView[]>('/studio/constraints');
+      void this.panel.webview.postMessage({ type: 'insightsConstraintsList', constraints });
+    } catch (err) {
+      void this.panel.webview.postMessage({ type: 'insightsConstraintsError', message: String(err) });
     }
   }
 
@@ -395,48 +432,79 @@ const IN_CSS = `
   .in-finding-actions { display: flex; gap: 6px; }
   .in-finding-actions button { font-size: 0.8em; padding: 2px 10px; }
   .in-finding-meta { font-size: 0.72em; opacity: 0.6; }
+  .in-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--nm-border); }
+  .in-tab { background: none; border: none; border-bottom: 2px solid transparent; padding: 6px 14px; cursor: pointer; opacity: 0.65; color: inherit; font-size: 0.9em; }
+  .in-tab:hover { opacity: 0.9; }
+  .in-tab.in-tab-active { border-bottom-color: currentColor; opacity: 1; font-weight: 600; }
+  .in-pane { display: flex; flex-direction: column; gap: 14px; }
+  .in-subheader { gap: 12px; }
+  .in-constraint-group > h4 { font-size: 0.8em; margin: 8px 0 6px; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.03em; }
+  .in-constraint-card { display: flex; align-items: flex-start; gap: 10px; border: 1px solid var(--nm-border); border-radius: 4px; padding: 8px 12px; margin-bottom: 6px; }
+  .in-constraint-card.in-constraint-off { opacity: 0.5; }
+  .in-constraint-toggle { margin-top: 3px; }
+  .in-constraint-main { flex: 1; min-width: 0; }
+  .in-constraint-title { font-weight: 600; }
+  .in-constraint-body { font-size: 0.85em; opacity: 0.85; margin-top: 3px; white-space: pre-wrap; }
+  .in-constraint-badges { display: flex; gap: 6px; margin-top: 5px; flex-wrap: wrap; }
 `;
 
 const IN_HTML = `
   <div class="in-header">
     <h2>Insights</h2>
-    <select id="in-period">
-      <option value="last30">Last 30 Days</option>
-      <option value="all">All Time</option>
-    </select>
-    <button id="in-run-btn">&#x25B6; Run Analysis</button>
-    <span class="in-generated-at" id="in-generated-at"></span>
   </div>
-  <div id="in-body"><p class="in-empty">No analysis run yet — click "Run Analysis" to aggregate outcomes across every goal, work unit, and proposal recorded so far.</p></div>
+  <div class="in-tabs">
+    <button class="in-tab in-tab-active" data-tab="analysis">Analysis</button>
+    <button class="in-tab" data-tab="constraints">Constraints</button>
+  </div>
 
-  <div class="in-section">
-    <h3>Findings — Knowledge &amp; Process Improvements</h3>
-    <div class="in-findings-toolbar">
-      <button id="in-detect-btn">Detect Findings</button>
-      <span class="in-hint">free, instant, deterministic rules</span>
-      <span style="flex:1"></span>
-      <select id="in-llm-profile"><option value="">(no profile configured)</option></select>
-      <button id="in-llm-scan-btn">Run LLM Scan</button>
-      <span class="in-hint">calls a real model with your credentials — real cost &amp; latency</span>
-    </div>
-    <div class="in-findings-toolbar">
-      <label class="in-hint" for="in-findings-status">View:</label>
-      <select id="in-findings-status">
-        <option value="Open">Open</option>
-        <option value="Promoted">Promoted</option>
-        <option value="Dismissed">Dismissed</option>
-        <option value="Investigating">Investigating</option>
-        <option value="All">All</option>
+  <div id="in-pane-analysis" class="in-pane">
+    <div class="in-header in-subheader">
+      <select id="in-period">
+        <option value="last30">Last 30 Days</option>
+        <option value="all">All Time</option>
       </select>
-      <span id="in-export-controls" style="display:none">
-        <button id="in-select-all-btn">Select All</button>
-        <button id="in-export-btn">Export Selected</button>
-      </span>
-      <span style="flex:1"></span>
-      <button id="in-import-btn">Import Findings&hellip;</button>
-      <span class="in-hint">bring in findings exported from another repo</span>
+      <button id="in-run-btn">&#x25B6; Run Analysis</button>
+      <span class="in-generated-at" id="in-generated-at"></span>
     </div>
-    <div id="in-findings-list"><p class="in-empty">No findings yet.</p></div>
+    <div id="in-body"><p class="in-empty">No analysis run yet — click "Run Analysis" to aggregate outcomes across every goal, work unit, and proposal recorded so far.</p></div>
+
+    <div class="in-section">
+      <h3>Findings — Knowledge &amp; Process Improvements</h3>
+      <div class="in-findings-toolbar">
+        <button id="in-detect-btn">Detect Findings</button>
+        <span class="in-hint">free, instant, deterministic rules</span>
+        <span style="flex:1"></span>
+        <select id="in-llm-profile"><option value="">(no profile configured)</option></select>
+        <button id="in-llm-scan-btn">Run LLM Scan</button>
+        <span class="in-hint">calls a real model with your credentials — real cost &amp; latency</span>
+      </div>
+      <div class="in-findings-toolbar">
+        <label class="in-hint" for="in-findings-status">View:</label>
+        <select id="in-findings-status">
+          <option value="Open">Open</option>
+          <option value="Promoted">Promoted</option>
+          <option value="Dismissed">Dismissed</option>
+          <option value="Investigating">Investigating</option>
+          <option value="All">All</option>
+        </select>
+        <span id="in-export-controls" style="display:none">
+          <button id="in-select-all-btn">Select All</button>
+          <button id="in-export-btn">Export Selected</button>
+        </span>
+        <span style="flex:1"></span>
+        <button id="in-import-btn">Import Findings&hellip;</button>
+        <span class="in-hint">bring in findings exported from another repo</span>
+      </div>
+      <div id="in-findings-list"><p class="in-empty">No findings yet.</p></div>
+    </div>
+  </div>
+
+  <div id="in-pane-constraints" class="in-pane" style="display:none">
+    <div class="in-section">
+      <h3>Constraints applied to your agents</h3>
+      <p class="in-section-note">Durable guidance folded into every agent's kickoff prompt. Uncheck one to turn it off for you only — it stays active for every other peer. Grouped by reach (who shares it) and application (which repositories it affects).</p>
+      <div id="in-constraints-list"><p class="in-empty">Open this tab to load constraints.</p></div>
+    </div>
   </div>
 `;
 
