@@ -5,16 +5,53 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
-public sealed class FindingService(IStudioNodeStore nodeStore, IArtifactLineageService artifactLineage)
+public sealed class FindingService(
+    IStudioNodeStore nodeStore,
+    IArtifactLineageService artifactLineage,
+    IRepositoryRegistryService? repositories = null,
+    WorkspaceOptions? options = null)
     : IFindingService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, Finding> _findings = new();
 
+    // Phase 0 — the workspace's repo id (same registry RepositoryId WorkUnit/Decision carry), resolved
+    // once and cached so findings route to the SAME repo room as the constraints they relate to.
+    private string? _workspaceRepositoryId;
+    private bool _repositoryIdResolved;
+
     public async Task<Finding> ProposeAsync(Finding finding, CancellationToken ct = default)
     {
+        // Attribute every finding — deterministic, LLM-scan, or imported — to the workspace's repo so
+        // FindingV1 replicates to same-repo peers. A caller that already set RepositoryId wins.
+        if (finding.RepositoryId is null)
+        {
+            var repoId = await ResolveWorkspaceRepositoryIdAsync(ct).ConfigureAwait(false);
+            if (repoId is not null)
+                finding = finding with { RepositoryId = repoId };
+        }
         _findings[finding.FindingId] = finding;
         await Persist(finding, ct).ConfigureAwait(false);
         return finding;
+    }
+
+    // Resolve the workspace's registry RepositoryId from the seed repo path (idempotent RegisterAsync,
+    // the same call goal creation makes). Best-effort and cached: if there's no seed repo or resolution
+    // fails, findings keep a null RepositoryId and stay in the local "studio" room — never a hard error.
+    private async Task<string?> ResolveWorkspaceRepositoryIdAsync(CancellationToken ct)
+    {
+        if (_repositoryIdResolved)
+            return _workspaceRepositoryId;
+        if (repositories is not null && !string.IsNullOrWhiteSpace(options?.SeedRepositoryPath))
+        {
+            try
+            {
+                var repo = await repositories.RegisterAsync(options.SeedRepositoryPath!, label: null, ct).ConfigureAwait(false);
+                _workspaceRepositoryId = repo.RepositoryId;
+            }
+            catch { /* unresolvable repo → findings stay local, not fatal */ }
+        }
+        _repositoryIdResolved = true;
+        return _workspaceRepositoryId;
     }
 
     public Task<Finding?> GetAsync(string findingId, CancellationToken ct = default)
@@ -109,6 +146,12 @@ public sealed class FindingService(IStudioNodeStore nodeStore, IArtifactLineageS
         }
     }
 
+    // Route by RepositoryId: non-null → the 4-arg overload lands FindingV1 in that repo's room (shared
+    // with same-repo peers, since FindingV1 is now in RepoScopedKinds); null → the 3-arg overload keeps
+    // it in the local "studio" room. ReviewAsync's re-persist carries the stored RepositoryId, so a
+    // reviewed finding stays in the same room it was first written to.
     private Task Persist(Finding finding, CancellationToken ct) =>
-        nodeStore.WriteNodeAsync(StudioNodeKind.FindingV1, finding.FindingId, JsonSerializer.Serialize(finding), ct);
+        string.IsNullOrEmpty(finding.RepositoryId)
+            ? nodeStore.WriteNodeAsync(StudioNodeKind.FindingV1, finding.FindingId, JsonSerializer.Serialize(finding), ct)
+            : nodeStore.WriteNodeAsync(StudioNodeKind.FindingV1, finding.FindingId, JsonSerializer.Serialize(finding), finding.RepositoryId, ct);
 }

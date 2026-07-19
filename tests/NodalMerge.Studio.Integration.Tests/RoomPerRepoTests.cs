@@ -651,6 +651,82 @@ public class RoomPerRepoTests : IDisposable
         Assert.Equal(HttpStatusCode.BadRequest, badRequest.StatusCode);
     }
 
+    /// <summary>
+    /// Phase 0 (plans/organizational-knowledge-and-workgroup-scope.md) — a Finding proposed in a
+    /// workspace bound to a repo is attributed to that repo (FindingService stamps RepositoryId from
+    /// the workspace seed repo) and, because FindingV1 is now in RepoScopedKinds, lands in the
+    /// repo/{repoId} room so the Insights Findings queue is shared with same-repo peers — never the
+    /// peer-private "studio" room, where findings used to be stranded.
+    /// </summary>
+    [Fact]
+    public async Task Finding_is_attributed_to_the_workspace_repo_and_lands_in_the_repo_room()
+    {
+        var seedRepoPath = Path.Combine(_tempRoot, "findings-seed-repo");
+        Directory.CreateDirectory(seedRepoPath);
+        var root = Path.Combine(_tempRoot, "findings-attr");
+
+        await using var app = StudioWebApplication.Build(
+            [],
+            configureConfiguration: cfg => cfg.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["NodalMerge:Storage:Sqlite:DbPath"] = Path.Combine(root, "nodes.db"),
+                ["NodalMerge:Storage:FileBlobs:RootPath"] = Path.Combine(root, "blobs"),
+                ["Workspace:RootPath"] = Path.Combine(root, "workspace"),
+                ["Workspace:SeedRepositoryPath"] = seedRepoPath,
+            }));
+
+        var repo = await RegisterBoundRepoAsync(app.Services, seedRepoPath, "seed");
+        var repoRoomId = $"repo/{repo.WorkgroupRepoId}";
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var findings = app.Services.GetRequiredService<IFindingService>();
+
+        // No RepositoryId supplied — ProposeAsync must stamp it from the workspace seed repo.
+        var finding = await findings.ProposeAsync(new Finding(
+            FindingId: "finding-attr",
+            Kind: FindingKind.KnowledgeGuideline,
+            Source: FindingSource.Deterministic,
+            Title: "t", Summary: "s",
+            SupportingDataJson: null,
+            Status: FindingStatus.Open,
+            CreatedAt: DateTimeOffset.UtcNow));
+
+        Assert.Equal(repo.RepositoryId, finding.RepositoryId);
+
+        var key = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.FindingV1, "finding-attr");
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", key)); // shared repo room
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", key));       // not stranded locally
+
+        // A review re-persists the finding; it must stay in the same repo room, not fall back to studio.
+        await findings.ReviewAsync("finding-attr", FindingStatus.Dismissed, "nope");
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", key));
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", key));
+    }
+
+    /// <summary>
+    /// Phase 0 — safe degradation: with no workspace seed repo to attribute to, a finding keeps a null
+    /// RepositoryId and stays in the local "studio" room (the 3-arg write), never blocked or lost.
+    /// </summary>
+    [Fact]
+    public async Task Finding_with_no_workspace_repo_stays_local()
+    {
+        await using var app = BuildApp("findings-local");
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var findings = app.Services.GetRequiredService<IFindingService>();
+
+        var finding = await findings.ProposeAsync(new Finding(
+            FindingId: "finding-local",
+            Kind: FindingKind.KnowledgeGuideline,
+            Source: FindingSource.Deterministic,
+            Title: "t", Summary: "s",
+            SupportingDataJson: null,
+            Status: FindingStatus.Open,
+            CreatedAt: DateTimeOffset.UtcNow));
+
+        Assert.Null(finding.RepositoryId);
+        var key = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.FindingV1, "finding-local");
+        Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", key));
+    }
+
     private static JsonNode? TryReadEngineMapValue(IRuntimeCommandBridge bridge, string roomId, string @namespace, string key)
     {
         var response = bridge.ProcessJsonCommand(JsonSerializer.Serialize(new

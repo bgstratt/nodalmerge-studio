@@ -49,4 +49,12 @@ public sealed record Finding(
     // Required for PromptImprovement findings, unused for KnowledgeGuideline. Scopes which
     // pipeline stage's agent loop(s) should see this guidance once Promoted — Title/Summary double
     // as both the review-UI text and the literal text appended to that stage's outgoing prompt.
-    PipelineStage? TargetStage = null);
+    PipelineStage? TargetStage = null,
+    // Phase 0 (plans/organizational-knowledge-and-workgroup-scope.md) — the repository this finding
+    // belongs to, stamped at ProposeAsync from the workspace's seed repo (same registry RepositoryId
+    // that WorkUnit/Decision carry, so a finding lands in the SAME repo room as the constraints it
+    // relates to). Drives FindingV1 replication routing: non-null → repo/{RepositoryId} room (shared
+    // with same-repo peers); null → local "studio" room. Workspace-aggregate findings (fork win
+    // rates etc.) are attributed to the workspace's repo; genuinely cross-repo attribution is a
+    // later refinement (Phase 1 workgroup reach).
+    string? RepositoryId = null);

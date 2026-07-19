@@ -135,6 +135,12 @@ public static class StudioNodeKind
         // same-repo peer can trace the "why" behind a decision; the transcript BYTES ride the CAS
         // content plane (pulled on demand), only this small ref is on the replication plane.
         ConversationRefV1,
+        // Phase 0 (plans/organizational-knowledge-and-workgroup-scope.md) — findings are low-volume
+        // human-review candidates (like DecisionV1), so the Insights Findings queue is shared among
+        // peers on the same repo. Attributed to the workspace's repo at ProposeAsync; a null
+        // RepositoryId (no seed repo) falls back to the local "studio" room. The manual Export/Import
+        // JSON path stays as the deliberate *cross*-workgroup sharing escape hatch.
+        FindingV1,
     };
 }
 
