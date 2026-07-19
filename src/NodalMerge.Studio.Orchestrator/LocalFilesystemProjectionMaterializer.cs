@@ -86,15 +86,17 @@ public sealed class LocalFilesystemProjectionMaterializer : IProjectionMateriali
             var files = await _fileWorkspace.ListAsync(workUnit.BranchId, ct: ct).ConfigureAwait(false);
             foreach (var relativePath in files)
             {
-                var content = await _fileWorkspace.ReadAsync(workUnit.BranchId, relativePath, ct).ConfigureAwait(false);
-                if (content is null) continue;
+                // Byte-accurate copy: reading as text + WriteAllTextAsync corrupted binaries (UTF-8
+                // round-trip) and threw on files over MaxReadBytes. Bytes are copied verbatim.
+                var bytes = await _fileWorkspace.ReadBytesAsync(workUnit.BranchId, relativePath, ct).ConfigureAwait(false);
+                if (bytes is null) continue;
 
                 var dest = Path.Combine(effectivePath, relativePath.Replace('/', Path.DirectorySeparatorChar));
                 var destDir = Path.GetDirectoryName(dest)!;
                 if (!Directory.Exists(destDir))
                     Directory.CreateDirectory(destDir);
 
-                await File.WriteAllTextAsync(dest, content, ct).ConfigureAwait(false);
+                await File.WriteAllBytesAsync(dest, bytes, ct).ConfigureAwait(false);
                 fileCount++;
             }
         }
@@ -139,15 +141,16 @@ public sealed class LocalFilesystemProjectionMaterializer : IProjectionMateriali
             var files = await _fileWorkspace.ListAsync(sourceBranchId, ct: ct).ConfigureAwait(false);
             foreach (var relativePath in files)
             {
-                var content = await _fileWorkspace.ReadAsync(sourceBranchId, relativePath, ct).ConfigureAwait(false);
-                if (content is null) continue;
+                // Byte-accurate copy — see MaterializeAsync above (binary-safe, no MaxReadBytes cap).
+                var bytes = await _fileWorkspace.ReadBytesAsync(sourceBranchId, relativePath, ct).ConfigureAwait(false);
+                if (bytes is null) continue;
 
                 var dest    = Path.Combine(effectivePath, relativePath.Replace('/', Path.DirectorySeparatorChar));
                 var destDir = Path.GetDirectoryName(dest)!;
                 if (!Directory.Exists(destDir))
                     Directory.CreateDirectory(destDir);
 
-                await File.WriteAllTextAsync(dest, content, ct).ConfigureAwait(false);
+                await File.WriteAllBytesAsync(dest, bytes, ct).ConfigureAwait(false);
                 fileCount++;
             }
         }
@@ -205,9 +208,11 @@ public sealed class LocalFilesystemProjectionMaterializer : IProjectionMateriali
             }
             else
             {
-                var contentA = await _fileWorkspace.ReadAsync(branchA, path, ct).ConfigureAwait(false);
-                var contentB = await _fileWorkspace.ReadAsync(branchB, path, ct).ConfigureAwait(false);
-                if (contentA != contentB)
+                // Byte-accurate compare — ReadAsync threw on >MaxReadBytes files and can't tell two
+                // binaries apart once they'd have been UTF-8 mangled. SequenceEqual on raw bytes is exact.
+                var bytesA = await _fileWorkspace.ReadBytesAsync(branchA, path, ct).ConfigureAwait(false);
+                var bytesB = await _fileWorkspace.ReadBytesAsync(branchB, path, ct).ConfigureAwait(false);
+                if (!BytesEqual(bytesA, bytesB))
                 {
                     diffs.Add(new FileDiffEntry(path, "Modified"));
                     modified++;
@@ -217,6 +222,13 @@ public sealed class LocalFilesystemProjectionMaterializer : IProjectionMateriali
 
         return new KnownGoodDiffResult(stateIdA, stateIdB, diffs, added, removed, modified);
     }
+
+    private static bool BytesEqual(byte[]? a, byte[]? b) => (a, b) switch
+    {
+        (null, null) => true,
+        (null, _) or (_, null) => false,
+        _ => a.AsSpan().SequenceEqual(b),
+    };
 
     public void Dispose() => _subscription.Dispose();
 }

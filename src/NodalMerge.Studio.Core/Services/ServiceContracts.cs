@@ -2251,6 +2251,20 @@ public interface IFileWorkspaceService
     Task InitBranchAsync(string branchId, string? seedFromBranchId = null,
         IReadOnlyList<string>? fileScope = null, CancellationToken ct = default);
     Task<string?> ReadAsync(string branchId, string relativePath, CancellationToken ct = default);
+
+    // Byte-accurate read used by the materialize/snapshot plumbing (produced-snapshot minting,
+    // projection materialization) — NOT the agent-facing tools. Unlike ReadAsync it applies no
+    // MaxReadBytes cap and does no UTF-8 round-trip, so binary files and files larger than the
+    // text read limit survive intact instead of being corrupted or dropped. Returns null only when
+    // the file does not exist. The default implementation falls back to the text path so the
+    // in-memory/test doubles that only model UTF-8 content keep compiling; the real
+    // FileSystemWorkspaceService overrides it with true byte I/O.
+    async Task<byte[]?> ReadBytesAsync(string branchId, string relativePath, CancellationToken ct = default)
+    {
+        var content = await ReadAsync(branchId, relativePath, ct).ConfigureAwait(false);
+        return content is null ? null : System.Text.Encoding.UTF8.GetBytes(content);
+    }
+
     Task WriteAsync(string branchId, string relativePath, string content, CancellationToken ct = default);
     Task DeleteAsync(string branchId, string relativePath, CancellationToken ct = default);
     Task<bool> ExistsAsync(string branchId, string relativePath, CancellationToken ct = default);
