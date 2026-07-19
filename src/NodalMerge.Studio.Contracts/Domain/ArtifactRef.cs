@@ -40,6 +40,22 @@ public enum ArtifactStatus
     Invalidated,
 }
 
+// Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — the "reach" half of the 2x2
+// scope model (Reach x Application): WHO gets a replicated copy. Application — WHICH repo it applies
+// to — is the separate RepositoryId axis (null = all repos). Reach selects the room; injection then
+// filters by RepositoryId. Null Reach means legacy routing (pre-Phase-1): route by RepositoryId
+// alone (repo room if set, else the local "studio" room), so existing artifacts are unchanged with
+// zero migration — only records that opt in by setting Reach get the new behavior.
+public enum ArtifactReach
+{
+    // The peer-private "studio" room — never replicated (Slice 7.3). A user's own knowledge, or a
+    // local override of a shared policy (with RepositoryId set = override scoped to one repo).
+    Private,
+    // Shared across the workgroup. With RepositoryId set → the repo/{id} room (peers on that repo);
+    // with RepositoryId null → the workgroup room (every member, all repos — the old "global").
+    Workgroup,
+}
+
 public sealed record ArtifactRef(
     string ArtifactId,
     ArtifactType Type,
@@ -62,8 +78,13 @@ public sealed record ArtifactRef(
     // Slice 6.3a (plans/cas-distribution-and-storage.md Phase 6, D1) — denormalized at RecordAsync
     // time from OwnedByWorkUnitId's own RepositoryId. Null for global artifacts (OwnedByWorkUnitId
     // itself null — e.g. GetGlobalConstraintsAsync's constraint set), a work unit with no
-    // resolvable RepositoryId, or an artifact that predates 6.3a.
-    string? RepositoryId = null)
+    // resolvable RepositoryId, or an artifact that predates 6.3a. Phase 1: doubles as the
+    // *application* filter (null = applies to all repos); combined with Reach it forms the 2x2 scope.
+    string? RepositoryId = null,
+    // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — the reach half of the scope
+    // model (see ArtifactReach). Null = legacy routing (route by RepositoryId alone); non-null opts
+    // into (Reach x RepositoryId) routing. See ArtifactLineageService.RecordAsync.
+    ArtifactReach? Reach = null)
 {
     public IReadOnlyList<string> Supersedes { get; init; } = Supersedes ?? [];
 }

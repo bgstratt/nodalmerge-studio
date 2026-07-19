@@ -652,6 +652,69 @@ public class RoomPerRepoTests : IDisposable
     }
 
     /// <summary>
+    /// Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — ArtifactRef routes by the
+    /// 2×2 (Reach × Application): Private → peer-private "studio" room; Workgroup + RepositoryId →
+    /// that repo's room; Workgroup + no RepositoryId → the shared "workgroup" room (the old "global",
+    /// now actually replicated instead of stranded locally). Legacy artifacts (Reach null) keep the
+    /// pre-Phase-1 repo-room-or-"studio" routing. The read fan-out consults the workgroup room too, so
+    /// a workgroup-only artifact is still found.
+    /// </summary>
+    [Fact]
+    public async Task Artifact_reach_routes_to_studio_repo_or_workgroup_room()
+    {
+        await using var app = BuildApp("artifact-reach");
+        var repo = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "reach-repoA"), "repoA");
+        var repoRoomId = $"repo/{repo.WorkgroupRepoId}";
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+        var store = app.Services.GetRequiredService<IStudioNodeStore>();
+
+        ArtifactRef Make(string id, ArtifactReach? reach, string? repositoryId) => new(
+            ArtifactId: id, Type: ArtifactType.Constraint, ParentArtifactId: null,
+            Status: ArtifactStatus.Approved, CreatedAt: DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null, Title: id, Body: "b",
+            RepositoryId: repositoryId, Reach: reach);
+
+        static string Key(string id) => NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.ArtifactRefV1, id);
+
+        // 1. Workgroup + no repo → the shared "workgroup" room (the old "global", now replicated).
+        await artifacts.RecordAsync(Make("wg-global", ArtifactReach.Workgroup, null));
+        Assert.NotNull(TryReadEngineMapValue(bridge, "workgroup", "studio", Key("wg-global")));
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", Key("wg-global")));
+        Assert.Null(TryReadEngineMapValue(bridge, repoRoomId, "studio", Key("wg-global")));
+
+        // 2. Workgroup + repo → that repo's room.
+        await artifacts.RecordAsync(Make("wg-repo", ArtifactReach.Workgroup, repo.RepositoryId));
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", Key("wg-repo")));
+        Assert.Null(TryReadEngineMapValue(bridge, "workgroup", "studio", Key("wg-repo")));
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", Key("wg-repo")));
+
+        // 3. Private → the peer-private "studio" room, never replicated.
+        await artifacts.RecordAsync(Make("priv", ArtifactReach.Private, null));
+        Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", Key("priv")));
+        Assert.Null(TryReadEngineMapValue(bridge, "workgroup", "studio", Key("priv")));
+
+        // 4. Private + repo (local override — the 4th 2×2 cell) → studio, NOT the repo room.
+        await artifacts.RecordAsync(Make("priv-repo", ArtifactReach.Private, repo.RepositoryId));
+        Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", Key("priv-repo")));
+        Assert.Null(TryReadEngineMapValue(bridge, repoRoomId, "studio", Key("priv-repo")));
+
+        // 5. Legacy (Reach null) unchanged: no repo → "studio", not the workgroup room.
+        await artifacts.RecordAsync(Make("legacy-local", null, null));
+        Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", Key("legacy-local")));
+        Assert.Null(TryReadEngineMapValue(bridge, "workgroup", "studio", Key("legacy-local")));
+
+        // Read fan-out: wg-global lives ONLY in the workgroup room, so a successful read proves
+        // ReadNodeAsync/ReadAllNodesAsync now consult that room.
+        Assert.NotNull(await store.ReadNodeAsync(StudioNodeKind.ArtifactRefV1, "wg-global"));
+        var all = await store.ReadAllNodesAsync(StudioNodeKind.ArtifactRefV1);
+        var ids = all.Select(e => e.EntityId).ToHashSet(StringComparer.Ordinal);
+        Assert.Contains("wg-global", ids);
+        Assert.Contains("wg-repo", ids);
+        Assert.Contains("priv", ids);
+    }
+
+    /// <summary>
     /// Phase 0 (plans/organizational-knowledge-and-workgroup-scope.md) — a Finding proposed in a
     /// workspace bound to a repo is attributed to that repo (FindingService stamps RepositoryId from
     /// the workspace seed repo) and, because FindingV1 is now in RepoScopedKinds, lands in the

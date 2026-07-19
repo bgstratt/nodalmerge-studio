@@ -62,12 +62,29 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
         _byId[stored.ArtifactId] = stored;
         Index(stored);
 
-        await _nodeStore.WriteNodeAsync(
-            StudioNodeKind.ArtifactRefV1,
-            stored.ArtifactId,
-            JsonSerializer.Serialize(stored),
-            stored.RepositoryId,
-            ct).ConfigureAwait(false);
+        // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — route by (Reach,
+        // RepositoryId). Reach == null is legacy routing (repo room if RepositoryId set, else
+        // "studio"), byte-identical to pre-Phase-1 behavior, so existing artifacts are unchanged.
+        var json = JsonSerializer.Serialize(stored);
+        var id = stored.ArtifactId;
+        if (stored.Reach == ArtifactReach.Private)
+        {
+            // Peer-private "studio" room — never replicated. RepositoryId (if any) is only an
+            // application filter, not a routing key.
+            await _nodeStore.WriteNodeAsync(StudioNodeKind.ArtifactRefV1, id, json, ct).ConfigureAwait(false);
+        }
+        else if (stored.Reach == ArtifactReach.Workgroup && string.IsNullOrEmpty(stored.RepositoryId))
+        {
+            // Workgroup reach, all repos → the shared "workgroup" room (the old "global", now actually
+            // replicated to every member instead of stranded in the local room).
+            await _nodeStore.WriteWorkgroupNodeAsync(StudioNodeKind.ArtifactRefV1, id, json, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            // Workgroup reach + a RepositoryId → that repo's room; and legacy (Reach null) → the
+            // existing repo-room-or-"studio" fallback.
+            await _nodeStore.WriteNodeAsync(StudioNodeKind.ArtifactRefV1, id, json, stored.RepositoryId, ct).ConfigureAwait(false);
+        }
 
         return stored;
     }
