@@ -1,4 +1,3 @@
-using System.Text;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NodalMerge.Host.Abstractions.Providers;
@@ -115,11 +114,14 @@ public sealed class WorkUnitProducedSnapshotObserver : IHostedService, IDisposab
         var tree = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var path in await _fileWorkspace.ListAsync(wu.BranchId).ConfigureAwait(false))
         {
-            var content = await _fileWorkspace.ReadAsync(wu.BranchId, path).ConfigureAwait(false);
-            if (content is null)
+            // Byte-accurate read: a UTF-8 round-trip here corrupted every binary in the branch, and
+            // ReadAsync's MaxReadBytes cap threw on files >512 KB — aborting the whole mint. Bytes
+            // are hashed/stored exactly as they sit on disk, matching RepositoryImportService's CAS
+            // ingest so the produced snapshot's blobs are byte-identical to an import of the same tree.
+            var bytes = await _fileWorkspace.ReadBytesAsync(wu.BranchId, path).ConfigureAwait(false);
+            if (bytes is null)
                 continue;
 
-            var bytes = Encoding.UTF8.GetBytes(content);
             var blobId = BlobHasher.ComputeHash(bytes);
             // Idempotent by hash — guarantees the tree's referenced blob is retrievable at materialize
             // time regardless of how the branch write originally stored it.

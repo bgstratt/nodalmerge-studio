@@ -190,6 +190,20 @@ internal sealed class FileSystemWorkspaceService(
         return await File.ReadAllTextAsync(fullPath, ct).ConfigureAwait(false);
     }
 
+    // Byte-accurate read for the materialize/snapshot plumbing (see IFileWorkspaceService). No
+    // MaxReadBytes cap and no UTF-8 round-trip: a binary or >MaxReadBytes file is returned exactly
+    // as it sits on disk, so it can be hashed/stored/copied without corruption or loss. Reads the
+    // whole file into memory (content-defined chunking is deliberately deferred — see
+    // plans/cas-distribution-and-storage.md); the caps stay on the agent-facing ReadAsync above.
+    public async Task<byte[]?> ReadBytesAsync(string branchId, string relativePath, CancellationToken ct = default)
+    {
+        var fullPath = SafePath(branchId, relativePath);
+        if (!File.Exists(fullPath))
+            return null;
+
+        return await File.ReadAllBytesAsync(fullPath, ct).ConfigureAwait(false);
+    }
+
     public async Task<IReadOnlyList<WorkspaceFileRead>> ReadManyAsync(
         string branchId, IReadOnlyList<string> paths, CancellationToken ct = default)
     {
