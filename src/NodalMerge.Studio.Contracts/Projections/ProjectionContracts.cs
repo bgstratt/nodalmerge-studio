@@ -472,7 +472,7 @@ public sealed record ReviewOutcomeStat(
     double? AvgConfidence);
 
 /// <summary>
-/// WorkspacePathways projection — "git for agent reasoning": a workspace-scoped history of
+/// WorkspacePathways projection — a workspace-scoped, branchable history of
 /// provenance-bearing moments (goal starts, integrations, rejections/dead branches, external
 /// file updates), each attributed to an actor (agent | human | external). Deliberately excludes
 /// per-cycle orchestration decision-log chatter (NoOp/Enqueue/SpawnPlanner) — that stays in

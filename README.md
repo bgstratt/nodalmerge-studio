@@ -1,6 +1,6 @@
 # NodalMerge Studio — VS Code Extension
 
-**Git for agent reasoning and execution** — not Git for files.
+**Branch ideas. Review reasoning. Materialize software.**
 
 NodalMerge Studio is a persistent collaborative runtime for human and AI development work, built on [NodalMerge](https://github.com/nodalmerge/nodalmerge). It provides the execution environment, decision history, artifact lineage, and coordination layer for a shared, evolving workspace — designed so that any agent harness, tool, or human collaborator can contribute, with every contribution reviewed, promoted, and replayable.
 

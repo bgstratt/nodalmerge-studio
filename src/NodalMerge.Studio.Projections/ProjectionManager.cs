@@ -1100,7 +1100,7 @@ public sealed class ProjectionManager : IProjectionManager
         return score;
     }
 
-    // ── WorkspacePathways projection — "git for agent reasoning" ────────────────────────
+    // ── WorkspacePathways projection — workspace-scoped branchable history ───────────────
     //
     // Deliberately does NOT read IOrchestrationDecisionLogService — that per-cycle chatter
     // (NoOp/Enqueue/SpawnPlanner) is exactly the noise plans/pathways-workspace-history.md
