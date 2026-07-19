@@ -71,7 +71,7 @@ internal sealed class InsightLlmAnalyzerService(LlmClient llm, IEnumerable<IOneS
             required = new[] { "findings" },
         });
 
-    public async Task<IReadOnlyList<LlmFindingSuggestion>> AnalyzeAsync(
+    public async Task<InsightLlmScanResult> AnalyzeAsync(
         InsightLlmScanRequest request, CancellationToken ct = default)
     {
         // Route B — a CLI provider (claude-cli / codex-cli) has no HTTP baseUrl; dispatch a one-shot
@@ -81,7 +81,7 @@ internal sealed class InsightLlmAnalyzerService(LlmClient llm, IEnumerable<IOneS
             c => string.Equals(c.ProviderKey, request.Provider, StringComparison.OrdinalIgnoreCase));
         return cli is not null
             ? await AnalyzeViaCliAsync(cli, request, ct).ConfigureAwait(false)
-            : await AnalyzeViaHttpAsync(request, ct).ConfigureAwait(false);
+            : new InsightLlmScanResult(await AnalyzeViaHttpAsync(request, ct).ConfigureAwait(false));
     }
 
     private async Task<IReadOnlyList<LlmFindingSuggestion>> AnalyzeViaHttpAsync(
@@ -111,7 +111,7 @@ internal sealed class InsightLlmAnalyzerService(LlmClient llm, IEnumerable<IOneS
         }
     }
 
-    private async Task<IReadOnlyList<LlmFindingSuggestion>> AnalyzeViaCliAsync(
+    private async Task<InsightLlmScanResult> AnalyzeViaCliAsync(
         IOneShotCliCompleter cli, InsightLlmScanRequest request, CancellationToken ct)
     {
         var userPrompt = request.ContextText + "\n\n" + CliJsonInstruction;
@@ -122,23 +122,25 @@ internal sealed class InsightLlmAnalyzerService(LlmClient llm, IEnumerable<IOneS
                 new OneShotCliRequest(request.Model, request.ApiKey, SystemPrompt, userPrompt), ct)
                 .ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex)
         {
-            // Spawn/timeout/nonzero-exit — treat as "no findings this run", mirroring the HTTP path's
-            // no-tool-call outcome rather than surfacing an error to the scan.
-            return [];
+            // Spawn/timeout/nonzero-exit — no findings this run. Surface the error text as the raw
+            // output so the UI can show why the scan produced nothing.
+            return new InsightLlmScanResult([], "CLI scan failed: " + ex.Message);
         }
 
+        // Always carry the model's verbatim response back (RawCliOutput) — that's what lets the UI
+        // show the user what the model actually returned when nothing parsed.
         var json = CliProcessRunner.ExtractJsonObject(text);
-        if (json is null) { return []; }
+        if (json is null) { return new InsightLlmScanResult([], text); }
         try
         {
             using var doc = JsonDocument.Parse(json);
-            return MapFindings(doc.RootElement);
+            return new InsightLlmScanResult(MapFindings(doc.RootElement), text);
         }
         catch (JsonException)
         {
-            return [];
+            return new InsightLlmScanResult([], text);
         }
     }
 

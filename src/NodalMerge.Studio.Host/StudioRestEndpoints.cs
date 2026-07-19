@@ -5577,12 +5577,12 @@ public static class StudioRestEndpoints
             }
 
             var contextText = await projections.BuildInsightScanContextAsync(ct).ConfigureAwait(false);
-            var suggestions = await analyzer.AnalyzeAsync(
+            var result = await analyzer.AnalyzeAsync(
                 new InsightLlmScanRequest(body.Provider, body.Model, body.BaseUrl, body.ApiKey, contextText), ct)
                 .ConfigureAwait(false);
 
             var created = new List<Finding>();
-            foreach (var s in suggestions)
+            foreach (var s in result.Findings)
             {
                 created.Add(await findings.ProposeAsync(new Finding(
                     FindingId: $"finding-{Guid.NewGuid():N}",
@@ -5596,7 +5596,9 @@ public static class StudioRestEndpoints
                     TargetStage: s.TargetStage), ct).ConfigureAwait(false));
             }
 
-            return Results.Ok(created);
+            // rawCliOutput is set only for CLI-provider scans — the model's verbatim response, so the
+            // extension can offer to open it when a CLI model returned text that parsed to no findings.
+            return Results.Ok(new { findings = created, rawCliOutput = result.RawCliOutput });
         });
 
         // ── Causal graph queries ───────────────────────────────────────────

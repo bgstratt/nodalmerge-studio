@@ -1547,9 +1547,15 @@ public sealed record InsightLlmScanRequest(string Provider, string Model, string
 // response degrades to "no actionable suggestion" rather than crashing the scan.
 public sealed record LlmFindingSuggestion(string Title, string Summary, FindingKind Kind = FindingKind.KnowledgeGuideline, PipelineStage? TargetStage = null);
 
+// Route B (plans/organizational-knowledge-and-workgroup-scope.md) — the scan result. RawCliOutput is
+// the model's verbatim response, set ONLY on the CLI path (claude-cli/codex-cli), so when a CLI model
+// returns text the analyzer couldn't parse into findings, the UI can surface it for the user to
+// inspect/fix. Null on the HTTP path (a forced tool call is always structured — nothing to inspect).
+public sealed record InsightLlmScanResult(IReadOnlyList<LlmFindingSuggestion> Findings, string? RawCliOutput = null);
+
 public interface IInsightLlmAnalyzerService
 {
-    Task<IReadOnlyList<LlmFindingSuggestion>> AnalyzeAsync(InsightLlmScanRequest request, CancellationToken ct = default);
+    Task<InsightLlmScanResult> AnalyzeAsync(InsightLlmScanRequest request, CancellationToken ct = default);
 }
 
 public interface IFanOutService

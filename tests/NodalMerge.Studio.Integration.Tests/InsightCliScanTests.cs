@@ -66,11 +66,12 @@ public class InsightCliScanTests : IDisposable
 
         // A claude-cli provider with no baseUrl — the path that used to 400 — now routes to the CLI
         // completer, spawns the stub, and parses its findings JSON.
-        var suggestions = await analyzer.AnalyzeAsync(new InsightLlmScanRequest(
+        var result = await analyzer.AnalyzeAsync(new InsightLlmScanRequest(
             Provider: "claude-cli", Model: "", BaseUrl: "", ApiKey: "", ContextText: "some run history"));
 
-        Assert.Single(suggestions);
-        Assert.Equal("Prefer repository abstraction", suggestions[0].Title);
-        Assert.Equal(FindingKind.KnowledgeGuideline, suggestions[0].Kind);
+        Assert.Single(result.Findings);
+        Assert.Equal("Prefer repository abstraction", result.Findings[0].Title);
+        Assert.Equal(FindingKind.KnowledgeGuideline, result.Findings[0].Kind);
+        Assert.NotNull(result.RawCliOutput); // the verbatim model response is carried back for the UI
     }
 }

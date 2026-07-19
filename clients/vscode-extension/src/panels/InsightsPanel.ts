@@ -363,8 +363,30 @@ export class InsightsPanel {
       // CLI profiles (claude-cli / codex-cli) resolve with an empty baseUrl — Route B teaches the
       // scan to drive them via a one-shot CLI completer server-side, so they no longer need an HTTP
       // baseUrl. cfg carries provider/model/apiKey; the server routes by provider.
-      await this.post('/studio/insights/llm-scan', cfg);
+      const result = await this.post<{ findings: Finding[]; rawCliOutput?: string | null }>(
+        '/studio/insights/llm-scan', cfg,
+      );
       await this.sendFindings();
+
+      if (result.findings.length > 0) {
+        void vscode.window.showInformationMessage(
+          `NodalMerge: LLM scan detected ${result.findings.length} finding(s) — see the Findings list.`,
+        );
+      } else if (result.rawCliOutput && result.rawCliOutput.trim()) {
+        // The CLI model replied but nothing parsed into findings. Offer to open its verbatim response
+        // so the user can see why (and hand-fix the JSON if they want to salvage it).
+        const choice = await vscode.window.showWarningMessage(
+          'NodalMerge: the LLM scan got a response but extracted no parseable findings. '
+          + 'Open the raw model output to inspect it?',
+          'Open raw output',
+        );
+        if (choice === 'Open raw output') {
+          const doc = await vscode.workspace.openTextDocument({ content: result.rawCliOutput, language: 'json' });
+          await vscode.window.showTextDocument(doc);
+        }
+      } else {
+        void vscode.window.showInformationMessage('NodalMerge: LLM scan found no patterns worth flagging.');
+      }
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: LLM scan failed — ' + String(err));
     } finally {
