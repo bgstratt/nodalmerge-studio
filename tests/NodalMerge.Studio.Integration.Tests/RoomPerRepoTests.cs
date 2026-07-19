@@ -700,6 +700,40 @@ public class RoomPerRepoTests : IDisposable
     }
 
     /// <summary>
+    /// Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — progressive promotion:
+    /// elevating a Workgroup + repo-specific constraint widens its application to all repos
+    /// (RepositoryId → null) and re-routes it from the repo room into the shared "workgroup" room.
+    /// </summary>
+    [Fact]
+    public async Task Elevating_a_repo_constraint_moves_it_to_the_workgroup_room()
+    {
+        await using var app = BuildApp("elevate");
+        var repo = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "elevate-repoA"), "repoA");
+        var repoRoomId = $"repo/{repo.WorkgroupRepoId}";
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+
+        await artifacts.RecordAsync(new ArtifactRef(
+            ArtifactId: "c-elevate", Type: ArtifactType.Constraint, ParentArtifactId: null,
+            Status: ArtifactStatus.Approved, CreatedAt: DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null, Title: "c", Body: "b",
+            RepositoryId: repo.RepositoryId, Reach: ArtifactReach.Workgroup));
+
+        var key = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.ArtifactRefV1, "c-elevate");
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", key));   // starts repo-scoped
+        Assert.Null(TryReadEngineMapValue(bridge, "workgroup", "studio", key));
+
+        var elevated = await artifacts.ElevateToWorkgroupAsync("c-elevate");
+        Assert.Equal(ArtifactReach.Workgroup, elevated!.Reach);
+        Assert.Null(elevated.RepositoryId);                                          // now all-repos
+        Assert.NotNull(TryReadEngineMapValue(bridge, "workgroup", "studio", key));   // now in the workgroup room
+
+        // Idempotent: a second elevate is a no-op.
+        var again = await artifacts.ElevateToWorkgroupAsync("c-elevate");
+        Assert.Null(again!.RepositoryId);
+    }
+
+    /// <summary>
     /// Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — ArtifactRef routes by the
     /// 2×2 (Reach × Application): Private → peer-private "studio" room; Workgroup + RepositoryId →
     /// that repo's room; Workgroup + no RepositoryId → the shared "workgroup" room (the old "global",

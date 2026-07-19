@@ -119,6 +119,28 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
         return updated;
     }
 
+    // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — progressive promotion: widen a
+    // constraint's *application* from one repo to all repos (RepositoryId → null), keeping Workgroup
+    // reach. This re-routes it into the shared "workgroup" room, so every member sees it regardless of
+    // repo. Idempotent: a no-op (returns unchanged) if already workgroup-wide; null if not found.
+    // Mirrors UpdateStatusAsync (mutate _byId + persist) — OwnedByWorkUnitId/ParentArtifactId are
+    // unchanged, so the parent/work-unit indices don't need re-indexing.
+    public async Task<ArtifactRef?> ElevateToWorkgroupAsync(string artifactId, CancellationToken ct = default)
+    {
+        if (!_byId.TryGetValue(artifactId, out var existing))
+            return null;
+        if (existing.Reach == ArtifactReach.Workgroup && string.IsNullOrEmpty(existing.RepositoryId))
+            return existing;
+
+        var updated = existing with { Reach = ArtifactReach.Workgroup, RepositoryId = null };
+        _byId[artifactId] = updated;
+
+        await _nodeStore.WriteWorkgroupNodeAsync(
+            StudioNodeKind.ArtifactRefV1, artifactId, JsonSerializer.Serialize(updated), ct).ConfigureAwait(false);
+
+        return updated;
+    }
+
     public async Task<ArtifactRef> ReparentAsync(string artifactId, string newParentArtifactId, CancellationToken ct = default)
     {
         if (!_byId.TryGetValue(artifactId, out var existing))

@@ -3638,6 +3638,20 @@ public static class StudioRestEndpoints
                 return Results.BadRequest(new { error = ex.Message });
             }
         });
+
+        // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — progressive promotion:
+        // widen a constraint from one repo to all repos (Workgroup + null → the shared "workgroup"
+        // room). Idempotent; 404 if the artifact doesn't exist.
+        app.MapPost("/studio/artifacts/{artifactId}/elevate", async (
+            string artifactId,
+            IArtifactLineageService artifacts,
+            CancellationToken ct) =>
+        {
+            var elevated = await artifacts.ElevateToWorkgroupAsync(artifactId, ct).ConfigureAwait(false);
+            return elevated is null
+                ? Results.NotFound(new { error = $"Artifact '{artifactId}' was not found." })
+                : Results.Ok(elevated);
+        });
     }
 
     // ── /studio/projections — Slice 6.5 deferred: projection REST parity ───

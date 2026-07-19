@@ -1475,6 +1475,14 @@ public interface IArtifactLineageService
     // these since it only indexes work-unit-owned artifacts.
     Task<IReadOnlyList<ArtifactRef>> GetGlobalConstraintsAsync(CancellationToken ct = default);
 
+    // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — progressive promotion: widen a
+    // constraint from one repo (Workgroup + RepositoryId) to all repos (Workgroup + null), re-routing
+    // it into the shared "workgroup" room. Idempotent; returns the updated artifact, or null if the
+    // artifact doesn't exist. Default no-op keeps in-memory test doubles compiling unchanged; the real
+    // ArtifactLineageService overrides it.
+    Task<ArtifactRef?> ElevateToWorkgroupAsync(string artifactId, CancellationToken ct = default) =>
+        Task.FromResult<ArtifactRef?>(null);
+
     // WorkspacePathways (plans/pathways-workspace-history.md) — every artifact of one type,
     // workspace-wide, regardless of owning work unit. The query surface GetChainAsync
     // (per-work-unit) can't provide for OwnedByWorkUnitId:null artifacts like ExternalChangeset;
