@@ -27,9 +27,14 @@ internal static class CliProcessRunner
     // Spawn the CLI in a throwaway temp working directory (a one-shot has no repo workspace), capture
     // stdout, enforce a wall-clock timeout, and surface stderr on a nonzero exit. Mirrors the
     // executors' BuildProcessStartInfo wrapping (cmd.exe /c on Windows so a PATH shim launches).
+    //
+    // The prompt goes on STDIN, never as a command-line argument: cmd.exe truncates an argument at its
+    // first newline (found live — a multi-line prompt reached the CLI as only its first line), and
+    // stdin is passed through the /c wrapper untouched. Written concurrently with the stdout read so a
+    // large prompt can't deadlock against a full stdout pipe.
     public static async Task<string> RunCaptureStdoutAsync(
         string executablePath, IReadOnlyList<string> args,
-        (string Key, string Value)? envVar, int timeoutSeconds, bool closeStdin, CancellationToken ct)
+        (string Key, string Value)? envVar, int timeoutSeconds, string? stdinText, CancellationToken ct)
     {
         var workDir = Path.Combine(Path.GetTempPath(), "nm-oneshot-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(workDir);
@@ -40,7 +45,7 @@ internal static class CliProcessRunner
                 WorkingDirectory = workDir,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
-                RedirectStandardInput = closeStdin,
+                RedirectStandardInput = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
@@ -63,8 +68,19 @@ internal static class CliProcessRunner
             cts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
             using var process = Process.Start(psi)
                 ?? throw new InvalidOperationException($"Failed to start '{executablePath}'.");
-            if (closeStdin)
-                process.StandardInput.Close();
+
+            // Feed the prompt to stdin then close it — fire-and-forget so it runs concurrently with the
+            // stdout read below (a full stdout pipe would otherwise block a blocking stdin write).
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    if (!string.IsNullOrEmpty(stdinText))
+                        await process.StandardInput.WriteAsync(stdinText.AsMemory(), cts.Token).ConfigureAwait(false);
+                }
+                catch { /* child may exit before we finish writing — harmless */ }
+                finally { try { process.StandardInput.Close(); } catch { /* already closed */ } }
+            }, cts.Token);
 
             var stdoutTask = process.StandardOutput.ReadToEndAsync(cts.Token);
             var stderrTask = process.StandardError.ReadToEndAsync(cts.Token);

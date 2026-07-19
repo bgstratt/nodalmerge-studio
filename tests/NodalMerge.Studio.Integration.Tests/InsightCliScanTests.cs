@@ -35,10 +35,12 @@ public class InsightCliScanTests : IDisposable
         File.WriteAllText(Path.Combine(_stubDir, "stub-oneshot.json"), envelope);
 
         // %~dp0 = the .cmd's own directory (not the process workdir, which is a throwaway temp dir),
-        // the same self-locating technique ClaudeCodeExecutorTests' stub uses.
+        // the same self-locating technique ClaudeCodeExecutorTests' stub uses. `more > file` captures
+        // the piped stdin (the prompt) so the test can assert it arrived — the whole point of the
+        // stdin fix (a multi-line prompt passed as a cmd.exe arg was truncated at its first newline).
         File.WriteAllText(
             Path.Combine(_stubDir, "stub-claude.cmd"),
-            "@echo off\r\ntype \"%~dp0stub-oneshot.json\"\r\n");
+            "@echo off\r\nmore > \"%~dp0stdin-capture.txt\"\r\ntype \"%~dp0stub-oneshot.json\"\r\n");
     }
 
     public void Dispose()
@@ -67,11 +69,15 @@ public class InsightCliScanTests : IDisposable
         // A claude-cli provider with no baseUrl — the path that used to 400 — now routes to the CLI
         // completer, spawns the stub, and parses its findings JSON.
         var result = await analyzer.AnalyzeAsync(new InsightLlmScanRequest(
-            Provider: "claude-cli", Model: "", BaseUrl: "", ApiKey: "", ContextText: "some run history"));
+            Provider: "claude-cli", Model: "", BaseUrl: "", ApiKey: "", ContextText: "distinctive-context-marker-42"));
 
         Assert.Single(result.Findings);
         Assert.Equal("Prefer repository abstraction", result.Findings[0].Title);
         Assert.Equal(FindingKind.KnowledgeGuideline, result.Findings[0].Kind);
         Assert.NotNull(result.RawCliOutput); // the verbatim model response is carried back for the UI
+
+        // The full context reached the CLI via stdin (not a truncated cmd.exe arg).
+        var capturedStdin = await File.ReadAllTextAsync(Path.Combine(_stubDir, "stdin-capture.txt"));
+        Assert.Contains("distinctive-context-marker-42", capturedStdin);
     }
 }

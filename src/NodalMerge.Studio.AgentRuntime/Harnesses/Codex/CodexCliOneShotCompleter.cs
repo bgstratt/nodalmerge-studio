@@ -11,14 +11,20 @@ internal sealed class CodexCliOneShotCompleter(CodexCliExecutorOptions options) 
 {
     public string ProviderKey => "codex-cli";
 
+    // Short single-line positional prompt safe through cmd.exe; the full prompt (system + context +
+    // JSON instruction) is piped to stdin (codex exec reads stdin as input) so nothing multi-line
+    // hits the command line — same fix as the claude completer.
+    private const string QueryArg =
+        "Analyze the data provided on standard input and respond with ONLY the JSON object it specifies — no prose, no code fences.";
+
     public async Task<string> CompleteAsync(OneShotCliRequest request, CancellationToken ct = default)
     {
-        var prompt = string.IsNullOrWhiteSpace(request.SystemPrompt)
+        var stdin = string.IsNullOrWhiteSpace(request.SystemPrompt)
             ? request.UserPrompt
             : request.SystemPrompt + "\n\n" + request.UserPrompt;
 
-        // codex has no system-prompt flag; the whole prompt goes positionally, last (verified arg
-        // ordering). --skip-git-repo-check because the throwaway temp workdir isn't a git repo.
+        // --skip-git-repo-check because the throwaway temp workdir isn't a git repo. Positional prompt
+        // goes last (verified arg ordering).
         var args = new List<string>
         {
             "exec", "--json", "--skip-git-repo-check", "-s", options.SandboxMode,
@@ -28,12 +34,12 @@ internal sealed class CodexCliOneShotCompleter(CodexCliExecutorOptions options) 
             args.Add("-m");
             args.Add(request.Model);
         }
-        args.Add(prompt);
+        args.Add(QueryArg);
 
         (string, string)? env = string.IsNullOrEmpty(request.ApiKey) ? null : ("OPENAI_API_KEY", request.ApiKey);
 
         var stdout = await CliProcessRunner.RunCaptureStdoutAsync(
-            options.ExecutablePath, args, env, options.TimeoutSeconds, closeStdin: true, ct).ConfigureAwait(false);
+            options.ExecutablePath, args, env, options.TimeoutSeconds, stdinText: stdin, ct).ConfigureAwait(false);
 
         // Scan the JSONL event stream for the last agent_message text — the final model answer.
         string? lastAgentText = null;

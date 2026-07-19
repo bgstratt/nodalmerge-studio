@@ -11,13 +11,19 @@ internal sealed class ClaudeCliOneShotCompleter(ClaudeCodeExecutorOptions option
 {
     public string ProviderKey => "claude-cli";
 
+    // The full prompt (system + context + JSON instruction) is piped to stdin — the idiomatic
+    // `<data> | claude -p "<query>"` shape — so nothing multi-line ever hits the command line. The
+    // -p query is a single short line safe through cmd.exe.
+    private const string QueryArg =
+        "Analyze the data provided on standard input and respond with ONLY the JSON object it specifies — no prose, no code fences.";
+
     public async Task<string> CompleteAsync(OneShotCliRequest request, CancellationToken ct = default)
     {
-        var prompt = string.IsNullOrWhiteSpace(request.SystemPrompt)
+        var stdin = string.IsNullOrWhiteSpace(request.SystemPrompt)
             ? request.UserPrompt
             : request.SystemPrompt + "\n\n" + request.UserPrompt;
 
-        var args = new List<string> { "-p", prompt, "--output-format", "json" };
+        var args = new List<string> { "-p", QueryArg, "--output-format", "json" };
         if (!string.IsNullOrWhiteSpace(request.Model))
         {
             args.Add("--model");
@@ -29,7 +35,7 @@ internal sealed class ClaudeCliOneShotCompleter(ClaudeCodeExecutorOptions option
         (string, string)? env = string.IsNullOrEmpty(request.ApiKey) ? null : ("ANTHROPIC_API_KEY", request.ApiKey);
 
         var stdout = await CliProcessRunner.RunCaptureStdoutAsync(
-            options.ExecutablePath, args, env, options.TimeoutSeconds, closeStdin: false, ct).ConfigureAwait(false);
+            options.ExecutablePath, args, env, options.TimeoutSeconds, stdinText: stdin, ct).ConfigureAwait(false);
 
         // claude --output-format json → {"type":"result","result":"<final text>", ...}. Unwrap
         // .result; if the output isn't that envelope (a different CLI version), fall back to raw stdout

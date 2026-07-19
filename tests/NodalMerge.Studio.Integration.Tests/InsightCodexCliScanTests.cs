@@ -32,9 +32,10 @@ public class InsightCodexCliScanTests : IDisposable
             """{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}""");
         File.WriteAllText(Path.Combine(_stubDir, "stub-events.jsonl"), jsonl);
 
+        // `more > file` captures the piped stdin (the prompt) so the test can assert it arrived.
         File.WriteAllText(
             Path.Combine(_stubDir, "stub-codex.cmd"),
-            "@echo off\r\ntype \"%~dp0stub-events.jsonl\"\r\n");
+            "@echo off\r\nmore > \"%~dp0stdin-capture.txt\"\r\ntype \"%~dp0stub-events.jsonl\"\r\n");
     }
 
     public void Dispose()
@@ -61,11 +62,15 @@ public class InsightCodexCliScanTests : IDisposable
         var analyzer = app.Services.GetRequiredService<IInsightLlmAnalyzerService>();
 
         var result = await analyzer.AnalyzeAsync(new InsightLlmScanRequest(
-            Provider: "codex-cli", Model: "", BaseUrl: "", ApiKey: "", ContextText: "some run history"));
+            Provider: "codex-cli", Model: "", BaseUrl: "", ApiKey: "", ContextText: "distinctive-context-marker-99"));
 
         Assert.Single(result.Findings);
         Assert.Equal("Codex rule", result.Findings[0].Title);
         Assert.Equal(FindingKind.KnowledgeGuideline, result.Findings[0].Kind);
         Assert.NotNull(result.RawCliOutput);
+
+        // The full context reached the CLI via stdin (not a truncated cmd.exe arg).
+        var capturedStdin = await File.ReadAllTextAsync(Path.Combine(_stubDir, "stdin-capture.txt"));
+        Assert.Contains("distinctive-context-marker-99", capturedStdin);
     }
 }
