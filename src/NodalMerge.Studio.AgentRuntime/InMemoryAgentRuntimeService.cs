@@ -1363,6 +1363,12 @@ public static class ServiceCollectionExtensions
         // why the real binary must never run in automated tests.
         services.AddSingleton(new CodexCliExecutorOptions());
         services.AddSingleton<IHarnessExecutor, CodexCliExecutor>();
+        // Route B (plans/organizational-knowledge-and-workgroup-scope.md) — one-shot CLI completers so
+        // a claude-cli/codex-cli Model Profile can run the insight LLM scan (InsightLlmAnalyzerService
+        // picks by ProviderKey). Reuse the same executor options (ExecutablePath/Timeout), so a
+        // stub-CLI test overrides the same knob.
+        services.AddSingleton<IOneShotCliCompleter, ClaudeCliOneShotCompleter>();
+        services.AddSingleton<IOneShotCliCompleter, CodexCliOneShotCompleter>();
         // Phase C.4 (phase-c-implementation.md C3) — the /mcp-harness bearer-token map. Singleton,
         // in-memory only; see HarnessMcpTokenService's own doc comment for the restart/resume story.
         services.AddSingleton<IHarnessMcpTokenService, HarnessMcpTokenService>();

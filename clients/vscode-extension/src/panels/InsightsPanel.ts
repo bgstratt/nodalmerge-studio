@@ -360,18 +360,9 @@ export class InsightsPanel {
         const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl);
         throw new Error(`Selected profile isn't ready — ${reason}.`);
       }
-      // CLI profiles (claude-cli / codex-cli) resolve with an empty baseUrl — they map to a local
-      // binary executor, not an HTTP endpoint. The insight LLM scan is an OpenAI-style HTTP call, so
-      // it can't drive a CLI harness. Explain instead of letting the server 400 on "baseUrl required".
-      if (!cfg.baseUrl || !cfg.baseUrl.trim()) {
-        void vscode.window.showWarningMessage(
-          'NodalMerge: the LLM scan needs an API model profile (OpenAI / Anthropic / vscode-lm). '
-          + 'A CLI profile like claude-cli can\'t run it — use "Detect Findings" for free deterministic '
-          + 'analysis, or add an API model profile in Model & Agent Studio.',
-        );
-        void this.panel.webview.postMessage({ type: 'insightsLlmScanDone' });
-        return;
-      }
+      // CLI profiles (claude-cli / codex-cli) resolve with an empty baseUrl — Route B teaches the
+      // scan to drive them via a one-shot CLI completer server-side, so they no longer need an HTTP
+      // baseUrl. cfg carries provider/model/apiKey; the server routes by provider.
       await this.post('/studio/insights/llm-scan', cfg);
       await this.sendFindings();
     } catch (err) {

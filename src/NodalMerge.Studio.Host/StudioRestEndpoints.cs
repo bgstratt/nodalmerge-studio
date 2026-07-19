@@ -5565,13 +5565,15 @@ public static class StudioRestEndpoints
             IFindingService findings,
             CancellationToken ct) =>
         {
-            // Model and apiKey are deliberately not required here — a vscode-lm-resolved profile
-            // (AgentConfigService.resolveSpawnLlmConfig) legitimately sends both blank, since the
-            // local LM proxy resolves the actual model and needs no real key. Same tolerance every
-            // other spawn path in this system already has for that provider.
-            if (string.IsNullOrWhiteSpace(body.Provider) || string.IsNullOrWhiteSpace(body.BaseUrl))
+            // Only Provider is required. Model/apiKey are optional (a vscode-lm profile sends both
+            // blank — the local LM proxy resolves them). BaseUrl is intentionally NOT required: Route B
+            // (plans/organizational-knowledge-and-workgroup-scope.md) lets a claude-cli/codex-cli
+            // profile run the scan, and those resolve with an empty baseUrl (a local binary, not an
+            // HTTP endpoint). InsightLlmAnalyzerService routes by provider — CLI providers to a
+            // one-shot CLI completer, HTTP providers to LlmClient (which needs the baseUrl).
+            if (string.IsNullOrWhiteSpace(body.Provider))
             {
-                return Results.BadRequest(new { error = "provider and baseUrl are required." });
+                return Results.BadRequest(new { error = "provider is required." });
             }
 
             var contextText = await projections.BuildInsightScanContextAsync(ct).ConfigureAwait(false);
