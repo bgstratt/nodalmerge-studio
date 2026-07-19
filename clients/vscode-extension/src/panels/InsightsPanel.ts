@@ -206,8 +206,15 @@ export class InsightsPanel {
       }
       case 'insightsDetectFindings': {
         try {
-          await this.post('/studio/insights/detect-findings', {});
+          const created = await this.post<Finding[]>('/studio/insights/detect-findings', {});
           await this.sendFindings();
+          void vscode.window.showInformationMessage(
+            created.length > 0
+              ? `NodalMerge: detected ${created.length} finding(s) — see the Findings list.`
+              : 'NodalMerge: no new findings. Deterministic detection needs more run history to spot patterns '
+                + '(e.g. ≥5 decided experiment forks, ≥5 rejected proposals, or co-modification patterns). '
+                + 'Keep running goals, or try Run LLM Scan with an API model profile.',
+          );
         } catch (err) {
           void vscode.window.showErrorMessage('NodalMerge: Detect Findings failed — ' + String(err));
         }
@@ -352,6 +359,18 @@ export class InsightsPanel {
       if (!cfg) {
         const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl);
         throw new Error(`Selected profile isn't ready — ${reason}.`);
+      }
+      // CLI profiles (claude-cli / codex-cli) resolve with an empty baseUrl — they map to a local
+      // binary executor, not an HTTP endpoint. The insight LLM scan is an OpenAI-style HTTP call, so
+      // it can't drive a CLI harness. Explain instead of letting the server 400 on "baseUrl required".
+      if (!cfg.baseUrl || !cfg.baseUrl.trim()) {
+        void vscode.window.showWarningMessage(
+          'NodalMerge: the LLM scan needs an API model profile (OpenAI / Anthropic / vscode-lm). '
+          + 'A CLI profile like claude-cli can\'t run it — use "Detect Findings" for free deterministic '
+          + 'analysis, or add an API model profile in Model & Agent Studio.',
+        );
+        void this.panel.webview.postMessage({ type: 'insightsLlmScanDone' });
+        return;
       }
       await this.post('/studio/insights/llm-scan', cfg);
       await this.sendFindings();
