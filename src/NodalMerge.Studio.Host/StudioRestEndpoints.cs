@@ -3739,9 +3739,102 @@ public static class StudioRestEndpoints
 
             return Results.Ok(created);
         });
+
+        // Phase 1 follow-up (organizational-knowledge-and-workgroup-scope.md §8) — the Constraints tab's
+        // "Proposed by observers & agents" section: work-unit-owned Constraint artifacts (recorded by
+        // domain observers or agents via nm_v1_artifact_record) that are lineage-scoped and so never
+        // surface on the global Constraints list. Each is flagged `promoted` if a global constraint
+        // already links back to it (ArtifactRef.PromotedFromArtifactId), so the UI can badge it instead
+        // of re-offering promotion. Invalidated / cascade-flagged sources are excluded.
+        app.MapGet("/studio/constraints/proposed", async (
+            IArtifactLineageService artifacts,
+            CancellationToken ct) =>
+        {
+            var globals = await artifacts.GetGlobalConstraintsAsync(ct).ConfigureAwait(false);
+            var promotedFrom = globals
+                .Where(g => g.PromotedFromArtifactId is not null)
+                .Select(g => g.PromotedFromArtifactId!)
+                .ToHashSet(StringComparer.Ordinal);
+
+            var all = await artifacts.GetByTypeAsync(ArtifactType.Constraint, ct).ConfigureAwait(false);
+            var proposed = all
+                .Where(c => c.OwnedByWorkUnitId is not null
+                    && c.Status != ArtifactStatus.Invalidated
+                    && c.InvalidatedByArtifactId is null)
+                .Select(c => new
+                {
+                    artifactId = c.ArtifactId,
+                    title = c.Title,
+                    body = c.Body,
+                    workUnitId = c.OwnedByWorkUnitId,
+                    repositoryId = c.RepositoryId,
+                    appliesToAllRepos = string.IsNullOrEmpty(c.RepositoryId),
+                    promoted = promotedFrom.Contains(c.ArtifactId),
+                })
+                .ToList();
+            return Results.Ok(proposed);
+        });
+
+        // Promote a lineage (work-unit-owned) constraint to a global one — the human governance gate that
+        // lets a genuinely reusable domain-observer/agent finding become shared policy without retyping.
+        // Creates a global (null-owner) copy stamped with PromotedFromArtifactId for provenance/dedupe;
+        // the source lineage constraint is left untouched (it still steers its own goal's descendants).
+        // Default scope mirrors finding promotion: Workgroup reach + the source's own repo (repoSpecific,
+        // default true); pass repoSpecific=false for all-repos, or reach=Private for a local-only copy.
+        // Widening a repo-scoped promotion to all repos afterwards is Elevate's job, not a re-promote.
+        // Idempotent: if this source was already promoted, returns that existing global unchanged.
+        app.MapPost("/studio/constraints/{artifactId}/promote", async (
+            string artifactId,
+            PromoteConstraintBody? body,
+            IArtifactLineageService artifacts,
+            CancellationToken ct) =>
+        {
+            var source = await artifacts.GetAsync(artifactId, ct).ConfigureAwait(false);
+            if (source is null)
+                return Results.NotFound(new { error = $"Artifact '{artifactId}' was not found." });
+            if (source.Type != ArtifactType.Constraint)
+                return Results.BadRequest(new { error = "Only Constraint artifacts can be promoted." });
+            if (source.OwnedByWorkUnitId is null)
+                return Results.BadRequest(new { error = "Artifact is already a global constraint." });
+
+            // Dedupe: one promotion per source. Re-promoting at a wider scope is Elevate, not this.
+            var globals = await artifacts.GetGlobalConstraintsAsync(ct).ConfigureAwait(false);
+            var already = globals.FirstOrDefault(g =>
+                string.Equals(g.PromotedFromArtifactId, artifactId, StringComparison.Ordinal));
+            if (already is not null)
+                return Results.Ok(already);
+
+            var reach = string.Equals(body?.Reach, "Private", StringComparison.OrdinalIgnoreCase)
+                ? ArtifactReach.Private
+                : ArtifactReach.Workgroup;
+            // repoSpecific (default true) pins it to the repo the observed work unit belonged to — the
+            // constraint is about that repo. A source with no resolvable repo falls back to all-repos.
+            var repoSpecific = body?.RepoSpecific ?? true;
+            var repositoryId = repoSpecific ? source.RepositoryId : null;
+
+            var created = await artifacts.RecordAsync(new ArtifactRef(
+                ArtifactId: $"constraint-{Guid.NewGuid():N}",
+                Type: ArtifactType.Constraint,
+                ParentArtifactId: null,
+                Status: ArtifactStatus.Approved,
+                CreatedAt: DateTimeOffset.UtcNow,
+                OwnedByWorkUnitId: null,
+                OwnedByAgentId: null,
+                Title: source.Title,
+                Body: source.Body,
+                RepositoryId: repositoryId,
+                Reach: reach,
+                PromotedFromArtifactId: artifactId), ct).ConfigureAwait(false);
+
+            return Results.Ok(created);
+        });
     }
 
     private sealed record ToggleConstraintBody(bool Disabled);
+
+    // Promote a lineage constraint to global (Phase 1 follow-up). Reach: "Workgroup" (default) | "Private".
+    // RepoSpecific: true (default) = pin to the source's repo; false = all repos.
+    private sealed record PromoteConstraintBody(string? Reach = "Workgroup", bool RepoSpecific = true);
 
     // Manual-add constraint (Phase 3). Reach: "Private" | "Workgroup" (default Workgroup). RepoSpecific:
     // true = applies only to the workspace's repo; false = all repos.

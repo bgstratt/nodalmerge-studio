@@ -306,16 +306,29 @@ filter + per-peer toggle.
 | **Manual add** (`POST /studio/constraints`) | null (global) | chosen (Private/Workgroup) | ✅ yes |
 | **Elevate** (`POST /studio/artifacts/{id}/elevate`) | unchanged | → Workgroup, all-repos | ✅ (if already global) |
 | `nm_v1_artifact_record` / `POST /studio/artifacts` (agents) | **the work unit** | null (legacy) | ❌ no — lineage-scoped |
-| **Domain observers** (Security/Architecture/…) | **the work unit** | null (legacy) | ❌ no — same path as agents |
+| **Domain observers** (Security/Architecture/…) | **the work unit** | null (legacy) | ❌ no — same path as agents (but **promotable**, below) |
 | `.workspace/decisions/` harvest | **the work unit** | null (legacy) | ❌ no |
 
 **Domain-observer constraints are work-unit-owned by design** — they record via the same
 `ArtifactCommandService.RecordAsync` path every agent uses (`OwnedByWorkUnitId = workUnitId`), so they
 flow via lineage inheritance into descendant work units, not onto the shared-policy tab. This is
 deliberate: the governance model requires a **human** to promote something into shared scope, so an
-observer never writes workgroup policy directly. If an observer's constraint deserves to be durable
-policy, a human adds/promotes it. (Follow-up: a "promote this work-unit constraint to policy" action
-that surfaces work-unit-owned constraints for review — not built.)
+observer never writes workgroup policy directly.
+
+**Promote a lineage constraint to global (SHIPPED).** The bridge that lets a reusable observer/agent
+constraint become shared policy without retyping:
+- `GET /studio/constraints/proposed` — lists work-unit-owned Constraint artifacts (excludes
+  invalidated/cascade-flagged), each flagged `promoted` if a global already links back to it.
+- `POST /studio/constraints/{id}/promote` `{ reach?, repoSpecific? }` — mints a **global copy**
+  (defaults: `Workgroup` reach + the source's own `RepositoryId`; mirrors finding-promotion's opinion),
+  stamped with the new **`ArtifactRef.PromotedFromArtifactId`** provenance field. The source lineage
+  constraint is left untouched (still steers its own goal). **Idempotent** — one promotion per source
+  (re-promote returns the existing global; widening to all-repos afterward is Elevate's job).
+  `ParentArtifactId` stays null on the copy so no invalidation cascade couples it to the source;
+  provenance rides on `PromotedFromArtifactId` instead.
+- **UI**: a "Proposed by observers & agents" section on the Insights **Constraints** sub-tab — one-click
+  **Promote** per card; promoted sources badge "promoted" instead. Tests:
+  `ConstraintEndpointsTests.Proposed_lineage_constraint_promotes_to_a_global_and_is_idempotent`.
 
 **Manual add — the process (`POST /studio/constraints`).** The one path that creates a global
 constraint at an arbitrary scope (promotion always makes Workgroup; this gives the full 2×2):

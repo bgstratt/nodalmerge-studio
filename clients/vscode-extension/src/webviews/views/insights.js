@@ -68,7 +68,9 @@ export function init(ctx) {
       $('in-pane-constraints').style.display = name === 'constraints' ? '' : 'none';
       if (name === 'constraints') {
         $('in-constraints-list').innerHTML = '<p class="in-empty">Loading&hellip;</p>';
+        $('in-proposed-list').innerHTML = '<p class="in-empty">Loading&hellip;</p>';
         vscode.postMessage({ type: 'insightsLoadConstraints' });
+        vscode.postMessage({ type: 'insightsLoadProposedConstraints' });
       }
     });
   });
@@ -278,6 +280,39 @@ export function init(ctx) {
     }).join('');
   }
 
+  // ── Proposed (lineage) constraints — promote to global ──────────────────────
+  function renderProposed(list) {
+    if (!list || !list.length) {
+      return '<p class="in-empty">No proposed constraints. Domain observers and agents record these against a work unit when they spot a gap — enable observers or run goals to see them here.</p>';
+    }
+    return list.map(function(c) {
+      var scopeBadge = '<span class="in-finding-badge">' + (c.appliesToAllRepos ? 'all repos' : 'this repo') + '</span>';
+      var action = c.promoted
+        ? '<span class="in-finding-badge">promoted</span>'
+        : '<div class="in-proposed-actions"><button class="in-proposed-promote" data-proposed-id="' + esc(c.artifactId) + '">Promote</button></div>';
+      var wu = c.workUnitId ? '<span class="in-finding-badge">' + esc(c.workUnitId) + '</span>' : '';
+      return '' +
+        '<div class="in-proposed-card" data-proposed-id="' + esc(c.artifactId) + '">' +
+          '<div class="in-proposed-main">' +
+            '<div class="in-proposed-title">' + esc(c.title || c.artifactId) + '</div>' +
+            (c.body ? '<div class="in-proposed-body">' + esc(c.body) + '</div>' : '') +
+            '<div class="in-proposed-badges">' + scopeBadge + wu + '</div>' +
+          '</div>' +
+          action +
+        '</div>';
+    }).join('');
+  }
+
+  function bindProposedActions() {
+    root.querySelectorAll('.in-proposed-promote').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        btn.disabled = true;
+        btn.textContent = 'Promoting…';
+        vscode.postMessage({ type: 'insightsPromoteConstraint', artifactId: btn.getAttribute('data-proposed-id') });
+      });
+    });
+  }
+
   function bindConstraintToggles() {
     root.querySelectorAll('.in-constraint-toggle').forEach(function(cb) {
       cb.addEventListener('change', function() {
@@ -359,6 +394,15 @@ export function init(ctx) {
     }
     if (msg.type === 'insightsConstraintsError') {
       $('in-constraints-list').innerHTML = '<p class="in-error">Could not load constraints — ' + esc(msg.message) + '</p>';
+      return;
+    }
+    if (msg.type === 'insightsProposedList') {
+      $('in-proposed-list').innerHTML = renderProposed(msg.proposed || []);
+      bindProposedActions();
+      return;
+    }
+    if (msg.type === 'insightsProposedError') {
+      $('in-proposed-list').innerHTML = '<p class="in-error">Could not load proposed constraints — ' + esc(msg.message) + '</p>';
       return;
     }
   });

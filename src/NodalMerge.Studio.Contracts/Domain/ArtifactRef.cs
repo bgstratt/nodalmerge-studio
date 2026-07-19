@@ -84,7 +84,15 @@ public sealed record ArtifactRef(
     // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — the reach half of the scope
     // model (see ArtifactReach). Null = legacy routing (route by RepositoryId alone); non-null opts
     // into (Reach x RepositoryId) routing. See ArtifactLineageService.RecordAsync.
-    ArtifactReach? Reach = null)
+    ArtifactReach? Reach = null,
+    // Phase 1 follow-up (organizational-knowledge-and-workgroup-scope.md §8) — provenance for a global
+    // constraint promoted from a work-unit-owned (lineage) one: the source artifact's id. Set only on
+    // the promoted global copy; null everywhere else (manual adds, promoted findings, the lineage
+    // source itself). Distinct from ParentArtifactId (which stays null on globals so no invalidation
+    // cascade couples the promotion to the source): this is a pure back-reference used to (a) show
+    // where a policy came from and (b) dedupe — a source is "already promoted" iff some global's
+    // PromotedFromArtifactId equals it. Additive/nullable = zero migration, same as Reach above.
+    string? PromotedFromArtifactId = null)
 {
     public IReadOnlyList<string> Supersedes { get; init; } = Supersedes ?? [];
 }

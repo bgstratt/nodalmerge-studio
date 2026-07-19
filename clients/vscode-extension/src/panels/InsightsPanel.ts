@@ -114,6 +114,19 @@ interface ConstraintView {
   enabled: boolean;
 }
 
+// A row of GET /studio/constraints/proposed — a work-unit-owned (lineage) constraint a domain observer
+// or agent recorded, eligible for human promotion to a shared global one. `promoted` is true once a
+// global constraint links back to it (so the UI badges it instead of re-offering the Promote button).
+interface ProposedConstraintView {
+  artifactId: string;
+  title?: string | null;
+  body?: string | null;
+  workUnitId?: string | null;
+  repositoryId?: string | null;
+  appliesToAllRepos: boolean;
+  promoted: boolean;
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 // Analytics dashboard + Knowledge Promotion review queue for the DAG's run history. Three
@@ -253,6 +266,22 @@ export class InsightsPanel {
         await this.sendConstraints();
         return;
       }
+      case 'insightsLoadProposedConstraints': {
+        await this.sendProposedConstraints();
+        return;
+      }
+      case 'insightsPromoteConstraint': {
+        try {
+          await this.post(`/studio/constraints/${encodeURIComponent(msg.artifactId as string)}/promote`, {});
+          // A promotion mints a global and marks the source promoted — refresh both lists.
+          await this.sendConstraints();
+          await this.sendProposedConstraints();
+          void vscode.window.showInformationMessage('NodalMerge: constraint promoted to a shared (global) policy.');
+        } catch (err) {
+          void vscode.window.showErrorMessage('NodalMerge: promoting constraint failed — ' + String(err));
+        }
+        return;
+      }
       case 'insightsToggleConstraint': {
         try {
           await this.post(`/studio/constraints/${encodeURIComponent(msg.artifactId as string)}/toggle`, {
@@ -290,6 +319,15 @@ export class InsightsPanel {
       void this.panel.webview.postMessage({ type: 'insightsConstraintsList', constraints });
     } catch (err) {
       void this.panel.webview.postMessage({ type: 'insightsConstraintsError', message: String(err) });
+    }
+  }
+
+  private async sendProposedConstraints(): Promise<void> {
+    try {
+      const proposed = await this.get<ProposedConstraintView[]>('/studio/constraints/proposed');
+      void this.panel.webview.postMessage({ type: 'insightsProposedList', proposed });
+    } catch (err) {
+      void this.panel.webview.postMessage({ type: 'insightsProposedError', message: String(err) });
     }
   }
 
@@ -500,6 +538,13 @@ const IN_CSS = `
   .in-add-scope { display: flex; gap: 14px; flex-wrap: wrap; font-size: 0.82em; align-items: center; }
   .in-add-scope label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
   #in-nc-add { align-self: flex-start; }
+  .in-proposed-card { display: flex; align-items: flex-start; gap: 10px; border: 1px solid var(--nm-border); border-radius: 4px; padding: 8px 12px; margin-bottom: 6px; }
+  .in-proposed-main { flex: 1; min-width: 0; }
+  .in-proposed-title { font-weight: 600; }
+  .in-proposed-body { font-size: 0.85em; opacity: 0.85; margin-top: 3px; white-space: pre-wrap; }
+  .in-proposed-badges { display: flex; gap: 6px; margin-top: 5px; flex-wrap: wrap; align-items: center; }
+  .in-proposed-actions { flex-shrink: 0; }
+  .in-proposed-actions button { font-size: 0.8em; padding: 2px 10px; }
 `;
 
 const IN_HTML = `
@@ -571,6 +616,12 @@ const IN_HTML = `
         </div>
       </details>
       <div id="in-constraints-list"><p class="in-empty">Open this tab to load constraints.</p></div>
+    </div>
+
+    <div class="in-section">
+      <h3>Proposed by observers &amp; agents</h3>
+      <p class="in-section-note">Constraints a domain observer or agent recorded against a work unit. They steer that goal's own agents but stay local to its lineage — promote one to make it a shared policy (defaults to Workgroup reach, scoped to the source's repository; widen or turn it off afterward from the list above).</p>
+      <div id="in-proposed-list"><p class="in-empty">Open this tab to load proposed constraints.</p></div>
     </div>
   </div>
 `;
