@@ -56,4 +56,35 @@ public class ConstraintEndpointsTests
         var row3 = list3.EnumerateArray().Single(e => e.GetProperty("artifactId").GetString() == "c-view");
         Assert.True(row3.GetProperty("enabled").GetBoolean());
     }
+
+    [Fact]
+    public async Task Manually_added_constraint_is_global_and_surfaces_on_the_tab()
+    {
+        await using var app = StudioWebApplication.Build(
+            [], configureWebHost: webHost => webHost.UseTestServer(),
+            configureServices: services => services.AddInMemoryStorage());
+        await app.StartAsync();
+        var client = app.GetTestClient();
+
+        // Manually add a Workgroup, all-repos constraint (the 2×2 the promotion path can't express
+        // arbitrarily — this is the missing manual-add-with-scope path).
+        var add = await client.PostAsJsonAsync("/studio/constraints", new
+        {
+            title = "Always run migrations before integration tests",
+            body = "do X before Y",
+            reach = "Workgroup",
+            repoSpecific = false,
+        });
+        add.EnsureSuccessStatusCode();
+        var created = JsonDocument.Parse(await add.Content.ReadAsStringAsync()).RootElement;
+        var id = created.GetProperty("artifactId").GetString();
+
+        // It's a global (null-owner) constraint, so it surfaces on the Constraints tab with its scope.
+        var list = await client.GetFromJsonAsync<JsonElement>("/studio/constraints");
+        var row = list.EnumerateArray().Single(e => e.GetProperty("artifactId").GetString() == id);
+        Assert.Equal("Workgroup", row.GetProperty("reach").GetString());
+        Assert.True(row.GetProperty("appliesToAllRepos").GetBoolean());
+        Assert.True(row.GetProperty("enabled").GetBoolean());
+        Assert.Equal("Always run migrations before integration tests", row.GetProperty("title").GetString());
+    }
 }

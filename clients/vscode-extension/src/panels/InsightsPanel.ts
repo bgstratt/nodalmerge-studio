@@ -264,6 +264,21 @@ export class InsightsPanel {
         }
         return;
       }
+      case 'insightsAddConstraint': {
+        try {
+          await this.post('/studio/constraints', {
+            title: msg.title as string,
+            body: msg.body as string,
+            reach: msg.reach as string,
+            repoSpecific: msg.repoSpecific as boolean,
+          });
+          await this.sendConstraints();
+          void vscode.window.showInformationMessage('NodalMerge: constraint added.');
+        } catch (err) {
+          void vscode.window.showErrorMessage('NodalMerge: adding constraint failed — ' + String(err));
+        }
+        return;
+      }
       default:
         return;
     }
@@ -478,6 +493,13 @@ const IN_CSS = `
   .in-constraint-title { font-weight: 600; }
   .in-constraint-body { font-size: 0.85em; opacity: 0.85; margin-top: 3px; white-space: pre-wrap; }
   .in-constraint-badges { display: flex; gap: 6px; margin-top: 5px; flex-wrap: wrap; }
+  .in-add-constraint { margin: 4px 0 12px; border: 1px solid var(--nm-border); border-radius: 4px; padding: 6px 10px; }
+  .in-add-constraint > summary { cursor: pointer; font-size: 0.85em; opacity: 0.8; }
+  .in-add-form { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+  .in-add-form input[type=text], .in-add-form textarea { width: 100%; box-sizing: border-box; font: inherit; }
+  .in-add-scope { display: flex; gap: 14px; flex-wrap: wrap; font-size: 0.82em; align-items: center; }
+  .in-add-scope label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  #in-nc-add { align-self: flex-start; }
 `;
 
 const IN_HTML = `
@@ -535,6 +557,19 @@ const IN_HTML = `
     <div class="in-section">
       <h3>Constraints applied to your agents</h3>
       <p class="in-section-note">Durable guidance folded into every agent's kickoff prompt. Uncheck one to turn it off for you only — it stays active for every other peer. Grouped by reach (who shares it) and application (which repositories it affects).</p>
+      <details class="in-add-constraint">
+        <summary>+ Add a constraint</summary>
+        <div class="in-add-form">
+          <input id="in-nc-title" type="text" placeholder="Title — e.g. Always run migrations before integration tests">
+          <textarea id="in-nc-body" rows="2" placeholder="The guidance an agent should follow"></textarea>
+          <div class="in-add-scope">
+            <label><input type="radio" name="in-nc-reach" value="Workgroup" checked> Workgroup (shared)</label>
+            <label><input type="radio" name="in-nc-reach" value="Private"> Private (only me)</label>
+            <label><input type="checkbox" id="in-nc-repo"> Only this repository</label>
+          </div>
+          <button id="in-nc-add">Add constraint</button>
+        </div>
+      </details>
       <div id="in-constraints-list"><p class="in-empty">Open this tab to load constraints.</p></div>
     </div>
   </div>

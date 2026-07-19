@@ -3691,9 +3691,61 @@ public static class StudioRestEndpoints
             await toggles.SetDisabledAsync(artifactId, body.Disabled, ct).ConfigureAwait(false);
             return Results.Ok(new { artifactId, disabled = body.Disabled });
         });
+
+        // Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — manually add a constraint at
+        // a chosen scope (the 2x2): reach Private|Workgroup × application this-repo|all-repos. Creates a
+        // global (null-owner) constraint — so it's a first-class shared policy that surfaces on the
+        // Constraints tab and is injected into agents — unlike nm_v1_artifact_record, which makes
+        // work-unit-owned lineage constraints. repoSpecific resolves the workspace's repo id server-side
+        // (the same resolution findings use); the routing (studio/repo/workgroup room) follows Reach ×
+        // RepositoryId exactly as promotion/elevate do.
+        app.MapPost("/studio/constraints", async (
+            AddConstraintBody body,
+            IArtifactLineageService artifacts,
+            IRepositoryRegistryService repositories,
+            WorkspaceOptions workspaceOptions,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.Title) || string.IsNullOrWhiteSpace(body.Body))
+                return Results.BadRequest(new { error = "title and body are required." });
+
+            var reach = string.Equals(body.Reach, "Private", StringComparison.OrdinalIgnoreCase)
+                ? ArtifactReach.Private
+                : ArtifactReach.Workgroup;
+
+            string? repositoryId = null;
+            if (body.RepoSpecific && !string.IsNullOrWhiteSpace(workspaceOptions.SeedRepositoryPath))
+            {
+                try
+                {
+                    var repo = await repositories.RegisterAsync(workspaceOptions.SeedRepositoryPath!, label: null, ct).ConfigureAwait(false);
+                    repositoryId = repo.RepositoryId;
+                }
+                catch { /* unresolvable workspace repo → falls back to all-repos */ }
+            }
+
+            var created = await artifacts.RecordAsync(new ArtifactRef(
+                ArtifactId: $"constraint-{Guid.NewGuid():N}",
+                Type: ArtifactType.Constraint,
+                ParentArtifactId: null,
+                Status: ArtifactStatus.Approved,
+                CreatedAt: DateTimeOffset.UtcNow,
+                OwnedByWorkUnitId: null,
+                OwnedByAgentId: null,
+                Title: body.Title,
+                Body: body.Body,
+                RepositoryId: repositoryId,
+                Reach: reach), ct).ConfigureAwait(false);
+
+            return Results.Ok(created);
+        });
     }
 
     private sealed record ToggleConstraintBody(bool Disabled);
+
+    // Manual-add constraint (Phase 3). Reach: "Private" | "Workgroup" (default Workgroup). RepoSpecific:
+    // true = applies only to the workspace's repo; false = all repos.
+    private sealed record AddConstraintBody(string Title, string Body, string? Reach = "Workgroup", bool RepoSpecific = false);
 
     // ── /studio/projections — Slice 6.5 deferred: projection REST parity ───
 

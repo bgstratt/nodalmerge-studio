@@ -292,3 +292,59 @@ the webview sub-tabs.
 - `src/NodalMerge.Studio.Storage/RuntimeDagPersistenceService.cs` — `DropRoomAsync` per-room eviction (Phase 2).
 - `src/NodalMerge.Studio.Host/StudioRestEndpoints.cs:5364` — elevate-scope + import-to-local endpoints.
 - `clients/vscode-extension/src/panels/InsightsPanel.ts`, `src/webviews/views/insights.js` — scope labels, elevate/import actions, applied-constraints view (follow-up).
+
+## 8. Constraint creation, visibility & manual add — ✅ SHIPPED (2026-07-19)
+
+**How each constraint is created, and whether it surfaces on the Insights "Constraints" tab.** The
+tab is `GET /studio/constraints` → `GetGlobalConstraintsAsync`, which returns **only null-owner
+constraints** (`OwnedByWorkUnitId is null && Type == Constraint`), then applies the repo application
+filter + per-peer toggle.
+
+| Creation path | Owner | Reach | On the tab? |
+|---|---|---|---|
+| **Promote a finding** (`FindingService.PromoteKnowledgeGuidelineAsync`) | null (global) | `Workgroup` | ✅ yes |
+| **Manual add** (`POST /studio/constraints`) | null (global) | chosen (Private/Workgroup) | ✅ yes |
+| **Elevate** (`POST /studio/artifacts/{id}/elevate`) | unchanged | → Workgroup, all-repos | ✅ (if already global) |
+| `nm_v1_artifact_record` / `POST /studio/artifacts` (agents) | **the work unit** | null (legacy) | ❌ no — lineage-scoped |
+| **Domain observers** (Security/Architecture/…) | **the work unit** | null (legacy) | ❌ no — same path as agents |
+| `.workspace/decisions/` harvest | **the work unit** | null (legacy) | ❌ no |
+
+**Domain-observer constraints are work-unit-owned by design** — they record via the same
+`ArtifactCommandService.RecordAsync` path every agent uses (`OwnedByWorkUnitId = workUnitId`), so they
+flow via lineage inheritance into descendant work units, not onto the shared-policy tab. This is
+deliberate: the governance model requires a **human** to promote something into shared scope, so an
+observer never writes workgroup policy directly. If an observer's constraint deserves to be durable
+policy, a human adds/promotes it. (Follow-up: a "promote this work-unit constraint to policy" action
+that surfaces work-unit-owned constraints for review — not built.)
+
+**Manual add — the process (`POST /studio/constraints`).** The one path that creates a global
+constraint at an arbitrary scope (promotion always makes Workgroup; this gives the full 2×2):
+
+```
+POST /studio/constraints
+{ "title": "...", "body": "...", "reach": "Private" | "Workgroup", "repoSpecific": true | false }
+```
+
+- `reach` → `ArtifactReach` (default `Workgroup`). `repoSpecific=true` resolves the workspace's repo id
+  server-side (same resolution findings use) → application = this repo; `false` → all repos.
+- Creates a null-owner `Constraint` (`Status=Approved`) with `Reach` + `RepositoryId`; routing follows
+  Reach × RepositoryId exactly as promotion/elevate do (studio / repo / workgroup room).
+- **UI**: the "+ Add a constraint" form on the Insights **Constraints** sub-tab — title, body, a reach
+  radio (Workgroup/Private) + an "Only this repository" checkbox = the 2×2.
+- No domain-observer contract change was needed; this is a new REST contract + UI only.
+
+## 9. One-shot CLI scan (Route B) & a guardrail for future CLI harnesses
+
+The Insights **Run LLM Scan** works with a `claude-cli`/`codex-cli` profile via a one-shot CLI
+completer (`IOneShotCliCompleter`, `Harnesses/OneShot/`) — the only "single structured completion over
+a CLI transport" in the system (goals use the agentic `IHarnessExecutor`; HTTP uses `LlmClient`). The
+analyzer branches by provider; over CLI it prompts the model to emit the `report_findings` JSON and
+parses it defensively (no forced-tool-call channel exists over CLI). Unparseable output is surfaced to
+the user via the extension's "Open raw output" action.
+
+**Guardrail for any future CLI harness / one-shot path:** pass the prompt on **stdin**, never as a
+command-line argument. `cmd.exe /c` (the Windows launch wrapper) truncates an argument at its first
+newline, so a multi-line prompt reaches the CLI as only its first line (found live — the model got the
+system prompt's first line and asked "where's the data?"). `CliProcessRunner` writes stdin
+concurrently with the stdout read to avoid a pipe-buffer deadlock. The stub-CLI tests capture stdin and
+assert a marker arrived, so this can't silently regress.

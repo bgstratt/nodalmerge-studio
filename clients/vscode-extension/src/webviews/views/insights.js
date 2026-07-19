@@ -219,6 +219,26 @@ export function init(ctx) {
   }
 
   // ── Constraints tab ────────────────────────────────────────────────────────
+  var addConstraintBtn = $('in-nc-add');
+  if (addConstraintBtn) {
+    addConstraintBtn.addEventListener('click', function() {
+      var title = ($('in-nc-title').value || '').trim();
+      var body = ($('in-nc-body').value || '').trim();
+      if (!title || !body) { return; }
+      var reachEl = root.querySelector('input[name="in-nc-reach"]:checked');
+      vscode.postMessage({
+        type: 'insightsAddConstraint',
+        title: title,
+        body: body,
+        reach: reachEl ? reachEl.value : 'Workgroup',
+        repoSpecific: $('in-nc-repo').checked,
+      });
+      $('in-nc-title').value = '';
+      $('in-nc-body').value = '';
+      $('in-nc-repo').checked = false;
+    });
+  }
+
   function constraintGroupLabel(c) {
     var reach = c.reach || 'Legacy';
     if (reach === 'Workgroup') { return c.appliesToAllRepos ? 'Workgroup · all repositories' : 'Workgroup · this repository'; }
