@@ -75,6 +75,22 @@ either its delta or a covering checkpoint must be on disk.
   (checkpoints supersede fast; keep latest + a small recent window). Collapses existing bloat and
   keeps checkpoint count bounded.
 
+## Implementation note — what "delta" actually is (found while writing the regression test)
+
+`PersistPromotedNodeDeltaAsync` persists the **promoted checkpoint node**, whose payload tracks the
+room's **live map (current entities)**, not a single-op delta. Consequences, measured:
+- **Churning one entity** N times keeps the pack ~constant (live map = 1 entry) — this is the fix for
+  the actual 205 MB bug, which was history churn (8k+ op-history nodes × 191 full-DAG snapshots).
+  Locked in by `RoomSnapshotCheckpointTests.Churning_one_entity_does_not_grow_the_persisted_pack_with_history`.
+- **N distinct entities** grow the pack ~linearly with N (~150 B/entry) — this is the working-set size,
+  inherent and bounded, NOT the unbounded-history explosion. Fine for realistic rooms (dozens–hundreds
+  of entities → KB packs → single-digit MB with pruning).
+
+Possible further optimization (only if huge-working-set rooms ever bite): a true per-op delta via
+`RequestServerPack{known_ids: <prior frontier>}` so the pack carries only nodes added since the last
+persist, constant regardless of live-entity count. Deferred — more CRDT-frontier bookkeeping, and the
+current behavior already removes the history-proportional blow-up that motivated this work.
+
 ## Follow-up (separate pass, after the above lands)
 
 **DAG replication content review** — even one checkpoint is 5 MB of metadata for 11 KB of work.
