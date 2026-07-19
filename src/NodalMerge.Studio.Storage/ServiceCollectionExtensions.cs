@@ -272,6 +272,11 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IFindingService>(sp => sp.GetRequiredService<FindingService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<FindingService>());
 
+        // Phase 3 — per-peer local constraint toggle (plans/organizational-knowledge-and-workgroup-scope.md).
+        services.AddSingleton<ConstraintToggleService>();
+        services.AddSingleton<IConstraintToggleService>(sp => sp.GetRequiredService<ConstraintToggleService>());
+        services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<ConstraintToggleService>());
+
         services.AddSingleton<ExecutionEventStreamService>();
         services.AddSingleton<IExecutionEventStream>(sp => sp.GetRequiredService<ExecutionEventStreamService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<ExecutionEventStreamService>());

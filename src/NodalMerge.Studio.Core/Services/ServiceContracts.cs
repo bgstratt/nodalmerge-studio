@@ -1499,6 +1499,19 @@ public interface IArtifactLineageService
         string artifactId, string reason, string? sessionId = null, CancellationToken ct = default);
 }
 
+// Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — per-peer local suppression of
+// constraints. "Turning a constraint off" on the Insights tab records a LOCAL toggle (never
+// replicated) so a shared workgroup/repo constraint stops reaching this peer's agents while staying
+// live for everyone else. Constraint injection subtracts the disabled set.
+public interface IConstraintToggleService
+{
+    // Disable (disabled=true) or re-enable (disabled=false) a constraint by ArtifactId for this peer.
+    Task SetDisabledAsync(string artifactId, bool disabled, CancellationToken ct = default);
+
+    // The set of ArtifactIds currently disabled on this peer.
+    Task<IReadOnlySet<string>> GetDisabledIdsAsync(CancellationToken ct = default);
+}
+
 // Slice — Knowledge Promotion. Review lifecycle for Findings detected by either the deterministic
 // or LLM scan (Insights tab). Modeled on IMergeService's Propose/Review shape, simplified since
 // there's no build/apply step — promotion's durable effect happens inside ReviewAsync itself.

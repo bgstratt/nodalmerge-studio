@@ -33,6 +33,7 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly ICoModService? _coMod;
     private readonly IExecutionEventStream? _eventStream;
     private readonly IGoalNodeService? _goals;
+    private readonly IConstraintToggleService? _constraintToggles;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
@@ -55,7 +56,8 @@ public sealed class ProjectionManager : IProjectionManager
         WorkspaceOptions? workspaceOptions = null,
         ICoModService? coMod = null,
         IExecutionEventStream? eventStream = null,
-        IGoalNodeService? goalNodes = null)
+        IGoalNodeService? goalNodes = null,
+        IConstraintToggleService? constraintToggles = null)
     {
         _workUnits          = workUnits;
         _tasks              = tasks;
@@ -78,6 +80,7 @@ public sealed class ProjectionManager : IProjectionManager
         _coMod              = coMod;
         _eventStream        = eventStream;
         _goals              = goalNodes;
+        _constraintToggles  = constraintToggles;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -362,6 +365,16 @@ public sealed class ProjectionManager : IProjectionManager
         var inheritedConstraints = globalConstraints
             .Concat(ancestorChain.Where(a => a.Type == ArtifactType.Constraint))
             .ToList();
+
+        // Phase 3 — subtract this peer's locally-disabled constraints (the Insights "turn off" toggle).
+        // Local suppression only: the constraint stays live for every other peer; it just stops
+        // reaching this peer's agents.
+        if (_constraintToggles is not null)
+        {
+            var disabled = await _constraintToggles.GetDisabledIdsAsync(ct).ConfigureAwait(false);
+            if (disabled.Count > 0)
+                inheritedConstraints = inheritedConstraints.Where(c => !disabled.Contains(c.ArtifactId)).ToList();
+        }
 
         // ── Slice 16l — attach latest execution result ───────────────────────
         WorkspaceExecutionSummary? execution = null;

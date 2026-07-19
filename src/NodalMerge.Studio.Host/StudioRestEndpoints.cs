@@ -3652,7 +3652,48 @@ public static class StudioRestEndpoints
                 ? Results.NotFound(new { error = $"Artifact '{artifactId}' was not found." })
                 : Results.Ok(elevated);
         });
+
+        // Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — the Insights "Constraints"
+        // sub-tab: every constraint applicable to the given repo (or all, if omitted), each labeled with
+        // its reach (Private/Workgroup) and application (this repo / all repos) plus whether it's enabled
+        // on THIS peer. `enabled=false` means the local toggle has suppressed it here.
+        app.MapGet("/studio/constraints", async (
+            [FromQuery] string? repositoryId,
+            IArtifactLineageService artifacts,
+            IConstraintToggleService toggles,
+            CancellationToken ct) =>
+        {
+            var all = await artifacts.GetGlobalConstraintsAsync(ct).ConfigureAwait(false);
+            var disabled = await toggles.GetDisabledIdsAsync(ct).ConfigureAwait(false);
+            var applicable = all
+                .Where(c => repositoryId is null || c.RepositoryId is null || c.RepositoryId == repositoryId)
+                .Select(c => new
+                {
+                    artifactId = c.ArtifactId,
+                    title = c.Title,
+                    body = c.Body,
+                    reach = c.Reach?.ToString(),
+                    repositoryId = c.RepositoryId,
+                    appliesToAllRepos = c.RepositoryId is null,
+                    enabled = !disabled.Contains(c.ArtifactId),
+                })
+                .ToList();
+            return Results.Ok(applicable);
+        });
+
+        // Turn a constraint off (disabled=true) or back on (disabled=false) for THIS peer only.
+        app.MapPost("/studio/constraints/{artifactId}/toggle", async (
+            string artifactId,
+            ToggleConstraintBody body,
+            IConstraintToggleService toggles,
+            CancellationToken ct) =>
+        {
+            await toggles.SetDisabledAsync(artifactId, body.Disabled, ct).ConfigureAwait(false);
+            return Results.Ok(new { artifactId, disabled = body.Disabled });
+        });
     }
+
+    private sealed record ToggleConstraintBody(bool Disabled);
 
     // ── /studio/projections — Slice 6.5 deferred: projection REST parity ───
 

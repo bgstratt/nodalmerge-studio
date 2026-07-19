@@ -39,6 +39,10 @@ public static class StudioNodeKind
     public const string ExperimentV1         = "studio/experiment/v1";
     public const string SteeringDecisionV1   = "studio/steering-decision/v1";
     public const string FindingV1            = "studio/finding/v1";
+    // Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — a peer-LOCAL suppression of a
+    // constraint by ArtifactId. Deliberately NOT in RepoScopedKinds/WorkgroupScopedKinds: it lives in
+    // the peer-private "studio" room so turning a shared constraint off affects only this peer.
+    public const string ConstraintToggleV1   = "studio/constraint-toggle/v1";
     public const string ConversationLogV1    = "studio/conversation-log/v1";
     // L2.3 (plans/room-persistence-bloat.md) — repo-scoped reference to a peer-visible reasoning
     // transcript. The bounded transcript body lives in the CAS (pulled on demand); this node carries
