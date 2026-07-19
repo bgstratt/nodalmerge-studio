@@ -16,10 +16,18 @@
 
   <ItemGroup Condition="'$(NodalMergeUseNuGetPackages)' == 'true'">
     <PackageReference Include="NodalMerge.Host.Abstractions" />
+    <!-- Slice 6.1a — NodalMergeStudioNodeStore rides RuntimeDagPersistenceService/IRuntimeCommandBridge
+         directly instead of only INodeStoreProvider. -->
+    <PackageReference Include="NodalMerge.DotNetHost" />
+    <!-- Phase 5 slice 5.2 — FileBlobGcCoordinator/FileBlobGcPolicy for the staged local sweep
+         (BlobGcService). -->
+    <PackageReference Include="NodalMerge.Host.Composition" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(NodalMergeUseNuGetPackages)' != 'true' AND Exists('$(NodalMergeDotNetHostProject)')">
-    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\..\nodalmerge\nodalmerge-host\src\NodalMerge.Host.Abstractions\NodalMerge.Host.Abstractions.csproj" />
+    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\..\nodalmerge\hosts\dotnet\src\NodalMerge.Host.Abstractions\NodalMerge.Host.Abstractions.csproj" />
+    <ProjectReference Include="$(NodalMergeDotNetHostProject)" />
+    <ProjectReference Include="$(MSBuildThisFileDirectory)..\..\..\nodalmerge\hosts\dotnet\src\NodalMerge.Host.Composition\NodalMerge.Host.Composition.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -27,6 +27,7 @@ internal sealed class HarnessHarvestPipeline(
     IFileWorkspaceService fileWorkspace,
     IArtifactCommandService artifactCommands,
     IMergeService merge,
+    IMergeDiffResolver diffResolver,
     ILogger<HarnessHarvestPipeline> logger,
     IExecutionEventStream? events = null)
 {
@@ -267,6 +268,7 @@ internal sealed class HarnessHarvestPipeline(
                 $"Review-mode run has no reviewable proposal (TaskId='{request.TaskId}').");
         }
 
+        var diff = await diffResolver.ResolveAsync(proposal, ct).ConfigureAwait(false);
         var reviewRequestJson = JsonSerializer.Serialize(new
         {
             proposalId = proposal.ProposalId,
@@ -278,7 +280,7 @@ internal sealed class HarnessHarvestPipeline(
             noFileChangesJustification = proposal.NoFileChangesJustification,
             sourceBranch = proposal.SourceBranch,
             targetBranch = proposal.TargetBranch,
-            diff = proposal.WorkspaceChanges,
+            diff,
         }, PlanJsonOpts);
         await fileWorkspace.WriteAsync(branchId, ReviewRequestFilePath, reviewRequestJson, ct).ConfigureAwait(false);
         return null;

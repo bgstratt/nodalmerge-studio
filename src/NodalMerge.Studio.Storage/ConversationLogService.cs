@@ -16,17 +16,30 @@ public sealed class ConversationLogService : IConversationLogService, IRehydrata
     // workUnitId -> ordered list of logIds
     private readonly ConcurrentDictionary<string, List<string>> _byWorkUnit = new();
     private readonly Lock _indexLock = new();
-    private readonly IStudioNodeStore _nodeStore;
+    private readonly IStudioLocalLogStore _localLog;
 
-    public ConversationLogService(IStudioNodeStore nodeStore)
+    // L2.1 — persists to the studio-owned local append log, not the CRDT room; this is peer-local
+    // reasoning history, off the sync graph. L2.3 publishes a bounded, shareable slice of it to the
+    // CAS content plane referenced by a repo-scoped ConversationRef.
+    public ConversationLogService(IStudioLocalLogStore localLog)
     {
-        _nodeStore = nodeStore;
+        _localLog = localLog;
     }
 
     public async Task<ConversationLogEntry> RecordAsync(ConversationLogEntry entry, CancellationToken ct = default)
     {
+        // L2.2 — cap the uncapped reasoning/tool-input fields (tool *results* were already capped
+        // below via Truncate). Bounds the per-cycle node payload; the marker keeps truncation visible.
         var truncatedResults = entry.ToolResults.Select(Truncate).ToList();
-        var stored = entry with { ToolResults = truncatedResults };
+        var truncatedCalls = entry.ToolCalls
+            .Select(c => c with { InputJson = NodePayloadLimits.Cap(c.InputJson) ?? c.InputJson })
+            .ToList();
+        var stored = entry with
+        {
+            AssistantText = NodePayloadLimits.Cap(entry.AssistantText),
+            ToolCalls = truncatedCalls,
+            ToolResults = truncatedResults,
+        };
 
         _entriesById[stored.LogId] = stored;
         lock (_indexLock)
@@ -36,15 +49,16 @@ public sealed class ConversationLogService : IConversationLogService, IRehydrata
             list.Add(stored.LogId);
         }
 
-        await _nodeStore.WriteNodeAsync(
-            StudioNodeKind.ConversationLogV1, stored.LogId, JsonSerializer.Serialize(stored), ct).ConfigureAwait(false);
+        await _localLog.AppendAsync(
+            StudioNodeKind.ConversationLogV1, stored.LogId, JsonSerializer.Serialize(stored), stored.OccurredAt, ct)
+            .ConfigureAwait(false);
 
         return stored;
     }
 
     public async Task RehydrateAsync(CancellationToken ct = default)
     {
-        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.ConversationLogV1, ct).ConfigureAwait(false);
+        var records = await _localLog.ReadAllAsync(StudioNodeKind.ConversationLogV1, ct).ConfigureAwait(false);
         foreach (var (_, payloadJson) in records)
         {
             var entry = JsonSerializer.Deserialize<ConversationLogEntry>(payloadJson);
@@ -70,8 +84,13 @@ public sealed class ConversationLogService : IConversationLogService, IRehydrata
             .Select(id => _entriesById.TryGetValue(id, out var entry) ? entry : null)
             .Where(entry => entry is not null)
             .Cast<ConversationLogEntry>()
-            .OrderBy(entry => entry.CycleNumber)
-            .ThenBy(entry => entry.OccurredAt)
+            // Order by wall-clock, not CycleNumber: cycle numbers reset per agent/process
+            // (orchestrator, planner, re-plan, retry each start at 0), so a CycleNumber-first
+            // sort groups every "cycle 0" together across agents instead of flowing the
+            // conversation in the real order things happened. OccurredAt is the true timeline;
+            // CycleNumber only tie-breaks entries stamped at the same instant.
+            .OrderBy(entry => entry.OccurredAt)
+            .ThenBy(entry => entry.CycleNumber)
             .ToList();
 
         return Task.FromResult<IReadOnlyList<ConversationLogEntry>>(entries);

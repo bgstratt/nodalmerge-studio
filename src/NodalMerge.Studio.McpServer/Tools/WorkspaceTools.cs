@@ -65,7 +65,8 @@ public sealed class WorkspaceTools(
 
         var effectiveBranchId = branchId ?? "main";
         var pending = await repositorySync.SyncBranchFromRepositoryAsync(
-            effectiveBranchId, path, SyncTrigger.ManualRefresh, cancellationToken).ConfigureAwait(false);
+            effectiveBranchId, path, SyncTrigger.ManualRefresh, cancellationToken, repositoryId: repositoryId)
+            .ConfigureAwait(false);
         workspaceOptions.SeedRepositoryPath = path;
 
         return McpJson.Ok(new { branchId = effectiveBranchId, repositoryPath = path, sync = pending });

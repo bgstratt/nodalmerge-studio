@@ -65,7 +65,7 @@ internal sealed class InMemoryCoModService(IStudioNodeStore nodeStore) : ICoModS
             patterns.Add(pattern);
 
             var nodeJson = JsonSerializer.Serialize(pattern);
-            await nodeStore.WriteNodeAsync(StudioNodeKind.CoModPatternV1, patternId, nodeJson, ct)
+            await nodeStore.WriteNodeAsync(StudioNodeKind.CoModPatternV1, patternId, nodeJson, pattern.RepositoryId, ct)
                 .ConfigureAwait(false);
         }
 
@@ -120,6 +120,9 @@ internal sealed class InMemoryCoModService(IStudioNodeStore nodeStore) : ICoModS
         }
         return false;
     }
+
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.CoModPatternV1];
 
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {

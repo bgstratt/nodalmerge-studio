@@ -69,7 +69,9 @@ public sealed class TaskReconciliationTrigger(
             Status: MergeProposalStatus.Merged,
             DiffGeneratedAt: DateTimeOffset.UtcNow,
             FilesTouched: resolvedContent.Keys.ToList(),
-            ReconciledFrom: proposalIds);
+            ReconciledFrom: proposalIds,
+            // Slice 6.3a — propagated from the conflict record's own RepositoryId.
+            RepositoryId: started.RepositoryId);
         await merge.ProposeAsync(resolutionProposal, ct).ConfigureAwait(false);
 
         var sourceWorkUnitIds = new List<string?>();

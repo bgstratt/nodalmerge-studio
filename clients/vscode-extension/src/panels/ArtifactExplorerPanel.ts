@@ -648,6 +648,12 @@ export class GoalWorkspacePanel {
         case 'explorerAddReference':
           await this.handleAddReference();
           break;
+        case 'explorerReconcileCasOrigin':
+          // Reuses the same command the launcher button and Command Palette entry run — this is
+          // just a second, contextual entry point next to Run, not a separate implementation.
+          await vscode.commands.executeCommand(COMMANDS.RECONCILE_BLOB_ORIGIN);
+          void this.panel.webview.postMessage({ type: 'casReconcileDone' });
+          break;
         case 'explorerPickWinner':
           await this.handlePickWinner(
             msg.parentId as string,
@@ -1946,6 +1952,7 @@ const GW_HTML = `
       <textarea id="gw-goal" placeholder="Describe a goal — e.g. Add dark mode support across the settings UI"></textarea>
     </div>
     <button id="gw-run" style="align-self:flex-end">&#x25B6; Run</button>
+    <button id="gw-load-cas" class="ghost" title="Push this repository's content into the deduped content-addressable store (CAS), so workers can materialize files from it. Mainly matters once a remote/shared CAS origin is configured — harmless no-op otherwise." style="align-self:flex-end">&#9729; Load to CAS</button>
     <button id="gw-settings-btn" class="ghost" title="Exploration Settings" style="align-self:flex-end">&#9881;</button>
   </div>
   <div class="gw-options-row">

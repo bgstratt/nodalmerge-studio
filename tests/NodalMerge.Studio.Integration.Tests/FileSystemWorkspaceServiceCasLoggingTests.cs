@@ -45,14 +45,6 @@ public class FileSystemWorkspaceServiceCasLoggingTests : IDisposable
             [.. Entries.Where(e => e.Category.Contains("FileSystemWorkspaceService", StringComparison.Ordinal))];
     }
 
-    private sealed class FakeBlobStoreProvider : IBlobStoreProvider
-    {
-        public ValueTask<BlobReadResult> TryGetBlobAsync(string hashHex, CancellationToken ct = default) =>
-            ValueTask.FromResult(BlobReadResult.Missing);
-        public ValueTask PutBlobAsync(string hashHex, byte[] bytes, string? contentType, CancellationToken ct = default) =>
-            ValueTask.CompletedTask;
-    }
-
     private sealed class RecordingRepositoryOpService : IRepositoryOpService
     {
         public List<RepositoryOperation> Emitted { get; } = [];
@@ -81,7 +73,7 @@ public class FileSystemWorkspaceServiceCasLoggingTests : IDisposable
         services.AddLogging(b => b.AddProvider(logs).SetMinimumLevel(LogLevel.Trace));
         if (configureCas)
         {
-            services.AddSingleton<IBlobStoreProvider>(new FakeBlobStoreProvider());
+            services.AddSingleton<IBlobStoreProvider>(new InMemoryBlobStoreProvider());
             services.AddSingleton<IRepositoryOpService>(ops);
         }
         var provider = services.BuildServiceProvider();

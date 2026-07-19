@@ -182,7 +182,7 @@ the panel, then re-running the merger.
 
 ## Pathways / Workspace History (`DagReplayPanel`)
 
-The workspace's branchable history — "git for agent reasoning." Renders the `WorkspacePathways`
+The workspace's branchable history. Renders the `WorkspacePathways`
 projection: goals started, integrations, rejections/dead branches, and external file updates,
 each attributed to an actor (agent / human / external). Per-cycle orchestration chatter
 (NoOp/Enqueue/SpawnPlanner) deliberately does not appear here — that lives in the per-goal views.

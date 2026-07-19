@@ -28,4 +28,9 @@ public sealed record CandidateConflictRecord(
     // best-effort resolved at record time by scanning for a Merged, LandedOnCandidateBranch
     // proposal whose FilesTouched overlaps. Null if no such proposal could be identified. Feeds
     // IReconciliationAgentService as the second participant alongside ProposalId.
-    string? WinningProposalId = null);
+    string? WinningProposalId = null,
+    // Slice 6.3a — denormalized at record-creation time from the owning (losing) proposal's
+    // owning work unit's RepositoryId (already in scope at InMemoryMergeService.
+    // TryApplyAdditivelyAsync's construction site as owningWorkUnit). Null when unresolvable or the
+    // record predates 6.3a.
+    string? RepositoryId = null);

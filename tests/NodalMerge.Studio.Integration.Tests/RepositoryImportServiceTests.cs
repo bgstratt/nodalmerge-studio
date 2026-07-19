@@ -15,6 +15,11 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// whether the repository was already bootstrapped (right for PostMergeWriteBack/ManualRefresh —
 /// "check again right now"). Before this split, EVERY resync request silently did nothing once a
 /// repository had been bootstrapped once in the process — this is the regression this file guards.
+///
+/// Slice 1.1 (plans/cas-distribution-and-storage.md Phase 1) — with a real (storing) blob store
+/// wired in, CreateAsync now writes cas-tree snapshots (TreeEntries: null, TreeFormat: "cas-tree",
+/// tree map in the CAS); tests below assert on the resolved tree via ISnapshotTreeResolver rather
+/// than the raw (now-null) TreeEntries field.
 /// </summary>
 [Trait("Category", "Integration")]
 public class RepositoryImportServiceTests : IDisposable
@@ -32,24 +37,18 @@ public class RepositoryImportServiceTests : IDisposable
     }
 
     // IBlobStoreProvider has no in-memory registration of its own anywhere in this codebase
-    // (production wiring only ever supplies it via the Rust host FFI bridge) — a minimal fake is
-    // enough here since these tests only care about snapshot/op-log bookkeeping, not blob content
-    // round-tripping.
-    private sealed class FakeBlobStoreProvider : IBlobStoreProvider
-    {
-        public ValueTask<BlobReadResult> TryGetBlobAsync(string hashHex, CancellationToken ct = default) =>
-            ValueTask.FromResult(BlobReadResult.Missing);
-        public ValueTask PutBlobAsync(string hashHex, byte[] bytes, string? contentType, CancellationToken ct = default) =>
-            ValueTask.CompletedTask;
-    }
-
-    private (IRepositoryImportService Import, IRepositorySnapshotService Snapshots) Build()
+    // (production wiring only ever supplies it via the Rust host FFI bridge) — InMemoryBlobStoreProvider
+    // (shared across this project) is a real, storing test double so slice 1.1's cas-tree write/resolve
+    // round trip is actually exercised, not just made reachable.
+    private (IRepositoryImportService Import, IRepositorySnapshotService Snapshots, ISnapshotTreeResolver TreeResolver) Build()
     {
         var services = new ServiceCollection();
         services.AddInMemoryStorage();
-        services.AddSingleton<IBlobStoreProvider>(new FakeBlobStoreProvider());
+        services.AddSingleton<IBlobStoreProvider>(new InMemoryBlobStoreProvider());
         var provider = services.BuildServiceProvider();
-        return (provider.GetRequiredService<IRepositoryImportService>(), provider.GetRequiredService<IRepositorySnapshotService>());
+        return (provider.GetRequiredService<IRepositoryImportService>(),
+                provider.GetRequiredService<IRepositorySnapshotService>(),
+                provider.GetRequiredService<ISnapshotTreeResolver>());
     }
 
     private string RepositoryId => Path.GetFullPath(_repoPath);
@@ -58,7 +57,7 @@ public class RepositoryImportServiceTests : IDisposable
     public async Task EnsureBootstrappedAsync_creates_a_Generation_zero_snapshot_for_a_fresh_repository()
     {
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "a.txt"), "v1");
-        var (import, snapshots) = Build();
+        var (import, snapshots, treeResolver) = Build();
 
         await import.EnsureBootstrappedAsync(RepositoryId, _repoPath);
 
@@ -66,8 +65,14 @@ public class RepositoryImportServiceTests : IDisposable
         Assert.NotNull(snapshot);
         Assert.Equal(0, snapshot!.Generation);
         Assert.Equal("Bootstrap", snapshot.Source);
-        Assert.NotNull(snapshot.TreeEntries);
-        Assert.Contains("a.txt", snapshot.TreeEntries!.Keys);
+
+        // Slice 1.1 — with a blob store configured, the node itself carries no inline map.
+        Assert.Null(snapshot.TreeEntries);
+        Assert.Equal("cas-tree", snapshot.TreeFormat);
+
+        var tree = await treeResolver.ResolveTreeAsync(snapshot);
+        Assert.NotNull(tree);
+        Assert.Contains("a.txt", tree!.Keys);
     }
 
     // plans/harness-hosting-architecture.md Phase A.5 — .workspace is the harness contract
@@ -80,20 +85,22 @@ public class RepositoryImportServiceTests : IDisposable
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "a.txt"), "v1");
         Directory.CreateDirectory(Path.Combine(_repoPath, ".workspace"));
         await File.WriteAllTextAsync(Path.Combine(_repoPath, ".workspace", "manifest.json"), "{}");
-        var (import, snapshots) = Build();
+        var (import, snapshots, treeResolver) = Build();
 
         await import.EnsureBootstrappedAsync(RepositoryId, _repoPath);
 
         var snapshot = await snapshots.GetLatestAsync(RepositoryId);
-        Assert.Contains("a.txt", snapshot!.TreeEntries!.Keys);
-        Assert.DoesNotContain(snapshot.TreeEntries!.Keys, k => k.Contains(".workspace"));
+        var tree = await treeResolver.ResolveTreeAsync(snapshot!);
+        Assert.NotNull(tree);
+        Assert.Contains("a.txt", tree!.Keys);
+        Assert.DoesNotContain(tree.Keys, k => k.Contains(".workspace"));
     }
 
     [Fact]
     public async Task EnsureBootstrappedAsync_called_again_after_a_disk_change_does_not_advance_the_snapshot()
     {
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "a.txt"), "v1");
-        var (import, snapshots) = Build();
+        var (import, snapshots, _) = Build();
         await import.EnsureBootstrappedAsync(RepositoryId, _repoPath);
         var first = await snapshots.GetLatestAsync(RepositoryId);
 
@@ -108,7 +115,7 @@ public class RepositoryImportServiceTests : IDisposable
     public async Task ForceSyncAsync_advances_the_snapshot_after_a_disk_change_that_EnsureBootstrappedAsync_would_have_missed()
     {
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "a.txt"), "v1");
-        var (import, snapshots) = Build();
+        var (import, snapshots, _) = Build();
         await import.EnsureBootstrappedAsync(RepositoryId, _repoPath);
         var first = await snapshots.GetLatestAsync(RepositoryId);
 
@@ -126,7 +133,7 @@ public class RepositoryImportServiceTests : IDisposable
     public async Task ForceSyncAsync_does_not_create_a_redundant_snapshot_when_nothing_changed_on_disk()
     {
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "a.txt"), "v1");
-        var (import, snapshots) = Build();
+        var (import, snapshots, _) = Build();
         await import.EnsureBootstrappedAsync(RepositoryId, _repoPath);
         var first = await snapshots.GetLatestAsync(RepositoryId);
 
@@ -141,22 +148,24 @@ public class RepositoryImportServiceTests : IDisposable
     {
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "a.txt"), "v1");
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "b.txt"), "v1");
-        var (import, snapshots) = Build();
+        var (import, snapshots, treeResolver) = Build();
         await import.EnsureBootstrappedAsync(RepositoryId, _repoPath);
 
         File.Delete(Path.Combine(_repoPath, "b.txt"));
         await import.ForceSyncAsync(RepositoryId, _repoPath);
 
         var snapshot = await snapshots.GetLatestAsync(RepositoryId);
-        Assert.Contains("a.txt", snapshot!.TreeEntries!.Keys);
-        Assert.DoesNotContain("b.txt", snapshot.TreeEntries!.Keys);
+        var tree = await treeResolver.ResolveTreeAsync(snapshot!);
+        Assert.NotNull(tree);
+        Assert.Contains("a.txt", tree!.Keys);
+        Assert.DoesNotContain("b.txt", tree.Keys);
     }
 
     [Fact]
     public async Task ForceSyncAsync_marks_the_repository_bootstrapped_so_a_later_EnsureBootstrappedAsync_call_no_ops()
     {
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "a.txt"), "v1");
-        var (import, snapshots) = Build();
+        var (import, snapshots, _) = Build();
 
         // ForceSyncAsync as the FIRST call ever for this repository (no prior EnsureBootstrappedAsync) —
         // proves it performs its own Case 1 bootstrap, not just Case 2 resync.
@@ -173,5 +182,60 @@ public class RepositoryImportServiceTests : IDisposable
 
         var afterEnsure = await snapshots.GetLatestAsync(RepositoryId);
         Assert.Equal(afterForceSync.SnapshotId, afterEnsure!.SnapshotId);
+    }
+
+    // Slice 1.1 — a hand-written legacy node (inline TreeEntries, TreeFormat null, as if written
+    // before this slice existed) must still drive Case 2 sync and materialize, proving cas-tree and
+    // legacy snapshots are interchangeable to every reader without ever rewriting the old node.
+    [Fact]
+    public async Task Case2_sync_still_works_against_a_hand_written_legacy_inline_snapshot()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_repoPath, "a.txt"), "v1");
+
+        var legacy = new NodalMerge.Studio.Contracts.Domain.RepositorySnapshot(
+            SnapshotId: "legacy-0",
+            RepositoryId: RepositoryId,
+            TreeHash: "legacy-hash",
+            Generation: 0,
+            CreatedAt: DateTimeOffset.UtcNow.AddMinutes(-5),
+            Source: "Bootstrap",
+            TreeEntries: new Dictionary<string, string> { ["a.txt"] = "deadbeef" });
+        // Force this exact instance into the service by writing the node directly, then rehydrating
+        // a fresh service instance from it (bypassing CreateAsync, which would produce a cas-tree
+        // snapshot given the blob store wired in below — the whole point here is a pre-slice-1.1
+        // node that was never touched).
+        var services = new ServiceCollection();
+        services.AddInMemoryStorage();
+        services.AddSingleton<IBlobStoreProvider>(new InMemoryBlobStoreProvider());
+        var provider = services.BuildServiceProvider();
+        var nodeStore = provider.GetRequiredService<IStudioNodeStore>();
+        await nodeStore.WriteNodeAsync(
+            StudioNodeKind.RepositorySnapshotV1, legacy.SnapshotId,
+            System.Text.Json.JsonSerializer.Serialize(legacy));
+
+        var localImport = provider.GetRequiredService<IRepositoryImportService>();
+        var localSnapshots = provider.GetRequiredService<IRepositorySnapshotService>();
+        var localTreeResolver = provider.GetRequiredService<ISnapshotTreeResolver>();
+
+        // Only rehydrate the one service under test (not every IRehydratable in the container —
+        // that would pull in unrelated services like InMemoryDeadLetterService, which needs
+        // IWorkUnitService and isn't registered by AddInMemoryStorage() alone).
+        Assert.IsAssignableFrom<IRehydratable>(localSnapshots);
+        await ((IRehydratable)localSnapshots).RehydrateAsync();
+
+        var beforeSync = await localSnapshots.GetLatestAsync(RepositoryId);
+        Assert.NotNull(beforeSync);
+        Assert.Equal("legacy-0", beforeSync!.SnapshotId);
+
+        await File.WriteAllTextAsync(Path.Combine(_repoPath, "a.txt"), "v2 — changed on disk");
+        await localImport.ForceSyncAsync(RepositoryId, _repoPath);
+
+        var afterSync = await localSnapshots.GetLatestAsync(RepositoryId);
+        Assert.NotEqual("legacy-0", afterSync!.SnapshotId);
+        Assert.Equal("legacy-0", afterSync.BaseSnapshotId);
+
+        var tree = await localTreeResolver.ResolveTreeAsync(afterSync);
+        Assert.NotNull(tree);
+        Assert.Contains("a.txt", tree!.Keys);
     }
 }

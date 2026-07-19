@@ -26,13 +26,18 @@ public sealed class InMemoryTaskService : ITaskService, IRehydratable
         if (workUnit is null)
             throw new KeyNotFoundException($"Work unit '{task.WorkUnitId}' was not found.");
 
-        _tasks[task.TaskId] = task;
+        // Slice 6.3a — a task always has exactly one WorkUnitId (required field), so this is a
+        // direct copy of the already-resolved WorkUnit.RepositoryId, never a chain walk.
+        var stored = task.RepositoryId is null ? task with { RepositoryId = workUnit.RepositoryId } : task;
+
+        _tasks[stored.TaskId] = stored;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.TaskV1,
-            task.TaskId,
-            JsonSerializer.Serialize(task),
+            stored.TaskId,
+            JsonSerializer.Serialize(stored),
+            stored.RepositoryId,
             cancellationToken).ConfigureAwait(false);
-        return task;
+        return stored;
     }
 
     public Task<StudioTask?> GetAsync(string taskId, CancellationToken cancellationToken = default)
@@ -52,13 +57,20 @@ public sealed class InMemoryTaskService : ITaskService, IRehydratable
                 $"Cannot transition task from {current.Status} to {task.Status}.");
         }
 
-        _tasks[task.TaskId] = task;
+        // RepositoryId is effectively immutable once set at CreateAsync — preserve the current
+        // value if the caller's `with`-copy somehow lost it.
+        var stored = task.RepositoryId is null && current.RepositoryId is not null
+            ? task with { RepositoryId = current.RepositoryId }
+            : task;
+
+        _tasks[stored.TaskId] = stored;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.TaskV1,
-            task.TaskId,
-            JsonSerializer.Serialize(task),
+            stored.TaskId,
+            JsonSerializer.Serialize(stored),
+            stored.RepositoryId,
             cancellationToken).ConfigureAwait(false);
-        return task;
+        return stored;
     }
 
     public Task<IReadOnlyList<StudioTask>> ListAsync(string? workUnitId = null, CancellationToken cancellationToken = default)
@@ -87,9 +99,13 @@ public sealed class InMemoryTaskService : ITaskService, IRehydratable
             StudioNodeKind.TaskV1,
             taskId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
         return updated;
     }
+
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.TaskV1];
 
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {

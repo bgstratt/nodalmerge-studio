@@ -71,7 +71,10 @@ public sealed class CandidateReconciliationTrigger(
             FilesTouched: resolvedContent.Keys.ToList(),
             ReconciledFrom: proposalIds,
             PromotedToDisk: false,
-            LandedOnCandidateBranch: true);
+            LandedOnCandidateBranch: true,
+            // Slice 6.3a — propagated from the conflict record's own RepositoryId (set at record
+            // time from its owning work unit — see InMemoryMergeService.TryApplyAdditivelyAsync).
+            RepositoryId: started.RepositoryId);
         await merge.ProposeAsync(resolutionProposal, ct).ConfigureAwait(false);
 
         var sourceWorkUnitIds = new List<string?>();

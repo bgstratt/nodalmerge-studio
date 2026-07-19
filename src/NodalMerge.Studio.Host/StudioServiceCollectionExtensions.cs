@@ -52,6 +52,92 @@ public static class StudioServiceCollectionExtensions
         });
 
         services.AddNodalMergeStorage();
+
+        // Phase 5 slice 5.2 — bind RetentionPolicyOptions/BlobGcOptions from config, overriding
+        // AddNodalMergeStorage's own default-valued registrations above (last AddSingleton
+        // registration wins — same convention WorkspaceOptions's AddInMemoryStorage comment
+        // documents, and why these two calls must come AFTER AddNodalMergeStorage rather than
+        // alongside WorkspaceOptions's own binding above).
+        services.AddSingleton<RetentionPolicyOptions>(sp =>
+        {
+            var config = sp.GetService<IConfiguration>();
+            var opts   = new RetentionPolicyOptions();
+            config?.GetSection("Retention").Bind(opts);
+            return opts;
+        });
+        services.AddSingleton<BlobGcOptions>(sp =>
+        {
+            var config = sp.GetService<IConfiguration>();
+            var opts   = new BlobGcOptions();
+            config?.GetSection("BlobGc").Bind(opts);
+            return opts;
+        });
+
+        // L2.1 (plans/room-persistence-bloat.md) — the studio-owned local append log. Override
+        // AddNodalMergeStorage's default-valued StudioLocalLogOptions (last-AddSingleton-wins). An
+        // explicit NodalMerge:Studio:LocalLog:Directory wins; otherwise anchor the log next to the
+        // node DB (NodalMerge:Storage:Sqlite:DbPath) so it lands in the SAME data dir the VS Code
+        // extension configures with an ABSOLUTE path — not a CWD-relative "data/local-log" that
+        // would diverge from an absolute DbPath.
+        services.AddSingleton<StudioLocalLogOptions>(sp =>
+        {
+            var config = sp.GetService<IConfiguration>();
+            var opts   = new StudioLocalLogOptions();
+
+            var explicitDir = config?["NodalMerge:Studio:LocalLog:Directory"];
+            if (!string.IsNullOrWhiteSpace(explicitDir))
+            {
+                opts.Directory = explicitDir;
+                return opts;
+            }
+
+            var dbPath = config?["NodalMerge:Storage:Sqlite:DbPath"];
+            if (!string.IsNullOrWhiteSpace(dbPath))
+            {
+                var dbDir = Path.GetDirectoryName(dbPath);
+                opts.Directory = string.IsNullOrEmpty(dbDir)
+                    ? "local-log"
+                    : Path.Combine(dbDir, "local-log");
+            }
+
+            return opts;
+        });
+
+        // Slice 6.4 (plans/cas-distribution-and-storage.md Phase 6, D4 "mode collapse") — bind
+        // RoomOptions from the "Room" config section, overriding AddNodalMergeStorage's own
+        // default-valued registration above (last-AddSingleton-wins, same pattern as
+        // RetentionPolicyOptions/BlobGcOptions immediately above). Back-compat: pre-6.4 configs
+        // (docs/guides/headless-peer.md) set "Peer:HostUri" — fall back to it (with a deprecation
+        // log) only when "Room:HostUri" itself is unset, so those deployments keep working
+        // unchanged.
+        services.AddSingleton<RoomOptions>(sp =>
+        {
+            var config = sp.GetService<IConfiguration>();
+            var opts   = new RoomOptions();
+            config?.GetSection("Room").Bind(opts);
+
+            if (string.IsNullOrWhiteSpace(opts.HostUri))
+            {
+                var legacyHostUri = config?["Peer:HostUri"];
+                if (!string.IsNullOrWhiteSpace(legacyHostUri))
+                {
+                    sp.GetService<ILogger<RoomOptions>>()?.LogWarning(
+                        "[RoomOptions] \"Peer:HostUri\" is deprecated — set \"Room:HostUri\" instead " +
+                        "(same value, new section). Using the legacy value this run: {HostUri}", legacyHostUri);
+                    opts.HostUri = legacyHostUri;
+                }
+            }
+
+            // Config binding overwrites the C# property default with an empty string when
+            // Room:Workgroup is present-but-blank; restore "workgroup" so standalone workgroup
+            // state (repositories map, cross-repo goal nodes) keeps a stable local room id either
+            // way (RoomOptions.Workgroup's own doc comment).
+            if (string.IsNullOrWhiteSpace(opts.Workgroup))
+                opts.Workgroup = "workgroup";
+
+            return opts;
+        });
+
         services.AddStudioProjections();
         services.AddSingleton<FindingDetectorService>();
         services.AddStudioTasks();

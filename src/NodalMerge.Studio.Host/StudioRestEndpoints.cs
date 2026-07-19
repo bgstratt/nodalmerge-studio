@@ -2,7 +2,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
-using NodalMerge.Host.Composition;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.AgentRuntime;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -316,6 +316,13 @@ public static class StudioRestEndpoints
         string? SessionId = null);
 
     private sealed record RollbackRequestBody(string KnownGoodStateId);
+
+    // Slice 6.3 (D3, docs/STUDIO_ROOM_SCHEMA.md (c)) — the pinned cross-repo reference triple,
+    // field names matching the frozen canonical JSON form exactly ({repoId, generationId, path}).
+    private sealed record PinnedReferenceRequestBody(
+        string RepoId,
+        string GenerationId,
+        string Path);
 
     private sealed record CreateGoalBody(
         string Goal,
@@ -681,7 +688,7 @@ public static class StudioRestEndpoints
 
             var branchId = body.BranchId ?? "main";
             var pending = await repositorySync.SyncBranchFromRepositoryAsync(
-                branchId, path, SyncTrigger.ManualRefresh, ct).ConfigureAwait(false);
+                branchId, path, SyncTrigger.ManualRefresh, ct, repositoryId: body.RepositoryId).ConfigureAwait(false);
             workspaceOptions.SeedRepositoryPath = path;
 
             return Results.Ok(new { branchId, repositoryPath = path, sync = pending });
@@ -793,13 +800,24 @@ public static class StudioRestEndpoints
         });
 
         // Phase 9d — detected project roots (paths, stacks, resolved build/test/run commands).
+        // A replicated peer branch (e.g. work-<guid> that crossed the room but was never materialized
+        // here) has no local working directory, so detection can't run. That's a normal state for a
+        // peer's work unit, not a server fault — return an empty profile instead of surfacing the
+        // "has no working directory" InvalidOperationException as an unhandled 500.
         app.MapGet("/studio/workspace/profile", async (
             [FromQuery] string branchId,
             IWorkspaceProfileService profiles,
             CancellationToken ct) =>
         {
-            var profile = await profiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
-            return Results.Ok(profile);
+            try
+            {
+                var profile = await profiles.GetOrDetectAsync(branchId, ct).ConfigureAwait(false);
+                return Results.Ok(profile);
+            }
+            catch (InvalidOperationException)
+            {
+                return Results.Ok(new WorkspaceProfile(branchId, [], DateTimeOffset.UtcNow));
+            }
         });
 
         app.MapPost("/studio/workspace/profile/rescan", async (
@@ -917,7 +935,7 @@ public static class StudioRestEndpoints
         {
             var ok = await cache.MaterializeAsync(workUnitId, ct).ConfigureAwait(false);
             return ok ? Results.Ok(new { workUnitId, materialized = true })
-                      : Results.NotFound(new { error = "No snapshot with TreeEntries found; cannot materialize." });
+                      : Results.NotFound(new { error = "No materializable snapshot found for this work unit (missing snapshot, unresolvable tree — legacy pre-tree-capture or a CAS miss/corrupt tree blob — or no branch directory); cannot materialize." });
         });
 
         // Evict a specific work unit's branch directory.
@@ -940,24 +958,137 @@ public static class StudioRestEndpoints
             return Results.Ok(new { evicted = count });
         });
 
-        // Run blob GC: collect live hashes from all snapshots and feed to FileBlobGcCoordinator.
-        // dryRun=true (default) only marks/reports candidates; dryRun=false deletes after grace window.
+        // Run blob GC via the staged local sweep (Phase 5 slice 5.2): honors the configured
+        // BlobGcOptions.Mode (DryRun by default) unless an explicit mode override is given.
+        //
+        // Back-compat note: dryRun is the pre-5.2 query parameter. dryRun=true still forces an
+        // explicit DryRun for this call (same as before). dryRun=false (including simply omitting
+        // the parameter, its default) is NO LONGER an implicit live-delete request — it now means
+        // "no override," so the configured mode (DryRun unless an operator has configured
+        // otherwise) governs. Before this slice, a bare POST with no query string ran a real
+        // delete pass; this is a deliberate, documented safety change, not an oversight — flag it
+        // if anything upstream (scripts, the extension) relied on the old bare-POST-deletes
+        // behavior.
         app.MapPost("/studio/cache/gc", async (
-            [FromQuery] bool dryRun,
-            IWorkspaceCacheManager cache,
-            WorkspaceOptions opts,
+            [FromQuery] bool? dryRun,
+            [FromQuery] string? mode,
+            IBlobGcService gc,
+            ILogger<WorkspaceCacheManager> logger,
             CancellationToken ct) =>
         {
-            var casRoot = opts.CasRootPath;
-            if (string.IsNullOrEmpty(casRoot))
-                return Results.BadRequest(new { error = "CAS storage is not configured (WorkspaceOptions.CasRootPath is null)." });
+            BlobGcMode? overrideMode = null;
+            if (!string.IsNullOrWhiteSpace(mode))
+            {
+                if (!Enum.TryParse<BlobGcMode>(mode, ignoreCase: true, out var parsed))
+                    return Results.BadRequest(new
+                    {
+                        error = $"Unknown gc mode '{mode}'. Valid values: DryRun, MarkOnly, SweepSoft, SweepHard.",
+                    });
+                overrideMode = parsed;
+            }
+            else if (dryRun == true)
+            {
+                overrideMode = BlobGcMode.DryRun;
+            }
 
-            var liveHashes = await cache.GetLiveBlobHashesAsync(ct).ConfigureAwait(false);
-            var coordinator = new FileBlobGcCoordinator(casRoot);
-            var report = dryRun
-                ? coordinator.DryRun(liveHashes, DateTimeOffset.UtcNow)
-                : coordinator.LiveRun(liveHashes, DateTimeOffset.UtcNow);
-            return Results.Ok(report);
+            try
+            {
+                var record = await gc.RunAsync(overrideMode, ct).ConfigureAwait(false);
+                return Results.Ok(record);
+            }
+            catch (BlobGcNotConfiguredException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Slice 1.1 — GetLiveBlobHashesAsync fails closed when a retained snapshot's tree
+                // can't be resolved (CAS miss/corrupt): an incomplete live set must never reach a
+                // sweep (it would look like an under-approximation and let live blobs get deleted).
+                // Skip this GC round rather than crash the host; the caller can retry later.
+                logger.LogWarning(ex, "Skipping blob GC this round — the live blob set could not be computed.");
+                return Results.Conflict(new
+                {
+                    error = "Live blob set is incomplete (a retained snapshot's tree failed to resolve) — GC skipped this round.",
+                    detail = ex.Message,
+                });
+            }
+        });
+
+        // Phase 5 slice 5.2 — the local GC run ledger, most recent first.
+        app.MapGet("/studio/cache/gc/runs", async (
+            [FromQuery] int? limit,
+            IBlobGcService gc,
+            CancellationToken ct) =>
+        {
+            var runs = await gc.GetRecentRunsAsync(limit is null or <= 0 ? 20 : limit.Value, ct).ConfigureAwait(false);
+            return Results.Ok(new { runs, count = runs.Count });
+        });
+
+        // Phase 2 slice 2.3 — CAS reconcile sweep: enumerate live blob hashes, HEAD the remote
+        // origin, and push whatever it's missing. A no-op (zero counts) when no remote push target
+        // is configured — see ICasReconcileService's own doc comment.
+        app.MapPost("/studio/cas/reconcile", async (
+            ICasReconcileService reconcile,
+            ILogger<CasReconcileService> logger,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var result = await reconcile.ReconcileAsync(ct).ConfigureAwait(false);
+                return Results.Ok(result);
+            }
+            catch (InvalidOperationException ex)
+            {
+                // Same fail-closed contract as /studio/cache/gc above — an incomplete live blob
+                // set must never be reported as a completed reconcile; skip this round rather than
+                // crash the host.
+                logger.LogWarning(ex, "Skipping CAS reconcile sweep — the live blob set could not be computed.");
+                return Results.Conflict(new
+                {
+                    error = "Live blob set is incomplete (a cas-tree snapshot's tree failed to resolve) — reconcile skipped this round.",
+                    detail = ex.Message,
+                });
+            }
+        });
+
+        // Slice 6.3 (D3, docs/STUDIO_ROOM_SCHEMA.md (c)) — resolves a pinned cross-repo reference
+        // triple through the frozen chain (repo room -> generation node -> TreeHash -> CAS walk ->
+        // blob), so the resolution path is exercisable end-to-end over HTTP. Bytes are returned
+        // base64-encoded inside a JSON envelope (not raw) to match every other endpoint in this
+        // file; 404 covers every "can't resolve" case (unknown generation, path not in tree, CAS
+        // miss) — the resolver logs which link broke.
+        app.MapPost("/studio/references/resolve", async (
+            PinnedReferenceRequestBody body,
+            IPinnedReferenceResolver resolver,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.RepoId)
+                || string.IsNullOrWhiteSpace(body.GenerationId)
+                || string.IsNullOrWhiteSpace(body.Path))
+            {
+                return Results.BadRequest(new { error = "repoId, generationId and path are all required." });
+            }
+
+            var bytes = await resolver.ResolveAsync(
+                new PinnedReference(body.RepoId, body.GenerationId, body.Path), ct).ConfigureAwait(false);
+
+            return bytes is null
+                ? Results.NotFound(new
+                {
+                    error = "Pinned reference did not resolve (unknown generation, path not in that generation's tree, or blob unavailable).",
+                    repoId = body.RepoId,
+                    generationId = body.GenerationId,
+                    path = body.Path,
+                })
+                : Results.Ok(new
+                {
+                    repoId = body.RepoId,
+                    generationId = body.GenerationId,
+                    path = body.Path,
+                    sizeBytes = bytes.Length,
+                    contentBase64 = Convert.ToBase64String(bytes),
+                });
         });
 
         app.MapPost("/studio/workspace/symbol/definition", async (
@@ -1171,13 +1302,16 @@ public static class StudioRestEndpoints
         app.MapGet("/studio/workunits/{workUnitId}/conversation-log", async (
             string workUnitId,
             IWorkUnitService workUnits,
-            IConversationLogService conversationLog,
+            IReasoningResolver reasoning,
             CancellationToken ct) =>
         {
             var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
             if (wu is null)
                 return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
-            var entries = await conversationLog.GetEntriesAsync(workUnitId, ct).ConfigureAwait(false);
+            // L2.3 — local ConversationLog when present; else the peer-published reasoning transcript
+            // (ConversationRef → CAS blob), so a peer sees the "why" behind another peer's work unit,
+            // not just its file state. Same ConversationLogEntry[] shape either way (no client change).
+            var entries = await reasoning.GetReasoningAsync(workUnitId, ct).ConfigureAwait(false);
             return Results.Ok(entries);
         });
 
@@ -1373,6 +1507,7 @@ public static class StudioRestEndpoints
         app.MapPost("/studio/workunits", async (
             CreateWorkUnitBody body,
             IWorkUnitCommandService workUnitCommands,
+            IGoalNodeService goalNodes,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(body.Goal))
@@ -1392,12 +1527,96 @@ public static class StudioRestEndpoints
                         SeedFromBranchId: body.SeedFromBranchId, ExpectedOutputKind: body.ExpectedOutputKind,
                         RepositoryId: body.RepositoryId, ReferenceFiles: body.ReferenceFiles),
                     ct).ConfigureAwait(false);
+
+                // First-class replicating goal (plans/first-class-goals-and-materialization.md Phase 1):
+                // a ROOT work unit IS a goal. Persist a repo-scoped GoalNode (GoalId == root WorkUnitId,
+                // routed by the work unit's resolved RepositoryId) so the goal REPLICATES to same-repo
+                // peers and carries the goal text/status — instead of being reconstructed per-peer from
+                // the work unit, which never crossed the network. Every run strategy funnels through this
+                // endpoint, so this one seam covers the extension, MCP tools, and the eval harness.
+                // Idempotent by GoalId; never overwrites an existing goal's status/pause state.
+                if (wu.ParentWorkUnitId is null
+                    && await goalNodes.GetAsync(wu.WorkUnitId, ct).ConfigureAwait(false) is null)
+                {
+                    await goalNodes.RecordAsync(new GoalNode(
+                        GoalId: wu.WorkUnitId,
+                        Goal: wu.Goal,
+                        WorkUnitId: wu.WorkUnitId,
+                        BranchId: wu.BranchId,
+                        Status: GoalStatus.Exploring,
+                        CreatedAt: wu.CreatedAt,
+                        UpdatedAt: wu.UpdatedAt,
+                        Owner: wu.Owner,
+                        RepositoryId: wu.RepositoryId,
+                        // Phase 4: the goal's pre-work state = the root work unit's seed snapshot,
+                        // already a real materializable RepositorySnapshot. Null until the repo is
+                        // bootstrapped (no snapshot to seed from yet).
+                        BaseSnapshotId: wu.SeedSnapshotId), ct).ConfigureAwait(false);
+                }
+
                 return Results.Ok(wu);
             }
             catch (KeyNotFoundException ex)
             {
                 return Results.NotFound(new { error = ex.Message });
             }
+        });
+
+        // Materialization anchors (plans/first-class-goals-and-materialization.md Phase 4d) — resolves
+        // the snapshot ids a caller can feed to POST /studio/repository-snapshots/{id}/materialize for
+        // this work unit and its goal: the work unit's base (pre-work seed) and produced (what it
+        // built) states, plus the owning goal's base and final (integrated result) states. A null
+        // anchor simply means that state hasn't been captured yet.
+        app.MapGet("/studio/workunits/{workUnitId}/materialization", async (
+            string workUnitId,
+            IWorkUnitService workUnits,
+            IGoalNodeService goalNodes,
+            IStudioNodeStore nodeStore,
+            CancellationToken ct) =>
+        {
+            var wu = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (wu is null)
+                return Results.NotFound(new { error = $"Work unit '{workUnitId}' not found." });
+
+            // Produced = the latest WorkUnitCompletion snapshot attributed to this work unit.
+            string? producedSnapshotId = null;
+            var producedGeneration = -1L;
+            foreach (var (_, json) in await nodeStore
+                .ReadAllNodesAsync(StudioNodeKind.RepositorySnapshotV1, ct).ConfigureAwait(false))
+            {
+                RepositorySnapshot? snap;
+                try { snap = JsonSerializer.Deserialize<RepositorySnapshot>(json); }
+                catch (JsonException) { continue; }
+                if (snap is null
+                    || snap.WorkUnitId != workUnitId
+                    || snap.Source != WorkUnitProducedSnapshotObserver.SnapshotSource)
+                    continue;
+                if (snap.Generation > producedGeneration)
+                {
+                    producedGeneration = snap.Generation;
+                    producedSnapshotId = snap.SnapshotId;
+                }
+            }
+
+            // Goal anchors — walk to the root work unit (GoalId == root WorkUnitId by convention).
+            var root = wu;
+            while (root.ParentWorkUnitId is { } parentId)
+            {
+                var parent = await workUnits.GetAsync(parentId, ct).ConfigureAwait(false);
+                if (parent is null) break;
+                root = parent;
+            }
+            var goal = await goalNodes.GetAsync(root.WorkUnitId, ct).ConfigureAwait(false);
+
+            return Results.Ok(new
+            {
+                workUnitId,
+                baseSnapshotId = wu.SeedSnapshotId,          // this work unit's pre-work state
+                producedSnapshotId,                          // what this work unit built
+                goalId = root.WorkUnitId,
+                goalBaseSnapshotId = goal?.BaseSnapshotId,    // the goal's pre-work state
+                goalFinalSnapshotId = goal?.FinalSnapshotId,  // the goal's integrated result
+            });
         });
 
         // Stop controls — cancels one goal's whole subtree (the work unit plus every descendant
@@ -1847,6 +2066,7 @@ public static class StudioRestEndpoints
         app.MapGet("/studio/merges/{proposalId}/constituents", async (
             string proposalId,
             IMergeService merge,
+            IMergeDiffResolver diffResolver,
             CancellationToken ct) =>
         {
             var proposal = await merge.GetAsync(proposalId, ct).ConfigureAwait(false);
@@ -1857,21 +2077,27 @@ public static class StudioRestEndpoints
             foreach (var id in proposal.ReconciledFrom)
             {
                 var constituent = await merge.GetAsync(id, ct).ConfigureAwait(false);
-                constituents.Add(constituent is null
-                    ? new { proposalId = id, status = "Unknown", goal = (string?)null, summary = (string?)null, model = (string?)null, confidence = (double?)null, rationale = (string?)null }
-                    : new
-                    {
-                        proposalId = constituent.ProposalId,
-                        status = constituent.Status.ToString(),
-                        goal = (string?)constituent.Goal,
-                        summary = (string?)constituent.Summary,
-                        model = (string?)constituent.Model,
-                        provider = (string?)constituent.Provider,
-                        confidence = constituent.Confidence,
-                        rationale = (string?)constituent.ChangeDescription,
-                        agentId = (string?)constituent.AgentId,
-                        workspaceChanges = (string?)constituent.WorkspaceChanges,
-                    });
+                if (constituent is null)
+                {
+                    constituents.Add(new { proposalId = id, status = "Unknown", goal = (string?)null, summary = (string?)null, model = (string?)null, confidence = (double?)null, rationale = (string?)null });
+                    continue;
+                }
+
+                // L2.4 — the diff is CAS-ref'd off the replicated node; resolve it for display.
+                var constituentDiff = await diffResolver.ResolveAsync(constituent, ct).ConfigureAwait(false);
+                constituents.Add(new
+                {
+                    proposalId = constituent.ProposalId,
+                    status = constituent.Status.ToString(),
+                    goal = (string?)constituent.Goal,
+                    summary = (string?)constituent.Summary,
+                    model = (string?)constituent.Model,
+                    provider = (string?)constituent.Provider,
+                    confidence = constituent.Confidence,
+                    rationale = (string?)constituent.ChangeDescription,
+                    agentId = (string?)constituent.AgentId,
+                    workspaceChanges = constituentDiff,
+                });
             }
 
             return Results.Ok(constituents);
@@ -2061,6 +2287,7 @@ public static class StudioRestEndpoints
         app.MapGet("/studio/merges/compare", async (
             [FromQuery] string? ids,
             IMergeService merge,
+            IMergeDiffResolver diffResolver,
             CancellationToken ct) =>
         {
             var idList = (ids ?? string.Empty)
@@ -2078,13 +2305,17 @@ public static class StudioRestEndpoints
 
             var overlapping = a.FilesTouched.Intersect(b.FilesTouched, StringComparer.OrdinalIgnoreCase).ToList();
 
+            // L2.4 — diffs are CAS-ref'd off the replicated node; resolve both for the comparison.
+            var diffA = await diffResolver.ResolveAsync(a, ct).ConfigureAwait(false);
+            var diffB = await diffResolver.ResolveAsync(b, ct).ConfigureAwait(false);
+
             return Results.Ok(new
             {
                 proposalIdA = a.ProposalId,
                 proposalIdB = b.ProposalId,
                 overlappingFiles = overlapping,
-                diffA = a.WorkspaceChanges,
-                diffB = b.WorkspaceChanges,
+                diffA,
+                diffB,
             });
         });
 
@@ -2197,11 +2428,26 @@ public static class StudioRestEndpoints
         {
             if (string.IsNullOrWhiteSpace(path))
                 return Results.BadRequest(new { error = "path query parameter is required." });
-            var found = await fileWorkspace.MaterializeFileAsync(branchId, path, ct).ConfigureAwait(false);
-            return found
-                ? Results.Ok(new { branchId, path, materialized = true })
-                : Results.NotFound(new { branchId, path, materialized = false,
-                    reason = "Path does not exist in the latest repository snapshot." });
+            try
+            {
+                var found = await fileWorkspace.MaterializeFileAsync(branchId, path, ct).ConfigureAwait(false);
+                return found
+                    ? Results.Ok(new { branchId, path, materialized = true })
+                    : Results.NotFound(new { branchId, path, materialized = false,
+                        reason = "Path does not exist in the latest repository snapshot." });
+            }
+            catch (RepositoryIdentityUnresolvedException ex)
+            {
+                // Slice 7.2 — distinct from the "path not found" 404 above: this branch's OWNING
+                // repository couldn't be identified at all on this peer (a cold peer whose local
+                // registry never bound this WorkgroupRepoId), not merely missing this one file from
+                // an otherwise-resolved snapshot.
+                return Results.NotFound(new
+                {
+                    branchId, path, materialized = false,
+                    reason = ex.Message, repositoryId = ex.RepositoryId,
+                });
+            }
         });
 
         // Replays manual on-disk edits (e.g. a human hand-fixing a pending proposal or a merge
@@ -3560,6 +3806,8 @@ public static class StudioRestEndpoints
             [FromQuery] string? targetPath,
             IRepositorySnapshotService snapshots,
             IMaterializationEngine materializer,
+            ISnapshotTreeResolver treeResolver,
+            ISnapshotRetentionPolicy retentionPolicy,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(targetPath))
@@ -3568,8 +3816,36 @@ public static class StudioRestEndpoints
             var snapshot = await snapshots.GetAsync(snapshotId, ct).ConfigureAwait(false);
             if (snapshot is null)
                 return Results.NotFound(new { error = $"Repository snapshot '{snapshotId}' was not found." });
-            if (snapshot.TreeEntries is null)
-                return Results.BadRequest(new { error = $"Snapshot '{snapshotId}' predates tree-entry capture and cannot be materialized directly." });
+
+            var tree = await treeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+            if (tree is null)
+            {
+                // Phase 5 slice 5.2 — a null tree here can mean either a genuine CAS problem
+                // (corrupt blob, or a legacy snapshot that predates tree-entry capture) or a
+                // generation whose bytes were deliberately reclaimed because retention classified
+                // it Intermediate and RetainIntermediateDays elapsed (see
+                // plans/cas-distribution-and-storage.md's retention doctrine: "the node stays;
+                // only bytes are reclaimed"; materializing a retired generation must fail
+                // gracefully, not crash). Distinguish the two with one extra check on the failure
+                // path only (not the happy path) so an operator sees an actionable, retention-
+                // specific message instead of a generic CAS-miss guess whenever the real cause is
+                // "this generation aged out and its bytes are gone, by design."
+                var report = await retentionPolicy.ClassifyAsync(ct).ConfigureAwait(false);
+                if (!report.RetainedSnapshotIds.Contains(snapshotId))
+                {
+                    return Results.Json(new
+                    {
+                        error = $"Snapshot '{snapshotId}' has aged out per retention policy — its tree/blob " +
+                                "bytes were reclaimed by the local GC sweep. The generation is still recorded " +
+                                "in history (append-only); it is no longer materializable.",
+                        snapshotId,
+                        repositoryId = snapshot.RepositoryId,
+                        agedOut = true,
+                    }, statusCode: StatusCodes.Status410Gone);
+                }
+
+                return Results.BadRequest(new { error = $"Snapshot '{snapshotId}' has no resolvable tree — it either predates tree-entry capture, or its CAS tree blob is missing/corrupt (TreeFormat={snapshot.TreeFormat ?? "null"})." });
+            }
 
             var fileCount = await materializer.MaterializeAsync(snapshot, targetPath, ct: ct).ConfigureAwait(false);
             return Results.Ok(new
@@ -3842,7 +4118,10 @@ public static class StudioRestEndpoints
                 CreatedAt: workUnit.CreatedAt,
                 UpdatedAt: workUnit.UpdatedAt,
                 Owner: workUnit.Owner,
-                ParentGoalId: workUnit.ParentWorkUnitId);
+                ParentGoalId: workUnit.ParentWorkUnitId,
+                // #1 goal replication — denormalize the work unit's repo so the goal routes to and
+                // replicates through the repo room (peers on the same repo see each other's goals).
+                RepositoryId: workUnit.RepositoryId);
             await goalNodes.RecordAsync(goalNode, ct).ConfigureAwait(false);
 
             return Results.Ok(new
@@ -3927,66 +4206,78 @@ public static class StudioRestEndpoints
                     : parkedWorkUnitIdsByRoot[root] = []).Add(item.WorkUnitId);
             }
 
+            // First-class replicating goals (plans/first-class-goals-and-materialization.md Phase 1):
+            // return stored goals UNION a synthesized goal for every work unit WITHOUT a stored
+            // GoalNode (deduped by WorkUnitId). This was previously either/or — the moment ANY stored
+            // goal existed, the endpoint returned ONLY stored goals and dropped every work-unit-derived
+            // goal, INCLUDING a peer's replicated work units, so one local goal masked all remote goals.
+            // The union guarantees a replicated peer work unit always surfaces regardless of local goals.
             var storedGoals = await goalNodes.ListAsync(ct).ConfigureAwait(false);
-            if (storedGoals.Count > 0)
+            var goals = new List<object>(storedGoals.Count);
+            var coveredWorkUnitIds = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var g in storedGoals)
             {
+                coveredWorkUnitIds.Add(g.WorkUnitId);
+
                 // Terminal work-unit statuses never flow back into GoalStatus anywhere else
                 // (only Pause/Resume set Paused/Exploring), so goal-store goals otherwise report
                 // "Exploring" forever even after their work unit finished. Derive the effective
                 // terminal status here and lazily write it back so the store converges.
-                var goals = new List<object>(storedGoals.Count);
-                foreach (var g in storedGoals)
+                var effectiveStatus = g.Status;
+                if (workUnitById.TryGetValue(g.WorkUnitId, out var wu))
                 {
-                    var effectiveStatus = g.Status;
-                    if (workUnitById.TryGetValue(g.WorkUnitId, out var wu))
+                    var terminal = wu.Status switch
                     {
-                        var terminal = wu.Status switch
-                        {
-                            WorkUnitStatus.Completed or WorkUnitStatus.Merged => GoalStatus.Converged,
-                            WorkUnitStatus.Cancelled => GoalStatus.Abandoned,
-                            _ => (GoalStatus?)null
-                        };
-                        if (terminal is not null && terminal.Value != g.Status)
-                        {
-                            effectiveStatus = terminal.Value;
-                            var corrected = g with { Status = effectiveStatus, UpdatedAt = DateTimeOffset.UtcNow };
-                            await goalNodes.RecordAsync(corrected, ct).ConfigureAwait(false);
-                        }
+                        WorkUnitStatus.Completed or WorkUnitStatus.Merged => GoalStatus.Converged,
+                        WorkUnitStatus.Cancelled => GoalStatus.Abandoned,
+                        _ => (GoalStatus?)null
+                    };
+                    if (terminal is not null && terminal.Value != g.Status)
+                    {
+                        effectiveStatus = terminal.Value;
+                        var corrected = g with { Status = effectiveStatus, UpdatedAt = DateTimeOffset.UtcNow };
+                        await goalNodes.RecordAsync(corrected, ct).ConfigureAwait(false);
                     }
-
-                    parkedReasonByRoot.TryGetValue(g.WorkUnitId, out var parkedReason);
-                    parkedWorkUnitIdsByRoot.TryGetValue(g.WorkUnitId, out var parkedIds);
-                    var orchestratorStalled = g.ParentGoalId is null
-                        && parkedReason is null
-                        && effectiveStatus is not (GoalStatus.Converged or GoalStatus.Abandoned or GoalStatus.Paused)
-                        && !activeRootIds.Contains(g.WorkUnitId);
-                    goals.Add(new
-                    {
-                        goalId = g.GoalId,
-                        goal = g.Goal,
-                        workUnitId = g.WorkUnitId,
-                        branchId = g.BranchId,
-                        status = effectiveStatus.ToString(),
-                        pauseReason = g.PauseReason,
-                        parentGoalId = g.ParentGoalId,
-                        createdAt = g.CreatedAt,
-                        updatedAt = g.UpdatedAt,
-                        hasParkedWork = parkedReason is not null,
-                        parkedReason,
-                        parkedWorkUnitIds = (IReadOnlyList<string>?)parkedIds ?? [],
-                        orchestratorStalled,
-                        // orchestratorProfileId is the legacy name for defaultProfileId — both ship
-                        // until the extension reads the new one (plans/orchestrator-pure-service.md M3).
-                        orchestratorProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null,
-                        defaultProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null
-                    });
                 }
-                return Results.Ok(new { goals, source = "goal-store" });
+
+                parkedReasonByRoot.TryGetValue(g.WorkUnitId, out var parkedReason);
+                parkedWorkUnitIdsByRoot.TryGetValue(g.WorkUnitId, out var parkedIds);
+                var orchestratorStalled = g.ParentGoalId is null
+                    && parkedReason is null
+                    && effectiveStatus is not (GoalStatus.Converged or GoalStatus.Abandoned or GoalStatus.Paused)
+                    && !activeRootIds.Contains(g.WorkUnitId);
+                goals.Add(new
+                {
+                    goalId = g.GoalId,
+                    goal = g.Goal,
+                    workUnitId = g.WorkUnitId,
+                    branchId = g.BranchId,
+                    status = effectiveStatus.ToString(),
+                    pauseReason = g.PauseReason,
+                    parentGoalId = g.ParentGoalId,
+                    createdAt = g.CreatedAt,
+                    updatedAt = g.UpdatedAt,
+                    hasParkedWork = parkedReason is not null,
+                    parkedReason,
+                    parkedWorkUnitIds = (IReadOnlyList<string>?)parkedIds ?? [],
+                    orchestratorStalled,
+                    // orchestratorProfileId is the legacy name for defaultProfileId — both ship
+                    // until the extension reads the new one (plans/orchestrator-pure-service.md M3).
+                    orchestratorProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null,
+                    defaultProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(g.WorkUnitId) : null
+                });
             }
 
+            // Union: synthesize a goal for any work unit lacking a stored GoalNode. With Phase 1's
+            // server-side auto-goal, a root work unit normally already has one; this still covers
+            // legacy pre-fix work units and any root created without going through the goal path.
             var items = await workUnits.ListAsync(branchId: null, ct).ConfigureAwait(false);
-            var fallback = items.Select(wu =>
+            foreach (var wu in items)
             {
+                if (coveredWorkUnitIds.Contains(wu.WorkUnitId))
+                    continue;
+
                 parkedReasonByRoot.TryGetValue(wu.WorkUnitId, out var parkedReason);
                 parkedWorkUnitIdsByRoot.TryGetValue(wu.WorkUnitId, out var parkedIds);
                 // Only meaningful for a root goal (no parent) — a child work unit is never itself
@@ -3995,7 +4286,7 @@ public static class StudioRestEndpoints
                     && parkedReason is null
                     && wu.Status is not (WorkUnitStatus.Completed or WorkUnitStatus.Merged or WorkUnitStatus.Cancelled)
                     && !activeRootIds.Contains(wu.WorkUnitId);
-                return new
+                goals.Add(new
                 {
                     goalId = wu.WorkUnitId,
                     goal = wu.Goal,
@@ -4003,6 +4294,7 @@ public static class StudioRestEndpoints
                     branchId = wu.BranchId,
                     status = wu.Status.ToString(),
                     pauseReason = (string?)null,
+                    parentGoalId = (string?)null,
                     parentWorkUnitId = wu.ParentWorkUnitId,
                     createdAt = wu.CreatedAt,
                     updatedAt = wu.UpdatedAt,
@@ -4013,9 +4305,14 @@ public static class StudioRestEndpoints
                     // Legacy + new name pair — see the goal-store branch above.
                     orchestratorProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(wu.WorkUnitId) : null,
                     defaultProfileId = orchestratorStalled ? agents.GetGoalDefaultProfileId(wu.WorkUnitId) : null,
-                };
-            }).ToList();
-            return Results.Ok(new { goals = fallback, source = "work-units" });
+                });
+            }
+
+            return Results.Ok(new
+            {
+                goals,
+                source = storedGoals.Count > 0 ? "goal-store+work-units" : "work-units"
+            });
         });
 
         // Pause a goal
@@ -4643,6 +4940,16 @@ public static class StudioRestEndpoints
 
     private sealed record ResyncFilesBody(List<ResyncFileEntry>? Files = null, List<string>? DeletedPaths = null);
 
+    // plans/cas-distribution-and-storage.md Phase 2 slice 2.4 — optional; an empty/omitted body or
+    // a null/empty fileScope makes the call a no-op (0 fetched), matching IBlobPrefetchService's
+    // own no-op stance.
+    private sealed record PrefetchScopeBody(IReadOnlyList<string>? FileScope = null);
+
+    // Slice 6.2 — disambiguation resolve body. ChosenRepoId is one of the candidates offered by the
+    // identity GET below, or null/"register-new" to mint a fresh workgroup entry instead (see
+    // IRepositoryRegistryService.ResolveDisambiguationAsync's own doc comment).
+    private sealed record ResolveIdentityDisambiguationBody(string? ChosenRepoId = null);
+
     private static void MapRepositoryEndpoints(WebApplication app)
     {
         // List known repositories (mirrors nm_v1_repository_list) — used by the VS Code extension's
@@ -4725,6 +5032,83 @@ public static class StudioRestEndpoints
             {
                 var repository = await repositories.CloneAsync(body.Url, body.TargetPath, body.Label, ct).ConfigureAwait(false);
                 return Results.Ok(new { repositoryId = repository.RepositoryId, path = repository.Path });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        // Phase 2 slice 2.4 — warms the local blob cache for a declared FileScope ahead of need
+        // (e.g. while connected, before a checkout that will actually require it). repositoryId is
+        // passed straight through to IRepositorySnapshotService.GetLatestAsync, same convention as
+        // the git import/export endpoints below (the snapshot store's key is the physical repo
+        // path, not the registry's opaque id — see WorkspaceCacheManager.GetRepositoryIdAsync's own
+        // comment on that mismatch). No automatic trigger is wired to work-unit creation yet — see
+        // IBlobPrefetchService's own comment; this REST call is the deliberate manual/harness-owned
+        // surface.
+        app.MapPost("/studio/repositories/{repositoryId}/prefetch", async (
+            string repositoryId,
+            PrefetchScopeBody? body,
+            IBlobPrefetchService prefetch,
+            CancellationToken ct) =>
+        {
+            var fetched = await prefetch.PrefetchScopeAsync(repositoryId, body?.FileScope, ct).ConfigureAwait(false);
+            return Results.Ok(new { fetched });
+        });
+
+        // Slice 6.2 — workgroup identity disambiguation surface (docs/STUDIO_ROOM_SCHEMA.md (b),
+        // D1/D2). REST-only per the slice's brief: VS Code UI wiring is explicitly out of scope
+        // (6.4/6.5), this is the acceptance boundary. Reports the current binding outcome for a
+        // registered repository — bound (workgroupRepoId set), pending disambiguation (candidates
+        // offered), or neither yet (workgroup services not wired for this host).
+        app.MapGet("/studio/repositories/{repositoryId}/identity", async (
+            string repositoryId,
+            IRepositoryRegistryService repositories,
+            CancellationToken ct) =>
+        {
+            var repository = await repositories.GetAsync(repositoryId, ct).ConfigureAwait(false);
+            if (repository is null)
+                return Results.NotFound(new { error = $"Repository '{repositoryId}' was not found." });
+
+            return Results.Ok(new
+            {
+                repositoryId = repository.RepositoryId,
+                workgroupRepoId = repository.WorkgroupRepoId,
+                pendingDisambiguation = repository.PendingDisambiguation is null
+                    ? null
+                    : new
+                    {
+                        candidates = repository.PendingDisambiguation.Candidates.Select(c => new
+                        {
+                            repoId = c.RepoId,
+                            label = c.Label,
+                            hints = new { rootShas = c.Hints.RootShas, remotes = c.Hints.Remotes }
+                        })
+                    }
+            });
+        });
+
+        // Resolves a pending disambiguation: body.ChosenRepoId must be one of the offered
+        // candidates' repoId, or null/"register-new" to mint a fresh workgroup entry. A no-op
+        // (200, unchanged) if the repository has no pending disambiguation.
+        app.MapPost("/studio/repositories/{repositoryId}/identity/resolve", async (
+            string repositoryId,
+            ResolveIdentityDisambiguationBody? body,
+            IRepositoryRegistryService repositories,
+            CancellationToken ct) =>
+        {
+            try
+            {
+                var resolved = await repositories.ResolveDisambiguationAsync(repositoryId, body?.ChosenRepoId, ct).ConfigureAwait(false);
+                if (resolved is null)
+                    return Results.NotFound(new { error = $"Repository '{repositoryId}' was not found." });
+
+                return Results.Ok(new { repositoryId = resolved.RepositoryId, workgroupRepoId = resolved.WorkgroupRepoId });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
             }
             catch (InvalidOperationException ex)
             {

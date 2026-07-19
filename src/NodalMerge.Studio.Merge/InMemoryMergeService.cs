@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Storage;
@@ -11,6 +13,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, MergeProposal> _proposals = new();
     private readonly IStudioNodeStore _nodeStore;
+    private readonly IBlobStoreProvider? _blobStore;
     private readonly IFileWorkspaceService _fileWorkspace;
     private readonly WorkspaceOptions _workspaceOptions;
     private readonly IExecutionEventStream _events;
@@ -58,7 +61,9 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         IRepositorySyncService? repositorySync = null,
         ICandidateConflictService? candidateConflicts = null,
         ICandidateConflictResolutionService? candidateConflictResolution = null,
-        ITaskConflictService? taskConflicts = null)
+        ITaskConflictService? taskConflicts = null,
+        // L2.4 — optional: when present, ProposeAsync moves the inlined diff to the CAS content plane.
+        IBlobStoreProvider? blobStore = null)
     {
         _nodeStore                    = nodeStore;
         _fileWorkspace                = fileWorkspace;
@@ -72,6 +77,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         _candidateConflicts           = candidateConflicts;
         _candidateConflictResolution  = candidateConflictResolution;
         _taskConflicts                = taskConflicts;
+        _blobStore                    = blobStore;
     }
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
@@ -80,11 +86,27 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // but the policy-gate-blocked path deliberately proposes straight into Rejected. Forcing Draft
         // here unconditionally used to silently clobber that back to Draft.
         var stored = proposal;
+
+        // L2.4 (plans/room-persistence-bloat.md) — the unified diff is the one repo-scoped payload
+        // that scales with change size, so move its bytes to the CAS content plane (pulled on demand)
+        // and keep only the hash on the replicated node. Only when a blob store exists, the diff is
+        // non-empty, and it isn't already CAS-ref'd (idempotent across re-persists / rehydration).
+        if (_blobStore is not null
+            && !string.IsNullOrEmpty(stored.WorkspaceChanges)
+            && stored.WorkspaceChangesBlobHash is null)
+        {
+            var bytes = Encoding.UTF8.GetBytes(stored.WorkspaceChanges);
+            var hash = BlobHasher.ComputeHash(bytes);
+            await _blobStore.PutBlobAsync(hash, bytes, "text/x-diff", cancellationToken).ConfigureAwait(false);
+            stored = stored with { WorkspaceChangesBlobHash = hash, WorkspaceChanges = null };
+        }
+
         _proposals[proposal.ProposalId] = stored;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.MergeProposalV1,
             stored.ProposalId,
             JsonSerializer.Serialize(stored),
+            stored.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         // Snapshot the target branch's current content as this proposal's base state (S0, 10f).
@@ -124,6 +146,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         if (proposal.SessionId is not null)
@@ -165,6 +188,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         EventBus?.Publish(new ReviewCompletedEvent(
@@ -481,6 +505,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         EventBus?.Publish(new ReviewCompletedEvent(
@@ -752,7 +777,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             && WorkspaceReviewScope.AppliesToRealRepo(owningWorkUnit) && !string.IsNullOrWhiteSpace(writeBackPath))
         {
             await WriteBackToRepositoryAsync(proposal.SourceBranch, writeBackPath, cancellationToken).ConfigureAwait(false);
-            appliedSnapshotId = await BestEffortResyncAsync(writeBackPath, cancellationToken).ConfigureAwait(false);
+            appliedSnapshotId = await BestEffortResyncAsync(owningWorkUnit?.RepositoryId, writeBackPath, cancellationToken).ConfigureAwait(false);
             promotedToDisk = true;
         }
 
@@ -768,7 +793,34 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
+
+        // Phase 4 (plans/first-class-goals-and-materialization.md): when this apply promoted the
+        // integrated state to disk, that snapshot IS the goal's latest final state — stamp it onto the
+        // owning goal's GoalNode.FinalSnapshotId (last apply wins → the true final). Fire-and-forget on
+        // purpose: the stamp is a materialization convenience and must never add latency to the apply
+        // response (an extra repo-scoped node write can be slow on a large room) nor be cancelled when
+        // the caller aborts. Uses CancellationToken.None so it still completes past a client timeout.
+        if (promotedToDisk && !string.IsNullOrEmpty(appliedSnapshotId))
+        {
+            var stampWorkUnit = owningWorkUnit;
+            var stampSnapshotId = appliedSnapshotId;
+            _ = Task.Run(() => TryStampGoalFinalSnapshotAsync(stampWorkUnit, stampSnapshotId, CancellationToken.None));
+        }
+
+        // Integration checkpoint (plans/room-snapshot-checkpoint-redesign.md): a merge landing on
+        // disk is the "last known good" boundary (lines up with a git commit / PR), so mint one
+        // full-room snapshot for the repo room here. This is the ONLY place — besides the disconnect
+        // flush — a full-room snapshot is taken now; per-write durability rides incremental deltas, so
+        // this bounds the delta chain the next hydrate replays. Fire-and-forget on CancellationToken.None
+        // for the same reason as the goal-final stamp above: it must never add latency to the apply
+        // response nor be cancelled when the caller aborts.
+        if (promotedToDisk && !string.IsNullOrWhiteSpace(updated.RepositoryId))
+        {
+            var checkpointRepositoryId = updated.RepositoryId;
+            _ = Task.Run(() => _nodeStore.CheckpointRepositoryRoomAsync(checkpointRepositoryId, CancellationToken.None));
+        }
 
         // A reconciliation work unit's own proposal just landed — generic across every source
         // (see WorkUnit.ReconciliationSourceProposalIds's own doc comment): supersede every
@@ -810,6 +862,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                         StudioNodeKind.MergeProposalV1,
                         sourceProposalId,
                         JsonSerializer.Serialize(supersededProposal),
+                        supersededProposal.RepositoryId,
                         cancellationToken).ConfigureAwait(false);
 
                     if (workUnitsForSupersede is not null && sourceProposal.WorkUnitId is { } sourceWorkUnitId)
@@ -946,6 +999,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                             await _nodeStore.WriteNodeAsync(
                                 StudioNodeKind.MergeProposalV1, proposalId,
                                 JsonSerializer.Serialize(rolledBack),
+                                rolledBack.RepositoryId,
                                 CancellationToken.None).ConfigureAwait(false);
 
                             throw new InvalidOperationException(
@@ -1251,23 +1305,28 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         // Group by resolved write-back path (multi-repo support) so each distinct real repo gets
         // exactly one write-back call sourced from candidate's current composed content, not one
         // per proposal (candidate already additively contains every landed proposal's changes).
-        var byWriteBackPath = new Dictionary<string, List<MergeProposal>>(StringComparer.Ordinal);
+        // Slice 7.2 — also carries a representative RepositoryId per group (any proposal sharing the
+        // same writeBackPath resolved from the same registered repository, so they all carry the
+        // same local-candidate RepositoryId) so BestEffortResyncAsync can resolve the same
+        // workgroup-portable CAS key ResolveWriteBackPathAsync's own repository lookup already used,
+        // instead of re-deriving a possibly-inconsistent key from the raw path alone.
+        var byWriteBackPath = new Dictionary<string, (string? RepositoryId, List<MergeProposal> Proposals)>(StringComparer.Ordinal);
         foreach (var (proposal, owningWorkUnit) in pending)
         {
             var writeBackPath = await ResolveWriteBackPathAsync(owningWorkUnit, cancellationToken).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(writeBackPath))
                 continue; // workspace-only session (no repo attached) — the branch mirror above is the whole promotion
 
-            if (!byWriteBackPath.TryGetValue(writeBackPath, out var list))
-                byWriteBackPath[writeBackPath] = list = [];
-            list.Add(proposal);
+            if (!byWriteBackPath.TryGetValue(writeBackPath, out var group))
+                byWriteBackPath[writeBackPath] = group = (owningWorkUnit?.RepositoryId, []);
+            group.Proposals.Add(proposal);
         }
 
-        foreach (var (writeBackPath, _) in byWriteBackPath)
+        foreach (var (writeBackPath, group) in byWriteBackPath)
         {
             await WriteBackToRepositoryAsync(_workspaceOptions.CandidateBranchId, writeBackPath, cancellationToken)
                 .ConfigureAwait(false);
-            await BestEffortResyncAsync(writeBackPath, cancellationToken).ConfigureAwait(false);
+            await BestEffortResyncAsync(group.RepositoryId, writeBackPath, cancellationToken).ConfigureAwait(false);
         }
 
         // Every pending proposal is now promoted, whether or not it individually resolved a real
@@ -1281,6 +1340,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                 StudioNodeKind.MergeProposalV1,
                 proposal.ProposalId,
                 JsonSerializer.Serialize(updated),
+                updated.RepositoryId,
                 cancellationToken).ConfigureAwait(false);
             promoted.Add(updated);
         }
@@ -1440,7 +1500,10 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                         proposal.WorkUnitId,
                         conflicts,
                         DateTimeOffset.UtcNow,
-                        WinningProposalId: winningProposal?.ProposalId);
+                        WinningProposalId: winningProposal?.ProposalId,
+                        // Slice 6.3a — owningWorkUnit is already resolved above (the losing
+                        // proposal's own owning work unit), so this is a direct copy.
+                        RepositoryId: owningWorkUnit?.RepositoryId);
                     await _candidateConflicts.RecordAsync(conflictRecord, ct).ConfigureAwait(false);
 
                     reconciliationUnit = await TryAutoTriggerReconciliationAsync(conflictRecord, ct).ConfigureAwait(false);
@@ -1472,7 +1535,8 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
                         proposal.WorkUnitId,
                         conflicts,
                         DateTimeOffset.UtcNow,
-                        WinningProposalId: winningSibling?.ProposalId);
+                        WinningProposalId: winningSibling?.ProposalId,
+                        RepositoryId: owningWorkUnit?.RepositoryId);
                     await _taskConflicts.RecordAsync(taskConflictRecord, ct).ConfigureAwait(false);
 
                     reconciliationUnit ??= await TryAutoTriggerTaskReconciliationAsync(taskConflictRecord, ct).ConfigureAwait(false);
@@ -1621,28 +1685,77 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     // anchor the MergeApplied event carries), or null when the CAS layer isn't configured or the
     // refresh failed. A failed or skipped resync must never affect the write-back itself, which
     // already succeeded.
-    private async Task<string?> BestEffortResyncAsync(string writeBackPath, CancellationToken ct)
+    // Phase 4 (plans/first-class-goals-and-materialization.md): stamp the just-applied integrated
+    // snapshot onto the owning goal's GoalNode.FinalSnapshotId so "materialize the goal's final state"
+    // resolves to a single snapshot id. Walks ParentWorkUnitId to the root (GoalId == root WorkUnitId
+    // by convention). Wholly best-effort — the final-snapshot pointer is a materialization convenience,
+    // never a merge invariant, so any failure here is swallowed (the merge already succeeded).
+    private async Task TryStampGoalFinalSnapshotAsync(
+        WorkUnit? owningWorkUnit, string appliedSnapshotId, CancellationToken ct)
+    {
+        try
+        {
+            if (owningWorkUnit is null)
+                return;
+            if (_serviceProvider?.GetService(typeof(IGoalNodeService)) is not IGoalNodeService goals)
+                return;
+            var workUnits = _serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+
+            var root = owningWorkUnit;
+            while (workUnits is not null && root.ParentWorkUnitId is { } parentId)
+            {
+                var parent = await workUnits.GetAsync(parentId, ct).ConfigureAwait(false);
+                if (parent is null)
+                    break;
+                root = parent;
+            }
+
+            var goal = await goals.GetAsync(root.WorkUnitId, ct).ConfigureAwait(false);
+            if (goal is null || goal.FinalSnapshotId == appliedSnapshotId)
+                return;
+
+            await goals.RecordAsync(
+                goal with { FinalSnapshotId = appliedSnapshotId, UpdatedAt = DateTimeOffset.UtcNow }, ct)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // Best-effort — never let a goal-stamp failure surface into the merge that already landed.
+        }
+    }
+
+    private async Task<string?> BestEffortResyncAsync(string? repositoryId, string writeBackPath, CancellationToken ct)
     {
         var isDefaultRepo = string.Equals(writeBackPath, _workspaceOptions.SeedRepositoryPath, StringComparison.Ordinal);
 
         try
         {
+            // Slice 7.2 — resolves the same workgroup-portable CAS key (sticky to any already-
+            // existing chain) RepositorySyncService/RepositoryImportService use for writes, so the
+            // GetLatestAsync read-back below finds what was just written instead of a stale/wrong
+            // key. Falls back to the pre-7.2 Path.GetFullPath(writeBackPath) convention when
+            // _repositories isn't wired at all.
+            var casRepositoryId = _repositories is not null
+                ? await _repositories.ResolveCasIdentityAsync(repositoryId, writeBackPath, ct).ConfigureAwait(false)
+                : null;
+            casRepositoryId ??= Path.GetFullPath(writeBackPath);
+
             if (isDefaultRepo && _repositorySync is not null)
             {
                 // Layer 1 (includes layer 2 internally — RepositorySyncService's own
                 // PostMergeWriteBack path already calls ForceSyncAsync for this repo).
                 await _repositorySync.SyncBranchFromRepositoryAsync(
-                    "main", writeBackPath, SyncTrigger.PostMergeWriteBack, ct).ConfigureAwait(false);
+                    "main", writeBackPath, SyncTrigger.PostMergeWriteBack, ct, repositoryId).ConfigureAwait(false);
             }
             else if (_serviceProvider?.GetService(typeof(IRepositoryImportService)) is IRepositoryImportService import)
             {
                 // Layer 2 only, for non-default repos.
-                await import.ForceSyncAsync(Path.GetFullPath(writeBackPath), writeBackPath, ct).ConfigureAwait(false);
+                await import.ForceSyncAsync(casRepositoryId, writeBackPath, ct).ConfigureAwait(false);
             }
 
             if (_serviceProvider?.GetService(typeof(IRepositorySnapshotService)) is IRepositorySnapshotService snapshots)
             {
-                var latest = await snapshots.GetLatestAsync(Path.GetFullPath(writeBackPath), ct).ConfigureAwait(false);
+                var latest = await snapshots.GetLatestAsync(casRepositoryId, ct).ConfigureAwait(false);
                 return latest?.SnapshotId;
             }
         }
@@ -1685,6 +1798,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             StudioNodeKind.MergeProposalV1,
             proposalId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         if (proposal.WorkUnitId is not null)
@@ -1702,6 +1816,9 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         return updated;
     }
+
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.MergeProposalV1];
 
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {

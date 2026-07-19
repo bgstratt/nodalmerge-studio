@@ -14,6 +14,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// Claude-shaped" requirement) — mirrors one case from ClaudeCodeExecutorHarvestTests.
 /// </summary>
 [Trait("Category", "Integration")]
+[Trait("Requires", "LocalCliProcess")]
 public class CodexCliExecutorHarvestTests : IDisposable
 {
     private readonly string _stubDir = Path.Combine(Path.GetTempPath(), $"codex-harvest-stub-{Guid.NewGuid():N}");

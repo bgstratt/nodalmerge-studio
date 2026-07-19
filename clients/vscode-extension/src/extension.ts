@@ -114,6 +114,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.window.showErrorMessage(`Failed to start local runtime: ${String(err)}`);
       }
     }),
+
+    // Slice 2.3 (plans/cas-distribution-and-storage.md Phase 2) — manual trigger for the CAS
+    // reconcile sweep: pushes whatever the configured blob origin is missing from the local live
+    // blob set. A true no-op (all-zero counts) when nodalmerge.blobOrigin.uri isn't set — the host
+    // endpoint itself handles that case, this command just surfaces whatever it reports.
+    vscode.commands.registerCommand(COMMANDS.RECONCILE_BLOB_ORIGIN, async () => {
+      output.show();
+      try {
+        const res = await fetch(`${manager.hostBaseUrl}/studio/cas/reconcile`, { method: 'POST' });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(`POST /studio/cas/reconcile → ${res.status}: ${text}`);
+        }
+        const result = await res.json() as {
+          scanned: number;
+          alreadyPresent: number;
+          pushed: number;
+          failed: number;
+          missingLocally: number;
+        };
+        output.appendLine(
+          `[NodalMerge] CAS reconcile: scanned=${result.scanned} alreadyPresent=${result.alreadyPresent} ` +
+          `pushed=${result.pushed} failed=${result.failed} missingLocally=${result.missingLocally}`,
+        );
+        const extras: string[] = [];
+        if (result.failed > 0) { extras.push(`${result.failed} failed`); }
+        if (result.missingLocally > 0) { extras.push(`${result.missingLocally} missing locally`); }
+        const suffix = extras.length > 0 ? ` (${extras.join(', ')})` : '';
+        vscode.window.showInformationMessage(
+          `NodalMerge: CAS reconcile complete — pushed ${result.pushed}, already present ${result.alreadyPresent}${suffix}.`,
+        );
+      } catch (err) {
+        vscode.window.showErrorMessage(`NodalMerge: CAS reconcile failed — ${String(err)}`);
+      }
+    }),
   );
 
   const notificationManager = new NotificationManager(
@@ -130,12 +165,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   try {
     await manager.start();
   } catch (err) {
-    const actions = manager.isRemote
-      ? ['Show Output']
-      : ['Show Output', 'Retry'];
+    // The extension always spawns/adopts its own local peer (D4 — no remote-only mode), so a
+    // start() failure is always retryable (e.g. a stale process holding the port).
     const action = await vscode.window.showErrorMessage(
       `NodalMerge Studio failed to connect: ${String(err)}`,
-      ...actions
+      'Show Output', 'Retry'
     );
     if (action === 'Show Output') {
       output.show();

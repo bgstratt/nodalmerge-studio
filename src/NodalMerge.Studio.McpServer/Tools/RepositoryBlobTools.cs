@@ -15,8 +15,20 @@ namespace NodalMerge.Studio.McpServer.Tools;
 public sealed class RepositoryBlobTools(
     IRepositorySnapshotService repoSnapshots,
     IBlobStoreProvider? repoBlobStore = null,
-    IRepositoryOpService? repoOpEmitter = null)
+    IRepositoryOpService? repoOpEmitter = null,
+    // Slice 1.1 — resolves a snapshot's tree map (inline legacy or cas-tree). Null falls back to
+    // direct snapshot.TreeEntries access.
+    ISnapshotTreeResolver? repoTreeResolver = null)
 {
+    private async Task<IReadOnlyDictionary<string, string>?> ResolveTreeAsync(
+        NodalMerge.Studio.Contracts.Domain.RepositorySnapshot? snapshot, CancellationToken ct)
+    {
+        if (snapshot is null) return null;
+        return repoTreeResolver is not null
+            ? await repoTreeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false)
+            : snapshot.TreeEntries;
+    }
+
     [McpServerTool(Name = McpToolNames.RepositoryBlobList), Description("List files in the latest CAS snapshot for a repository. Returns path→blobId entries from the snapshot's tree.")]
     public async Task<string> BlobListAsync(string repositoryId, CancellationToken cancellationToken = default)
     {
@@ -24,7 +36,7 @@ public sealed class RepositoryBlobTools(
         if (snapshot is null)
             return McpJson.Error(McpToolNames.RepositoryBlobList, $"No snapshot found for repository '{repositoryId}'.");
 
-        var entries = snapshot.TreeEntries ?? new Dictionary<string, string>();
+        var entries = await ResolveTreeAsync(snapshot, cancellationToken).ConfigureAwait(false) ?? new Dictionary<string, string>();
         return McpJson.Ok(new { repositoryId, snapshotId = snapshot.SnapshotId, files = entries });
     }
 
@@ -35,7 +47,8 @@ public sealed class RepositoryBlobTools(
             return McpJson.Error(McpToolNames.RepositoryBlobRead, "Blob store is not configured.");
 
         var snapshot = await repoSnapshots.GetLatestAsync(repositoryId, cancellationToken).ConfigureAwait(false);
-        if (snapshot?.TreeEntries is null || !snapshot.TreeEntries.TryGetValue(path, out var blobId))
+        var tree = await ResolveTreeAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        if (tree is null || !tree.TryGetValue(path, out var blobId))
             return McpJson.Error(McpToolNames.RepositoryBlobRead, $"Path '{path}' not found in latest snapshot for repository '{repositoryId}'.");
 
         var result = await repoBlobStore.TryGetBlobAsync(blobId, cancellationToken).ConfigureAwait(false);
@@ -59,7 +72,8 @@ public sealed class RepositoryBlobTools(
         await repoBlobStore.PutBlobAsync(blobId, bytes, "text/plain", cancellationToken).ConfigureAwait(false);
 
         var snapshot = await repoSnapshots.GetLatestAsync(repositoryId, cancellationToken).ConfigureAwait(false);
-        var oldBlobId = snapshot?.TreeEntries?.TryGetValue(path, out var ob) == true ? ob : null;
+        var tree = await ResolveTreeAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        var oldBlobId = tree?.TryGetValue(path, out var ob) == true ? ob : null;
         var kind = oldBlobId is not null
             ? NodalMerge.Studio.Contracts.Domain.OperationType.Replace
             : NodalMerge.Studio.Contracts.Domain.OperationType.Add;
@@ -84,11 +98,12 @@ public sealed class RepositoryBlobTools(
             return McpJson.Error(McpToolNames.RepositoryBlobSearch, "Blob store is not configured.");
 
         var snapshot = await repoSnapshots.GetLatestAsync(repositoryId, cancellationToken).ConfigureAwait(false);
-        if (snapshot?.TreeEntries is null)
+        var tree = await ResolveTreeAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        if (tree is null)
             return McpJson.Error(McpToolNames.RepositoryBlobSearch, $"No snapshot found for repository '{repositoryId}'.");
 
         var matches = new List<object>();
-        foreach (var (path, blobId) in snapshot.TreeEntries)
+        foreach (var (path, blobId) in tree)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var blobResult = await repoBlobStore.TryGetBlobAsync(blobId, cancellationToken).ConfigureAwait(false);

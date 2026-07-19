@@ -8,6 +8,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Slice 6.1b — lets Integration.Tests assert on RoomPeerClient's internal outbound-queue
+         depth without a real WebSocket connection. -->
+    <InternalsVisibleTo Include="NodalMerge.Studio.Integration.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\NodalMerge.Studio.Core\NodalMerge.Studio.Core.csproj" />
     <ProjectReference Include="..\NodalMerge.Studio.Storage\NodalMerge.Studio.Storage.csproj" />
     <ProjectReference Include="..\NodalMerge.Studio.Projections\NodalMerge.Studio.Projections.csproj" />

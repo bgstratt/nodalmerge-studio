@@ -15,6 +15,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// `claude -p --output-format stream-json` run captured 2026-07-12 against claude 2.1.177.
 /// </summary>
 [Trait("Category", "Integration")]
+[Trait("Requires", "LocalCliProcess")]
 public class ClaudeCodeExecutorTests : IDisposable
 {
     private readonly string _stubDir = Path.Combine(Path.GetTempPath(), $"claude-stub-{Guid.NewGuid():N}");

@@ -57,7 +57,7 @@ public sealed class InMemoryRepositoryOpService : IRepositoryOpService, IRehydra
         }
 
         var json = JsonSerializer.Serialize(op);
-        await _nodeStore.WriteNodeAsync(StudioNodeKind.RepositoryOpV1, op.OperationId, json, ct)
+        await _nodeStore.WriteNodeAsync(StudioNodeKind.RepositoryOpV1, op.OperationId, json, op.RepositoryId, ct)
             .ConfigureAwait(false);
         IndexOp(op);
     }
@@ -91,6 +91,9 @@ public sealed class InMemoryRepositoryOpService : IRepositoryOpService, IRehydra
             return Task.FromResult<IReadOnlyList<RepositoryOperation>>(results);
         }
     }
+
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.RepositoryOpV1];
 
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {

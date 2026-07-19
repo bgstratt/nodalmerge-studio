@@ -356,7 +356,9 @@ public class AutomatedReviewGateServiceTests
             new FakeTaskService(),
             deadLetter,
             artifactCommands ?? new FakeArtifactCommandService(),
-            fileWorkspace ?? new FakeFileWorkspaceService());
+            fileWorkspace ?? new FakeFileWorkspaceService(),
+            // L2.4 — no blob store → resolver returns the inline WorkspaceChanges (unchanged behavior).
+            new NodalMerge.Studio.Storage.MergeDiffResolverService());
     }
 
     private sealed class FakeAgentControlService(string autoReviewProfileId) : IAgentControlService

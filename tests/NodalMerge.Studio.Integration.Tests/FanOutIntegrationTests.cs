@@ -46,13 +46,20 @@ public class FanOutIntegrationTests
                 baseUrl: "http://fake-llm",
                 apiKey: "fake-key");
 
-            // Wait for two child work units.
+            // Wait for two child work units AND for both to enter the scheduler pipeline.
+            // Polling only for their existence races the async enqueue: on a slow runner the
+            // children can exist for a beat before their status transitions out of the initial
+            // state, which failed the pipeline assertion below intermittently.
             IReadOnlyList<WorkUnit> children = [];
             var childrenDeadline = DateTimeOffset.UtcNow.AddSeconds(20);
             while (DateTimeOffset.UtcNow < childrenDeadline)
             {
                 children = await workUnits.GetChildrenAsync(parent.WorkUnitId);
-                if (children.Count >= 2) break;
+                if (children.Count >= 2 &&
+                    children.All(c => c.Status is WorkUnitStatus.Queued or WorkUnitStatus.Executing or WorkUnitStatus.Proposed))
+                {
+                    break;
+                }
                 await Task.Delay(100);
             }
             Assert.Equal(2, children.Count);

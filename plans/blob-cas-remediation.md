@@ -1,0 +1,1674 @@
+# Blob/CAS remediation — hardening the blobExpansion surface
+
+Follow-up hardening for the CAS work shipped on nodalmerge branch `blobExpansion`
+(see [cas-distribution-and-storage.md](./cas-distribution-and-storage.md), Phases
+2–6). A max-effort review of `git diff main...HEAD` on that branch surfaced **29
+confirmed defects** plus efficiency and duplication debt. This plan sequences the
+fixes into validate-as-you-go phases and slices so no single change is too large
+to review or roll back.
+
+**Finding #30 was added during Phase 0** (2026-07-16), found by slice 0.4 while
+trying to assert a doc comment's claim — see the map below and slice 1.6.
+
+## Status — **PLAN COMPLETE 2026-07-17 except deferred Phase 8**
+
+Every correctness, robustness, migration, runtime, and cleanup slice is done — all 30
+findings closed. Every slice shipped RED-first with the RED independently reproduced
+(revert or sabotage) before commit. The only remaining work is Phase 8 (CI coverage,
+deferred by decision), whose case has been building all plan long: **13 logged
+instances** of tests/paths that CI silently didn't cover.
+
+- [x] Phase 0 — Reproduce-first scaffolding — complete 2026-07-16
+- [x] Phase 1 — GC data-loss & the crash — complete 2026-07-17 (1.2 last: `e4e76808`)
+- [x] Phase 2 — Non-hydrating (S3) backend correctness — complete 2026-07-17 (2.4 last: `b5137032`)
+- [x] Phase 3 — Blob integrity & cross-runtime interop — complete 2026-07-16 (3.4: `8fc3f776`)
+- [x] Phase 4 — HTTP-surface robustness & backward compat — complete 2026-07-16 (`6d2ec2a4`, `fb3bf095`, `f5867ef6`)
+- [x] Phase 5 — Migration safety — complete 2026-07-16 (`3bc843d8`)
+- [x] Phase 6 — Runtime, async-safety & efficiency — complete 2026-07-17 (6.5 last: NM `509d5b85` + ST `86e57cb`)
+- [x] Phase 7 — Duplication & altitude cleanup — complete 2026-07-17 (7.5 `e9439a75`, 7.1+7.3 `65edcde4`, 7.2+7.4 `ceb5db53`)
+- [ ] **Phase 8 — CI coverage (DEFERRED)** — the one remaining phase. The interim stub
+  convention worked (every slice added its own steps), but the 13-bite ledger says the
+  audit + 8.1's meta-test are worth scheduling.
+
+## Guiding principles
+
+1. **One plan, two repos.** Nearly all fixes land in **nodalmerge** (`server/**`,
+   `hosts/dotnet/**`, `core/**`); a few are **studio**-side (`StudioInboundPackObserver`,
+   the `WorkUnitStatus` enum, GC live-source composition). Each slice is tagged
+   **[NM]**, **[ST]**, or **[BOTH]**.
+2. **Don't change nodalmerge just for studio.** A nodalmerge change is in scope only
+   when it fixes a system-wide correctness/robustness problem (data loss, crash,
+   contract divergence) that any consumer would hit — not to paper over a studio
+   need. Where a fix is purely studio's, it stays in studio.
+3. **Preserve nodalmerge backward compatibility.** nodalmerge shipped `0.2.0` on
+   `main`; external hosts consume its wire surface and its .NET package APIs. Prefer
+   additive changes, keep frozen HTTP contracts and response shapes, and where a
+   guard must tighten, **warn-don't-throw** on config that used to work. Slices that
+   knowingly touch a compat boundary carry a **⚠ compat** note. Internal server
+   trait changes (not on the wire, not in a published surface) are fair game.
+4. **Studio is greenfield.** studio (`0.x`, pre-release) can take breaking changes
+   freely — lean on that to fix things at the right altitude rather than bolting on
+   compatibility shims studio doesn't need yet.
+5. **Reproduce before fixing.** Every correctness slice starts by adding a test that
+   fails against today's code, then makes it pass. Phase 0 builds the shared
+   harnesses the later phases reuse so this is cheap.
+6. **Slices are independently shippable.** A slice = one reviewable PR with its own
+   validation gate. Phases order by severity and dependency; within a phase, slices
+   are mostly parallelizable unless a dependency is noted.
+
+## Finding → slice map
+
+| # | Finding (short) | Repo | Slice |
+|---|---|---|---|
+| 1 | `Composite`/Postgres/Mongo don't forward `known_room_ids` → cold-room blobs deleted | NM | 1.1 |
+| 2 | new coordinator live set is `studio/`-only → non-studio SetBlob blobs swept | NM | 1.2 |
+| 3 | `S3BlobStore::blob_gc_sweep` ignores grace + skips inventory | NM | 1.3 |
+| 5 | `sweep_blobs` races hydrating rooms / post-snapshot write-through | NM | 1.4 |
+| 9 | `tree_walk` unbounded recursion → stack-overflow process abort | NM | 1.5 |
+| 10 | `tree_walk` via `get_blob`=None on S3 → GC fails closed forever | NM | 2.2 |
+| 7 | archive export/digest/hydration silently drop `get_blob`=None on S3 | NM | 2.3 |
+| — | .NET HEAD/PUT-idempotency full-read → remote hydration (existence probe) | NM | 2.1 |
+| — | WS blob-request fallthrough has no persistence fallback (latent) | NM | 2.4 |
+| 4 | `BlobCompression.TryDecompress` rejects Rust zstd frames (no content-size) | NM | 3.1 |
+| 13 | identity-path reads unverified; encoded pass-through unverified | NM | 3.2 |
+| 6 | s3-direct client zstd default-on; web/wasm readers can't decode | ~~BOTH~~ NM | 3.3 |
+| — | `Accept-Encoding: zstd;q=0` treated as accept (both hosts) | NM | 3.4 |
+| — | .NET PUT ignores `Content-Encoding` (Rust 415) — parity gap | NM | 3.4 |
+| 12 | legacy `/sync/blob-url` breaking changes vs `main` | NM | 4.1 |
+| 8 | `put_blob` returns 201 + Active inventory despite failed persist | NM | 4.2 |
+| — | `BlobHttpOptions` no `Validate()`; negative `MaxBlobBytes` → 500/413 | NM | 4.3 |
+| — | root-relative request URIs drop `BaseUrl` path prefix | NM | 4.3 |
+| — | `S3DelegatedBlobOptions` dropped `PutPath`/`GetPath` w/o startup guard | NM | 4.3 |
+| 15 | capability-profile `limits` now profile-supplied, no hard-ceiling clamp | NM | 4.4 |
+| — | Rust migration writes `.layout-v2` marker despite skipped rooms | NM | 5.1 |
+| — | .NET migration re-quarantines `.migration-skipped`; `.tmp` leak; `SanitizeHash` mangles | NM | 5.2 |
+| 11 | s3-blobs per-op thread+Runtime+timeout-less recv; delegate no timeout | NM | 6.1 |
+| — | blocking blob I/O + BLAKE3 hashing on async workers (no `spawn_blocking`) | NM | 6.2 |
+| — | per-hash autocommit GC upserts (100k txns); sequential S3 deletes (N+1) | NM | 6.3 |
+| — | sweep reloads full room history/tick; studio-map replay/run; fresh visited-set/snapshot | NM | 6.4 |
+| — | inbound-pack observer awaited inline in WS receive loop | BOTH | 6.5 |
+| — | `server-s3` CLI/wiring copy; circuit-breaker ×3; date-arith ×2; canonical-hash/s3-key/bridge dup | NM | 7.1–7.3 |
+| — | `_global` vs `default` delegate room-id divergence (unfrozen) | NM | 7.4 |
+| — | GC coordinator hard-wires studio live-source into generic server crate (altitude) | NM | 7.5 |
+| 14 | `WorkUnitStatus` ordinals hand-mirrored, unpinned by any vector (latent) | BOTH | 0.4 |
+| 30 | `Failed` retention-aged as terminal despite a legal `Failed`→`Cancelled`→`Queued` revival path | BOTH | 1.6 |
+
+---
+
+## Phase 0 — Reproduce-first scaffolding
+
+Builds the shared test surfaces the later phases assert against. No production
+behavior changes. Ship these first so every subsequent slice can open with a
+failing test.
+
+### 0.1 — Cross-runtime zstd fixture **[NM]**
+A golden fixture of a zstd frame produced by Rust `zstd::stream::encode_all` (the
+at-rest encoder) and one by .NET `ZstdSharp.Compressor.Wrap`, each decoded by the
+**other** runtime. This is currently untested — every `.zst` interop test is
+same-runtime, which is exactly why finding #4 shipped. Land the fixtures + a RED
+test that decodes the Rust frame in .NET (fails today).
+- **Validation:** RED test committed and failing, referenced by 3.1.
+
+### 0.2 — Non-hydrating backend conformance harness **[NM]**
+A fake `BlobPersistence`/`IBlobStoreProvider` whose `get_blob`/point-read always
+returns `None`/Missing (mirroring `S3BlobStore`), plus a conformance suite exercising
+GC live-set, archive export, tree-walk, and HEAD/existence against it. Reproduces
+findings #7, #10, and the 2.1 existence-probe gap in one place.
+- **Validation:** suite compiles; the S3-seam assertions fail today (become the
+  gates for Phase 2).
+
+### 0.3 — GC data-loss regression suite **[NM]**
+Five scenarios, each a RED test: (a) cold-room blob survives a sweep, (b)
+inventory-referenced-but-not-yet-in-DAG blob survives, (c) `blob_gc_sweep` honors a
+non-zero grace on the S3 path, (d) a blob write-through during a still-hydrating
+room survives, (e) a `Failed` work unit's blobs survive retention age-out, since
+`Failed` has a legal revival path (finding #30 — gates 1.6). These become the
+acceptance gates for Phase 1.
+- **Validation:** all five fail against current code.
+
+### 0.4 — Pin the hand-mirrored contracts **[BOTH]** (finding #14)
+Freeze what the review found unpinned: a `WorkUnit` payload vector carrying real
+`WorkUnitStatus` ordinals + PascalCase casing, asserted by **both** the studio C#
+enum ([WorkUnit.cs](../src/NodalMerge.Studio.Core/…/WorkUnit.cs)) and the Rust
+consumer (`nodalmerge:server/server/src/studio_live_hashes.rs:96`). Add a
+cross-repo parity check so a future enum reorder breaks CI, not production GC.
+Likewise pin the delegate room-id placeholder (defer the value decision to 7.4;
+here just add the vector slot).
+- **Validation:** reordering the C# enum locally makes the new vector test fail.
+- **Note:** studio owns the enum; nodalmerge owns the parser. The vector file is the
+  shared contract — put it where the existing frozen vectors live in nodalmerge and
+  have studio's test read it.
+
+---
+
+## Phase 1 — GC data-loss & the crash (P0)
+
+The highest-severity cluster: five paths that can permanently delete live blobs, and
+one remotely-reachable process abort. Everything here fails **closed** — when the
+system can't prove a blob is dead, it must not delete it.
+
+### 1.1 — `known_room_ids` completeness + fail-closed global sweep **[NM]** (#1) — ✅ **DONE 2026-07-16** (`a4c4a694`)
+**As shipped:** `can_enumerate_rooms()` defaults `false`; `sweep_blobs` refuses the
+**entire** two-phase sweep (warn + `nodalmerge_blob_gc_skipped_total{reason="cannot_enumerate_rooms"}`
++ 0 deletions) when it is false — not just the physical delete, since tombstoning against a
+known-incomplete live set still starts a deletion clock on possibly-live blobs. Verified no
+production impl is left behind: `Composite` forwards, `Dir`/`Postgres`/`Mongo` return `true`,
+`NoPersistence` is short-circuited by the pre-existing `is_durable()` check. A not-enumerable
+stub test was added alongside 0.3(a), which only covered the forwarding half.
+⚠ **Residual risk — see the CI follow-up below.** The guard makes *absent* enumeration safe, but
+Postgres/Mongo now assert `can_enumerate_rooms() == true`, which tells the sweep to **trust** their
+`known_room_ids()` and delete. A broken/empty result from those queries reintroduces #1's data loss
+*with the guard vouching for it* — and **no CI step runs the Postgres or Mongo suites**. Those two
+impls are the safety-critical path and are covered only by local Docker runs today.
+`nodalmerge:server/server/src/store.rs:291`. The trait default returns an empty
+`Vec`; `Composite<N,B>` (the production server-s3 wiring) doesn't forward it, and
+`PostgresNodeStore`/`MongoNodeStore` never implement it — so the global sweep treats
+"no enumerable rooms" as "no cold rooms have blobs."
+- Forward `known_room_ids` through `Composite`; implement it on the Postgres and
+  Mongo node stores.
+- **Altitude fix:** stop treating an empty enumeration as authoritative. Add a
+  capability signal (e.g. `can_enumerate_rooms()`), and make the global sweep
+  **refuse to delete** (log + skip) when the backing store can't enumerate, rather
+  than deleting everything not resident. The empty default becomes safe by
+  construction.
+- **Validation:** 0.3(a) passes on `Composite`+S3 and on a store stubbed to
+  not-enumerable.
+- ⚠ compat: internal trait surface only — no wire/package break.
+
+### 1.2 — New coordinator live set unions room-DAG blobs **[NM]** (#2) — ✅ **DONE 2026-07-17** (`e4e76808`) — **PHASE 1 COMPLETE; ALL CORRECTNESS PHASES (0–6) DONE**
+- **Shipped:** `RoomDagLiveHashCollector` (room.rs) **delegates to 6.4's cached
+  `collect_global_live_blob_hashes`** — semantics verified as a strict additive
+  superset of every-SetBlob-referenced-hash (resident-hydrated via incremental
+  StateGraph refs; cold + resident-unhydrated per 1.4 via version-keyed cached
+  replay; plus 1.3's upload window); no second scan built, 6.4's cache-equivalence
+  coverage carries over unchanged. `None → Err`, never `Ok(empty)` —
+  sabotage-proven fail-closed (the new blob_gc test is the only one that can catch
+  that mapping). Binaries wire `UnionLiveHashCollector::new([studio, room_dag])`
+  — 7.5's seam, both server-s3 arms; dev-server spawns no GC.
+- **Validation met:** the 0.3(b) RED — ignored since Phase 0, verified still
+  failing during 7.5's check — is un-ignored and passes: studio_gc **13/0
+  ignored**, blob_gc 13. Tests strengthened only: `production_live()` (the
+  binaries' exact union) used precisely where the production live set IS the claim
+  (the RED, the reclaim gate — proving 1.2 added protection, not
+  everything-live-forever — and the fail-poison ledger test); studio-only kept
+  elsewhere so a DAG contribution can't mask a classification regression.
+- **Inherited fail-opens NOT absorbed** (recent-upload inventory read;
+  Postgres/Mongo `known_room_ids` warn+empty) — both already on the one-decision
+  ledger; no new instance added.
+- **CI: zero edits needed** — first slice of the plan where every touched file
+  already fired a covering workflow. One stale step-name comment fixed.
+
+### 1.3 — S3 sweep honors grace + consults inventory **[NM]** (#3) — ✅ **DONE 2026-07-16** (`043df73d`)
+
+**As shipped.** Real two-phase grace on S3, tombstones as bucket objects at
+`<prefix>.tombstones/blake3/<hex>.<unix_millis>` — a sibling of `<prefix>blake3/` (never
+enumerated by the blob listing), keyed by bare hex so one tombstone covers `<hex>` and
+`<hex>.zst`. Branch-for-branch `DirPersistence`'s semantics. The bucket-versioning premise is
+**deleted, not preserved** (it was off by default, never checked or set by the crate, the
+comment invited operators to disable the one thing standing in for grace, a noncurrent version
+isn't re-linked when a blob becomes live again, and it silently no-op'd 1.4's floor).
+Versioning remains a fine *backstop*; it is no longer load-bearing.
+
+> **The tombstone time lives in the KEY, not in the object's `last_modified`.** `last_modified`
+> is the **bucket's** clock while `grace` is measured against **this process's**; skew in the
+> unsafe direction (bucket behind) deletes early — exactly the failure this slice exists to
+> prevent. Writing the time into the key means one clock both writes and compares it, and costs
+> one LIST instead of a GET per candidate. A clock stepped back reads as age 0
+> (`saturating_sub`) → wait, never delete. Worth remembering: **the obvious implementation
+> (ask the bucket when the tombstone was written) is the unsafe one.**
+
+**`blob_upload_grace` = 3600s (1h).** **DECIDED 2026-07-16 (user).** The window bounds
+**bytes-exist → referenced-by-a-CRDT-op** — i.e. *client latency*. It is **not the presign
+TTL**, and that is the whole subtlety: both upload paths stamp `last_seen_at` at the moment
+the bytes exist (`blob_http.rs:406` after `verify_uploaded`, `:510` after the hash check), so
+`presign_put_ttl` (15 min) bounds the interval that **ends before this one starts**. The plan's
+original "ideally tied to the presign TTL" instinct conflated two intervals and would have
+reclaimed legitimate slow uploads. 1h coincides with `presign_get_ttl` — a coherent story
+("the longest URL we'd hand out") — but is chosen on its own merits. **Any finite window bounds
+retention** (disk ≈ upload rate × window), so this is a "how slow a client do we tolerate"
+call, not a safety-vs-unbounded one.
+
+> **The knob is on `Rooms`, NOT on `S3BlobStoreConfig`** — a deliberate deviation from this
+> section's original wording, and the right one. `S3BlobStore` has no inventory handle, and the
+> union is on the *server-side legacy live set*, so a field on the S3 config would be read by
+> nothing: **dead config that looks like a knob, on a P0 data-loss path.** On `Rooms` it also
+> protects `DirPersistence` deployments, whose anonymous `PUT /blobs/{hash}` writes the same
+> `Active` rows. Config-struct-only; no CLI surface (7.1's shared bootstrap module owns that).
+
+> **The unbounded-retention hole was shipped on purpose to prove the gate catches it.** With the
+> `last_seen_at` cutoff removed (a naive union of every `Active` row), **exactly one test
+> failed** — `blob_gc_reclaims_unreferenced_upload_once_upload_window_elapses`. The *protection*
+> test passed happily. Reproduced independently before accepting the slice. This is the plan's
+> "without it, this hole ships silently and looks like a fix", made visible: **the reclaim gate,
+> not the protection gate, is what proves you didn't just make everything live forever.**
+
+**Trap 1 (the gate hazard) was avoided, not sidestepped.** The real backend was fixed **first**
+and is asserted by three bucket-touching MinIO tests, verified RED against the *unmodified*
+`S3BlobStore` and a real `minio/minio:latest` container (*"first sighting must only tombstone,
+never delete"*, left: 1, right: 0). The `blob-conformance` fake was then brought back into
+agreement — **updated, not deleted** (deleting it would have taken 0.3(c) and the relay suites'
+S3-shaped fake with it). Its doc now states outright that it can only gate a *copy*, names the
+three MinIO tests as the real gates, and says: *"if this port and `S3BlobStore` ever disagree,
+the MinIO tests are right and this file is wrong."*
+
+**CI:** new `.github/workflows/blob-s3-gc-minio.yml` (`minio_round_trip.rs` previously ran in
+**zero** workflows — the test this slice's correctness rests on). Fail-open closed with
+`NODALMERGE_REQUIRE_DOCKER=1`, verified both directions against a bogus image tag: **without it,
+4 passed while testing nothing.** Also added `gc_store.rs` to `blob-layout-parity.yml`'s
+`paths:` — `blob_gc.rs` now drives a real `SqliteGcStore` and that file could not previously
+trigger the workflow (**fifth** instance of that bite).
+
+**Gates:** `blob_gc` 9 passed/1 ignored → **12 passed / 0 ignored**; MinIO **4 passed**.
+
+**Carried over knowingly (not regressions):**
+- **`collect_recent_upload_hashes` fails *open*** on an inventory read error (`warn!` + empty
+  set), so a transient SQLite error un-protects recent uploads for that tick. Same "a failed
+  query is indistinguishable from an empty result" shape already filed against `known_room_ids()`
+  on Postgres/Mongo — it wants **one** decision across all three, not three. See follow-ups.
+- **1.4's "time as a proxy for call count" gap** applies verbatim to the S3 port: the guarantee
+  is stated in ms but the invariant needed is *two separate sightings*, and nothing enforces
+  separateness. Now in two places; if the sweep cadence ever tightens, both need the same
+  "tombstone must predate this call" hardening.
+- **Two concurrent sweeps can leave two tombstone keys for one hash** — handled fail-closed (age
+  by the *newest* → smallest age → never delete early; all keys removed when the blob goes).
+  No cross-process sweep lock exists; strictly safer than the previous behavior.
+- **`iter_unmarked_candidates` is the only enumeration on `AssetInventoryStore`**, so the union
+  calls it with a sentinel run id to mean "all non-Deleted rows". Works, reads/writes nothing,
+  but is a load-bearing use of a method named for another purpose; an `iter_active_since(cutoff)`
+  would be cleaner. A *defaulted trait method* was deliberately **not** added — that is exactly
+  2.1's `RemoteBlobLinkAggregator` trap (a default that compiles, answers correctly, and hides a
+  missing override).
+
+**Original section text follows.**
+`nodalmerge:server/s3-blobs/src/lib.rs:524`. `blob_gc_sweep` binds `_grace` and
+never reads it (single-pass immediate delete), and the legacy live set never consults
+the gc-inventory `Active` rows written by the upload-confirm path.
+- Implement a real two-phase grace (tombstone/pending-delete then delete-after-grace)
+  for the S3 backend, matching the Dir backend's semantics. Do **not** rely on bucket
+  versioning as the implicit grace period — make it explicit.
+- Union inventory `Active` rows into the live set on the legacy path so a
+  confirmed-but-not-yet-referenced upload is protected. ⚠ **The union MUST be
+  time-bounded** — see the retention hazard below.
+- ⚠ **This slice can create an unbounded-retention hole. Do not union naively.**
+  Liveness today is decided *per-run by marking*, not by the `state` column:
+  `gc_store.rs:257` selects candidates `WHERE state != 'Deleted' AND
+  (last_marked_run_id IS NULL OR last_marked_run_id != ?1)`. The PUT/confirm path
+  (`blob_http.rs:406,510`) stamps `last_marked_run_id = "upload"` (`UPLOAD_MARK_SENTINEL`),
+  a value no real run id ever equals — so an unreferenced upload is unmarked on the next
+  run and correctly reclaimed. **`state = 'Active'` is inventory bookkeeping, not
+  protection.** If this slice unions *all* `Active` rows into the live set, it converts
+  that sentinel into permanent protection and every anonymous PUT becomes live forever —
+  unbounded disk growth from an unauthenticated endpoint (blob PUT is anonymous by
+  default; see 1.5's note, where auth was deliberately left optional).
+  **Required design:** protect only `Active` rows whose `last_seen_at` falls inside a
+  bounded upload window (a new `--blob-upload-grace`-style knob, defaulting to something
+  like the presign TTL), so the presign→confirm→`SetBlob` race is covered without
+  granting permanent liveness. An upload that is never referenced within the window must
+  become reclaimable again.
+  - **Add a test:** an `Active`-but-never-referenced upload is reclaimed once the upload
+    window elapses. Without it, this hole ships silently and looks like a fix.
+- **Validation:** 0.3(c) passes; a presign+confirm-then-delayed-reference sequence
+  survives a sweep tick.
+- ⚠ **Gate hazard — read before starting.** 0.3(c) runs against
+  `NonHydratingBackend::blob_gc_sweep` in `server/stores/blob-conformance`, which is a
+  deliberate **byte-for-byte port of today's buggy `S3BlobStore::blob_gc_sweep`**, so
+  the scenario can run without Docker. It therefore gates a *copy* of the bug, not the
+  bug. Making 0.3(c) green by editing the fake **ships data loss behind a green test**.
+  This slice is not done until: (1) the real `S3BlobStore` two-phase grace is asserted
+  by a MinIO/testcontainers test (extend `server/s3-blobs/tests/minio_round_trip.rs`),
+  and (2) the fake's `blob_gc_sweep` override is updated to match the fixed backend —
+  or deleted, if the real test subsumes it. Do not treat the un-ignore of 0.3(c) as
+  sufficient evidence.
+
+### 1.4 — `sweep_blobs` hydration/write-through race **[NM]** (#5) — ✅ **DONE** (`20aaba88` + `043df73d`)
+
+> ✅ **The 1.4↔1.3 coupling is RESOLVED (2026-07-16).** 1.4 shipped half-done — its
+> `MIN_PHYSICAL_GRACE` floor was a **total no-op on S3**, because `S3BlobStore::blob_gc_sweep`
+> bound `_grace` and never read it. **1.3 (`043df73d`) made S3 honor grace, so the floor is now
+> genuinely effective on both paths** — verified end-to-end against a real MinIO bucket
+> (`s3_min_physical_grace_floor_is_effective_end_to_end` drives the production wiring with
+> `--blob-gc-grace 0`; it failed pre-1.3 with *"the S3 path must still never delete on first
+> sighting"* and now tombstones first and deletes only on a second, separate sweep). **Observed,
+> not traced.** The ⚠️ callout below is kept for the record — read it as history, not status.
+>
+> **Worth keeping as a lesson:** 1.4 was reported as complete, and its own Validation line was
+> satisfiable, while the bug it fixed remained fully open on the backend most likely to be in
+> production. A fix that is a no-op one layer down still passes every test written at its own
+> layer.
+
+**As shipped.** Bug 1 (hydration race): `Room::hydrated` (`AtomicBool`, set only after every
+hydration stage publishes graph/blobs/lineage) now gates the resident-scan exemption; a
+still-hydrating room falls through to the cold-room scan. Bug 2 (write-through window):
+`MIN_PHYSICAL_GRACE = 1ms` floors the grace handed to `blob_gc_sweep`, so a first sighting only
+ever tombstones and deletion waits for a later, separate sweep call.
+
+> ⚠️ **1.4 ↔ 1.3 coupling — bug 2 is still fully open on S3.** `MIN_PHYSICAL_GRACE` protects the
+> **`DirPersistence` path only**. `S3BlobStore::blob_gc_sweep` (`server/s3-blobs/src/lib.rs:524`)
+> binds `_grace` and never reads it — it is *deliberately* single-phase, on the documented premise
+> that "S3 object versions act as their own grace period, and operators who want hard-delete can
+> disable versioning." So the floor is a **no-op** there, not partial protection. This is not a
+> defect in 1.4: this section's own text already said "…or the S3 path (which 1.3 makes
+> grace-honoring)." But it means **1.4's Validation line is satisfied only for `DirPersistence`,
+> and Phase 1 is not actually closed on the S3 path until 1.3 ships.** Do not read 1.4's ✅ as
+> "the write-through race is fixed."
+>
+> Two things for 1.3 to absorb: (a) that versioning premise holds *only while versioning is
+> enabled*, and the comment actively invites operators to disable it for hard-delete — which
+> silently opts out of the only thing standing in for grace; (b) `NonHydratingBackend::blob_gc_sweep`
+> (`server/stores/blob-conformance/src/lib.rs:125`) is a byte-for-byte port of the same
+> `_grace`-ignoring bug. **That is the 0.3(c) gate hazard already flagged in this plan: it gates a
+> *copy* of the bug, so green there is not evidence.**
+
+**Bug 2 shipped untested against its own regression, then was covered.** 0.3(d) reproduces bug 1
+only (a persisted-before-process-start node; no live write-through during the test), so the
+implementing agent verified bug 2 by hand-tracing `store.rs` alone and said so. Added
+`blob_gc_zero_grace_never_deletes_on_first_sighting`, which does **not** try to test the race by
+racing — a test spawning threads to hit the window between snapshot and sweep would be flaky and
+prove little. It pins the *observable invariant the fix establishes*, which is deterministic and
+concurrency-free: with `grace == 0`, the first sweep must return 0 and leave the bytes on disk; a
+second, separate sweep deletes. RED-proven against the single line under test.
+
+> **Convention worth reusing:** when a fix closes a race, look for the deterministic invariant the
+> fix *establishes* and pin that, rather than trying to reproduce the interleaving. Racing the race
+> makes a flaky test that proves little; asserting "never on first sighting" proves exactly the
+> property that closes the window.
+
+**Known weakness (assessed, not fixed).** The guarantee is stated in **time** (1ms) but the
+invariant actually needed is **two separate sightings**. Nothing in `sweep_blobs` enforces
+separateness — it works only because no caller invokes it twice within 1ms (true in production,
+where the sweeper interval is seconds; true incidentally in tests, via real disk I/O between
+calls). A "first sighting only tombstones" check — consult the tombstone's existence *before*
+creating it, and allow same-call deletion only when the tombstone predates this call — would encode
+the real invariant instead of using wall-clock as a proxy for call count. Not wrong today; worth
+hardening if the sweep cadence ever tightens.
+
+**Original section text follows.**
+`nodalmerge:server/server/src/room.rs:644`. A still-hydrating resident room is treated
+as "covered" (its persisted scan skipped) while its in-memory graph is empty; and a
+blob persisted via write-through after the live snapshot isn't in the set.
+- Only skip the persisted scan for **fully-hydrated** resident rooms; a room still
+  replaying its background-spawned hydration must fall through to the cold-room scan
+  (or the sweep must wait on a hydration barrier).
+- Close the write-through window: either take the live snapshot under the same guard
+  that admits new blobs, or extend grace/tombstone coverage so a blob written after
+  the snapshot is never same-tick deleted regardless of `--blob-gc-grace 0` or the S3
+  path (which 1.3 makes grace-honoring).
+- **Validation:** 0.3(d) passes, including with `--blob-gc-grace 0`.
+
+### 1.5 — Bound the tree walk (stop the crash) **[NM]** (#9) — ✅ **DONE 2026-07-16** (`ef693f39`)
+**As shipped:** iterative heap work-stack **and** a `MAX_TREE_DEPTH = 4096` cap returning
+`TreeWalkError::TooDeep`. **Both were required, despite this section's "or" phrasing** — the
+work-stack removes the OS-stack dependence (the crash), but alone it would let an arbitrarily deep
+chain *succeed slowly* rather than fail closed, which the Validation line requires. If this plan is
+reused as a template, tighten that wording. Pre-fix crash independently reproduced against the
+recursive `walk_one` (`STATUS_STACK_OVERFLOW`, exit `0xc00000fd`, no output before the abort), so
+the RED state is an observation, not an inference. Tests: `server/server/tests/tree_walk_depth.rs`
+(50k-deep chain on a 256 KiB-stack thread → `TooDeep`; a 300-deep chain must still succeed, guarding
+against an over-aggressive cap).
+`nodalmerge:server/server/src/tree_walk.rs:133`. `walk_one` recurses once per
+directory level with no depth bound; a chain of distinct single-entry tree blobs
+(uploadable via anonymous PUT) overflows the worker stack and aborts the process.
+- Convert to an explicit work-stack (iterative) or enforce a hard depth/node-count
+  cap, returning `TreeWalkError` (fail-closed, run recorded Failed) instead of
+  recursing without limit.
+- Track the anonymous-PUT exposure separately (see note) — the depth bound is the
+  crash fix and does not depend on auth.
+- **Validation:** a synthetic deep-chain fixture that aborts the server today returns
+  a clean `Err` after the fix; add it to the GC suite.
+- **Note — anonymous PUT (`BlobHttpConfig` default `auth_token: None`). DECIDED
+  2026-07-16 (user): auth stays optional.** Rationale, recorded so it isn't relitigated:
+  content-addressing already supplies the integrity properties auth is usually reached
+  for. PUT verifies the body against the path hash (`blob_http.rs:497`,
+  `Hash::of(&body) != path_hash` → 422), so an anonymous writer cannot forge bytes at a
+  chosen hash, cannot overwrite an existing blob with different content, and cannot
+  poison a hash another room depends on. Oversize bodies are already 413'd by the body
+  limit. And unreferenced uploads are reclaimed by the normal mark/sweep (see 1.3) — so
+  spam is bounded by the GC interval + grace, not permanent.
+  This holds **only while 1.3's inventory union stays time-bounded.** If 1.3 ever grants
+  `Active` rows unconditional liveness, anonymous PUT becomes an unbounded disk-growth
+  vector and this decision must be revisited. The two are coupled; 1.3 carries the
+  matching warning.
+  Operators wanting authorization set `auth_token`; deployments needing more can front
+  the surface. Do not couple any of this to the crash fix.
+
+### 1.6 — `Failed` is not terminal **[BOTH]** (#30 — found during 0.4) — ✅ **DONE 2026-07-16** (`5664c2b1` + studio `58d9a5c`)
+**As shipped:** `Failed` dropped from `TERMINAL_STATUSES`; doc comment corrected; 0.3(e)
+un-ignored as written; the vacuous sibling given a unique bootstrap tree (proved non-vacuous by
+disabling seed-protection → both tests RED → revert → both green).
+**The load-bearing part was NOT the [NM] one-liner.** studio's
+`WorkUnitStatusVectorTests.cs` bound `terminal_status_names` to `_` — because **0.4 deleted the
+assertion that used it, precisely because that assertion FAILED**, which is how #30 was found.
+1.6 fixed the root cause, so the assertion became true and was **restored**
+(`Every_terminal_status_has_zero_outgoing_transition_edges`, driven off the vector file, with an
+`Assert.NotEmpty` vacuity guard and a `DO NOT DELETE` remark).
+**Why it matters:** nodalmerge's own pin is **circular** — 1.6 edited both Rust `TERMINAL_STATUSES`
+and the vector's `terminal_status_names`, and `terminal_status_ordinals_match_frozen_constants`
+only checks the two mirror each other. Both live in nodalmerge, so it passes for *any* terminal set.
+The studio-side edge assertion is the **only non-circular pin** — it validates the set against the
+real transition graph. Its RED proof isolates exactly `Failed -> Cancelled`: finding #30 as one line
+of test output.
+**Generalizable lesson:** when a slice fixes a root cause, check whether an earlier slice *removed*
+an assertion because of that root cause. A `_`-bound variable is a scar, not an accident.
+`nodalmerge:server/server/src/studio_live_hashes.rs:86-89` documents
+`TERMINAL_STATUSES = [Completed, Failed, Merged]` on the stated grounds that
+`WorkUnitTransitions.CanTransition` "has zero outgoing edges from these three."
+**That is false for `Failed`.** studio's catch-all rule
+([WorkUnit.cs:208](../src/NodalMerge.Studio.Contracts/Domain/WorkUnit.cs)) reads
+`(_, Cancelled) when from is not Completed and not Merged => true` — the guard
+excludes `Completed` and `Merged` but **not** `Failed` — and `Cancelled → Queued`
+/ `Cancelled → Executing` are both legal. So `Failed → Cancelled → Queued →
+Executing` revives a work unit out of a status the GC retention-ages, which is the
+Phase 1 failure mode exactly: the GC concludes a blob is dead when it cannot prove
+it. The doc comment's own reasoning is right (it excludes `Cancelled`/`DeadLettered`
+*because* they have revival edges) — it just missed that `Failed` has one, one hop
+further out.
+
+**Exact mechanism** (both `is_terminal_status` call sites):
+- `studio_live_hashes.rs:474` — the loop building the always-retained `active` set
+  does `if is_terminal_status(wu.status) { continue; }`. `Cancelled(5)`/`DeadLettered(11)`
+  are non-terminal, so their seed snapshots land in `active` and are retained
+  **indefinitely**. `Failed(4)` is terminal, so it is skipped.
+- `studio_live_hashes.rs:522` — the skipped snapshot falls to Intermediate age-out with
+  `base_nanos = wu.updated_at_nanos`, expiring after `RetainIntermediateDays`
+  (**default 30**).
+
+**Blast radius is narrower than "always deletes."** Revival *within* 30 days is safe:
+the snapshot is still retained, `Failed → Cancelled` makes the unit non-terminal, and
+the seed jumps into `active`. The data loss is **revival after day 30** — a human
+returns to a failed unit to steer or hand-fix it, and its base snapshot was collected
+weeks earlier.
+
+**The intent is inverted today.** `Cancelled` ("I deliberately stopped this") is kept
+forever; `Failed` ("this broke, someone may retry with steering") is on a 30-day clock.
+`Failed` is the odd one out among the statuses a human resumes from.
+
+**DECIDED 2026-07-16 (user): a failed work unit *is* resumable — take the [NM] route.**
+Drop `Failed` from `TERMINAL_STATUSES` so its seeds join `active` alongside
+`Cancelled`/`DeadLettered`. 0.3(e) is **un-ignored as written** (no inversion). The
+rejected **[ST]** alternative (exclude `Failed` from studio's `(_, Cancelled)` guard,
+closing the revival path) would have contradicted that product answer.
+- **Accepted consequence:** `Failed` blobs then retain indefinitely. This is not a new
+  policy — it is the property `Cancelled`/`DeadLettered` already have; it makes `Failed`
+  consistent with its peers rather than exempt. If unbounded retention of failed work
+  later matters, the fix is a revival-window policy applied to **all three**, which is a
+  larger design question than this plan should absorb — file it separately, do not
+  smuggle it into 1.6.
+- **Validation:** 0.3(e) passes; the vector from 0.4 still pins ordinals/casing.
+- **Note:** the doc comment is wrong *today* regardless of which fix wins — 0.4's
+  rework corrects the comment to state the truth and point here.
+- **0.3(e) is un-ignored as written** — the [NM] decision above means the gate's
+  assertion (nodalmerge retains a `Failed` unit's blobs) is already the correct one.
+- **Related pre-existing defect found by 0.3 (not fixed):** `studio_gc.rs`'s
+  already-green `active_work_unit_seed_stays_live_past_the_retention_window` is
+  **vacuous** — its seed generation shares a tree hash with the Pinned Bootstrap
+  generation, so it passes whether or not work-unit-seed protection works at all. 0.3(e)
+  deliberately gives its bootstrap generation a unique tree to isolate the mechanism.
+  Fix the sibling while doing 1.6.
+
+---
+
+## Phase 2 — Non-hydrating (S3) backend correctness
+
+The S3 seam (`get_blob` returning `None`) silently breaks GC, archive export, and
+existence probes. Fix the abstraction rather than each call site: give the blob layer
+a real existence check and a hydrating-read path, and make callers that need bytes
+either use it or fail **loudly**. Uses the 0.2 harness throughout.
+
+### 2.1 — Existence probe on the blob abstraction **[NM]** — ✅ **DONE 2026-07-16** (`9fd95355`)
+
+**As shipped:** `ExistsAsync` added to `IBlobStoreProvider` as a default interface member
+(via `TryGetBlobAsync`), overridden with a real cheap probe on File (`File.Exists`),
+HttpRemote (existing HEAD), S3Direct (bucket HEAD on the same presigned URL), Chained,
+and — see below — `RemoteBlobLinkAggregator`. HEAD and PUT-idempotency route through it.
+The additive-compat guarantee is pinned by a test (`BlobStoreProviderExistsAsyncDefaultTests`),
+not just asserted in the ⚠ note.
+
+> **The aggregator was a hole that would have silently voided this slice.**
+> `RemoteBlobLinkAggregator` **is** the single `remote` argument `ChainedBlobStoreProvider`
+> sees whenever more than one remote link is configured. It implements `IBlobStoreProvider`,
+> so without its own override it inherited the compat default — putting the full remote
+> download + verify + write-back straight back onto the HEAD path for exactly the three-link
+> `local -> relay -> s3-direct` deployment that most needs the probe. **A default interface
+> member makes a missing override invisible: it compiles, it returns the right answer, it is
+> merely expensive** — which is precisely the failure `ExistsAsync` exists to prevent. This
+> is why its tests assert `GetCallCount == 0` rather than asserting the boolean: a
+> boolean-only test passes against the hydrating default and proves nothing. Any future
+> `IBlobStoreProvider` implementation must be checked for the same hole.
+
+**⚠ compat, second and unlisted in the original slice: HEAD no longer sets `Content-Length`.**
+Verified this converges rather than diverges — Rust's `head_blob` has only ever set
+`Content-Type` + `ETag`, and **no** vector in `blob-http-surface-vectors.v1.json` asserts a
+`Content-Length` (checked, not assumed). Keeping it would mean reading and — for zstd-at-rest
+blobs — decompressing the bytes to learn the plaintext length, i.e. paying exactly the cost
+the slice removes; a best-effort value would be inconsistent (present for identity, absent
+for encoded) and self-defeating. The .NET side setting it was the divergence.
+
+**Accepted behavior change: PUT-idempotency loses an accidental self-healing property.**
+The old full read meant a *corrupt* on-disk blob failed the existence check and got silently
+re-stored by a repeat PUT. The cheap probe reports it present, so the repeat PUT is a no-op
+and the corruption persists. This is **parity with Rust** (`blob_http.rs:515` already uses
+`has_blob` here), not a new divergence — but it was undocumented, and it means blob healing
+is now exclusively the reconcile sweep's job on both runtimes. Note 3.2 makes a corrupt
+identity blob read as *Missing* while `ExistsAsync` still reports it *present* — that
+asymmetry is deliberate (existence is not integrity, and a probe that verified would not be
+a probe), but it is worth knowing the two answers can disagree for the same hash.
+
+**Original section text follows.**
+`nodalmerge:hosts/dotnet/…/WebApplicationExtensions.cs:758`. HEAD and PUT-idempotency
+answer existence via a full `TryGetBlobAsync` read; under `ChainedRemote`/`S3Direct`
+that triggers a full remote download + BLAKE3 verify + local write-back just to
+answer "exists?". Rust already has `has_blob`; .NET's `IBlobStoreProvider` has none.
+- Add `ExistsAsync` to `IBlobStoreProvider` with a **default** implemented via
+  `TryGetBlobAsync` (so third-party providers don't break — additive), and override
+  it on the file/remote/s3 providers with a cheap probe (HEAD / `File.Exists`).
+- Route HEAD and PUT-idempotency through `ExistsAsync`.
+- **Validation:** 0.2 asserts HEAD does not hydrate; a non-hydrating provider reports
+  existing blobs as present, not 404.
+- ⚠ compat: additive interface default member — no break for external providers.
+
+### 2.2 — Tree walk on S3 uses a hydrating read or fails loud **[NM]** (#10) — ✅ **DONE 2026-07-16** (`fe56ad34`)
+
+**As shipped.** `walk_tree` resolves tree objects through a new
+`BlobPersistence::hydrate_blob` seam. Direct mode does a real bucket GET; Delegate mode (no
+bucket credentials, structurally impossible) fails **loud**: `TreeWalkError::Unresolvable` →
+*"tree walk could not resolve (DEPLOYMENT CONFIGURATION, not data loss)"* naming the mode and
+the remedy, plus `nodalmerge_tree_walk_resolve_failed_total`. Proven not-generic by asserting
+the message does **not** contain `"missing tree/blob object"`.
+
+> **Hydrating the tree walk does not violate the offloading policy** — and the code says so
+> where the next reader will look. `get_blob`'s "S3 never hydrates" contract exists to keep
+> **large file payloads** out of the server process. `walk_tree` only ever fetches **tree
+> objects**: v2 `"f"` entries are inserted and never read, only `"d"` entries are pushed and
+> fetched, v1 entries are terminal. `get_blob`'s contract is untouched — pinned by asserting
+> `get_blob_calls() == 0`, *not* a return value, since a value-only assertion passes against a
+> walk that calls `get_blob` and ignores the answer.
+
+> **`get_blob_hydrates()` is a DECLARATION, not an inference — and this is the slice's most
+> valuable finding.** The tempting inference — `get_blob == None && has_blob == true` ⟹
+> non-hydrating — is **unavailable**: `DirPersistence::has_blob` is pure file existence
+> (`blob_path.is_file() || blob_encoded_path.is_file()`, no verify) while `get_blob` returns
+> `None` for a **corrupt** blob. Corrupt therefore has the *identical signature* to
+> non-hydrating, and inferring would relabel every corrupt file blob as "backend cannot
+> hydrate". **Third sighting of "existence is not integrity"** in this plan, after 2.1's
+> `ExistsAsync` and 3.2's verify-on-read. Never infer; ask, or match on `HydrateError`.
+> *Residual gap, pinned not papered over:* a backend that overrides `get_blob → None` and
+> forgets **both** new methods is still silently `Missing`. The type system can't catch it
+> without breaking external implementors.
+
+**2.1's lesson generalized, unprompted:** `Composite` must forward **both** new methods.
+Inheriting the defaults would report `get_blob_hydrates() == true` for an S3-backed composite,
+call `get_blob` (correctly `None`), and reinstate finding #10 **with `S3BlobStore::hydrate_blob`
+sitting unused and untested** — same shape as the `RemoteBlobLinkAggregator` hole: compiles,
+answers plausibly, silently wrong. Own pin: `composite_forwards_hydration_seam_to_the_blob_half`.
+
+> **The inherited gate was weaker than it looked.** It asserted only `live.is_ok()` — satisfiable
+> by a fix returning an **empty live set**, which is *worse* than #10 (GC would then delete live
+> blobs). Strengthened to assert the tree and file hashes are actually present. **Ask what would
+> catch you being subtly wrong, not just plainly wrong.**
+
+**Not proven:** the metric's **value** is asserted by no test (no precedent in-repo; observing one
+needs a process-global recorder — the same singleton shape as the known `archive_adapter` env-race
+flake). Verified by compile and code-read only.
+
+**Original section text follows.**
+### 2.2 (original) — Tree walk on S3 uses a hydrating read or fails loud **[NM]** (#10)
+`nodalmerge:server/server/src/tree_walk.rs:101`. Tree blobs are fetched via
+`get_blob`, hardwired `None` on S3, so every new-mode GC run over a cas-tree snapshot
+fails closed forever.
+- Walk trees through a resolution path that works on S3 (pull via the presigned/origin
+  path used elsewhere), or — if a run genuinely cannot resolve a tree — surface a
+  distinct, actionable error and metric rather than a generic per-run Failure, so
+  "GC never runs on S3" is impossible to miss.
+- **Validation:** 0.2 GC-over-cas-tree scenario completes on the non-hydrating stub
+  (via the resolve path) instead of erroring every tick.
+
+### 2.3 — Archive export/hydration must not silently drop blobs **[NM]** (#7) — ✅ **DONE 2026-07-16** (`5f34ab26`)
+
+**As shipped.** Export/describe resolve referenced blobs through 2.2's `hydrate_blob`.
+`sha256:af1349b9…` (BLAKE3-of-empty) is finding #7's signature and appeared as `left` in every
+pre-fix failure. Proven RED against a **real MinIO bucket**, with the Dir half passing in the
+same loop — real bucket-vs-disk divergence, not a broken fixture.
+
+> ⚠️ **The plan's "all three call sites want the same policy" is WRONG — `room.rs` wants the
+> opposite, and "fixing" it would be a serious regression.** `room.rs:497` is **room-open
+> hydration, not export**: resolving there would pull every file payload a room references into
+> server memory **on every room open** — exactly what offloading exists to prevent, and what
+> `hydrate_blob`'s own contract tells file-byte callers not to do. Its `filter_map` was **correct
+> behavior with a silence problem**. It keeps its behavior and gains only visibility (asks
+> `get_blob_hydrates()`, logs the skip as a design fact), because `loaded_blobs = 0` was
+> indistinguishable from "the blobs are gone". Pinned non-hydrating via `get_blob_calls()`.
+
+**Policy is split by `HydrateError` variant** — 2.2's distinction proved exactly load-bearing:
+- **`Unhydratable` → FAIL.** A manifest marker still mismatches every Dir peer: #7's damage,
+  annotated. An operator can act on it.
+- **`Backend` (transient) → FAIL.** One 503 would otherwise mint a *signed* manifest permanently
+  disagreeing with every peer. Retry is cheap; a wrong digest is forever.
+- **`Missing` → tolerate, count, warn.** A fact about the **data**, not the backend: every peer
+  sees it and excludes the hash, so digests still agree — the very property #7 is about. Failing
+  would brick export forever for any room with a dangling `SetBlob`, with no operator remedy, and
+  regress Dir behavior #7 doesn't allege is wrong.
+
+**The line: fail on faults an operator can act on; count and continue on facts about the data
+every peer shares.** Delegate mode therefore cannot export or describe at all — a hard, actionable
+failure naming backend, mode and hash. It *can* still `validate` and do `metadata_only` imports.
+
+> **"Digests match" is never asserted as the property — it is satisfied by two EMPTY digests,
+> i.e. the exact bug.** Every digest is pinned against an independently computed expected value,
+> plus `assert_ne!` against the empty digest, plus a sanity assert that expected != empty so the
+> test cannot go vacuous. `dir == s3` is asserted last, as a restatement.
+
+> ⚠️ **A functional regression the plan doesn't mention, hit and fixed during the slice.**
+> `load_archive_from_ref` is shared by **four** entry points and only some want bytes:
+> `archive.validate` **never reads `loaded.blobs` at all**, and `metadata_only` import discards
+> them. Resolving unconditionally is **invisible on Dir** (a wasted local read) but on S3
+> downloads the whole room to throw it away — and on **Delegate turns a working
+> `validate`/`metadata_only` import into a hard failure**. Guarded by `BlobBytesNeed` + two tests
+> RED against the naive version. **Anyone reviewing a "fix all three `filter_map`s" diff should
+> check this specifically: it is silent on every Dir-backed test.**
+
+**Not proven:** the `Backend`-transient path is exercised only via the fake (no real 503 against
+MinIO); `Missing`-via-corruption is reasoned, not tested end-to-end (3.2 owns it); metric names
+are emitted but asserted by no test — "counted" is verified by code-read only.
+
+**Original section text follows.**
+### 2.3 (original) — Archive export/hydration must not silently drop blobs **[NM]** (#7)
+`nodalmerge:server/server/src/archive_adapter.rs:702`, `archive_export.rs:201`,
+`room.rs:497`. All three `filter_map` away `get_blob` `None`, so S3-backed servers
+export archives and compute `blobs_digest` over an empty set with no warning.
+- Resolve referenced blobs through the hydrating path (2.2's mechanism); if a
+  referenced hash truly cannot be materialized, **fail the export** (or emit an
+  explicit, counted warning and a manifest marker) rather than producing a
+  silently-empty archive whose digest mismatches a Dir-backed peer.
+- **Validation:** 0.2 export scenario either includes the bytes or returns a clear
+  error; digest parity between Dir- and S3-backed exports of the same room.
+
+### 2.4 — WS blob-request persistence fallback **[NM]** (latent) — ✅ **DONE 2026-07-17** (`b5137032`) — **PHASE 2 COMPLETE**
+- **Subsumption check answered first: NOT subsumed** — 2.2's hydration seam is
+  deliberately tree-objects-only (`get_blob` stays `None` for S3 forever), while this
+  is file payloads on the WS serve path.
+- **Shipped:** on in-memory miss the BlobRequest arm serves `persistence.get_blob`
+  in the identical `BlobPackEntry` shape — Dir returns 3.2-verified bytes; S3 is a
+  structural no-op by 2.2's contract (comment at the site points at the F6 redirect
+  path for capable clients). **Deliberately no warming**: `MemoryBlobStore` is an
+  unbounded HashMap with no eviction — warming on fallback would pull the durable
+  CAS into RAM on a busy relay room (asserted: `room.blobs` empty after a fallback
+  serve). In-memory hits trust correctly (store keys by `Hash::of(data)` at write).
+- **Validation met + independently reproduced** (ws_handler.rs revert): pre-fix
+  `blobs=[]` for a durably-stored, node-unreferenced hash; post-fix served. Real-WS
+  harness (axum + tungstenite, host_migration_parity's pattern) — no seam
+  compromise. Non-hydrating pin green both sides, honestly labeled.
+- **CI:** `ws_handler.rs` + the new test added to blob-layout-parity paths/steps —
+  closes the this-path portion of 4.2's filed zero-coverage gap (BlobUpload etc.
+  covered transitively by already-wired suites).
+- **Filed:** WS blob paths still do synchronous store I/O on the async task (6.2 was
+  HTTP-surface-only by scope) — future slice if WS load warrants.
+
+---
+
+## Phase 3 — Blob integrity & cross-runtime interop
+
+### 3.1 — .NET accepts unknown-content-size zstd frames **[NM]** (#4) — ✅ **DONE 2026-07-16** (`6cf2c8fd`)
+
+**As shipped:** `TryDecompress` accepts `written <= buffer.Length` and slices to the real length.
+The hash-verify is untouched — it lives one level up in `FileBlobStoreProvider.TryGetBlobAsync`,
+not in `TryDecompress`, and it is what makes loosening the length check safe. Proven still to
+reject genuine corruption (the existing byte-flip-mid-frame test, magic intact, still yields
+`Found == false`).
+
+**`GetDecompressedSize` on a headerless frame — measured, not assumed** (ZstdSharp.Port 0.8.1):
+returns **131072**, the zstd default window size — an upper bound, *not* zero and *not* an error.
+So `written == buffer.Length` was false by construction for every Rust-encoded frame. Worth
+recording because "returns 0 / errors on unknown size" is the intuitive guess and it is wrong.
+
+> **The 0.1 empty-payload fixture was never RED.** `rust-encode-all-empty-payload.zst` has a
+> 0-byte plaintext, and `GetDecompressedSize` returns 0 for it — matching `buffer.Length` *by
+> coincidence*, so it passed even pre-fix. Only the non-empty fixture ever gated this slice. A
+> reminder that a fixture existing is not a fixture proving anything.
+
+**Original section text follows.**
+`nodalmerge:hosts/dotnet/…/BlobCompression.cs:111`. `TryDecompress` requires
+`written == buffer.Length` after sizing from `GetDecompressedSize`, which returns an
+**upper bound** for frames without the content-size header — i.e. every frame from
+Rust `zstd::stream::encode_all`. Result: all cross-runtime compressed fetches throw
+"corrupt zstd frame."
+- On unknown/bound size, accept `written <= buffer.Length` and slice, or switch to a
+  streaming `DecompressionStream`. Keep the existing hash-verify-after-decompress.
+- **Validation:** 0.1 fixture decodes green in both directions.
+
+### 3.2 — Verify-on-read policy for the file provider **[NM]** (#13) — ✅ **DONE 2026-07-16** (code `37374294`; doc half `90ed5b80`, after 3.3 made its premise true)
+
+**Doc half (shipped `90ed5b80`):** `BLOB_HTTP_SURFACE.md` now scopes "corrupt → 404,
+never wrong bytes" to identity responses and states the encoded pass-through exemption
+in the Content-encoding section (server structurally cannot verify a frame whose hash is
+of the plaintext; the client completes integrity after decompress — true for all
+reference readers as of 3.3; deliberately no verify-on-encoded-GET option);
+`BLOB_STORAGE_LAYOUT.md` §8 mirrors it with a cross-reference. Wording-only — no status
+codes, shapes, or vectors changed; the docs now say what both runtimes already do.
+
+**As shipped (code half only):** the identity branch of `FileBlobStoreProvider.TryGetBlobAsync`
+hashes on read and, on mismatch, warns and returns `Missing` — matching `store.rs:683`
+exactly: no delete, no throw, and **no fall-through to the `.zst` sibling** (Rust `return`s
+from the identity branch immediately; so does this). `Missing` is what an absent file already
+produces, so the origin answers 404 with no call-site plumbing. RED proven at both levels;
+the HTTP-origin test reported the defect verbatim — *"expected 404 for a tampered identity
+blob, got 200"*.
+
+~~The doc half is NOT done and must not be marked done.~~ **Done `90ed5b80`** — the
+sequencing held: 3.3 (`2e69b9dd`) made "the client verifies after decompress" true first,
+then the exemption was documented (see the heading note above). The encoded code path was
+left untouched throughout, as decided. Call graph traced to
+confirm no second unverified identity-serving path hides in `TryGetEncodedBlobAsync`: the GET
+handler serves its result only when `ContentEncoding == "zstd"` and otherwise routes through
+`TryGetBlobAsync`.
+
+> **Five pre-existing tests were only green because the read path never checked.**
+> `ProviderDurabilityTests`, `Row19AutomatedScenarioHarnessTests` and
+> `ProviderHostRestartDurabilityIntegrationTests` each keyed fixture blobs by a **fabricated
+> string** (`"sha256:multi-device-a"`, `"sha256:abc"`, `"sha256:room-a-blob"`), and
+> `BlobLayoutParityTests`' *runtime* identity-preference test reused a **path-derivation
+> vector's placeholder hash**. Verify-on-read turned all five red. Each was fixed by keying on
+> the real content hash — assertions got *stronger*, none were weakened; the Rust counterpart
+> `both_exist_prefers_identity_at_runtime` already used `Hash::of(&payload)` for this exact
+> reason. **Checked before accepting the slice, because the alternative reading would have been
+> serious:** if any *production* caller used opaque keys, verify-on-read would strand live data.
+> It cannot — the only production callers are the origin's GET/PUT, and PUT rejects a
+> non-canonical name (400) and a body disagreeing with its path (422), so every reachable blob
+> is keyed by the BLAKE3 hex of its own bytes. **A fabricated-key fixture is a test that has
+> opted out of content-addressing; the moment a slice enforces it, they all surface at once.**
+
+**Accepted cost:** identity reads now hash every byte on every read — symmetric with the zstd
+path and with Rust, so this is parity, not a .NET-only regression. Correctness over cost, per
+the plan's explicit intent.
+
+**Original section text follows.**
+`nodalmerge:hosts/dotnet/…/FileBlobStoreProvider.cs:38` and the encoded pass-through
+(`get_blob_encoded`, `store.rs:678`). The identity path returns bytes **unverified**
+while the zstd path and Rust `get_blob` both verify; the HTTP origin then serves
+corrupt bytes as 200.
+- Add BLAKE3 verify-on-read to the .NET identity path to match Rust and honor
+  `BLOB_HTTP_SURFACE.md` ("corrupt → 404, never wrong bytes").
+- For the **encoded** pass-through: **DECIDED 2026-07-16 (user) — document it as
+  contractual; do NOT add an opt-in verify flag.**
+  *What the pass-through is:* blobs are stored zstd-compressed at rest; on
+  `Accept-Encoding: zstd` the server returns the stored frame byte-for-byte rather than
+  decode-then-recode (`store.rs:678`). It cannot verify, structurally: the BLAKE3 hash is
+  of the **plaintext**, so checking the frame means fully decompressing it — the exact
+  work the pass-through exists to avoid. Integrity is completed by the client hashing
+  after decompress.
+  *Accepted consequence:* the same corrupt blob answers **404** on the identity GET
+  (decode → verify → fail) and **200 + corrupt bytes** on the encoded GET. This
+  contradicts the letter of `BLOB_HTTP_SURFACE.md`'s "corrupt → 404, never wrong bytes".
+  Document "never wrong bytes" as an **end-to-end guarantee the client completes**, not a
+  server-side one, and mark the encoded GET explicitly exempt in
+  `BLOB_HTTP_SURFACE.md` + `BLOB_STORAGE_LAYOUT.md` §8, on **both** runtimes.
+  *Why no flag:* verify-on-encoded-GET is a footgun — it silently costs a full decompress
+  per GET to buy a property the client already provides.
+- ⚠ **Sequencing: write 3.2's doc change AFTER 3.3 lands.** The decision above rests on
+  "the client verifies after decompress" — which 3.3 shows is **not true today** for the
+  web/wasm readers (they hash raw presigned bytes with no zstd handling). Documenting the
+  contract while its load-bearing premise is false would enshrine a hole. 3.3 makes the
+  premise true; then 3.2 documents it.
+- **Validation:** a tampered identity file returns 404 on the .NET origin, matching
+  Rust.
+
+### 3.3 — s3-direct client zstd vs web/wasm readers **[BOTH→NM]** (#6) — ✅ **DONE 2026-07-16** (`2e69b9dd`)
+
+**As shipped (both steps, in the decided order):**
+- **Step 1:** `S3DirectBlobOriginOptions` compression default `Zstd` → `Off`, opt-in
+  stays via `S3Direct:Compression = Zstd`; pinned by 4 new options tests (RED: 2 failed
+  against the old default). Old-default sightings fixed in the provider doc-comment and
+  `BLOB_STORAGE_LAYOUT.md` §8.
+- **Step 2:** the ONE real presigned-GET reader — `fetchBlobViaUrl` in `clients/web/sdk.js`
+  (pre-scoping was right: `bridge-wasm` never fetches; `clients/sdk-js`'s `doc.js` is a
+  generated copy of sdk.js, and its `index.js` runtime client only ingests WS `blob-pack`)
+  — now stores via exported `storeFetchedBlobBytes`: **verify-raw-first** (headers cannot
+  say whether the runtime auto-decoded; `store_blob_bytes`' BLAKE3 throw is the oracle),
+  then decode only on rejection + standard zstd magic, re-verified through the store; a
+  corrupt frame surfaces the *original* integrity error. Decoder = `zstd_decompress` wasm
+  export on the bridge, pure-Rust `ruzstd =0.8.1` (+84 KiB wasm), one code path for
+  Safari/Node/old-browsers instead of feature-detecting `DecompressionStream`/`node:zlib`.
+  Decode stays despite the default flip — pre-flip buckets still hold frames (pinned by a
+  test comment + the Rust-frame test).
+- **Validation met:** Node suite drives the exact shipped function against the REAL wasm
+  bridge with the Phase 0 cross-runtime goldens (ZstdSharp + Rust encoder frames, never
+  ruzstd's own output; anti-vacuous: pinned plaintext lens + BLAKE3s). RED 3 failed
+  pre-fix with the verbatim Safari/Node failure (`blob integrity check failed`);
+  independently re-proven by sabotage (magic sniff disabled → same 3 red, restored →
+  33/33). Bridge native 4/4 (incl. reject-garbage/truncated); .NET full project 589/589.
+- **CI:** new `clients-web-sdk-blob-decode.yml` — the **first workflow running any
+  clients/ test at all** (bridge-native + wasm-pack build + Node suite vs the real
+  bridge); `blob-layout-parity.yml` gains the options-test step + paths.
+- **Corrected premise:** the wasm `pkg/` dirs are NOT checked in (wasm-pack emits a
+  self-gitignore); they were mutually stale local artifacts (`clients/web/pkg` ~6 weeks
+  behind). All three rebuilt in sync; CI drift risk now covered by the new workflow,
+  local pack-time staleness filed to Phase 8-adjacent backlog.
+- **Follow-ups filed:** `docs/sdk.md:10` + `bridge-wasm/README.md:12` stale build-command
+  paths (`bridge` vs `bridge-wasm`); deprecated wasm-bindgen `ready(bytes)` init shape;
+  pre-existing `unused import: TextOp` warning in bridge lib.rs; `nuget-build-push.yml`
+  `wrapper-smoke` doesn't build the bridge crate it embeds (partially mitigated by the
+  new workflow).
+
+**Original section text follows.**
+`nodalmerge:hosts/dotnet/…/S3DirectBlobOriginOptions.cs:86` defaults client-side zstd
+ON; the bucket stores a zstd frame with `Content-Encoding: zstd` object metadata,
+but `clients/web/sdk.js` and `clients/bridge-wasm` hash the raw presigned-GET bytes
+with no zstd handling. Correctness depends on the browser/runtime transparently
+decoding zstd (Chrome 123+/FF 126+ do; Safari and Node/undici do not).
+- **DECIDED 2026-07-16 (user): do BOTH, in order — not either/or.**
+  1. **Default s3-direct compression OFF** now (`S3DirectBlobOriginOptions.cs:86`), making
+     compression explicitly opt-in. Low-risk, least code, stops correctness depending on
+     which browser the user happens to run.
+  2. **Then teach the SDK readers to decode** `Content-Encoding: zstd` before hashing
+     (`clients/web/sdk.js`, `clients/bridge-wasm`). This is **not** an optional
+     enhancement: nodalmerge must not ship a server option its own SDK cannot read, and
+     correctness must not rest on transparent browser decode (Chrome 123+/FF 126+ do;
+     Safari and Node/undici do not). Until (2) lands, opting compression ON is a
+     documented footgun.
+- **Retagged [BOTH] → [NM]** (2026-07-16): the plan assumed an `[ST]` half "wherever
+  studio surfaces the web SDK". **Studio does not consume the web SDK** — verified, the
+  only references to `sdk.js`/`bridge-wasm`/`clients/web` anywhere in nodalmerge-studio
+  are this plan and the README; there is no code. Nothing to do studio-side.
+- Step (2) is what makes 3.2's "the client verifies after decompress" premise true, so
+  3.2's doc change depends on it — see 3.2's sequencing note.
+- **Validation:** a Safari/Node-style fetch (no auto-decode) round-trips an s3-direct
+  blob and passes the integrity check.
+
+### 3.4 — Content-Encoding negotiation correctness **[NM]** — ✅ **DONE 2026-07-16** (`8fc3f776`) — **PHASE 3 COMPLETE**
+- **Shipped:** per-coding `q=0` refusal honored on both hosts (mirrored
+  `coding_accepts_zstd`/`is_qvalue_zero` helpers; RFC 9110 zero-branch spellings
+  `0`/`0.`/`0.0`/`0.00`/`0.000`; `gzip;q=0, zstd` still accepts zstd — params never
+  leak across tokens). Deliberately NOT full qvalue preference ordering — nonzero or
+  absent `q` keeps accept-if-mentioned, pinned by tests on both hosts so a future
+  refactor can't silently add preference math. .NET PUT now 415s on `Content-Encoding`
+  **presence alone** (any value, `identity` included), before body/hash work — verified
+  to match Rust exactly (same `contains_key` check, same body text, same
+  canonical→auth→CE ordering). Pre-fix .NET both failure modes confirmed live: a
+  correct compressed upload 422'd, and wire bytes that happened to hash right were
+  **201'd and stored mislabeled as identity, permanently**.
+- **Vector escape hatch taken:** the frozen `blob-http-surface-vectors.v1.json` schema
+  has **no request-header slot** (pre-existing limitation, noted in 2.1-era comments),
+  so these are paired hand-written tests on both hosts (Rust surface 3→8 + 7 helper
+  unit tests; .NET negotiation 4→17), not forced vector entries. If the vector schema
+  ever grows a request-header slot (v2), fold these three cases in.
+- **RED:** Rust 3 failed / .NET 11 failed pre-fix (415 cases: `Expected
+  UnsupportedMediaType, Actual UnprocessableEntity/Created`), reproduced independently
+  by stash-revert of only the two production files. `gzip;q=0`-then-zstd and nonzero-q
+  pins were green-side (correct-by-accident scoping), honestly labeled.
+- **CI:** no edits needed — all four touched files already had dedicated steps + paths
+  in `blob-layout-parity.yml` (tests were added to existing covered files).
+
+---
+
+## Phase 4 — HTTP-surface robustness & backward compatibility — ✅ **PHASE COMPLETE 2026-07-16**
+
+### 4.1 — Restore `/sync/blob-url` backward compat **[NM]** ⚠ compat (#12) — ✅ **DONE 2026-07-16** (`f5867ef6`, with 4.3)
+- **Shipped:** dedicated `HandleLegacyBlobUrlAsync` restored byte-for-byte from
+  `main`'s git ground truth (pulled first, not trusted from this section): `expiresAt`
+  unix seconds; registered-resolver-returning-`null` → **404**; any non-empty hash
+  accepted **anonymously** (the route never consults the blob-http auth token — main
+  evidence recorded, pinned with a control assertion against the new route); empty
+  hash → 400 `"hash is required"` (main's distinct wording); `room`/`namespace`
+  defaulting kept. New `/blobs/{hash}/url` untouched.
+- Misleading same-shape claims fixed in BOTH the code comment and
+  `BLOB_HTTP_SURFACE.md`'s deferred-section (which had enshrined the false alias
+  claim); CHANGELOG **0.2.3** entry discloses the actual history — the break shipped
+  silently after 0.2.0's entry was written. Two pre-existing tests that encoded the
+  broken alias behavior as expected were corrected (one pulled forward from the
+  Phase-8 backlog into CI).
+- **Gotcha for the record:** injecting `IBlobUrlResolverProvider` as a minimal-API
+  handler parameter (main's own style) makes ASP.NET infer `[FromBody]` when DI lacks
+  the service — crashing the entire endpoint-matcher build in resolver-less test
+  hosts; resolved via `RequestServices` inside the handler, runtime semantics
+  unchanged.
+- **Validation met + independently reproduced** (stash-revert of
+  WebApplicationExtensions.cs only): golden suite 8/12 red pre-fix (expiresAtUtc/501/
+  400-on-loose-hash captured), 12/12 after.
+
+### 4.2 — `put_blob` durability truthfulness **[NM]** (#8) — ✅ **DONE 2026-07-16** (`fb3bf095`)
+`nodalmerge:server/server/src/blob_http.rs:519`. The handler upserted `Active` before
+the write, called infallible `persist_blob`, returned `201` unconditionally.
+- **Shipped:** `PersistBlobError{Backend→500, Unavailable→503}` at the trait
+  (deliberately NOT a HydrateError mirror — no Missing, no config variant; structural
+  no-ops are `Ok`). All implementors propagate: Dir fs errors → Backend (zstd-encode
+  failure keeps its 3.1b fall-back-to-identity; only the identity write is terminal);
+  S3 Direct bridge Timeout/Bridge → Unavailable, bucket error reply → Backend; S3
+  **Delegate stays `Ok` as a documented structural no-op** (pinned); Composite
+  forwards; conformance port updated AFTER the real backends per 1.3's ordering,
+  MinIO-wins note intact. PUT ordering now `hash → dedupe(200 marks — those bytes
+  exist) → persist(Err: 5xx, NO mark) → mark → 201`, inside 6.2's off_worker boundary:
+  **the Active row can no longer exist for bytes that were never stored**, so the 1.3
+  upload-window union can't protect a phantom. Mark-after-confirmed-write failure
+  stays warn-only (bytes ARE durable) — **4th instance of the fail-open-inventory
+  family, filed on 1.3's ledger; still wants one decision.**
+- **All callers of the newly-fallible method audited, zero silent discards:** WS
+  BlobUpload treats failed persist as not-accepted (not stored/counted/broadcast —
+  the protocol has no per-entry error affordance; matches hash-mismatch treatment) and
+  the `blob-available` broadcast now lists **actually-stored** hashes — pre-4.2 it
+  echoed the raw request, advertising even hash-rejected entries (same lie family,
+  fixed in-slice; frozen envelope unchanged, truthful contents). Archive import:
+  persist failure → ImportRejected (3rd `CheckpointNotFound` reuse — backend-variant
+  gap filed again).
+- **.NET origin checked: already truthful** — `FileBlobStoreProvider.PutBlobAsync`
+  throws, handler `await` is unguarded → 500; `ChainedBlobStoreProvider`'s warn-only
+  remote push is documented design (local durable + reconcile heals), not the lie.
+- **Contract doc:** BLOB_HTTP_SURFACE.md PUT section gains the failure-status
+  bullet (failure-path-only tightening; success statuses/vectors untouched; clients
+  already treat 5xx as retryable per the doc's own client-behavior section).
+- **Validation met + independently reproduced** (revert of blob_http.rs only): 4/9 red —
+  injectable Backend/Unavailable, real Dir with a squatted `blobs/blake3` path, real
+  S3BlobStore vs stalled listener (6.1's filed feeder verbatim) — each `201` where 5xx
+  expected, plus the phantom-`Active`-row half asserted explicitly; 9/9 after. S3
+  store-level classification pinned by sabotage (swallow reintroduced → red). Gates:
+  32 green server targets, s3-blobs full + MinIO 8/8, conformance crate 5→6, builds
+  clean.
+- **CI:** `blob_put_durability` step + paths in blob-layout-parity.yml. **Filed:**
+  `ws_handler.rs` runs in NO blob workflow (no CI gate on the WS persist-failure path,
+  no unit seam — Phase 8 material, pairs with 6.5); archive partial-state-on-mid-loop
+  failure (pre-existing shape).
+
+### 4.3 — Options validation & URL resolution **[NM]** — ✅ **DONE 2026-07-16** (`f5867ef6`, with 4.1)
+- **Shipped, all three:** (1) `BlobHttpOptions.Validate()` fails fast on
+  `MaxBlobBytes <= 0` in sibling style. (2) Base-URL: option (a) resolve-relative
+  taken — `RemoteBlobOriginOptions.ResolveBaseUri()` normalizes the trailing slash
+  (the `new Uri(base, rel)` drop-last-segment trap tested explicitly, both spellings)
+  and both providers now build **absolute** request URIs, decoupling them from
+  ambient `HttpClient.BaseAddress` config as a side benefit. No Rust-side equivalent
+  exists (these are .NET-only client providers). (3) `WarnOnStaleKeys()` reads the
+  raw `IConfiguration` section past the binder (which silently drops removed keys),
+  warns via `Trace` naming keys + migration, never throws (principle 3).
+- **Validation met + independently reproduced** (stash-revert of the two providers
+  only): BaseUrl prefix suite 10/11 red pre-fix (requests hit `/blobs/…` at the bare
+  host), 11/11 after. Options + stale-key suites green post-fix (Validate() didn't
+  exist pre-fix — structural, honestly labeled). Full project **648/648** (614 + 34
+  new; zero flakes on the verification run).
+- **CI:** `blob-layout-parity.yml` paths gained `BlobHttpOptions.cs` +
+  `RemoteBlobOriginOptions.cs` (**previously missing — 9th paths bite**) + steps/paths
+  for 4 new test files and the 2 corrected ones.
+
+### 4.4 — Capability-profile hard-ceiling clamp **[NM→BOTH]** ⚠ compat (#15) — ✅ **DONE 2026-07-16** (`6d2ec2a4`)
+`nodalmerge:server/capability-profile/src/lib.rs:388`. The mint/validate safety caps
+moved from unconditional constants to profile-file-supplied `limits` with no clamp.
+- **Shipped:** `resolved_limits` clamps **five** fields, not the four this section
+  listed — `main` also had `MAX_CAPABILITY_LENGTH = 128` (ceilings pulled from
+  `main:server/jwt-bridge/src/capability_profile.rs:6-10`, verified independently, not
+  trusted from this plan). Lower allowed, raise clamped, per-field warn naming
+  requested-vs-ceiling; no-`limits` profiles behave byte-for-byte as `main`'s
+  constants; file format untouched (oversized values parse, resolution clamps).
+- **Retag [NM]→[BOTH], and the reason matters:** the .NET host does NOT reach this
+  code via FFI — `nm_room_token_mint/validate_json` only sign/verify a
+  caller-supplied cap list AFTER expansion. Expansion happens in a **parallel managed
+  implementation** (`CapabilityProfileExpander.cs`, reached from
+  `RoomTokenEmbeddedAuth.cs` mint AND validate) with the identical unclamped
+  regression — fixed with the same clamp (`ResolveLimits`/`ClampToCeiling`, resolved
+  once per profile load; warn via `Trace` — the .NET host has no logging abstraction
+  repo-wide, filed).
+- **Plan-premise correction:** on `main` only the **mint** path (jwt-bridge) had
+  unconditional constants; the **validate** path already honored profile limits
+  unclamped (the impl A/B asymmetry documented in `docs/CAPCOMP_PARITY_PLAN.md`). The
+  clamp restores B's historical guarantee and tightens A + .NET beyond `main` —
+  intended posture, the ⚠ compat note resolves as strictly-safer.
+- **Validation met:** two additive capcomp parity vectors (`limits-above-ceiling-*`)
+  pin the clamp on BOTH runtimes ($comment + parity doc moved with them per the
+  file's own rule; existing vectors untouched). RED independently reproduced by
+  stash-revert of both prod files: Rust `limits_clamp` 6 failed/4 passed (130-cap
+  expansion and depth-17 chain both returned `Ok` pre-fix under raised limits),
+  shared vectors red on both runtimes, .NET 7 failed. Post-fix: cap-profile
+  lib+vectors+clamp green, jwt-bridge 10, .NET capability filters 59/59.
+- **CI:** `control-plane-capability-parity.yml` gains the .NET clamp-test step +
+  paths; coverage gap found and filled — pre-existing `CapabilityProfileExpanderTests`
+  ran in **no workflow at all** despite its source file being a paths trigger (8th
+  paths-filter bite, logged for Phase 8).
+
+---
+
+## Phase 5 — Migration safety — ✅ **PHASE COMPLETE 2026-07-16** (`3bc843d8`, both slices)
+
+### 5.1 — Rust migration marker only on full success **[NM]** — ✅ **DONE 2026-07-16** (`3bc843d8`)
+- **Shipped:** `migrate_legacy_blob_layout` had **12 skip paths, 8 fully silent**
+  (non-Unicode room dir orphaned a whole room; blocked-quarantine left the file in
+  place with the rename `let _ =`'d; read-dir/file-type/mkdir/copy failures all
+  `continue`d) — every deferrable one now warns with path+cause and increments a
+  `deferred` counter; `deferred > 0` ⇒ summary warn + **no marker**, so the next
+  startup retries (sole caller: `DirPersistence::open`, once per process — verified).
+  Successful quarantine remains terminal (pinned by the pre-existing inline test).
+- **Idempotency hazard found beyond the plan (the important part):** a
+  failed/interrupted copy-fallback leaves a *partial dest*, and the dedupe branch
+  (`dest.exists()`) would have **adopted it and deleted the only good copy** on the
+  very retry this slice introduces. Fixed both ways: dedupe now BLAKE3-verifies dest
+  and repairs a partial/corrupt one from the verified legacy bytes; the copy failure
+  path removes its partial file. RED-proven with the data loss visible in the assert
+  diff (`"the only goo"`, 12 bytes of the real payload).
+- **Validation met + independently reproduced** (stash-revert of store.rs only):
+  0/3 pre-fix — incl. the second-run-completes assertion (run 1 defers, run 2
+  migrates the remainder THEN writes the marker, run 3 no-ops); non-Unicode dir
+  constructible on BOTH OSes (Windows unpaired-surrogate via `from_wide`, proven on
+  this machine; Linux invalid UTF-8) — **no test seam needed**.
+
+### 5.2 — .NET migration & write-path hygiene **[NM]** — ✅ **DONE 2026-07-16** (`3bc843d8`)
+- **Shipped, all three:** quarantine scan recurses only into non-`blake3` non-dot
+  dirs (GUID names stable across crash-restarts — pre-fix grew one prefix per
+  restart); temp-then-move in try/finally, best-effort tmp cleanup, write errors
+  still propagate (4.2's truthful PUT preserved); **`SanitizeHash` deleted** —
+  `GetPath` rejects non-64-lowercase-hex (writes throw `ArgumentException`, reads
+  answer Missing/false = Rust's foreign-name-is-absent posture; uppercase rejected,
+  never normalized). `FileBlobGcCoordinator` keeps a local deliberately-lenient fold
+  with rationale (a non-canonical live hash can only over-protect).
+- **Plan claim verified:** no WS/runtime path reaches `IBlobStoreProvider` at all;
+  the HTTP funnel already 400s non-canonical; legacy `/sync/blob-url` loose hashes
+  stop before path math. Zero fixture fallout — 3.2 had already converted the
+  fabricated-hash fixtures.
+- **Validation met + independently reproduced** (stash-revert of provider +
+  coordinator): 6/8 pre-fix (GUID growth captured; `.tmp` leaked under `blake3/`;
+  `sha256:abc`→`sha256_abc`, `../escape`→`.._escape` actually stored), 8/8 after.
+  Deviation (sanctioned): `.tmp` RED injects failure at the move step — genuine
+  mid-write cancellation isn't deterministically forcible.
+- **Gates:** blob_gc 12 / conformance 13 / host_migration_parity 18 unchanged; .NET
+  full **656/656** (648+8). CI: both new test files get steps + both paths lists in
+  blob-layout-parity.yml.
+- **Filed, not fixed:** .NET `MigrateLegacyLayoutIfNeeded` still writes its marker
+  unconditionally — same bug class 5.1 fixed in Rust, plan scoped marker-gating to
+  Rust only (candidate follow-up slice); interrupted compressed run can leave
+  `<hex>` + `<hex>.zst` both present (benign — readers prefer identity — but a §8
+  "exactly one form" wrinkle, same window as the dedupe-verify not considering a
+  `.zst`-only dest); legacy `.tmp` files remain in legacy room dirs forever
+  (harmless leftover).
+
+---
+
+## Phase 6 — Runtime, async-safety & efficiency
+
+> ⚠️ **6.1 is no longer comfortably deferrable (escalated by 2.2 and 2.3, 2026-07-16).** The plan
+> already called it "near-P1: the wedge risk"; Phase 2 made it worse in two steps and it should now be
+> scheduled ahead of the rest of Phase 6, and arguably ahead of Phases 4–5:
+> - **2.2** routed the tree walk through the bridge — per tree object, per GC tick. Small JSON, but a
+>   repo with N directories now builds N tokio runtimes and spawns N threads on **every sweep**, serially.
+> - **2.3** routed archive export through it — **full file payloads**, on an operator-triggered path. A
+>   5,000-blob room = 5,000 threads + 5,000 runtimes, serially, and **every bridge site is timeout-less**,
+>   so a hung bucket wedges a tokio worker forever.
+>
+> Neither slice added a *new* bridge (still 9 sites, existing pattern reused) — they changed the **traffic**
+> through it from per-request to per-blob-per-sweep and per-export. Nothing here is a defect in 2.2/2.3;
+> both were correct and bucket-proven. But "defer 6.1" was priced against the old traffic.
+>
+> **Resolved 2026-07-16:** 6.1 shipped (`ac505724`) — one shared runtime, all waits bounded, timeouts
+> classify as backend errors. The *wedge* is gone. What remains of the escalation is the bounded-but-
+> still-blocking caller thread (6.2, now unblocked) and sweep/export I/O shape (6.3 + the export-RSS
+> follow-up).
+
+Confirmed performance/robustness debt. ~~6.1 is the most impactful (a hung delegate can
+wedge a worker indefinitely) — treat it as near-P1.~~ 6.1 done; 6.2 is next-most-impactful.
+
+### 6.1 — s3-blobs runtime bridge + timeouts **[NM]** (#11) — ✅ **DONE 2026-07-16** (`ac505724`)
+`nodalmerge:server/s3-blobs/src/lib.rs:289` (8 sites — actual count on dispatch: **9**,
+the plan predated S5.3's `head_key`/`delete_key`). Each S3 op spawned a fresh OS
+thread + a new multi-threaded tokio `Runtime` and blocked on a **timeout-less**
+`mpsc::recv()`; the delegate `reqwest::Client` had no timeout (it was NOT rebuilt
+per-call as suspected — built once in `new()` and cloned, so pooling was fine; only
+timeouts were missing).
+- **Shipped:** all 9 sites route through one `block_on_shared_runtime` helper (name per
+  7.3, which this pre-absorbs) backed by a **process-wide `OnceLock<Runtime>`**, not a
+  store-owned one — dropping a `Runtime` inside an async context panics, and
+  `S3BlobStore` is constructed/dropped freely (server-s3 builds a second instance for
+  `S3BlobObjectStore`). 2 worker threads named `nm-s3-bridge`. Timeouts applied
+  **3-deep** (object_store `ClientOptions`, reqwest builder, bridge
+  `tokio::time::timeout` + `recv_timeout(inner + 15s)`), knobs on `S3BlobStoreConfig`:
+  `op_timeout` 30s / `connect_timeout` 10s / **`sweep_timeout` 15min** (deviation, and
+  correct: `blob_gc_sweep` is ONE bridge call wrapping a whole LIST+PUT+DELETE batch,
+  so `op_timeout` would abort every legitimate large-bucket sweep; each request inside
+  is still individually bounded by `op_timeout`). server-s3 got 3 matching env vars per
+  its env-only convention; no CLI flag duplication touched.
+- **Classification (the load-bearing part):** a timeout is a *backend* error, never
+  absence — `hydrate_blob`→`HydrateError::Backend`, GC `head_key`/`delete_key`→
+  `S3BlobError::Timeout`→`GcError::Backend`, aborted sweep ≡ crashed sweep (two-phase
+  tombstones tolerate it, nothing deletes without an aged persisted tombstone).
+  `has_blob() -> bool` cannot carry an error; `false` is conservative **for its actual
+  callers** (blob_http HEAD-404/PUT-dedupe, where spurious-absent costs a WS fallback
+  and spurious-present would 200 a HEAD it can't serve) and GC liveness never reads it
+  — verified + documented at the method. No trait signatures changed, no frozen
+  contracts touched.
+- **Validation done:** `tests/bridge_timeouts.rs` (7 tests, stalled in-test
+  `TcpListener`): 0/7 pre-fix — every op still running at a 10s watchdog — 7/7 after,
+  each returning via a 750ms configured timeout. Independently re-proven by sabotage
+  (timeouts stripped at all 3 layers → 0/7 at 10.03s; restored → 7/7). Runtime reuse
+  pinned green-side by `bridge_reuses_one_shared_runtime_across_ops`
+  (`BRIDGE_RUNTIMES_BUILT == 1` across stores/auth modes; pre-fix N-runtimes shown by
+  code shape, honestly reported as structural). MinIO 8/8 under `REQUIRE_DOCKER`;
+  blob_gc 12, conformance 13, delegate_gc 2, both binaries build clean.
+- **CI:** `blob-layout-parity.yml` gained the `bridge_timeouts` step + both `paths:`
+  entries (Docker-free by design, so it lives there, not in blob-s3-gc-minio.yml —
+  whose `server/s3-blobs/**` glob already picks up the change).
+- **Follow-ups filed (not fixed here):** (1) the bridge still *blocks the calling
+  thread* up to `op_timeout + 15s` — bounded now, but blob_http handlers still park
+  tokio workers; that IS 6.2, now unblocked. (2) blob_http PUT on a timing-out
+  backend: `has_blob`→false, `persist_blob` times out warn-only, handler still returns
+  **201 with nothing durably stored** — pre-existing void-`persist_blob` shape, same
+  family as 4.2's durability-truthfulness slice (fix it there or in 6.2). (3)
+  object_store's default `RetryConfig` still applies inside the sweep; per-request
+  bounds hold but retries multiply worst-case duration toward `sweep_timeout` — tune in
+  6.3.
+
+### 6.2 — Move blocking blob work off async workers **[NM]** — ✅ **DONE 2026-07-16** (`c76edf9d`)
+`nodalmerge:server/server/src/blob_http.rs:234`. GET/PUT handlers did blocking
+`std::fs` I/O, up-to-64 MiB BLAKE3 hashing, and zstd encode/decode directly on tokio
+workers — plus, post-6.1, S3 bridge calls that block bounded (`op_timeout + 15s`) but
+still park the worker.
+- **Shipped:** one `off_worker` helper (`spawn_blocking` + JoinError→logged 500, never a
+  hang or silent success); every store-touching handler tail (GET/HEAD reads+verify,
+  /url presigns incl. the Delegate-mode HTTP round trip, /uploaded bucket HEAD + SQLite
+  upsert, PUT body-hash + dedupe + persist + inventory mark) runs in ONE blocking
+  closure per request, preserving in-request ordering exactly; the cheap pure prefix
+  (canonical check, auth, parsing) stays async. Sync `BlobPersistence` trait untouched —
+  the async-trait conversion was rejected as blast radius for zero scheduling benefit.
+  PUT's known-lossy 201-on-backend-timeout deliberately preserved (4.2's job).
+- **Validation met (made deterministic):** `tests/blob_http_offload.rs` — 2-worker
+  runtime, 6 concurrent requests on a 500ms-blocking store fake, 200ms heartbeat bound,
+  measurement gated on ≥2 ops in flight so the RED is spawn-order-independent. Pre-fix
+  4/5 failed (heartbeats 1.5–3.0s, 7–15× over bound) — reproduced independently by
+  stash-revert of only blob_http.rs; post-fix 5/5 in ~1s. Panic-in-closure→500 is
+  behavioral too; the /uploaded green-side guard is honestly labeled not-a-RED.
+- **Known pre-existing flake, NOT this slice:**
+  `archive_profile_002_object_manifest_parity_reports_p50_p95` fails under the parallel
+  full-lib run and passes solo — verified to fail identically on the pre-6.2 tree
+  (stash-and-rerun). A timing/percentile test that is load-sensitive; worth a
+  follow-up de-flake (serial marker or wider percentile budget) but do not paper over
+  it inside an unrelated slice.
+- **Filed, not fixed — the same sync-from-async family elsewhere:** WS handlers
+  (`ws_handler.rs:1064` persist_blob on the receive loop — which also base64-decodes and
+  `Hash::of`s inline — `:1100`/`:1171` presign resolutions, `:1220` verify_uploaded); GC
+  (`room.rs:920` blob_gc_sweep inside async sweep_blobs, `room.rs:643` get_blob in
+  live-set collection — 6.3/6.4 territory); archive control-plane
+  (`archive_adapter.rs:320`/`:1360`, `archive_export.rs:269`/`:438`). The WS receive-loop
+  sites pair naturally with 6.5 (inbound-pack observer off the hot path).
+- **CI:** `blob-layout-parity.yml` gained the `blob_http_offload` step + both `paths:`
+  entries (Docker-free, bridge_timeouts-style comment).
+
+### 6.3 — GC batch/bulk I/O **[NM]** — ✅ **DONE 2026-07-17** (`5ca7a9d0`, with 6.4)
+- **Shipped:** mark pass = ONE cached-statement txn via new
+  `AssetInventoryStore::upsert_active_seen_batch` (defaulted method loops the per-row
+  one — documented as correct-but-unbatched, not the 2.1 trap; shared SQL const so
+  the two paths can't drift; single txn chosen over chunking: all-or-nothing fails
+  closed before any sweep). Sweep = plan-then-execute, actions via
+  `buffer_unordered(16)`; **`delete_stream` rejected deliberately** — AWS bulk
+  DeleteObjects folds blob+tombstone keys into shared 1000-key batches, erasing the
+  per-object tombstone-PUT-before-delete ordering (cross-object order was never a
+  protocol property; per-object steps stay sequential). RetryConfig tamed
+  (2 retries, `op_timeout + 5s` — **the +5s is load-bearing**: equal bounds made the
+  client race the bridge and reclassified stalled PUTs 503→500, caught by
+  blob_put_durability; closes 6.1's filed follow-up).
+- **Measured (this machine):** mark 100k: 12.88s → 0.878s (**14.7×**); MinIO sweep
+  10k: tombstone pass 71.9s → 9.2s, delete pass 27.8s → 6.3s (Docker-Desktop MinIO's
+  ~1.5k write-ops/s is the remaining ceiling, not the sweep). Benches are
+  `#[ignore]`d, not CI-gating; behavior-equality smokes run in CI.
+- Two-phase semantics untouched: `minio_round_trip.rs` not modified, 8/8; new
+  `minio_sweep_scale` smoke pins two-phase at 50 objects with overlap.
+
+### 6.4 — GC recomputation caching **[NM]** — ✅ **DONE 2026-07-17** (`5ca7a9d0`, with 6.3)
+- **Shipped:** `GcScanCaches` on `Rooms` — cold-room live-blob set + studio-map
+  projection (the filtered `studio/` map, NOT the classified result), keyed on new
+  `NodePersistence::room_nodes_version` (`MAX(seq)`; monotonic by AUTOINCREMENT;
+  version read BEFORE load so a mid-load append costs one wasted rescan, never
+  staleness; `Composite` forwards, pinned; **default `None` = cache disabled = exact
+  pre-6.4 behavior** — Postgres/Mongo are safe-slow until overridden, filed:
+  Postgres is a trivial MAX(seq), Mongo needs design). Rooms absent from
+  enumeration are pruned (deletion can't advance a version). **Everything that
+  changes the live set WITHOUT a seq advance — upload-window rows, grace expiry,
+  `retain_intermediate_days`, pins, inventory transitions — is deliberately NOT
+  cached** and recomputed per tick; pinned by a warm-cache retention-change test.
+- **Plan-premise correction (the big one): "the visited set IS the live output set"
+  is WRONG as stated.** `live` also holds terminal (file) inserts that were never
+  expanded; sharing one set would let an earlier snapshot's file entry suppress a
+  later snapshot's *directory* expansion of the same content-aliased hash — silently
+  dropping that subtree from the live set = GC deleting live data. Two-set design
+  (`live` + `expanded`) via new `walk_tree_into`; strictly ⊇ the old union, and
+  deterministic where the old walk was traversal-order-dependent in the f/d-alias
+  corner. Sets shared per run (CAS makes expansion location-independent), never
+  across runs. Pinned by a suppression test + fetch-counted union-equality.
+- Sweeper's blocking work wrapped in `spawn_blocking` (cold replays incl. signature
+  re-verification, per-room tree walks, the 15-min `blob_gc_sweep` — 6.2's filed
+  site; sweeper is `tokio::spawn`ed on the shared runtime, verified). **In-scope
+  fix:** `resolve_room_studio_map`'s resident fast-path was keyed on residency
+  alone — 1.4's hydration race, second sighting — now gated on `hydrated`.
+- **Teeth proven twice:** agent's planted-stale seams (`assert_ne!` divergence in
+  the dangerous direction, healed by version advance) AND the orchestrator's
+  independent sabotage (constant `room_nodes_version` → 5/8 cache tests fail:
+  both equivalence oracles, both planted-stale tests, the monotonicity pin).
+  Warm tick on 120 cold rooms: 16.37s → 43.5ms, zero re-scans by counter. All GC
+  gates unchanged.
+- **CI:** `core/gc/src/**` was NOT a paths trigger anywhere (**10th bite**) — added;
+  `room.rs` added to studio-live-hashes-parity (new coupling); 2 new steps in
+  blob-layout-parity, 1 in blob-s3-gc-minio.
+- **Filed:** write-through `persist_node` failures are warn-only → a blob referenced
+  only by an unpersisted node is invisible to any persisted-node scan after eviction
+  (wants 4.2-family treatment on node writes); studio scan enumerates non-studio
+  rooms (cheap predicate would skip most); Postgres/Mongo version overrides.
+
+### 6.4 — GC recomputation caching **[NM]**
+- `sweep_blobs` reloads every cold room's full node history per tick
+  (`room.rs:647`); cache the extracted hash set keyed by max seq, re-scanning only
+  rooms whose seq advanced (or add a SQL projection returning only blob hashes).
+- `resolve_room_studio_map` replays full history into a fresh `StateGraph` per GC run
+  (`studio_live_hashes.rs:624`); cache keyed by last-applied seq and run under
+  `spawn_blocking`.
+- `resolve_snapshot_into` allocates a fresh visited set per retained snapshot
+  (`studio_live_hashes.rs:548`), re-walking shared subtrees; thread one shared
+  visited/live set across all snapshots in a room (safe — the visited set **is** the
+  live output set).
+- **Validation:** GC tick cost on a many-cold-room / many-shared-subtree fixture is
+  sub-linear in redundant work.
+
+### 6.5 — Inbound-pack observer off the hot path **[BOTH]** — ✅ **DONE 2026-07-17** (NM `509d5b85`, ST `86e57cb`) — **PHASE 6 COMPLETE**
+- **[NM] shipped:** per-connection bounded channel (512, **DropOldest** + warn +
+  counter) + one consumer task; policy justified by the shipped observer's own
+  contract (ignores pack bytes, idempotent full-store refresh → surviving newest
+  notification heals a drop; WAIT would re-couple receive latency to observer
+  latency — the defect itself). Per-connection receive-order FIFO pinned incl.
+  max-concurrency 1. 30s per-observer timeout via `WaitAsync` (holds against
+  sync-blocking token-ignoring observers). Teardown: TryComplete → 5s drain →
+  hard-cancel → bounded abandon. **`IInboundPackObserver` untouched** (it already
+  took a CancellationToken); CHANGELOG discloses the two behavioral notes.
+- **[ST] shipped:** per-room dirty/running flags + drain-until-clean loop with
+  lost-wakeup re-check — N-pack burst = in-flight + one trailing cycle, lossless
+  (bytes ignored; callees idempotent). Own linked token (dispose + 30s), never the
+  caller's; mid-cycle cancel tears nothing; IAsyncDisposable bounded.
+- **Packaging:** [ST] compiles against published 0.2.2 interface only — halves
+  developed/tested independently, no repack needed; end-to-end pairing lands at the
+  next version repack. (Repack recipe recorded in the slice report: studio
+  `scripts/restore-local-nodalmerge.ps1`; `pack-local-artifacts.ps1` is at nodalmerge
+  repo ROOT, not scripts/.)
+- **REDs, both independently re-proven by orchestrator sabotage:** [NM] 500ms block
+  in `Post` → starvation test fails (pre-fix inline dispatch delayed the last pack
+  to 1603ms; post-fix <750ms); [ST] dirty-mark removed → all 5 observer tests fail.
+  Restored → green. Gates: nodalmerge 660/660; studio full solution 973 green.
+- **CI:** `RuntimeWebSocketLoopRunner` had **zero .NET CI coverage** — the .NET twin
+  of the Rust `ws_handler` gap (4.2, still open) — both runner test classes added to
+  `dotnet-peerlocal-smoke.yml` (11th bite). Studio: solution-wide ci.yml needs no
+  edits; new tests deliberately untraited so they run in the unconditional unit lane.
+- **Filed:** `ControlPlaneDenyMeterCapture` mutates a non-concurrent Dictionary in a
+  MeterListener callback (crashed one baseline run — wants a lock); studio
+  Integration lane still gated on `NODALMERGE_NATIVE_AVAILABLE` (145 classes may
+  never run in CI); DropOldest cross-room staleness corner documented (heals on the
+  room's next pack).
+
+**Original section text follows.**
+`nodalmerge:hosts/dotnet/…/RuntimeWebSocketLoopRunner.cs:273` awaits the
+`IInboundPackObserver` hook **inline** in the WS receive loop; the try/catch isolates
+exceptions but not latency, so a slow/hung observer stalls all further frames on that
+connection. The one shipped observer, studio's
+[StudioInboundPackObserver](../src/NodalMerge.Studio.Host/StudioInboundPackObserver.cs),
+does real per-pack work (live-map replay + refresh of every `IRehydratable`).
+- **[NM]:** dispatch observers off the receive loop — a bounded queue/channel with its
+  own worker, or `Task.Run` with backpressure — so observer latency never blocks frame
+  processing/relay; give the hook its own timeout independent of connection teardown.
+- **[ST]:** make `StudioInboundPackObserver` resilient to being called off-loop
+  (idempotent, its own cancellation/timeout) and consider debouncing the
+  refresh-every-`IRehydratable` behavior.
+- **Validation:** a deliberately slow observer no longer degrades inbound throughput
+  on the connection; relay to other peers is unaffected.
+
+---
+
+## Phase 7 — Duplication & altitude cleanup
+
+Quality debt with no behavior change; do last, once the surface is correct. Each slice
+must be behavior-preserving (guard with the tests from earlier phases).
+
+### 7.1 — Shared server CLI/bootstrap module **[NM]** — ✅ **DONE 2026-07-17** (`65edcde4`, with 7.3)
+- **Shipped:** `nodalmerge_server::cli_args` — 14 parsers + `parse_gc_sweep_common`
+  (flags, GcServiceConfig, studio-union collector, pin store); main.rs 900→539,
+  server-s3 830→~450; keep-in-sync comment dead. Per-block inventory found NO
+  meaningful parser drift (latent risk, hadn't fired); object-store selection on
+  `--blob-backend` stays binary-local (capability difference, not drift);
+  **dev-server deliberately not switched** (it never had CLI flags — gaining them
+  silently would be a behavior change). Golden check: pre/post binaries × 32 flag
+  matrices × both bins = 0 diffs across 64 captures. 20 parser unit tests.
+
+**Original section text follows.**
+`nodalmerge:server/server-s3/src/main.rs:423` duplicates ~310 lines of flag parsers +
+~75 lines of GC/blob wiring from `server/server/src/main.rs` (with a "keep in sync by
+hand" comment). Extract a `cli`/`bootstrap` module in the `nodalmerge-server` library
+that all three binaries (`server`, `server-s3`, `dev-server`) call.
+- **Validation:** identical CLI behavior across binaries; the duplicated helpers exist
+  once.
+
+### 7.2 — One retry/circuit-breaker component **[NM]** — ✅ **DONE 2026-07-17** (`ceb5db53`, with 7.4)
+- **Shipped characterization-first:** 19 pins captured green against UNCHANGED code,
+  then `RetryCircuitBreakerPolicy` extracted (Composition, not Abstractions — only
+  Composition consumes it). **The drift stays drift, now visible as options:**
+  S3Direct alone carries the 501 capability-declined carve-out
+  (`TreatNotImplementedAsCapabilityDeclined`); Delegated alone uses `CallerDecides`
+  breaker polarity — its 4xx and 200-with-JSON-null answers are breaker FAILURES,
+  the inverse of the origin providers (pinned; filed as a deliberate future
+  unification candidate, incl. the healthy-but-empty-delegate-opens-breaker quirk);
+  exhaustion mapping stays caller-side (HttpRemote throws, both S3 providers null).
+  Wiring sabotage-proven three ways (agent ×2 + orchestrator's 501-option flip →
+  exactly the 3 S3Direct-501 pins fail).
+
+**Original section text follows.**
+The retry-classification + circuit-breaker is copied three times in
+`NodalMerge.Host.Composition` (`S3DirectBlobStoreProvider.cs:526`,
+`HttpRemoteBlobStoreProvider.cs`, `S3DelegatedBlobUrlResolverProvider.cs`) and already
+drifts (null-on-exhaustion vs throw; a 501 cooldown in one copy). Extract one
+options-driven component; map its "exhausted" outcome per caller.
+- **Validation:** all three providers use it; behavior matches each provider's current
+  contract (pin with tests first).
+
+### 7.3 — Shared low-level helpers **[NM]** — ✅ **DONE 2026-07-17** (`65edcde4`, with 7.1)
+- **Shipped:** `date_util.rs` (both copies were already in the same crate) + the
+  long-missing round-trip property test (±150k-day sweep, century pins); the .NET
+  canonical-hash copies — **three** by now, 5.2 added one — merged into
+  `Host.Abstractions.BlobHash.IsCanonical` after verifying identical semantics;
+  `FileBlobGcCoordinator.SanitizeHash` correctly identified as a **deliberate
+  non-duplicate** (lenient fold, over-protection is its safe failure mode) and left
+  untouched; `key_for`/`s3_key_scheme` → one `blake3_object_key`; 6.1's bridge
+  helper confirmed already single (that bullet was pre-absorbed).
+- Behavior-preservation: full gates identical; .NET 660/660 ×2 consecutive; net
+  −700 lines. CI: new modules in paths + dedicated `--lib` steps (the filtered
+  `--lib` blind spot struck again — 8.1's meta-test would catch the class).
+
+**Original section text follows.**
+- One proleptic-Gregorian date module for the two copies in
+  `studio_live_hashes.rs:272` and `blob_http.rs:421` (add the round-trip test the
+  split copies lack).
+- One canonical-hash helper for `WebApplicationExtensions.cs:891` vs
+  `FileBlobGcCoordinator.cs:185` (natural home: `NodalMerge.Host.Abstractions`).
+- One `s3_object_key` derivation shared by `key_for` and `s3_key_scheme`
+  (`s3-blobs:276`/`:724`).
+- One `block_on_shared_runtime` bridge helper for the s3-blobs sites (folds into 6.1).
+- **Validation:** each duplicate collapses to a single definition; existing tests
+  green.
+
+### 7.4 — Freeze the delegate room-id placeholder **[NM]** — ✅ **DONE 2026-07-17** (`ceb5db53`, with 7.2) — **PHASE 7 COMPLETE**
+- **Decided: `room = "_global"`** (+ `namespace = "blobs"` for hosts sending the
+  OPTIONAL field; Rust's request struct has no namespace field and keeps omitting it
+  — conformant). `_global` was Rust's documented value (mirrors the GC-preflight
+  placeholder) and can't collide with real room ids the way .NET's `"default"`
+  could — which also collided with the legacy route's real-room default.
+- The 0.4-reserved vector slot in `work-unit-status-vectors.v1.json` filled
+  (additive, no schema bump); `DelegatePresignProtocol` constants in Abstractions;
+  §7 gained "The room-agnostic placeholder (frozen)" + a ⚠ change note (a delegate
+  quota/audit keyed on room sees .NET's value change; bytes/keys unaffected).
+- **RED independently reproduced** (WebApplicationExtensions revert): 3/4 failed
+  `Expected "_global" / Actual "default"`; Rust pin green both sides — the
+  asymmetry WAS the finding. Gates: .NET 683/683, Rust vectors 2/2, MinIO 1/1.
+- **13th CI gap closed in-slice:** the entire blob URL-resolution vector family
+  (both hosts' tests + the vector file) ran in NO workflow.
+
+**Original section text follows.**
+`nodalmerge:server/server/src/blob_http.rs:73` sends `room="_global"` while the .NET
+host sends `room="default", ns="blobs"` into the same delegate presign protocol; the
+contract makes room metadata-only (never a key input), so bytes are unaffected, but a
+delegate keying policy/quota/audit on room sees different per-host values. Pick one
+placeholder, define it as a frozen contract constant (doc + the vector slot from 0.4),
+and assert both runtimes against it.
+- **Validation:** both hosts emit the same room/namespace on the room-agnostic routes;
+  a vector pins it.
+
+### 7.5 — Pluggable `LiveHashSource` (altitude) **[NM]** — ✅ **DONE 2026-07-17** (`e9439a75`)
+- **Shipped:** async `LiveHashCollector` trait in gc_service (core `LiveHashSource`/
+  `GcCoordinator` untouched — collector runs once per tick, wrapped in the existing
+  `PrecomputedLiveHashSource`); threaded as a generic `Arc` function param mirroring
+  the `BlobObjectStore` seam, **not** a `GcServiceConfig` field (config is
+  Debug+Clone data; deviation from the section wording, justified).
+  `GcServiceConfig.retain_intermediate_days` removed — studio-only knob on generic
+  config, the dead-config shape 1.3 condemned; rides the studio collector's ctor,
+  CLI flag unchanged. `StudioLiveHashCollector` at the bottom of
+  studio_live_hashes.rs — **injection-only, not a crate move** (6.4's warm caches
+  ride the shared `Rooms` clone; parity workflow pins the path; move noted as
+  future). gc_service.rs has ZERO compile-time studio references (verified).
+  Injected in server + server-s3 both arms; dev-server never spawns GC.
+- **1.2's seam built:** `UnionLiveHashCollector`, fail-closed on both axes (any
+  member error fails the union — refusing the 5th fail-open instance; zero members
+  = Invariant error, 1.1's refuse-to-delete posture). 1.2 = room-DAG collector +
+  wrap in union + flip its ignored RED.
+- **Behavior-preservation verified:** every GC suite identical, incl. **the 1.2
+  ignored RED still failing with the same panic** (gap preserved, not papered
+  over); zero assertion changes in studio_gc's 11 mechanical call edits
+  (grep-verified). Seam pin structurally unwritable pre-refactor (old signature
+  quoted in suite docs). Fail-closed independently sabotage-proven
+  (`unwrap_or_default` in the union loop → union test red).
+- **CI:** gc_service.rs wasn't a blob-layout-parity paths trigger (12th bite);
+  the `--lib store::` filter had left `gc_service::` unit tests running in NO
+  workflow (same class 8.1's meta-test would catch); **no workflow anywhere
+  compiled `nodalmerge-server-s3`** — build step stubbed into blob-s3-gc-minio,
+  dev-server still builds nowhere (filed).
+
+**Original section text follows.**
+`nodalmerge:server/server/src/gc_service.rs:149` hard-wires the studio-domain
+live-hash source (971 lines of product-specific parsing) into the generic server GC
+service, even though `GcCoordinator` is already generic over `LiveHashSource`. Thread a
+`LiveHashSource` factory through `GcServiceConfig`/`spawn_gc_sweeper` (the way
+`BlobObjectStore` is already threaded) and move the studio source toward the
+composition layer. This is the clean home for the union built in 1.2 and keeps
+studio-specifics out of the generic crate — the right-altitude version of principle 2.
+- **Validation:** the generic server crate builds/tests without the studio source; the
+  studio composition supplies it; GC behavior unchanged.
+
+---
+
+## Phase 8 — CI coverage (DEFERRED) **[NM]**
+
+**Status: deferred by decision (user, 2026-07-16). Not scheduled, not blocking any slice.**
+Promoted from a follow-up bullet to a phase because it is a body of work with its own design
+question, not a chore — but deliberately parked at the bottom rather than inserted into the
+critical path.
+
+**The problem in one line:** this plan's slices have hit CI coverage gaps **four separate
+times**, escalating each time, and the audit that the fourth prompted found that the failure
+mode is not stale filters — it is **steps that do not exist at all**.
+
+1. `studio_gc.rs` — test file existed, **no step ran it** anywhere (fixed, `5664c2b1`).
+2. `tree_walk.rs` — step existed, **`paths:` omitted the source file it guards** (fixed, `ef693f39`).
+3. `ZstdInteropTests.cs` — **both at once**: listed in `paths:` but no step ran it, *and*
+   `BlobCompression.cs` — the file 3.1 actually fixed — wasn't in the filter at all. The interop
+   contract was enforced only from the Rust side, and a Rust test can never catch a .NET decoder
+   regression.
+4. **The audit: ~15 Rust integration-test files and ~34 .NET test classes run in ZERO workflows.**
+   Includes `server/s3-blobs/tests/minio_round_trip.rs` (**the very test 1.3 is blocked on**),
+   `persistence.rs`, `idle_eviction.rs`, `rate_limit.rs`, `token_expiry.rs`, `metrics_endpoint.rs`,
+   and — sharpest — `blob_layout_vectors_v3.rs`, a *sibling* of the already-covered
+   `blob_layout_vectors.rs`. Several cross-runtime parity contracts are pinned from **one runtime
+   only**: `SpecAuthVectorsTests.cs`↔`spec_auth_vectors.rs` and
+   `BranchForkVectorsTests.cs`↔`branch_fork_vectors.rs` (neither side runs anywhere);
+   `QueryMaterializationVectorsTests.cs` (Rust covered, .NET mirror never runs) — the exact
+   one-directional shape that let finding #4 live.
+
+Some are plausibly uncovered for the same structural reason Postgres/Mongo were (Docker / MinIO /
+native FFI that CI doesn't set up) — **that is a reason to fix the setup, not evidence the gap is
+benign.** Phase 2/3 added several more suites that had run in no workflow
+(`HttpRemoteBlobStoreProviderTests`, `S3DirectBlobStoreProviderTests`, `ChainedBlobStoreProviderTests`,
+`RemoteBlobLinkAggregatorTests`) — each closed only because a slice happened to touch it.
+
+**Until this phase lands, "CI is green" carries much less information than it appears to.**
+
+### 8.0 — The stub convention (IN FORCE NOW, not deferred)
+
+Deferring the phase must not mean slices quietly skip CI wiring in the meantime. So:
+
+- **Every slice still adds its step and its `paths:` entries** — that stays part of the
+  definition of done (see Conventions).
+- **When the right home for a step is unclear, or it needs CI setup that does not exist**
+  (Docker, MinIO, native FFI): **add the step where you believe it should run, with a comment
+  marking it as needing follow-up, and say so in the slice's report.** A stub in roughly the
+  right place is the wanted outcome; silent omission is not. Phase 8 sorts them out.
+- Rationale: a stub is *discoverable* and *movable*. An absent step is neither — which is the
+  entire reason this phase exists.
+
+### 8.1 — Meta-test: every test file is named by some workflow **[NM]**
+The mechanical fixes considered before (drop filters on the cheap correctness workflows, or
+derive them) address staleness. The audit says the **load-bearing** fix is different, because the
+failure is *absence*: a meta-test asserting every `server/**/tests/*.rs` and every .NET test class
+is named by at least one workflow step, failing on any that isn't. An allow-list is fine for
+genuinely-excluded suites — the point is that exclusion becomes **explicit and reviewed** instead
+of accidental.
+- **Validation:** the meta-test, run against the tree as of this phase's start, reproduces the
+  ~15 + ~34 list. That list *is* its RED.
+
+### 8.2 — Close the audit's backlog **[NM]**
+Wire in what 8.1 surfaces, including the CI setup (Docker/MinIO/FFI) that some suites need.
+- ✅ **`minio_round_trip.rs` is DONE — 1.3 absorbed it** (`043df73d`, new `blob-s3-gc-minio.yml`,
+  fail-open closed with `NODALMERGE_REQUIRE_DOCKER=1`). Pulled forward deliberately rather than
+  left to this phase, because 1.3's correctness rested on it. **That is the pattern for the rest
+  of this backlog: a suite whose slice needs it gets wired by that slice, not by Phase 8.**
+  Phase 8 is for what no slice happens to touch — which is most of it.
+  See the Sequencing summary.
+
+### 8.3 — Both-directions rule for parity contracts **[NM]**
+A cross-runtime contract pinned from one runtime only is not pinned. `QueryMaterializationVectorsTests`
+is the live example, and finding #4 is the proof of what it costs. Make "both sides run, or the
+contract is not enforced" an explicit, checked rule rather than a habit.
+
+---
+
+## Sequencing summary
+
+1. **Phase 0** unblocks everything (RED tests + harnesses).
+2. **Phase 1** is P0 — schedule immediately after 0.3; each slice ships behind its
+   0.3 gate.
+3. **Phase 2** depends on 0.2 and shares the existence/hydration seam — 2.1 first
+   (others build on it). ✅ 2.1 shipped, so **2.2/2.3/2.4 are unblocked**.
+4. **Phases 3–5** are independent of each other; parallelizable across contributors.
+   **Within Phase 3 there is one ordering constraint: 3.2's doc half must follow 3.3.**
+5. **Phase 6** — start **6.1** early (near-P1: the wedge risk); the rest after the
+   surface is correct.
+6. **Phase 7** last, behavior-preserving, guarded by earlier tests. 7.5 absorbs the
+   1.2 composition seam; 7.3's bridge helper absorbs 6.1's.
+7. **Phase 8** is deferred and unscheduled — but **8.0's stub convention applies from now on**,
+   and **8.2's MinIO wiring should be pulled forward into 1.3**, not left to the phase.
+
+**Next up (as of 2026-07-16), in order of readiness:**
+- **6.1** — ⚠️ **now the highest-priority remaining item.** Already "near-P1: the wedge risk"; 2.2
+  and 2.3 changed the traffic through the timeout-less runtime bridge from per-request to
+  per-blob-per-sweep (GC) and full-file-payload-per-export. See the callout at Phase 6.
+- **3.3** — unblocks 3.2's doc half, and is required parity work in its own right. Also keeps the
+  `.zst`/`key_for` asymmetry latent.
+- **Phase 4 / Phase 5** — independent, unblocked.
+- **2.4** — the last Phase 2 slice; explicitly low-priority/latent, and the plan says to check
+  whether 2.1–2.3's seam already subsumes it before doing it at all.
+- **1.2** — the last Phase 1 slice, still blocked on 7.5's composition seam.
+
+## Conventions settled during Phase 0
+
+- **RED tests** are committed **gated**, asserting the correct post-fix behavior:
+  Rust `#[ignore = "RED: fails until slice N.N — see plans/blob-cas-remediation.md"]`,
+  C# `[Fact(Skip = "RED: ...")]`. The fixing slice removes the gate **and** adds the
+  CI step. Rationale: CI stays green and the gate is real runnable code, not a comment.
+- **CI is not `--workspace`.** `.github/workflows/*.yml` name every test file as its
+  own step (`cargo test -p <crate> --test <file>` / `dotnet test --filter
+  "FullyQualifiedName~<Class>"`). **A new test file is invisible to CI unless a step is
+  added.** Adding the step is part of every slice's definition of done.
+- ⚠ **A step existing is not the same as a step running** (learned the hard way in Phase 1,
+  2026-07-16). Two failure modes this convention originally missed — **check both, every slice**:
+  1. **No step at all.** `server/server/tests/studio_gc.rs` shipped with **no step in any
+     workflow** — so its Phase 0 RED gates for 1.2/1.6 were not "skipped until their slice", they
+     had *never executed in CI*. Fixed in 1.6 (`studio-live-hashes-parity.yml`). When Phase 0 says
+     a gate is committed, verify the file it lives in actually runs.
+  2. **The workflow is `paths:`-filtered.** `blob-layout-parity.yml` triggers only on a hand-listed
+     set of files. It listed `store.rs`/`room.rs`/`blob_http.rs` but **not** `tree_walk.rs` — so
+     1.5's fix would have landed with its own suite never firing. Fixed in 1.5. **Adding a step is
+     half the job; the trigger must also list the source files the suite guards.**
+  3. **A step can exist, run, and still prove nothing.** Wiring Postgres/Mongo in would have gone
+     green while testing nothing about finding #1 — the suite had no scenario for the property
+     (`known_room_ids`), and `run_all(store, room_id)` took a *single* room, so it structurally
+     could not test multi-room enumeration. Both round-trip tests also fail **open** (skip on
+     missing Docker → reported PASS). **Check the suite asserts the property before wiring it in
+     to guard that property**, and that it cannot no-op.
+  - **Root cause, unfixed:** these filters enumerate implementation files *by hand*, so every
+    suite's real coverage depends on someone remembering each file it transitively exercises. Same
+    shape as the missing `.gitattributes` (fixed `10723954`): correct by luck, silent when wrong.
+    **Now tracked as Phase 8 (deferred)** — and note **8.0's stub convention is in force now**: if
+    a step's home is unclear or needs CI setup that doesn't exist, add it where you believe it
+    belongs with a follow-up comment and report it. Never omit it silently.
+- **Vectors** live flat in `nodalmerge:engine/commands/*.v1.json`; binary goldens in
+  `engine/commands/fixtures/`. Rust consumes via `include_str!` → collect failures into
+  a `Vec<String>` → one `assert!`. Prefer an **inline** `#[cfg(test)]` vector test over
+  an external `tests/` crate when the alternative is exporting test-only `pub` surface
+  (precedent: `s3-blobs/src/lib.rs:775`).
+- **studio's CI** checks out nodalmerge as a sibling at `ref: blobExpansion`
+  (`TODO(blobExpansion-merge):`) because the shared vectors only exist on that branch.
+  **Flip to `main` when `blobExpansion` merges** — this is on the merge checklist.
+
+## Open decisions (resolve before the relevant slice)
+
+- ~~**1.5 note** — require blob-PUT auth by default?~~ **RESOLVED 2026-07-16: no, auth stays optional.** Content-addressing already prevents forging/overwriting (PUT 422s on hash mismatch), and unreferenced uploads are reclaimed by mark/sweep. **Coupled to 1.3:** valid only while 1.3's inventory union stays time-bounded. See 1.5's note.
+- ~~**1.6** — drop `Failed` from the GC terminal set **[NM]**, or make it genuinely terminal **[ST]**?~~ **RESOLVED 2026-07-16: [NM].** A failed work unit is resumable (a human steers it or hand-fixes the file), so the GC must not age its blobs out. See 1.6.
+- ~~**3.2** — encoded pass-through: document unverified-serve as contractual, or add opt-in verify?~~ **RESOLVED 2026-07-16: document it, no flag.** The 200-vs-404 divergence is accepted; "never wrong bytes" is an end-to-end guarantee the client completes. **Write the doc only after 3.3 step 2** — the premise is false until then.
+- ~~**3.3** — default s3-direct compression OFF, vs teach the SDK readers to decode zstd?~~ **RESOLVED 2026-07-16: both, in that order.** Default OFF now; SDK decode is required parity work, not an optional enhancement. Retagged **[NM]** — studio does not consume the web SDK.
+- **All four of the plan's original open decisions are now resolved.** New ones raised by Phase 0 stay below.
+
+## Follow-ups filed (not in this plan's scope)
+
+- ✅ **RESOLVED 2026-07-16** (`968a215b`) — ~~Postgres/Mongo node stores have no CI coverage at
+  all~~ (raised by 1.1). New `.github/workflows/nodestore-adapter-conformance.yml` runs
+  `dir_persistence`, `postgres_round_trip`, `mongo_round_trip`. Two things learned that generalize:
+  - **Wiring the suites in would have proved nothing.** The shared F7 conformance suite had 7
+    scenarios, none touching `known_room_ids`/`can_enumerate_rooms`, and `run_all(store, room_id)`
+    takes a *single* room — so it structurally *could not* test multi-room enumeration. The CI job
+    would have gone green while testing nothing about finding #1. Added
+    `known_room_ids_is_superset_of_written_rooms` (superset, never exact-set — the call is
+    store-global, so other rooms are legitimately present). RED-proven on both stores against real
+    containers, and deliberately sabotaged *two different ways* — empty enumeration (Postgres) and
+    partial, dropping one room (Mongo) — because the guard's whole weakness is *wrong* rather than
+    *absent* enumeration. **Check that a suite asserts the property before wiring it into CI to
+    guard that property.**
+  - **The tests fail *open*.** Both round-trip tests `eprintln!` + `return` when Docker is
+    unavailable, which the harness reports as **PASS** — correct on a dev laptop, catastrophic in
+    CI, where a broken Docker setup goes green while testing nothing. `NODALMERGE_REQUIRE_DOCKER=1`
+    (set at job level) converts the skip into a panic; local runs keep skipping. Verified in both
+    directions by pointing the image at a nonexistent tag. **Any "skips gracefully" test is a
+    fail-open test the moment CI runs it.**
+  - ⚠ **Now THREE instances of one shape — worth a single decision, not three fixes.**
+  `Rooms::collect_recent_upload_hashes` (added by 1.3) `warn!`s and returns an empty set on an
+  inventory read error, so a transient SQLite error silently un-protects recent uploads for that
+  tick. Same shape as, one layer down: both stores' `known_room_ids()` `warn!` + return an empty `Vec` on
+    query failure, so a transient DB error is indistinguishable from "no rooms" — the same
+    silent-data-loss shape the conformance scenario now guards against, but a live-traffic version
+    the scenario cannot reach.
+- ➡ **CI coverage — MOVED to Phase 8 (deferred).** Was the highest-value item on this list;
+  it outgrew a follow-up bullet, so it is now a phase of its own at the bottom of the plan
+  rather than tracked in two places. **Its stub convention (8.0) is in force now, not
+  deferred** — slices still add their step; when a step's home is unclear or needs CI setup
+  that doesn't exist, stub it where it belongs and report it. Note `minio_round_trip.rs`
+  should NOT wait for Phase 8: it is what **1.3** is blocked on, and 1.3 should absorb it.
+
+- ⚠ **`archive.import` silently defaults to the WRITE path on a misspelled key** (found by 2.3,
+  because it inverted one of the slice's own tests). `parse_archive_import_request` reads
+  `message["import_mode"]` and `.unwrap_or("full_apply")`; the "must be full_apply|metadata_only"
+  validation runs **after** the default, so it cannot catch a wrong key name. A client sending
+  `"mode": "metadata_only"` gets **`full_apply`** — the destructive option — silently. The safe
+  default for an absent mode is arguably `metadata_only`, or no default at all (reject).
+- ⚠ **`ExportManifestDocument`'s signature does not cover its digests** (found by 2.3, adjacent
+  but out of its scope). `signature_payload` binds format_version / source_room / compatibility
+  window / `payload_digest_policy` / policy timeline — but **not `payload_digest_set`**. So the
+  signature attests to which digest *policy* was used, never to the digest *values*: a signed
+  manifest's blobs digest can be altered without invalidating the signature. Verified by reading
+  `archive_export.rs:356`. This weakens the "a wrong signed digest is forever" reasoning 2.3 used
+  (correctly, for its own purposes) and deserves its own decision.
+- **`ArchiveReasonClass` has no variant for a backend/config failure**, so 2.3's Delegate-mode
+  errors report as `CheckpointNotFound` — actively misleading for a configuration problem. The
+  detail is in `reason_message`. Adding a variant is a **frozen cross-runtime contract change**
+  (`core/crdt/archive_contracts.rs`, `engine/host-core/protocol.rs`,
+  `archive_portability_vectors.rs`) with a .NET parity obligation — hence not absorbed by 2.3.
+- **`S3BlobStore::hydrate_blob`'s `Unhydratable` detail is GC-specific prose** ("the server can
+  never read *tree objects*", "*Studio GC* cannot run in this mode") and now surfaces verbatim in
+  archive-export errors, where it reads oddly. Still accurate about the *cause*. Not changed
+  because `delegate_gc.rs` asserts on that exact wording.
+- **`.zst`-at-rest is invisible to every S3 reader but visible to the sweeper** (found by 2.2,
+  pre-existing). `S3BlobStore::key_for` derives identity-only `blake3/<hex>`, so `has_blob`,
+  `resolve_get_url`, `verify_uploaded` and now `hydrate_blob` never look at `<hex>.zst` — while
+  `blob_gc_sweep` enumerates via `parse_blob_entry_name`, which understands both. 2.2 matched
+  `has_blob`'s derivation deliberately (one derivation for every reader, so hydration can't drift
+  from existence), which is the consistent choice, but it means the sweeper's view and every
+  reader's view genuinely diverge. **3.3 defaulting s3-direct compression OFF keeps this latent
+  rather than live.**
+- **Export holds every blob in memory at once.** `resolve_referenced_blobs` materializes the full
+  map and `canonical_hash` takes it whole, so a 10 GB room means ~10 GB RSS during export.
+  Pre-existing (Dir did it too) but **free on S3 until 2.3**. Not fixable without changing
+  `canonical_hash`'s frozen cross-runtime contract.
+- **Unbounded retention of revivable statuses.** After 1.6, `Failed` joins
+  `Cancelled`/`DeadLettered` in being retained indefinitely. That is consistent, not new,
+  but three statuses now never age out. If it matters, the fix is a real revival-window
+  policy applied to all three — a design question this plan should not absorb.
+- **`--blob-upload-grace` knob** (if 1.3 introduces one): needs a documented default,
+  ideally tied to the presign TTL, and a CLI/config surface on all three binaries — which
+  lands in 7.1's shared bootstrap module.
+- **7.4** — which placeholder wins, `_global` or `default`/`blobs`?

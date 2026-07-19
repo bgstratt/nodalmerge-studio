@@ -80,7 +80,19 @@ public sealed record MergeProposal(
     // proposal — including ones merged straight to main before promotion was ever turned on — the
     // instant a human flips the toggle. This field is the actual "did this land on candidate and
     // need an explicit promote step" signal PromoteAsync/the pending endpoint must filter on.
-    bool LandedOnCandidateBranch = false)
+    bool LandedOnCandidateBranch = false,
+    // Slice 6.3a (plans/cas-distribution-and-storage.md Phase 6, D1) — denormalized at ProposeAsync
+    // time from the owning WorkUnit's own (already-resolved) RepositoryId, so this proposal routes
+    // to its repo room (StudioNodeKind.RepoScopedKinds) instead of staying peer-local in "studio".
+    // Null when WorkUnitId is null, the owning work unit itself has no resolvable RepositoryId, or
+    // this proposal predates 6.3a — all fall back to "studio", never blocking the write.
+    string? RepositoryId = null,
+    // L2.4 (plans/room-persistence-bloat.md) — the unified diff is the one repo-scoped (replicating)
+    // payload that scales with change size. On ProposeAsync it is moved to a CAS blob (content plane,
+    // pulled on demand) and this carries its BLAKE3 hash, with WorkspaceChanges nulled so the diff
+    // BYTES no longer ride the replication plane to every peer. Resolve via IMergeDiffResolver, which
+    // returns the inline WorkspaceChanges when present (legacy / no-CAS configs) else pulls this blob.
+    string? WorkspaceChangesBlobHash = null)
 {
     public IReadOnlyList<string> FilesTouched { get; init; } = FilesTouched ?? [];
     public IReadOnlyList<string> ReconciledFrom { get; init; } = ReconciledFrom ?? [];

@@ -3,6 +3,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage.TreeObjects;
 
 namespace NodalMerge.Studio.Storage;
 
@@ -10,7 +11,60 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddNodalMergeStorage(this IServiceCollection services)
     {
+        // Slice 6.1b — default no-op outbound replication; NodalMerge.Studio.Host's
+        // StudioWebApplication registers a real implementation (RoomPeerClient) after calling
+        // AddStudioServices, which wins (last AddSingleton registration wins — see e.g. the
+        // WorkspaceOptions comment in AddInMemoryStorage below for the same pattern/rationale).
+        services.AddSingleton<IStudioReplicationOutbound>(NoopStudioReplicationOutbound.Instance);
+        // Slice 6.4 — default-valued RoomOptions (no HostUri, Workgroup="workgroup") so
+        // WorkgroupRepositoryDirectory/WorkgroupGoalDirectory/RoomReplicationDispatcher/
+        // RoomPeerClient always have a room id to bind to, even before NodalMerge.Studio.Host's
+        // config-bound override runs (last-AddSingleton-wins, same pattern as
+        // RetentionPolicyOptions/BlobGcOptions in AddRehydratableServices below).
+        services.AddSingleton(new RoomOptions());
         services.AddSingleton<IStudioNodeStore, NodalMergeStudioNodeStore>();
+        // L2.1 (plans/room-persistence-bloat.md) — durable local append log for the four high-volume
+        // peer-local kinds (Conversation/Execution/Orchestration/ProjectionSnapshot), OFF the CRDT
+        // sync graph. Default directory; NodalMerge.Studio.Host binds NodalMerge:Studio:LocalLog:*
+        // over it (last-AddSingleton-wins, same pattern as RoomOptions above).
+        services.AddSingleton(new StudioLocalLogOptions());
+        services.AddSingleton<IStudioLocalLogStore>(sp =>
+            new FileStudioLocalLogStore(sp.GetRequiredService<StudioLocalLogOptions>()));
+        // L2.3 (plans/room-persistence-bloat.md) — reasoning publisher: on a decision, publish the
+        // work unit's bounded reasoning transcript to the CAS + a repo-scoped ConversationRef.
+        // Requires a blob store (the content plane); when none is configured there's nothing to
+        // publish into, so resolve to null and DecisionNodeService's optional dependency skips
+        // publishing. Only registered on the real storage path — AddInMemoryStorage has no blob store.
+        services.AddSingleton<IReasoningPublisher>(sp =>
+        {
+            var blobStore = sp.GetService<IBlobStoreProvider>();
+            return blobStore is null
+                ? null!
+                : new ReasoningPublisherService(
+                    sp.GetRequiredService<IConversationLogService>(),
+                    blobStore,
+                    sp.GetRequiredService<IStudioNodeStore>());
+        });
+        // Slice 6.2 — workgroup room repositories map (docs/STUDIO_ROOM_SCHEMA.md (b)), engine-backed
+        // like IStudioNodeStore above but a separate room ("workgroup") and namespace
+        // ("repositories") — see WorkgroupRepositoryDirectory's own class comment for what
+        // upstream replication does/doesn't do yet.
+        services.AddSingleton<IWorkgroupRepositoryDirectory, WorkgroupRepositoryDirectory>();
+        // Slice 6.3 — D3's workgroup-level cross-repo goal node (minimal, deliberately not wired
+        // into goal creation — see WorkgroupGoalDirectory's own class comment).
+        services.AddSingleton<IWorkgroupGoalDirectory, WorkgroupGoalDirectory>();
+        // Slice 6.1b/6.3 — inbound replication seam (see IStudioNodeStoreReplicationSink's own doc
+        // comment). Slice 6.3: routed through RoomReplicationDispatcher rather than
+        // NodalMergeStudioNodeStore directly, since RoomPeerClient now applies inbound packs for
+        // "workgroup" and repo rooms too, and those are owned by WorkgroupRepositoryDirectory and
+        // NodalMergeStudioNodeStore respectively — only registered here (not AddInMemoryStorage):
+        // the in-memory doubles have no room_maps/sync-graph split to bridge, so callers must
+        // resolve this as optional.
+        services.AddSingleton<IStudioNodeStoreReplicationSink>(sp => new RoomReplicationDispatcher(
+            (NodalMergeStudioNodeStore)sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetRequiredService<IWorkgroupRepositoryDirectory>(),
+            sp.GetRequiredService<RoomOptions>()));
+        services.AddSingleton<IRepositoryIdentityHintsService, GitRepositoryIdentityHintsService>();
         services.AddSingleton<IBranchService, NodalMergeBranchService>();
         services.AddSingleton<IReplayService, ReplayService>();
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
@@ -23,7 +77,27 @@ public static class ServiceCollectionExtensions
 
     public static IServiceCollection AddInMemoryStorage(this IServiceCollection services)
     {
+        // Slice 6.1b — see AddNodalMergeStorage's identical registration above; InMemoryStudioNodeStore
+        // never calls this (no engine bridge to promote/notify through), but every service that
+        // constructs NodalMergeStudioNodeStore-shaped test doubles directly still needs it resolvable.
+        services.AddSingleton<IStudioReplicationOutbound>(NoopStudioReplicationOutbound.Instance);
+        // Slice 6.4 — default-valued RoomOptions, same reasoning as AddNodalMergeStorage's
+        // identical registration above; the in-memory doubles below don't consume it themselves,
+        // but it's resolvable for any caller/test that does (e.g. constructing a real RoomPeerClient
+        // against an otherwise in-memory-storage host).
+        services.AddSingleton(new RoomOptions());
         services.AddSingleton<IStudioNodeStore, InMemoryStudioNodeStore>();
+        // L2.1 — in-memory local log; forward to the same InMemoryStudioNodeStore instance (it
+        // implements both interfaces over one map), matching the direct-construction tests.
+        services.AddSingleton<IStudioLocalLogStore>(sp =>
+            (InMemoryStudioNodeStore)sp.GetRequiredService<IStudioNodeStore>());
+        // Slice 6.2 — in-memory workgroup directory (no engine bridge needed here, same reasoning
+        // as InMemoryStudioNodeStore above); GitRepositoryIdentityHintsService itself has no engine
+        // dependency at all (LibGit2Sharp only), so it's the same registration in both DI paths.
+        services.AddSingleton<IWorkgroupRepositoryDirectory>(new InMemoryWorkgroupRepositoryDirectory());
+        // Slice 6.3 — in-memory workgroup goal directory, same reasoning as the line above.
+        services.AddSingleton<IWorkgroupGoalDirectory>(new InMemoryWorkgroupGoalDirectory());
+        services.AddSingleton<IRepositoryIdentityHintsService, GitRepositoryIdentityHintsService>();
         services.AddSingleton<IBranchService, InMemoryBranchService>();
         services.AddSingleton<IReplayService, ReplayService>();
         services.AddSingleton<IStateReconstructionService, StateReconstructionService>();
@@ -155,6 +229,19 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IConversationLogService>(sp => sp.GetRequiredService<ConversationLogService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<ConversationLogService>());
 
+        // L2.3 (plans/room-persistence-bloat.md) — resolves reasoning for the drawer: local
+        // ConversationLog first, else the peer-published ConversationRef → CAS blob. Blob store is
+        // optional (absent under AddInMemoryStorage / no-CAS configs → local-only resolution).
+        services.AddSingleton<IReasoningResolver>(sp => new ReasoningResolverService(
+            sp.GetRequiredService<IConversationLogService>(),
+            sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetService<IBlobStoreProvider>()));
+
+        // L2.4 (plans/room-persistence-bloat.md) — resolves a proposal's diff (inline when present,
+        // else pulls the CAS blob). Blob store optional (local-only / no-CAS configs return inline).
+        services.AddSingleton<IMergeDiffResolver>(sp =>
+            new MergeDiffResolverService(sp.GetService<IBlobStoreProvider>()));
+
         services.AddSingleton<SteeringDecisionService>();
         services.AddSingleton<ISteeringDecisionService>(sp => sp.GetRequiredService<SteeringDecisionService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<SteeringDecisionService>());
@@ -205,10 +292,14 @@ public static class ServiceCollectionExtensions
 
         // Repository virtualization — Phase 2/6: snapshot service registered before import service.
         // Phase 6: snapshot service receives IRepositoryOpService for ConsiderCompactionAsync.
+        // Slice 1.1: snapshot service receives ISnapshotTreeResolver so CreateAsync can write the
+        // tree map into the CAS when a blob store is configured (registered in AddFileWorkspaceService
+        // below — registration order doesn't matter, DI resolves lazily).
         services.AddSingleton<InMemoryRepositorySnapshotService>(sp =>
             new InMemoryRepositorySnapshotService(
                 sp.GetRequiredService<IStudioNodeStore>(),
-                sp));
+                sp,
+                sp.GetService<ISnapshotTreeResolver>()));
         services.AddSingleton<IRepositorySnapshotService>(sp => sp.GetRequiredService<InMemoryRepositorySnapshotService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<InMemoryRepositorySnapshotService>());
 
@@ -217,13 +308,28 @@ public static class ServiceCollectionExtensions
             sp.GetService<IRepositorySnapshotService>(),
             sp.GetService<IBlobStoreProvider>(),
             sp.GetService<IRepositoryOpService>(),
-            sp.GetService<WorkspaceOptions>()));
+            sp.GetService<WorkspaceOptions>(),
+            sp.GetService<ISnapshotTreeResolver>(),
+            sp.GetService<ILogger<RepositoryImportService>>()));
         services.AddSingleton<IRepositoryImportService>(sp => sp.GetRequiredService<RepositoryImportService>());
         services.AddSingleton<IRehydratable>(sp => sp.GetRequiredService<RepositoryImportService>());
 
         // Phase 8 — workspace cache manager: eviction, startup orphan sweep, live blob hash enumeration.
         // IHostedService StartAsync fires EvictOrphanedAsync as a best-effort background task so that
         // stale branch dirs from prior runs are cleaned up without blocking the startup chain.
+        // Phase 5 slice 5.1 — snapshot retention classification. No state of its own (unlike
+        // WorkspaceCacheManager it doesn't implement IRehydratable/IHostedService — every read
+        // goes straight through IStudioNodeStore at ClassifyAsync call time). Registered ahead of
+        // WorkspaceCacheManager below because slice 5.2's LiveHashSource v2 now consumes it
+        // directly (registration order doesn't affect factory-based DI resolution, but this keeps
+        // the read order in this file matching the dependency order).
+        services.AddSingleton(new RetentionPolicyOptions());
+        services.AddSingleton<ISnapshotRetentionPolicy>(sp => new SnapshotRetentionPolicy(
+            sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetRequiredService<IRepositoryRegistryService>(),
+            sp.GetService<WorkspaceOptions>(),
+            sp.GetService<RetentionPolicyOptions>()));
+
         services.AddSingleton<WorkspaceCacheManager>(sp => new WorkspaceCacheManager(
             sp.GetRequiredService<IFileWorkspaceService>(),
             sp,
@@ -231,9 +337,25 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IMaterializationEngine>(),
             sp.GetRequiredService<IStudioNodeStore>(),
             sp.GetRequiredService<IRepositoryRegistryService>(),
+            sp.GetRequiredService<ISnapshotTreeResolver>(),
+            sp.GetRequiredService<ISnapshotRetentionPolicy>(),
             sp.GetService<WorkspaceOptions>()));
         services.AddSingleton<IWorkspaceCacheManager>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
+
+        // Phase 5 slice 5.2 — staged local blob GC (DryRun/MarkOnly/SweepSoft/SweepHard) + run
+        // ledger. BlobGcOptions default registration mirrors RetentionPolicyOptions above;
+        // NodalMerge.Studio.Host.StudioServiceCollectionExtensions re-registers a config-bound
+        // instance after AddNodalMergeStorage/AddInMemoryStorage runs (last AddSingleton wins).
+        services.AddSingleton(new BlobGcOptions());
+        services.AddSingleton<IBlobGcService>(sp => new BlobGcService(
+            sp.GetRequiredService<IWorkspaceCacheManager>(),
+            sp.GetRequiredService<ISnapshotRetentionPolicy>(),
+            sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions(),
+            sp.GetService<BlobGcOptions>(),
+            sp.GetService<TimeProvider>(),
+            sp.GetService<ILogger<BlobGcService>>()));
 
         services.AddSingleton<RepositorySyncService>();
         services.AddSingleton<IRepositorySyncService>(sp => sp.GetRequiredService<RepositorySyncService>());
@@ -278,6 +400,16 @@ public static class ServiceCollectionExtensions
         // poll loop's StartAsync begins.
         services.AddSingleton<StudioStateRehydrationService>();
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<StudioStateRehydrationService>());
+
+        // Slice 6.5 Part 1 — resolves IEnumerable<IRehydratable> (every registration above),
+        // exactly like StudioStateRehydrationService, but on-demand (called by RoomPeerClient after
+        // an inbound pack) rather than once at startup. Registered in both AddNodalMergeStorage and
+        // AddInMemoryStorage (this method runs from both) so it's resolvable in every test/host
+        // configuration even though only a connected host (RoomPeerClient) ever actually calls it.
+        services.AddSingleton<IStudioCacheRefreshCoordinator>(sp => new RehydratableRefreshCoordinator(
+            sp.GetServices<IRehydratable>(),
+            sp.GetRequiredService<RoomOptions>(),
+            sp.GetRequiredService<ILogger<RehydratableRefreshCoordinator>>()));
     }
 
     // Slice 14a — no state to rehydrate (rules are resolved fresh from DI each time), so this
@@ -298,6 +430,27 @@ public static class ServiceCollectionExtensions
 
     private static void AddFileWorkspaceService(IServiceCollection services)
     {
+        // Slice 1.1 — resolves a snapshot's tree map (inline legacy TreeEntries or a cas-tree CAS
+        // blob) uniformly for every reader below. Always registered (even with no blob store —
+        // CanWrite is false, ResolveTreeAsync falls back to inline-only) so every consumer can take
+        // it as a required dependency instead of null-checking.
+        services.AddSingleton<ISnapshotTreeResolver>(sp => new SnapshotTreeResolver(
+            sp.GetService<IBlobStoreProvider>(),
+            sp.GetService<ILogger<SnapshotTreeResolver>>()
+                ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<SnapshotTreeResolver>.Instance));
+
+        // Slice 6.3 (D3, docs/STUDIO_ROOM_SCHEMA.md (c)) — pinned cross-repo reference resolution:
+        // repo room -> generation node -> TreeHash -> CAS walk -> blob bytes. Registered for both
+        // DI paths (this method is shared); blob store stays optional (resolver returns null with a
+        // logged warning when absent, same optional-collaborator shape as everything above).
+        services.AddSingleton<IPinnedReferenceResolver>(sp => new PinnedReferenceResolver(
+            sp.GetRequiredService<IStudioNodeStore>(),
+            sp.GetRequiredService<IWorkgroupRepositoryDirectory>(),
+            sp.GetRequiredService<ISnapshotTreeResolver>(),
+            sp.GetService<IBlobStoreProvider>(),
+            sp.GetService<ILogger<PinnedReferenceResolver>>()
+                ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<PinnedReferenceResolver>.Instance));
+
         // Phase 7 — materializer registered here so it's available to both AddNodalMergeStorage
         // and AddInMemoryStorage; it has no state to rehydrate so it doesn't go through
         // AddRehydratableServices.
@@ -306,9 +459,30 @@ public static class ServiceCollectionExtensions
             var blobStore = sp.GetService<IBlobStoreProvider>();
             var opts      = sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions();
             return blobStore is not null
-                ? new MaterializationEngine(blobStore, opts)
+                ? new MaterializationEngine(
+                    blobStore, opts, sp.GetRequiredService<ISnapshotTreeResolver>(),
+                    sp.GetService<ILogger<MaterializationEngine>>())
                 : NullMaterializationEngine.Instance;
         });
+
+        // Phase 2 slice 2.4 — prefetch warms the local blob cache for a work unit's declared
+        // FileScope ahead of need; registered alongside the materializer/resolver above since it
+        // shares their optional-blob-store shape (no store configured = a no-op service, not a
+        // missing registration every caller has to null-check for).
+        services.AddSingleton<IBlobPrefetchService>(sp => new WorkUnitPrefetchService(
+            sp.GetRequiredService<IRepositorySnapshotService>(),
+            sp.GetRequiredService<ISnapshotTreeResolver>(),
+            sp.GetService<IBlobStoreProvider>()));
+
+        // Phase 2 slice 2.3 — CAS reconcile sweep: heals gaps in the remote origin. remote is
+        // resolved via GetService (may be null — Studio.Core's ICasReconcileService documents a
+        // zero-result no-op for that case, same optional-collaborator shape as IBlobPrefetchService
+        // above), so registering this always is safe even when no remote origin is configured.
+        services.AddSingleton<ICasReconcileService>(sp => new CasReconcileService(
+            sp.GetRequiredService<IWorkspaceCacheManager>(),
+            sp.GetRequiredService<IBlobStoreProvider>(),
+            sp.GetRequiredService<ILogger<CasReconcileService>>(),
+            sp.GetService<IRemoteBlobPushTarget>()));
 
         services.AddSingleton<IFileWorkspaceService>(sp => new FileSystemWorkspaceService(
             sp.GetService<WorkspaceOptions>() ?? new WorkspaceOptions(),
@@ -316,7 +490,10 @@ public static class ServiceCollectionExtensions
             sp.GetService<IRepositoryOpService>(),
             sp.GetService<IMaterializationEngine>(),
             sp.GetService<IRepositorySnapshotService>(),
-            sp.GetService<ILogger<FileSystemWorkspaceService>>()));
+            sp.GetService<ILogger<FileSystemWorkspaceService>>(),
+            sp.GetService<ISnapshotTreeResolver>(),
+            sp.GetService<IRepositoryRegistryService>(),
+            sp));
 
         // Phase 10 — Roslyn C# syntax validator for AstMergeStrategy.
         services.AddSingleton<ISourceValidator, RoslynSourceValidator>();

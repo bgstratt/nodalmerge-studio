@@ -3,92 +3,86 @@ using Microsoft.Extensions.Logging;
 using NodalMerge.DotNetHost.Ffi;
 using NodalMerge.DotNetHost.Runtime;
 using NodalMerge.Studio.Core.Services;
+using NodalMerge.Studio.Storage;
 
 namespace NodalMerge.Studio.Host;
 
+// Slice 6.1b: this class used to own its own RequestServerPack + RuntimeRoomBroker.BroadcastAsync
+// call (the 30 s StudioCrdtSyncBackgroundService promoter's broadcast half, now retired). It now
+// routes through the same IStudioReplicationOutbound seam NodalMergeStudioNodeStore's per-write
+// path uses, so there is exactly one place that knows how to turn a promoted node id into an
+// outbound pack (RoomPeerClient) instead of two. What remains here is purely the promote call
+// itself — still needed for InMemoryWorkUnitService's WorkUnit-completion-boundary safety net
+// (see IStudioGraphPromoter's own doc comment); it is frequently a no-op race against
+// NodalMergeStudioNodeStore's own per-write promote (PromoteCheckpointToGraph is idempotent per
+// checkpoint identity), and when it isn't, the resulting node still needs to reach replication.
+//
+// Slice 6.3 — per the slice's own "what NOT to do" boundary, this class is NOT redesigned: it
+// still does exactly one thing (promote a room's latest checkpoint + notify outbound). What
+// changed is WHICH room: repositoryId resolves via the same BoundRepoRooms helper
+// NodalMergeStudioNodeStore's write path uses, so a repo-scoped WorkUnit's completion safety net
+// promotes that repo's own room instead of unconditionally promoting "studio" — otherwise the
+// safety net would promote the wrong room's checkpoint (or a room the write never touched at all)
+// once WorkUnitV1 writes started routing to repo/{repoId} rooms.
 internal sealed class RuntimeGraphPromoter(
     IRuntimeCommandBridge bridge,
-    RuntimeRoomBroker roomBroker,
-    ILogger<RuntimeGraphPromoter> logger
+    IStudioReplicationOutbound replicationOutbound,
+    ILogger<RuntimeGraphPromoter> logger,
+    IRepositoryRegistryService? repositoryRegistry = null
 ) : IStudioGraphPromoter
 {
     private const string StudioRoomId = "studio";
 
-    private static readonly string PromoteCommand = JsonSerializer.Serialize(new
+    public async Task TryPromoteStudioCheckpointAsync(string? repositoryId = null)
     {
-        room_id = StudioRoomId,
-        command = new
-        {
-            PromoteCheckpointToGraph = new
-            {
-                selector = new { selector = "latest" }
-            }
-        }
-    });
+        var roomId = await BoundRepoRooms.TryResolveRepoRoomIdAsync(repositoryRegistry, repositoryId, CancellationToken.None)
+            .ConfigureAwait(false) ?? StudioRoomId;
 
-    private static readonly string RequestPackCommand = JsonSerializer.Serialize(new
-    {
-        room_id = StudioRoomId,
-        command = new
-        {
-            RequestServerPack = new
-            {
-                known_ids = Array.Empty<string>()
-            }
-        }
-    });
-
-    public async Task TryPromoteStudioCheckpointAsync()
-    {
         try
         {
-            bridge.ProcessJsonCommand(PromoteCommand);
-            await BroadcastStudioPackAsync(CancellationToken.None).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "studio graph promotion failed; checkpoint not materialized this cycle");
-        }
-    }
+            var promoteCommand = JsonSerializer.Serialize(new
+            {
+                room_id = roomId,
+                command = new
+                {
+                    PromoteCheckpointToGraph = new
+                    {
+                        selector = new { selector = "latest" }
+                    }
+                }
+            });
 
-    internal async Task BroadcastStudioPackAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            var response = bridge.ProcessJsonCommand(RequestPackCommand);
+            var response = bridge.ProcessJsonCommand(promoteCommand);
             if (response.Status != AsStatus.Ok)
                 return;
 
-            using var eventsDoc = JsonDocument.Parse(response.EventsJson);
-            if (eventsDoc.RootElement.ValueKind != JsonValueKind.Array)
+            var nodeIdHex = TryExtractPromotedNodeIdHex(response.EventsJson);
+            if (string.IsNullOrWhiteSpace(nodeIdHex))
                 return;
 
-            foreach (var evt in eventsDoc.RootElement.EnumerateArray())
-            {
-                if (!evt.TryGetProperty("ServerPackPrepared", out var serverPack))
-                    continue;
-                if (!serverPack.TryGetProperty("nodes_b64", out var nodesB64Node))
-                    continue;
-                var nodesB64 = nodesB64Node.GetString();
-                if (string.IsNullOrWhiteSpace(nodesB64))
-                    continue;
-
-                var packJson = JsonSerializer.Serialize(new
-                {
-                    type = "pack",
-                    room = StudioRoomId,
-                    from = "server",
-                    nodes = nodesB64
-                });
-
-                await roomBroker.BroadcastAsync(StudioRoomId, packJson, cancellationToken: cancellationToken)
-                    .ConfigureAwait(false);
-                return;
-            }
+            await replicationOutbound.NotifyLocalWriteAsync(roomId, nodeIdHex, CancellationToken.None)
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "studio pack broadcast failed");
+            logger.LogWarning(ex, "studio graph promotion failed room={Room}; checkpoint not materialized this cycle", roomId);
         }
+    }
+
+    private static string? TryExtractPromotedNodeIdHex(string eventsJson)
+    {
+        using var eventsDoc = JsonDocument.Parse(eventsJson);
+        if (eventsDoc.RootElement.ValueKind != JsonValueKind.Array)
+            return null;
+
+        foreach (var evt in eventsDoc.RootElement.EnumerateArray())
+        {
+            if (evt.ValueKind != JsonValueKind.Object || !evt.TryGetProperty("CheckpointPromoted", out var promoted))
+                continue;
+            if (promoted.TryGetProperty("node_id_hex", out var nodeIdEl) && nodeIdEl.ValueKind == JsonValueKind.String)
+                return nodeIdEl.GetString();
+        }
+
+        return null;
     }
 }

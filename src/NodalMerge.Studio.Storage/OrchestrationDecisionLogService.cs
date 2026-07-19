@@ -11,12 +11,13 @@ public sealed class OrchestrationDecisionLogService : IOrchestrationDecisionLogS
     // workUnitId → ordered list of eventIds
     private readonly ConcurrentDictionary<string, List<string>> _byWorkUnit = new();
     private readonly Lock _indexLock = new();
-    private readonly IStudioNodeStore _nodeStore;
+    private readonly IStudioLocalLogStore _localLog;
     private readonly IExecutionEventStream _events;
 
-    public OrchestrationDecisionLogService(IStudioNodeStore nodeStore, IExecutionEventStream events)
+    // L2.1 — peer-local decision log, persisted to the local append log off the CRDT sync graph.
+    public OrchestrationDecisionLogService(IStudioLocalLogStore localLog, IExecutionEventStream events)
     {
-        _nodeStore = nodeStore;
+        _localLog = localLog;
         _events    = events;
     }
 
@@ -50,10 +51,11 @@ public sealed class OrchestrationDecisionLogService : IOrchestrationDecisionLogS
             list.Add(ev.EventId);
         }
 
-        await _nodeStore.WriteNodeAsync(
+        await _localLog.AppendAsync(
             StudioNodeKind.OrchestrationEventV1,
             ev.EventId,
             JsonSerializer.Serialize(ev),
+            ev.OccurredAt,
             ct).ConfigureAwait(false);
 
         // Mirror into the unified causal stream (10b.2) — this decision log is the queryable-by-
@@ -73,7 +75,7 @@ public sealed class OrchestrationDecisionLogService : IOrchestrationDecisionLogS
 
     public async Task RehydrateAsync(CancellationToken ct = default)
     {
-        var records = await _nodeStore.ReadAllNodesAsync(StudioNodeKind.OrchestrationEventV1, ct).ConfigureAwait(false);
+        var records = await _localLog.ReadAllAsync(StudioNodeKind.OrchestrationEventV1, ct).ConfigureAwait(false);
         foreach (var (_, payloadJson) in records)
         {
             var ev = JsonSerializer.Deserialize<OrchestrationEvent>(payloadJson);

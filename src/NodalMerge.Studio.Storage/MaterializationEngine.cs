@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -19,12 +20,16 @@ internal sealed class NullMaterializationEngine : IMaterializationEngine
         => Task.FromResult(0);
 }
 
-// Phase 7 — reconstructs workspace directories from a snapshot's TreeEntries + CAS.
+// Phase 7 — reconstructs workspace directories from a snapshot's tree map + CAS.
 // The skip-already-matching optimization avoids re-fetching blobs for files already on disk
 // with the correct content — critical for partial-eviction recovery.
+// Slice 1.1 — the tree map itself is resolved via ISnapshotTreeResolver (inline legacy TreeEntries
+// or a CAS tree blob keyed by TreeHash), never dereferenced from RepositorySnapshot directly.
 internal sealed class MaterializationEngine(
     IBlobStoreProvider blobStore,
-    WorkspaceOptions options) : IMaterializationEngine
+    WorkspaceOptions options,
+    ISnapshotTreeResolver treeResolver,
+    ILogger<MaterializationEngine>? logger = null) : IMaterializationEngine
 {
     public async Task<int> MaterializeAsync(
         RepositorySnapshot snapshot,
@@ -32,9 +37,16 @@ internal sealed class MaterializationEngine(
         IReadOnlyList<string>? fileScope = null,
         CancellationToken ct = default)
     {
-        if (snapshot.TreeEntries is null) return 0;
+        // Phase 2 slice 2.4 — passes fileScope into the resolver so a v2 tree walk can prune
+        // subtrees the scope can't reach (bounding CAS reads, not just the local file-write loop
+        // below). FilterByScope is still applied afterward: it's a no-op against an
+        // already-scoped map (same IsInScope predicate) but keeps behavior identical for legacy
+        // snapshots (whose resolver-side filtering is itself just FilterByScope's twin) and for a
+        // null scope (a no-op filter either way).
+        var treeEntries = await treeResolver.ResolveTreeAsync(snapshot, fileScope, ct).ConfigureAwait(false);
+        if (treeEntries is null) return 0;
 
-        var entries = FilterByScope(snapshot.TreeEntries, fileScope);
+        var entries = FilterByScope(treeEntries, fileScope);
         var entrySet = entries.Keys.ToHashSet(StringComparer.Ordinal);
 
         Directory.CreateDirectory(targetPath);
@@ -53,12 +65,14 @@ internal sealed class MaterializationEngine(
         IReadOnlyList<string>? fileScope = null,
         CancellationToken ct = default)
     {
-        if (snapshot.TreeEntries is null) return 0;
+        var currentEntries = await treeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+        if (currentEntries is null) return 0;
 
-        var current  = FilterByScope(snapshot.TreeEntries, fileScope);
-        var previous = previousSnapshot.TreeEntries is null
+        var current = FilterByScope(currentEntries, fileScope);
+        var previousEntries = await treeResolver.ResolveTreeAsync(previousSnapshot, ct).ConfigureAwait(false);
+        var previous = previousEntries is null
             ? new Dictionary<string, string>(StringComparer.Ordinal)
-            : FilterByScope(previousSnapshot.TreeEntries, fileScope);
+            : FilterByScope(previousEntries, fileScope);
 
         // Changed or added paths.
         var toWrite = current
@@ -99,7 +113,17 @@ internal sealed class MaterializationEngine(
                 try
                 {
                     var result = await blobStore.TryGetBlobAsync(blobId, ct).ConfigureAwait(false);
-                    if (!result.Found || result.Bytes is null) return;
+                    if (!result.Found || result.Bytes is null)
+                    {
+                        // Silently leaving this file unwritten would make the workspace look like the
+                        // path was deleted to any downstream diff (e.g. merge proposal generation) —
+                        // log loudly so a CAS/origin gap is distinguishable from a real deletion.
+                        logger?.LogWarning(
+                            "File blob {BlobId} for {RelativePath} is missing from the blob store " +
+                            "(CAS miss) — leaving the path unwritten; workspace at {TargetPath} will be " +
+                            "incomplete.", blobId, relativePath, targetPath);
+                        return;
+                    }
 
                     Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
                     await File.WriteAllBytesAsync(fullPath, result.Bytes, ct).ConfigureAwait(false);

@@ -105,7 +105,8 @@ public sealed class WorkUnitCommandService(
         if (isFreshTopLevelGoal && !string.IsNullOrWhiteSpace(effectiveRepositoryPath))
         {
             await repositorySync.SyncBranchFromRepositoryAsync(
-                seedFromBranchId!, effectiveRepositoryPath, SyncTrigger.GoalCreation, cancellationToken)
+                seedFromBranchId!, effectiveRepositoryPath, SyncTrigger.GoalCreation, cancellationToken,
+                repositoryId: effectiveRepositoryId)
                 .ConfigureAwait(false);
 
             var syncState = await repositorySync.GetStateAsync(seedFromBranchId!, cancellationToken).ConfigureAwait(false);

@@ -23,7 +23,7 @@ public sealed class InMemoryTaskConflictService(IStudioNodeStore nodeStore)
         }
 
         await nodeStore.WriteNodeAsync(
-            StudioNodeKind.TaskConflictV1, conflict.ConflictId, JsonSerializer.Serialize(conflict), ct)
+            StudioNodeKind.TaskConflictV1, conflict.ConflictId, JsonSerializer.Serialize(conflict), conflict.RepositoryId, ct)
             .ConfigureAwait(false);
         return conflict;
     }
@@ -61,7 +61,7 @@ public sealed class InMemoryTaskConflictService(IStudioNodeStore nodeStore)
         }
 
         await nodeStore.WriteNodeAsync(
-            StudioNodeKind.TaskConflictV1, conflictId, JsonSerializer.Serialize(updated), ct)
+            StudioNodeKind.TaskConflictV1, conflictId, JsonSerializer.Serialize(updated), updated.RepositoryId, ct)
             .ConfigureAwait(false);
         return updated;
     }
@@ -78,7 +78,7 @@ public sealed class InMemoryTaskConflictService(IStudioNodeStore nodeStore)
         }
 
         await nodeStore.WriteNodeAsync(
-            StudioNodeKind.TaskConflictV1, conflictId, JsonSerializer.Serialize(updated), ct)
+            StudioNodeKind.TaskConflictV1, conflictId, JsonSerializer.Serialize(updated), updated.RepositoryId, ct)
             .ConfigureAwait(false);
         return updated;
     }
@@ -95,10 +95,13 @@ public sealed class InMemoryTaskConflictService(IStudioNodeStore nodeStore)
         }
 
         await nodeStore.WriteNodeAsync(
-            StudioNodeKind.TaskConflictV1, conflictId, JsonSerializer.Serialize(updated), ct)
+            StudioNodeKind.TaskConflictV1, conflictId, JsonSerializer.Serialize(updated), updated.RepositoryId, ct)
             .ConfigureAwait(false);
         return updated;
     }
+
+    // Slice 6.5 Part 1 — see InMemoryWorkUnitService.RehydratedKinds' doc comment.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.TaskConflictV1];
 
     public async Task RehydrateAsync(CancellationToken cancellationToken = default)
     {
@@ -110,6 +113,23 @@ public sealed class InMemoryTaskConflictService(IStudioNodeStore nodeStore)
             {
                 var conflict = JsonSerializer.Deserialize<TaskConflictRecord>(json);
                 if (conflict is not null && !_byId.ContainsKey(conflict.ConflictId))
+                    _byId[conflict.ConflictId] = conflict;
+            }
+        }
+    }
+
+    // Slice 6.5 Part 1 — see InMemoryCandidateConflictService's identical override for why an
+    // unconditional upsert replaces RehydrateAsync's add-only guard here.
+    public async Task RefreshAsync(CancellationToken cancellationToken = default)
+    {
+        var nodes = await nodeStore.ReadAllNodesAsync(StudioNodeKind.TaskConflictV1, cancellationToken)
+            .ConfigureAwait(false);
+        lock (_lock)
+        {
+            foreach (var (_, json) in nodes)
+            {
+                var conflict = JsonSerializer.Deserialize<TaskConflictRecord>(json);
+                if (conflict is not null)
                     _byId[conflict.ConflictId] = conflict;
             }
         }

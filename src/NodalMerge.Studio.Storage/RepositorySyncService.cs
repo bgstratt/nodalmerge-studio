@@ -19,6 +19,12 @@ internal sealed class RepositorySyncService : IRepositorySyncService, IRehydrata
     private readonly IWorkspaceProfileService _workspaceProfiles;
     private readonly IStudioNodeStore _nodeStore;
     private readonly IRepositoryImportService? _repositoryImport;
+    // Slice 7.2 — resolves the workgroup-portable CAS key instead of always using
+    // Path.GetFullPath(repositoryPath) directly. Optional/nullable: no circular DI risk
+    // (RepositoryRegistryService doesn't depend on IRepositorySyncService), but kept nullable to
+    // match every other collaborator here and so any direct test construction of this class
+    // continues compiling unchanged.
+    private readonly IRepositoryRegistryService? _repositories;
 
     public RepositorySyncService(
         IFileWorkspaceService fileWorkspace,
@@ -26,7 +32,8 @@ internal sealed class RepositorySyncService : IRepositorySyncService, IRehydrata
         IArtifactLineageService artifactLineage,
         IWorkspaceProfileService workspaceProfiles,
         IStudioNodeStore nodeStore,
-        IRepositoryImportService? repositoryImport = null)
+        IRepositoryImportService? repositoryImport = null,
+        IRepositoryRegistryService? repositories = null)
     {
         _fileWorkspace = fileWorkspace;
         _knownGoodState = knownGoodState;
@@ -34,16 +41,18 @@ internal sealed class RepositorySyncService : IRepositorySyncService, IRehydrata
         _workspaceProfiles = workspaceProfiles;
         _nodeStore = nodeStore;
         _repositoryImport = repositoryImport;
+        _repositories = repositories;
     }
 
     public async Task<PendingExternalSync?> SyncBranchFromRepositoryAsync(
-        string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct = default)
+        string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct = default,
+        string? repositoryId = null)
     {
         var gate = _gates.GetOrAdd(branchId, _ => new SemaphoreSlim(1, 1));
         await gate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            return await SyncCoreAsync(branchId, repositoryPath, trigger, ct).ConfigureAwait(false);
+            return await SyncCoreAsync(branchId, repositoryPath, trigger, ct, repositoryId).ConfigureAwait(false);
         }
         finally
         {
@@ -52,7 +61,7 @@ internal sealed class RepositorySyncService : IRepositorySyncService, IRehydrata
     }
 
     private async Task<PendingExternalSync?> SyncCoreAsync(
-        string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct)
+        string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct, string? repositoryId)
     {
         // Phase 5 — one-time CAS bootstrap: walk the repo, put every file to CAS, emit Import ops,
         // and record the Generation-0 RepositorySnapshot. Fast no-op on subsequent GoalCreation/
@@ -63,11 +72,19 @@ internal sealed class RepositorySyncService : IRepositorySyncService, IRehydrata
         // times a resync is explicitly requested.
         if (_repositoryImport is not null)
         {
-            var repositoryId = Path.GetFullPath(repositoryPath);
+            // Slice 7.2 — resolves the workgroup-portable CAS key (sticky to any already-existing
+            // chain — see ResolveCasIdentityAsync's own doc comment) instead of always assuming
+            // Path.GetFullPath(repositoryPath) directly. Falls back to that exact pre-7.2 behavior
+            // when no registry is wired at all.
+            var casRepositoryId = _repositories is not null
+                ? await _repositories.ResolveCasIdentityAsync(repositoryId, repositoryPath, ct).ConfigureAwait(false)
+                : null;
+            casRepositoryId ??= Path.GetFullPath(repositoryPath);
+
             if (trigger is SyncTrigger.PostMergeWriteBack or SyncTrigger.ManualRefresh)
-                await _repositoryImport.ForceSyncAsync(repositoryId, repositoryPath, ct).ConfigureAwait(false);
+                await _repositoryImport.ForceSyncAsync(casRepositoryId, repositoryPath, ct).ConfigureAwait(false);
             else
-                await _repositoryImport.EnsureBootstrappedAsync(repositoryId, repositoryPath, ct).ConfigureAwait(false);
+                await _repositoryImport.EnsureBootstrappedAsync(casRepositoryId, repositoryPath, ct).ConfigureAwait(false);
         }
 
         // No-op if main is already populated (today's existing one-time seed mechanism, untouched).

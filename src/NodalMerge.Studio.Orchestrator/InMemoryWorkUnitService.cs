@@ -12,6 +12,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
     private readonly ConcurrentDictionary<string, WorkUnit> _workUnits = new();
     private readonly IBranchService _branchService;
     private readonly IMergeService _mergeService;
+    private readonly IMergeDiffResolver? _diffResolver;
     private readonly IKnownGoodStateService _knownGoodStateService;
     private readonly IAgentControlService _agentControl;
     private readonly IStudioNodeStore _nodeStore;
@@ -40,10 +41,14 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IRuntimeEventBroadcaster? broadcaster = null,
         IStudioGraphPromoter? graphPromoter = null,
         IParticipantEventBus? eventBus = null,
-        IServiceProvider? serviceProvider = null)
+        IServiceProvider? serviceProvider = null,
+        // L2.4 — optional: resolves a proposal's diff (CAS-ref'd off the replication plane). Null
+        // falls back to the inline WorkspaceChanges (tests / no-CAS configs).
+        IMergeDiffResolver? diffResolver = null)
     {
         _branchService         = branchService;
         _mergeService          = mergeService;
+        _diffResolver          = diffResolver;
         _knownGoodStateService = knownGoodStateService;
         _agentControl          = agentControl;
         _nodeStore             = nodeStore;
@@ -66,6 +71,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnit.WorkUnitId,
             JsonSerializer.Serialize(workUnit),
+            workUnit.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         // The work unit's own ID doubles as its Goal artifact's ID — every other artifact in
@@ -104,6 +110,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         if (sessionId is not null)
@@ -118,7 +125,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
 
         if (status is WorkUnitStatus.Completed or WorkUnitStatus.Merged)
         {
-            _ = GraphPromoter?.TryPromoteStudioCheckpointAsync();
+            _ = GraphPromoter?.TryPromoteStudioCheckpointAsync(updated.RepositoryId);
         }
 
         _eventBus?.Publish(new WorkUnitStatusChangedEvent(workUnitId, previousStatus, status, DateTimeOffset.UtcNow));
@@ -138,6 +145,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         if (_broadcaster is not null)
@@ -165,6 +173,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -189,6 +198,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -211,6 +221,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -232,6 +243,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -256,6 +268,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -287,6 +300,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         return updated;
@@ -317,6 +331,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
 
         if (sessionId is not null)
@@ -395,8 +410,41 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             }
         }
 
+        // Slice 6.3a — inherit RepositoryId from the immediate parent when this work unit didn't
+        // resolve its own (single-hop, per RepositoryIdResolution's own comment: the parent's
+        // stored value is already fully resolved by construction, so one hop suffices).
+        if (resolvedRepositoryId is null && parentWorkUnitId is not null
+            && _workUnits.TryGetValue(parentWorkUnitId, out var parentWorkUnitForRepo))
+        {
+            resolvedRepositoryId = parentWorkUnitForRepo.RepositoryId;
+        }
+
+        // Slice 6.5 Part 2 (plans/cas-distribution-and-storage.md Phase 6) — capture the
+        // repository's actual current-head RepositorySnapshot.SnapshotId at the moment this
+        // branch/work unit is seeded, so SnapshotRetentionPolicy's "Active" classification can pin
+        // the exact seed generation instead of approximating it by CreatedAt timestamp (see that
+        // class's own doc comment and WorkUnit.SeedSnapshotId's). RepositorySnapshot.RepositoryId is
+        // keyed by Path.GetFullPath of the physical repo path — a different id space than the
+        // registry RepositoryId resolved above — so this mirrors
+        // SnapshotRetentionPolicy.ResolveRepositoryIdAsync's exact resolution rather than reusing
+        // resolvedRepositoryId directly. Best-effort: no snapshot service registered, or no
+        // snapshot yet for a brand-new/unbootstrapped repository, both leave this null — the
+        // existing timestamp proxy remains the fallback for those rows, same as every pre-6.5 one.
+        string? seedSnapshotId = null;
+        var snapshotService = _serviceProvider?.GetService<IRepositorySnapshotService>();
+        if (snapshotService is not null)
+        {
+            var snapshotRepositoryPath = await ResolveSnapshotRepositoryPathAsync(resolvedRepositoryId, cancellationToken)
+                .ConfigureAwait(false);
+            var headSnapshot = await snapshotService.GetLatestAsync(snapshotRepositoryPath, cancellationToken)
+                .ConfigureAwait(false);
+            seedSnapshotId = headSnapshot?.SnapshotId;
+        }
+
         var resolvedBranchId = await _branchService
-            .CreateBranchAsync(branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, fileScope, cancellationToken)
+            .CreateBranchAsync(
+                branchId ?? $"work-{Guid.NewGuid():N}", seedFromBranchId, fileScope,
+                repositoryId: resolvedRepositoryId, seedSnapshotId: seedSnapshotId, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
 
         var fanOutInfo = sliceId is not null || seedFromBranchId is not null
@@ -436,7 +484,8 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             WorkspaceId: workspaceId ?? "workspace-default",
             ReconciliationSourceProposalIds: reconciliationSourceProposalIds,
             ReconciliationTargetPaths: reconciliationTargetPaths,
-            ReconciliationSourceRef: reconciliationSourceRef);
+            ReconciliationSourceRef: reconciliationSourceRef,
+            SeedSnapshotId: seedSnapshotId);
 
         return await CreateAsync(workUnit, cancellationToken).ConfigureAwait(false);
     }
@@ -455,6 +504,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             StudioNodeKind.WorkUnitV1,
             workUnitId,
             JsonSerializer.Serialize(updated),
+            updated.RepositoryId,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -532,7 +582,10 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
                 if (proposal is null)
                     continue;
 
-                var snapshot = BuildProposalSnapshot(proposal, proposalRef.CreatedAt);
+                var diff = _diffResolver is not null
+                    ? await _diffResolver.ResolveAsync(proposal, cancellationToken).ConfigureAwait(false)
+                    : proposal.WorkspaceChanges;
+                var snapshot = BuildProposalSnapshot(proposal, proposalRef.CreatedAt, diff);
                 proposalSnapshots.Add(snapshot);
             }
         }
@@ -541,7 +594,10 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             var proposals = await _mergeService.ListAsync(resolvedBranchId, cancellationToken).ConfigureAwait(false);
             foreach (var proposal in proposals.OrderBy(p => p.DiffGeneratedAt ?? DateTimeOffset.MinValue))
             {
-                proposalSnapshots.Add(BuildProposalSnapshot(proposal, proposal.DiffGeneratedAt ?? DateTimeOffset.MinValue));
+                var diff = _diffResolver is not null
+                    ? await _diffResolver.ResolveAsync(proposal, cancellationToken).ConfigureAwait(false)
+                    : proposal.WorkspaceChanges;
+                proposalSnapshots.Add(BuildProposalSnapshot(proposal, proposal.DiffGeneratedAt ?? DateTimeOffset.MinValue, diff));
             }
         }
 
@@ -619,9 +675,9 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return Task.FromResult<IReadOnlyList<WorkUnit>>(dependents);
     }
 
-    private static (DateTimeOffset SortKey, WorkspaceStatusProposalSummary Summary, IReadOnlyList<WorkspaceStatusFileChange> ChangedFiles) BuildProposalSnapshot(MergeProposal proposal, DateTimeOffset sortKey)
+    private static (DateTimeOffset SortKey, WorkspaceStatusProposalSummary Summary, IReadOnlyList<WorkspaceStatusFileChange> ChangedFiles) BuildProposalSnapshot(MergeProposal proposal, DateTimeOffset sortKey, string? workspaceChanges)
     {
-        var (changedFiles, addedLines, removedLines) = ParseChangedFiles(proposal.ProposalId, proposal.WorkspaceChanges, proposal.FilesTouched);
+        var (changedFiles, addedLines, removedLines) = ParseChangedFiles(proposal.ProposalId, workspaceChanges, proposal.FilesTouched);
         var addedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Added);
         var modifiedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Modified);
         var deletedFiles = changedFiles.Count(f => f.ChangeKind == WorkspaceChangeKind.Deleted);
@@ -698,6 +754,12 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         return (changes, addedLines, null);
     }
 
+    // Slice 6.5 Part 1 — declares the one kind this cache owns, so RehydratableRefreshCoordinator
+    // can skip calling this service's refresh for an inbound pack on a room that could never
+    // contain WorkUnitV1 rows (workgroup-room packs — WorkUnitV1 is repo-scoped or "studio"-local,
+    // never workgroup). See the interface's own doc comment for the full reasoning.
+    public IReadOnlyCollection<string> RehydratedKinds => [StudioNodeKind.WorkUnitV1];
+
     // Slice 0a — bypasses CreateAsync's parent-existence check (children can be loaded before
     // their parents) and never re-emits artifacts/events; just repopulates the dictionary from
     // what was already durably written.
@@ -711,6 +773,30 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             if (workUnit is not null)
                 _workUnits[entityId] = workUnit;
         }
+    }
+
+    // Slice 6.5 Part 2 — mirrors SnapshotRetentionPolicy.ResolveRepositoryIdAsync exactly (same
+    // physical-path id space RepositorySnapshot.RepositoryId is keyed by), so the seed snapshot this
+    // resolves against is the same one the retention policy's Active classification means to pin.
+    private async Task<string> ResolveSnapshotRepositoryPathAsync(string? repositoryId, CancellationToken ct)
+    {
+        if (repositoryId is not null)
+        {
+            var repositories = _serviceProvider?.GetService<IRepositoryRegistryService>();
+            var repository = repositories is null
+                ? null
+                : await repositories.GetAsync(repositoryId, ct).ConfigureAwait(false);
+            if (repository is not null)
+                return Path.GetFullPath(repository.Path);
+        }
+
+        // SeedRepositoryPath is commonly "" (not null) as the "no seed configured" convention
+        // elsewhere in this codebase (e.g. WorkspaceOptions' default) — Path.GetFullPath throws on
+        // an empty string, unlike a null one, so this must check IsNullOrEmpty, not just "??".
+        var fallback = string.IsNullOrEmpty(_workspaceOptions.SeedRepositoryPath)
+            ? Directory.GetCurrentDirectory()
+            : _workspaceOptions.SeedRepositoryPath;
+        return Path.GetFullPath(fallback);
     }
 
     private WorkUnit GetRequired(string workUnitId)
@@ -740,7 +826,10 @@ public static class ServiceCollectionExtensions
             sp.GetService<IRuntimeEventBroadcaster>(),
             graphPromoter: null,       // deferred — IStudioGraphPromoter chains to native FFI
             eventBus: sp.GetService<IParticipantEventBus>(),
-            serviceProvider: sp));
+            serviceProvider: sp,
+            // L2.4 — resolves a proposal's diff (now CAS-ref'd off the replicated node) for the
+            // workspace-status changed-files summary.
+            diffResolver: sp.GetService<IMergeDiffResolver>()));
         services.AddSingleton<IWorkUnitService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IOrchestratorService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());
         services.AddSingleton<IWorkspaceService>(sp => sp.GetRequiredService<InMemoryWorkUnitService>());

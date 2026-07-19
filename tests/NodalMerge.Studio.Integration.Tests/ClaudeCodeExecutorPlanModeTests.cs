@@ -15,6 +15,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// ClaudeCodeExecutorHarvestTests' shape for the Execute path.
 /// </summary>
 [Trait("Category", "Integration")]
+[Trait("Requires", "LocalCliProcess")]
 public class ClaudeCodeExecutorPlanModeTests : IDisposable
 {
     private readonly string _stubDir = Path.Combine(Path.GetTempPath(), $"claude-plan-stub-{Guid.NewGuid():N}");

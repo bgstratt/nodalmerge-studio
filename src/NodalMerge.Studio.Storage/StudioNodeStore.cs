@@ -40,6 +40,11 @@ public static class StudioNodeKind
     public const string SteeringDecisionV1   = "studio/steering-decision/v1";
     public const string FindingV1            = "studio/finding/v1";
     public const string ConversationLogV1    = "studio/conversation-log/v1";
+    // L2.3 (plans/room-persistence-bloat.md) — repo-scoped reference to a peer-visible reasoning
+    // transcript. The bounded transcript body lives in the CAS (pulled on demand); this node carries
+    // only ids + the blob hash + a heuristic label, so it replicates cheaply. This is what makes
+    // another peer's agentic reasoning legible on the same repo without the ConversationLogV1 firehose.
+    public const string ConversationRefV1    = "studio/conversation-ref/v1";
     public const string FileLeaseV1          = "studio/file-lease/v1";
     public const string RepositorySyncStateV1 = "studio/repository-sync-state/v1";
     public const string RepositoryV1          = "studio/repository/v1";
@@ -52,29 +57,187 @@ public static class StudioNodeKind
     public const string BlobIndexEntryV1       = "studio/blob-index-entry/v1";
     public const string CandidateConflictV1    = "studio/candidate-conflict/v1";
     public const string TaskConflictV1         = "studio/task-conflict/v1";
+    // Phase 5 slice 5.2 — local blob-GC run ledger (BlobGcRunRecord), one row per run, keyed by a
+    // generated RunId (never reused, so unlike most kinds there is no "latest per entityId"
+    // collapse to worry about). Safe under the STUDIO_ROOM_SCHEMA.md (a) longest-match parsing
+    // rule: "studio/gc-run/v1/" is not a prefix of any other kind above once suffixed with "/",
+    // nor is any other kind a prefix of it (verified by inspection of the full list above).
+    public const string GcRunV1                = "studio/gc-run/v1";
+
+    // Slice 6.3 (plans/cas-distribution-and-storage.md Phase 6, D1) — the kinds whose payload
+    // record carries a direct, non-derived `RepositoryId` field, verified by inspection of every
+    // StudioNodeKind's backing C# record (see the slice's own research pass, summarized here so the
+    // finding survives as more than a commit message): WorkUnit.RepositoryId (nullable),
+    // RepositorySnapshot.RepositoryId, RepositoryOperation.RepositoryId, RepositoryConflict.RepositoryId,
+    // CoModificationPattern.RepositoryId. These are the kinds NodalMergeStudioNodeStore actually
+    // routes to a per-repo engine room (repo/{repositoryId}) via the WriteNodeAsync(..., repositoryId,
+    // ...) overload below; every other kind stays in the workspace-local "studio" room.
+    //
+    // Slice 6.3a — the "repo-scoped-indirect" family 6.3 deliberately deferred (see that slice's own
+    // finding, preserved below) is now ALSO in this set: MergeProposalV1, TaskV1, BranchV1,
+    // KnownGoodStateV1, DecisionV1, ArtifactRefV1, CandidateConflictV1, TaskConflictV1. Each of
+    // these records now carries its OWN `RepositoryId` field too (added by 6.3a, denormalized at
+    // creation time from the owning WorkUnit's already-resolved RepositoryId — see
+    // RepositoryIdResolution and each record's own field comment), so — per 6.3's own recommendation
+    // — no live WorkUnit lookup or parent-chain walk is needed at read/route time; every kind in
+    // this set now satisfies the exact same "direct field" contract uniformly, and
+    // NodalMergeStudioNodeStore's routing/aggregation/migration code (all written generically
+    // against this set + a "RepositoryId" JSON property name) needed ZERO changes to cover them.
+    // BranchV1 in particular had NO stored field of any kind before 6.3a (a bare
+    // {id, parentId, createdAt} — see NodalMergeBranchService) and gained one for this slice.
+    //
+    // Deliberately left OUT of this set (still peer-local, "studio" room), with reasons:
+    //   - GoalV1, goal routing (GoalRoutingV1/OrchestratorRoutingV1), RuntimeSettingsV1,
+    //     WorkspaceV1, SchedulerV1, AgentWorkspaceV1: workgroup/global by design (D1) — a goal can
+    //     span multiple repos (D3), so it is not single-repo-scoped at all.
+    //   - ExecutionSessionV1, ExecutionEventV1, ExecutionResultV1, CommandResultV1: hang off a
+    //     work unit/session but are by far the highest-volume kinds in practice (one row per
+    //     execution event — see the 2026-07-15 baseline note: "bulk of node-store growth... is
+    //     tasks/messages/history", i.e. exactly these). 5.3's retention classification (Pinned/
+    //     Active/Intermediate, 5.1) is computed entirely from snapshots/work-units/branches/
+    //     proposals — it never needs to see these to do its job — and Phase 5's own "Out of scope"
+    //     section already flags non-CAS node-store retention for this family as a *separate*,
+    //     replication-plane-compaction problem, not this slice's. Routing them now would multiply
+    //     per-repo-room replication traffic for no 5.3 benefit; revisit only if/when that
+    //     compaction question is designed.
+    //   - GcRunV1: not per-repo (today's GC run ledger is workspace-wide); out of this slice's
+    //     named target set.
+    //   2. Genuinely GLOBAL/cross-repo kinds: BlobIndexEntryV1 and WorkspaceV1 carry `RepositoryIds`
+    //      (plural) by design — a blob can be referenced by multiple repos (global CAS dedup, D5),
+    //      and the workspace aggregate owns every repo. RepositorySyncStateV1 is keyed by
+    //      `RepositoryPath` (a legacy pre-6.2 identity concept), not `RepositoryId` — flagged as the
+    //      odd one out, not silently reinterpreted. RepositoryV1 itself (the local-candidate
+    //      registry entry) stays local by necessity: it's the record that MAPS a local candidate to
+    //      a repo room, so it can't live inside the room it names.
+    public static readonly IReadOnlyCollection<string> RepoScopedKinds = new HashSet<string>(StringComparer.Ordinal)
+    {
+        WorkUnitV1,
+        RepositorySnapshotV1,
+        RepositoryOpV1,
+        RepositoryConflictV1,
+        CoModPatternV1,
+        // Slice 6.3a additions:
+        MergeProposalV1,
+        TaskV1,
+        BranchV1,
+        KnownGoodStateV1,
+        DecisionV1,
+        ArtifactRefV1,
+        CandidateConflictV1,
+        TaskConflictV1,
+        // #1 goal replication (plans/repo-identity-convergence.md): a top-level goal is denormalized
+        // with its work unit's RepositoryId (GoalNode.RepositoryId) and routed to that repo's room so
+        // it replicates to peers on the same repo. This deliberately revises the "GoalV1 is
+        // workgroup/global, not single-repo-scoped" note above: a single-repo goal is repo-scoped;
+        // genuinely cross-repo goal fan-out (D3) is a later layer that can override this per-goal.
+        GoalV1,
+        // L2.3 (plans/room-persistence-bloat.md) — the reasoning-transcript reference replicates so a
+        // same-repo peer can trace the "why" behind a decision; the transcript BYTES ride the CAS
+        // content plane (pulled on demand), only this small ref is on the replication plane.
+        ConversationRefV1,
+    };
 }
 
 public interface IStudioNodeStore
 {
     Task WriteNodeAsync(string kind, string entityId, string payloadJson, CancellationToken cancellationToken = default);
 
+    // Slice 6.3 — explicit repo-room routing overload (design option (a): explicit over ambient).
+    // Repo-scoped callers (StudioNodeKind.RepoScopedKinds) pass the entity's own RepositoryId
+    // (typically already in scope as a field on the object being serialized — e.g. `updated.RepositoryId`)
+    // so the store can write into repo/{repositoryId}'s bound engine room instead of the
+    // workspace-local "studio" room. `repositoryId` is the *local-candidate* RepositoryId (the id
+    // carried on WorkUnit/RepositorySnapshot/etc. payloads today) — NodalMergeStudioNodeStore
+    // resolves it to the workgroup-bound room via the registry's WorkgroupRepoId (6.2) internally;
+    // callers never need to know the distinction.
+    //
+    // Default implementation ignores repositoryId and falls back to the 3-arg overload — this keeps
+    // InMemoryStudioNodeStore (and any other pre-6.3 IStudioNodeStore implementation/test double)
+    // compiling and behaviorally unchanged with zero edits; only NodalMergeStudioNodeStore overrides
+    // it with real per-repo-room writes.
+    Task WriteNodeAsync(string kind, string entityId, string payloadJson, string? repositoryId, CancellationToken cancellationToken = default) =>
+        WriteNodeAsync(kind, entityId, payloadJson, cancellationToken);
+
     Task<string?> ReadNodeAsync(string kind, string entityId, CancellationToken cancellationToken = default);
 
     // Slice 0a — rehydration. Returns the latest payload per entityId for every node of this
     // kind, so a service can rebuild its in-memory dictionary on startup from what was already
     // durably written via WriteNodeAsync.
+    //
+    // Slice 6.3 — for a kind in StudioNodeKind.RepoScopedKinds, an IStudioNodeStore implementation
+    // MUST aggregate across every repo room this peer has bound (see BoundRepoRooms), not just the
+    // local "studio" room — callers of this method (rehydration dictionaries, migration, etc.) never
+    // need to know which room a given entity actually lives in.
     Task<IReadOnlyList<(string EntityId, string PayloadJson)>> ReadAllNodesAsync(
         string kind, CancellationToken cancellationToken = default);
+
+    // Integration-checkpoint model (plans/room-snapshot-checkpoint-redesign.md): mints a single
+    // full-room snapshot ("last known good") for the repo room bound to `repositoryId`, taken only
+    // at integration points (merge to main / goal completion). Per-write durability now rides
+    // incremental deltas, so this is the only place — besides the disconnect/shutdown flush — a
+    // full-room snapshot is minted; it bounds the delta chain replayed on the next hydrate and lines
+    // up with git-commit/PR boundaries. No-op if `repositoryId` doesn't resolve to a bound repo room.
+    // Default no-op so InMemoryStudioNodeStore and other test doubles are unaffected — only
+    // NodalMergeStudioNodeStore overrides it with a real per-repo-room snapshot.
+    Task CheckpointRepositoryRoomAsync(string repositoryId, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
 }
 
-public sealed class InMemoryStudioNodeStore : IStudioNodeStore
+// Implements IStudioLocalLogStore as well as IStudioNodeStore over the same (kind, id) map so the
+// many tests that construct services directly with `new InMemoryStudioNodeStore()` — or share one
+// store across several services — keep compiling after the four high-volume services switched their
+// dependency to IStudioLocalLogStore (L2.1). Production keeps the two stores separate
+// (NodalMergeStudioNodeStore for the room, FileStudioLocalLogStore for the local log).
+public sealed class InMemoryStudioNodeStore : IStudioNodeStore, IStudioLocalLogStore
 {
     private readonly ConcurrentDictionary<(string Kind, string EntityId), string> _nodes = new();
+    private readonly ConcurrentDictionary<(string Kind, string EntityId), DateTimeOffset> _timestamps = new();
 
     public Task WriteNodeAsync(string kind, string entityId, string payloadJson, CancellationToken cancellationToken = default)
     {
         _nodes[(kind, entityId)] = payloadJson;
         return Task.CompletedTask;
+    }
+
+    // ── IStudioLocalLogStore ─────────────────────────────────────────────────
+    public Task AppendAsync(
+        string kind, string id, string payloadJson, DateTimeOffset occurredAt,
+        CancellationToken cancellationToken = default)
+    {
+        _nodes[(kind, id)] = payloadJson;
+        _timestamps[(kind, id)] = occurredAt;
+        return Task.CompletedTask;
+    }
+
+    public Task<string?> GetAsync(string kind, string id, CancellationToken cancellationToken = default)
+    {
+        _nodes.TryGetValue((kind, id), out var payload);
+        return Task.FromResult(payload);
+    }
+
+    public Task<IReadOnlyList<(string Id, string PayloadJson)>> ReadAllAsync(
+        string kind, CancellationToken cancellationToken = default)
+    {
+        IReadOnlyList<(string Id, string PayloadJson)> results = _nodes
+            .Where(n => n.Key.Kind == kind)
+            .Select(n => (n.Key.EntityId, n.Value))
+            .ToList();
+        return Task.FromResult(results);
+    }
+
+    public Task<int> PruneOlderThanAsync(
+        string kind, DateTimeOffset olderThan, CancellationToken cancellationToken = default)
+    {
+        var toRemove = _timestamps
+            .Where(t => t.Key.Kind == kind && t.Value < olderThan)
+            .Select(t => t.Key)
+            .ToList();
+        foreach (var key in toRemove)
+        {
+            _nodes.TryRemove(key, out _);
+            _timestamps.TryRemove(key, out _);
+        }
+        return Task.FromResult(toRemove.Count);
     }
 
     public Task<string?> ReadNodeAsync(string kind, string entityId, CancellationToken cancellationToken = default)

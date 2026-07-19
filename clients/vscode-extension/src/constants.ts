@@ -1,7 +1,13 @@
 export const DEFAULT_RUNTIME_URI = 'http://127.0.0.1:5080';
 /** @deprecated Use DEFAULT_RUNTIME_URI. Kept so existing hostPort config can be migrated. */
 export const DEFAULT_HOST_PORT = 5080;
-export const HOST_STARTUP_TIMEOUT_MS = 15_000;
+// Cold-start budget for the spawned host to answer /studio/health. This is NOT just process
+// boot — the host replays + rehydrates every persisted room/service before it serves, which on a
+// large or bloated node store runs to tens of seconds (observed ~80s on a pre-bloat-fix store).
+// 15s was far too tight and surfaced as a phantom "host crashed for no reason" (the extension
+// killed a host that was still, correctly, rehydrating). Keep generous; a genuinely wedged host
+// still fails, just later. Resetting a bloated node store is the real perf fix — this is the guard.
+export const HOST_STARTUP_TIMEOUT_MS = 120_000;
 export const HOST_HEALTH_POLL_INTERVAL_MS = 500;
 
 export const LAUNCHER_VIEW_ID = 'nodalmerge.launcher';
@@ -14,6 +20,7 @@ export const COMMANDS = {
   OPEN_MERGE_REVIEW_CONFLICT: 'nodalmerge.openMergeReviewConflict',
   OPEN_INSIGHTS:        'nodalmerge.openInsights',
   START_LOCAL_RUNTIME:  'nodalmerge.startLocalRuntime',
+  RECONCILE_BLOB_ORIGIN: 'nodalmerge.reconcileBlobOrigin',
 } as const;
 
 export const HOST_BINARY_NAME = {
@@ -32,16 +39,6 @@ export function getRid(): string {
   if (platform === 'darwin' && arch === 'x64')    { return 'osx-x64'; }
   if (platform === 'darwin' && arch === 'arm64')  { return 'osx-arm64'; }
   throw new Error(`Unsupported platform: ${platform}/${arch}`);
-}
-
-/** Returns true when the URI points at a local loopback address. */
-export function isLocalUri(uri: string): boolean {
-  try {
-    const u = new URL(uri);
-    return u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '::1';
-  } catch {
-    return true; // malformed URI — treat as local to avoid remote-mode behaviour
-  }
 }
 
 /** Converts an http(s) base URL to its ws(s) equivalent for WebSocket connections. */

@@ -10,6 +10,37 @@ namespace NodalMerge.Studio.Core.Services;
 public interface IRehydratable
 {
     Task RehydrateAsync(CancellationToken cancellationToken = default);
+
+    // Slice 6.5 Part 1 (plans/cas-distribution-and-storage.md Phase 6) — invoked by
+    // IStudioCacheRefreshCoordinator after an inbound replication pack is applied to a room, so
+    // this service's in-memory cache reconciles with newly-visible remote state without a process
+    // restart (the gap 6.1b/6.3's own notes flagged: "in-memory service caches still don't see
+    // mid-run inbound changes"). Default implementation just re-runs RehydrateAsync — correct for
+    // the majority pattern every implementer here already uses (`_dict[entityId] = deserialized`,
+    // an unconditional overwrite that is already an update-safe reconcile, not merely an add). A
+    // few implementers instead guard RehydrateAsync with TryAdd/ContainsKey — correct for a
+    // one-time startup load where every row is by definition new, but wrong for a live refresh
+    // where an already-known entity may have changed on the other peer — those override this
+    // method explicitly with an update-safe variant (see ArtifactLineageService,
+    // InMemoryConflictService, InMemoryCandidateConflictService, InMemoryTaskConflictService).
+    //
+    // Reconcile rule: additive/update only — an entity present in the store is upserted into the
+    // dictionary; nothing is ever removed, and an entity this call doesn't see (not yet persisted,
+    // e.g. a local write still in flight — see IStudioCacheRefreshCoordinator's own doc comment)
+    // is left untouched. "Which value wins" for an entity that changed on both sides is already
+    // decided by the engine's CRDT LWW resolution before this ever runs (ImportPack + canonical
+    // resolution replay happen first) — this method just reflects whatever the engine already
+    // decided, it never compares timestamps itself.
+    Task RefreshAsync(CancellationToken cancellationToken = default) => RehydrateAsync(cancellationToken);
+
+    // Slice 6.5 Part 1 — the StudioNodeKind(s) (see that class) this service's cache is populated
+    // from, so IStudioCacheRefreshCoordinator's implementation can skip calling RefreshAsync for an
+    // inbound pack on a room that could never carry that kind (e.g. a repo-scoped-kind owner has
+    // nothing to gain from refreshing on a "workgroup" room pack). Default is empty — "undeclared" —
+    // meaning the coordinator always refreshes this service regardless of room, the original fully
+    // conservative behavior; only services worth the small extra bookkeeping opt in explicitly (see
+    // e.g. InMemoryWorkUnitService.RehydratedKinds).
+    IReadOnlyCollection<string> RehydratedKinds => [];
 }
 
 public interface IProjectionManager
@@ -90,6 +121,16 @@ public interface ITaskService
         Task<StudioTask> AssignAsync(string taskId, string agentId, CancellationToken cancellationToken = default);
 
         Task<IReadOnlyList<StudioTask>> ListAsync(string? workUnitId = null, CancellationToken cancellationToken = default);
+    }
+
+    // L2.4 (plans/room-persistence-bloat.md) — resolves a proposal's unified diff: the inline
+    // WorkspaceChanges when present (legacy proposals / no-CAS configs), else pulls the CAS blob named
+    // by WorkspaceChangesBlobHash. ProposeAsync moves the diff bytes off the replication plane into
+    // the CAS; every consumer that needs the actual diff text goes through this instead of reading
+    // MergeProposal.WorkspaceChanges directly.
+    public interface IMergeDiffResolver
+    {
+        Task<string?> ResolveAsync(MergeProposal proposal, CancellationToken cancellationToken = default);
     }
 
     public interface IMergeService
@@ -808,7 +849,96 @@ public interface IWorkUnitService
 // integration tests that build services directly never register an implementation.
 public interface IStudioGraphPromoter
 {
-    Task TryPromoteStudioCheckpointAsync();
+    // Slice 6.3 — repositoryId (the *local-candidate* id, same convention as
+    // IStudioNodeStore.WriteNodeAsync's repositoryId overload) lets this safety net promote the
+    // correct room for a repo-scoped WorkUnit: when it resolves to a bound workgroup room, that
+    // room is promoted instead of the workspace-local "studio" room. Null (the default — every
+    // pre-6.3 call site keeps compiling unchanged) preserves the original "studio"-only behavior,
+    // which is still correct for a WorkUnit with no RepositoryId.
+    Task TryPromoteStudioCheckpointAsync(string? repositoryId = null);
+}
+
+// Slice 6.1b (plans/cas-distribution-and-storage.md Phase 6) — outbound replication seam.
+// NodalMergeStudioNodeStore.WriteNodeAsync (and its one-shot legacy migration) calls this
+// immediately after a successful per-write checkpoint promotion, handing over the resulting
+// sync-graph node id so a connected room peer client can push it upstream and/or broadcast it to
+// any peer directly connected to this host's own room endpoint. Lives here (not in
+// NodalMerge.Studio.Storage) because the real implementation (RoomPeerClient) lives in
+// NodalMerge.Studio.Host, which Storage cannot reference (layering); Storage only needs the
+// interface to call through. No-op by default (NoopStudioReplicationOutbound, registered by both
+// AddNodalMergeStorage and AddInMemoryStorage) so standalone hosts and every existing test that
+// builds services directly keep working unchanged; NodalMerge.Studio.Host's StudioWebApplication
+// overrides the registration to point at RoomPeerClient.
+//
+// Loop-prevention note (see RoomPeerClient's inbound-pack handling): this is called ONLY from the
+// per-entity write path (NodalMergeStudioNodeStore.WriteNodeAsync / migration), never from inbound
+// pack application. An inbound pack is applied via ImportPack directly against the engine bridge,
+// bypassing WriteNodeAsync entirely — so an inbound-applied write can never re-enter this seam and
+// echo back out. That structural fact, not an origin-tracking flag, is what prevents ping-pong.
+public interface IStudioReplicationOutbound
+{
+    Task NotifyLocalWriteAsync(string roomId, string nodeIdHex, CancellationToken cancellationToken = default);
+}
+
+public sealed class NoopStudioReplicationOutbound : IStudioReplicationOutbound
+{
+    public static readonly NoopStudioReplicationOutbound Instance = new();
+
+    private NoopStudioReplicationOutbound()
+    {
+    }
+
+    public Task NotifyLocalWriteAsync(string roomId, string nodeIdHex, CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
+}
+
+// Slice 6.1b — inbound replication seam, the mirror image of IStudioReplicationOutbound. After a
+// room peer client applies an inbound pack (ImportPack against the engine's sync graph +
+// PersistInboundPackAsync for durability), it must also replay canonical resolution back into the
+// engine's live "room_maps" state or IStudioNodeStore reads on this peer would see nothing from
+// the just-imported pack — see NodalMergeStudioNodeStore's class comment for the full room_maps
+// vs. sync-graph split this bridges, and ReplayCanonicalResolutionIntoLiveMap's own comment for why
+// this is safe to re-run at any time (it is namespace-inferring and idempotent). Registered only
+// against the engine-backed NodalMergeStudioNodeStore (NOT InMemoryStudioNodeStore, which has no
+// room_maps/sync-graph split to bridge) — callers must resolve it as optional and log+skip when
+// absent (standalone/in-memory test configurations), the same nullable-optional-collaborator shape
+// IStudioGraphPromoter already uses elsewhere in this codebase.
+//
+// Out-of-scope note carried from the design: any in-memory Studio service with a startup-
+// rehydrated cache (a dictionary populated once at boot from IStudioNodeStore.ReadAllNodesAsync)
+// will NOT observe a mid-run inbound pack — only future ReadNodeAsync/ReadAllNodesAsync calls see
+// it. Making those caches subscribe to a store-changed notification is future work.
+// Slice 6.3 — roomId identifies which room's live map to replay: the workspace-local "studio" room,
+// "workgroup", or "repo/{repoId}" for a bound repo room (see StudioNodeKind.RepoScopedKinds and
+// BoundRepoRooms). Pre-6.3 this took no roomId at all — there was only ever one room to replay.
+// Implementations that don't own a given room's EngineRoomMap should dispatch to whichever
+// collaborator does rather than throw; see RoomReplicationDispatcher (NodalMerge.Studio.Storage),
+// registered as the one IStudioNodeStoreReplicationSink so RoomPeerClient's single resolved
+// collaborator can replay any room's live map without knowing which underlying service owns it.
+public interface IStudioNodeStoreReplicationSink
+{
+    Task RehydrateLiveMapFromCanonicalResolutionAsync(string roomId, CancellationToken cancellationToken = default);
+}
+
+// Slice 6.5 Part 1 (plans/cas-distribution-and-storage.md Phase 6) — the enabler that makes "work
+// on peer A appears in peer B's extension" actually true. IStudioNodeStoreReplicationSink (above)
+// already bridges an inbound pack into the engine's live room_maps (so a *future*
+// IStudioNodeStore.ReadNodeAsync/ReadAllNodesAsync call sees it); this interface is the missing
+// second half — it re-pulls every IRehydratable service's own in-memory dictionary (what B's
+// REST/UI actually reads) so that future call actually happens, without waiting for a restart.
+// Called by RoomPeerClient (NodalMerge.Studio.Host) immediately after
+// RehydrateLiveMapFromCanonicalResolutionAsync succeeds, once per applied inbound pack.
+//
+// Deliberately conservative rather than kind-scoped: the caller does not attempt to derive which
+// entity kinds a given pack actually touched (MapAll only ever exposes the room's current
+// snapshot, not a diff against pre-pack state — deriving an exact changed-kind set would mean
+// snapshotting every namespace key before and after every ImportPack call, for a benefit that only
+// ever saves a handful of extra in-memory dictionary reads). Every registered IRehydratable
+// refreshes on every inbound pack, regardless of room — see RehydratableRefreshCoordinator
+// (NodalMerge.Studio.Storage) for the concrete upsert semantics this guarantees.
+public interface IStudioCacheRefreshCoordinator
+{
+    Task RefreshAfterInboundPackAsync(string roomId, CancellationToken cancellationToken = default);
 }
 
 public sealed record CausalParentsResult(string[] ParentIdsHex, bool NodeFound);
@@ -987,8 +1117,19 @@ public interface IKnownGoodStateService
 
 public interface IBranchService
 {
+    // Slice 6.3a — optional repositoryId denormalizes BranchV1 (a bare {id, parentId, createdAt}
+    // before this slice) so it routes to its owning repo room. Callers that don't have a repo
+    // context in scope (ad hoc/global branches — e.g. the shared "candidate" staging branch) pass
+    // null, which keeps the branch in "studio", matching pre-6.3a behavior exactly.
+    // Slice 6.5 Part 2 — optional seedSnapshotId records, on the branch record itself, the
+    // repository's current-head RepositorySnapshot.SnapshotId at the moment this branch is created
+    // — the branch-record half of the same seed-pinning WorkUnit.SeedSnapshotId carries (see that
+    // field's own doc comment). Callers that resolve a repository at all (InMemoryWorkUnitService)
+    // pass it; ad hoc/global branches (e.g. the shared "candidate" staging branch) pass null,
+    // matching repositoryId's own null-for-unscoped convention.
     Task<string> CreateBranchAsync(string name, string? fromBranchId = null,
-        IReadOnlyList<string>? fileScope = null, CancellationToken cancellationToken = default);
+        IReadOnlyList<string>? fileScope = null, string? repositoryId = null, string? seedSnapshotId = null,
+        CancellationToken cancellationToken = default);
 
     Task CheckoutBranchAsync(string branchId, CancellationToken cancellationToken = default);
 
@@ -2253,8 +2394,17 @@ public interface IWorkspaceSemanticNavigationService
 
 public interface IRepositorySyncService
 {
+    // Slice 7.2 — repositoryId is the caller's already-resolved local-candidate RepositoryId
+    // (RepositoryV1.RepositoryId) for repositoryPath, when the caller has one in hand (goal
+    // creation, an explicit workspace/switch call). When supplied, the CAS/snapshot-store key
+    // stamped for this repository is resolved via IRepositoryRegistryService.ResolveCasIdentityAsync
+    // (workgroup-portable, sticky to any already-existing chain) instead of the pre-7.2 convention
+    // of always using Path.GetFullPath(repositoryPath) directly — see plans/cas-distribution-and-
+    // storage.md Phase 7, 7.2. Omitting it (null) preserves that exact pre-7.2 behavior, for callers
+    // that never resolved a RepositoryV1 (ad hoc/ungoverned paths).
     Task<PendingExternalSync?> SyncBranchFromRepositoryAsync(
-        string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct = default);
+        string branchId, string repositoryPath, SyncTrigger trigger, CancellationToken ct = default,
+        string? repositoryId = null);
 
     // Non-mutating lookup — lets a caller find the chain's current tail via
     // LatestExternalChangesetId, mirrors IKnownGoodStateService.GetAsync's role.
@@ -2321,6 +2471,123 @@ public interface IMaterializationEngine
         string targetPath,
         IReadOnlyList<string>? fileScope = null,
         CancellationToken ct = default);
+}
+
+// plans/cas-distribution-and-storage.md Phase 1 slice 1.1 — resolves a RepositorySnapshot's
+// path→blobId map regardless of whether it's stored inline (legacy TreeEntries) or as a CAS tree
+// object (TreeFormat="cas-tree", TreeHash → blob, docs/TREE_OBJECT_FORMAT.md). Every reader that
+// used to dereference RepositorySnapshot.TreeEntries directly goes through this instead, so
+// legacy and cas-tree snapshots resolve identically without ever rewriting old nodes (append-only,
+// AP-5 — see the plan's Phase 1 slice 1.1 acceptance criteria).
+public interface ISnapshotTreeResolver
+{
+    // Precedence: inline TreeEntries (legacy) always wins and is returned directly, no CAS fetch.
+    // Otherwise, TreeFormat == "cas-tree" resolves TreeHash through the blob store (recursively,
+    // for a v2 directory tree once something writes one). Any other snapshot (pre-Phase-2 — neither
+    // TreeEntries nor TreeFormat set) returns null, same as every existing caller already treats a
+    // null map. A CAS miss or a corrupt tree blob also returns null — distinctly logged (miss vs
+    // corrupt) so operators can tell the two apart — never throws, so a stale/incomplete cache
+    // can't crash a caller mid-materialization. Delegates to the scoped overload below with a null
+    // fileScope (i.e. "resolve everything").
+    Task<IReadOnlyDictionary<string, string>?> ResolveTreeAsync(
+        RepositorySnapshot snapshot, CancellationToken ct = default);
+
+    // Phase 2 slice 2.4 — scope-aware resolution: when fileScope is non-null/non-empty, the
+    // returned map contains only entries within scope (mirrors MaterializationEngine's
+    // IsInScope/FilterByScope exact-path-or-directory-prefix semantics — see
+    // MaterializationEngine for the canonical definition both sides must agree on). For a v2
+    // directory tree, a subtree is only fetched from the blob store if it could contain an
+    // in-scope path — this is what bounds CAS reads to the scope instead of the whole tree. For a
+    // v1 flat tree blob or legacy inline TreeEntries, there is no per-directory structure to prune,
+    // so the whole map is resolved (already in memory / a single blob) and then filtered — same
+    // result, just not the same fetch-avoidance. fileScope == null or empty resolves everything
+    // (equivalent to the no-scope overload). Same null/logging/never-throws contract as the no-scope
+    // overload otherwise.
+    Task<IReadOnlyDictionary<string, string>?> ResolveTreeAsync(
+        RepositorySnapshot snapshot, IReadOnlyList<string>? fileScope, CancellationToken ct = default);
+
+    // Serializes entries as a v1 flat tree object (docs/TREE_OBJECT_FORMAT.md), stores it via the
+    // blob store, and returns its BLAKE3 hash for use as RepositorySnapshot.TreeHash. Throws
+    // InvalidOperationException when CanWrite is false (no blob store configured) — callers must
+    // check CanWrite first if they want to fall back to the legacy inline-TreeEntries write path.
+    Task<string> WriteTreeAsync(
+        IReadOnlyDictionary<string, string> entries, CancellationToken ct = default);
+
+    // Every tree-object blob hash referenced by this snapshot (root, plus every subtree once a v2
+    // directory tree is written) — feeds Phase 1.3's GC reachability walk. Empty for legacy/inline
+    // snapshots (nothing to protect beyond the file blobs already in TreeEntries).
+    Task<IReadOnlyCollection<string>> GetTreeBlobHashesAsync(
+        RepositorySnapshot snapshot, CancellationToken ct = default);
+
+    // Phase 1 slice 1.3 — the union of every tree-object hash AND file-blob hash reachable from
+    // this snapshot's root; the seam Phase 5's LiveHashSource is built on
+    // (nodalmerge/docs/delegated-storage-gc.md). Inline-legacy snapshots (TreeEntries set) return
+    // just the file hashes — there's no tree-object concept for them to protect. A pre-Phase-2
+    // snapshot (neither TreeEntries nor a cas-tree TreeFormat) returns an empty set — nothing to
+    // protect, same as GetTreeBlobHashesAsync's stance for that case.
+    //
+    // THROWS InvalidOperationException — never returns a partial set — when a cas-tree snapshot
+    // can't be fully resolved (missing blob store, CAS miss, or a corrupt tree object anywhere in
+    // the walk). This is deliberately stricter than ResolveTreeAsync's null-on-failure: a null
+    // return is safe for a materializer (it just fails that one operation), but a partial
+    // reachable-hash set handed to a GC sweep would look like a valid, smaller live set and let the
+    // sweep delete blobs that are still referenced. Fail closed instead — the exception message
+    // names the snapshot id and the specific hash that could not be resolved.
+    Task<IReadOnlySet<string>> GetReachableHashesAsync(
+        RepositorySnapshot snapshot, CancellationToken ct = default);
+
+    bool CanWrite { get; }
+}
+
+// Phase 2 slice 2.4 — the prefetch half of scoped fetch. MaterializationEngine already bounds *how
+// many* blobs a checkout touches (FileScope-filtered resolve); this bounds *when* they're fetched:
+// pulling a work unit's declared FileScope into the local blob cache ahead of the materialize call
+// that actually needs it, so a peer that goes offline mid-goal already has what it needs cached
+// (harness plan's "bound offline exposure" stance). A miss for an individual hash is not a failure
+// of the whole prefetch — this is a best-effort warm, not a correctness-bearing fetch.
+public interface IBlobPrefetchService
+{
+    // Resolves repositoryId's latest snapshot, scope-prunes it to fileScope via
+    // ISnapshotTreeResolver's scoped ResolveTreeAsync overload, and warms the local blob cache
+    // (TryGetBlobAsync — through the chained provider this pulls from the remote origin and
+    // writes through to the local cache; the bytes themselves are discarded here) for every
+    // in-scope file hash, bounded to Concurrency requests in flight at once. Returns the count of
+    // hashes that resolved Found. Returns 0 when there is no snapshot yet, or fileScope is
+    // null/empty (nothing declared to prefetch).
+    Task<int> PrefetchScopeAsync(
+        string repositoryId, IReadOnlyList<string>? fileScope, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Result of a CAS reconcile sweep — see <see cref="ICasReconcileService"/>.
+/// </summary>
+public sealed record CasReconcileResult(
+    int Scanned,
+    int AlreadyPresent,
+    int Pushed,
+    int Failed,
+    int MissingLocally);
+
+// Phase 2 slice 2.3 — the healing path for the remote push slice 2.2 already wired up (a fresh
+// PutBlobAsync already rides the local->remote chain). This covers what that write-time path
+// can't: blobs written before a remote origin was configured, blobs written during an outage, or
+// any other drift between the local store and the origin. Enumerates the current live blob set
+// (the same fail-closed set IWorkspaceCacheManager.GetLiveBlobHashesAsync computes for GC), HEADs
+// the remote origin for each hash, and pushes whatever the origin is missing.
+//
+// Deliberately free of any NodalMerge.Host.Abstractions type (e.g. IRemoteBlobPushTarget) —
+// Studio.Core doesn't reference that package. The implementation (which does need it) lives in
+// Studio.Storage.
+public interface ICasReconcileService
+{
+    /// <summary>
+    /// Zero-result no-op (every count 0) when no remote blob push target is configured — there is
+    /// nothing to reconcile against. Otherwise computes the live blob set and lets
+    /// IWorkspaceCacheManager.GetLiveBlobHashesAsync's fail-closed exception propagate (an
+    /// incomplete live set must never drive a sweep, same reasoning as blob GC) — callers must
+    /// catch and report, same convention as the /studio/cache/gc endpoint.
+    /// </summary>
+    Task<CasReconcileResult> ReconcileAsync(CancellationToken ct = default);
 }
 
 // Phase 2 — snapshot checkpoint service for the repository op log. One snapshot per goal cycle
@@ -2755,3 +3022,147 @@ public sealed record GitExportResult(
     bool Pushed = false,
     string? PushOutput = null,
     string? Message = null);
+
+// ── Phase 5 slice 5.1 — snapshot retention classification ───────────────────────────────────
+//
+// plans/cas-distribution-and-storage.md Phase 5: "truth is the promoted history; everything
+// else is cache with a TTL." A RepositorySnapshot NODE is never deleted (AP-5, append-only) —
+// this policy only decides which generations' *tree/blob bytes* must stay materializable right
+// now. Pure policy, no behavior change: nothing consumes this yet (that's slice 5.2's
+// LiveHashSource v2 rewrite of IWorkspaceCacheManager.GetLiveBlobHashesAsync).
+public enum SnapshotRetentionClass
+{
+    // Live forever by default: the bootstrap generation of a repository, every generation an
+    // applied merge proposal's write-back resync stamped (WorkUnit.Metadata["appliedSnapshotId"]),
+    // and admin pins.
+    Pinned,
+
+    // Live regardless of age: a repository's current head, or a generation a still-in-flight
+    // (non-terminal) work unit's branch depends on as its seed/merge base.
+    Active,
+
+    // Live only until RetainIntermediateDays past its branch reaching a terminal state (falling
+    // back to the snapshot's own CreatedAt when no better timestamp is available) — everything
+    // that is neither Pinned nor Active.
+    Intermediate
+}
+
+/// <summary>
+/// One snapshot generation's classification. <see cref="RepositoryId"/> is null only for the
+/// fail-safe anomaly case (the RepositorySnapshot node itself failed to deserialize — its
+/// EntityId is still known and reported as <see cref="SnapshotId"/>, but nothing else about it
+/// could be read). <see cref="Reason"/> is a human-readable audit trail, not machine-parsed —
+/// safe to render directly in a debug/REST dump. <see cref="ExpiresAt"/> is set only for
+/// Intermediate entries (null for Pinned/Active, which never expire under this policy).
+/// </summary>
+public sealed record SnapshotRetentionEntry(
+    string SnapshotId,
+    string? RepositoryId,
+    SnapshotRetentionClass Class,
+    string Reason,
+    bool Retained,
+    DateTimeOffset? ExpiresAt);
+
+/// <summary>
+/// Result of <see cref="ISnapshotRetentionPolicy.ClassifyAsync"/>. <see cref="RetainedSnapshotIds"/>
+/// is the set slice 5.2's LiveHashSource v2 will union with op-referenced blobs and pins — every
+/// Pinned and Active snapshot, plus every not-yet-expired Intermediate one. <see cref="Anomalies"/>
+/// carries data-integrity notes that don't map to a single snapshot entry (e.g. a WorkUnit node
+/// that failed to parse, so its own branch-seed/merge-base contribution to <see cref="Snapshots"/>
+/// could not be computed) — fail-safe bias means nothing is ever demoted because of these, but an
+/// operator reading the report should know the input data had gaps.
+/// </summary>
+public sealed record SnapshotRetentionReport(
+    IReadOnlyList<SnapshotRetentionEntry> Snapshots,
+    IReadOnlySet<string> RetainedSnapshotIds,
+    int PinnedCount,
+    int ActiveCount,
+    int IntermediateRetainedCount,
+    int IntermediateExpiredCount,
+    DateTimeOffset EvaluatedAt,
+    IReadOnlyList<string> Anomalies);
+
+/// <summary>
+/// Classifies every stored RepositorySnapshot generation into Pinned/Active/Intermediate — see
+/// plans/cas-distribution-and-storage.md Phase 5 slice 5.1. Deterministic given node-store
+/// contents and the injected clock; a sibling read-model over the same rows
+/// IWorkspaceCacheManager.GetLiveBlobHashesAsync already reads (RepositorySnapshotV1, WorkUnitV1).
+/// Ships as a service + tests only in 5.1 — nothing consumes it until 5.2.
+/// </summary>
+public interface ISnapshotRetentionPolicy
+{
+    Task<SnapshotRetentionReport> ClassifyAsync(CancellationToken ct = default);
+}
+
+// ── Phase 5 slice 5.2 — staged local blob GC + run ledger ───────────────────────────────────
+//
+// plans/cas-distribution-and-storage.md: "DryRun (default) -> MarkOnly -> SweepSoft -> SweepHard
+// by config." Maps onto the installed NodalMerge.Host.Composition.FileBlobGcCoordinator's own
+// mark-then-grace-then-delete two-phase design (see BlobGcService's own doc comment for the exact
+// mapping and the one honest collapse it forces: the coordinator has no knob to delete a hash the
+// very first time it's observed non-live, only a grace-window length, so "MarkOnly" and
+// "SweepHard" are both expressed as different GraceWindow values over the same LiveRun call, never
+// a distinct coordinator mode).
+public enum BlobGcMode
+{
+    // Compute candidates/report only; never writes a tombstone file or deletes a blob. Maps to
+    // FileBlobGcCoordinator.DryRun, which already computes the exact same Marked/Deleted counts a
+    // live run would act on — this is what makes "DryRun mutates nothing and reports the same
+    // candidate set the live run would act on" true for free, not something this slice re-derives.
+    DryRun,
+
+    // Tombstones newly-non-live blobs (a real, persisted mark this time) but never deletes —
+    // GraceWindow is configured unreachably large so the delete branch never fires.
+    MarkOnly,
+
+    // The coordinator's ordinary two-phase behavior: mark this run, delete only blobs a *previous*
+    // run already tombstoned once GraceHours has elapsed.
+    SweepSoft,
+
+    // Same two-phase shape, but GraceWindow is collapsed to zero: a blob tombstoned in an earlier
+    // call (even moments earlier) is immediately eligible for deletion on the next call. Still
+    // requires two calls to actually reclaim bytes — see BlobGcService's comment for why eliding
+    // that isn't safe to build even under this name.
+    SweepHard,
+}
+
+/// <summary>
+/// One row of the local blob-GC run ledger — see plans/cas-distribution-and-storage.md Phase 5
+/// slice 5.2's "run ledger" requirement. Persisted via <see cref="IStudioNodeStore"/> under
+/// <c>StudioNodeKind.GcRunV1</c>, one row per run, append-only (a run is never rewritten). Field
+/// names deliberately mirror <c>NodalMerge.Host.Composition.FileBlobGcRunReport</c> so a reader
+/// already familiar with that report needs no translation.
+/// </summary>
+public sealed record BlobGcRunRecord(
+    string RunId,
+    BlobGcMode Mode,
+    DateTimeOffset StartedAt,
+    DateTimeOffset FinishedAt,
+    int Scanned,
+    int Marked,
+    int Cleared,
+    int DeleteCandidates,
+    int Deleted,
+    int LiveSetSize,
+    int RetainedSnapshotCount,
+    int AnomalyCount,
+    long DurationMs,
+    bool Success,
+    string? Error = null);
+
+/// <summary>
+/// Runs a staged local blob GC pass (see <see cref="BlobGcMode"/>) against the configured CAS root
+/// and records a <see cref="BlobGcRunRecord"/> for every attempt, successful or not. Fail-closed:
+/// when the live blob set can't be computed (see <see cref="IWorkspaceCacheManager.GetLiveBlobHashesAsync"/>'s
+/// own contract), no coordinator run happens at all — same convention <c>/studio/cache/gc</c> and
+/// <c>/studio/cas/reconcile</c> already establish (the exception propagates for the REST layer to
+/// map to its established 409 shape).
+/// </summary>
+public interface IBlobGcService
+{
+    // modeOverride, when given, wins over the configured BlobGcOptions.Mode for this call only
+    // (the REST endpoint's operator override) — the scheduled background run always passes null.
+    Task<BlobGcRunRecord> RunAsync(BlobGcMode? modeOverride = null, CancellationToken ct = default);
+
+    Task<IReadOnlyList<BlobGcRunRecord>> GetRecentRunsAsync(int limit = 20, CancellationToken ct = default);
+}

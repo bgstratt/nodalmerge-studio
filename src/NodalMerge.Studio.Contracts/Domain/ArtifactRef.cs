@@ -58,7 +58,12 @@ public sealed record ArtifactRef(
     // relation (SupersededBy) is never stored here — it's branch-relative (two branches can each
     // promote a different successor to the same artifact) and so can only be derived by walking a
     // chosen history, which is exactly what the EngineeringState projection fold does.
-    IReadOnlyList<string>? Supersedes = null)
+    IReadOnlyList<string>? Supersedes = null,
+    // Slice 6.3a (plans/cas-distribution-and-storage.md Phase 6, D1) — denormalized at RecordAsync
+    // time from OwnedByWorkUnitId's own RepositoryId. Null for global artifacts (OwnedByWorkUnitId
+    // itself null — e.g. GetGlobalConstraintsAsync's constraint set), a work unit with no
+    // resolvable RepositoryId, or an artifact that predates 6.3a.
+    string? RepositoryId = null)
 {
     public IReadOnlyList<string> Supersedes { get; init; } = Supersedes ?? [];
 }

@@ -19,4 +19,17 @@
     <ProjectReference Include="..\..\src\NodalMerge.Studio.Contracts\NodalMerge.Studio.Contracts.csproj" />
   </ItemGroup>
 
+  <!-- Slice 0.4 (plans/blob-cas-remediation.md, finding #14) — the canonical WorkUnitStatus
+       ordinal/casing vectors shared with nodalmerge's Rust GC live-hash classifier
+       (server/server/src/studio_live_hashes.rs). Guarded by Exists() because the file lives in
+       the sibling nodalmerge repo (see NodalMergeEngineCommandsDir in Directory.Build.props): if
+       that checkout is absent (e.g. a CI runner that only checked out this repo),
+       WorkUnitStatusVectorTests reports that explicitly rather than the build failing to copy a
+       missing file or the test silently no-op'ing. -->
+  <ItemGroup Condition="Exists('$(NodalMergeEngineCommandsDir)work-unit-status-vectors.v1.json')">
+    <None Include="$(NodalMergeEngineCommandsDir)work-unit-status-vectors.v1.json"
+          Link="work-unit-status-vectors.v1.json"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

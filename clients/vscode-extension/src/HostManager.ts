@@ -12,7 +12,6 @@ import {
   HOST_HEALTH_POLL_INTERVAL_MS,
   HOST_STARTUP_TIMEOUT_MS,
   getRid,
-  isLocalUri,
   toWebSocketUrl,
 } from './constants';
 
@@ -94,10 +93,13 @@ export class HostManager implements vscode.Disposable {
   get isReady(): boolean { return this._ready; }
   get hostBaseUrl(): string { return this.uri; }
   get hostWsUrl(): string { return toWebSocketUrl(this.uri); }
-  get isRemote(): boolean { return !isLocalUri(this.uri); }
 
-  /** Start the runtime. If the configured URI is remote, just health-check and adopt it.
-   *  If local, check first (adopt if already running), then spawn. */
+  /** Start the runtime. The extension always adopts-or-spawns its own local peer — see
+   *  docs/... and plans/cas-distribution-and-storage.md decision D4 ("mode collapse"): there is
+   *  no separate "remote mode" branch here. Connecting to a room (a different server entirely)
+   *  is a `nodalmerge.room.*` config concern threaded through to the spawned/adopted local peer,
+   *  never a reason to skip spawning or to talk to a remote host directly. Check first (adopt an
+   *  already-running local peer for this exact workspace), then spawn. */
   async start(): Promise<void> {
     const t0 = performance.now();
     const elapsed = () => `+${(performance.now() - t0).toFixed(0)}ms`;
@@ -107,30 +109,27 @@ export class HostManager implements vscode.Disposable {
     this.output.appendLine(`[startup] extension start() at ${elapsed()}`);
 
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
-    if (wsRoot && !this.isRemote) {
+    if (wsRoot) {
       const t1 = performance.now();
       await this.maybePromptLegacyMigration(wsRoot);
       this.output.appendLine(`[startup] legacy migration check: ${(performance.now() - t1).toFixed(0)}ms`);
     }
 
-    const expectedWorkspaceRoot = wsRoot && !this.isRemote
+    const expectedWorkspaceRoot = wsRoot
       ? path.join(this.resolveDataRoot(wsRoot) ?? '', 'workspace')
       : undefined;
 
     const t2 = performance.now();
     const health = await this.checkHealth();
-    if (health.ok && (this.isRemote || !expectedWorkspaceRoot || samePath(health.workspaceRootPath, expectedWorkspaceRoot))) {
+    if (health.ok && (!expectedWorkspaceRoot || samePath(health.workspaceRootPath, expectedWorkspaceRoot))) {
       this.output.appendLine(`[startup] initial health check (already running): ${(performance.now() - t2).toFixed(0)}ms`);
       this._ready = true;
       this.applyStatus('ready');
-      const label = this.isRemote ? this.uri : `port ${this.extractPort()}`;
-      this.output.appendLine(`[NodalMerge] Connected to running runtime at ${label}.`);
-      if (!this.isRemote) {
-        this.output.appendLine(
-          '[NodalMerge] Host logs will not appear here. Stop the process on that port, then run ' +
-          '"NodalMerge: Restart Studio Host" so the extension owns the host and streams logs.',
-        );
-      }
+      this.output.appendLine(`[NodalMerge] Connected to running runtime at port ${this.extractPort()}.`);
+      this.output.appendLine(
+        '[NodalMerge] Host logs will not appear here. Stop the process on that port, then run ' +
+        '"NodalMerge: Restart Studio Host" so the extension owns the host and streams logs.',
+      );
       return;
     }
     if (health.ok) {
@@ -143,14 +142,6 @@ export class HostManager implements vscode.Disposable {
       );
     } else {
       this.output.appendLine(`[startup] initial health check (not running): ${(performance.now() - t2).toFixed(0)}ms`);
-    }
-
-    if (this.isRemote) {
-      this.applyStatus('error');
-      throw new Error(
-        `NodalMerge Studio: could not reach runtime at ${this.uri}. ` +
-        'Make sure the remote runtime is running and accessible.'
-      );
     }
 
     this.applyStatus('starting');
@@ -166,9 +157,9 @@ export class HostManager implements vscode.Disposable {
     this.output.appendLine(`[startup] total extension-side startup: ${elapsed()}`);
   }
 
-  /** Explicitly starts the local runtime regardless of the configured URI.
-   *  Used by the "Start Local Runtime" command when the user wants a local instance
-   *  alongside a remote URI they normally point at. */
+  /** Explicitly (re-)spawns the local runtime process, bypassing start()'s adopt-if-healthy
+   *  check. Used by the "Start Local Runtime" command as a manual recovery action when the
+   *  process isn't already running (e.g. after a crash start() didn't retry). */
   async startLocal(): Promise<void> {
     if (this.process) {
       this.output.appendLine('[NodalMerge] Local runtime already running.');
@@ -228,9 +219,11 @@ export class HostManager implements vscode.Disposable {
   }
 
   private resolveHostCommand(): { cmd: string; args: string[]; env: Record<string, string>; cwd?: string } {
-    // For a local spawn we always bind to 127.0.0.1. If the runtimeUri is also local, use its
-    // port; otherwise fall back to the default port so the explicit local spawn has a stable address.
-    const bindPort = isLocalUri(this.uri) ? this.extractPort() : DEFAULT_HOST_PORT;
+    // The local peer always binds to 127.0.0.1 on the configured (or auto-picked free) port —
+    // there is no separate "remote spawn" address to fall back to (D4: this process is always
+    // the local peer; connecting outward to a room server is `nodalmerge.room.*` config below,
+    // never a different bind address for this process's own HTTP/MCP surface).
+    const bindPort = this.extractPort();
     const bindAddr = `http://127.0.0.1:${bindPort}`;
 
     const hostEnv: Record<string, string> = {
@@ -246,6 +239,48 @@ export class HostManager implements vscode.Disposable {
         hostEnv.NodalMerge__Storage__Sqlite__DbPath = path.join(dataRoot, 'data', 'nodalmerge-nodes.db');
         hostEnv.NodalMerge__Storage__FileBlobs__RootPath = path.join(dataRoot, 'data', 'blobs');
       }
+    }
+
+    // Chained remote blob origin (docs/BLOB_HTTP_SURFACE.md): only switch the
+    // host's blob provider when a URI is actually configured. Empty URI
+    // leaves blob storage behavior unchanged (local File provider only).
+    const blobOriginConfig = vscode.workspace.getConfiguration('nodalmerge.blobOrigin');
+    const blobOriginUri = blobOriginConfig.get<string>('uri', '');
+    if (blobOriginUri) {
+      hostEnv.NodalMerge__Providers__BlobStorage = 'ChainedRemote';
+      hostEnv.NodalMerge__Storage__RemoteOrigin__BaseUrl = blobOriginUri;
+
+      const blobOriginToken = blobOriginConfig.get<string>('token', '');
+      if (blobOriginToken) {
+        hostEnv.NodalMerge__Storage__RemoteOrigin__AuthToken = blobOriginToken;
+      }
+    }
+
+    // Slice 4.3 follow-up (plans/cas-distribution-and-storage.md) — enables the s3-direct chain
+    // link on top of the server-relay origin above; reuses nodalmerge.blobOrigin.uri/token for the
+    // presign-resolution endpoint (S3DirectBlobOriginOptions deliberately has no BaseUrl/AuthToken
+    // of its own — see that class's doc comment in the nodalmerge repo). Only the enable flag rides
+    // this bridge; the numeric knobs (timeout/retries/circuit-breaker/compression) stay
+    // host-config-only for now.
+    const s3DirectEnabled = vscode.workspace.getConfiguration('nodalmerge.blobOrigin.s3Direct').get<boolean>('enabled', false);
+    if (s3DirectEnabled) {
+      hostEnv.NodalMerge__Storage__S3Direct__Enabled = 'true';
+    }
+
+    // Slice 6.4 (plans/cas-distribution-and-storage.md Phase 6, D4 "mode collapse") — Room config
+    // section on the spawned/adopted local peer. Standalone vs connected is solely whether
+    // nodalmerge.room.hostUri is set — never inferred from URL shape, and never a reason to skip
+    // spawning this process (D4: the extension always spawns/adopts its own local peer; connecting
+    // outward to a room server is this config, not a different mode). Empty (default) leaves the
+    // peer's own Room:HostUri unset — standalone, no sockets attempted.
+    const roomConfig = vscode.workspace.getConfiguration('nodalmerge.room');
+    const roomHostUri = roomConfig.get<string>('hostUri', '');
+    if (roomHostUri) {
+      hostEnv.Room__HostUri = roomHostUri;
+    }
+    const roomWorkgroup = roomConfig.get<string>('workgroup', '');
+    if (roomWorkgroup) {
+      hostEnv.Room__Workgroup = roomWorkgroup;
     }
 
     if (this.context.extensionMode === vscode.ExtensionMode.Development) {
@@ -416,7 +451,7 @@ export class HostManager implements vscode.Disposable {
   }
 
   private applyStatus(status: HostStatus): void {
-    const uriLabel = this.isRemote ? this.uri : `:${this.extractPort()}`;
+    const uriLabel = `:${this.extractPort()}`;
     switch (status) {
       case 'idle':
         this.statusBar.text    = '$(circle-outline) NodalMerge';

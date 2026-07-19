@@ -5,6 +5,8 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using NodalMerge.Studio.Contracts.Domain;
+using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Host;
 using NodalMerge.Studio.McpServer.Tools;
 using NodalMerge.Studio.Storage;
@@ -333,5 +335,75 @@ public class RepositoryRegistryTests
 
         var direct = await registry.ListAsync();
         Assert.Single(direct);
+    }
+
+    // ── Slice 7.2 (plans/cas-distribution-and-storage.md Phase 7) — ResolveCasIdentityAsync ──────
+
+    [Fact]
+    public async Task ResolveCasIdentityAsync_uses_workgroup_id_for_a_brand_new_repository()
+    {
+        var (registry, _) = BuildServices();
+        var path = Path.Combine(Path.GetTempPath(), $"studio-repo-{Guid.NewGuid():N}");
+        var registered = await registry.RegisterAsync(path, "brand new");
+
+        // AddInMemoryStorage wires a real (in-memory) IWorkgroupRepositoryDirectory, so this
+        // first-ever registration auto-mints a WorkgroupRepoId equal to its own RepositoryId (6.2's
+        // preferred-id continuity — RegisterWorkgroupEntryAsync passes preferredRepoId). With no
+        // existing snapshot chain under the path yet (step 1 of ResolveCasIdentityAsync's own doc
+        // comment misses), resolution lands on step 2 — the workgroup-portable key — not the raw
+        // disk path, even though both happen to be equal here.
+        Assert.NotNull(registered.WorkgroupRepoId);
+        var resolved = await registry.ResolveCasIdentityAsync(registered.RepositoryId, path);
+
+        Assert.Equal(registered.WorkgroupRepoId, resolved);
+    }
+
+    [Fact]
+    public async Task ResolveCasIdentityAsync_is_sticky_to_an_already_existing_snapshot_chain()
+    {
+        var (registry, services) = BuildServices();
+        var path = Path.Combine(Path.GetTempPath(), $"studio-repo-{Guid.NewGuid():N}");
+        var registered = await registry.RegisterAsync(path, "existing chain");
+
+        var snapshots = services.GetRequiredService<IRepositorySnapshotService>();
+        var pathKey = Path.GetFullPath(path);
+        await snapshots.CreateAsync(pathKey, new Dictionary<string, string> { ["a.txt"] = "hash-a" }, baseSnapshotId: null);
+
+        // Even though this repository DOES have a WorkgroupRepoId-shaped local candidate id, an
+        // already-existing chain under the path key must win — never orphan pre-7.2 history.
+        var resolved = await registry.ResolveCasIdentityAsync(registered.RepositoryId, path);
+
+        Assert.Equal(pathKey, resolved);
+    }
+
+    [Fact]
+    public async Task ResolveCasIdentityAsync_resolves_a_foreign_repositoryId_via_a_replicated_RepositoryV1_row()
+    {
+        var (registry, services) = BuildServices();
+        var nodeStore = services.GetRequiredService<IStudioNodeStore>();
+
+        // Simulates a peer's own local-candidate RepositoryV1 row arriving via replication (the
+        // "studio" room is shared upstream pre-7.3) — this peer never called RegisterAsync for it
+        // itself, so it's absent from the registry's own in-memory cache.
+        var foreignRepositoryId = "repo-foreign0000000000000000000000";
+        var foreignRow = new RepositoryV1(
+            foreignRepositoryId, @"C:\peer-a-only\path", "peer A's repo", DateTimeOffset.UtcNow,
+            WorkgroupRepoId: "repo-workgroup0000000000000000000");
+        await nodeStore.WriteNodeAsync(
+            StudioNodeKind.RepositoryV1, foreignRepositoryId, JsonSerializer.Serialize(foreignRow));
+
+        var resolved = await registry.ResolveCasIdentityAsync(foreignRepositoryId, repositoryPath: null);
+
+        Assert.Equal("repo-workgroup0000000000000000000", resolved);
+    }
+
+    [Fact]
+    public async Task ResolveCasIdentityAsync_returns_null_for_a_completely_unknown_repositoryId()
+    {
+        var (registry, _) = BuildServices();
+
+        var resolved = await registry.ResolveCasIdentityAsync("repo-does-not-exist-anywhere", repositoryPath: null);
+
+        Assert.Null(resolved);
     }
 }

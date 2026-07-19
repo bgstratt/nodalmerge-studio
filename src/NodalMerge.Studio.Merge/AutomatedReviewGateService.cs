@@ -13,7 +13,8 @@ public sealed class AutomatedReviewGateService(
     ITaskService tasks,
     IDeadLetterService deadLetter,
     IArtifactCommandService artifactCommands,
-    IFileWorkspaceService fileWorkspace) : IAutomatedReviewGateService
+    IFileWorkspaceService fileWorkspace,
+    IMergeDiffResolver diffResolver) : IAutomatedReviewGateService
 {
     public async Task<AutomatedReviewGateResult> TryEnqueueReviewerAsync(
         string parentWorkUnitId,
@@ -340,7 +341,9 @@ public sealed class AutomatedReviewGateService(
                     workUnitId,
                     null,
                     "Prior attempt (revise)",
-                    BuildRevisionContextBody(proposal)),
+                    BuildRevisionContextBody(
+                        proposal,
+                        await diffResolver.ResolveAsync(proposal, cancellationToken).ConfigureAwait(false) ?? string.Empty)),
                 cancellationToken).ConfigureAwait(false);
         }
 
@@ -430,9 +433,8 @@ public sealed class AutomatedReviewGateService(
     // itself (fetchable by ProposalId) for anyone who needs it; this is a nudge, not a replay.
     private const int MaxRevisionDiffChars = 1500;
 
-    private static string BuildRevisionContextBody(MergeProposal proposal)
+    private static string BuildRevisionContextBody(MergeProposal proposal, string diff)
     {
-        var diff = proposal.WorkspaceChanges ?? string.Empty;
         var truncatedDiff = diff.Length > MaxRevisionDiffChars
             ? diff[..MaxRevisionDiffChars] + "\n… (truncated)"
             : diff;

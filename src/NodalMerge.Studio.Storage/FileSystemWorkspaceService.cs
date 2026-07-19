@@ -14,8 +14,67 @@ internal sealed class FileSystemWorkspaceService(
     IRepositoryOpService? repoOpService = null,
     IMaterializationEngine? materializer = null,
     IRepositorySnapshotService? snapshotService = null,
-    ILogger<FileSystemWorkspaceService>? logger = null) : IFileWorkspaceService
+    ILogger<FileSystemWorkspaceService>? logger = null,
+    // Slice 1.1 — resolves a snapshot's tree map (inline legacy or cas-tree). Null falls back to
+    // direct snapshot.TreeEntries access, same as pre-slice-1.1 behavior.
+    ISnapshotTreeResolver? treeResolver = null,
+    // Slice 7.2 — resolves the workgroup-portable CAS identity for a branch's owning repository.
+    // Safe to inject directly (no circular DI risk: RepositoryRegistryService never depends on
+    // IFileWorkspaceService).
+    IRepositoryRegistryService? repositories = null,
+    // Slice 7.2 — lazily resolves IWorkUnitService (branchId -> owning WorkUnit -> RepositoryId) for
+    // the cold-peer case (no SeedRepositoryPath configured). Must be lazy: InMemoryWorkUnitService ->
+    // IBranchService (NodalMergeBranchService) -> IFileWorkspaceService is a real cycle, so a direct
+    // constructor dependency on IWorkUnitService here would deadlock DI construction.
+    IServiceProvider? serviceProvider = null) : IFileWorkspaceService
 {
+    private async Task<IReadOnlyDictionary<string, string>?> ResolveTreeAsync(
+        RepositorySnapshot snapshot, CancellationToken ct) =>
+        treeResolver is not null
+            ? await treeResolver.ResolveTreeAsync(snapshot, ct).ConfigureAwait(false)
+            : snapshot.TreeEntries;
+
+    // Slice 7.2 (plans/cas-distribution-and-storage.md Phase 7) — resolves the CAS/snapshot-store
+    // repositoryId for branchId's owning repository. Prefers the single configured default repo
+    // (SeedRepositoryPath) — the ordinary single-peer/default-repo case, unchanged behavior for
+    // every existing deployment. Falls back to the branch's owning WorkUnit's own RepositoryId when
+    // no default is configured — the cold-peer case: a peer with no local default clone at all
+    // (e.g. the multi-user smoke's host B), whose branches all belong to replicated work units. See
+    // docs/guides/multi-user-smoke.md's former forced-matching-paths accommodation, removed by this
+    // slice now that this resolves without it.
+    //
+    // Returns null when there's no repository context to even attempt resolution (no SeedRepositoryPath
+    // AND no owning work unit found for branchId) — callers treat that exactly like pre-7.2's silent
+    // "nothing configured" case. When an owning work unit IS found but its RepositoryId can't be
+    // bound anywhere on this peer, throws RepositoryIdentityUnresolvedException UNLESS
+    // <paramref name="throwOnUnresolved"/> is false (InitBranchAsync's scoped-materialization path
+    // passes false — an identity failure there should fall through to its other seed strategies
+    // below, not abort branch initialization outright; MaterializeFileAsync — whose whole job is
+    // "resolve this one file, and say clearly why not" — uses the default true).
+    private async Task<string?> ResolveBranchRepositoryCasIdAsync(
+        string branchId, CancellationToken ct, bool throwOnUnresolved = true)
+    {
+        if (options.SeedRepositoryPath is { Length: > 0 } seed)
+        {
+            return repositories is not null
+                ? await repositories.ResolveCasIdentityAsync(null, seed, ct).ConfigureAwait(false)
+                : Path.GetFullPath(seed);
+        }
+
+        if (repositories is null) return null;
+        var workUnitService = serviceProvider?.GetService(typeof(IWorkUnitService)) as IWorkUnitService;
+        if (workUnitService is null) return null;
+
+        var owners = await workUnitService.ListAsync(branchId, ct).ConfigureAwait(false);
+        var ownerRepositoryId = owners.FirstOrDefault()?.RepositoryId;
+        if (ownerRepositoryId is null) return null;
+
+        var resolved = await repositories.ResolveCasIdentityAsync(ownerRepositoryId, null, ct).ConfigureAwait(false);
+        if (resolved is null && throwOnUnresolved)
+            throw new RepositoryIdentityUnresolvedException(ownerRepositoryId);
+        return resolved;
+    }
+
     // CAS being unconfigured is a legitimate, common, intentional deployment choice — not a
     // misconfiguration — so this is logged once per instance (this class is a singleton, so
     // effectively once per process) at Information, not per-call at Warning. WriteAsync/DeleteAsync
@@ -36,17 +95,24 @@ internal sealed class FileSystemWorkspaceService(
         // Phase 11 — scoped materialization: when a work unit declares FileScope and CAS is
         // available, materialize only the matching paths from the latest snapshot instead of
         // copying the full seed branch directory. This keeps work unit branch dirs small.
-        if (fileScope is { Count: > 0 } && materializer is not null && snapshotService is not null
-            && options.SeedRepositoryPath is { Length: > 0 } seedForScope)
+        // Slice 7.2 — repositoryId resolution no longer requires SeedRepositoryPath to be set: a
+        // cold peer with no local default clone resolves via branchId's owning WorkUnit.RepositoryId
+        // instead (throwOnUnresolved: false — an identity failure here falls through to this
+        // method's other seed strategies below, not a hard failure of branch initialization).
+        if (fileScope is { Count: > 0 } && materializer is not null && snapshotService is not null)
         {
-            var repositoryId = Path.GetFullPath(seedForScope);
-            var snapshot = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
-            if (snapshot?.TreeEntries is not null)
+            var repositoryId = await ResolveBranchRepositoryCasIdAsync(branchId, ct, throwOnUnresolved: false)
+                .ConfigureAwait(false);
+            var snapshot = repositoryId is not null
+                ? await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false)
+                : null;
+            var tree = snapshot is not null ? await ResolveTreeAsync(snapshot, ct).ConfigureAwait(false) : null;
+            if (tree is not null)
             {
                 // Expand work unit glob patterns to materializer prefix paths, and always include
                 // project structure files so WorkspaceProfileService can detect project roots.
                 var materializationScope = ExpandScopeForMaterializer(fileScope);
-                await materializer.MaterializeAsync(snapshot, branchDir, materializationScope, ct)
+                await materializer.MaterializeAsync(snapshot!, branchDir, materializationScope, ct)
                     .ConfigureAwait(false);
                 return;
             }
@@ -71,9 +137,10 @@ internal sealed class FileSystemWorkspaceService(
             {
                 var repositoryId = Path.GetFullPath(seed);
                 var snapshot = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
-                if (snapshot?.TreeEntries is not null)
+                var tree = snapshot is not null ? await ResolveTreeAsync(snapshot, ct).ConfigureAwait(false) : null;
+                if (tree is not null)
                 {
-                    await materializer.MaterializeAsync(snapshot, branchDir, ct: ct).ConfigureAwait(false);
+                    await materializer.MaterializeAsync(snapshot!, branchDir, ct: ct).ConfigureAwait(false);
                     return;
                 }
             }
@@ -584,30 +651,36 @@ internal sealed class FileSystemWorkspaceService(
     // (not silently) so a future debugging session doesn't have to infer this from stale/missing
     // CAS state — see the class-level _loggedMissingCasConfig comment for why this is Information,
     // logged once, not a per-call Warning.
-    private bool CanEmitOps([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? repositoryId)
+    // Slice 7.2 — resolves the same workgroup-portable CAS key (sticky to any already-existing
+    // chain) the bootstrap/sync path uses, so ops emitted here from an ordinary file write land
+    // under the SAME RepositoryId as the repository's own RepositorySnapshot chain, rather than
+    // (pre-7.2) always the raw disk path regardless of which key convention that repo actually
+    // bootstrapped under.
+    private async Task<string?> ResolveOpsRepositoryIdAsync(CancellationToken ct)
     {
-        repositoryId = null;
-        if (blobStore is not null && repoOpService is not null && options.SeedRepositoryPath is { Length: > 0 })
+        if (blobStore is null || repoOpService is null || options.SeedRepositoryPath is not { Length: > 0 } seed)
         {
-            repositoryId = Path.GetFullPath(options.SeedRepositoryPath);
-            return true;
+            if (!_loggedMissingCasConfig)
+            {
+                _loggedMissingCasConfig = true;
+                logger?.LogInformation(
+                    "CAS dual-write disabled (blobStore={HasBlobStore}, repoOpService={HasRepoOpService}, " +
+                    "seedRepositoryPath={HasSeedPath}). This is expected for deployments that don't need " +
+                    "the audit trail; file writes/deletes proceed normally on disk.",
+                    blobStore is not null, repoOpService is not null, options.SeedRepositoryPath is { Length: > 0 });
+            }
+            return null;
         }
 
-        if (!_loggedMissingCasConfig)
-        {
-            _loggedMissingCasConfig = true;
-            logger?.LogInformation(
-                "CAS dual-write disabled (blobStore={HasBlobStore}, repoOpService={HasRepoOpService}, " +
-                "seedRepositoryPath={HasSeedPath}). This is expected for deployments that don't need " +
-                "the audit trail; file writes/deletes proceed normally on disk.",
-                blobStore is not null, repoOpService is not null, options.SeedRepositoryPath is { Length: > 0 });
-        }
-        return false;
+        return repositories is not null
+            ? await repositories.ResolveCasIdentityAsync(null, seed, ct).ConfigureAwait(false)
+            : Path.GetFullPath(seed);
     }
 
     private async Task EmitWriteOpAsync(string fullPath, string relativePath, byte[] newBytes, CancellationToken ct)
     {
-        if (!CanEmitOps(out var repositoryId) || IsStudioInternalPath(relativePath))
+        var repositoryId = await ResolveOpsRepositoryIdAsync(ct).ConfigureAwait(false);
+        if (repositoryId is null || IsStudioInternalPath(relativePath))
             return;
 
         var newBlobId = BlobId(newBytes);
@@ -628,7 +701,8 @@ internal sealed class FileSystemWorkspaceService(
 
     private async Task EmitDeleteOpAsync(string fullPath, string relativePath, CancellationToken ct)
     {
-        if (!CanEmitOps(out var repositoryId) || IsStudioInternalPath(relativePath) || !File.Exists(fullPath))
+        var repositoryId = await ResolveOpsRepositoryIdAsync(ct).ConfigureAwait(false);
+        if (repositoryId is null || IsStudioInternalPath(relativePath) || !File.Exists(fullPath))
             return;
 
         var oldBytes = await File.ReadAllBytesAsync(fullPath, ct).ConfigureAwait(false);
@@ -763,15 +837,23 @@ internal sealed class FileSystemWorkspaceService(
     // Phase 11 on-demand fetch: materializes a single path from the latest snapshot into the branch
     // dir so agents can access files that weren't in their initial FileScope. Returns true when the
     // file was found in the snapshot and written to disk, false when it genuinely doesn't exist.
+    // Slice 7.2 — repositoryId resolution no longer requires SeedRepositoryPath: a cold peer (no
+    // local default clone at all — e.g. the multi-user smoke's host B) resolves via branchId's
+    // owning WorkUnit.RepositoryId instead, throwing RepositoryIdentityUnresolvedException (an
+    // identity-aware error, not a bare 404) when that RepositoryId can't be bound anywhere on this
+    // peer — see ResolveBranchRepositoryCasIdAsync's own doc comment.
     public async Task<bool> MaterializeFileAsync(string branchId, string path, CancellationToken ct = default)
     {
-        if (materializer is null || snapshotService is null
-            || options.SeedRepositoryPath is not { Length: > 0 } seed)
+        if (materializer is null || snapshotService is null)
             return false;
 
-        var repositoryId = Path.GetFullPath(seed);
+        var repositoryId = await ResolveBranchRepositoryCasIdAsync(branchId, ct).ConfigureAwait(false);
+        if (repositoryId is null) return false;
+
         var snapshot = await snapshotService.GetLatestAsync(repositoryId, ct).ConfigureAwait(false);
-        if (snapshot?.TreeEntries is null || !snapshot.TreeEntries.ContainsKey(path))
+        if (snapshot is null) return false;
+        var tree = await ResolveTreeAsync(snapshot, ct).ConfigureAwait(false);
+        if (tree is null || !tree.ContainsKey(path))
             return false;
 
         var branchDir = BranchDir(branchId);

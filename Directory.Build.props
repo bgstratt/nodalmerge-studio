@@ -6,7 +6,16 @@
     <LangVersion>latest</LangVersion>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <NodalMergeUseNuGetPackages Condition="'$(NodalMergeUseNuGetPackages)' == ''">true</NodalMergeUseNuGetPackages>
-    <NodalMergePackageVersion Condition="'$(NodalMergePackageVersion)' == ''">0.1.2</NodalMergePackageVersion>
-    <NodalMergeDotNetHostProject Condition="'$(NodalMergeDotNetHostProject)' == ''">$(MSBuildThisFileDirectory)..\nodalmerge\nodalmerge-host\src\NodalMerge.DotNetHost\NodalMerge.DotNetHost.csproj</NodalMergeDotNetHostProject>
+    <NodalMergePackageVersion Condition="'$(NodalMergePackageVersion)' == ''">0.2.2</NodalMergePackageVersion>
+    <!-- The nodalmerge repo's .NET host moved from nodalmerge-host/ to hosts/dotnet/. -->
+    <NodalMergeDotNetHostProject Condition="'$(NodalMergeDotNetHostProject)' == ''">$(MSBuildThisFileDirectory)..\nodalmerge\hosts\dotnet\src\NodalMerge.DotNetHost\NodalMerge.DotNetHost.csproj</NodalMergeDotNetHostProject>
+    <!-- Slice 0.4 (plans/blob-cas-remediation.md, finding #14) — the nodalmerge repo's shared,
+         frozen cross-repo contract vectors (engine/commands/*.v1.json). Same sibling-checkout
+         assumption as NodalMergeDotNetHostProject above: this repo and nodalmerge are expected to
+         be checked out side by side. There is no NuGet-package fallback for these (they are data
+         files, not an assembly), so a consumer whose sibling checkout is absent/differently-named
+         must override this property (e.g. -p:NodalMergeEngineCommandsDir=...) rather than getting
+         a silent substitute; test projects that <None Include> from this dir guard with Exists(). -->
+    <NodalMergeEngineCommandsDir Condition="'$(NodalMergeEngineCommandsDir)' == ''">$(MSBuildThisFileDirectory)..\nodalmerge\engine\commands\</NodalMergeEngineCommandsDir>
   </PropertyGroup>
 </Project>

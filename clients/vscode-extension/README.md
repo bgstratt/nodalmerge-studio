@@ -36,8 +36,10 @@ Side-by-side diff of two projection snapshots — useful for auditing what an ag
 ## Requirements
 
 - **VS Code** 1.90 or later
-- **NodalMerge Studio Host** running locally or on a reachable host  
-  The extension auto-manages a local host process on startup. Point it at a remote host via `nodalmerge.runtimeUri`.
+- **NodalMerge Studio Host** — the extension always spawns/adopts its own local host process on
+  startup; it never talks to a remote server directly (`nodalmerge.runtimeUri` only tunes the
+  local bind address/port). To join a shared room hosted elsewhere, set `nodalmerge.room.hostUri`
+  instead — the local host connects out to it.
 - **.NET SDK 10.0** (for the local host process)
 
 ---
@@ -70,7 +72,9 @@ Side-by-side diff of two projection snapshots — useful for auditing what an ag
 
 | Setting | Default | Description |
 |---|---|---|
-| `nodalmerge.runtimeUri` | `""` | Base URI of the Studio runtime. Empty = local host on `127.0.0.1:5080`. Set to a remote address to connect to a standalone or shared host. |
+| `nodalmerge.runtimeUri` | `""` | Base URI the extension's own locally-managed runtime binds to. Empty = `127.0.0.1:5080`. Always local — see `nodalmerge.room.hostUri` to join a shared room. |
+| `nodalmerge.room.hostUri` | `""` | WebSocket URI of a room server the local runtime should connect to (e.g. `wss://team.example.com`). Empty = standalone, no room connection attempted. |
+| `nodalmerge.room.workgroup` | `""` | Names the workgroup room this workspace's repository/goal state joins. Only meaningful once `nodalmerge.room.hostUri` is set. |
 | `nodalmerge.workspaceDataPath` | `""` | Where Studio stores branch files and the node-store database. Empty = VS Code's per-workspace extension storage (outside your repo). Set a relative path (e.g. `.nodalmerge`) to store inside the repo. |
 | `nodalmerge.repositoryPath` | `""` | Absolute path to the repository agents operate against. Empty = first folder open in the window. |
 | `nodalmerge.agentProfiles` | `[]` | Named agent profiles. Each maps an agent type to a provider, model, system prompt, and tool allowlist. |

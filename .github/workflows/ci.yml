@@ -16,11 +16,40 @@ jobs:
         with:
           path: nodalmerge-studio
 
+      # Slice 0.4 (plans/blob-cas-remediation.md, finding #14) — checks out the sibling
+      # nodalmerge repo so WorkUnitStatusVectorTests (NodalMerge.Studio.Contracts.Tests) can read
+      # the shared cross-repo contract vectors at
+      # ../nodalmerge/engine/commands/work-unit-status-vectors.v1.json (matching the
+      # NodalMergeEngineCommandsDir convention in Directory.Build.props, which already assumes a
+      # sibling checkout the same way NodalMergeDotNetHostProject does).
+      #
+      # TODO(blobExpansion-merge): pinned to nodalmerge's `blobExpansion` branch, NOT `main`.
+      # The vector file (engine/commands/work-unit-status-vectors.v1.json) only exists on
+      # `blobExpansion` today — the whole `blob-cas-remediation.md` remediation plan lands there
+      # before merging to nodalmerge's `main`. Pointing this checkout at `main` would leave
+      # studio's CI red (WorkUnitStatusVectorTests failing closed on a missing vectors file) for
+      # the entire multi-phase remediation effort, which trains people to ignore red CI and
+      # contradicts the green-CI convention the RED-first tests in this plan rely on. Flip `ref:`
+      # below to `main` the moment `blobExpansion` merges into nodalmerge's `main` — do not leave
+      # it pointed at `blobExpansion` after that merge lands, or this step will silently keep
+      # tracking a stale/deleted branch instead of `main`'s ongoing history.
+      - name: Checkout nodalmerge (sibling repo — shared vector contracts)
+        uses: actions/checkout@v4
+        with:
+          repository: bgstratt/nodalmerge
+          ref: blobExpansion
+          path: nodalmerge
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           global-json-file: nodalmerge-studio/global.json
 
+      # NodalMerge.* 0.2.4 is published to nuget.org, so studio's pins restore directly from it
+      # — no local pack step (and thus no Rust toolchain) needed in CI. Local testing of an
+      # UNRELEASED NodalMerge.* build still works via scripts/restore-local-nodalmerge.ps1, which
+      # injects a local feed at restore time (RestoreAdditionalProjectSources), independent of
+      # NuGet.config.
       - name: Restore
         run: dotnet restore NodalMerge.Studio.slnx --configfile NuGet.config
 
@@ -32,8 +61,14 @@ jobs:
       - name: Test (unit)
         run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category!=Integration"
 
+      # Excludes the CLI-executor harness classes tagged [Trait("Requires","LocalCliProcess")]:
+      # their fixtures spawn Windows-style processes (a stub-claude.cmd batch file, the cmd
+      # builtin `exit`) that fail on the linux runner with Win32Exception. That's test
+      # scaffolding, not product code — the studio assemblies and every CAS/blob/multi-user
+      # integration test are portable and run green here. Making those stubs cross-platform is
+      # filed separately; they still run on Windows/local where the filter is not applied.
       - name: Test (integration)
         if: env.NODALMERGE_NATIVE_AVAILABLE == 'true'
-        run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category=Integration"
+        run: dotnet test NodalMerge.Studio.slnx -c Release --no-build --filter "Category=Integration&Requires!=LocalCliProcess"
         env:
           NODALMERGE_NATIVE_AVAILABLE: ${{ vars.NODALMERGE_NATIVE_AVAILABLE }}

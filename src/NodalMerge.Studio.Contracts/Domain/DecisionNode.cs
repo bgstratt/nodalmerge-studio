@@ -15,7 +15,15 @@ public sealed record DecisionNode(
     double? Confidence,
     string? Rationale,
     DateTimeOffset DecidedAt,
-    string? SessionId = null);
+    string? SessionId = null,
+    // Slice 6.3a — denormalized at RecordAsync time from WorkUnitId's own RepositoryId. Null when
+    // the work unit itself has no resolvable RepositoryId, or the decision predates 6.3a.
+    string? RepositoryId = null,
+    // L2.3 (plans/room-persistence-bloat.md) — the ConversationRef.RefId whose CAS transcript blob
+    // captures the reasoning that led to this decision. This is the link that lets a same-repo peer
+    // trace decision → reasoning; set when a reasoning publisher is wired into RecordAsync, null
+    // otherwise (and for decisions that predate L2.3).
+    string? ReasoningRefId = null);
 
 public enum DecisionOutcome
 {

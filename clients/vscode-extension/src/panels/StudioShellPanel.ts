@@ -120,6 +120,16 @@ export class StudioShellPanel implements vscode.Disposable {
       StudioShellPanel.current.panel.reveal(vscode.ViewColumn.Active);
       return StudioShellPanel.current;
     }
+    // The runtime host's port, granted to the webview via portMapping below. A webview is a
+    // sandboxed iframe: its own fetch/WebSocket calls (e.g. the live-feed WebSocket the studio views
+    // open to ws://127.0.0.1:<port>/ws/runtime) cannot reach a localhost port unless the extension
+    // declares a portMapping for it — without this every in-webview WebSocket handshake fails even
+    // though the extension host's own REST calls to the same port succeed. Identity map (same port
+    // on both sides): we only need the access grant, not a remap. Falls back to 80 if baseUrl has no
+    // explicit port. (Live pathways feed fix — see plans/first-class-goals-and-materialization.md.)
+    let runtimePort = 80;
+    try { runtimePort = Number(new URL(baseUrl).port) || 80; } catch { /* keep default */ }
+
     const panel = vscode.window.createWebviewPanel(
       StudioShellPanel.viewType,
       'NodalMerge Studio',
@@ -131,6 +141,7 @@ export class StudioShellPanel implements vscode.Disposable {
         // Studio view un-searchable: no way to find text in conversations, cards, or timelines.
         enableFindWidget: true,
         localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'out')],
+        portMapping: [{ webviewPort: runtimePort, extensionHostPort: runtimePort }],
       },
     );
     StudioShellPanel.current = new StudioShellPanel(

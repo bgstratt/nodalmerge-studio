@@ -14,7 +14,8 @@ instead of `StudioWebApplication.Build(args)`.
 
 ### Standalone (no room presence)
 
-`Peer:HostUri` is null or omitted. The `RoomPeerClient` service logs "running standalone" and
+`Room:HostUri` is empty or omitted (see the Configuration reference below for the `Peer:HostUri`
+back-compat fallback). The `RoomPeerClient` service logs "running standalone" and
 becomes a no-op. All agent loops execute locally. Agent work units, artifacts, and proposals are
 stored in the peer's own workspace; nothing is replicated to a remote room.
 
@@ -23,18 +24,28 @@ multi-peer room replication is not needed.
 
 ### Connected (room presence)
 
-`Peer:HostUri` is set (e.g., `ws://localhost:5080`). `RoomPeerClient` opens an outbound WebSocket
+`Room:HostUri` is set (e.g., `ws://localhost:5080`). `RoomPeerClient` opens an outbound WebSocket
 connection to `{HostUri}/ws/{RoomId}` and sends a `hello` message identifying itself with
-`peer_id`, `peer_type`, and an empty `frontier`. The peer then participates in NodalMerge CRDT
-replication — work units, artifacts, and proposals created by the peer are replicated to the room
-and visible to all connected peers, including the VS Code extension.
+`peer_id`, `peer_type`, and an empty `frontier`.
 
 Reconnection: exponential backoff starting at 1 s, capped at 30 s. On a `participant.stop` message
 addressed to this peer, the peer calls `StopApplication()` and shuts down cleanly.
 
-**What the VS Code extension sees in connected mode:** Agents spawned by the headless peer appear
-in the Activity Center "Running Agents" list alongside interactively spawned agents. They can be
-paused, resumed, or stopped from the extension. The peer process itself is controlled externally.
+> **Current status (2026-07-14): connected mode is presence + remote stop only — Studio
+> data does NOT replicate yet.** Work units, artifacts, and proposals created by the
+> peer stay in the peer's own workspace store; they are not visible to the host or to
+> other peers. Inbound room messages (e.g. `catch-up-pack`) are received but not
+> applied to the peer's store. The bidirectional replication plane is planned work —
+> see `plans/cas-distribution-and-storage.md`, Phase 6 slice 6.1. Until it lands, do
+> not build anything that assumes peer-created data appears anywhere but the peer's
+> own database.
+
+**What the VS Code extension sees in connected mode:** the peer itself appears in the
+participant list as a connected peer (`kind: "peer"`, with its `peer_type`), and it can
+be **stopped** from the extension (a targeted `participant.stop` shuts the whole peer
+process down). The peer's agents and work units do *not* appear in the Activity Center,
+and per-agent pause/resume from the extension is not possible — the host's agent list
+is in-process only (`StudioParticipantService`).
 
 ---
 
@@ -67,13 +78,21 @@ Or via env var: `Peer__Enabled=true`.
 
 ## Configuration reference
 
-All keys live under the `"Peer"` section in `appsettings.json`:
+**Slice 6.4 update (2026-07-15):** `HostUri` moved to its own `"Room"` config section, shared
+with the embedded Studio host (`plans/cas-distribution-and-storage.md`, decision D4 — "mode
+collapse": connection is config, not a mode). `Peer:HostUri` still works — it's read as a
+deprecated fallback (with a one-line warning logged) whenever `Room:HostUri` is unset — so
+existing deployments of this guide's config need no changes. New configs should use `Room:HostUri`.
+The rest of the `"Peer"` section (`Enabled`, `RoomId`, `PeerType`, `PeerId`) is unchanged.
 
 ```json
 {
+  "Room": {
+    "HostUri": "ws://localhost:5080",
+    "Workgroup": "workgroup"
+  },
   "Peer": {
     "Enabled": true,
-    "HostUri": "ws://localhost:5080",
     "RoomId": "studio",
     "PeerType": "ephemeral-agent",
     "PeerId": null
@@ -84,8 +103,9 @@ All keys live under the `"Peer"` section in `appsettings.json`:
 | Key | Default | Description |
 |---|---|---|
 | `Peer:Enabled` | `false` | Must be `true` (or use CLI/env override) to activate peer mode |
-| `Peer:HostUri` | `null` | WebSocket base URI of the room host. `null` = standalone mode. |
-| `Peer:RoomId` | `"studio"` | The NodalMerge room to join. Must match the room ID on the host. |
+| `Room:HostUri` | `null`/`""` | WebSocket base URI of the room host. Empty/unset = standalone mode (D4 — never inferred from URL shape). Falls back to `Peer:HostUri` if set and `Room:HostUri` is not (deprecated). |
+| `Room:Workgroup` | `"workgroup"` | Names the workgroup room this peer's repositories-map/cross-repo-goal state joins. The default keeps standalone workgroup state working with a stable local room id even with no server configured. |
+| `Peer:RoomId` | `"studio"` | This peer's own room (distinct from the workgroup room above). Must match the room ID on the host. |
 | `Peer:PeerType` | `"ephemeral-agent"` | `"ephemeral-agent"` for short-lived runs; `"persistent-agent"` for long-running workers. |
 | `Peer:PeerId` | `null` | Stable identity string. When null, a UUID is auto-generated and persisted to `{Workspace:RootPath}/.peer-id` so the same identity is reused on restart. |
 
@@ -172,10 +192,12 @@ patterns for different trigger scenarios.
 ## What the peer cannot do
 
 - **No MCP-over-HTTP endpoint.** External MCP clients must connect to the embedded Studio host
-  (the full HTTP server). The peer participates in the room as a write peer only.
+  (the full HTTP server). The peer's room participation is presence + remote stop today (see
+  the connected-mode status note above).
 - **No VS Code extension UI of its own.** All UI interaction happens through the extension
-  connected to the embedded host. In connected mode, the peer's agents surface in the extension;
-  in standalone mode, there is no UI visibility.
+  connected to the embedded host. In connected mode, the *peer* surfaces in the extension's
+  participant list (not its agents or work units); in standalone mode, there is no UI
+  visibility at all.
 - **No agent-to-agent room discovery.** The peer connects to a known `HostUri`; it does not
   discover other peers dynamically.
 
@@ -204,12 +226,15 @@ orchestrator. With `AllowAgentGitPush=true`, the agent pushes a branch when done
 when the orchestrator finishes (`AllowAutoRequeue=false` is appropriate here to avoid retrying
 indefinitely on a cron schedule).
 
-### Background observer (persistent peer, no goal injection)
+### Background observer (persistent peer, no goal injection) — future state
 
 A `persistent-agent` peer connects to the room (`HostUri` set) but does not inject goals — it
-simply participates in replication and has domain observers enabled. Any artifact recorded by
+participates in replication with domain observers enabled, so any artifact recorded by
 interactive agents triggers the observer pipeline in the peer as well, effectively doubling
-observer coverage when the embedded host has observers disabled.
+observer coverage when the embedded host has observers disabled. **This pattern requires the
+replication plane (cas-distribution-and-storage.md Phase 6 slice 6.1) and does not work today**
+— artifacts recorded on the host currently never reach a connected peer's store, so its
+observers have nothing to react to.
 
 ---
 
@@ -217,9 +242,11 @@ observer coverage when the embedded host has observers disabled.
 
 ```json
 {
+  "Room": {
+    "HostUri": "ws://studio-host:5080"
+  },
   "Peer": {
     "Enabled": true,
-    "HostUri": "ws://studio-host:5080",
     "RoomId": "studio",
     "PeerType": "ephemeral-agent"
   },
