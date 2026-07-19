@@ -113,6 +113,13 @@ public sealed class FindingService(
 
     private async Task<string?> PromoteKnowledgeGuidelineAsync(Finding finding, CancellationToken ct)
     {
+        // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — promotion defaults to
+        // shared + repo-specific: Reach=Workgroup so the constraint actually replicates (fixing the
+        // old "global constraint stranded in the local room" bug), with the finding's own
+        // RepositoryId (Phase 0) as the application scope — so it lands in that repo's room and
+        // applies to that repo. A null RepositoryId (no workspace repo) falls back to the shared
+        // "workgroup" room (all repos). Widening to all-repos, or restricting to a private local
+        // override, are separate explicit human actions (elevate / restrict — progressive promotion).
         var artifact = new ArtifactRef(
             ArtifactId: $"constraint-{Guid.NewGuid():N}",
             Type: ArtifactType.Constraint,
@@ -122,7 +129,9 @@ public sealed class FindingService(
             OwnedByWorkUnitId: null,
             OwnedByAgentId: null,
             Title: finding.Title,
-            Body: finding.Summary);
+            Body: finding.Summary,
+            RepositoryId: finding.RepositoryId,
+            Reach: ArtifactReach.Workgroup);
 
         await artifactLineage.RecordAsync(artifact, ct).ConfigureAwait(false);
         return artifact.ArtifactId;

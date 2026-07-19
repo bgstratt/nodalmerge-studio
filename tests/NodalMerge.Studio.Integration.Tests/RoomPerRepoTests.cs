@@ -652,6 +652,54 @@ public class RoomPerRepoTests : IDisposable
     }
 
     /// <summary>
+    /// Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — promoting a KnowledgeGuideline
+    /// finding now creates a REPLICATED constraint (Reach=Workgroup), not one stranded in the local
+    /// room (the motivating bug). Default is shared + repo-specific: the finding's own RepositoryId
+    /// (Phase 0) becomes the constraint's application scope, so it lands in that repo's room; a finding
+    /// with no repo promotes to the shared "workgroup" room (all repos).
+    /// </summary>
+    [Fact]
+    public async Task Promoting_a_finding_creates_a_replicated_constraint()
+    {
+        await using var app = BuildApp("promote");
+        var repo = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "promote-repoA"), "repoA");
+        var repoRoomId = $"repo/{repo.WorkgroupRepoId}";
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var findings = app.Services.GetRequiredService<IFindingService>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+
+        // A finding attributed to the repo → promotes to a Workgroup + repo-specific constraint.
+        await findings.ProposeAsync(new Finding(
+            FindingId: "finding-repo", Kind: FindingKind.KnowledgeGuideline,
+            Source: FindingSource.Deterministic, Title: "run migrations first", Summary: "do X before Y",
+            SupportingDataJson: null, Status: FindingStatus.Open, CreatedAt: DateTimeOffset.UtcNow,
+            RepositoryId: repo.RepositoryId));
+        var reviewedRepo = await findings.ReviewAsync("finding-repo", FindingStatus.Promoted);
+        Assert.NotNull(reviewedRepo.PromotedArtifactId);
+
+        var repoConstraint = await artifacts.GetAsync(reviewedRepo.PromotedArtifactId!);
+        Assert.Equal(ArtifactReach.Workgroup, repoConstraint!.Reach);
+        Assert.Equal(repo.RepositoryId, repoConstraint.RepositoryId);
+        var repoKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.ArtifactRefV1, repoConstraint.ArtifactId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", repoKey)); // replicated to repo peers
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", repoKey));       // NOT stranded local
+
+        // A finding with no repo → promotes to a workgroup-wide (all repos) constraint.
+        await findings.ProposeAsync(new Finding(
+            FindingId: "finding-global", Kind: FindingKind.KnowledgeGuideline,
+            Source: FindingSource.Deterministic, Title: "global rule", Summary: "everywhere",
+            SupportingDataJson: null, Status: FindingStatus.Open, CreatedAt: DateTimeOffset.UtcNow));
+        var reviewedGlobal = await findings.ReviewAsync("finding-global", FindingStatus.Promoted);
+
+        var globalConstraint = await artifacts.GetAsync(reviewedGlobal.PromotedArtifactId!);
+        Assert.Equal(ArtifactReach.Workgroup, globalConstraint!.Reach);
+        Assert.Null(globalConstraint.RepositoryId);
+        var globalKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.ArtifactRefV1, globalConstraint.ArtifactId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, "workgroup", "studio", globalKey)); // shared workgroup room
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", globalKey));
+    }
+
+    /// <summary>
     /// Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — ArtifactRef routes by the
     /// 2×2 (Reach × Application): Private → peer-private "studio" room; Workgroup + RepositoryId →
     /// that repo's room; Workgroup + no RepositoryId → the shared "workgroup" room (the old "global",
