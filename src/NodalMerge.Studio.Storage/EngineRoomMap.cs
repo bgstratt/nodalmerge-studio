@@ -256,16 +256,25 @@ internal sealed class EngineRoomMap(
         return (response.Status, nodeIdHex);
     }
 
-    // Persists a fresh server-pack snapshot for this room and, if a checkpoint was actually
-    // promoted (promotedNodeIdHex non-null), notifies the outbound replication seam. Best-effort:
-    // a replication hiccup here never fails the write itself (the MapSet already succeeded), only
-    // logs — matching NodalMergeStudioNodeStore's original per-write tail exactly.
+    // Persists this write as an incremental DELTA (just the promoted checkpoint node) and, when a
+    // checkpoint was actually promoted, notifies the outbound replication seam. Best-effort: a
+    // persistence/replication hiccup here never fails the write itself (the MapSet already succeeded),
+    // only logs.
+    //
+    // Integration-checkpoint model (plans/room-snapshot-checkpoint-redesign.md): a full-room snapshot
+    // is no longer taken per write — that re-serialized the entire growing room on every entity write
+    // and was the primary source of the O(n^2) DB bloat. The promoted node is the same self-applying
+    // single-node pack this method already hands to outbound replication, so persisting it locally is
+    // symmetric to how an inbound peer delta is persisted; hydration replays these on top of the last
+    // full checkpoint (minted only at goal-complete / merge-to-main). A null promotedNodeIdHex means
+    // nothing new reached the sync graph (promotion failed / no-op) — there is nothing to persist or
+    // replicate, and the old full-snapshot here would only re-serialize already-persisted state.
     public async Task PersistAndReplicateAsync(string? promotedNodeIdHex, CancellationToken cancellationToken)
     {
-        await dagPersistence.PersistRoomSnapshotAsync(RoomId, cancellationToken).ConfigureAwait(false);
-
         if (string.IsNullOrWhiteSpace(promotedNodeIdHex))
             return;
+
+        await dagPersistence.PersistPromotedNodeDeltaAsync(RoomId, promotedNodeIdHex, cancellationToken).ConfigureAwait(false);
 
         try
         {
@@ -276,6 +285,14 @@ internal sealed class EngineRoomMap(
             logger.LogWarning(ex, "engine room map outbound replication notify failed room={Room}", RoomId);
         }
     }
+
+    // Integration-checkpoint (plans/room-snapshot-checkpoint-redesign.md): mints one full-room
+    // server-pack snapshot for this room as a "last known good" hydrate checkpoint. This is the
+    // full-room snapshot that the per-write path (PersistAndReplicateAsync) no longer takes — invoked
+    // only at integration points (merge to main / goal completion) so the delta chain replayed on the
+    // next hydrate stays bounded.
+    public Task PersistCheckpointAsync(CancellationToken cancellationToken) =>
+        dagPersistence.PersistRoomSnapshotAsync(RoomId, cancellationToken).AsTask();
 
     // Convenience combining Set + PromoteLatestCheckpointToGraph + PersistAndReplicateAsync — the
     // exact tail every single-entry mutating write in this codebase performs. Batched multi-row

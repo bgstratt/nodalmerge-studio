@@ -170,6 +170,17 @@ public interface IStudioNodeStore
     // need to know which room a given entity actually lives in.
     Task<IReadOnlyList<(string EntityId, string PayloadJson)>> ReadAllNodesAsync(
         string kind, CancellationToken cancellationToken = default);
+
+    // Integration-checkpoint model (plans/room-snapshot-checkpoint-redesign.md): mints a single
+    // full-room snapshot ("last known good") for the repo room bound to `repositoryId`, taken only
+    // at integration points (merge to main / goal completion). Per-write durability now rides
+    // incremental deltas, so this is the only place — besides the disconnect/shutdown flush — a
+    // full-room snapshot is minted; it bounds the delta chain replayed on the next hydrate and lines
+    // up with git-commit/PR boundaries. No-op if `repositoryId` doesn't resolve to a bound repo room.
+    // Default no-op so InMemoryStudioNodeStore and other test doubles are unaffected — only
+    // NodalMergeStudioNodeStore overrides it with a real per-repo-room snapshot.
+    Task CheckpointRepositoryRoomAsync(string repositoryId, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
 }
 
 // Implements IStudioLocalLogStore as well as IStudioNodeStore over the same (kind, id) map so the

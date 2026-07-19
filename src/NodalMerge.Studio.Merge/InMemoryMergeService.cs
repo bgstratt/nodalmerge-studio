@@ -809,6 +809,19 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
             _ = Task.Run(() => TryStampGoalFinalSnapshotAsync(stampWorkUnit, stampSnapshotId, CancellationToken.None));
         }
 
+        // Integration checkpoint (plans/room-snapshot-checkpoint-redesign.md): a merge landing on
+        // disk is the "last known good" boundary (lines up with a git commit / PR), so mint one
+        // full-room snapshot for the repo room here. This is the ONLY place — besides the disconnect
+        // flush — a full-room snapshot is taken now; per-write durability rides incremental deltas, so
+        // this bounds the delta chain the next hydrate replays. Fire-and-forget on CancellationToken.None
+        // for the same reason as the goal-final stamp above: it must never add latency to the apply
+        // response nor be cancelled when the caller aborts.
+        if (promotedToDisk && !string.IsNullOrWhiteSpace(updated.RepositoryId))
+        {
+            var checkpointRepositoryId = updated.RepositoryId;
+            _ = Task.Run(() => _nodeStore.CheckpointRepositoryRoomAsync(checkpointRepositoryId, CancellationToken.None));
+        }
+
         // A reconciliation work unit's own proposal just landed — generic across every source
         // (see WorkUnit.ReconciliationSourceProposalIds's own doc comment): supersede every
         // proposal it folds together, then resolve any open conflict record (candidate- or

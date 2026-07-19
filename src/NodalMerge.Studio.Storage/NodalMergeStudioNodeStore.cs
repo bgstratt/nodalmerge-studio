@@ -591,6 +591,23 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         await WriteToRoomAsync(repoRoomMap, kind, entityId, payloadJson, cancellationToken).ConfigureAwait(false);
     }
 
+    // Integration-checkpoint (plans/room-snapshot-checkpoint-redesign.md): mints one full-room
+    // snapshot for the repo room bound to `repositoryId`. Resolution mirrors the repo-scoped
+    // WriteNodeAsync above; a no-op when `repositoryId` doesn't resolve to a bound repo room (nothing
+    // to checkpoint). Full-room snapshots are otherwise no longer taken per write — this and the
+    // disconnect flush are the only sources, keeping the hydrate delta chain bounded.
+    public async Task CheckpointRepositoryRoomAsync(string repositoryId, CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var repoRoomId = await TryResolveRepoRoomIdCoreAsync(repositoryId, cancellationToken).ConfigureAwait(false);
+        if (repoRoomId is null)
+            return;
+
+        var repoRoomMap = await GetOrCreateRepoRoomMapAsync(repoRoomId, cancellationToken).ConfigureAwait(false);
+        await repoRoomMap.PersistCheckpointAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     // Core binding resolution off this store's own RepositoryV1 rows (see the class-comment NOTE
     // for why the registry is deliberately not consulted). No init gate — callable both from
     // public methods (already initialized) and from inside EnsureInitializedAsync's own migration
