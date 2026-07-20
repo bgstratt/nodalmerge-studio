@@ -179,6 +179,8 @@ public class ReconciliationAgentServiceTests
 
         public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
 
+        public GoalDefaultCredentials? GetCredentialsForProfile(string workUnitId, string profileId) => null;
+
         public string? GetAutoReviewProfileId(string workUnitId) => null;
         public string? GetGoalDefaultProfileId(string workUnitId) => null;
 
@@ -198,6 +200,7 @@ public class ReconciliationAgentServiceTests
             IReadOnlyList<string>? enabledDomainAgents = null,
             string? credentialRef = null,
             bool lenientToolParsing = false,
+            IReadOnlyDictionary<string, GoalDefaultCredentials>? profileCredentials = null,
             CancellationToken cancellationToken = default)
         {
             spawnCalls.Add((agentType, workUnitId, model));

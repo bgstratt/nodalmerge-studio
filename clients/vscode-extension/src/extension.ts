@@ -73,6 +73,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       output.show();
     }),
 
+    vscode.commands.registerCommand(COMMANDS.OPEN_SETTINGS, () => {
+      // Opens the Settings UI pre-filtered to the extension's own settings (runtime URI, room,
+      // blob origin, model profiles, etc.).
+      void vscode.commands.executeCommand('workbench.action.openSettings', '@ext:nodalmerge-studio.nodalmerge-studio');
+    }),
+
     vscode.commands.registerCommand(COMMANDS.OPEN_STUDIO, () => {
       StudioShellPanel.createOrShow(
         manager.hostBaseUrl, context.extensionUri, agentConfig, context.secrets, lmProxy.baseUrl, output, notificationManager,

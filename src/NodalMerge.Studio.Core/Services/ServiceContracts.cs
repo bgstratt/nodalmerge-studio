@@ -1301,7 +1301,14 @@ public sealed record GoalRoutingConfig(
     // The goal's Default-profile lenient-tool-parsing setting — so a role that inherits Default
     // (no explicit StageCredentials entry) still honors it. Per-stage overrides carry their own
     // flag inside StageCredentials; this is only the Default fallback. See GetGoalDefaultCredentials.
-    bool LenientToolParsing = false);
+    bool LenientToolParsing = false,
+    // Scoped-worker credentials keyed by AgentProfileId — the LLM connection a file-scoped Execute/
+    // Plan profile (AgentProfile.ModelProfileId) runs on, resolved client-side at spawn. Twin of
+    // StageCredentials but keyed by profile instead of stage; consulted by GetCredentialsForProfile
+    // when FanOut/Planner deterministically route a slice to a bound profile. Persisted (key-only,
+    // no ApiKey survives — same as StageCredentials) so routing resolves after a restart.
+    // See plans/scoped-execute-workers-per-profile-models.md.
+    IReadOnlyDictionary<string, GoalDefaultCredentials>? ProfileCredentials = null);
 
 public interface IAgentControlService
 {
@@ -1321,6 +1328,11 @@ public interface IAgentControlService
         // The Default profile's lenient-tool-parsing setting — inherited by any role without an
         // explicit per-stage override in stageCredentials. See GoalDefaultCredentials.LenientToolParsing.
         bool lenientToolParsing = false,
+        // Scoped-worker credentials keyed by AgentProfileId — resolved client-side from each bound
+        // profile's Model Profile. Twin of stageCredentials, keyed by profile instead of stage; used
+        // by GetCredentialsForProfile when a file-scope match routes a slice to a bound profile. See
+        // plans/scoped-execute-workers-per-profile-models.md.
+        IReadOnlyDictionary<string, GoalDefaultCredentials>? profileCredentials = null,
         CancellationToken cancellationToken = default);
 
     // Runs one deterministic IGoalCoordinator convergence sweep for a goal/orchestrator-type work
@@ -1373,6 +1385,15 @@ public interface IAgentControlService
     /// callers fall back to <see cref="GetGoalDefaultCredentials"/> in that case.
     /// </summary>
     GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage);
+
+    /// <summary>
+    /// Per-profile credential override captured at orchestrator spawn time, keyed by AgentProfileId —
+    /// the LLM connection a file-scoped Execute/Plan profile (<see cref="AgentProfile.ModelProfileId"/>)
+    /// was bound to. Null when the matched profile declared no Model Profile binding, in which case
+    /// callers fall back to <see cref="GetCredentialsForStage"/> (the stage default). Twin of
+    /// GetCredentialsForStage; see plans/scoped-execute-workers-per-profile-models.md.
+    /// </summary>
+    GoalDefaultCredentials? GetCredentialsForProfile(string workUnitId, string profileId);
 
     /// <summary>
     /// Profile ID for the automated reviewer pre-gate, captured at orchestrator spawn time.
@@ -1475,6 +1496,26 @@ public interface IArtifactLineageService
     // these since it only indexes work-unit-owned artifacts.
     Task<IReadOnlyList<ArtifactRef>> GetGlobalConstraintsAsync(CancellationToken ct = default);
 
+    // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — progressive promotion: widen a
+    // constraint from one repo (Workgroup + RepositoryId) to all repos (Workgroup + null), re-routing
+    // it into the shared "workgroup" room. Idempotent; returns the updated artifact, or null if the
+    // artifact doesn't exist. Default no-op keeps in-memory test doubles compiling unchanged; the real
+    // ArtifactLineageService overrides it.
+    Task<ArtifactRef?> ElevateToWorkgroupAsync(string artifactId, CancellationToken ct = default) =>
+        Task.FromResult<ArtifactRef?>(null);
+
+    // Phase 1 follow-up (organizational-knowledge-and-workgroup-scope.md) — set BOTH scope axes on a
+    // (global) constraint at once and re-route it to the matching room: Reach {Private→studio room,
+    // Workgroup+repo→repo room, Workgroup+null→workgroup room} × RepositoryId (application, null=all
+    // repos). Generalizes ElevateToWorkgroupAsync (which only widens to Workgroup+all-repos) to the full
+    // 2×2 so the UI can move a constraint between any cells. Returns the updated artifact, or null if the
+    // artifact doesn't exist. Default no-op keeps in-memory test doubles compiling; the real service
+    // overrides it. (Like Elevate, this leaves any stale copy in the previously-routed room — rooms have
+    // no eviction; local reads via _byId stay correct because they key on ArtifactId.)
+    Task<ArtifactRef?> SetScopeAsync(
+        string artifactId, ArtifactReach reach, string? repositoryId, CancellationToken ct = default) =>
+        Task.FromResult<ArtifactRef?>(null);
+
     // WorkspacePathways (plans/pathways-workspace-history.md) — every artifact of one type,
     // workspace-wide, regardless of owning work unit. The query surface GetChainAsync
     // (per-work-unit) can't provide for OwnedByWorkUnitId:null artifacts like ExternalChangeset;
@@ -1489,6 +1530,19 @@ public interface IArtifactLineageService
     // if the artifact doesn't exist.
     Task<ArtifactRef> InvalidateAsync(
         string artifactId, string reason, string? sessionId = null, CancellationToken ct = default);
+}
+
+// Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — per-peer local suppression of
+// constraints. "Turning a constraint off" on the Insights tab records a LOCAL toggle (never
+// replicated) so a shared workgroup/repo constraint stops reaching this peer's agents while staying
+// live for everyone else. Constraint injection subtracts the disabled set.
+public interface IConstraintToggleService
+{
+    // Disable (disabled=true) or re-enable (disabled=false) a constraint by ArtifactId for this peer.
+    Task SetDisabledAsync(string artifactId, bool disabled, CancellationToken ct = default);
+
+    // The set of ArtifactIds currently disabled on this peer.
+    Task<IReadOnlySet<string>> GetDisabledIdsAsync(CancellationToken ct = default);
 }
 
 // Slice — Knowledge Promotion. Review lifecycle for Findings detected by either the deterministic
@@ -1526,9 +1580,15 @@ public sealed record InsightLlmScanRequest(string Provider, string Model, string
 // response degrades to "no actionable suggestion" rather than crashing the scan.
 public sealed record LlmFindingSuggestion(string Title, string Summary, FindingKind Kind = FindingKind.KnowledgeGuideline, PipelineStage? TargetStage = null);
 
+// Route B (plans/organizational-knowledge-and-workgroup-scope.md) — the scan result. RawCliOutput is
+// the model's verbatim response, set ONLY on the CLI path (claude-cli/codex-cli), so when a CLI model
+// returns text the analyzer couldn't parse into findings, the UI can surface it for the user to
+// inspect/fix. Null on the HTTP path (a forced tool call is always structured — nothing to inspect).
+public sealed record InsightLlmScanResult(IReadOnlyList<LlmFindingSuggestion> Findings, string? RawCliOutput = null);
+
 public interface IInsightLlmAnalyzerService
 {
-    Task<IReadOnlyList<LlmFindingSuggestion>> AnalyzeAsync(InsightLlmScanRequest request, CancellationToken ct = default);
+    Task<InsightLlmScanResult> AnalyzeAsync(InsightLlmScanRequest request, CancellationToken ct = default);
 }
 
 public interface IFanOutService

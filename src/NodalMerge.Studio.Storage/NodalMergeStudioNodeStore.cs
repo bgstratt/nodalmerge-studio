@@ -192,6 +192,13 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
     // repo don't race to hydrate twice, mirroring RuntimeDagPersistenceService's own per-room cache.
     private readonly ConcurrentDictionary<string, Lazy<Task<EngineRoomMap>>> _repoRoomMaps = new(StringComparer.Ordinal);
 
+    // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — this store's own wrapper over
+    // the shared "workgroup" room, under MapNamespace (disjoint from the workgroup repositories/goals
+    // directories' own namespaces — the same "N wrappers, one room, disjoint namespaces" pattern
+    // those two directories already establish). Holds Workgroup-reach graph nodes with no
+    // RepositoryId (global constraints). Single room → a single Lazy, unlike _repoRoomMaps.
+    private readonly Lazy<Task<EngineRoomMap>> _workgroupRoomMapLazy;
+
     // NOTE (6.3, learned the hard way): binding resolution here deliberately does NOT go through
     // IRepositoryRegistryService. The registry's in-memory cache is only populated by RegisterAsync
     // calls or by startup rehydration (StudioStateRehydrationService -> RehydrateAsync), and
@@ -215,6 +222,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         RuntimeDagPersistenceService dagPersistence,
         INodeStoreProvider legacyNodeStore,
         IStudioReplicationOutbound replicationOutbound,
+        RoomOptions roomOptions,
         ILogger<NodalMergeStudioNodeStore> logger)
     {
         // ReplayNamespaceFor: canonical-resolution entries carry no namespace of their own (see
@@ -236,7 +244,24 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         _bridge = bridge;
         _dagPersistence = dagPersistence;
         _replicationOutbound = replicationOutbound;
+
+        // The workgroup room uses the single-namespace shape (MapNamespace only — migration markers
+        // are a "studio"-room concept, never inside the workgroup room), hydrated once on first touch.
+        var workgroupRoomId = roomOptions.EffectiveWorkgroupRoomId;
+        _workgroupRoomMapLazy = new Lazy<Task<EngineRoomMap>>(async () =>
+        {
+            var roomMap = new EngineRoomMap(
+                workgroupRoomId, _ => MapNamespace, bridge, dagPersistence, replicationOutbound, logger);
+            await roomMap.HydrateAndReplayAsync(CancellationToken.None).ConfigureAwait(false);
+            return roomMap;
+        }, LazyThreadSafetyMode.ExecutionAndPublication);
     }
+
+    // Phase 1 — the shared "workgroup" room map (see the _workgroupRoomMapLazy field). No repo-room
+    // migration passes run here (those are repo-scoped; nothing resolves a RepositoryId to the
+    // workgroup room), just hydrate-and-replay like the workgroup directories do.
+    private Task<EngineRoomMap> GetOrCreateWorkgroupRoomMapAsync(CancellationToken cancellationToken) =>
+        _workgroupRoomMapLazy.Value;
 
     // Slice 6.3 — every repo room uses the same single-namespace shape ("studio", no "-meta" split;
     // migration markers are a workspace-level concept and live in the local "studio" room's
@@ -591,6 +616,17 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         await WriteToRoomAsync(repoRoomMap, kind, entityId, payloadJson, cancellationToken).ConfigureAwait(false);
     }
 
+    // Phase 1 — write into the shared "workgroup" room (every member, all repos). Unconditional: the
+    // caller (ArtifactLineageService) has already decided Workgroup reach with no RepositoryId, so
+    // there is no repositoryId to resolve or fall back on.
+    public async Task WriteWorkgroupNodeAsync(
+        string kind, string entityId, string payloadJson, CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+        var workgroupRoomMap = await GetOrCreateWorkgroupRoomMapAsync(cancellationToken).ConfigureAwait(false);
+        await WriteToRoomAsync(workgroupRoomMap, kind, entityId, payloadJson, cancellationToken).ConfigureAwait(false);
+    }
+
     // Integration-checkpoint (plans/room-snapshot-checkpoint-redesign.md): mints one full-room
     // snapshot for the repo room bound to `repositoryId`. Resolution mirrors the repo-scoped
     // WriteNodeAsync above; a no-op when `repositoryId` doesn't resolve to a bound repo room (nothing
@@ -771,6 +807,15 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
             }
         }
 
+        // Phase 1 — a Workgroup-reach global (no RepositoryId) lives in the shared "workgroup" room.
+        if (StudioNodeKind.WorkgroupScopedKinds.Contains(kind))
+        {
+            var workgroupRoomMap = await GetOrCreateWorkgroupRoomMapAsync(cancellationToken).ConfigureAwait(false);
+            var workgroupEnvelopeRawJson = workgroupRoomMap.TryGetValueRawJson(MapNamespace, key);
+            if (workgroupEnvelopeRawJson is not null)
+                return ExtractPayloadRawText(workgroupEnvelopeRawJson);
+        }
+
         var envelopeRawJson = _roomMap.TryGetValueRawJson(MapNamespace, key);
         if (envelopeRawJson is not null)
             return ExtractPayloadRawText(envelopeRawJson);
@@ -822,6 +867,21 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
 
                     results[mapKey[prefix.Length..]] = ExtractPayloadRawText(valueRawJson);
                 }
+            }
+        }
+
+        // Phase 1 — aggregate the shared "workgroup" room too, for kinds that can carry Workgroup
+        // reach (global constraints). A given entity lives in exactly one room, so no override
+        // ordering concern with the repo/studio entries collected above.
+        if (StudioNodeKind.WorkgroupScopedKinds.Contains(kind))
+        {
+            var workgroupRoomMap = await GetOrCreateWorkgroupRoomMapAsync(cancellationToken).ConfigureAwait(false);
+            foreach (var (mapKey, valueRawJson) in workgroupRoomMap.AllEntries(MapNamespace))
+            {
+                if (!mapKey.StartsWith(prefix, StringComparison.Ordinal))
+                    continue;
+
+                results[mapKey[prefix.Length..]] = ExtractPayloadRawText(valueRawJson);
             }
         }
 
@@ -890,6 +950,13 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
             await _roomMap.HydrateAndReplayAsync(cancellationToken).ConfigureAwait(false);
 
             await MigrateLegacyRowsIfNeededAsync(cancellationToken).ConfigureAwait(false);
+
+            // Phase 1 — hydrate the shared "workgroup" room map here, at init, rather than lazily on
+            // the first Workgroup-reach read. The workgroup room is always joined by RoomPeerClient,
+            // so this is symmetric with _roomMap above; hydrating it up front (a stable connection by
+            // teardown) also avoids instantiating it during a late replication-driven refresh that
+            // could race process/DB shutdown. Force the Lazy so it's created within this init gate.
+            await _workgroupRoomMapLazy.Value.ConfigureAwait(false);
 
             _initialized = true;
         }

@@ -101,6 +101,32 @@ interface ExportableFinding {
   targetStage?: string | null;
 }
 
+// Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — a row of GET /studio/constraints:
+// a constraint applicable to this peer, labeled with its reach + application scope and whether the
+// local toggle currently has it enabled here.
+interface ConstraintView {
+  artifactId: string;
+  title?: string | null;
+  body?: string | null;
+  reach?: string | null;
+  repositoryId?: string | null;
+  appliesToAllRepos: boolean;
+  enabled: boolean;
+}
+
+// A row of GET /studio/constraints/proposed — a work-unit-owned (lineage) constraint a domain observer
+// or agent recorded, eligible for human promotion to a shared global one. `promoted` is true once a
+// global constraint links back to it (so the UI badges it instead of re-offering the Promote button).
+interface ProposedConstraintView {
+  artifactId: string;
+  title?: string | null;
+  body?: string | null;
+  workUnitId?: string | null;
+  repositoryId?: string | null;
+  appliesToAllRepos: boolean;
+  promoted: boolean;
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 // Analytics dashboard + Knowledge Promotion review queue for the DAG's run history. Three
@@ -193,8 +219,15 @@ export class InsightsPanel {
       }
       case 'insightsDetectFindings': {
         try {
-          await this.post('/studio/insights/detect-findings', {});
+          const created = await this.post<Finding[]>('/studio/insights/detect-findings', {});
           await this.sendFindings();
+          void vscode.window.showInformationMessage(
+            created.length > 0
+              ? `NodalMerge: detected ${created.length} finding(s) — see the Findings list.`
+              : 'NodalMerge: no new findings. Deterministic detection needs more run history to spot patterns '
+                + '(e.g. ≥5 decided experiment forks, ≥5 rejected proposals, or co-modification patterns). '
+                + 'Keep running goals, or try Run LLM Scan with an API model profile.',
+          );
         } catch (err) {
           void vscode.window.showErrorMessage('NodalMerge: Detect Findings failed — ' + String(err));
         }
@@ -211,6 +244,20 @@ export class InsightsPanel {
             notes: (msg.notes as string) || undefined,
           });
           await this.sendFindings();
+          // Promotion lands in one of two different places depending on the finding's kind — tell the
+          // user which, so a PromptImprovement (which never becomes a constraint) isn't a mystery.
+          if ((msg.decision as string) === 'Promoted') {
+            if ((msg.kind as string) === 'PromptImprovement') {
+              const stage = (msg.targetStage as string) || 'target';
+              void vscode.window.showInformationMessage(
+                `NodalMerge: promoted to prompt guidance for the ${stage} stage — it steers that stage's agents directly and does not appear on the Constraints tab.`,
+              );
+            } else {
+              void vscode.window.showInformationMessage(
+                'NodalMerge: promoted to a Constraint — see the Constraints tab (adjust its scope there).',
+              );
+            }
+          }
         } catch (err) {
           void vscode.window.showErrorMessage('NodalMerge: Finding review failed — ' + String(err));
         }
@@ -229,8 +276,85 @@ export class InsightsPanel {
         await this.handleImportFindings();
         return;
       }
+      case 'insightsLoadConstraints': {
+        await this.sendConstraints();
+        return;
+      }
+      case 'insightsLoadProposedConstraints': {
+        await this.sendProposedConstraints();
+        return;
+      }
+      case 'insightsPromoteConstraint': {
+        try {
+          await this.post(`/studio/constraints/${encodeURIComponent(msg.artifactId as string)}/promote`, {});
+          // A promotion mints a global and marks the source promoted — refresh both lists.
+          await this.sendConstraints();
+          await this.sendProposedConstraints();
+          void vscode.window.showInformationMessage('NodalMerge: constraint promoted to a shared (global) policy.');
+        } catch (err) {
+          void vscode.window.showErrorMessage('NodalMerge: promoting constraint failed — ' + String(err));
+        }
+        return;
+      }
+      case 'insightsToggleConstraint': {
+        try {
+          await this.post(`/studio/constraints/${encodeURIComponent(msg.artifactId as string)}/toggle`, {
+            disabled: msg.disabled as boolean,
+          });
+        } catch (err) {
+          void vscode.window.showErrorMessage('NodalMerge: toggling constraint failed — ' + String(err));
+          await this.sendConstraints(); // resync the UI on failure
+        }
+        return;
+      }
+      case 'insightsScopeConstraint': {
+        try {
+          await this.post(`/studio/constraints/${encodeURIComponent(msg.artifactId as string)}/scope`, {
+            reach: msg.reach as string,
+            repoSpecific: msg.repoSpecific as boolean,
+          });
+          await this.sendConstraints(); // reflect the re-route (and any all-repos fallback) back in the UI
+        } catch (err) {
+          void vscode.window.showErrorMessage('NodalMerge: changing constraint scope failed — ' + String(err));
+          await this.sendConstraints();
+        }
+        return;
+      }
+      case 'insightsAddConstraint': {
+        try {
+          await this.post('/studio/constraints', {
+            title: msg.title as string,
+            body: msg.body as string,
+            reach: msg.reach as string,
+            repoSpecific: msg.repoSpecific as boolean,
+          });
+          await this.sendConstraints();
+          void vscode.window.showInformationMessage('NodalMerge: constraint added.');
+        } catch (err) {
+          void vscode.window.showErrorMessage('NodalMerge: adding constraint failed — ' + String(err));
+        }
+        return;
+      }
       default:
         return;
+    }
+  }
+
+  private async sendConstraints(): Promise<void> {
+    try {
+      const constraints = await this.get<ConstraintView[]>('/studio/constraints');
+      void this.panel.webview.postMessage({ type: 'insightsConstraintsList', constraints });
+    } catch (err) {
+      void this.panel.webview.postMessage({ type: 'insightsConstraintsError', message: String(err) });
+    }
+  }
+
+  private async sendProposedConstraints(): Promise<void> {
+    try {
+      const proposed = await this.get<ProposedConstraintView[]>('/studio/constraints/proposed');
+      void this.panel.webview.postMessage({ type: 'insightsProposedList', proposed });
+    } catch (err) {
+      void this.panel.webview.postMessage({ type: 'insightsProposedError', message: String(err) });
     }
   }
 
@@ -316,8 +440,33 @@ export class InsightsPanel {
         const reason = await this.configService.describeMissingCredentials(profileId, this.secrets, this.lmProxyBaseUrl);
         throw new Error(`Selected profile isn't ready — ${reason}.`);
       }
-      await this.post('/studio/insights/llm-scan', cfg);
+      // CLI profiles (claude-cli / codex-cli) resolve with an empty baseUrl — Route B teaches the
+      // scan to drive them via a one-shot CLI completer server-side, so they no longer need an HTTP
+      // baseUrl. cfg carries provider/model/apiKey; the server routes by provider.
+      const result = await this.post<{ findings: Finding[]; rawCliOutput?: string | null }>(
+        '/studio/insights/llm-scan', cfg,
+      );
       await this.sendFindings();
+
+      if (result.findings.length > 0) {
+        void vscode.window.showInformationMessage(
+          `NodalMerge: LLM scan detected ${result.findings.length} finding(s) — see the Findings list.`,
+        );
+      } else if (result.rawCliOutput && result.rawCliOutput.trim()) {
+        // The CLI model replied but nothing parsed into findings. Offer to open its verbatim response
+        // so the user can see why (and hand-fix the JSON if they want to salvage it).
+        const choice = await vscode.window.showWarningMessage(
+          'NodalMerge: the LLM scan got a response but extracted no parseable findings. '
+          + 'Open the raw model output to inspect it?',
+          'Open raw output',
+        );
+        if (choice === 'Open raw output') {
+          const doc = await vscode.workspace.openTextDocument({ content: result.rawCliOutput, language: 'json' });
+          await vscode.window.showTextDocument(doc);
+        }
+      } else {
+        void vscode.window.showInformationMessage('NodalMerge: LLM scan found no patterns worth flagging.');
+      }
     } catch (err) {
       void vscode.window.showErrorMessage('NodalMerge: LLM scan failed — ' + String(err));
     } finally {
@@ -395,48 +544,114 @@ const IN_CSS = `
   .in-finding-actions { display: flex; gap: 6px; }
   .in-finding-actions button { font-size: 0.8em; padding: 2px 10px; }
   .in-finding-meta { font-size: 0.72em; opacity: 0.6; }
+  .in-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--nm-border); }
+  .in-tab { background: none; border: none; border-bottom: 2px solid transparent; padding: 6px 14px; cursor: pointer; opacity: 0.65; color: inherit; font-size: 0.9em; }
+  .in-tab:hover { opacity: 0.9; }
+  .in-tab.in-tab-active { border-bottom-color: currentColor; opacity: 1; font-weight: 600; }
+  .in-pane { display: flex; flex-direction: column; gap: 14px; }
+  .in-subheader { gap: 12px; }
+  .in-constraint-group > h4 { font-size: 0.8em; margin: 8px 0 6px; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.03em; }
+  .in-constraint-card { display: flex; align-items: flex-start; gap: 10px; border: 1px solid var(--nm-border); border-radius: 4px; padding: 8px 12px; margin-bottom: 6px; }
+  .in-constraint-card.in-constraint-off { opacity: 0.5; }
+  .in-constraint-toggle { margin-top: 3px; }
+  .in-constraint-main { flex: 1; min-width: 0; }
+  .in-constraint-title { font-weight: 600; }
+  .in-constraint-body { font-size: 0.85em; opacity: 0.85; margin-top: 3px; white-space: pre-wrap; }
+  .in-constraint-badges { display: flex; gap: 6px; margin-top: 5px; flex-wrap: wrap; align-items: center; }
+  .in-constraint-scope { font-size: 0.78em; padding: 1px 4px; }
+  .in-constraint-scope-label { font-size: 0.72em; opacity: 0.55; }
+  .in-add-constraint { margin: 4px 0 12px; border: 1px solid var(--nm-border); border-radius: 4px; padding: 6px 10px; }
+  .in-add-constraint > summary { cursor: pointer; font-size: 0.85em; opacity: 0.8; }
+  .in-add-form { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+  .in-add-form input[type=text], .in-add-form textarea { width: 100%; box-sizing: border-box; font: inherit; }
+  .in-add-scope { display: flex; gap: 14px; flex-wrap: wrap; font-size: 0.82em; align-items: center; }
+  .in-add-scope label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  #in-nc-add { align-self: flex-start; }
+  .in-proposed-card { display: flex; align-items: flex-start; gap: 10px; border: 1px solid var(--nm-border); border-radius: 4px; padding: 8px 12px; margin-bottom: 6px; }
+  .in-proposed-main { flex: 1; min-width: 0; }
+  .in-proposed-title { font-weight: 600; }
+  .in-proposed-body { font-size: 0.85em; opacity: 0.85; margin-top: 3px; white-space: pre-wrap; }
+  .in-proposed-badges { display: flex; gap: 6px; margin-top: 5px; flex-wrap: wrap; align-items: center; }
+  .in-proposed-actions { flex-shrink: 0; }
+  .in-proposed-actions button { font-size: 0.8em; padding: 2px 10px; }
 `;
 
 const IN_HTML = `
   <div class="in-header">
     <h2>Insights</h2>
-    <select id="in-period">
-      <option value="last30">Last 30 Days</option>
-      <option value="all">All Time</option>
-    </select>
-    <button id="in-run-btn">&#x25B6; Run Analysis</button>
-    <span class="in-generated-at" id="in-generated-at"></span>
   </div>
-  <div id="in-body"><p class="in-empty">No analysis run yet — click "Run Analysis" to aggregate outcomes across every goal, work unit, and proposal recorded so far.</p></div>
+  <div class="in-tabs">
+    <button class="in-tab in-tab-active" data-tab="analysis">Analysis</button>
+    <button class="in-tab" data-tab="constraints">Constraints</button>
+  </div>
 
-  <div class="in-section">
-    <h3>Findings — Knowledge &amp; Process Improvements</h3>
-    <div class="in-findings-toolbar">
-      <button id="in-detect-btn">Detect Findings</button>
-      <span class="in-hint">free, instant, deterministic rules</span>
-      <span style="flex:1"></span>
-      <select id="in-llm-profile"><option value="">(no profile configured)</option></select>
-      <button id="in-llm-scan-btn">Run LLM Scan</button>
-      <span class="in-hint">calls a real model with your credentials — real cost &amp; latency</span>
-    </div>
-    <div class="in-findings-toolbar">
-      <label class="in-hint" for="in-findings-status">View:</label>
-      <select id="in-findings-status">
-        <option value="Open">Open</option>
-        <option value="Promoted">Promoted</option>
-        <option value="Dismissed">Dismissed</option>
-        <option value="Investigating">Investigating</option>
-        <option value="All">All</option>
+  <div id="in-pane-analysis" class="in-pane">
+    <div class="in-header in-subheader">
+      <select id="in-period">
+        <option value="last30">Last 30 Days</option>
+        <option value="all">All Time</option>
       </select>
-      <span id="in-export-controls" style="display:none">
-        <button id="in-select-all-btn">Select All</button>
-        <button id="in-export-btn">Export Selected</button>
-      </span>
-      <span style="flex:1"></span>
-      <button id="in-import-btn">Import Findings&hellip;</button>
-      <span class="in-hint">bring in findings exported from another repo</span>
+      <button id="in-run-btn">&#x25B6; Run Analysis</button>
+      <span class="in-generated-at" id="in-generated-at"></span>
     </div>
-    <div id="in-findings-list"><p class="in-empty">No findings yet.</p></div>
+    <div id="in-body"><p class="in-empty">No analysis run yet — click "Run Analysis" to aggregate outcomes across every goal, work unit, and proposal recorded so far.</p></div>
+
+    <div class="in-section">
+      <h3>Findings — Knowledge &amp; Process Improvements</h3>
+      <div class="in-findings-toolbar">
+        <button id="in-detect-btn">Detect Findings</button>
+        <span class="in-hint">free, instant, deterministic rules</span>
+        <span style="flex:1"></span>
+        <select id="in-llm-profile"><option value="">(no profile configured)</option></select>
+        <button id="in-llm-scan-btn">Run LLM Scan</button>
+        <span class="in-hint">calls a real model with your credentials — real cost &amp; latency</span>
+      </div>
+      <div class="in-findings-toolbar">
+        <label class="in-hint" for="in-findings-status">View:</label>
+        <select id="in-findings-status">
+          <option value="Open">Open</option>
+          <option value="Promoted">Promoted</option>
+          <option value="Dismissed">Dismissed</option>
+          <option value="Investigating">Investigating</option>
+          <option value="All">All</option>
+        </select>
+        <span id="in-export-controls" style="display:none">
+          <button id="in-select-all-btn">Select All</button>
+          <button id="in-export-btn">Export Selected</button>
+        </span>
+        <span style="flex:1"></span>
+        <button id="in-import-btn">Import Findings&hellip;</button>
+        <span class="in-hint">bring in findings exported from another repo</span>
+      </div>
+      <div id="in-findings-list"><p class="in-empty">No findings yet.</p></div>
+    </div>
+  </div>
+
+  <div id="in-pane-constraints" class="in-pane" style="display:none">
+    <div class="in-section">
+      <h3>Constraints applied to your agents</h3>
+      <p class="in-section-note">Durable guidance folded into every agent's kickoff prompt. Uncheck one to turn it off for you only — it stays active for every other peer. Grouped by reach (who shares it) and application (which repositories it affects).</p>
+      <details class="in-add-constraint">
+        <summary>+ Add a constraint</summary>
+        <div class="in-add-form">
+          <input id="in-nc-title" type="text" placeholder="Title — e.g. Always run migrations before integration tests">
+          <textarea id="in-nc-body" rows="2" placeholder="The guidance an agent should follow"></textarea>
+          <div class="in-add-scope">
+            <label><input type="radio" name="in-nc-reach" value="Workgroup" checked> Workgroup (shared)</label>
+            <label><input type="radio" name="in-nc-reach" value="Private"> Private (only me)</label>
+            <label><input type="checkbox" id="in-nc-repo"> Only this repository</label>
+          </div>
+          <button id="in-nc-add">Add constraint</button>
+        </div>
+      </details>
+      <div id="in-constraints-list"><p class="in-empty">Open this tab to load constraints.</p></div>
+    </div>
+
+    <div class="in-section">
+      <h3>Proposed by observers &amp; agents</h3>
+      <p class="in-section-note">Constraints a domain observer or agent recorded against a work unit. They steer that goal's own agents but stay local to its lineage — promote one to make it a shared policy (defaults to Workgroup reach, scoped to the source's repository; widen or turn it off afterward from the list above).</p>
+      <div id="in-proposed-list"><p class="in-empty">Open this tab to load proposed constraints.</p></div>
+    </div>
   </div>
 `;
 

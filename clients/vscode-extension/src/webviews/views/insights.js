@@ -59,6 +59,22 @@ export function init(ctx) {
     vscode.postMessage({ type: 'insightsImportFindings' });
   });
 
+  // ── Tabs (Analysis | Constraints) ──────────────────────────────────────────
+  root.querySelectorAll('.in-tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      var name = tab.getAttribute('data-tab');
+      root.querySelectorAll('.in-tab').forEach(function(t) { t.classList.toggle('in-tab-active', t === tab); });
+      $('in-pane-analysis').style.display = name === 'analysis' ? '' : 'none';
+      $('in-pane-constraints').style.display = name === 'constraints' ? '' : 'none';
+      if (name === 'constraints') {
+        $('in-constraints-list').innerHTML = '<p class="in-empty">Loading&hellip;</p>';
+        $('in-proposed-list').innerHTML = '<p class="in-empty">Loading&hellip;</p>';
+        vscode.postMessage({ type: 'insightsLoadConstraints' });
+        vscode.postMessage({ type: 'insightsLoadProposedConstraints' });
+      }
+    });
+  });
+
   function renderHighlights(data) {
     var cards = '';
     cards += '<div class="in-card"><div class="in-card-value">' + data.averageReworkCycles.toFixed(1) + '</div><div class="in-card-label">Avg Rework Cycles</div></div>';
@@ -183,7 +199,17 @@ export function init(ctx) {
       var metaParts = [];
       if (f.reviewedAt) { metaParts.push('Reviewed ' + new Date(f.reviewedAt).toLocaleString()); }
       if (f.reviewNotes) { metaParts.push('Notes: ' + f.reviewNotes); }
-      if (f.promotedArtifactId) { metaParts.push('Artifact: ' + f.promotedArtifactId); }
+      // Where did a promoted finding go? Knowledge → a Constraint (on the Constraints tab);
+      // PromptImprovement → stage-scoped prompt guidance (no constraint, no tab).
+      if (f.status === 'Promoted') {
+        if (f.kind === 'PromptImprovement') {
+          metaParts.push('→ prompt guidance for the ' + (f.targetStage || '?') + ' stage (steers that stage’s agents, not the Constraints tab)');
+        } else {
+          metaParts.push('→ Constraint on the Constraints tab' + (f.promotedArtifactId ? ' (' + f.promotedArtifactId + ')' : ''));
+        }
+      } else if (f.promotedArtifactId) {
+        metaParts.push('Artifact: ' + f.promotedArtifactId);
+      }
       var meta = metaParts.length ? '<div class="in-finding-meta">' + esc(metaParts.join(' · ')) + '</div>' : '';
       var checkbox = statusFilter === 'Promoted'
         ? '<input type="checkbox" class="in-finding-select" data-finding-id="' + esc(f.findingId) + '">'
@@ -204,6 +230,140 @@ export function init(ctx) {
     }).join('');
   }
 
+  // ── Constraints tab ────────────────────────────────────────────────────────
+  var addConstraintBtn = $('in-nc-add');
+  if (addConstraintBtn) {
+    addConstraintBtn.addEventListener('click', function() {
+      var title = ($('in-nc-title').value || '').trim();
+      var body = ($('in-nc-body').value || '').trim();
+      if (!title || !body) { return; }
+      var reachEl = root.querySelector('input[name="in-nc-reach"]:checked');
+      vscode.postMessage({
+        type: 'insightsAddConstraint',
+        title: title,
+        body: body,
+        reach: reachEl ? reachEl.value : 'Workgroup',
+        repoSpecific: $('in-nc-repo').checked,
+      });
+      $('in-nc-title').value = '';
+      $('in-nc-body').value = '';
+      $('in-nc-repo').checked = false;
+    });
+  }
+
+  function constraintGroupLabel(c) {
+    var reach = c.reach || 'Legacy';
+    if (reach === 'Workgroup') { return c.appliesToAllRepos ? 'Workgroup · all repositories' : 'Workgroup · this repository'; }
+    if (reach === 'Private') { return 'Private · local to you'; }
+    return c.appliesToAllRepos ? 'Legacy · all repositories' : 'Legacy · this repository';
+  }
+
+  function renderConstraints(list) {
+    if (!list || !list.length) {
+      return '<p class="in-empty">No constraints yet. Promote a finding on the Analysis tab to create one.</p>';
+    }
+    var groups = {};
+    var order = [];
+    list.forEach(function(c) {
+      var label = constraintGroupLabel(c);
+      if (!groups[label]) { groups[label] = []; order.push(label); }
+      groups[label].push(c);
+    });
+    return order.map(function(label) {
+      var cards = groups[label].map(function(c) {
+        var offClass = c.enabled ? '' : ' in-constraint-off';
+        var reachVal = (c.reach === 'Private') ? 'Private' : 'Workgroup';
+        // Reach × application as two editable selects — change either to re-scope (and re-route) the
+        // constraint; on refresh the card moves to its new group. "This repository" falls back to all
+        // repos if the workspace has no resolvable repo.
+        var scope =
+          '<span class="in-constraint-scope-label">Reach</span>' +
+          '<select class="in-constraint-scope in-constraint-reach" data-constraint-id="' + esc(c.artifactId) + '">' +
+            '<option value="Workgroup"' + (reachVal === 'Workgroup' ? ' selected' : '') + '>Workgroup (shared)</option>' +
+            '<option value="Private"' + (reachVal === 'Private' ? ' selected' : '') + '>Private (only me)</option>' +
+          '</select>' +
+          '<span class="in-constraint-scope-label">Applies to</span>' +
+          '<select class="in-constraint-scope in-constraint-appl" data-constraint-id="' + esc(c.artifactId) + '">' +
+            '<option value="all"' + (c.appliesToAllRepos ? ' selected' : '') + '>All repositories</option>' +
+            '<option value="repo"' + (!c.appliesToAllRepos ? ' selected' : '') + '>This repository</option>' +
+          '</select>' +
+          (c.enabled ? '' : '<span class="in-finding-badge">off</span>');
+        return '' +
+          '<div class="in-constraint-card' + offClass + '" data-constraint-id="' + esc(c.artifactId) + '">' +
+            '<input type="checkbox" class="in-constraint-toggle" data-constraint-id="' + esc(c.artifactId) + '"' + (c.enabled ? ' checked' : '') + ' title="Enable/disable for you only">' +
+            '<div class="in-constraint-main">' +
+              '<div class="in-constraint-title">' + esc(c.title || c.artifactId) + '</div>' +
+              (c.body ? '<div class="in-constraint-body">' + esc(c.body) + '</div>' : '') +
+              '<div class="in-constraint-badges">' + scope + '</div>' +
+            '</div>' +
+          '</div>';
+      }).join('');
+      return '<div class="in-constraint-group"><h4>' + esc(label) + '</h4>' + cards + '</div>';
+    }).join('');
+  }
+
+  // ── Proposed (lineage) constraints — promote to global ──────────────────────
+  function renderProposed(list) {
+    if (!list || !list.length) {
+      return '<p class="in-empty">No proposed constraints. Domain observers and agents record these against a work unit when they spot a gap — enable observers or run goals to see them here.</p>';
+    }
+    return list.map(function(c) {
+      var scopeBadge = '<span class="in-finding-badge">' + (c.appliesToAllRepos ? 'all repos' : 'this repo') + '</span>';
+      var action = c.promoted
+        ? '<span class="in-finding-badge">promoted</span>'
+        : '<div class="in-proposed-actions"><button class="in-proposed-promote" data-proposed-id="' + esc(c.artifactId) + '">Promote</button></div>';
+      var wu = c.workUnitId ? '<span class="in-finding-badge">' + esc(c.workUnitId) + '</span>' : '';
+      return '' +
+        '<div class="in-proposed-card" data-proposed-id="' + esc(c.artifactId) + '">' +
+          '<div class="in-proposed-main">' +
+            '<div class="in-proposed-title">' + esc(c.title || c.artifactId) + '</div>' +
+            (c.body ? '<div class="in-proposed-body">' + esc(c.body) + '</div>' : '') +
+            '<div class="in-proposed-badges">' + scopeBadge + wu + '</div>' +
+          '</div>' +
+          action +
+        '</div>';
+    }).join('');
+  }
+
+  function bindProposedActions() {
+    root.querySelectorAll('.in-proposed-promote').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        btn.disabled = true;
+        btn.textContent = 'Promoting…';
+        vscode.postMessage({ type: 'insightsPromoteConstraint', artifactId: btn.getAttribute('data-proposed-id') });
+      });
+    });
+  }
+
+  function bindConstraintToggles() {
+    root.querySelectorAll('.in-constraint-toggle').forEach(function(cb) {
+      cb.addEventListener('change', function() {
+        var id = cb.getAttribute('data-constraint-id');
+        var disabled = !cb.checked;
+        var card = cb.closest('.in-constraint-card');
+        if (card) { card.classList.toggle('in-constraint-off', disabled); }
+        vscode.postMessage({ type: 'insightsToggleConstraint', artifactId: id, disabled: disabled });
+      });
+    });
+  }
+
+  function bindConstraintScope() {
+    root.querySelectorAll('.in-constraint-reach, .in-constraint-appl').forEach(function(sel) {
+      sel.addEventListener('change', function() {
+        var card = sel.closest('.in-constraint-card');
+        if (!card) { return; }
+        var reachSel = card.querySelector('.in-constraint-reach');
+        var applSel = card.querySelector('.in-constraint-appl');
+        vscode.postMessage({
+          type: 'insightsScopeConstraint',
+          artifactId: sel.getAttribute('data-constraint-id'),
+          reach: reachSel ? reachSel.value : 'Workgroup',
+          repoSpecific: applSel ? applSel.value === 'repo' : false,
+        });
+      });
+    });
+  }
+
   function bindFindingActions() {
     root.querySelectorAll('.in-finding-card').forEach(function(card) {
       var findingId = card.getAttribute('data-finding-id');
@@ -211,7 +371,9 @@ export function init(ctx) {
       var dismiss = card.querySelector('.in-finding-dismiss');
       var investigate = card.querySelector('.in-finding-investigate');
       if (promote) { promote.addEventListener('click', function() {
-        vscode.postMessage({ type: 'insightsReviewFinding', findingId: findingId, decision: 'Promoted' });
+        // Pass kind/targetStage so the host can toast where this promotion actually landed.
+        var f = (state.lastFindings || []).filter(function(x) { return x.findingId === findingId; })[0] || {};
+        vscode.postMessage({ type: 'insightsReviewFinding', findingId: findingId, decision: 'Promoted', kind: f.kind, targetStage: f.targetStage });
       }); }
       if (dismiss) { dismiss.addEventListener('click', function() {
         vscode.postMessage({ type: 'insightsReviewFinding', findingId: findingId, decision: 'Dismissed' });
@@ -264,6 +426,25 @@ export function init(ctx) {
       var btn = $('in-llm-scan-btn');
       btn.disabled = false;
       btn.textContent = 'Run LLM Scan';
+      return;
+    }
+    if (msg.type === 'insightsConstraintsList') {
+      $('in-constraints-list').innerHTML = renderConstraints(msg.constraints || []);
+      bindConstraintToggles();
+      bindConstraintScope();
+      return;
+    }
+    if (msg.type === 'insightsConstraintsError') {
+      $('in-constraints-list').innerHTML = '<p class="in-error">Could not load constraints — ' + esc(msg.message) + '</p>';
+      return;
+    }
+    if (msg.type === 'insightsProposedList') {
+      $('in-proposed-list').innerHTML = renderProposed(msg.proposed || []);
+      bindProposedActions();
+      return;
+    }
+    if (msg.type === 'insightsProposedError') {
+      $('in-proposed-list').innerHTML = '<p class="in-error">Could not load proposed constraints — ' + esc(msg.message) + '</p>';
       return;
     }
   });

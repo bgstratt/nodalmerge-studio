@@ -18,6 +18,11 @@ export interface PipelineProfile {
   // exist so values set directly over REST survive a UI edit's PUT round-trip.
   executor?: string;
   injectApiKeyEnv?: boolean;
+  // Scoped-worker model binding — the Model Profile id whose LLM this file-scoped Execute/Plan
+  // profile runs on. Empty/undefined = inherit the stage default from Agent Topology. Resolved to
+  // credentials at goal start and shipped as SpawnAgentBody.profileCredentials. See
+  // plans/scoped-execute-workers-per-profile-models.md (in the nodalmerge-studio repo).
+  modelProfileId?: string;
 }
 
 export interface DomainAgentInfo {
@@ -227,9 +232,10 @@ export class ModelAgentStudioPanel {
         const exists = await this.get<unknown>('/studio/agent-profiles/' + p.agentProfileId).then(() => true).catch(() => false);
         const endpoint = '/studio/agent-profiles' + (exists ? '/' + p.agentProfileId : '');
         const method   = exists ? 'PUT' : 'POST';
+        const modelProfileId = p.modelProfileId ? p.modelProfileId : undefined;
         const body = exists
-          ? { name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv ?? false }
-          : { agentProfileId: p.agentProfileId, name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv ?? false };
+          ? { name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv ?? false, modelProfileId }
+          : { agentProfileId: p.agentProfileId, name: p.name, stage: p.stage, systemPrompt: p.systemPrompt, allowedTools: p.allowedTools, maxIterations: p.maxIterations, fileScopePatterns: p.fileScopePatterns, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv ?? false, modelProfileId };
         await (method === 'PUT'
           ? fetch(this.baseUrl + endpoint, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
           : this.post(endpoint, body));
@@ -523,7 +529,7 @@ const MAS_HTML = `
   <div id="pane-pipeline-profiles" class="tab-pane">
     <div id="pipeline-profile-form-area"></div>
     <table>
-      <thead><tr><th>ID</th><th>Name</th><th>Stage</th><th>Tools</th><th>File Scope</th><th>Max Iter</th><th></th></tr></thead>
+      <thead><tr><th>ID</th><th>Name</th><th>Stage</th><th>Tools</th><th>File Scope</th><th>Model</th><th>Max Iter</th><th></th></tr></thead>
       <tbody id="pipeline-profile-tbody"></tbody>
     </table>
     <button class="add-btn" id="btn-add-pipeline-profile">+ Add Pipeline Profile</button>
@@ -579,7 +585,7 @@ const MAS_HTML = `
   <div class="save-bar">
     <span class="status" id="save-status"></span>
     <button id="btn-save-profiles">Save Profiles</button>
-    <button id="btn-save-strategies">Save Strategies</button>
+    <button id="btn-save-strategies">Save Topologies</button>
   </div>
 `;
 

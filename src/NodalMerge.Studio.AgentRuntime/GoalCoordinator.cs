@@ -174,6 +174,12 @@ internal sealed class GoalCoordinator(IServiceProvider serviceProvider, ILogger<
         var defaultCreds = agentControl?.GetGoalDefaultCredentials(workUnitId);
         var profileId = isReconciliation ? "reconciler" : "planner";
         string? selectedProvider = null;
+        // The bound Model Profile of a file-scope-matched Plan profile — same per-profile LLM binding
+        // FanOutService applies on the Execute path, here for the planner. Only ever populated in the
+        // auto/unset branch below (an explicit Plan-stage topology override is never second-guessed);
+        // null falls through to defaultCreds, i.e. exactly today's behavior. See
+        // plans/scoped-execute-workers-per-profile-models.md.
+        GoalDefaultCredentials? profileCreds = null;
 
         if (!isReconciliation && stageCreds is null
             && serviceProvider.GetService<IPlannerSelectionService>() is { } plannerSelection)
@@ -181,9 +187,10 @@ internal sealed class GoalCoordinator(IServiceProvider serviceProvider, ILogger<
             var selection = await plannerSelection.SelectPlannerAsync(unit, defaultCreds, ct).ConfigureAwait(false);
             profileId = selection.ProfileId;
             selectedProvider = selection.Provider;
+            profileCreds = agentControl?.GetCredentialsForProfile(workUnitId, profileId);
         }
 
-        var creds = stageCreds ?? defaultCreds;
+        var creds = stageCreds ?? profileCreds ?? defaultCreds;
         if (creds is null)
         {
             // Same graceful degradation the credential-less spawn path always had: the goal stays
@@ -198,12 +205,12 @@ internal sealed class GoalCoordinator(IServiceProvider serviceProvider, ILogger<
         await scheduler.EnqueueAsync(
             workUnitId,
             profileId,
-            model: stageCreds?.Model ?? defaultCreds?.Model,
-            baseUrl: stageCreds?.BaseUrl ?? defaultCreds?.BaseUrl,
-            apiKey: stageCreds?.ApiKey ?? defaultCreds?.ApiKey,
-            provider: selectedProvider ?? stageCreds?.Provider ?? defaultCreds?.Provider,
+            model: stageCreds?.Model ?? profileCreds?.Model ?? defaultCreds?.Model,
+            baseUrl: stageCreds?.BaseUrl ?? profileCreds?.BaseUrl ?? defaultCreds?.BaseUrl,
+            apiKey: stageCreds?.ApiKey ?? profileCreds?.ApiKey ?? defaultCreds?.ApiKey,
+            provider: selectedProvider ?? stageCreds?.Provider ?? profileCreds?.Provider ?? defaultCreds?.Provider,
             sessionId: sessionId,
-            credentialRef: stageCreds?.CredentialRef ?? defaultCreds?.CredentialRef,
+            credentialRef: stageCreds?.CredentialRef ?? profileCreds?.CredentialRef ?? defaultCreds?.CredentialRef,
             ct: ct).ConfigureAwait(false);
 
         await RecordDecisionAsync(

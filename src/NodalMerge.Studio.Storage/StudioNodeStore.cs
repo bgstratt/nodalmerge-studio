@@ -39,6 +39,10 @@ public static class StudioNodeKind
     public const string ExperimentV1         = "studio/experiment/v1";
     public const string SteeringDecisionV1   = "studio/steering-decision/v1";
     public const string FindingV1            = "studio/finding/v1";
+    // Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — a peer-LOCAL suppression of a
+    // constraint by ArtifactId. Deliberately NOT in RepoScopedKinds/WorkgroupScopedKinds: it lives in
+    // the peer-private "studio" room so turning a shared constraint off affects only this peer.
+    public const string ConstraintToggleV1   = "studio/constraint-toggle/v1";
     public const string ConversationLogV1    = "studio/conversation-log/v1";
     // L2.3 (plans/room-persistence-bloat.md) — repo-scoped reference to a peer-visible reasoning
     // transcript. The bounded transcript body lives in the CAS (pulled on demand); this node carries
@@ -135,6 +139,22 @@ public static class StudioNodeKind
         // same-repo peer can trace the "why" behind a decision; the transcript BYTES ride the CAS
         // content plane (pulled on demand), only this small ref is on the replication plane.
         ConversationRefV1,
+        // Phase 0 (plans/organizational-knowledge-and-workgroup-scope.md) — findings are low-volume
+        // human-review candidates (like DecisionV1), so the Insights Findings queue is shared among
+        // peers on the same repo. Attributed to the workspace's repo at ProposeAsync; a null
+        // RepositoryId (no seed repo) falls back to the local "studio" room. The manual Export/Import
+        // JSON path stays as the deliberate *cross*-workgroup sharing escape hatch.
+        FindingV1,
+    };
+
+    // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — kinds that can carry
+    // Workgroup reach with no RepositoryId, i.e. live in the shared "workgroup" room (every member,
+    // all repos). The read fan-out consults that room for these kinds in addition to studio + repo
+    // rooms. Today only ArtifactRefV1 (a Workgroup-reach global constraint); the write path routes
+    // there via WriteWorkgroupNodeAsync, driven by ArtifactRef.Reach.
+    public static readonly IReadOnlyCollection<string> WorkgroupScopedKinds = new HashSet<string>(StringComparer.Ordinal)
+    {
+        ArtifactRefV1,
     };
 }
 
@@ -156,6 +176,15 @@ public interface IStudioNodeStore
     // compiling and behaviorally unchanged with zero edits; only NodalMergeStudioNodeStore overrides
     // it with real per-repo-room writes.
     Task WriteNodeAsync(string kind, string entityId, string payloadJson, string? repositoryId, CancellationToken cancellationToken = default) =>
+        WriteNodeAsync(kind, entityId, payloadJson, cancellationToken);
+
+    // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — write a node into the shared
+    // "workgroup" room (every member, all repos): the home for a Workgroup-reach artifact with no
+    // RepositoryId. Rides the same EngineRoomMap bridging every other room uses, in a separate
+    // namespace from the workgroup repositories/goals directories. Default falls back to the 3-arg
+    // (local) overload so InMemoryStudioNodeStore and other doubles are unchanged; only
+    // NodalMergeStudioNodeStore overrides it with a real workgroup-room write.
+    Task WriteWorkgroupNodeAsync(string kind, string entityId, string payloadJson, CancellationToken cancellationToken = default) =>
         WriteNodeAsync(kind, entityId, payloadJson, cancellationToken);
 
     Task<string?> ReadNodeAsync(string kind, string entityId, CancellationToken cancellationToken = default);

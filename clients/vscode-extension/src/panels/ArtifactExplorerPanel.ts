@@ -1348,6 +1348,22 @@ export class GoalWorkspacePanel {
         stageCredentials[stage] = cfg;
       }
 
+      // Scoped-worker credentials — each Execute/Plan Pipeline Profile that binds its own Model
+      // Profile (modelProfileId) runs on that LLM. Resolve them here keyed by AgentProfileId so the
+      // server's FanOut/Planner use them when a file-scope match routes a slice to that profile;
+      // unbound profiles stay on the stage default. A profile whose bound Model Profile can't be
+      // resolved is skipped (it degrades to the stage default rather than blocking the whole goal).
+      // See plans/scoped-execute-workers-per-profile-models.md.
+      const profileCredentials: Record<string, SpawnLlmConfig> = {};
+      type ScopedProfile = { agentProfileId: string; stage: string; modelProfileId?: string };
+      const pipelineProfiles = await this.get<ScopedProfile[]>('/studio/agent-profiles')
+        .catch(() => [] as ScopedProfile[]);
+      for (const pp of pipelineProfiles) {
+        if (!pp.modelProfileId || (pp.stage !== 'Execute' && pp.stage !== 'Plan')) { continue; }
+        const cfg = await this.configService.resolveSpawnLlmConfig(pp.modelProfileId, this.secrets, this.lmProxyBaseUrl);
+        if (cfg) { profileCredentials[pp.agentProfileId] = cfg; }
+      }
+
       const repositoryPath = resolveRepositoryPath();
       const rootWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
         goal,
@@ -1388,6 +1404,7 @@ export class GoalWorkspacePanel {
         profileId: template.orchestrator,
         ...(wantsAgentReview ? { autoReviewProfileId: template.reviewer || template.orchestrator } : {}),
         ...(Object.keys(stageCredentials).length > 0 ? { stageCredentials } : {}),
+        ...(Object.keys(profileCredentials).length > 0 ? { profileCredentials } : {}),
       });
 
       this.selectedSessionId = session.sessionId;

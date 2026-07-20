@@ -449,7 +449,7 @@ export function init(ctx) {
   });
   $('btn-save-strategies').addEventListener('click', function() {
     vscode.postMessage({ type: 'saveTemplates', templates: templates });
-    setStatus('Strategies saved.');
+    setStatus('Topologies saved.');
   });
 
   // ── Session Defaults ──────────────────────────────────────────────────────
@@ -496,6 +496,8 @@ export function init(ctx) {
     pipelineProfiles.forEach(function(p, i) {
       const toolCount = p.allowedTools && p.allowedTools.length > 0 ? p.allowedTools.length + ' tools' : 'all tools';
       const fileScope = p.fileScopePatterns && p.fileScopePatterns.length > 0 ? p.fileScopePatterns.join(', ') : '—';
+      const boundModelProfile = profiles.filter(function(mp) { return mp.id === p.modelProfileId; })[0];
+      const boundModel = p.modelProfileId ? ((boundModelProfile && boundModelProfile.label) || p.modelProfileId) : '—';
       const tr = document.createElement('tr');
       tr.innerHTML =
         '<td class="mono">' + esc(p.agentProfileId) + '</td>' +
@@ -503,6 +505,7 @@ export function init(ctx) {
         '<td class="mono">' + esc(p.stage) + '</td>' +
         '<td class="mono">' + esc(toolCount) + '</td>' +
         '<td class="mono">' + esc(fileScope) + '</td>' +
+        '<td class="mono">' + esc(boundModel) + '</td>' +
         '<td class="mono">' + esc(String(p.maxIterations)) + '</td>' +
         '<td><div class="act-cell">' +
           '<button class="ghost" data-action="edit" data-idx="' + i + '">Edit</button>' +
@@ -521,11 +524,19 @@ export function init(ctx) {
   function showPipelineProfileForm(idx) {
     const isNew = idx === -1;
     const p = isNew
-      ? { agentProfileId: '', name: '', stage: 'Execute', systemPrompt: '', allowedTools: [], maxIterations: 20, fileScopePatterns: [] }
+      ? { agentProfileId: '', name: '', stage: 'Execute', systemPrompt: '', allowedTools: [], maxIterations: 20, fileScopePatterns: [], modelProfileId: '' }
       : pipelineProfiles[idx];
     const stageOptions = PIPELINE_STAGES.map(function(s) {
       return '<option value="' + s + '"' + (p.stage === s ? ' selected' : '') + '>' + s + '</option>';
     }).join('');
+    // Model Profile binding — a file-scoped Execute/Plan profile can run on its own LLM connection.
+    // Empty option = inherit the stage default from Agent Topology (unchanged behavior). Options are
+    // the configured Model Profiles.
+    const modelProfileOptions = ['<option value="">(stage default)</option>'].concat(
+      profiles.map(function(mp) {
+        return '<option value="' + esc(mp.id) + '"' + (p.modelProfileId === mp.id ? ' selected' : '') + '>' + esc(mp.label || mp.id) + '</option>';
+      })
+    ).join('');
     const area = $('pipeline-profile-form-area');
     area.innerHTML =
       '<div class="form-box">' +
@@ -542,6 +553,8 @@ export function init(ctx) {
         '<input type="text" id="pp-tools" value="' + esc((p.allowedTools || []).join(', ')) + '" placeholder="e.g. nm_v1_task_create, nm_v1_task_list"></div>' +
       '<div class="field"><label>File Scope Patterns (comma-separated globs, empty = no declared specialty)</label>' +
         '<input type="text" id="pp-filescope" value="' + esc((p.fileScopePatterns || []).join(', ')) + '" placeholder="e.g. src/**/*.tsx, src/**/*.css"></div>' +
+      '<div class="field"><label>Model Profile (which LLM this scoped profile runs on; empty = stage default)</label>' +
+        '<select id="pp-modelprofile">' + modelProfileOptions + '</select></div>' +
       '<div class="field"><label>Max Iterations</label>' +
         '<input type="text" id="pp-maxiter" value="' + esc(String(p.maxIterations)) + '" placeholder="20"></div>' +
       '<div class="field"><label>System Prompt (optional)</label>' +
@@ -562,9 +575,10 @@ export function init(ctx) {
       if (!id || !name) { alert('Profile ID and Name are required.'); return; }
       const allowedTools = toolsRaw ? toolsRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
       const fileScopePatterns = fileScopeRaw ? fileScopeRaw.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
+      const modelProfileId = $('pp-modelprofile').value || '';
       // executor/injectApiKeyEnv are not editable here (provider-driven via Model Profiles +
       // Agent Topology), but REST-set values must survive this form's PUT round-trip.
-      const profile = { agentProfileId: id, name: name, stage: stage, systemPrompt: prompt, allowedTools: allowedTools, maxIterations: maxIter, fileScopePatterns: fileScopePatterns, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv };
+      const profile = { agentProfileId: id, name: name, stage: stage, systemPrompt: prompt, allowedTools: allowedTools, maxIterations: maxIter, fileScopePatterns: fileScopePatterns, modelProfileId: modelProfileId, executor: p.executor, injectApiKeyEnv: p.injectApiKeyEnv };
       vscode.postMessage({ type: 'savePipelineProfile', profile: profile });
       $('pipeline-profile-form-area').innerHTML = '';
     });

@@ -60,7 +60,13 @@ public static class StudioRestEndpoints
         // The Default profile's lenient-tool-parsing setting (from the extension's orchCfg). Any role
         // that inherits Default — no per-stage entry in StageCredentials — picks this up. Per-stage
         // overrides carry their own flag inside StageCredentials.
-        bool LenientToolParsing = false);
+        bool LenientToolParsing = false,
+        // Scoped-worker credentials keyed by AgentProfileId — the extension resolves each file-scoped
+        // Execute/Plan profile's bound Model Profile (AgentProfile.ModelProfileId) to a connection and
+        // ships it here, parallel to StageCredentials. Consumed by GetCredentialsForProfile when a
+        // file-scope match routes a slice to that profile. See
+        // plans/scoped-execute-workers-per-profile-models.md.
+        Dictionary<string, StageCredentialDto>? ProfileCredentials = null);
 
     private sealed record StageCredentialDto(string Provider, string Model, string BaseUrl, string ApiKey, string? CredentialRef = null, bool LenientToolParsing = false);
 
@@ -118,7 +124,8 @@ public static class StudioRestEndpoints
         int MaxIterations,
         IReadOnlyList<string>? FileScopePatterns = null,
         string? Executor = null,
-        bool InjectApiKeyEnv = false);
+        bool InjectApiKeyEnv = false,
+        string? ModelProfileId = null);
 
     private sealed record UpdateAgentProfileBody(
         string Name,
@@ -128,7 +135,8 @@ public static class StudioRestEndpoints
         int MaxIterations,
         IReadOnlyList<string>? FileScopePatterns = null,
         string? Executor = null,
-        bool InjectApiKeyEnv = false);
+        bool InjectApiKeyEnv = false,
+        string? ModelProfileId = null);
 
     private sealed record MarkKnownGoodBody(
         string BranchId,
@@ -1858,10 +1866,22 @@ public static class StudioRestEndpoints
                 stageCredentials = resolved;
             }
 
+            // Scoped-worker credentials, keyed by AgentProfileId — same DTO shape as StageCredentials
+            // but the key is the bound profile's id (no enum parse). See GetCredentialsForProfile.
+            IReadOnlyDictionary<string, GoalDefaultCredentials>? profileCredentials = null;
+            if (body.ProfileCredentials is { Count: > 0 })
+            {
+                var resolved = new Dictionary<string, GoalDefaultCredentials>();
+                foreach (var (agentProfileId, dto) in body.ProfileCredentials)
+                    resolved[agentProfileId] = new GoalDefaultCredentials(dto.Provider, dto.Model, dto.BaseUrl, dto.ApiKey, agentProfileId, dto.CredentialRef, dto.LenientToolParsing);
+                profileCredentials = resolved;
+            }
+
             var agentId = await agents.SpawnAsync(
                 body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey,
                 body.Provider, body.ProfileId, body.AutoReviewProfileId, stageCredentials,
-                body.EnabledDomainAgents, body.CredentialRef, body.LenientToolParsing, ct).ConfigureAwait(false);
+                body.EnabledDomainAgents, body.CredentialRef, body.LenientToolParsing,
+                profileCredentials, ct).ConfigureAwait(false);
             return Results.Ok(new { agentId, agentType = body.AgentType, workUnitId = body.WorkUnitId, branchId = wu.BranchId });
         });
 
@@ -3403,7 +3423,8 @@ public static class StudioRestEndpoints
                 body.MaxIterations > 0 ? body.MaxIterations : 20,
                 body.FileScopePatterns ?? [],
                 body.Executor,
-                body.InjectApiKeyEnv);
+                body.InjectApiKeyEnv,
+                body.ModelProfileId);
             var created = await profiles.CreateAsync(profile, ct).ConfigureAwait(false);
             return Results.Ok(created);
         });
@@ -3427,7 +3448,8 @@ public static class StudioRestEndpoints
                     body.MaxIterations > 0 ? body.MaxIterations : 20,
                     body.FileScopePatterns ?? [],
                     body.Executor,
-                    body.InjectApiKeyEnv);
+                    body.InjectApiKeyEnv,
+                    body.ModelProfileId);
                 var updated = await profiles.UpdateAsync(profile, ct).ConfigureAwait(false);
                 return Results.Ok(updated);
             }
@@ -3638,7 +3660,245 @@ public static class StudioRestEndpoints
                 return Results.BadRequest(new { error = ex.Message });
             }
         });
+
+        // Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — progressive promotion:
+        // widen a constraint from one repo to all repos (Workgroup + null → the shared "workgroup"
+        // room). Idempotent; 404 if the artifact doesn't exist.
+        app.MapPost("/studio/artifacts/{artifactId}/elevate", async (
+            string artifactId,
+            IArtifactLineageService artifacts,
+            CancellationToken ct) =>
+        {
+            var elevated = await artifacts.ElevateToWorkgroupAsync(artifactId, ct).ConfigureAwait(false);
+            return elevated is null
+                ? Results.NotFound(new { error = $"Artifact '{artifactId}' was not found." })
+                : Results.Ok(elevated);
+        });
+
+        // Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — the Insights "Constraints"
+        // sub-tab: every constraint applicable to the given repo (or all, if omitted), each labeled with
+        // its reach (Private/Workgroup) and application (this repo / all repos) plus whether it's enabled
+        // on THIS peer. `enabled=false` means the local toggle has suppressed it here.
+        app.MapGet("/studio/constraints", async (
+            [FromQuery] string? repositoryId,
+            IArtifactLineageService artifacts,
+            IConstraintToggleService toggles,
+            CancellationToken ct) =>
+        {
+            var all = await artifacts.GetGlobalConstraintsAsync(ct).ConfigureAwait(false);
+            var disabled = await toggles.GetDisabledIdsAsync(ct).ConfigureAwait(false);
+            var applicable = all
+                .Where(c => repositoryId is null || c.RepositoryId is null || c.RepositoryId == repositoryId)
+                .Select(c => new
+                {
+                    artifactId = c.ArtifactId,
+                    title = c.Title,
+                    body = c.Body,
+                    reach = c.Reach?.ToString(),
+                    repositoryId = c.RepositoryId,
+                    appliesToAllRepos = c.RepositoryId is null,
+                    enabled = !disabled.Contains(c.ArtifactId),
+                })
+                .ToList();
+            return Results.Ok(applicable);
+        });
+
+        // Turn a constraint off (disabled=true) or back on (disabled=false) for THIS peer only.
+        app.MapPost("/studio/constraints/{artifactId}/toggle", async (
+            string artifactId,
+            ToggleConstraintBody body,
+            IConstraintToggleService toggles,
+            CancellationToken ct) =>
+        {
+            await toggles.SetDisabledAsync(artifactId, body.Disabled, ct).ConfigureAwait(false);
+            return Results.Ok(new { artifactId, disabled = body.Disabled });
+        });
+
+        // Phase 1 follow-up — set a global constraint's full 2×2 scope in one call (reach × application),
+        // re-routing it to the matching room. Generalizes /elevate (widen-only) so the Constraints tab can
+        // move a constraint between any cells: Private/Workgroup × this-repo/all-repos. repoSpecific
+        // resolves the workspace repo id server-side (same as manual add); false → all repos. 404 if the
+        // artifact doesn't exist.
+        app.MapPost("/studio/constraints/{artifactId}/scope", async (
+            string artifactId,
+            ScopeConstraintBody body,
+            IArtifactLineageService artifacts,
+            IRepositoryRegistryService repositories,
+            WorkspaceOptions workspaceOptions,
+            CancellationToken ct) =>
+        {
+            var reach = string.Equals(body.Reach, "Private", StringComparison.OrdinalIgnoreCase)
+                ? ArtifactReach.Private
+                : ArtifactReach.Workgroup;
+
+            string? repositoryId = null;
+            if (body.RepoSpecific && !string.IsNullOrWhiteSpace(workspaceOptions.SeedRepositoryPath))
+            {
+                try
+                {
+                    var repo = await repositories.RegisterAsync(workspaceOptions.SeedRepositoryPath!, label: null, ct).ConfigureAwait(false);
+                    repositoryId = repo.RepositoryId;
+                }
+                catch { /* unresolvable workspace repo → falls back to all-repos */ }
+            }
+
+            var updated = await artifacts.SetScopeAsync(artifactId, reach, repositoryId, ct).ConfigureAwait(false);
+            return updated is null
+                ? Results.NotFound(new { error = $"Artifact '{artifactId}' was not found." })
+                : Results.Ok(updated);
+        });
+
+        // Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — manually add a constraint at
+        // a chosen scope (the 2x2): reach Private|Workgroup × application this-repo|all-repos. Creates a
+        // global (null-owner) constraint — so it's a first-class shared policy that surfaces on the
+        // Constraints tab and is injected into agents — unlike nm_v1_artifact_record, which makes
+        // work-unit-owned lineage constraints. repoSpecific resolves the workspace's repo id server-side
+        // (the same resolution findings use); the routing (studio/repo/workgroup room) follows Reach ×
+        // RepositoryId exactly as promotion/elevate do.
+        app.MapPost("/studio/constraints", async (
+            AddConstraintBody body,
+            IArtifactLineageService artifacts,
+            IRepositoryRegistryService repositories,
+            WorkspaceOptions workspaceOptions,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(body.Title) || string.IsNullOrWhiteSpace(body.Body))
+                return Results.BadRequest(new { error = "title and body are required." });
+
+            var reach = string.Equals(body.Reach, "Private", StringComparison.OrdinalIgnoreCase)
+                ? ArtifactReach.Private
+                : ArtifactReach.Workgroup;
+
+            string? repositoryId = null;
+            if (body.RepoSpecific && !string.IsNullOrWhiteSpace(workspaceOptions.SeedRepositoryPath))
+            {
+                try
+                {
+                    var repo = await repositories.RegisterAsync(workspaceOptions.SeedRepositoryPath!, label: null, ct).ConfigureAwait(false);
+                    repositoryId = repo.RepositoryId;
+                }
+                catch { /* unresolvable workspace repo → falls back to all-repos */ }
+            }
+
+            var created = await artifacts.RecordAsync(new ArtifactRef(
+                ArtifactId: $"constraint-{Guid.NewGuid():N}",
+                Type: ArtifactType.Constraint,
+                ParentArtifactId: null,
+                Status: ArtifactStatus.Approved,
+                CreatedAt: DateTimeOffset.UtcNow,
+                OwnedByWorkUnitId: null,
+                OwnedByAgentId: null,
+                Title: body.Title,
+                Body: body.Body,
+                RepositoryId: repositoryId,
+                Reach: reach), ct).ConfigureAwait(false);
+
+            return Results.Ok(created);
+        });
+
+        // Phase 1 follow-up (organizational-knowledge-and-workgroup-scope.md §8) — the Constraints tab's
+        // "Proposed by observers & agents" section: work-unit-owned Constraint artifacts (recorded by
+        // domain observers or agents via nm_v1_artifact_record) that are lineage-scoped and so never
+        // surface on the global Constraints list. Each is flagged `promoted` if a global constraint
+        // already links back to it (ArtifactRef.PromotedFromArtifactId), so the UI can badge it instead
+        // of re-offering promotion. Invalidated / cascade-flagged sources are excluded.
+        app.MapGet("/studio/constraints/proposed", async (
+            IArtifactLineageService artifacts,
+            CancellationToken ct) =>
+        {
+            var globals = await artifacts.GetGlobalConstraintsAsync(ct).ConfigureAwait(false);
+            var promotedFrom = globals
+                .Where(g => g.PromotedFromArtifactId is not null)
+                .Select(g => g.PromotedFromArtifactId!)
+                .ToHashSet(StringComparer.Ordinal);
+
+            var all = await artifacts.GetByTypeAsync(ArtifactType.Constraint, ct).ConfigureAwait(false);
+            var proposed = all
+                .Where(c => c.OwnedByWorkUnitId is not null
+                    && c.Status != ArtifactStatus.Invalidated
+                    && c.InvalidatedByArtifactId is null)
+                .Select(c => new
+                {
+                    artifactId = c.ArtifactId,
+                    title = c.Title,
+                    body = c.Body,
+                    workUnitId = c.OwnedByWorkUnitId,
+                    repositoryId = c.RepositoryId,
+                    appliesToAllRepos = string.IsNullOrEmpty(c.RepositoryId),
+                    promoted = promotedFrom.Contains(c.ArtifactId),
+                })
+                .ToList();
+            return Results.Ok(proposed);
+        });
+
+        // Promote a lineage (work-unit-owned) constraint to a global one — the human governance gate that
+        // lets a genuinely reusable domain-observer/agent finding become shared policy without retyping.
+        // Creates a global (null-owner) copy stamped with PromotedFromArtifactId for provenance/dedupe;
+        // the source lineage constraint is left untouched (it still steers its own goal's descendants).
+        // Default scope mirrors finding promotion: Workgroup reach + the source's own repo (repoSpecific,
+        // default true); pass repoSpecific=false for all-repos, or reach=Private for a local-only copy.
+        // Widening a repo-scoped promotion to all repos afterwards is Elevate's job, not a re-promote.
+        // Idempotent: if this source was already promoted, returns that existing global unchanged.
+        app.MapPost("/studio/constraints/{artifactId}/promote", async (
+            string artifactId,
+            PromoteConstraintBody? body,
+            IArtifactLineageService artifacts,
+            CancellationToken ct) =>
+        {
+            var source = await artifacts.GetAsync(artifactId, ct).ConfigureAwait(false);
+            if (source is null)
+                return Results.NotFound(new { error = $"Artifact '{artifactId}' was not found." });
+            if (source.Type != ArtifactType.Constraint)
+                return Results.BadRequest(new { error = "Only Constraint artifacts can be promoted." });
+            if (source.OwnedByWorkUnitId is null)
+                return Results.BadRequest(new { error = "Artifact is already a global constraint." });
+
+            // Dedupe: one promotion per source. Re-promoting at a wider scope is Elevate, not this.
+            var globals = await artifacts.GetGlobalConstraintsAsync(ct).ConfigureAwait(false);
+            var already = globals.FirstOrDefault(g =>
+                string.Equals(g.PromotedFromArtifactId, artifactId, StringComparison.Ordinal));
+            if (already is not null)
+                return Results.Ok(already);
+
+            var reach = string.Equals(body?.Reach, "Private", StringComparison.OrdinalIgnoreCase)
+                ? ArtifactReach.Private
+                : ArtifactReach.Workgroup;
+            // repoSpecific (default true) pins it to the repo the observed work unit belonged to — the
+            // constraint is about that repo. A source with no resolvable repo falls back to all-repos.
+            var repoSpecific = body?.RepoSpecific ?? true;
+            var repositoryId = repoSpecific ? source.RepositoryId : null;
+
+            var created = await artifacts.RecordAsync(new ArtifactRef(
+                ArtifactId: $"constraint-{Guid.NewGuid():N}",
+                Type: ArtifactType.Constraint,
+                ParentArtifactId: null,
+                Status: ArtifactStatus.Approved,
+                CreatedAt: DateTimeOffset.UtcNow,
+                OwnedByWorkUnitId: null,
+                OwnedByAgentId: null,
+                Title: source.Title,
+                Body: source.Body,
+                RepositoryId: repositoryId,
+                Reach: reach,
+                PromotedFromArtifactId: artifactId), ct).ConfigureAwait(false);
+
+            return Results.Ok(created);
+        });
     }
+
+    private sealed record ToggleConstraintBody(bool Disabled);
+
+    // Re-scope a global constraint (Phase 1 follow-up). Reach: "Workgroup" (default) | "Private".
+    // RepoSpecific: true = pin to the workspace repo; false = all repos.
+    private sealed record ScopeConstraintBody(string? Reach = "Workgroup", bool RepoSpecific = false);
+
+    // Promote a lineage constraint to global (Phase 1 follow-up). Reach: "Workgroup" (default) | "Private".
+    // RepoSpecific: true (default) = pin to the source's repo; false = all repos.
+    private sealed record PromoteConstraintBody(string? Reach = "Workgroup", bool RepoSpecific = true);
+
+    // Manual-add constraint (Phase 3). Reach: "Private" | "Workgroup" (default Workgroup). RepoSpecific:
+    // true = applies only to the workspace's repo; false = all repos.
+    private sealed record AddConstraintBody(string Title, string Body, string? Reach = "Workgroup", bool RepoSpecific = false);
 
     // ── /studio/projections — Slice 6.5 deferred: projection REST parity ───
 
@@ -5510,22 +5770,24 @@ public static class StudioRestEndpoints
             IFindingService findings,
             CancellationToken ct) =>
         {
-            // Model and apiKey are deliberately not required here — a vscode-lm-resolved profile
-            // (AgentConfigService.resolveSpawnLlmConfig) legitimately sends both blank, since the
-            // local LM proxy resolves the actual model and needs no real key. Same tolerance every
-            // other spawn path in this system already has for that provider.
-            if (string.IsNullOrWhiteSpace(body.Provider) || string.IsNullOrWhiteSpace(body.BaseUrl))
+            // Only Provider is required. Model/apiKey are optional (a vscode-lm profile sends both
+            // blank — the local LM proxy resolves them). BaseUrl is intentionally NOT required: Route B
+            // (plans/organizational-knowledge-and-workgroup-scope.md) lets a claude-cli/codex-cli
+            // profile run the scan, and those resolve with an empty baseUrl (a local binary, not an
+            // HTTP endpoint). InsightLlmAnalyzerService routes by provider — CLI providers to a
+            // one-shot CLI completer, HTTP providers to LlmClient (which needs the baseUrl).
+            if (string.IsNullOrWhiteSpace(body.Provider))
             {
-                return Results.BadRequest(new { error = "provider and baseUrl are required." });
+                return Results.BadRequest(new { error = "provider is required." });
             }
 
             var contextText = await projections.BuildInsightScanContextAsync(ct).ConfigureAwait(false);
-            var suggestions = await analyzer.AnalyzeAsync(
+            var result = await analyzer.AnalyzeAsync(
                 new InsightLlmScanRequest(body.Provider, body.Model, body.BaseUrl, body.ApiKey, contextText), ct)
                 .ConfigureAwait(false);
 
             var created = new List<Finding>();
-            foreach (var s in suggestions)
+            foreach (var s in result.Findings)
             {
                 created.Add(await findings.ProposeAsync(new Finding(
                     FindingId: $"finding-{Guid.NewGuid():N}",
@@ -5539,7 +5801,9 @@ public static class StudioRestEndpoints
                     TargetStage: s.TargetStage), ct).ConfigureAwait(false));
             }
 
-            return Results.Ok(created);
+            // rawCliOutput is set only for CLI-provider scans — the model's verbatim response, so the
+            // extension can offer to open it when a CLI model returned text that parsed to no findings.
+            return Results.Ok(new { findings = created, rawCliOutput = result.RawCliOutput });
         });
 
         // ── Causal graph queries ───────────────────────────────────────────

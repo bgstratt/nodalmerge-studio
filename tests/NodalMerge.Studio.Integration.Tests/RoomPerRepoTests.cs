@@ -651,6 +651,227 @@ public class RoomPerRepoTests : IDisposable
         Assert.Equal(HttpStatusCode.BadRequest, badRequest.StatusCode);
     }
 
+    /// <summary>
+    /// Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — promoting a KnowledgeGuideline
+    /// finding now creates a REPLICATED constraint (Reach=Workgroup), not one stranded in the local
+    /// room (the motivating bug). Default is shared + repo-specific: the finding's own RepositoryId
+    /// (Phase 0) becomes the constraint's application scope, so it lands in that repo's room; a finding
+    /// with no repo promotes to the shared "workgroup" room (all repos).
+    /// </summary>
+    [Fact]
+    public async Task Promoting_a_finding_creates_a_replicated_constraint()
+    {
+        await using var app = BuildApp("promote");
+        var repo = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "promote-repoA"), "repoA");
+        var repoRoomId = $"repo/{repo.WorkgroupRepoId}";
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var findings = app.Services.GetRequiredService<IFindingService>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+
+        // A finding attributed to the repo → promotes to a Workgroup + repo-specific constraint.
+        await findings.ProposeAsync(new Finding(
+            FindingId: "finding-repo", Kind: FindingKind.KnowledgeGuideline,
+            Source: FindingSource.Deterministic, Title: "run migrations first", Summary: "do X before Y",
+            SupportingDataJson: null, Status: FindingStatus.Open, CreatedAt: DateTimeOffset.UtcNow,
+            RepositoryId: repo.RepositoryId));
+        var reviewedRepo = await findings.ReviewAsync("finding-repo", FindingStatus.Promoted);
+        Assert.NotNull(reviewedRepo.PromotedArtifactId);
+
+        var repoConstraint = await artifacts.GetAsync(reviewedRepo.PromotedArtifactId!);
+        Assert.Equal(ArtifactReach.Workgroup, repoConstraint!.Reach);
+        Assert.Equal(repo.RepositoryId, repoConstraint.RepositoryId);
+        var repoKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.ArtifactRefV1, repoConstraint.ArtifactId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", repoKey)); // replicated to repo peers
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", repoKey));       // NOT stranded local
+
+        // A finding with no repo → promotes to a workgroup-wide (all repos) constraint.
+        await findings.ProposeAsync(new Finding(
+            FindingId: "finding-global", Kind: FindingKind.KnowledgeGuideline,
+            Source: FindingSource.Deterministic, Title: "global rule", Summary: "everywhere",
+            SupportingDataJson: null, Status: FindingStatus.Open, CreatedAt: DateTimeOffset.UtcNow));
+        var reviewedGlobal = await findings.ReviewAsync("finding-global", FindingStatus.Promoted);
+
+        var globalConstraint = await artifacts.GetAsync(reviewedGlobal.PromotedArtifactId!);
+        Assert.Equal(ArtifactReach.Workgroup, globalConstraint!.Reach);
+        Assert.Null(globalConstraint.RepositoryId);
+        var globalKey = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.ArtifactRefV1, globalConstraint.ArtifactId);
+        Assert.NotNull(TryReadEngineMapValue(bridge, "workgroup", "studio", globalKey)); // shared workgroup room
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", globalKey));
+    }
+
+    /// <summary>
+    /// Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — progressive promotion:
+    /// elevating a Workgroup + repo-specific constraint widens its application to all repos
+    /// (RepositoryId → null) and re-routes it from the repo room into the shared "workgroup" room.
+    /// </summary>
+    [Fact]
+    public async Task Elevating_a_repo_constraint_moves_it_to_the_workgroup_room()
+    {
+        await using var app = BuildApp("elevate");
+        var repo = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "elevate-repoA"), "repoA");
+        var repoRoomId = $"repo/{repo.WorkgroupRepoId}";
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+
+        await artifacts.RecordAsync(new ArtifactRef(
+            ArtifactId: "c-elevate", Type: ArtifactType.Constraint, ParentArtifactId: null,
+            Status: ArtifactStatus.Approved, CreatedAt: DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null, Title: "c", Body: "b",
+            RepositoryId: repo.RepositoryId, Reach: ArtifactReach.Workgroup));
+
+        var key = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.ArtifactRefV1, "c-elevate");
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", key));   // starts repo-scoped
+        Assert.Null(TryReadEngineMapValue(bridge, "workgroup", "studio", key));
+
+        var elevated = await artifacts.ElevateToWorkgroupAsync("c-elevate");
+        Assert.Equal(ArtifactReach.Workgroup, elevated!.Reach);
+        Assert.Null(elevated.RepositoryId);                                          // now all-repos
+        Assert.NotNull(TryReadEngineMapValue(bridge, "workgroup", "studio", key));   // now in the workgroup room
+
+        // Idempotent: a second elevate is a no-op.
+        var again = await artifacts.ElevateToWorkgroupAsync("c-elevate");
+        Assert.Null(again!.RepositoryId);
+    }
+
+    /// <summary>
+    /// Phase 1 (plans/organizational-knowledge-and-workgroup-scope.md) — ArtifactRef routes by the
+    /// 2×2 (Reach × Application): Private → peer-private "studio" room; Workgroup + RepositoryId →
+    /// that repo's room; Workgroup + no RepositoryId → the shared "workgroup" room (the old "global",
+    /// now actually replicated instead of stranded locally). Legacy artifacts (Reach null) keep the
+    /// pre-Phase-1 repo-room-or-"studio" routing. The read fan-out consults the workgroup room too, so
+    /// a workgroup-only artifact is still found.
+    /// </summary>
+    [Fact]
+    public async Task Artifact_reach_routes_to_studio_repo_or_workgroup_room()
+    {
+        await using var app = BuildApp("artifact-reach");
+        var repo = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "reach-repoA"), "repoA");
+        var repoRoomId = $"repo/{repo.WorkgroupRepoId}";
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+        var store = app.Services.GetRequiredService<IStudioNodeStore>();
+
+        ArtifactRef Make(string id, ArtifactReach? reach, string? repositoryId) => new(
+            ArtifactId: id, Type: ArtifactType.Constraint, ParentArtifactId: null,
+            Status: ArtifactStatus.Approved, CreatedAt: DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null, Title: id, Body: "b",
+            RepositoryId: repositoryId, Reach: reach);
+
+        static string Key(string id) => NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.ArtifactRefV1, id);
+
+        // 1. Workgroup + no repo → the shared "workgroup" room (the old "global", now replicated).
+        await artifacts.RecordAsync(Make("wg-global", ArtifactReach.Workgroup, null));
+        Assert.NotNull(TryReadEngineMapValue(bridge, "workgroup", "studio", Key("wg-global")));
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", Key("wg-global")));
+        Assert.Null(TryReadEngineMapValue(bridge, repoRoomId, "studio", Key("wg-global")));
+
+        // 2. Workgroup + repo → that repo's room.
+        await artifacts.RecordAsync(Make("wg-repo", ArtifactReach.Workgroup, repo.RepositoryId));
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", Key("wg-repo")));
+        Assert.Null(TryReadEngineMapValue(bridge, "workgroup", "studio", Key("wg-repo")));
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", Key("wg-repo")));
+
+        // 3. Private → the peer-private "studio" room, never replicated.
+        await artifacts.RecordAsync(Make("priv", ArtifactReach.Private, null));
+        Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", Key("priv")));
+        Assert.Null(TryReadEngineMapValue(bridge, "workgroup", "studio", Key("priv")));
+
+        // 4. Private + repo (local override — the 4th 2×2 cell) → studio, NOT the repo room.
+        await artifacts.RecordAsync(Make("priv-repo", ArtifactReach.Private, repo.RepositoryId));
+        Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", Key("priv-repo")));
+        Assert.Null(TryReadEngineMapValue(bridge, repoRoomId, "studio", Key("priv-repo")));
+
+        // 5. Legacy (Reach null) unchanged: no repo → "studio", not the workgroup room.
+        await artifacts.RecordAsync(Make("legacy-local", null, null));
+        Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", Key("legacy-local")));
+        Assert.Null(TryReadEngineMapValue(bridge, "workgroup", "studio", Key("legacy-local")));
+
+        // Read fan-out: wg-global lives ONLY in the workgroup room, so a successful read proves
+        // ReadNodeAsync/ReadAllNodesAsync now consult that room.
+        Assert.NotNull(await store.ReadNodeAsync(StudioNodeKind.ArtifactRefV1, "wg-global"));
+        var all = await store.ReadAllNodesAsync(StudioNodeKind.ArtifactRefV1);
+        var ids = all.Select(e => e.EntityId).ToHashSet(StringComparer.Ordinal);
+        Assert.Contains("wg-global", ids);
+        Assert.Contains("wg-repo", ids);
+        Assert.Contains("priv", ids);
+    }
+
+    /// <summary>
+    /// Phase 0 (plans/organizational-knowledge-and-workgroup-scope.md) — a Finding proposed in a
+    /// workspace bound to a repo is attributed to that repo (FindingService stamps RepositoryId from
+    /// the workspace seed repo) and, because FindingV1 is now in RepoScopedKinds, lands in the
+    /// repo/{repoId} room so the Insights Findings queue is shared with same-repo peers — never the
+    /// peer-private "studio" room, where findings used to be stranded.
+    /// </summary>
+    [Fact]
+    public async Task Finding_is_attributed_to_the_workspace_repo_and_lands_in_the_repo_room()
+    {
+        var seedRepoPath = Path.Combine(_tempRoot, "findings-seed-repo");
+        Directory.CreateDirectory(seedRepoPath);
+        var root = Path.Combine(_tempRoot, "findings-attr");
+
+        await using var app = StudioWebApplication.Build(
+            [],
+            configureConfiguration: cfg => cfg.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["NodalMerge:Storage:Sqlite:DbPath"] = Path.Combine(root, "nodes.db"),
+                ["NodalMerge:Storage:FileBlobs:RootPath"] = Path.Combine(root, "blobs"),
+                ["Workspace:RootPath"] = Path.Combine(root, "workspace"),
+                ["Workspace:SeedRepositoryPath"] = seedRepoPath,
+            }));
+
+        var repo = await RegisterBoundRepoAsync(app.Services, seedRepoPath, "seed");
+        var repoRoomId = $"repo/{repo.WorkgroupRepoId}";
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var findings = app.Services.GetRequiredService<IFindingService>();
+
+        // No RepositoryId supplied — ProposeAsync must stamp it from the workspace seed repo.
+        var finding = await findings.ProposeAsync(new Finding(
+            FindingId: "finding-attr",
+            Kind: FindingKind.KnowledgeGuideline,
+            Source: FindingSource.Deterministic,
+            Title: "t", Summary: "s",
+            SupportingDataJson: null,
+            Status: FindingStatus.Open,
+            CreatedAt: DateTimeOffset.UtcNow));
+
+        Assert.Equal(repo.RepositoryId, finding.RepositoryId);
+
+        var key = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.FindingV1, "finding-attr");
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", key)); // shared repo room
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", key));       // not stranded locally
+
+        // A review re-persists the finding; it must stay in the same repo room, not fall back to studio.
+        await findings.ReviewAsync("finding-attr", FindingStatus.Dismissed, "nope");
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", key));
+        Assert.Null(TryReadEngineMapValue(bridge, "studio", "studio", key));
+    }
+
+    /// <summary>
+    /// Phase 0 — safe degradation: with no workspace seed repo to attribute to, a finding keeps a null
+    /// RepositoryId and stays in the local "studio" room (the 3-arg write), never blocked or lost.
+    /// </summary>
+    [Fact]
+    public async Task Finding_with_no_workspace_repo_stays_local()
+    {
+        await using var app = BuildApp("findings-local");
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var findings = app.Services.GetRequiredService<IFindingService>();
+
+        var finding = await findings.ProposeAsync(new Finding(
+            FindingId: "finding-local",
+            Kind: FindingKind.KnowledgeGuideline,
+            Source: FindingSource.Deterministic,
+            Title: "t", Summary: "s",
+            SupportingDataJson: null,
+            Status: FindingStatus.Open,
+            CreatedAt: DateTimeOffset.UtcNow));
+
+        Assert.Null(finding.RepositoryId);
+        var key = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.FindingV1, "finding-local");
+        Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", key));
+    }
+
     private static JsonNode? TryReadEngineMapValue(IRuntimeCommandBridge bridge, string roomId, string @namespace, string key)
     {
         var response = bridge.ProcessJsonCommand(JsonSerializer.Serialize(new

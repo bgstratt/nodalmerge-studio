@@ -33,6 +33,7 @@ public sealed class ProjectionManager : IProjectionManager
     private readonly ICoModService? _coMod;
     private readonly IExecutionEventStream? _eventStream;
     private readonly IGoalNodeService? _goals;
+    private readonly IConstraintToggleService? _constraintToggles;
 
     public ProjectionManager(
         IWorkUnitService workUnits,
@@ -55,7 +56,8 @@ public sealed class ProjectionManager : IProjectionManager
         WorkspaceOptions? workspaceOptions = null,
         ICoModService? coMod = null,
         IExecutionEventStream? eventStream = null,
-        IGoalNodeService? goalNodes = null)
+        IGoalNodeService? goalNodes = null,
+        IConstraintToggleService? constraintToggles = null)
     {
         _workUnits          = workUnits;
         _tasks              = tasks;
@@ -78,6 +80,7 @@ public sealed class ProjectionManager : IProjectionManager
         _coMod              = coMod;
         _eventStream        = eventStream;
         _goals              = goalNodes;
+        _constraintToggles  = constraintToggles;
     }
 
     public async Task<ProjectionResult> GetAsync(ProjectionRequest request, CancellationToken cancellationToken = default)
@@ -348,16 +351,30 @@ public sealed class ProjectionManager : IProjectionManager
         combined.AddRange(ancestorChain);
         combined.AddRange(enriched);
 
-        // Global constraints (promoted Knowledge Findings, no owning work unit) apply to every
-        // work unit regardless of lineage — folded in ahead of the ancestor-chain ones.
-        var globalConstraints = await _artifactLineage.GetGlobalConstraintsAsync(ct).ConfigureAwait(false);
+        // Global constraints (promoted Knowledge Findings, no owning work unit) apply across lineage,
+        // folded in ahead of the ancestor-chain ones. Phase 1
+        // (plans/organizational-knowledge-and-workgroup-scope.md) adds the *application* filter: a
+        // repo-specific constraint (RepositoryId set) fires only when this work unit targets that
+        // repo; a constraint with no RepositoryId applies to all repos. Reach (Private/Workgroup)
+        // governs replication — who has the constraint at all — not whether it fires here.
+        var wu = await _workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+        var currentRepositoryId = wu?.RepositoryId;
+        var globalConstraints = (await _artifactLineage.GetGlobalConstraintsAsync(ct).ConfigureAwait(false))
+            .Where(c => c.RepositoryId is null || c.RepositoryId == currentRepositoryId)
+            .ToList();
         var inheritedConstraints = globalConstraints
             .Concat(ancestorChain.Where(a => a.Type == ArtifactType.Constraint))
             .ToList();
 
-        WorkUnit? wu = null;
-        if (_executionCommands is not null || _workspaceProfiles is not null)
-            wu = await _workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+        // Phase 3 — subtract this peer's locally-disabled constraints (the Insights "turn off" toggle).
+        // Local suppression only: the constraint stays live for every other peer; it just stops
+        // reaching this peer's agents.
+        if (_constraintToggles is not null)
+        {
+            var disabled = await _constraintToggles.GetDisabledIdsAsync(ct).ConfigureAwait(false);
+            if (disabled.Count > 0)
+                inheritedConstraints = inheritedConstraints.Where(c => !disabled.Contains(c.ArtifactId)).ToList();
+        }
 
         // ── Slice 16l — attach latest execution result ───────────────────────
         WorkspaceExecutionSummary? execution = null;

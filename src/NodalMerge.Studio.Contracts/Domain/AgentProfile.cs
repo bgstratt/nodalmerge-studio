@@ -30,4 +30,13 @@ public sealed record AgentProfile(
     // the machine's existing CLI auth and holds no secret. Set true only for headless/CI profiles
     // that need ClaudeCodeExecutor to inject the caller-supplied credential (HarnessRunRequest
     // .ApiKey) as ANTHROPIC_API_KEY on the spawned process's environment instead.
-    bool InjectApiKeyEnv = false);
+    bool InjectApiKeyEnv = false,
+    // Scoped-worker model binding — the client-side Model Profile id whose LLM connection this
+    // (file-scoped Execute/Plan) profile runs on. Null (the default for every profile that
+    // predates this field) = inherit the stage's Model Profile from Agent Topology, i.e. exactly
+    // today's behavior. The server never resolves this id itself: it's a client join key. At spawn
+    // the client resolves each bound profile's Model Profile to credentials and ships them keyed by
+    // AgentProfileId (SpawnAgentBody.ProfileCredentials), which FanOut/Planner then use in place of
+    // the per-stage credentials when this profile wins a file-scope match. See
+    // plans/scoped-execute-workers-per-profile-models.md.
+    string? ModelProfileId = null);

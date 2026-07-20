@@ -277,6 +277,51 @@ public class InMemoryAgentRuntimeServiceTests
         Assert.Single(await svc.ListAllAsync());
     }
 
+    // ── GetCredentialsForProfile (scoped-worker model binding) ────────────────
+
+    [Fact]
+    public async Task GetCredentialsForProfile_returns_bound_credentials_captured_at_spawn()
+    {
+        // plans/scoped-execute-workers-per-profile-models.md — a file-scoped Execute/Plan profile
+        // that bound its own Model Profile runs on that LLM. profileCredentials is captured at spawn
+        // keyed by AgentProfileId and resolved by GetCredentialsForProfile, the twin of
+        // GetCredentialsForStage.
+        var svc = Build();
+        var stageCredentials = new Dictionary<PipelineStage, GoalDefaultCredentials>
+        {
+            [PipelineStage.Execute] = new("anthropic", "stage-model", "http://stage", "stage-key", null),
+        };
+        var profileCredentials = new Dictionary<string, GoalDefaultCredentials>
+        {
+            ["frontend-worker"] = new("anthropic", "sonnet-frontend", "http://frontend", "fe-key", "frontend-worker"),
+        };
+        await svc.SpawnAsync("orchestrator", "wu-1", model: "m", baseUrl: "http://fake-llm", apiKey: "k",
+            stageCredentials: stageCredentials, profileCredentials: profileCredentials);
+
+        var bound = svc.GetCredentialsForProfile("wu-1", "frontend-worker");
+        Assert.NotNull(bound);
+        Assert.Equal("sonnet-frontend", bound!.Model);
+        Assert.Equal("http://frontend", bound.BaseUrl);
+
+        // A profile with no binding, and an unknown work unit, both resolve to null so the caller
+        // falls back to the stage default — exactly today's behavior.
+        Assert.Null(svc.GetCredentialsForProfile("wu-1", "backend-worker"));
+        Assert.Null(svc.GetCredentialsForProfile("wu-unknown", "frontend-worker"));
+
+        // The per-stage path is untouched by the per-profile binding.
+        var stage = svc.GetCredentialsForStage("wu-1", PipelineStage.Execute);
+        Assert.Equal("stage-model", stage!.Model);
+    }
+
+    [Fact]
+    public async Task GetCredentialsForProfile_returns_null_when_no_bindings_were_registered()
+    {
+        var svc = Build();
+        await svc.SpawnAsync("orchestrator", "wu-1", model: "m", baseUrl: "http://fake-llm", apiKey: "k");
+
+        Assert.Null(svc.GetCredentialsForProfile("wu-1", "frontend-worker"));
+    }
+
     // ── GetEnabledDomainAgents ────────────────────────────────────────────────
 
     [Fact]
