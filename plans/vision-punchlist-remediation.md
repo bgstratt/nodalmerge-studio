@@ -428,6 +428,14 @@ the rehydrated `_goalRouting` twin → survives host restart identically to toda
       in the `RepositoryRelinkTests` harness); **verified load-bearing by neutering the split-is-a-move
       flag — exactly that test fails.**
       Extension tsc clean + webview smoke PASS; Integration 748/748 on a clean run; all other suites green.
+- [x] **Register-the-open-folder in the re-link flow — DONE 2026-07-20.** Found by opening a fresh repo:
+      the command dead-ended with "no repositories are registered yet". Registration otherwise happens
+      only as a side effect of goal creation, so the very first state a new user is in had no path
+      forward. The picker now offers **"Register the open folder"** first when the active folder isn't
+      registered (`POST /studio/repositories`, which creates the dir if needed, `git init`s a non-repo,
+      and registers), then continues into the normal re-link flow with the new id. The in-panel button
+      relabels to **"Register…"** when unregistered — the same flow handles both, but "Re-link" does not
+      read as the way to register something.
 - [ ] **Deferred: test-hygiene sweep.** 163 test sites build a `StudioWebApplication` without disposing it
       (vs 33 that do), leaking background loops and file handles into whatever runs next — the cause of the
       residual "different test each run" flakiness that survived the shutdown-contract fix. Note 6 of those

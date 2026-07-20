@@ -183,27 +183,64 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       try {
         const repos = await getJson('/studio/repositories') as
           { repositoryId: string; path: string; label?: string | null; workgroupRepoId?: string | null }[];
-        if (!repos.length) {
-          vscode.window.showInformationMessage('NodalMerge: no repositories are registered yet.');
+        const activeFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const normPath = (p: string) => p.replace(/[\\/]+$/, '').toLowerCase();
+        const activeRegistered = activeFolder
+          ? repos.find(r => normPath(r.path) === normPath(activeFolder))
+          : undefined;
+
+        type RepoPick = vscode.QuickPickItem & { repositoryId?: string; registerPath?: string };
+        const items: RepoPick[] = repos.map(r => ({
+          label: r.label || r.path,
+          description: activeFolder && normPath(r.path) === normPath(activeFolder) ? '(this workspace)' : r.path,
+          detail: r.workgroupRepoId ? `Currently in room repo/${r.workgroupRepoId}` : 'Not bound to a room yet',
+          repositoryId: r.repositoryId,
+        }));
+
+        // A freshly opened folder isn't registered yet, and registration otherwise only happens as a
+        // side effect of creating a goal — so without this the command dead-ends on exactly the case
+        // a new user hits first. Offered first because it is almost always what they want.
+        if (activeFolder && !activeRegistered) {
+          items.unshift({
+            label: '$(add) Register the open folder',
+            description: activeFolder,
+            detail: 'Not a NodalMerge repository yet — registering it gives it a replication room.',
+            registerPath: activeFolder,
+          });
+        }
+
+        if (!items.length) {
+          vscode.window.showInformationMessage(
+            'NodalMerge: no repositories are registered, and no folder is open to register.');
           return;
         }
 
-        const activeFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        const picked = await vscode.window.showQuickPick(
-          repos.map(r => ({
-            label: r.label || r.path,
-            description: r.path === activeFolder ? '(this workspace)' : r.path,
-            detail: r.workgroupRepoId ? `Currently in room repo/${r.workgroupRepoId}` : 'Not bound to a room yet',
-            repositoryId: r.repositoryId,
-          })),
-          { title: 'Re-link repository', placeHolder: 'Which repository?' },
-        );
+        const picked = await vscode.window.showQuickPick(items, {
+          title: 'Re-link repository',
+          placeHolder: activeRegistered || !activeFolder ? 'Which repository?' : 'Register this folder, or pick another repository',
+        });
         if (!picked) { return; }
+
+        let repositoryId = picked.repositoryId;
+        if (picked.registerPath) {
+          const created = await postJson('/studio/repositories', { path: picked.registerPath }) as
+            { repositoryId: string };
+          repositoryId = created.repositoryId;
+          // Registering already binds it (match-or-mint), so the re-link below will usually report
+          // nothing to change — which is the correct outcome, and the flow still lets them split it
+          // off or pick a different room deliberately.
+          vscode.window.showInformationMessage(`NodalMerge: registered ${picked.registerPath}.`);
+          StudioShellPanel.current?.refresh();
+        }
+        if (!repositoryId) { return; }
+
+        // The quickpick label for the register entry is a UI affordance, not a name — use the path.
+        const displayName = picked.registerPath ?? picked.label;
 
         // Preview first — same evaluation the commit would do, but no writes. This is what lets the
         // confirmation below state exactly what changes and what stops appearing.
         const preview = await postJson(
-          `/studio/repositories/${encodeURIComponent(picked.repositoryId)}/identity/relink`,
+          `/studio/repositories/${encodeURIComponent(repositoryId)}/identity/relink`,
           { mode: 'auto', commit: false }) as {
             currentWorkgroupRepoId?: string | null;
             proposedWorkgroupRepoId?: string | null;
@@ -244,7 +281,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
 
         const action = await vscode.window.showQuickPick(choices, {
-          title: `Re-link ${picked.label}`,
+          title: `Re-link ${displayName}`,
           placeHolder: preview.currentWorkgroupRepoId
             ? `Currently repo/${preview.currentWorkgroupRepoId}`
             : 'Not bound to a room yet',
@@ -259,7 +296,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           summary = `Re-link to repo/${preview.proposedWorkgroupRepoId}?`;
         } else if (action.label.includes('own repository')) {
           body = { mode: 'manual', chosenRepoId: 'register-new', commit: true };
-          summary = `Register ${picked.label} as its own separate repository?`;
+          summary = `Register ${displayName} as its own separate repository?`;
         } else {
           // Offer the matcher's candidates when it produced any; otherwise every other registered
           // repository, which is what makes the already-diverged case reachable at all.
@@ -281,14 +318,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (!chosen) { return; }
 
           body = { mode: 'manual', chosenRepoId: chosen.label, commit: true };
-          summary = `Link ${picked.label} to repo/${chosen.label}?`;
+          summary = `Link ${displayName} to repo/${chosen.label}?`;
         }
 
         // Preview THIS action, not the auto one evaluated earlier — each choice leaves a different
         // room behind (and "register as its own" leaves one even when auto would have done nothing),
         // so reusing the first preview's impact would understate or omit the cost.
         const actionPreview = await postJson(
-          `/studio/repositories/${encodeURIComponent(picked.repositoryId)}/identity/relink`,
+          `/studio/repositories/${encodeURIComponent(repositoryId)}/identity/relink`,
           { ...body, commit: false }) as { impact?: typeof preview.impact };
 
         // Modal, because this is the point of no easy return: the old room's content stops being
@@ -298,7 +335,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (confirm !== 'Re-link') { return; }
 
         const result = await postJson(
-          `/studio/repositories/${encodeURIComponent(picked.repositoryId)}/identity/relink`, body) as {
+          `/studio/repositories/${encodeURIComponent(repositoryId)}/identity/relink`, body) as {
             committed: boolean; proposedWorkgroupRepoId?: string | null; explanation: string;
           };
 

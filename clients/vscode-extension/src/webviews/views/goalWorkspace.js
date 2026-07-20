@@ -1714,6 +1714,15 @@ export function init(ctx) {
         }
         roomEl.classList.toggle('gw-repo-room-unbound', unbound);
       }
+      // The same flow handles both, but "Re-link" does not read as "this is how you register an
+      // unregistered folder" — which is the very first state a new user is in.
+      var relinkBtn = $('gw-repo-relink');
+      if (relinkBtn) {
+        relinkBtn.textContent = msg.registered ? 'Re-link…' : 'Register…';
+        relinkBtn.title = msg.registered
+          ? 'Re-link this repository to a different room, or split it into its own'
+          : 'Register this folder with NodalMerge so it gets a replication room';
+      }
       return;
     }
     if (msg.type === 'explorerSettings') {
