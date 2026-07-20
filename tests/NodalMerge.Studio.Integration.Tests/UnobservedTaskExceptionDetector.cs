@@ -32,7 +32,20 @@ internal static class UnobservedTaskExceptionDetector
     // printed as a finding.
     internal const string SelfTestMarker = "deliberate leak - detector self-test";
 
+    // Real findings. Only ReportSummary drains this — nothing else may, or evidence is destroyed.
     private static readonly ConcurrentQueue<Capture> Captured = new();
+
+    // The self-test's own deliberate leak, kept in a SEPARATE queue.
+    //
+    // This used to share one queue with the real findings, and the self-test called Drain() — which
+    // empties it — both before and after its own leak. The shared queue is process-wide and the
+    // self-test runs somewhere in the middle of 700+ others, so every real leak captured before it
+    // was silently discarded and never reached the end-of-run summary. The detector was destroying
+    // exactly the evidence it exists to collect, and "no leaks reported" meant nothing.
+    //
+    // Two queues instead of one filter: it makes the interference structurally impossible rather
+    // than dependent on every future caller remembering to filter.
+    private static readonly ConcurrentQueue<Capture> SelfTestCaptured = new();
 
     // Runs when the test assembly is loaded, before any test executes — earlier than any fixture
     // could, which matters because the leaks we care about can start during the very first test.
@@ -49,10 +62,11 @@ internal static class UnobservedTaskExceptionDetector
 
             // The detector's own self-test leaks a task on purpose; reporting it would train readers
             // to ignore this output, which is the one thing that would make the detector useless.
+            // It goes to its own queue so the self-test can consume it without touching real findings.
             if (capture.Exception.Flatten().InnerExceptions.Any(
                     x => x.Message.Contains(SelfTestMarker, StringComparison.Ordinal)))
             {
-                Captured.Enqueue(capture);
+                SelfTestCaptured.Enqueue(capture);
                 return;
             }
 
@@ -94,14 +108,83 @@ internal static class UnobservedTaskExceptionDetector
             report.Append(Format(leak, "UNOBSERVED TASK EXCEPTION (summary)"));
 
         Console.Error.WriteLine(report.ToString());
+
+        // Also written to disk, because stderr at ProcessExit is not reliably relayed by
+        // `dotnet test` — it did not appear even at `-l "console;verbosity=detailed"`. A summary
+        // nobody can see is the same as no detector at all, so the file is the dependable channel
+        // and the console copy is the convenience.
+        TryWriteReportFile(report.ToString());
     }
 
-    internal static IReadOnlyList<Capture> Drain()
+    // Deliberately best-effort and never throwing: this runs on ProcessExit, where an exception
+    // would be an unhelpful way to end an otherwise-green run. The console copy above is the
+    // fallback if this fails.
+    private static void TryWriteReportFile(string report)
+    {
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, ReportFileName);
+            File.WriteAllText(path, report);
+            Console.Error.WriteLine($"[UnobservedTaskExceptionDetector] Report written to {path}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[UnobservedTaskExceptionDetector] Could not write report file: {ex.Message}");
+        }
+    }
+
+    internal const string ReportFileName = "unobserved-task-exceptions.txt";
+
+    // Private on purpose. This empties the real-findings queue, so only the end-of-run summary may
+    // call it — a test that drains it destroys the evidence for every test that ran before it, which
+    // is the exact defect this class previously had.
+    private static IReadOnlyList<Capture> Drain()
     {
         var all = new List<Capture>();
         while (Captured.TryDequeue(out var c))
             all.Add(c);
         return all;
+    }
+
+    // Safe for the self-test: touches only the self-test queue.
+    internal static IReadOnlyList<Capture> DrainSelfTestCaptures()
+    {
+        var all = new List<Capture>();
+        while (SelfTestCaptured.TryDequeue(out var c))
+            all.Add(c);
+        return all;
+    }
+
+    // Diagnostic only — does NOT dequeue. Lets a test observe the real-findings count without
+    // consuming it.
+    internal static int PendingFindingCount => Captured.Count;
+
+    internal static bool HasFindingMatching(Func<Capture, bool> match) => Captured.Any(match);
+
+    /// <summary>
+    /// Removes findings matching <paramref name="match"/> and returns how many were removed.
+    ///
+    /// Exists for ONE caller: the regression test that plants a real (unmarked) leak to prove the
+    /// self-test does not consume it. That test has to plant a genuine finding — anything less is
+    /// unfalsifiable — and must then clean it up so it does not show in the end-of-run report as a
+    /// phantom defect. Do not use this to suppress findings.
+    /// </summary>
+    internal static int RemoveFindings(Func<Capture, bool> match)
+    {
+        // ConcurrentQueue has no removal, so cycle the whole queue once, re-enqueueing keepers.
+        // Safe because ProcessExit is the only other consumer and it cannot run concurrently here.
+        var removed = 0;
+        var kept = new List<Capture>();
+        while (Captured.TryDequeue(out var c))
+        {
+            if (match(c)) removed++;
+            else kept.Add(c);
+        }
+
+        foreach (var c in kept)
+            Captured.Enqueue(c);
+
+        return removed;
     }
 
     internal static string Format(Capture capture, string header)
@@ -131,8 +214,9 @@ public class UnobservedTaskExceptionDetectorTests
     [Fact]
     public void Detector_catches_a_faulted_fire_and_forget_task()
     {
-        // Drain first so an unrelated leak from another test cannot make this pass spuriously.
-        UnobservedTaskExceptionDetector.Drain();
+        // Draining only the self-test queue. This used to call Drain(), which emptied the shared
+        // real-findings queue and threw away every leak detected by the tests that ran earlier.
+        UnobservedTaskExceptionDetector.DrainSelfTestCaptures();
 
         // Faulted inside its own scope so nothing holds a reference once it returns — a local would
         // keep it alive and it would never be finalized.
@@ -148,8 +232,57 @@ public class UnobservedTaskExceptionDetectorTests
         GC.Collect();
         GC.WaitForPendingFinalizers();
 
-        var caught = UnobservedTaskExceptionDetector.Drain();
+        var caught = UnobservedTaskExceptionDetector.DrainSelfTestCaptures();
         Assert.Contains(caught, c => c.Exception.Flatten().InnerExceptions
             .Any(e => e.Message.Contains(UnobservedTaskExceptionDetector.SelfTestMarker, StringComparison.Ordinal)));
+    }
+
+    /// <summary>
+    /// The self-test above leaks a task on purpose. This proves that doing so does not disturb the
+    /// real-findings queue — the defect this class shipped with, where the self-test silently
+    /// discarded every genuine leak recorded before it and made "no leaks reported" meaningless.
+    /// </summary>
+    [Fact]
+    public void Draining_self_test_captures_preserves_a_real_finding()
+    {
+        const string realLeakMarker = "real-leak-sentinel-must-survive-the-self-test-drain";
+
+        // Plant a GENUINE (unmarked) leak. This has to be a real finding in the real queue —
+        // asserting on counts alone passes trivially when the queue happens to be empty, which is
+        // how the first version of this test managed to pass even against the original bug.
+        static void LeakARealFaultedTask() =>
+            _ = Task.Run(() => throw new InvalidOperationException(realLeakMarker));
+
+        LeakARealFaultedTask();
+
+        Thread.Sleep(200);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+
+        static bool IsSentinel(UnobservedTaskExceptionDetector.Capture c) =>
+            c.Exception.Flatten().InnerExceptions
+                .Any(e => e.Message.Contains(realLeakMarker, StringComparison.Ordinal));
+
+        try
+        {
+            Assert.True(
+                UnobservedTaskExceptionDetector.HasFindingMatching(IsSentinel),
+                "Planted leak was never recorded — the detector itself is not working.");
+
+            // The operation the self-test performs. It must not consume real findings.
+            UnobservedTaskExceptionDetector.DrainSelfTestCaptures();
+
+            Assert.True(
+                UnobservedTaskExceptionDetector.HasFindingMatching(IsSentinel),
+                "DrainSelfTestCaptures() consumed a real finding — the detector is destroying "
+                + "the evidence it exists to collect, exactly as it did before this was fixed.");
+        }
+        finally
+        {
+            // Clean up so this planted leak never appears in the end-of-run report as a phantom.
+            UnobservedTaskExceptionDetector.RemoveFindings(IsSentinel);
+        }
     }
 }
