@@ -308,7 +308,48 @@ the rehydrated `_goalRouting` twin → survives host restart identically to toda
       *Known gap (deliberate):* the *derived* "superseded by a newer artifact" relation is branch-relative
       and only computable by the EngineeringState reverse index, so a constraint retired purely via another
       artifact's `Supersedes` list still injects. Closing it means reusing that fold here — larger change.
-- [ ] **Item 3 S3 — hard enforcement — BLOCKED ON A PRODUCT DECISION, do not build as specified.**
+- [x] **Item 3 S3 — RESOLVED 2026-07-20 as "constraints stay advisory". Steps 0 + 0.5 DONE; Step 1 DEFERRED.**
+      Product decision (user): constraints are **guidance, not gates** — "there seem to be exceptions to every
+      rule; get your goal complete and explain" — and **correct work being rejected is the higher risk** than
+      a violation slipping through. No blocking rule will be built.
+      **What investigation found:** the reviewer already enforces constraints by LLM judgment
+      (`AutoReviewRule` blocks on rejection), and already attests what it weighed
+      (`MergeProposal.ConsideredArtifactIds`). But (a) that attestation was rendered in **zero** UI —
+      `clients/` had no match for `considered`, and the purpose-built `GET /studio/artifacts/{id}/feedback`
+      had **no caller**; and (b) the worker and reviewer prompts **contradicted each other**: the worker was
+      told constraints are guidance to "apply unless this work unit's goal explicitly says otherwise", while
+      the reviewer was told a violation is "grounds for rejection even if the diff otherwise looks reasonable"
+      and listed it as a flat defect beside build/test failure. A worker correctly exercising its license got
+      rejected by a reviewer under a stricter rule — and the reviewer could not even see the worker's
+      reasoning, since no such record exists.
+      **Step 0 (DONE) — surface what already existed.** `consideredArtifactIds` now renders in Merge Review's
+      Evidence section; the orphaned `/feedback` endpoint is wired to a per-constraint "Usage" affordance on
+      the Insights Constraints tab (on-demand, one request per constraint asked about, not N per tab open).
+      Both surfaces state plainly that a review records the constraint was **weighed, not followed** — an
+      Approved proposal carries an identical list whether the constraint was obeyed or departed from.
+      **Step 0.5 (DONE) — resolve the contradiction.** Reviewer prompt now treats a departure the goal
+      justifies as correct work to note in `verificationResults`, and rejects only an unjustified departure;
+      when it cannot tell why, it prefers approving with the departure called out. Mirrors the wording the
+      same prompt already used for `fileScope` ("a rejection here throws away correct, working code the user
+      already paid tokens for"). Three sites: `AgentLoopPrompts.Reviewer` step 2 and Rules,
+      `ReviewerAgentLoop`'s `ArtifactQuery` tool description.
+      **Step 1 (DEFERRED, revisit before any further tuning) — worker-side deviation record.** Genuinely does
+      not exist: no field, MCP tool, event, or `.workspace/` slot lets a worker say "I departed from C-7
+      because Y", and no worker prompt asks. Precedent to follow when built: `noFileChangesJustification`
+      (opt-in gate → agent supplies free text → persisted on the proposal). Open design question recorded
+      then: proposal field (simpler, replicates with the merge) vs `Decision` artifact (rides lineage +
+      scope rules, so it reaches future work units).
+      **Known limit of the whole approach:** self-reporting only ever captures *conscious* deviation. An agent
+      that never noticed a constraint applied does not believe it deviated, so no prompting extracts a reason
+      — the reviewer stays the only thing catching unaware violations. Surface any future reason as "agent's
+      stated reason", since asking an LLM to justify reliably produces a justification.
+      **Watch after 0.5:** it loosens the reviewer *before* Step 1 gives it a stated reason to weigh, so it is
+      currently inferring justification from the diff alone. If violations start sliding through, that is the
+      signal to build Step 1 rather than re-tighten the prompt.
+- [ ] ~~Item 3 S3 — hard enforcement~~ — **NOT BUILDING.** Superseded by the entry above. Retained for the
+      reasoning: no machine-checkable field exists on a Constraint (Title/Body are free text), the LLM path
+      that can evaluate one is already wired and already blocking, and constraints are **per-peer disableable**
+      (Phase 3 toggle) — so a blocking policy would gate merges on a set that differs per machine.
       S3 assumed "advisory→blocking = one new `IPolicyRule` over the constraint set." Investigation found
       that is not buildable as written: **no machine-checkable field exists on a Constraint** (Title/Body are
       free text; no predicate, pattern, rule-kind, severity, or tag), so a deterministic rule has nothing to

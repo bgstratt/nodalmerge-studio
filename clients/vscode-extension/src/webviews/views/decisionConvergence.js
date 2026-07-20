@@ -708,6 +708,32 @@ export function init(ctx) {
       evidenceEl.textContent = '';
     }
 
+    // Which recorded Constraint/Research artifacts the automated reviewer said it weighed. This has
+    // been persisted on the proposal since the reviewer attestation shipped but was never rendered,
+    // so "was this constraint actually considered?" meant curling the REST API. Note the careful
+    // wording below: the reviewer attests it LOOKED at these, not that the change complied with
+    // them — an approved proposal carries the same list whether a constraint was obeyed or departed
+    // from, so claiming more than "weighed" here would be a lie.
+    var consideredEl = $('considered-constraints');
+    if (consideredEl) {
+      var considered = p.consideredArtifactIds || [];
+      if (considered.length > 0) {
+        var items = '';
+        for (var ci = 0; ci < considered.length; ci++) {
+          items += '<li><code>' + esc(considered[ci]) + '</code></li>';
+        }
+        consideredEl.innerHTML =
+          '<div class="cc-title">Constraints weighed by the automated reviewer (' + considered.length + ')</div>'
+          + '<ul>' + items + '</ul>'
+          + '<div class="cc-hint">The reviewer reported checking these. That records what it looked at, '
+          + 'not that the change complied with them.</div>';
+        consideredEl.classList.remove('hidden');
+      } else {
+        consideredEl.innerHTML = '';
+        consideredEl.classList.add('hidden');
+      }
+    }
+
     if (parsedExec && execResultsEl) {
       execResultsEl.classList.remove('hidden');
       execResultsEl.innerHTML = renderExecResult(parsedExec);

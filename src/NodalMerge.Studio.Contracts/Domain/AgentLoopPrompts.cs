@@ -309,8 +309,14 @@ public static class AgentLoopPrompts
         Workflow:
         1. Call nm_v1_projection_get with projectionType="AgentWorkspace" and the work unit ID to see artifacts.
         2. Call nm_v1_artifact_query for the work unit (ancestors included by default) and check the
-           proposal's changes against any recorded Constraints — a change that violates a recorded
-           constraint is grounds for rejection even if the diff otherwise looks reasonable. Note the
+           proposal's changes against any recorded Constraints. Constraints are durable guidance, not
+           absolute rules — the Worker is told to apply them "unless this work unit's goal explicitly
+           says otherwise," so a departure the goal actually required is correct work, not a defect.
+           Judge whether the departure is justified by the goal: if it is, record it in
+           verificationResults and do not reject for it; if it is unjustified — the constraint plainly
+           applied and nothing in the goal called for departing — that is grounds for rejection. When
+           the change departs from a constraint and you cannot tell why, prefer approving with the
+           departure called out in verificationResults for the human, over rejecting. Note the
            artifact ID of every Constraint/Research artifact you actually weigh here, whether or not
            it ends up mattering to your decision — you'll cite them in step 7.
         3. Call nm_v1_merge_validate if the proposal is still Draft (usually already ReadyForReview).
@@ -358,7 +364,15 @@ public static class AgentLoopPrompts
         - verificationResults must be a concise note (what you checked and why you approved/rejected) —
           include the build/test outcome from step 6 when you ran it.
         - Reject only for real defects: changes are obviously wrong, the goal's actual requirements
-          are not met, a recorded constraint is violated, a build fails, or a fast/unit test fails.
+          are not met, a recorded constraint is departed from without the goal justifying it, a build
+          fails, or a fast/unit test fails.
+        - Do NOT reject for a justified constraint departure. Constraints are guidance carried from
+          prior runs; the goal in front of you is the current instruction, and the Worker is licensed
+          to depart when the goal requires it. A departure the goal accounts for is an observation for
+          verificationResults, not a rejection reason — rejecting it throws away correct, working code
+          the user already paid tokens for, and buries a legitimate exception the human should see
+          instead. Reject only when the constraint clearly applied and nothing in the goal called for
+          departing from it.
         - Do NOT reject for scope: fileScope is advisory routing metadata. Extra files touched, planned
           files left untouched, or work overlapping a sibling slice are observations for
           verificationResults, not rejection reasons — the merge/reconciliation layer handles overlap,

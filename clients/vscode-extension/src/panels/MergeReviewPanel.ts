@@ -24,6 +24,10 @@ export interface MergeProposal {
   filesTouched?: string[];
   noFileChangesJustification?: string | null;
   reviewNotes?: string | null;
+  // Constraint/Research artifact IDs the automated reviewer said it weighed when deciding this
+  // proposal. Persisted since the reviewer attestation shipped, but rendered nowhere until now —
+  // "was this constraint actually considered?" previously required curling the REST API.
+  consideredArtifactIds?: string[] | null;
   // True once this proposal's own apply actually redirected onto the shared "candidate" staging
   // branch (WorkspaceOptions.UsePromotionBranch). Distinct from targetBranch, which stays the
   // proposal's ultimate declared destination ("main") whether or not promotion is in play — see
@@ -848,6 +852,16 @@ const DC_CSS = `
   .file-change-body {
     border-top: 1px solid var(--nm-border);
   }
+  .considered-constraints {
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-left: 2px solid var(--vscode-panel-border);
+    font-size: 12px;
+    opacity: 0.9;
+  }
+  .considered-constraints .cc-title { font-weight: 600; margin-bottom: 4px; }
+  .considered-constraints .cc-hint { opacity: 0.75; margin-top: 4px; }
+  .considered-constraints ul { margin: 4px 0 0 16px; padding: 0; }
   .evidence-accepted {
     border-left: 3px solid var(--nm-success);
     padding: 8px 12px;
@@ -989,6 +1003,7 @@ const DC_HTML = `
       <h2>Evidence</h2>
       <div id="no-changes-banner" class="hidden no-changes-banner"></div>
       <div id="evidence-results"></div>
+      <div id="considered-constraints" class="hidden considered-constraints"></div>
       <div id="execution-results" class="hidden"></div>
       <h2 style="margin-top:14px">Build / Test / Run</h2>
       <div id="root-rows"></div>

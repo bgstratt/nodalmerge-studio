@@ -114,6 +114,17 @@ interface ConstraintView {
   enabled: boolean;
 }
 
+// GET /studio/artifacts/{id}/feedback — where a constraint has actually shown up. `surfaced` is every
+// time it was injected into an agent's projection; `consideredIn` is every proposal whose automated
+// reviewer cited it as weighed. Note what this cannot tell you: `consideredIn` records that the
+// reviewer looked, never whether the change complied — an Approved entry looks identical whether the
+// constraint was obeyed or departed from.
+interface ConstraintUsageView {
+  artifactId: string;
+  surfaced: { surfacedToAgentId?: string | null; projectionType?: string | null; occurredAt: string }[];
+  consideredIn: { proposalId: string; decision: string; occurredAt: string }[];
+}
+
 // A row of GET /studio/constraints/proposed — a work-unit-owned (lineage) constraint a domain observer
 // or agent recorded, eligible for human promotion to a shared global one. `promoted` is true once a
 // global constraint links back to it (so the UI badges it instead of re-offering the Promote button).
@@ -282,6 +293,24 @@ export class InsightsPanel {
       }
       case 'insightsLoadProposedConstraints': {
         await this.sendProposedConstraints();
+        return;
+      }
+      // GET /studio/artifacts/{id}/feedback has existed since the reviewer attestation shipped —
+      // its own comment says it exists so that "was this Constraint ever surfaced/acted on" doesn't
+      // require hand-querying the execution event stream — but no client had ever called it. Fetched
+      // per-constraint on demand rather than for the whole list on tab load, so opening the tab
+      // stays one request instead of N.
+      case 'insightsLoadConstraintUsage': {
+        const artifactId = msg.artifactId as string;
+        try {
+          const usage = await this.get<ConstraintUsageView>(
+            `/studio/artifacts/${encodeURIComponent(artifactId)}/feedback`);
+          void this.panel.webview.postMessage({ type: 'insightsConstraintUsage', artifactId, usage });
+        } catch (err) {
+          void this.panel.webview.postMessage({
+            type: 'insightsConstraintUsage', artifactId, error: String(err),
+          });
+        }
         return;
       }
       case 'insightsPromoteConstraint': {
@@ -558,6 +587,13 @@ const IN_CSS = `
   .in-constraint-title { font-weight: 600; }
   .in-constraint-body { font-size: 0.85em; opacity: 0.85; margin-top: 3px; white-space: pre-wrap; }
   .in-constraint-badges { display: flex; gap: 6px; margin-top: 5px; flex-wrap: wrap; align-items: center; }
+  .in-constraint-usage-btn { font-size: 0.8em; padding: 1px 6px; cursor: pointer; }
+  .in-constraint-usage { display: none; font-size: 0.82em; margin-top: 6px; padding: 6px 8px;
+    border-left: 2px solid var(--vscode-panel-border); opacity: 0.92; }
+  .in-constraint-usage.in-usage-open { display: block; }
+  .in-constraint-usage ul { margin: 3px 0 0 16px; padding: 0; }
+  .in-usage-line { margin-bottom: 2px; }
+  .in-usage-note, .in-usage-empty { opacity: 0.75; margin-top: 5px; }
   .in-constraint-scope { font-size: 0.78em; padding: 1px 4px; }
   .in-constraint-scope-label { font-size: 0.72em; opacity: 0.55; }
   .in-add-constraint { margin: 4px 0 12px; border: 1px solid var(--nm-border); border-radius: 4px; padding: 6px 10px; }
