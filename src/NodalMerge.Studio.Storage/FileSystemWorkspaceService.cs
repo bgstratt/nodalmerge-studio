@@ -187,7 +187,30 @@ internal sealed class FileSystemWorkspaceService(
             throw new InvalidOperationException(
                 $"File '{relativePath}' is {info.Length:N0} bytes, which exceeds the read limit of {options.MaxReadBytes:N0} bytes.");
 
-        return await File.ReadAllTextAsync(fullPath, ct).ConfigureAwait(false);
+        return await ReadWithRetryAsync(() => File.ReadAllTextAsync(fullPath, ct), ct).ConfigureAwait(false);
+    }
+
+    // The read-side twin of WriteAsync's retry, and for the same reason — see its comment. A write
+    // holds the file with FileAccess.Write; a reader opens with FileShare.Read, whose share mode does
+    // NOT admit that existing write handle, so a read overlapping an in-flight write fails with a
+    // sharing violation. WriteAsync already treats that overlap as transient rather than a real
+    // error; reads did not, so the identical moment of contention surfaced as a hard IOException to
+    // whoever happened to be reading — an agent reading a file a sibling worker is writing, the
+    // materializer snapshotting a branch mid-apply, or the reconciliation sweep refreshing a branch.
+    // Same bounded budget as the write path (5 attempts, 25/50/75/100ms), last attempt rethrows.
+    private static async Task<T> ReadWithRetryAsync<T>(Func<Task<T>> read, CancellationToken ct)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return await read().ConfigureAwait(false);
+            }
+            catch (IOException) when (attempt < 4)
+            {
+                await Task.Delay(25 * (attempt + 1), ct).ConfigureAwait(false);
+            }
+        }
     }
 
     // Byte-accurate read for the materialize/snapshot plumbing (see IFileWorkspaceService). No
@@ -201,7 +224,10 @@ internal sealed class FileSystemWorkspaceService(
         if (!File.Exists(fullPath))
             return null;
 
-        return await File.ReadAllBytesAsync(fullPath, ct).ConfigureAwait(false);
+        // Same transient-sharing-violation retry as ReadAsync — arguably more important here, since
+        // this feeds materialization and snapshotting, where a spurious failure aborts a snapshot
+        // rather than one agent tool call.
+        return await ReadWithRetryAsync(() => File.ReadAllBytesAsync(fullPath, ct), ct).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<WorkspaceFileRead>> ReadManyAsync(

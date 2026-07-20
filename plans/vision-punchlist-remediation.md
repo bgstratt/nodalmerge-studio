@@ -453,6 +453,23 @@ the rehydrated `_goalRouting` twin → survives host restart identically to toda
       a real `WorkerAgentLoop`, and the loop is still live (writing) when the test reads. Same family as the
       shutdown-contract bug: work outliving the awaited call. `ScopedTreeFetchTests` builds no host at all,
       so its failure is a third, separate cause. Both are now narrow enough to fix directly.
+- [x] **Workspace read-vs-write contention — FIXED 2026-07-20. A production bug, found via the flake.**
+      `WriteAsync` has always retried transient sharing violations, with a comment saying Windows write
+      handles are exclusive and a moment of overlap is *"not a real error"*. **The read path never got the
+      same treatment.** A writer holds `FileAccess.Write`; a reader opening with `FileShare.Read` cannot
+      share with that handle, so a read overlapping an in-flight write threw a hard `IOException` at
+      whoever was reading — an agent reading a file a sibling worker is writing, the materializer
+      snapshotting a branch mid-apply, the reconciliation sweep refreshing a branch. Not test-only.
+      `ReadAsync` and `ReadBytesAsync` now share `ReadWithRetryAsync` with the identical bounded budget
+      (5 attempts, 25/50/75/100ms, last rethrows). `ReadBytesAsync` matters more, not less — it feeds
+      materialization/snapshotting, where a spurious failure aborts a whole snapshot.
+      Tests: `FileSystemWorkspaceServiceReadContentionTests` (2) hold the file with `FileShare.None` —
+      strictly harsher than a real writer — for 120ms, inside the retry budget but longer than one
+      attempt, so the read must genuinely retry. **Verified load-bearing: both fail with the retry
+      disabled.**
+      *Authoring note:* the first version of these tests hung for 10 minutes rather than failing, because
+      the holder task threw on a wrong path **before** signalling its handshake. It now routes that
+      failure through `TrySetException` — a test that can hang instead of failing is worse than no test.
 - [ ] **Follow-ups this sweep exposed (not done):** (a) the 33 service-returning helpers still leak a host
       each; (b) `ReadBeforeWriteEnforcementTests` / `ScopedTreeFetchTests` intra-test races above; (c) the
       detector the flake investigation recommended — an assembly fixture failing the run on
