@@ -290,7 +290,43 @@ the rehydrated `_goalRouting` twin → survives host restart identically to toda
       Solution builds clean; Integration 737/738 (sole failure the pre-existing `MultiUserMilestoneTests`
       flake); AgentRuntime 109/109, Core 42/42, Contracts 24/24, Tasks 14/14, Projections 37/37, Merge 71/71.
       *Note: `ScopeVersion` must be bumped by any future scope mutator or the tiebreak silently regresses.*
-- [ ] Item 3 S2/S3 — injection status hygiene / enforcement `IPolicyRule` (optional)
+- [x] **Item 3 S2 — injection status hygiene — DONE 2026-07-20.** `IsInjectableConstraint` blocklist
+      (`Status is not (Invalidated|Rejected|Superseded) && InvalidatedByArtifactId is null`) applied at the
+      `ProjectionManager` injection fold, covering **both** the global and ancestor-chain arms. Deliberately
+      a blocklist, not an allowlist of {Active, Approved}: globals are created `Approved` and lineage
+      constraints `Active`, so an allowlist missing either would zero out the feature, and guidance is
+      advisory so failing open is the right default. Filter placed at the fold, **not** in
+      `GetGlobalConstraintsAsync` — that query also feeds `/studio/constraints/proposed`'s
+      `PromotedFromArtifactId` dedupe, where excluding invalidated globals would wrongly re-offer promotion.
+      **The arm that actually bites is the lineage one:** no product path moves a global off `Approved`,
+      but lineage constraints are created `Active` and *can* be retired (agent `nm_v1_artifact_invalidate`,
+      or the `InvalidateAsync` cascade stamping `InvalidatedByArtifactId`) — and were still being injected.
+      This also reconciles two surfaces that disagreed: `.workspace/constraints.json` already filtered by
+      `IsCurrent` while native prompt injection did not. Tests
+      `Retired_constraints_are_excluded_from_injection` + `Invalidated_ancestor_constraints_are_excluded_from_injection`;
+      **verified by neutering the predicate — exactly the 2 new tests fail, the other 3 pass.**
+      *Known gap (deliberate):* the *derived* "superseded by a newer artifact" relation is branch-relative
+      and only computable by the EngineeringState reverse index, so a constraint retired purely via another
+      artifact's `Supersedes` list still injects. Closing it means reusing that fold here — larger change.
+- [ ] **Item 3 S3 — hard enforcement — BLOCKED ON A PRODUCT DECISION, do not build as specified.**
+      S3 assumed "advisory→blocking = one new `IPolicyRule` over the constraint set." Investigation found
+      that is not buildable as written: **no machine-checkable field exists on a Constraint** (Title/Body are
+      free text; no predicate, pattern, rule-kind, severity, or tag), so a deterministic rule has nothing to
+      evaluate. The LLM path that *can* evaluate it is **already wired and already blocking** — the reviewer
+      is handed the constraints, `ReviewerAgentLoop` tells it "a change that violates a recorded Constraint
+      is grounds for rejection", and `AutoReviewRule` already fails the merge on rejection. An LLM-judge rule
+      would be a second, worse reviewer at the highest-blast-radius checkpoint.
+      **The blocking contradiction:** constraints are per-peer disableable (Phase 3 toggle,
+      `ProjectionManager` subtracts local disables), so a "blocking" policy would gate merges on a set that
+      **differs per machine**. `organizational-knowledge-and-workgroup-scope.md:238-240` wants hard
+      enforcement; `:186-190` and the injected prompt text deliberately preserve advisory framing. Resolve
+      *"can a constraint block a merge at all, or is per-peer opt-out the intended control surface?"* before
+      this has a well-defined target.
+      **If something concrete is wanted meanwhile:** a deterministic `ConstraintAttestationRule` at
+      `BeforeMerge`, off by default behind a `WorkspaceOptions` flag, asserting the applicable constraint set
+      ⊆ `MergeProposal.ConsideredArtifactIds` (already populated by `nm_v1_merge_review`). ~80 lines, zero new
+      domain fields. Honest framing: it proves each constraint was *weighed*, not *obeyed* — which is exactly
+      what the existing design already promises.
 - [ ] Items 1+2 R1 — `Hints` + `BindingProvenance` on `RepositoryV1`
 - [ ] Items 1+2 R2 — `RelinkAsync` (fresh hints, Auto/Manual, impact report)
 - [ ] Items 1+2 R3 — REST `/identity` dry-run + `/identity/relink`

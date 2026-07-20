@@ -106,6 +106,97 @@ public class AgentWorkspaceProjectionProfileTests : IDisposable
     }
 
     /// <summary>
+    /// Item 3 S2 (plans/vision-punchlist-remediation.md) — a retired constraint stops being injected.
+    /// The global arm is defensive (nothing in the product can currently move a global off Approved),
+    /// so the load-bearing assertion here is the FIRST one: an ordinary Approved constraint must still
+    /// inject. The filter is a blocklist precisely so it can't silently zero out the whole feature.
+    /// </summary>
+    [Fact]
+    public async Task Retired_constraints_are_excluded_from_injection()
+    {
+        await using var app = BuildTestApp();
+        await app.StartAsync();
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+        var projections = app.Services.GetRequiredService<IProjectionManager>();
+
+        var wu = await orchestrator.CreateWorkUnitAsync(goal: "g", owner: "o", repositoryId: "repoA");
+
+        ArtifactRef Constraint(string id) => new(
+            ArtifactId: id, Type: ArtifactType.Constraint, ParentArtifactId: null,
+            Status: ArtifactStatus.Approved, CreatedAt: DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null, Title: id, Body: "b",
+            RepositoryId: null, Reach: ArtifactReach.Workgroup);
+
+        await artifacts.RecordAsync(Constraint("c-live"));
+        await artifacts.RecordAsync(Constraint("c-invalidated"));
+        await artifacts.RecordAsync(Constraint("c-superseded"));
+        await artifacts.RecordAsync(Constraint("c-rejected"));
+
+        await artifacts.InvalidateAsync("c-invalidated", "no longer applies");
+        await artifacts.UpdateStatusAsync("c-superseded", ArtifactStatus.Superseded);
+        await artifacts.UpdateStatusAsync("c-rejected", ArtifactStatus.Rejected);
+
+        var result = await projections.GetAsync(new ProjectionRequest(
+            ProjectionType.AgentWorkspace, ProjectionLevel.Normal, WorkUnitId: wu.WorkUnitId));
+        var payload = JsonSerializer.Deserialize<AgentWorkspaceProjectionPayload>(
+            result.DataJson, JsonSerializerOptions.Web);
+
+        var ids = payload!.InheritedConstraints.Select(c => c.ArtifactId).ToHashSet();
+        Assert.Contains("c-live", ids);              // still Approved → still injected
+        Assert.DoesNotContain("c-invalidated", ids);
+        Assert.DoesNotContain("c-superseded", ids);
+        Assert.DoesNotContain("c-rejected", ids);
+    }
+
+    /// <summary>
+    /// Item 3 S2 — the arm that actually bites. Lineage (work-unit-owned) constraints are created
+    /// Active and CAN be retired in the product: an agent calling nm_v1_artifact_invalidate, or the
+    /// InvalidateAsync cascade stamping InvalidatedByArtifactId on a descendant when the artifact it
+    /// was derived from is invalidated. Both were still being injected into every descendant's prompt.
+    /// </summary>
+    [Fact]
+    public async Task Invalidated_ancestor_constraints_are_excluded_from_injection()
+    {
+        await using var app = BuildTestApp();
+        await app.StartAsync();
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+        var projections = app.Services.GetRequiredService<IProjectionManager>();
+
+        var parent = await orchestrator.CreateWorkUnitAsync(goal: "parent", owner: "o", repositoryId: "repoA");
+        var child = await orchestrator.CreateWorkUnitAsync(
+            goal: "child", owner: "o", repositoryId: "repoA", parentWorkUnitId: parent.WorkUnitId);
+
+        ArtifactRef Owned(string id, ArtifactType type, string? parentArtifactId) => new(
+            ArtifactId: id, Type: type, ParentArtifactId: parentArtifactId,
+            Status: ArtifactStatus.Active, CreatedAt: DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: parent.WorkUnitId, OwnedByAgentId: null, Title: id, Body: "b");
+
+        await artifacts.RecordAsync(Owned("lc-keep", ArtifactType.Constraint, null));
+        await artifacts.RecordAsync(Owned("lc-invalid", ArtifactType.Constraint, null));
+        // A constraint derived from a Research artifact — invalidating the Research cascades an
+        // InvalidatedByArtifactId stamp onto this constraint without changing its own Status.
+        await artifacts.RecordAsync(Owned("r-root", ArtifactType.Research, null));
+        await artifacts.RecordAsync(Owned("lc-cascade", ArtifactType.Constraint, "r-root"));
+
+        await artifacts.InvalidateAsync("lc-invalid", "retired directly");
+        await artifacts.InvalidateAsync("r-root", "research superseded");
+
+        var result = await projections.GetAsync(new ProjectionRequest(
+            ProjectionType.AgentWorkspace, ProjectionLevel.Normal, WorkUnitId: child.WorkUnitId));
+        var payload = JsonSerializer.Deserialize<AgentWorkspaceProjectionPayload>(
+            result.DataJson, JsonSerializerOptions.Web);
+
+        var ids = payload!.InheritedConstraints.Select(c => c.ArtifactId).ToHashSet();
+        Assert.Contains("lc-keep", ids);              // inherited from the ancestor, still live
+        Assert.DoesNotContain("lc-invalid", ids);     // Status == Invalidated
+        Assert.DoesNotContain("lc-cascade", ids);     // InvalidatedByArtifactId set by the cascade
+    }
+
+    /// <summary>
     /// Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — the Insights local toggle: a
     /// constraint disabled on this peer is subtracted from injection, without affecting any other
     /// constraint; re-enabling restores it. (Suppression is local — it never touches the shared copy.)
