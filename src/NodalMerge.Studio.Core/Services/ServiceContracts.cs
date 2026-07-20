@@ -1301,7 +1301,14 @@ public sealed record GoalRoutingConfig(
     // The goal's Default-profile lenient-tool-parsing setting — so a role that inherits Default
     // (no explicit StageCredentials entry) still honors it. Per-stage overrides carry their own
     // flag inside StageCredentials; this is only the Default fallback. See GetGoalDefaultCredentials.
-    bool LenientToolParsing = false);
+    bool LenientToolParsing = false,
+    // Scoped-worker credentials keyed by AgentProfileId — the LLM connection a file-scoped Execute/
+    // Plan profile (AgentProfile.ModelProfileId) runs on, resolved client-side at spawn. Twin of
+    // StageCredentials but keyed by profile instead of stage; consulted by GetCredentialsForProfile
+    // when FanOut/Planner deterministically route a slice to a bound profile. Persisted (key-only,
+    // no ApiKey survives — same as StageCredentials) so routing resolves after a restart.
+    // See plans/scoped-execute-workers-per-profile-models.md.
+    IReadOnlyDictionary<string, GoalDefaultCredentials>? ProfileCredentials = null);
 
 public interface IAgentControlService
 {
@@ -1321,6 +1328,11 @@ public interface IAgentControlService
         // The Default profile's lenient-tool-parsing setting — inherited by any role without an
         // explicit per-stage override in stageCredentials. See GoalDefaultCredentials.LenientToolParsing.
         bool lenientToolParsing = false,
+        // Scoped-worker credentials keyed by AgentProfileId — resolved client-side from each bound
+        // profile's Model Profile. Twin of stageCredentials, keyed by profile instead of stage; used
+        // by GetCredentialsForProfile when a file-scope match routes a slice to a bound profile. See
+        // plans/scoped-execute-workers-per-profile-models.md.
+        IReadOnlyDictionary<string, GoalDefaultCredentials>? profileCredentials = null,
         CancellationToken cancellationToken = default);
 
     // Runs one deterministic IGoalCoordinator convergence sweep for a goal/orchestrator-type work
@@ -1373,6 +1385,15 @@ public interface IAgentControlService
     /// callers fall back to <see cref="GetGoalDefaultCredentials"/> in that case.
     /// </summary>
     GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage);
+
+    /// <summary>
+    /// Per-profile credential override captured at orchestrator spawn time, keyed by AgentProfileId —
+    /// the LLM connection a file-scoped Execute/Plan profile (<see cref="AgentProfile.ModelProfileId"/>)
+    /// was bound to. Null when the matched profile declared no Model Profile binding, in which case
+    /// callers fall back to <see cref="GetCredentialsForStage"/> (the stage default). Twin of
+    /// GetCredentialsForStage; see plans/scoped-execute-workers-per-profile-models.md.
+    /// </summary>
+    GoalDefaultCredentials? GetCredentialsForProfile(string workUnitId, string profileId);
 
     /// <summary>
     /// Profile ID for the automated reviewer pre-gate, captured at orchestrator spawn time.

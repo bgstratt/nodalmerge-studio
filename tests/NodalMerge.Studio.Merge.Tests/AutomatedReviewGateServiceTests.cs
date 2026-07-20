@@ -370,6 +370,8 @@ public class AutomatedReviewGateServiceTests
 
         public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
 
+        public GoalDefaultCredentials? GetCredentialsForProfile(string workUnitId, string profileId) => null;
+
         public Task<string> SpawnAsync(
             string agentType,
             string workUnitId,
@@ -384,6 +386,7 @@ public class AutomatedReviewGateServiceTests
             IReadOnlyList<string>? enabledDomainAgents = null,
             string? credentialRef = null,
             bool lenientToolParsing = false,
+            IReadOnlyDictionary<string, GoalDefaultCredentials>? profileCredentials = null,
             CancellationToken cancellationToken = default) =>
             Task.FromResult("agent");
 

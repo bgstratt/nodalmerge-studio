@@ -81,7 +81,10 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? StageCredentials = null,
         IReadOnlyList<string>? EnabledDomainAgents = null,
         string? CredentialRef = null,
-        bool LenientToolParsing = false);
+        bool LenientToolParsing = false,
+        // Scoped-worker credentials keyed by AgentProfileId — twin of StageCredentials. See
+        // GetCredentialsForProfile / plans/scoped-execute-workers-per-profile-models.md.
+        IReadOnlyDictionary<string, GoalDefaultCredentials>? ProfileCredentials = null);
 
     // ── IHostedService ─────────────────────────────────────────────────────
 
@@ -735,6 +738,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         IReadOnlyList<string>? enabledDomainAgents = null,
         string? credentialRef = null,
         bool lenientToolParsing = false,
+        IReadOnlyDictionary<string, GoalDefaultCredentials>? profileCredentials = null,
         CancellationToken cancellationToken = default)
     {
         var agentId = $"{agentType}-{Guid.NewGuid():N}";
@@ -778,7 +782,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 // unchanged.
                 _goalCredentialRegistrations[workUnitId] = new GoalCredentialRegistration(
                     resolvedProvider, loopModel, baseUrl ?? string.Empty, apiKey ?? string.Empty, profileId, autoReviewProfileId,
-                    stageCredentials, enabledDomainAgents, credentialRef, lenientToolParsing);
+                    stageCredentials, enabledDomainAgents, credentialRef, lenientToolParsing, profileCredentials);
 
                 _credentialCache.Capture(credentialRef, resolvedProvider, loopModel, baseUrl, apiKey);
 
@@ -788,7 +792,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 // doesn't. See RehydrateGoalRoutingAsync for the read side.
                 var routing = new GoalRoutingConfig(
                     workUnitId, resolvedProvider, loopModel, baseUrl ?? string.Empty, profileId, autoReviewProfileId,
-                    credentialRef, stageCredentials, enabledDomainAgents, lenientToolParsing);
+                    credentialRef, stageCredentials, enabledDomainAgents, lenientToolParsing, profileCredentials);
                 _goalRouting[workUnitId] = routing;
                 await _nodeStore.WriteNodeAsync(
                     StudioNodeKind.GoalRoutingV1, workUnitId,
@@ -853,6 +857,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         IReadOnlyDictionary<PipelineStage, GoalDefaultCredentials>? stageCredentials = null;
         IReadOnlyList<string>? enabledDomainAgents = null;
         var lenientToolParsing = false;
+        IReadOnlyDictionary<string, GoalDefaultCredentials>? profileCredentials = null;
 
         // Same-process hot path first (real ApiKey already in memory, no cache lookup needed).
         if (_goalCredentialRegistrations.TryGetValue(workUnitId, out var reg))
@@ -862,6 +867,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             autoReviewProfileId = reg.AutoReviewProfileId;
             stageCredentials = reg.StageCredentials; enabledDomainAgents = reg.EnabledDomainAgents;
             lenientToolParsing = reg.LenientToolParsing;
+            profileCredentials = reg.ProfileCredentials;
         }
         else if (_goalRouting.TryGetValue(workUnitId, out var routing))
         {
@@ -876,6 +882,7 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
             autoReviewProfileId = routing.AutoReviewProfileId;
             stageCredentials = routing.StageCredentials; enabledDomainAgents = routing.EnabledDomainAgents;
             lenientToolParsing = routing.LenientToolParsing;
+            profileCredentials = routing.ProfileCredentials;
             var cached = _credentialCache.TryGet(credentialRef);
             apiKey ??= cached?.ApiKey;
             model ??= cached?.Model; baseUrl ??= cached?.BaseUrl; provider ??= cached?.Provider;
@@ -920,10 +927,10 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
         // can recover this orchestrator too, closing the gap that got it here in the first place.
         _goalCredentialRegistrations[workUnitId] = new GoalCredentialRegistration(
             provider, model, baseUrl, apiKey, profileId, autoReviewProfileId,
-            stageCredentials, enabledDomainAgents, credentialRef, lenientToolParsing);
+            stageCredentials, enabledDomainAgents, credentialRef, lenientToolParsing, profileCredentials);
         var routingToPersist = new GoalRoutingConfig(
             workUnitId, provider, model, baseUrl, profileId, autoReviewProfileId,
-            credentialRef, stageCredentials, enabledDomainAgents, lenientToolParsing);
+            credentialRef, stageCredentials, enabledDomainAgents, lenientToolParsing, profileCredentials);
         _goalRouting[workUnitId] = routingToPersist;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.GoalRoutingV1, workUnitId,
@@ -1018,6 +1025,26 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
         // Same CLI reconstruction as GetGoalDefaultCredentials above.
         return IsCliProviderSafe(stageRouting.Provider) ? stageRouting with { ApiKey = string.Empty } : null;
+    }
+
+    // Twin of GetCredentialsForStage, keyed by AgentProfileId — the LLM a file-scoped Execute/Plan
+    // profile was bound to (AgentProfile.ModelProfileId), resolved client-side at spawn. Null here
+    // means the matched profile declared no binding, so FanOut/Planner fall back to the stage default.
+    public GoalDefaultCredentials? GetCredentialsForProfile(string workUnitId, string profileId)
+    {
+        if (_goalCredentialRegistrations.TryGetValue(workUnitId, out var reg))
+            return reg.ProfileCredentials?.GetValueOrDefault(profileId);
+
+        if (!_goalRouting.TryGetValue(workUnitId, out var routing) ||
+            routing.ProfileCredentials?.GetValueOrDefault(profileId) is not { } profileRouting)
+            return null;
+
+        var cached = _credentialCache.TryGet(profileRouting.CredentialRef);
+        if (cached is not null)
+            return profileRouting with { ApiKey = cached.ApiKey };
+
+        // Same CLI reconstruction as GetCredentialsForStage above.
+        return IsCliProviderSafe(profileRouting.Provider) ? profileRouting with { ApiKey = string.Empty } : null;
     }
 
     // GetService, not GetRequiredService — same degrade-gracefully posture as every other gate

@@ -72,6 +72,10 @@
       {
         "command": "nodalmerge.reconcileBlobOrigin",
         "title": "NodalMerge: Reconcile Blob Origin"
+      },
+      {
+        "command": "nodalmerge.openSettings",
+        "title": "NodalMerge: Open Settings"
       }
     ],
     "configuration": {

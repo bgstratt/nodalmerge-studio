@@ -23,6 +23,7 @@ export class LauncherViewProvider implements vscode.WebviewViewProvider {
     const buttons: Array<[string, string]> = [
       ['Open Studio', COMMANDS.OPEN_STUDIO],
       ['Open Insights', COMMANDS.OPEN_INSIGHTS],
+      ['Settings', COMMANDS.OPEN_SETTINGS],
       ['Start Local Runtime', COMMANDS.START_LOCAL_RUNTIME],
       ['Restart Studio Host', COMMANDS.RESTART_HOST],
       ['Show Output', COMMANDS.SHOW_OUTPUT],

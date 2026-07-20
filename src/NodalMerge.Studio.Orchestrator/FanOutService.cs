@@ -486,6 +486,15 @@ public sealed class FanOutService : IFanOutService
                 UsedLlm: false)
             : await _profileSelection.SelectProfileAsync(child, creds, ct).ConfigureAwait(false);
 
+        // A file-scope-matched profile that bound its own Model Profile (AgentProfile.ModelProfileId)
+        // runs on *that* LLM instead of the Execute-stage default. Null when the profile declared no
+        // binding (or the selection came from the heuristic/LLM path, which doesn't carry a profile
+        // credential), so this cleanly falls back to the stage `creds` — exactly today's behavior.
+        // See plans/scoped-execute-workers-per-profile-models.md.
+        var effectiveCreds = matchedProfile is not null
+            ? _agentControl.GetCredentialsForProfile(parentWorkUnitId, matchedProfile.AgentProfileId) ?? creds
+            : creds;
+
         var policyContext = new Dictionary<string, object?>
         {
             ["workUnitId"] = child.WorkUnitId,
@@ -530,12 +539,12 @@ public sealed class FanOutService : IFanOutService
             child.WorkUnitId,
             selection.ProfileId,
             task.TaskId,
-            creds?.Model,
-            creds?.BaseUrl,
-            creds?.ApiKey,
-            creds?.Provider,
+            effectiveCreds?.Model,
+            effectiveCreds?.BaseUrl,
+            effectiveCreds?.ApiKey,
+            effectiveCreds?.Provider,
             sessionId,
-            creds?.CredentialRef,
+            effectiveCreds?.CredentialRef,
             ct).ConfigureAwait(false);
 
         // Slice 12d — fan-out child enqueue previously had no decision-log entry at all (it

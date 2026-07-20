@@ -60,7 +60,13 @@ public static class StudioRestEndpoints
         // The Default profile's lenient-tool-parsing setting (from the extension's orchCfg). Any role
         // that inherits Default — no per-stage entry in StageCredentials — picks this up. Per-stage
         // overrides carry their own flag inside StageCredentials.
-        bool LenientToolParsing = false);
+        bool LenientToolParsing = false,
+        // Scoped-worker credentials keyed by AgentProfileId — the extension resolves each file-scoped
+        // Execute/Plan profile's bound Model Profile (AgentProfile.ModelProfileId) to a connection and
+        // ships it here, parallel to StageCredentials. Consumed by GetCredentialsForProfile when a
+        // file-scope match routes a slice to that profile. See
+        // plans/scoped-execute-workers-per-profile-models.md.
+        Dictionary<string, StageCredentialDto>? ProfileCredentials = null);
 
     private sealed record StageCredentialDto(string Provider, string Model, string BaseUrl, string ApiKey, string? CredentialRef = null, bool LenientToolParsing = false);
 
@@ -118,7 +124,8 @@ public static class StudioRestEndpoints
         int MaxIterations,
         IReadOnlyList<string>? FileScopePatterns = null,
         string? Executor = null,
-        bool InjectApiKeyEnv = false);
+        bool InjectApiKeyEnv = false,
+        string? ModelProfileId = null);
 
     private sealed record UpdateAgentProfileBody(
         string Name,
@@ -128,7 +135,8 @@ public static class StudioRestEndpoints
         int MaxIterations,
         IReadOnlyList<string>? FileScopePatterns = null,
         string? Executor = null,
-        bool InjectApiKeyEnv = false);
+        bool InjectApiKeyEnv = false,
+        string? ModelProfileId = null);
 
     private sealed record MarkKnownGoodBody(
         string BranchId,
@@ -1858,10 +1866,22 @@ public static class StudioRestEndpoints
                 stageCredentials = resolved;
             }
 
+            // Scoped-worker credentials, keyed by AgentProfileId — same DTO shape as StageCredentials
+            // but the key is the bound profile's id (no enum parse). See GetCredentialsForProfile.
+            IReadOnlyDictionary<string, GoalDefaultCredentials>? profileCredentials = null;
+            if (body.ProfileCredentials is { Count: > 0 })
+            {
+                var resolved = new Dictionary<string, GoalDefaultCredentials>();
+                foreach (var (agentProfileId, dto) in body.ProfileCredentials)
+                    resolved[agentProfileId] = new GoalDefaultCredentials(dto.Provider, dto.Model, dto.BaseUrl, dto.ApiKey, agentProfileId, dto.CredentialRef, dto.LenientToolParsing);
+                profileCredentials = resolved;
+            }
+
             var agentId = await agents.SpawnAsync(
                 body.AgentType, body.WorkUnitId, body.TaskId, body.Model, body.BaseUrl, body.ApiKey,
                 body.Provider, body.ProfileId, body.AutoReviewProfileId, stageCredentials,
-                body.EnabledDomainAgents, body.CredentialRef, body.LenientToolParsing, ct).ConfigureAwait(false);
+                body.EnabledDomainAgents, body.CredentialRef, body.LenientToolParsing,
+                profileCredentials, ct).ConfigureAwait(false);
             return Results.Ok(new { agentId, agentType = body.AgentType, workUnitId = body.WorkUnitId, branchId = wu.BranchId });
         });
 
@@ -3403,7 +3423,8 @@ public static class StudioRestEndpoints
                 body.MaxIterations > 0 ? body.MaxIterations : 20,
                 body.FileScopePatterns ?? [],
                 body.Executor,
-                body.InjectApiKeyEnv);
+                body.InjectApiKeyEnv,
+                body.ModelProfileId);
             var created = await profiles.CreateAsync(profile, ct).ConfigureAwait(false);
             return Results.Ok(created);
         });
@@ -3427,7 +3448,8 @@ public static class StudioRestEndpoints
                     body.MaxIterations > 0 ? body.MaxIterations : 20,
                     body.FileScopePatterns ?? [],
                     body.Executor,
-                    body.InjectApiKeyEnv);
+                    body.InjectApiKeyEnv,
+                    body.ModelProfileId);
                 var updated = await profiles.UpdateAsync(profile, ct).ConfigureAwait(false);
                 return Results.Ok(updated);
             }

@@ -244,6 +244,7 @@ public class ControlPlaneIdempotencyTests
             IReadOnlyList<string>? enabledDomainAgents = null,
             string? credentialRef = null,
             bool lenientToolParsing = false,
+            IReadOnlyDictionary<string, GoalDefaultCredentials>? profileCredentials = null,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
 
         public Task ReinvokeOrchestratorAsync(string workUnitId, string? sessionId = null, string? overrideModel = null, string? overrideBaseUrl = null, string? overrideApiKey = null, string? overrideProvider = null, string? overrideProfileId = null, string? overrideCredentialRef = null, bool ensurePlanner = false, CancellationToken cancellationToken = default)
@@ -257,6 +258,7 @@ public class ControlPlaneIdempotencyTests
 
         public GoalDefaultCredentials? GetGoalDefaultCredentials(string workUnitId) => null;
         public GoalDefaultCredentials? GetCredentialsForStage(string workUnitId, PipelineStage stage) => null;
+        public GoalDefaultCredentials? GetCredentialsForProfile(string workUnitId, string profileId) => null;
         public string? GetAutoReviewProfileId(string workUnitId) => null;
         public string? GetGoalDefaultProfileId(string workUnitId) => null;
         public IReadOnlyList<string>? GetEnabledDomainAgents(string workUnitId) => null;
