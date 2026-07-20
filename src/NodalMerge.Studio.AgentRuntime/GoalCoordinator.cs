@@ -168,10 +168,17 @@ internal sealed class GoalCoordinator(IServiceProvider serviceProvider, ILogger<
         // is auto/unset (an explicit per-stage assignment is never second-guessed). Reconciliation
         // units use the Reconcile stage instead and skip planner selection entirely — there is no
         // planning decision to make.
+        // Credential registrations are keyed by the goal ROOT work unit (written once at spawn), so
+        // every lookup below resolves against the root rather than this unit. Planning is not always
+        // at the root — a reconciliation or sub-plan unit gets its planner ensured here too, and
+        // keying by its own id found nothing, skipping the enqueue with a "no credentials
+        // registered" warning. Same walk FanOutService uses on the Execute path; for a root goal
+        // this is workUnitId unchanged.
+        var credRootId = await ResolveCredentialRootAsync(workUnits, workUnitId, ct).ConfigureAwait(false);
         var agentControl = serviceProvider.GetService<IAgentControlService>();
         var stageCreds = agentControl?.GetCredentialsForStage(
-            workUnitId, isReconciliation ? PipelineStage.Reconcile : PipelineStage.Plan);
-        var defaultCreds = agentControl?.GetGoalDefaultCredentials(workUnitId);
+            credRootId, isReconciliation ? PipelineStage.Reconcile : PipelineStage.Plan);
+        var defaultCreds = agentControl?.GetGoalDefaultCredentials(credRootId);
         var profileId = isReconciliation ? "reconciler" : "planner";
         string? selectedProvider = null;
         // The bound Model Profile of a file-scope-matched Plan profile — same per-profile LLM binding
@@ -187,7 +194,7 @@ internal sealed class GoalCoordinator(IServiceProvider serviceProvider, ILogger<
             var selection = await plannerSelection.SelectPlannerAsync(unit, defaultCreds, ct).ConfigureAwait(false);
             profileId = selection.ProfileId;
             selectedProvider = selection.Provider;
-            profileCreds = agentControl?.GetCredentialsForProfile(workUnitId, profileId);
+            profileCreds = agentControl?.GetCredentialsForProfile(credRootId, profileId);
         }
 
         var creds = stageCreds ?? profileCreds ?? defaultCreds;
@@ -218,6 +225,24 @@ internal sealed class GoalCoordinator(IServiceProvider serviceProvider, ILogger<
             [workUnitId],
             $"Enqueued {(isReconciliation ? "reconciler" : "planner")} (profile '{profileId}') for goal start.",
             sessionId, ct).ConfigureAwait(false);
+    }
+
+    // Walk to the goal root, where every credential registration is keyed. Bounded (a malformed
+    // parent cycle stops at 32 hops); a missing parent mid-walk stops and uses the last id resolved.
+    // Mirrors FanOutService.ResolveCredentialRootAsync — see the note there for why the immediate
+    // work unit is the wrong key.
+    private static async Task<string> ResolveCredentialRootAsync(
+        IWorkUnitService workUnits, string workUnitId, CancellationToken ct)
+    {
+        var rootId = workUnitId;
+        for (var depth = 0; depth < 32; depth++)
+        {
+            var unit = await workUnits.GetAsync(rootId, ct).ConfigureAwait(false);
+            if (unit?.ParentWorkUnitId is not { } parentId)
+                break;
+            rootId = parentId;
+        }
+        return rootId;
     }
 
     private async Task RecordDecisionAsync(

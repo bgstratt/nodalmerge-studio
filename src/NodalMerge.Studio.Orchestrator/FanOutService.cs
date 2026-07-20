@@ -120,8 +120,9 @@ public sealed class FanOutService : IFanOutService
                     actions.Add(FanOutAction.ChildrenCreated);
             }
 
-            var creds = _agentControl.GetCredentialsForStage(parentWorkUnitId, PipelineStage.Execute)
-                ?? _agentControl.GetGoalDefaultCredentials(parentWorkUnitId);
+            var credRootId = await ResolveCredentialRootAsync(parentWorkUnitId, ct).ConfigureAwait(false);
+            var creds = _agentControl.GetCredentialsForStage(credRootId, PipelineStage.Execute)
+                ?? _agentControl.GetGoalDefaultCredentials(credRootId);
             var children = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
             foreach (var child in children)
             {
@@ -137,7 +138,7 @@ public sealed class FanOutService : IFanOutService
 
                 await RefreshBranchFromDependenciesAsync(sequenced, parent.BranchId, ct).ConfigureAwait(false);
 
-                if (await EnqueueChildWorkerAsync(sequenced, parentWorkUnitId, creds, sessionId, ct).ConfigureAwait(false))
+                if (await EnqueueChildWorkerAsync(sequenced, parentWorkUnitId, credRootId, creds, sessionId, ct).ConfigureAwait(false))
                 {
                     actions.Add(FanOutAction.ChildEnqueued);
                     enqueued.Add(sequenced.WorkUnitId);
@@ -447,6 +448,7 @@ public sealed class FanOutService : IFanOutService
     private async Task<bool> EnqueueChildWorkerAsync(
         WorkUnit child,
         string parentWorkUnitId,
+        string credRootId,
         GoalDefaultCredentials? creds,
         string? sessionId,
         CancellationToken ct)
@@ -492,7 +494,7 @@ public sealed class FanOutService : IFanOutService
         // credential), so this cleanly falls back to the stage `creds` — exactly today's behavior.
         // See plans/scoped-execute-workers-per-profile-models.md.
         var effectiveCreds = matchedProfile is not null
-            ? _agentControl.GetCredentialsForProfile(parentWorkUnitId, matchedProfile.AgentProfileId) ?? creds
+            ? _agentControl.GetCredentialsForProfile(credRootId, matchedProfile.AgentProfileId) ?? creds
             : creds;
 
         var policyContext = new Dictionary<string, object?>
@@ -571,6 +573,30 @@ public sealed class FanOutService : IFanOutService
             ct).ConfigureAwait(false);
 
         return true;
+    }
+
+    // Credential registrations — stage, goal-default, and the per-profile bindings behind
+    // GetCredentialsForProfile — are all written once at orchestrator spawn, keyed by the GOAL ROOT
+    // work unit. Resolving them by the immediate parent only ever worked for a root's direct
+    // children: a deeper fan-out (an orchestrator-type child, typically a reconciliation or sub-plan
+    // unit, fanning out its own children via GoalCoordinator's rescue sweep) has an intermediate
+    // unit as its parent, found no registration, and silently enqueued with *no* credentials at all
+    // — not even the stage default, since that lookup is keyed the same way. Walking to the root
+    // makes every depth resolve the one registration that exists. For a root's direct children this
+    // returns parentWorkUnitId unchanged, so depth-1 behavior is identical to before.
+    // Bounded like ContinueService.ResolveGoalSessionIdAsync's walk; a missing parent mid-walk stops
+    // and uses the last id resolved.
+    private async Task<string> ResolveCredentialRootAsync(string workUnitId, CancellationToken ct)
+    {
+        var rootId = workUnitId;
+        for (var depth = 0; depth < 32; depth++)
+        {
+            var unit = await _workUnits.GetAsync(rootId, ct).ConfigureAwait(false);
+            if (unit?.ParentWorkUnitId is not { } parentId)
+                break;
+            rootId = parentId;
+        }
+        return rootId;
     }
 
     // Slice 14c — "matches every path" means every entry in the child's fileScope is covered by
