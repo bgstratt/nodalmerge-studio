@@ -125,7 +125,21 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
 
         if (status is WorkUnitStatus.Completed or WorkUnitStatus.Merged)
         {
-            _ = GraphPromoter?.TryPromoteStudioCheckpointAsync(updated.RepositoryId);
+            // Deferred, but tracked (plans/vision-punchlist-remediation.md, shutdown contract): this
+            // used to be an untracked fire-and-forget that could still be writing after the host had
+            // been disposed.
+            var promotionRepositoryId = updated.RepositoryId;
+            if (_serviceProvider?.GetService<IStudioBackgroundWork>() is { } queue)
+            {
+                queue.Enqueue(
+                    "workunit/promote-studio-checkpoint",
+                    _ => GraphPromoter?.TryPromoteStudioCheckpointAsync(promotionRepositoryId)
+                        ?? Task.CompletedTask);
+            }
+            else
+            {
+                _ = GraphPromoter?.TryPromoteStudioCheckpointAsync(promotionRepositoryId);
+            }
         }
 
         _eventBus?.Publish(new WorkUnitStatusChangedEvent(workUnitId, previousStatus, status, DateTimeOffset.UtcNow));

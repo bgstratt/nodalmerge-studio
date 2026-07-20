@@ -24,7 +24,7 @@ public class FileLeaseConflictIntegrationTests
         const string path = "src/Shared.cs";
         var fakeHandler = new FileLeaseConflictLlmHandler { Path = path };
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());
@@ -157,7 +157,7 @@ public class FileLeaseConflictIntegrationTests
         const string sessionId = "SES-lease-contention-1";
         var fakeHandler = new FileLeaseConflictLlmHandler { Path = path };
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());
@@ -250,7 +250,7 @@ public class FileLeaseConflictIntegrationTests
         const string path = "src/Shared.cs";
         var fakeHandler = new FileLeaseConflictLlmHandler { Path = path };
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());

@@ -318,6 +318,14 @@ public class MultiUserMilestoneTests : IDisposable
         {
             await hostB.StopAsync();
             hostB.Dispose();
+
+            // Stop A explicitly rather than relying on `await using` alone. IHost.DisposeAsync
+            // disposes the container but does NOT run hosted services' StopAsync, which is where the
+            // background work queue drains the deferred writes ApplyAsync above just queued (the
+            // goal-final stamp and the integration checkpoint). Without this the test could reach
+            // Dispose() -> Directory.Delete while a checkpoint was still writing to hostA/nodes.db,
+            // which is exactly the IOException this suite kept flaking on.
+            await hostA.StopAsync();
         }
     }
 

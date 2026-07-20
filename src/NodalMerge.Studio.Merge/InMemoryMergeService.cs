@@ -13,6 +13,24 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, MergeProposal> _proposals = new();
     private readonly IStudioNodeStore _nodeStore;
+
+    // plans/vision-punchlist-remediation.md (shutdown contract) — deferred durable follow-ups run on
+    // the tracked queue so they are drained at shutdown instead of abandoned mid-write. Resolved
+    // lazily through the service provider, matching how IWorkUnitService/IWorkScheduler are handled
+    // above, so the many direct (non-DI) test constructions of this service need no changes.
+    private void RunDeferred(string name, Func<CancellationToken, Task> work)
+    {
+        if (_serviceProvider?.GetService<IStudioBackgroundWork>() is { } queue)
+        {
+            queue.Enqueue(name, work);
+            return;
+        }
+
+        // No queue available (direct construction in a test) — keep the previous behavior rather
+        // than silently skipping the write.
+        _ = Task.Run(() => work(CancellationToken.None), CancellationToken.None);
+    }
+
     private readonly IBlobStoreProvider? _blobStore;
     private readonly IFileWorkspaceService _fileWorkspace;
     private readonly WorkspaceOptions _workspaceOptions;
@@ -798,28 +816,34 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         // Phase 4 (plans/first-class-goals-and-materialization.md): when this apply promoted the
         // integrated state to disk, that snapshot IS the goal's latest final state — stamp it onto the
-        // owning goal's GoalNode.FinalSnapshotId (last apply wins → the true final). Fire-and-forget on
+        // owning goal's GoalNode.FinalSnapshotId (last apply wins → the true final). Deferred on
         // purpose: the stamp is a materialization convenience and must never add latency to the apply
         // response (an extra repo-scoped node write can be slow on a large room) nor be cancelled when
-        // the caller aborts. Uses CancellationToken.None so it still completes past a client timeout.
+        // the caller aborts — so it survives a client timeout. It now rides the tracked background
+        // queue instead of an untracked Task.Run, so shutdown drains it rather than tearing it in half.
         if (promotedToDisk && !string.IsNullOrEmpty(appliedSnapshotId))
         {
             var stampWorkUnit = owningWorkUnit;
             var stampSnapshotId = appliedSnapshotId;
-            _ = Task.Run(() => TryStampGoalFinalSnapshotAsync(stampWorkUnit, stampSnapshotId, CancellationToken.None));
+            RunDeferred(
+                "merge/stamp-goal-final-snapshot",
+                ct => TryStampGoalFinalSnapshotAsync(stampWorkUnit, stampSnapshotId, ct));
         }
 
         // Integration checkpoint (plans/room-snapshot-checkpoint-redesign.md): a merge landing on
         // disk is the "last known good" boundary (lines up with a git commit / PR), so mint one
         // full-room snapshot for the repo room here. This is the ONLY place — besides the disconnect
         // flush — a full-room snapshot is taken now; per-write durability rides incremental deltas, so
-        // this bounds the delta chain the next hydrate replays. Fire-and-forget on CancellationToken.None
-        // for the same reason as the goal-final stamp above: it must never add latency to the apply
-        // response nor be cancelled when the caller aborts.
+        // this bounds the delta chain the next hydrate replays. Deferred for the same reason as the
+        // goal-final stamp above (never add latency to the apply response, survive a caller abort) and,
+        // like it, drained at shutdown — this write IS the durability boundary, so abandoning it
+        // half-finished on process exit is precisely the failure it exists to prevent.
         if (promotedToDisk && !string.IsNullOrWhiteSpace(updated.RepositoryId))
         {
             var checkpointRepositoryId = updated.RepositoryId;
-            _ = Task.Run(() => _nodeStore.CheckpointRepositoryRoomAsync(checkpointRepositoryId, CancellationToken.None));
+            RunDeferred(
+                "merge/checkpoint-repository-room",
+                ct => _nodeStore.CheckpointRepositoryRoomAsync(checkpointRepositoryId, ct));
         }
 
         // A reconciliation work unit's own proposal just landed — generic across every source

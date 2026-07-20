@@ -3240,3 +3240,21 @@ public interface IBlobGcService
 
     Task<IReadOnlyList<BlobGcRunRecord>> GetRecentRunsAsync(int limit = 20, CancellationToken ct = default);
 }
+
+// plans/vision-punchlist-remediation.md (shutdown contract) — the single seam for deferred durable
+// work: follow-up writes that must not add latency to the response that triggered them, but must
+// still be awaited at shutdown instead of abandoned mid-write.
+//
+// This replaces a family of `_ = Task.Run(..., CancellationToken.None)` calls that were
+// unshutdownable by construction — nothing could await them and no token could cancel them, so a
+// host could dispose with a half-written checkpoint still in flight.
+public interface IStudioBackgroundWork
+{
+    // Returns immediately. `name` is for logging only. Work that throws is logged, never rethrown —
+    // the caller has already returned, so there is nobody left to observe it.
+    void Enqueue(string name, Func<CancellationToken, Task> work);
+
+    // Test/diagnostic hook: completes when nothing is queued or in flight. True if drained, false
+    // if the timeout elapsed first.
+    Task<bool> WaitForDrainAsync(TimeSpan timeout, CancellationToken cancellationToken = default);
+}
