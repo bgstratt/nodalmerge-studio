@@ -74,6 +74,10 @@
         "title": "NodalMerge: Reconcile Blob Origin"
       },
       {
+        "command": "nodalmerge.relinkRepository",
+        "title": "NodalMerge: Re-link Repository…"
+      },
+      {
         "command": "nodalmerge.openSettings",
         "title": "NodalMerge: Open Settings"
       }

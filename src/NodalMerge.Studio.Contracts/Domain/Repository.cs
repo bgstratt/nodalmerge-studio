@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace NodalMerge.Studio.Contracts.Domain;
 
 // Slice 6.2 (plans/cas-distribution-and-storage.md Phase 6, D1/D2; docs/STUDIO_ROOM_SCHEMA.md (b))
@@ -51,13 +53,48 @@ public sealed record RepositoryDisambiguationPendingV1(
 // PendingDisambiguation is set instead of WorkgroupRepoId when the most recent bind attempt
 // couldn't resolve automatically (fork ambiguity with no remote tiebreak, or genuinely degraded
 // hints against more than zero registered candidates) — see RepositoryMatchResult.NeedsDisambiguation.
+// How a repository's current WorkgroupRepoId came to be — recorded explicitly rather than inferred,
+// so a user-initiated re-link (plans/vision-punchlist-remediation.md, Items 1+2) can tell a settled
+// deterministic binding from a provisional guid it should offer to converge, and can leave a binding
+// a human explicitly chose alone. Null on rows written before this existed.
+// Serialized as a string, deliberately, on both planes. Over HTTP the host already registers
+// JsonStringEnumConverter, so a numeric-by-default enum would round-trip inconsistently (the REST
+// list emits a name, a strongly-typed client reading it back with default options cannot parse it).
+// More importantly this value is *persisted* on RepositoryV1: as a bare ordinal, inserting a member
+// into the middle of this enum later would silently change what every stored row means. A name is
+// self-describing and survives reordering.
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum RepositoryBindingProvenance
+{
+    // Derived from the root-SHA set — two clones of one repo compute this identically, so it is
+    // already canonical and a re-link has nothing to converge.
+    Deterministic,
+
+    // A minted guid, because the signal was degraded (shallow/empty/no-HEAD clone → no root SHA) or
+    // the deterministic id was already taken locally by a different fork. These are the bindings
+    // that stay divergent forever without a re-link, and the only ones Auto mode will move.
+    ProvisionalMint,
+
+    // A human explicitly chose this binding (disambiguation resolve, or a manual re-link). Never
+    // moved automatically — that is exactly D2's concern about second-guessing a settled decision.
+    HumanResolved,
+}
+
 public sealed record RepositoryV1(
     string RepositoryId,
     string Path,
     string? Label,
     DateTimeOffset RegisteredAt,
     string? WorkgroupRepoId = null,
-    RepositoryDisambiguationPendingV1? PendingDisambiguation = null);
+    RepositoryDisambiguationPendingV1? PendingDisambiguation = null,
+    // The identity hints this binding was made from, persisted so the current binding can be shown
+    // and compared without re-reading git. A user-initiated re-link deliberately DOES re-read git
+    // (that is the point — a clone that was shallow at register time may since have gained its root
+    // history, and only a fresh read can converge it), but everything else reads this cached copy.
+    RepositoryIdentityHints? Hints = null,
+    // Null on rows written before this field existed — treated as "unknown provenance", which Auto
+    // re-link handles conservatively (see RepositoryRegistryService.RelinkAsync).
+    RepositoryBindingProvenance? Provenance = null);
 
 // Cross-repo file reference — a pointer to a file in a *different* registered repository than the
 // one a work unit is actually seeded from, used for read-only context (style/examples) during a

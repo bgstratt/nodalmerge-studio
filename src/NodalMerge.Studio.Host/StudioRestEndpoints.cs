@@ -5210,6 +5210,14 @@ public static class StudioRestEndpoints
     // IRepositoryRegistryService.ResolveDisambiguationAsync's own doc comment).
     private sealed record ResolveIdentityDisambiguationBody(string? ChosenRepoId = null);
 
+    // plans/vision-punchlist-remediation.md (Items 1+2). Mode is "auto" or "manual". Commit defaults
+    // true; pass false for a preview — same evaluation, no writes — which is how the client shows the
+    // user what would change (and what would stop appearing) before asking them to confirm.
+    private sealed record RelinkIdentityBody(
+        string? Mode = null,
+        string? ChosenRepoId = null,
+        bool Commit = true);
+
     private static void MapRepositoryEndpoints(WebApplication app)
     {
         // List known repositories (mirrors nm_v1_repository_list) — used by the VS Code extension's
@@ -5335,6 +5343,14 @@ public static class StudioRestEndpoints
             {
                 repositoryId = repository.RepositoryId,
                 workgroupRepoId = repository.WorkgroupRepoId,
+                // plans/vision-punchlist-remediation.md (Items 1+2) — how this binding came to be, and
+                // the hints it was made from. Read straight off the persisted record: this endpoint
+                // stays cheap and never touches git. The re-link preview (POST .../identity/relink
+                // with commit=false) is the thing that re-reads.
+                provenance = repository.Provenance?.ToString(),
+                hints = repository.Hints is null
+                    ? null
+                    : new { rootShas = repository.Hints.RootShas, remotes = repository.Hints.Remotes },
                 pendingDisambiguation = repository.PendingDisambiguation is null
                     ? null
                     : new
@@ -5365,6 +5381,72 @@ public static class StudioRestEndpoints
                     return Results.NotFound(new { error = $"Repository '{repositoryId}' was not found." });
 
                 return Results.Ok(new { repositoryId = resolved.RepositoryId, workgroupRepoId = resolved.WorkgroupRepoId });
+            }
+            catch (ArgumentException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        // plans/vision-punchlist-remediation.md (Items 1+2) — USER-INITIATED re-link. Unlike
+        // .../identity/resolve above, which only acts on a *pending* disambiguation, this works on an
+        // already-settled binding: the two-clones-diverged case, and the shallow-clone-since-fetched
+        // case. Nothing calls it automatically — re-resolution never runs on an inbound pack, a timer,
+        // or startup — which is what makes re-reading git inside it safe.
+        //
+        // mode=auto commits only an unambiguous match and never moves a human-chosen binding;
+        // mode=manual commits chosenRepoId (or "register-new" to split into a fresh room).
+        // commit=false previews: same evaluation, no writes, including the impact report of what
+        // would stop appearing.
+        app.MapPost("/studio/repositories/{repositoryId}/identity/relink", async (
+            string repositoryId,
+            RelinkIdentityBody? body,
+            IRepositoryRegistryService repositories,
+            CancellationToken ct) =>
+        {
+            var mode = string.Equals(body?.Mode, "manual", StringComparison.OrdinalIgnoreCase)
+                ? RepositoryRelinkMode.Manual
+                : RepositoryRelinkMode.Auto;
+
+            try
+            {
+                var result = await repositories
+                    .RelinkAsync(repositoryId, mode, body?.ChosenRepoId, body?.Commit ?? true, ct)
+                    .ConfigureAwait(false);
+
+                if (result is null)
+                    return Results.NotFound(new { error = $"Repository '{repositoryId}' was not found." });
+
+                return Results.Ok(new
+                {
+                    repositoryId = result.RepositoryId,
+                    currentWorkgroupRepoId = result.CurrentWorkgroupRepoId,
+                    proposedWorkgroupRepoId = result.ProposedWorkgroupRepoId,
+                    committed = result.Committed,
+                    provenance = result.Provenance?.ToString(),
+                    explanation = result.Explanation,
+                    candidates = result.Candidates.Select(c => new
+                    {
+                        repoId = c.RepoId,
+                        label = c.Label,
+                        hints = new { rootShas = c.Hints.RootShas, remotes = c.Hints.Remotes },
+                    }),
+                    // Null when the binding would not move. When present, these are the nodes in the
+                    // room this repository is leaving — they are not deleted, but they do drop out of
+                    // the read fan-out, so the caller must show this before committing.
+                    impact = result.Impact is null
+                        ? null
+                        : new
+                        {
+                            roomId = result.Impact.RoomId,
+                            totalNodes = result.Impact.TotalNodes,
+                            countsByKind = result.Impact.CountsByKind,
+                        },
+                });
             }
             catch (ArgumentException ex)
             {

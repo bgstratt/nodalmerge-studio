@@ -210,6 +210,18 @@ public interface IStudioNodeStore
     // NodalMergeStudioNodeStore overrides it with a real per-repo-room snapshot.
     Task CheckpointRepositoryRoomAsync(string repositoryId, CancellationToken cancellationToken = default) =>
         Task.CompletedTask;
+
+    // plans/vision-punchlist-remediation.md (Items 1+2) — per-kind node counts inside ONE repo room,
+    // addressed by its workgroup repo id (i.e. the room is repo/{workgroupRepoId}). Re-linking a
+    // repository re-points future reads and writes at a different room, and nothing moves the content
+    // already written to the old one — it simply drops out of the read fan-out. This is what lets the
+    // re-link flow tell the user what will stop appearing BEFORE they commit, instead of silently
+    // orphaning it. Default returns empty so test doubles are unaffected; only
+    // NodalMergeStudioNodeStore enumerates a real room.
+    Task<IReadOnlyDictionary<string, int>> CountRepoRoomNodesByKindAsync(
+        string workgroupRepoId, CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyDictionary<string, int>>(
+            new Dictionary<string, int>(StringComparer.Ordinal));
 }
 
 // Implements IStudioLocalLogStore as well as IStudioNodeStore over the same (kind, id) map so the

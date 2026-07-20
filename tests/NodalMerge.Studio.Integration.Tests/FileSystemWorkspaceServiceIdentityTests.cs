@@ -50,6 +50,7 @@ public class FileSystemWorkspaceServiceIdentityTests
     {
         public Task<RepositoryV1> RegisterAsync(string path, string? label, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<RepositoryV1?> ResolveDisambiguationAsync(string repositoryId, string? chosenRepoId, CancellationToken ct = default) => throw new NotSupportedException();
+        public Task<RepositoryRelinkResult?> RelinkAsync(string repositoryId, RepositoryRelinkMode mode, string? chosenRepoId = null, bool commit = true, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<RepositoryV1> CreateAsync(string path, string? label, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<RepositoryV1> CloneAsync(string url, string targetPath, string? label, CancellationToken ct = default) => throw new NotSupportedException();
         public Task<string?> ReadFileAsync(string repositoryId, string relativePath, CancellationToken ct = default) => throw new NotSupportedException();

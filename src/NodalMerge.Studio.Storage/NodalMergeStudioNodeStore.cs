@@ -896,6 +896,47 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         return results.Select(kv => (EntityId: kv.Key, PayloadJson: kv.Value)).ToList();
     }
 
+    // plans/vision-punchlist-remediation.md (Items 1+2) — see IStudioNodeStore. Enumerates one repo
+    // room directly (not the bound-set fan-out) so a re-link can report exactly what lives in the
+    // room it is about to stop reading. Works for a room this peer has bound; an unknown/unbound id
+    // yields an empty result rather than throwing, since "nothing to lose" is the honest answer for a
+    // room with no local state.
+    public async Task<IReadOnlyDictionary<string, int>> CountRepoRoomNodesByKindAsync(
+        string workgroupRepoId, CancellationToken cancellationToken = default)
+    {
+        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(workgroupRepoId))
+            return counts;
+
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var roomId = $"repo/{workgroupRepoId}";
+        EngineRoomMap roomMap;
+        try
+        {
+            roomMap = await GetOrCreateRepoRoomMapAsync(roomId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogDebug(ex, "[NodeStore] Could not open room {RoomId} to count nodes.", roomId);
+            return counts;
+        }
+
+        foreach (var (mapKey, _) in roomMap.AllEntries(MapNamespace))
+        {
+            // Keys are "{kind}/{entityId}" per the frozen schema — the kind is everything before the
+            // LAST separator, since kinds themselves contain slashes ("studio/artifact-ref/v1").
+            var lastSlash = mapKey.LastIndexOf('/');
+            if (lastSlash <= 0)
+                continue;
+
+            var kind = mapKey[..lastSlash];
+            counts[kind] = counts.GetValueOrDefault(kind) + 1;
+        }
+
+        return counts;
+    }
+
     // Item 3 (plans/vision-punchlist-remediation.md) — collision resolution for the multi-room read
     // fan-out above. Every kind except ArtifactRefV1 keeps the historical last-room-wins overwrite
     // (studio → repo → workgroup precedence), which is correct for them: an entity lives in exactly

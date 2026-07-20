@@ -368,9 +368,47 @@ the rehydrated `_goalRouting` twin → survives host restart identically to toda
       ⊆ `MergeProposal.ConsideredArtifactIds` (already populated by `nm_v1_merge_review`). ~80 lines, zero new
       domain fields. Honest framing: it proves each constraint was *weighed*, not *obeyed* — which is exactly
       what the existing design already promises.
-- [ ] Items 1+2 R1 — `Hints` + `BindingProvenance` on `RepositoryV1`
-- [ ] Items 1+2 R2 — `RelinkAsync` (fresh hints, Auto/Manual, impact report)
-- [ ] Items 1+2 R3 — REST `/identity` dry-run + `/identity/relink`
-- [ ] Items 1+2 R4 — narrowed schema amendment (user-initiated only)
-- [ ] Items 1+2 R5 — `nodalmerge.relinkRepository` command + quickpick + orphan confirmation
-- [ ] Items 1+2 R6/R7 — in-panel surfacing / lifecycle watchers (optional)
+- [x] **Items 1+2 R1–R5 — DONE 2026-07-20. User-initiated repo re-link shipped end to end.**
+      **R1** `RepositoryV1` gained `Hints` (persisted, so the identity view and future re-links need no
+      git read) and `Provenance` (`Deterministic` / `ProvisionalMint` / `HumanResolved`) — explicit, not
+      inferred. Both additive/nullable = zero migration. The enum carries
+      `[JsonConverter(typeof(JsonStringEnumConverter))]`: the host registers that converter for HTTP, so a
+      numeric-by-default enum round-tripped inconsistently (caught by `CrossRepoFileReferenceTests`), and
+      more importantly the value is *persisted* — as a bare ordinal, inserting an enum member later would
+      silently change what every stored row means.
+      **R2** `IRepositoryRegistryService.RelinkAsync(repositoryId, mode, chosenRepoId, commit)`. Re-reads git
+      **fresh** (sanctioned because it is user-initiated — and it is the only thing that can rescue a clone
+      that was shallow at register time), re-matches against the live workgroup map, and **works on an
+      already-settled binding** — the gap `ResolveDisambiguationAsync` could not close, since it no-ops
+      unless a disambiguation is pending. Auto commits only an unambiguous `Matched`, never moves a
+      `HumanResolved` binding, and commits nothing on fork/degraded/multi-candidate (returns candidates,
+      ordered deterministically). Manual commits a choice or `register-new`. `commit:false` previews with no
+      writes.
+      **Orphan impact**: new `IStudioNodeStore.CountRepoRoomNodesByKindAsync` (default-impl empty, real
+      enumeration only in `NodalMergeStudioNodeStore`) reports what is in the room being left, so the flow
+      warns before committing. Content is **not** migrated — accept-orphan per the settled decision.
+      **R3** `GET .../identity` now returns `provenance` + `hints` (cheap, never touches git);
+      `POST .../identity/relink` takes `{mode, chosenRepoId, commit}` and returns proposal + candidates +
+      impact.
+      **R4** `STUDIO_ROOM_SCHEMA.md` amended in all three no-re-derivation clauses plus a new
+      "User-initiated re-link" section. The rule narrowed to *"never re-derived **on its own**"* — explicit
+      human action only, no background/timer/startup/inbound-pack path may ever trigger it. Materially
+      smaller than the auto-re-resolution amendment the earlier draft would have needed.
+      **R5** `nodalmerge.relinkRepository` command + quickpick (no webview, no smoke-harness change, no host
+      restart — the membership loop joins the new room in ~5s). Previews first, then a **modal**
+      confirmation naming the room being left and how many records stop appearing.
+      **Tests** (`RepositoryRelinkTests`, 7): un-shallowed clone converges; already-settled divergent binding
+      re-points; preview writes nothing; fork never auto-collapses; human-resolved binding untouched;
+      `register-new` splits; and a guard that a better match appearing changes nothing until asked.
+      **Falsified both load-bearing claims**: replacing the fresh git read with cached hints fails exactly
+      the 4 tests that depend on it; disabling the `HumanResolved` guard fails exactly that test.
+      Solution builds clean; extension tsc clean + webview smoke PASS; **Integration 747/747**; Core 42/42,
+      Contracts 24/24, Tasks 14/14, AgentRuntime 109/109, Merge 71/71, Projections 37/37.
+- [ ] Items 1+2 R6/R7 — in-panel surfacing (show current room + a "Re-link…" button in the goal workspace)
+      / lifecycle watchers (`onDidChangeWorkspaceFolders`, register-all-open-folders). Both optional and
+      independent; the command covers the actual capability gap.
+- [ ] **Deferred: test-hygiene sweep.** 163 test sites build a `StudioWebApplication` without disposing it
+      (vs 33 that do), leaking background loops and file handles into whatever runs next — the cause of the
+      residual "different test each run" flakiness that survived the shutdown-contract fix. Note 6 of those
+      sites are helpers that `return app`, where a blind `await using` would dispose before use, so this
+      needs a careful pass rather than a bulk replace.

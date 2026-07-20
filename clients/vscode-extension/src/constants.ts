@@ -21,6 +21,7 @@ export const COMMANDS = {
   OPEN_INSIGHTS:        'nodalmerge.openInsights',
   START_LOCAL_RUNTIME:  'nodalmerge.startLocalRuntime',
   RECONCILE_BLOB_ORIGIN: 'nodalmerge.reconcileBlobOrigin',
+  RELINK_REPOSITORY:    'nodalmerge.relinkRepository',
   OPEN_SETTINGS:        'nodalmerge.openSettings',
 } as const;
 
