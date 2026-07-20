@@ -129,16 +129,27 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             // used to be an untracked fire-and-forget that could still be writing after the host had
             // been disposed.
             var promotionRepositoryId = updated.RepositoryId;
-            if (_serviceProvider?.GetService<IStudioBackgroundWork>() is { } queue)
+
+            // Resolve the promoter HERE and capture it, rather than touching the service provider
+            // from inside the queued closure. The queue can drain while the DI container is disposing
+            // (see StudioBackgroundWorkQueue), and resolving from a disposed provider throws — which
+            // is exactly what the unobserved-task-exception detector caught. This also restores the
+            // original timing: the pre-queue code resolved GraphPromoter synchronously right here,
+            // and only the promotion call itself was deferred.
+            var promoter = GraphPromoter;
+            if (promoter is null)
+            {
+                // nothing to promote with
+            }
+            else if (_serviceProvider?.GetService<IStudioBackgroundWork>() is { } queue)
             {
                 queue.Enqueue(
                     "workunit/promote-studio-checkpoint",
-                    _ => GraphPromoter?.TryPromoteStudioCheckpointAsync(promotionRepositoryId)
-                        ?? Task.CompletedTask);
+                    _ => promoter.TryPromoteStudioCheckpointAsync(promotionRepositoryId));
             }
             else
             {
-                _ = GraphPromoter?.TryPromoteStudioCheckpointAsync(promotionRepositoryId);
+                _ = promoter.TryPromoteStudioCheckpointAsync(promotionRepositoryId);
             }
         }
 

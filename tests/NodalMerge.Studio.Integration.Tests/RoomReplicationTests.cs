@@ -365,7 +365,24 @@ public class RoomReplicationTests : IDisposable
         var liveCompleted = await Task.WhenAny(pending, Task.Delay(TimeSpan.FromSeconds(3)));
         var liveMessage = liveCompleted == pending ? await pending : null;
         Assert.Null(liveMessage);
+
+        // Passing this assertion means `pending` is still outstanding, and it cannot be cancelled
+        // (see ReceiveOneAsync — cancelling an in-flight ClientWebSocket receive aborts the whole
+        // socket). It will therefore fault when the host tears the connection down at the end of the
+        // test. Observe that fault deliberately: left alone it becomes an unobserved task exception,
+        // which the detector reports as a leak — correctly, but this one is intentional, and noise
+        // in that report is exactly what would train us to stop reading it.
+        ObserveExpectedFault(pending);
     }
+
+    // Marks a deliberately-abandoned task's exception as observed. Only for tasks a test knowingly
+    // walks away from — never as a way to quiet a leak that has not been understood.
+    private static void ObserveExpectedFault(Task task) =>
+        _ = task.ContinueWith(
+            t => _ = t.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
     /// <summary>
     /// Slice 7.3's other product decision: with the "studio"-room collision source gone,

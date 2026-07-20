@@ -112,6 +112,20 @@ public sealed class StudioBackgroundWorkQueue : IStudioBackgroundWork, IHostedSe
                 {
                     _logger?.LogDebug("[BackgroundWork] '{Name}' cancelled by hard stop.", item.Name);
                 }
+                catch (ObjectDisposedException)
+                {
+                    // The drain can run from DisposeAsync, i.e. while the DI container is disposing
+                    // its own singletons — and singleton disposal order is not guaranteed. Work that
+                    // resolves a service at drain time (rather than capturing it at enqueue time) can
+                    // therefore find the provider already gone. That is an expected shutdown race, not
+                    // a defect, so it is logged quietly rather than as a failure.
+                    //
+                    // Enqueue sites should prefer capturing their dependencies in the closure so the
+                    // work is self-contained and this path stays rare.
+                    _logger?.LogDebug(
+                        "[BackgroundWork] '{Name}' skipped — a dependency was already disposed (host shutting down).",
+                        item.Name);
+                }
                 catch (Exception ex)
                 {
                     // Observed and logged rather than rethrown. This is the same failure surface the

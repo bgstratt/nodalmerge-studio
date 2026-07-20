@@ -496,7 +496,34 @@ the rehydrated `_goalRouting` twin → survives host restart identically to toda
       reconciliation loop catches per-constituent so one odd proposal cannot abort the pass. Tests in
       `SupersedeIdempotencyTests`; **verified load-bearing by disabling the idempotency check.**
       Note the detector found this while every assertion passed — it was invisible to the test suite.
-- [ ] **Still leaking, newly visible (~2 per run, both shutdown-ordering):** 4×
+- [x] **First leak sweep — DONE 2026-07-20. Three sources closed; the detector then exposed the next layer.**
+      **(1) WebSocket leak — was NOT a production bug, contrary to my hypothesis.** The stack pointed at
+      `RoomReplicationTests.ReceiveOneAsync`, not a replication loop: the test deliberately leaves a receive
+      outstanding (it *cannot* be cancelled — cancelling an in-flight `ClientWebSocket` receive aborts the
+      whole socket), asserts the timeout wins, and never awaits it; it then faults when the host tears the
+      connection down. Now observed explicitly via `ObserveExpectedFault`. Noise in the detector's report is
+      the one thing that would train us to stop reading it.
+      **(2) `ObjectDisposedException` from my own background queue — a regression I introduced.** The queued
+      closure resolved `GraphPromoter` from the container *at drain time*, but the drain can run while the
+      container is disposing its singletons (order is not guaranteed). The pre-queue code resolved it
+      **synchronously** before the fire-and-forget, so moving the resolve into the closure was the bug. Now
+      captured at enqueue time. `StudioBackgroundWorkQueue` also tolerates `ObjectDisposedException` during
+      drain (logged debug, not failure), with the guidance recorded there: **queued work should capture its
+      dependencies at enqueue time so it is self-contained.**
+      **(3) Supersede — now visible instead of silent.** No longer an unobserved exception; the caught case
+      logs a warning and reconciliation continues. Worth noting what that revealed: the surviving cases are
+      the *different-target* conflict (a constituent already superseded by **another** reconciliation), i.e.
+      two reconciliations claiming the same constituent — previously invisible, now logged.
+      Measured 4 runs before/after: WebSocket 4→0, `get_GraphPromoter` 4→0, queue-pump frames →0.
+- [ ] **Next layer, now visible (~7 unobserved across 4 runs):** mostly `ObjectDisposedException` from
+      fire-and-forget scheduler paths hitting disposed state at shutdown
+      (`WorkSchedulerService.ReleaseAsync` / `ReinvokeOrchestratorAsync` → `GoalCoordinator.ConvergeAsync`,
+      `ArtifactLineageService.RecordAsync`) — the same family as the shutdown contract, one level deeper.
+      Plus one `IOException` on a *write* collision in `FileSystemWorkspaceService.ApplyBranchAsync` (the
+      read/write retry covers reads and single-file writes; the branch-apply copy path has no retry), and one
+      `InvalidOperationException: Cannot transition task from Open to Completed` — **the same shape as the
+      supersede bug**: an invalid state transition thrown inside swallowed background work.
+- [ ] ~~Superseded by the entry above~~: 4×
       `ObjectDisposedException: 'EventLogInternal'` (the Windows EventLog logging provider used after
       disposal) and 4× `WebSocketException: remote party closed ... without completing the close handshake`
       (a peer connection torn down abruptly on host dispose, thrown into a fire-and-forget WS loop). Lower
