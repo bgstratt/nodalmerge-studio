@@ -141,6 +141,30 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
         return updated;
     }
 
+    // Phase 1 follow-up — set both scope axes at once and re-route to the matching room (mirrors
+    // RecordAsync's routing exactly). OwnedByWorkUnitId/ParentArtifactId are unchanged, so the
+    // work-unit/parent indices don't need re-indexing (same as ElevateToWorkgroupAsync/UpdateStatusAsync).
+    public async Task<ArtifactRef?> SetScopeAsync(
+        string artifactId, ArtifactReach reach, string? repositoryId, CancellationToken ct = default)
+    {
+        if (!_byId.TryGetValue(artifactId, out var existing))
+            return null;
+
+        var normalizedRepo = string.IsNullOrEmpty(repositoryId) ? null : repositoryId;
+        var updated = existing with { Reach = reach, RepositoryId = normalizedRepo };
+        _byId[artifactId] = updated;
+
+        var json = JsonSerializer.Serialize(updated);
+        if (reach == ArtifactReach.Private)
+            await _nodeStore.WriteNodeAsync(StudioNodeKind.ArtifactRefV1, artifactId, json, ct).ConfigureAwait(false);
+        else if (normalizedRepo is null)
+            await _nodeStore.WriteWorkgroupNodeAsync(StudioNodeKind.ArtifactRefV1, artifactId, json, ct).ConfigureAwait(false);
+        else
+            await _nodeStore.WriteNodeAsync(StudioNodeKind.ArtifactRefV1, artifactId, json, normalizedRepo, ct).ConfigureAwait(false);
+
+        return updated;
+    }
+
     public async Task<ArtifactRef> ReparentAsync(string artifactId, string newParentArtifactId, CancellationToken ct = default)
     {
         if (!_byId.TryGetValue(artifactId, out var existing))

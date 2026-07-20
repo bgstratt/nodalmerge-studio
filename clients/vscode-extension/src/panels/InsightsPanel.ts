@@ -244,6 +244,20 @@ export class InsightsPanel {
             notes: (msg.notes as string) || undefined,
           });
           await this.sendFindings();
+          // Promotion lands in one of two different places depending on the finding's kind — tell the
+          // user which, so a PromptImprovement (which never becomes a constraint) isn't a mystery.
+          if ((msg.decision as string) === 'Promoted') {
+            if ((msg.kind as string) === 'PromptImprovement') {
+              const stage = (msg.targetStage as string) || 'target';
+              void vscode.window.showInformationMessage(
+                `NodalMerge: promoted to prompt guidance for the ${stage} stage — it steers that stage's agents directly and does not appear on the Constraints tab.`,
+              );
+            } else {
+              void vscode.window.showInformationMessage(
+                'NodalMerge: promoted to a Constraint — see the Constraints tab (adjust its scope there).',
+              );
+            }
+          }
         } catch (err) {
           void vscode.window.showErrorMessage('NodalMerge: Finding review failed — ' + String(err));
         }
@@ -290,6 +304,19 @@ export class InsightsPanel {
         } catch (err) {
           void vscode.window.showErrorMessage('NodalMerge: toggling constraint failed — ' + String(err));
           await this.sendConstraints(); // resync the UI on failure
+        }
+        return;
+      }
+      case 'insightsScopeConstraint': {
+        try {
+          await this.post(`/studio/constraints/${encodeURIComponent(msg.artifactId as string)}/scope`, {
+            reach: msg.reach as string,
+            repoSpecific: msg.repoSpecific as boolean,
+          });
+          await this.sendConstraints(); // reflect the re-route (and any all-repos fallback) back in the UI
+        } catch (err) {
+          void vscode.window.showErrorMessage('NodalMerge: changing constraint scope failed — ' + String(err));
+          await this.sendConstraints();
         }
         return;
       }
@@ -530,7 +557,9 @@ const IN_CSS = `
   .in-constraint-main { flex: 1; min-width: 0; }
   .in-constraint-title { font-weight: 600; }
   .in-constraint-body { font-size: 0.85em; opacity: 0.85; margin-top: 3px; white-space: pre-wrap; }
-  .in-constraint-badges { display: flex; gap: 6px; margin-top: 5px; flex-wrap: wrap; }
+  .in-constraint-badges { display: flex; gap: 6px; margin-top: 5px; flex-wrap: wrap; align-items: center; }
+  .in-constraint-scope { font-size: 0.78em; padding: 1px 4px; }
+  .in-constraint-scope-label { font-size: 0.72em; opacity: 0.55; }
   .in-add-constraint { margin: 4px 0 12px; border: 1px solid var(--nm-border); border-radius: 4px; padding: 6px 10px; }
   .in-add-constraint > summary { cursor: pointer; font-size: 0.85em; opacity: 0.8; }
   .in-add-form { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }

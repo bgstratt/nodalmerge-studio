@@ -1483,6 +1483,18 @@ public interface IArtifactLineageService
     Task<ArtifactRef?> ElevateToWorkgroupAsync(string artifactId, CancellationToken ct = default) =>
         Task.FromResult<ArtifactRef?>(null);
 
+    // Phase 1 follow-up (organizational-knowledge-and-workgroup-scope.md) — set BOTH scope axes on a
+    // (global) constraint at once and re-route it to the matching room: Reach {Private→studio room,
+    // Workgroup+repo→repo room, Workgroup+null→workgroup room} × RepositoryId (application, null=all
+    // repos). Generalizes ElevateToWorkgroupAsync (which only widens to Workgroup+all-repos) to the full
+    // 2×2 so the UI can move a constraint between any cells. Returns the updated artifact, or null if the
+    // artifact doesn't exist. Default no-op keeps in-memory test doubles compiling; the real service
+    // overrides it. (Like Elevate, this leaves any stale copy in the previously-routed room — rooms have
+    // no eviction; local reads via _byId stay correct because they key on ArtifactId.)
+    Task<ArtifactRef?> SetScopeAsync(
+        string artifactId, ArtifactReach reach, string? repositoryId, CancellationToken ct = default) =>
+        Task.FromResult<ArtifactRef?>(null);
+
     // WorkspacePathways (plans/pathways-workspace-history.md) — every artifact of one type,
     // workspace-wide, regardless of owning work unit. The query surface GetChainAsync
     // (per-work-unit) can't provide for OwnedByWorkUnitId:null artifacts like ExternalChangeset;

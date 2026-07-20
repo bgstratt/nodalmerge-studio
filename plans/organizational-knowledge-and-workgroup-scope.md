@@ -330,6 +330,25 @@ constraint become shared policy without retyping:
   **Promote** per card; promoted sources badge "promoted" instead. Tests:
   `ConstraintEndpointsTests.Proposed_lineage_constraint_promotes_to_a_global_and_is_idempotent`.
 
+**Re-scope a constraint after the fact (SHIPPED).** Promotion is opinionated (Workgroup + repo, or
+all-repos if no repo resolves), so the Constraints tab now lets you move a constraint between any 2×2
+cell without recreating it. `POST /studio/constraints/{id}/scope { reach?, repoSpecific? }` →
+`IArtifactLineageService.SetScopeAsync(reach, repositoryId)` mutates Reach+RepositoryId and re-routes to
+the matching room (mirrors RecordAsync routing; generalizes the widen-only `/elevate`). Leaves a stale
+copy in the prior room (rooms have no eviction — same caveat as Elevate; local reads via `_byId` stay
+correct). **UI**: two inline selects (Reach: Workgroup/Private × Applies-to: All/This repository) on each
+constraint card, replacing the static badges; the card re-groups on refresh. Test:
+`ConstraintEndpointsTests.Scope_endpoint_moves_a_constraint_between_reach_cells`.
+
+**Finding-kind promotion destinations (UX clarity SHIPPED).** Longstanding confusion: only
+`FindingKind.KnowledgeGuideline` promotes to a Constraint (`PromoteKnowledgeGuidelineAsync`);
+`FindingKind.PromptImprovement` promotes to **stage-scoped prompt guidance** (`PromotePromptImprovementAsync`
+returns null — no artifact; read by the target stage's loop via `ListPromotedPromptGuidanceAsync`), so it
+never hits the Constraints tab. The Insights UI now surfaces this: a toast on promote names the
+destination, and a Promoted finding shows a `→ Constraint` / `→ prompt guidance for the <stage> stage`
+line (renderFindings + insightsReviewFinding pass `kind`/`targetStage`). No backend change — data already
+on the Finding.
+
 **Manual add — the process (`POST /studio/constraints`).** The one path that creates a global
 constraint at an arbitrary scope (promotion always makes Workgroup; this gives the full 2×2):
 

@@ -199,7 +199,17 @@ export function init(ctx) {
       var metaParts = [];
       if (f.reviewedAt) { metaParts.push('Reviewed ' + new Date(f.reviewedAt).toLocaleString()); }
       if (f.reviewNotes) { metaParts.push('Notes: ' + f.reviewNotes); }
-      if (f.promotedArtifactId) { metaParts.push('Artifact: ' + f.promotedArtifactId); }
+      // Where did a promoted finding go? Knowledge → a Constraint (on the Constraints tab);
+      // PromptImprovement → stage-scoped prompt guidance (no constraint, no tab).
+      if (f.status === 'Promoted') {
+        if (f.kind === 'PromptImprovement') {
+          metaParts.push('→ prompt guidance for the ' + (f.targetStage || '?') + ' stage (steers that stage’s agents, not the Constraints tab)');
+        } else {
+          metaParts.push('→ Constraint on the Constraints tab' + (f.promotedArtifactId ? ' (' + f.promotedArtifactId + ')' : ''));
+        }
+      } else if (f.promotedArtifactId) {
+        metaParts.push('Artifact: ' + f.promotedArtifactId);
+      }
       var meta = metaParts.length ? '<div class="in-finding-meta">' + esc(metaParts.join(' · ')) + '</div>' : '';
       var checkbox = statusFilter === 'Promoted'
         ? '<input type="checkbox" class="in-finding-select" data-finding-id="' + esc(f.findingId) + '">'
@@ -262,17 +272,29 @@ export function init(ctx) {
     return order.map(function(label) {
       var cards = groups[label].map(function(c) {
         var offClass = c.enabled ? '' : ' in-constraint-off';
-        var badges =
-          '<span class="in-finding-badge">' + esc(c.reach || 'legacy') + '</span>' +
-          '<span class="in-finding-badge">' + (c.appliesToAllRepos ? 'all repos' : 'this repo') + '</span>' +
+        var reachVal = (c.reach === 'Private') ? 'Private' : 'Workgroup';
+        // Reach × application as two editable selects — change either to re-scope (and re-route) the
+        // constraint; on refresh the card moves to its new group. "This repository" falls back to all
+        // repos if the workspace has no resolvable repo.
+        var scope =
+          '<span class="in-constraint-scope-label">Reach</span>' +
+          '<select class="in-constraint-scope in-constraint-reach" data-constraint-id="' + esc(c.artifactId) + '">' +
+            '<option value="Workgroup"' + (reachVal === 'Workgroup' ? ' selected' : '') + '>Workgroup (shared)</option>' +
+            '<option value="Private"' + (reachVal === 'Private' ? ' selected' : '') + '>Private (only me)</option>' +
+          '</select>' +
+          '<span class="in-constraint-scope-label">Applies to</span>' +
+          '<select class="in-constraint-scope in-constraint-appl" data-constraint-id="' + esc(c.artifactId) + '">' +
+            '<option value="all"' + (c.appliesToAllRepos ? ' selected' : '') + '>All repositories</option>' +
+            '<option value="repo"' + (!c.appliesToAllRepos ? ' selected' : '') + '>This repository</option>' +
+          '</select>' +
           (c.enabled ? '' : '<span class="in-finding-badge">off</span>');
         return '' +
           '<div class="in-constraint-card' + offClass + '" data-constraint-id="' + esc(c.artifactId) + '">' +
-            '<input type="checkbox" class="in-constraint-toggle" data-constraint-id="' + esc(c.artifactId) + '"' + (c.enabled ? ' checked' : '') + '>' +
+            '<input type="checkbox" class="in-constraint-toggle" data-constraint-id="' + esc(c.artifactId) + '"' + (c.enabled ? ' checked' : '') + ' title="Enable/disable for you only">' +
             '<div class="in-constraint-main">' +
               '<div class="in-constraint-title">' + esc(c.title || c.artifactId) + '</div>' +
               (c.body ? '<div class="in-constraint-body">' + esc(c.body) + '</div>' : '') +
-              '<div class="in-constraint-badges">' + badges + '</div>' +
+              '<div class="in-constraint-badges">' + scope + '</div>' +
             '</div>' +
           '</div>';
       }).join('');
@@ -325,6 +347,23 @@ export function init(ctx) {
     });
   }
 
+  function bindConstraintScope() {
+    root.querySelectorAll('.in-constraint-reach, .in-constraint-appl').forEach(function(sel) {
+      sel.addEventListener('change', function() {
+        var card = sel.closest('.in-constraint-card');
+        if (!card) { return; }
+        var reachSel = card.querySelector('.in-constraint-reach');
+        var applSel = card.querySelector('.in-constraint-appl');
+        vscode.postMessage({
+          type: 'insightsScopeConstraint',
+          artifactId: sel.getAttribute('data-constraint-id'),
+          reach: reachSel ? reachSel.value : 'Workgroup',
+          repoSpecific: applSel ? applSel.value === 'repo' : false,
+        });
+      });
+    });
+  }
+
   function bindFindingActions() {
     root.querySelectorAll('.in-finding-card').forEach(function(card) {
       var findingId = card.getAttribute('data-finding-id');
@@ -332,7 +371,9 @@ export function init(ctx) {
       var dismiss = card.querySelector('.in-finding-dismiss');
       var investigate = card.querySelector('.in-finding-investigate');
       if (promote) { promote.addEventListener('click', function() {
-        vscode.postMessage({ type: 'insightsReviewFinding', findingId: findingId, decision: 'Promoted' });
+        // Pass kind/targetStage so the host can toast where this promotion actually landed.
+        var f = (state.lastFindings || []).filter(function(x) { return x.findingId === findingId; })[0] || {};
+        vscode.postMessage({ type: 'insightsReviewFinding', findingId: findingId, decision: 'Promoted', kind: f.kind, targetStage: f.targetStage });
       }); }
       if (dismiss) { dismiss.addEventListener('click', function() {
         vscode.postMessage({ type: 'insightsReviewFinding', findingId: findingId, decision: 'Dismissed' });
@@ -390,6 +431,7 @@ export function init(ctx) {
     if (msg.type === 'insightsConstraintsList') {
       $('in-constraints-list').innerHTML = renderConstraints(msg.constraints || []);
       bindConstraintToggles();
+      bindConstraintScope();
       return;
     }
     if (msg.type === 'insightsConstraintsError') {

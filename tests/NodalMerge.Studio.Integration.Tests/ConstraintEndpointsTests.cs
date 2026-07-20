@@ -147,4 +147,47 @@ public class ConstraintEndpointsTests
         var globals2 = await client.GetFromJsonAsync<JsonElement>("/studio/constraints");
         Assert.Single(globals2.EnumerateArray(), e => e.GetProperty("artifactId").GetString() == globalId);
     }
+
+    [Fact]
+    public async Task Scope_endpoint_moves_a_constraint_between_reach_cells()
+    {
+        await using var app = StudioWebApplication.Build(
+            [], configureWebHost: webHost => webHost.UseTestServer(),
+            configureServices: services => services.AddInMemoryStorage());
+        await app.StartAsync();
+        var client = app.GetTestClient();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+
+        await artifacts.RecordAsync(new ArtifactRef(
+            ArtifactId: "c-scope", Type: ArtifactType.Constraint, ParentArtifactId: null,
+            Status: ArtifactStatus.Approved, CreatedAt: DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null, Title: "rule", Body: "do X",
+            RepositoryId: null, Reach: ArtifactReach.Workgroup));
+
+        // Starts Workgroup / all repos.
+        var list0 = await client.GetFromJsonAsync<JsonElement>("/studio/constraints");
+        var row0 = list0.EnumerateArray().Single(e => e.GetProperty("artifactId").GetString() == "c-scope");
+        Assert.Equal("Workgroup", row0.GetProperty("reach").GetString());
+        Assert.True(row0.GetProperty("appliesToAllRepos").GetBoolean());
+
+        // Re-scope to Private (still all repos, since no workspace repo resolves here).
+        var toPrivate = await client.PostAsJsonAsync("/studio/constraints/c-scope/scope", new { reach = "Private", repoSpecific = false });
+        toPrivate.EnsureSuccessStatusCode();
+        var list1 = await client.GetFromJsonAsync<JsonElement>("/studio/constraints");
+        var row1 = list1.EnumerateArray().Single(e => e.GetProperty("artifactId").GetString() == "c-scope");
+        Assert.Equal("Private", row1.GetProperty("reach").GetString());
+        Assert.True(row1.GetProperty("appliesToAllRepos").GetBoolean());
+        Assert.True(row1.GetProperty("enabled").GetBoolean()); // scope change doesn't touch the local toggle
+
+        // Back to Workgroup.
+        var toWorkgroup = await client.PostAsJsonAsync("/studio/constraints/c-scope/scope", new { reach = "Workgroup", repoSpecific = false });
+        toWorkgroup.EnsureSuccessStatusCode();
+        var list2 = await client.GetFromJsonAsync<JsonElement>("/studio/constraints");
+        var row2 = list2.EnumerateArray().Single(e => e.GetProperty("artifactId").GetString() == "c-scope");
+        Assert.Equal("Workgroup", row2.GetProperty("reach").GetString());
+
+        // Unknown artifact → 404.
+        var missing = await client.PostAsJsonAsync("/studio/constraints/nope/scope", new { reach = "Private", repoSpecific = false });
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, missing.StatusCode);
+    }
 }

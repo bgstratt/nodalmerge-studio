@@ -3692,6 +3692,40 @@ public static class StudioRestEndpoints
             return Results.Ok(new { artifactId, disabled = body.Disabled });
         });
 
+        // Phase 1 follow-up — set a global constraint's full 2×2 scope in one call (reach × application),
+        // re-routing it to the matching room. Generalizes /elevate (widen-only) so the Constraints tab can
+        // move a constraint between any cells: Private/Workgroup × this-repo/all-repos. repoSpecific
+        // resolves the workspace repo id server-side (same as manual add); false → all repos. 404 if the
+        // artifact doesn't exist.
+        app.MapPost("/studio/constraints/{artifactId}/scope", async (
+            string artifactId,
+            ScopeConstraintBody body,
+            IArtifactLineageService artifacts,
+            IRepositoryRegistryService repositories,
+            WorkspaceOptions workspaceOptions,
+            CancellationToken ct) =>
+        {
+            var reach = string.Equals(body.Reach, "Private", StringComparison.OrdinalIgnoreCase)
+                ? ArtifactReach.Private
+                : ArtifactReach.Workgroup;
+
+            string? repositoryId = null;
+            if (body.RepoSpecific && !string.IsNullOrWhiteSpace(workspaceOptions.SeedRepositoryPath))
+            {
+                try
+                {
+                    var repo = await repositories.RegisterAsync(workspaceOptions.SeedRepositoryPath!, label: null, ct).ConfigureAwait(false);
+                    repositoryId = repo.RepositoryId;
+                }
+                catch { /* unresolvable workspace repo → falls back to all-repos */ }
+            }
+
+            var updated = await artifacts.SetScopeAsync(artifactId, reach, repositoryId, ct).ConfigureAwait(false);
+            return updated is null
+                ? Results.NotFound(new { error = $"Artifact '{artifactId}' was not found." })
+                : Results.Ok(updated);
+        });
+
         // Phase 3 (plans/organizational-knowledge-and-workgroup-scope.md) — manually add a constraint at
         // a chosen scope (the 2x2): reach Private|Workgroup × application this-repo|all-repos. Creates a
         // global (null-owner) constraint — so it's a first-class shared policy that surfaces on the
@@ -3831,6 +3865,10 @@ public static class StudioRestEndpoints
     }
 
     private sealed record ToggleConstraintBody(bool Disabled);
+
+    // Re-scope a global constraint (Phase 1 follow-up). Reach: "Workgroup" (default) | "Private".
+    // RepoSpecific: true = pin to the workspace repo; false = all repos.
+    private sealed record ScopeConstraintBody(string? Reach = "Workgroup", bool RepoSpecific = false);
 
     // Promote a lineage constraint to global (Phase 1 follow-up). Reach: "Workgroup" (default) | "Private".
     // RepoSpecific: true (default) = pin to the source's repo; false = all repos.
