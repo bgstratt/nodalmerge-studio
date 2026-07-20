@@ -132,7 +132,14 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
         if (existing.Reach == ArtifactReach.Workgroup && string.IsNullOrEmpty(existing.RepositoryId))
             return existing;
 
-        var updated = existing with { Reach = ArtifactReach.Workgroup, RepositoryId = null };
+        // ScopeVersion bump — see ArtifactRef.ScopeVersion. The copy this leaves behind in the
+        // previous room stays readable but must lose the read fan-out's collision resolution.
+        var updated = existing with
+        {
+            Reach = ArtifactReach.Workgroup,
+            RepositoryId = null,
+            ScopeVersion = existing.ScopeVersion + 1,
+        };
         _byId[artifactId] = updated;
 
         await _nodeStore.WriteWorkgroupNodeAsync(
@@ -151,7 +158,14 @@ public sealed class ArtifactLineageService : IArtifactLineageService, IRehydrata
             return null;
 
         var normalizedRepo = string.IsNullOrEmpty(repositoryId) ? null : repositoryId;
-        var updated = existing with { Reach = reach, RepositoryId = normalizedRepo };
+        // ScopeVersion bump — see ArtifactRef.ScopeVersion. Every scope mutator must bump, or the
+        // read fan-out silently falls back to room precedence and the move is reverted on peers.
+        var updated = existing with
+        {
+            Reach = reach,
+            RepositoryId = normalizedRepo,
+            ScopeVersion = existing.ScopeVersion + 1,
+        };
         _byId[artifactId] = updated;
 
         var json = JsonSerializer.Serialize(updated);

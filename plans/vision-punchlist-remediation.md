@@ -277,7 +277,19 @@ the rehydrated `_goalRouting` twin → survives host restart identically to toda
       .Two_peers_one_repo_goal_appears_cold_materializes_and_edits_land`, `FileScopeAmendmentTests
       .SetFileScopeAsync_throws_for_terminal_work_units(Completed)`) **confirmed pre-existing flakes —
       reproduced on a clean stashed baseline, and they pass in isolation.**
-- [ ] Item 3 S1 — `ScopeVersion` + max-version tiebreak + rehydrate test
+- [x] **Item 3 S1 — `ScopeVersion` + max-version tiebreak — DONE 2026-07-20.** Additive `int ScopeVersion = 0`
+      on `ArtifactRef`; bumped by both scope mutators (`SetScopeAsync`, `ElevateToWorkgroupAsync`);
+      `ReadAllNodesAsync` routes all three room-collection loops through a new `UpsertResolvingScope`,
+      which for `ArtifactRefV1` keeps the higher `ScopeVersion` and otherwise preserves the historical
+      last-room-wins overwrite. Ties keep the incoming value, so never-re-scoped artifacts (all at 0)
+      resolve exactly as before. `ReadScopeVersion` is defensive (missing/non-numeric/malformed ⇒ 0).
+      Two new tests in `RoomPerRepoTests`: `Narrowing_a_constraints_scope_is_not_reverted_by_the_stale_room_copy`
+      (asserts both room copies genuinely coexist, then that the fan-out *and* a live `RefreshAsync`
+      both resolve to the narrowed copy) and `Re_scoping_a_constraint_between_two_repos_resolves_to_the_newer_room`.
+      **Verified by neutering the resolution — exactly the 2 new tests fail, the other 13 pass.**
+      Solution builds clean; Integration 737/738 (sole failure the pre-existing `MultiUserMilestoneTests`
+      flake); AgentRuntime 109/109, Core 42/42, Contracts 24/24, Tasks 14/14, Projections 37/37, Merge 71/71.
+      *Note: `ScopeVersion` must be bumped by any future scope mutator or the tiebreak silently regresses.*
 - [ ] Item 3 S2/S3 — injection status hygiene / enforcement `IPolicyRule` (optional)
 - [ ] Items 1+2 R1 — `Hints` + `BindingProvenance` on `RepositoryV1`
 - [ ] Items 1+2 R2 — `RelinkAsync` (fresh hints, Auto/Manual, impact report)
