@@ -1806,6 +1806,20 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     {
         var proposal = GetRequired(proposalId);
 
+        // Idempotent re-application. Superseding a proposal that is ALREADY superseded by this same
+        // proposal is not a state transition at all — it is the caller arriving at a conclusion the
+        // system already reached. Reconciliation re-runs (a retry, a reinvoke, a second convergence
+        // pass over the same parent) hit this routinely, and throwing here aborted the entire
+        // reconciliation loop mid-way: the remaining constituents were never superseded and the
+        // stage was never advanced. Worse, the whole chain runs fire-and-forget from the scheduler,
+        // so the exception was swallowed and the goal simply stopped converging with no error
+        // anywhere. Found via the unobserved-task-exception detector.
+        if (proposal.Status == MergeProposalStatus.Superseded
+            && string.Equals(proposal.SupersededBy, supersededByProposalId, StringComparison.Ordinal))
+        {
+            return proposal;
+        }
+
         if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.Superseded))
         {
             throw new InvalidOperationException(

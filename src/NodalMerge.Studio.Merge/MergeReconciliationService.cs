@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Storage;
@@ -25,7 +26,10 @@ public sealed class MergeReconciliationService(
     // through IServiceProvider instead — the exact same workaround
     // InMemoryMergeService.TryAutoTriggerTaskReconciliationAsync already uses for this identical
     // cycle.
-    IServiceProvider? serviceProvider = null) : IMergeReconciliationService
+    IServiceProvider? serviceProvider = null,
+    // Optional for the same back-compat reason as the parameters above — direct-construction test
+    // sites pass nothing and simply get no logging.
+    ILogger<MergeReconciliationService>? logger = null) : IMergeReconciliationService
 {
     public const string ConflictReportFileName = "merge-conflict-report.md";
 
@@ -374,8 +378,25 @@ public sealed class MergeReconciliationService(
             parent.WorkUnitId,
             null), cancellationToken).ConfigureAwait(false);
 
+        // One constituent in an unexpected state must not abort the reconciliation. Superseding is
+        // already idempotent for the same target (see SupersedeAsync), but a proposal superseded by
+        // a *different* reconciliation still throws — and letting that propagate here would leave
+        // the remaining constituents un-superseded and skip the stage advance below, silently
+        // stalling the goal because this whole path runs fire-and-forget from the scheduler.
         foreach (var id in constituentIds)
-            await merge.SupersedeAsync(id, reconciledId, cancellationToken).ConfigureAwait(false);
+        {
+            try
+            {
+                await merge.SupersedeAsync(id, reconciledId, cancellationToken).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException ex)
+            {
+                logger?.LogWarning(
+                    ex,
+                    "[MergeReconciliation] Could not supersede constituent proposal {ProposalId} into {ReconciledId} — continuing with the remaining constituents.",
+                    id, reconciledId);
+            }
+        }
 
         await workUnits.SetCurrentStageAsync(parent.WorkUnitId, PipelineStage.Merge, cancellationToken)
             .ConfigureAwait(false);

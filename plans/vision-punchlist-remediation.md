@@ -470,6 +470,38 @@ the rehydrated `_goalRouting` twin → survives host restart identically to toda
       *Authoring note:* the first version of these tests hung for 10 minutes rather than failing, because
       the holder task threw on a wrong path **before** signalling its handshake. It now routes that
       failure through `TrySetException` — a test that can hang instead of failing is worse than no test.
+- [x] **Unobserved-task-exception detector — DONE 2026-07-20, and it found a real bug on its first run.**
+      `_ = SomethingAsync()` that throws is invisible: the Task holds the exception, and when it is
+      collected unobserved the runtime raises `TaskScheduler.UnobservedTaskException`, which since .NET 4.5
+      does **nothing** by default. No crash, no log — the work just did not happen, and the damage surfaces
+      later as an unrelated test failing.
+      `UnobservedTaskExceptionDetector` subscribes from a `[ModuleInitializer]` (before any test), prints
+      each leak with its stack the moment it is detected (so it lands near the responsible test), and
+      summarises at `ProcessExit` after forcing two GC/finalizer passes — an unobserved exception is only
+      raised once the dead task is finalized, so without that a late failure would never be reported.
+      xunit v2 has no assembly fixture and `TestFramework.Dispose` is not virtual, hence `ProcessExit`.
+      Self-tested (`Detector_catches_a_faulted_fire_and_forget_task`) so it cannot rot into dead code that
+      silently reports nothing; the self-test's deliberate leak is filtered from the report so the output
+      stays trustworthy. **Known limit:** detection is GC-timed, so the stack trace is the truth and the
+      surrounding log position is only a hint.
+- [x] **Silent convergence death via non-idempotent supersede — FIXED 2026-07-20. Found by the detector.**
+      `MergeReconciliationService` loops `SupersedeAsync` over every constituent proposal. If one was
+      already superseded (a retry, a reinvoke, a second convergence pass over the same parent) it threw
+      `status Superseded cannot transition to Superseded`, aborting the loop: remaining constituents were
+      never superseded and `SetCurrentStageAsync` never ran. Because the whole chain runs fire-and-forget
+      from the scheduler (`WorkSchedulerService.ReinvokeOrchestratorAsync` → `GoalCoordinator.ConvergeAsync`),
+      **the exception was swallowed and the goal simply stopped converging with nothing logged anywhere.**
+      Two fixes: `SupersedeAsync` is now idempotent for the *same* target (re-stating a conclusion is not a
+      state transition; a *different* target still throws, since that is a genuine conflict), and the
+      reconciliation loop catches per-constituent so one odd proposal cannot abort the pass. Tests in
+      `SupersedeIdempotencyTests`; **verified load-bearing by disabling the idempotency check.**
+      Note the detector found this while every assertion passed — it was invisible to the test suite.
+- [ ] **Still leaking, newly visible (~2 per run, both shutdown-ordering):** 4×
+      `ObjectDisposedException: 'EventLogInternal'` (the Windows EventLog logging provider used after
+      disposal) and 4× `WebSocketException: remote party closed ... without completing the close handshake`
+      (a peer connection torn down abruptly on host dispose, thrown into a fire-and-forget WS loop). Lower
+      severity than the supersede bug — noisy shutdown rather than silently lost work — but the WS one is
+      worth confirming the receive loop survives rather than dies.
 - [ ] **Follow-ups this sweep exposed (not done):** (a) the 33 service-returning helpers still leak a host
       each; (b) `ReadBeforeWriteEnforcementTests` / `ScopedTreeFetchTests` intra-test races above; (c) the
       detector the flake investigation recommended — an assembly fixture failing the run on
