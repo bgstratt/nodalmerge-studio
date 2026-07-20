@@ -404,9 +404,30 @@ the rehydrated `_goalRouting` twin → survives host restart identically to toda
       the 4 tests that depend on it; disabling the `HumanResolved` guard fails exactly that test.
       Solution builds clean; extension tsc clean + webview smoke PASS; **Integration 747/747**; Core 42/42,
       Contracts 24/24, Tasks 14/14, AgentRuntime 109/109, Merge 71/71, Projections 37/37.
-- [ ] Items 1+2 R6/R7 — in-panel surfacing (show current room + a "Re-link…" button in the goal workspace)
-      / lifecycle watchers (`onDidChangeWorkspaceFolders`, register-all-open-folders). Both optional and
-      independent; the command covers the actual capability gap.
+- [x] **Items 1+2 R6/R7 — DONE 2026-07-20.** A command-palette-only flow left the binding invisible, which
+      is most of the problem: the room id appeared nowhere, so "why can't I see my teammate's work?" had no
+      answer short of curling REST.
+      **R6** The goal workspace's repo-path row now shows the bound room and a "Re-link…" button.
+      Three distinct states, because the difference is exactly what a confused user needs: *not registered*,
+      *registered but no room* (nothing replicates), or *room {id}*. `sendRepositoryRoom` matches the
+      effective repository path against `/studio/repositories`; sent separately from `explorerSettings` so a
+      REST round trip can't block or fail the settings render. The button delegates to the command so the
+      preview / candidate-pick / orphan-confirmation flow lives in one place.
+      **R7** `onDidChangeWorkspaceFolders` and `onDidChangeConfiguration` watchers. The config one just
+      repaints (`repositoryPath` is per-request). The folder one repaints **and offers a host restart**,
+      because the host bakes its data dir and workspace root at spawn — silently showing stale state, or
+      restarting behind the user's back, would both be worse than asking.
+      **Bug found and fixed while wiring this** (surfaced by the user asking whether an already-linked repo
+      could be split off): `register-new` mints nothing on a dry run, so `willMove` was false and the
+      preview reported **no orphan impact** — splitting a bound repository was the one path that would have
+      orphaned its old room's content with no warning. `RelinkAsync` now tracks the split separately, and
+      the command previews the *specific* chosen action rather than reusing the initial auto preview (each
+      choice leaves a different room behind). Test
+      `RoomPerRepoTests.Relink_preview_reports_what_the_repository_would_leave_behind` covers it against the
+      real node store (the in-memory double's default-impl count returns empty, so this could not be tested
+      in the `RepositoryRelinkTests` harness); **verified load-bearing by neutering the split-is-a-move
+      flag — exactly that test fails.**
+      Extension tsc clean + webview smoke PASS; Integration 748/748 on a clean run; all other suites green.
 - [ ] **Deferred: test-hygiene sweep.** 163 test sites build a `StudioWebApplication` without disposing it
       (vs 33 that do), leaking background loops and file handles into whatever runs next — the cause of the
       residual "different test each run" flakiness that survived the shutdown-contract fix. Note 6 of those

@@ -349,6 +349,10 @@ export function init(ctx) {
     vscode.postMessage({ type: 'explorerClearRepositoryPath' });
   });
 
+  $('gw-repo-relink').addEventListener('click', function() {
+    vscode.postMessage({ type: 'explorerRelinkRepository' });
+  });
+
   $('gw-llm-profile-checkbox').addEventListener('change', function(ev) {
     vscode.postMessage({ type: 'explorerSetUseLlmProfileSelection', value: ev.target.checked });
   });
@@ -1686,6 +1690,30 @@ export function init(ctx) {
     }
     if (msg.type === 'compareResult') {
       renderCompareResult(msg.result);
+      return;
+    }
+    // Items 1+2 (R6) — the replication room this repository is bound to. Three distinct states, and
+    // the difference matters when work is not showing up: not registered at all, registered but not
+    // bound to any room yet, or bound (show which).
+    if (msg.type === 'explorerRepositoryRoom') {
+      var roomEl = $('gw-repo-room');
+      if (roomEl) {
+        var unbound = false;
+        if (!msg.registered) {
+          roomEl.textContent = 'not registered';
+          roomEl.title = 'This folder is not a registered repository yet, so it has no replication room.';
+          unbound = true;
+        } else if (!msg.workgroupRepoId) {
+          roomEl.textContent = 'no room';
+          roomEl.title = 'Registered, but not yet bound to a replication room — nothing here replicates to peers.';
+          unbound = true;
+        } else {
+          roomEl.textContent = 'room ' + msg.workgroupRepoId;
+          roomEl.title = 'Replication room: repo/' + msg.workgroupRepoId
+            + '\nPeers must be in this same room to see the work in this repository.';
+        }
+        roomEl.classList.toggle('gw-repo-room-unbound', unbound);
+      }
       return;
     }
     if (msg.type === 'explorerSettings') {

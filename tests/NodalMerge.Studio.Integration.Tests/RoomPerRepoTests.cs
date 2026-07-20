@@ -734,6 +734,49 @@ public class RoomPerRepoTests : IDisposable
     }
 
     /// <summary>
+    /// Items 1+2 (plans/vision-punchlist-remediation.md) — the orphan-impact report. Re-linking never
+    /// migrates content: whatever is already in the room being left stays there and drops out of the
+    /// read fan-out. A preview must therefore be able to say how much that is, BEFORE anything is
+    /// committed, so the user makes an informed choice instead of silently losing sight of work.
+    ///
+    /// Uses "register-new" deliberately: splitting an already-bound repository into its own room is
+    /// the case where a dry run has nothing to mint, so it was the one path that reported no impact
+    /// at all until the preview learned to treat a split as a move.
+    /// </summary>
+    [Fact]
+    public async Task Relink_preview_reports_what_the_repository_would_leave_behind()
+    {
+        await using var app = BuildApp("relink-impact");
+        var repo = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "impact-repo"), "impact");
+        var store = app.Services.GetRequiredService<IStudioNodeStore>();
+        var registry = app.Services.GetRequiredService<IRepositoryRegistryService>();
+
+        // Put some repo-scoped state in the room this repository currently occupies.
+        await store.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1, "WU-impact-1",
+            JsonSerializer.Serialize(new { WorkUnitId = "WU-impact-1", RepositoryId = repo.RepositoryId }),
+            repo.RepositoryId);
+        await store.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1, "WU-impact-2",
+            JsonSerializer.Serialize(new { WorkUnitId = "WU-impact-2", RepositoryId = repo.RepositoryId }),
+            repo.RepositoryId);
+
+        var preview = await registry.RelinkAsync(
+            repo.RepositoryId, RepositoryRelinkMode.Manual, "register-new", commit: false);
+
+        Assert.NotNull(preview);
+        Assert.False(preview!.Committed);                       // a preview writes nothing...
+        Assert.NotNull(preview.Impact);                          // ...but still knows the cost
+        Assert.Equal($"repo/{repo.WorkgroupRepoId}", preview.Impact!.RoomId);
+        Assert.True(preview.Impact.TotalNodes >= 2,
+            $"expected the two work units to be counted, got {preview.Impact.TotalNodes}");
+        Assert.Contains(StudioNodeKind.WorkUnitV1, preview.Impact.CountsByKind.Keys);
+
+        // And the binding really is untouched by the preview.
+        Assert.Equal(repo.WorkgroupRepoId, (await registry.GetAsync(repo.RepositoryId))!.WorkgroupRepoId);
+    }
+
+    /// <summary>
     /// Item 3 (plans/vision-punchlist-remediation.md) — re-scoping re-routes an artifact into a new
     /// room but cannot delete the copy left in the old one (EngineRoomMap has no per-entry eviction),
     /// so the same ArtifactId lives in two rooms with divergent payloads. The read fan-out used to

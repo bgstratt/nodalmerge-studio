@@ -404,6 +404,11 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
         string? proposed = null;
         IReadOnlyList<RepositoryDisambiguationCandidateV1> candidates = [];
         string explanation;
+        // "register-new" always moves (into a room that does not exist yet), but a preview must not
+        // mint one to find that out. Tracked separately so the impact report below still fires on a
+        // dry run — otherwise splitting an already-bound repository would be the one path that
+        // orphaned its old room's content with no warning.
+        var splitsIntoNewRoom = false;
 
         if (mode == RepositoryRelinkMode.Manual)
         {
@@ -412,6 +417,7 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
 
             if (string.Equals(chosenRepoId, "register-new", StringComparison.OrdinalIgnoreCase))
             {
+                splitsIntoNewRoom = true;
                 if (commit)
                 {
                     var minted = await _workgroupDirectory
@@ -474,7 +480,8 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
             }
         }
 
-        var willMove = proposed is not null && !string.Equals(proposed, current, StringComparison.Ordinal);
+        var willMove = (proposed is not null && !string.Equals(proposed, current, StringComparison.Ordinal))
+            || splitsIntoNewRoom;
 
         // Only meaningful when the binding actually moves — otherwise nothing leaves the fan-out.
         RepositoryRelinkImpact? impact = null;

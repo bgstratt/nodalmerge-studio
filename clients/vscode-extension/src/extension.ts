@@ -256,10 +256,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
         if (action.label.includes('Auto re-link')) {
           body = { mode: 'auto', commit: true };
-          summary = `Re-link to repo/${preview.proposedWorkgroupRepoId}?${describeImpact(preview.impact)}`;
+          summary = `Re-link to repo/${preview.proposedWorkgroupRepoId}?`;
         } else if (action.label.includes('own repository')) {
           body = { mode: 'manual', chosenRepoId: 'register-new', commit: true };
-          summary = `Register ${picked.label} as its own separate repository?${describeImpact(preview.impact)}`;
+          summary = `Register ${picked.label} as its own separate repository?`;
         } else {
           // Offer the matcher's candidates when it produced any; otherwise every other registered
           // repository, which is what makes the already-diverged case reachable at all.
@@ -281,13 +281,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (!chosen) { return; }
 
           body = { mode: 'manual', chosenRepoId: chosen.label, commit: true };
-          summary = `Link ${picked.label} to repo/${chosen.label}?${describeImpact(preview.impact)}`;
+          summary = `Link ${picked.label} to repo/${chosen.label}?`;
         }
+
+        // Preview THIS action, not the auto one evaluated earlier — each choice leaves a different
+        // room behind (and "register as its own" leaves one even when auto would have done nothing),
+        // so reusing the first preview's impact would understate or omit the cost.
+        const actionPreview = await postJson(
+          `/studio/repositories/${encodeURIComponent(picked.repositoryId)}/identity/relink`,
+          { ...body, commit: false }) as { impact?: typeof preview.impact };
 
         // Modal, because this is the point of no easy return: the old room's content stops being
         // visible and nothing migrates it back.
         const confirm = await vscode.window.showWarningMessage(
-          summary, { modal: true }, 'Re-link');
+          summary + describeImpact(actionPreview.impact), { modal: true }, 'Re-link');
         if (confirm !== 'Re-link') { return; }
 
         const result = await postJson(
@@ -305,6 +312,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       } catch (err) {
         vscode.window.showErrorMessage(`NodalMerge: re-link failed — ${String(err)}`);
+      }
+    }),
+
+    // plans/vision-punchlist-remediation.md (Items 1+2, R7) — until now nothing watched for the open
+    // folder or the repository-path setting changing, so the UI kept showing the repository (and
+    // room) it was started with. Refreshing repaints the room indicator against the new folder.
+    //
+    // Deliberately honest about the limit: the host bakes its data directory and workspace root at
+    // spawn, so a *folder* change genuinely needs a host restart to take effect. Rather than
+    // silently showing stale state or restarting behind the user's back, offer it.
+    vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+      StudioShellPanel.current?.refresh();
+      const choice = await vscode.window.showInformationMessage(
+        'NodalMerge: the workspace folders changed. Restart the local host so Studio points at the new folder?',
+        'Restart Host', 'Not Now');
+      if (choice === 'Restart Host') {
+        await vscode.commands.executeCommand(COMMANDS.RESTART_HOST);
+      }
+    }),
+
+    vscode.workspace.onDidChangeConfiguration(e => {
+      // repositoryPath is per-request, not baked at spawn, so this one needs no restart — just a
+      // repaint so the room indicator matches the repository now in effect.
+      if (e.affectsConfiguration('nodalmerge.repositoryPath')) {
+        StudioShellPanel.current?.refresh();
       }
     }),
   );
