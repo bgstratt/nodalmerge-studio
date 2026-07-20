@@ -11,7 +11,7 @@ public class WorkSchedulerAwaitingCredentialsTests
     [Fact]
     public async Task MarkAwaitingCredentialsAsync_parks_the_item_instead_of_removing_it()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
@@ -35,7 +35,7 @@ public class WorkSchedulerAwaitingCredentialsTests
     [Fact]
     public async Task SupplyCredentialsAsync_unparks_the_item_and_warms_the_shared_cache()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
@@ -66,7 +66,7 @@ public class WorkSchedulerAwaitingCredentialsTests
     [Fact]
     public async Task ApiKey_never_appears_in_the_persisted_scheduler_payload()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());

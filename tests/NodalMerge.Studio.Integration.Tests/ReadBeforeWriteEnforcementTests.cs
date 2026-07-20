@@ -28,7 +28,7 @@ public class ReadBeforeWriteEnforcementTests : IDisposable
     public async Task Write_to_existing_unread_file_is_blocked_then_succeeds_after_read()
     {
         var fakeHandler = new ReadBeforeWriteLlmHandler();
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services =>

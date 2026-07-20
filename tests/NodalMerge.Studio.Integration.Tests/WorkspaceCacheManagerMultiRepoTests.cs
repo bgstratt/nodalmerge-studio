@@ -33,7 +33,7 @@ public class WorkspaceCacheManagerMultiRepoTests : IDisposable
         await File.WriteAllTextAsync(Path.Combine(_repoAPath, "Program.cs"), "// repo A v1");
         await File.WriteAllTextAsync(Path.Combine(_repoBPath, "Program.cs"), "// repo B v1");
 
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
         var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();

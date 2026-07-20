@@ -21,7 +21,7 @@ public class MergeReconciliationRetryTests
     [Fact]
     public async Task Retrying_a_rejected_reconciled_proposal_does_not_carry_forward_the_old_attempts_files()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var workUnits        = app.Services.GetRequiredService<IWorkUnitService>();
         var mergeCommands    = app.Services.GetRequiredService<IMergeCommandService>();

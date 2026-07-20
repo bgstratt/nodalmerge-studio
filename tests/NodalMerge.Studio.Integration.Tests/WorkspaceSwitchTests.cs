@@ -118,7 +118,7 @@ public class WorkspaceSwitchTests : IDisposable
         Directory.CreateDirectory(_repoAPath);
         await File.WriteAllTextAsync(Path.Combine(_repoAPath, "Program.cs"), "// repo A via mcp");
 
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var repositories = app.Services.GetRequiredService<IRepositoryRegistryService>();
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();

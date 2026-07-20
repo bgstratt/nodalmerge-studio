@@ -25,7 +25,7 @@ public class ContinueReviewerDispatchTests
     public async Task ContinueWithPriorContextAsync_ReviewStage_spawns_ReviewerAgentLoop_not_WorkerAgentLoop()
     {
         var handler = new ReviewerToolSetProbeHandler();
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(handler),
             configureServices: services => services.AddInMemoryStorage());

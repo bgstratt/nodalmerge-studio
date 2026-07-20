@@ -37,7 +37,7 @@ public class LlmProfileSelectionTests
     {
         var handler = new ProfileSelectionLlmHandler("worker", "goal clearly maps to execute stage");
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(handler),
             configureServices: services =>
@@ -61,7 +61,7 @@ public class LlmProfileSelectionTests
     {
         var handler = new ProfileSelectionLlmHandler("totally-not-a-real-profile", "made up");
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(handler),
             configureServices: services =>
@@ -84,7 +84,7 @@ public class LlmProfileSelectionTests
     {
         var handler = new ProfileSelectionLlmHandler("worker", "irrelevant — should never be asked");
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(handler),
             configureServices: services => services.AddInMemoryStorage());

@@ -31,7 +31,7 @@ public class PostMergeResyncIntegrationTests : IDisposable
         Directory.CreateDirectory(_repoPath);
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "Program.cs"), "// v1");
 
-        var app = StudioWebApplication.Build([], configureServices: services =>
+        await using var app = StudioWebApplication.Build([], configureServices: services =>
         {
             services.AddInMemoryStorage();
             services.AddSingleton(new WorkspaceOptions { SeedRepositoryPath = _repoPath });

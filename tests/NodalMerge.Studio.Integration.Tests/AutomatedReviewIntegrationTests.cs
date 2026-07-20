@@ -40,7 +40,7 @@ public class AutomatedReviewIntegrationTests
     {
         var fakeHandler = new AutomatedReviewFanOutLlmHandler();
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());
@@ -95,7 +95,7 @@ public class AutomatedReviewIntegrationTests
     {
         var fakeHandler = new AutomatedReviewFanOutLlmHandler(rejectReview: true);
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());
@@ -149,7 +149,7 @@ public class AutomatedReviewIntegrationTests
     {
         var fakeHandler = new AutomatedReviewFanOutLlmHandler(rejectReview: true);
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());
@@ -213,7 +213,7 @@ public class AutomatedReviewIntegrationTests
     {
         var fakeHandler = new FanOutLlmHandler();
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());

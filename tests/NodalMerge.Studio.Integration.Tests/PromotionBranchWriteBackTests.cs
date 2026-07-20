@@ -30,7 +30,7 @@ public class PromotionBranchWriteBackTests : IDisposable
         Directory.CreateDirectory(_repoPath);
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "Program.cs"), "// v1");
 
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
 
@@ -65,7 +65,7 @@ public class PromotionBranchWriteBackTests : IDisposable
         Directory.CreateDirectory(_repoPath);
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "Program.cs"), "// v1");
 
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
 
@@ -104,7 +104,7 @@ public class PromotionBranchWriteBackTests : IDisposable
         Directory.CreateDirectory(_repoPath);
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "Program.cs"), "// v1");
 
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
 
@@ -146,7 +146,7 @@ public class PromotionBranchWriteBackTests : IDisposable
     [Fact]
     public async Task Goal_merged_before_promotion_branch_was_enabled_never_appears_in_the_promotion_queue()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         // UsePromotionBranch starts (and stays, for this apply) off.
 

@@ -24,7 +24,7 @@ public class ArtifactSurfacedEventTests
     {
         var fakeHandler = new ProjectionGetSurfacedArtifactLlmHandler();
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());
@@ -82,7 +82,7 @@ public class ArtifactSurfacedEventTests
     {
         var fakeHandler = new ProjectionGetSurfacedArtifactLlmHandler();
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());

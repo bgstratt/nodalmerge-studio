@@ -15,7 +15,7 @@ public class FileScopeProfileRoutingTests
     [Fact]
     public async Task Slice_with_fileScope_matching_exactly_one_profiles_patterns_routes_deterministically()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -56,7 +56,7 @@ public class FileScopeProfileRoutingTests
     [Fact]
     public async Task Slice_with_fileScope_matching_zero_profiles_falls_through_to_heuristic_default()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -95,7 +95,7 @@ public class FileScopeProfileRoutingTests
     [Fact]
     public async Task Slice_with_one_fileScope_path_unmatched_by_a_profiles_patterns_falls_through()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -137,7 +137,7 @@ public class FileScopeProfileRoutingTests
         // plans/scoped-execute-workers-per-profile-models.md — when a file-scope match routes a slice
         // to a profile whose bound Model Profile was resolved into profileCredentials at spawn, the
         // child enqueues on *that* model, not the Execute-stage default.
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -200,7 +200,7 @@ public class FileScopeProfileRoutingTests
         // its own children (a reconciliation/sub-plan unit, via GoalCoordinator's rescue sweep)
         // found no registration and silently enqueued with no model at all. The grandchild must
         // resolve the same bound Model Profile a depth-1 child does.
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -263,7 +263,7 @@ public class FileScopeProfileRoutingTests
     {
         // The other half of the root walk: with no per-profile binding, a grandchild must still find
         // the root's Execute-stage default rather than enqueueing with nothing.
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -315,7 +315,7 @@ public class FileScopeProfileRoutingTests
     {
         // Back-compat: a file-scope-matched profile that declared no Model Profile binding runs on
         // the Execute-stage default — the enqueue is identical to before this feature existed.
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -363,7 +363,7 @@ public class FileScopeProfileRoutingTests
     [Fact]
     public async Task Slice_with_fileScope_matching_multiple_profiles_falls_through_to_heuristic_default()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 

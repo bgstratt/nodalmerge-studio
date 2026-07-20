@@ -33,7 +33,7 @@ public class PolicyGateFanOutTests
     [Fact]
     public async Task BeforeEnqueue_rule_rejection_blocks_enqueue_and_is_visible_in_decision_log()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services =>
             {

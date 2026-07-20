@@ -56,7 +56,7 @@ public class RuleFileKickoffInjectionTests : IDisposable
     public async Task Worker_kickoff_message_includes_the_branchs_rule_file_content()
     {
         var fakeHandler = new CapturingLlmHandler();
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services =>

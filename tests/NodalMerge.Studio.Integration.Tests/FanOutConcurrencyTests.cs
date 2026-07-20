@@ -75,7 +75,7 @@ public class FanOutConcurrencyTests
     [Fact]
     public async Task Concurrent_fan_out_calls_for_the_same_parent_create_exactly_one_child_per_slice()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services =>

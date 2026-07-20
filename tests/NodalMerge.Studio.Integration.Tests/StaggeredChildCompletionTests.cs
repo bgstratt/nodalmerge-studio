@@ -32,7 +32,7 @@ public class StaggeredChildCompletionTests
     [Fact]
     public async Task Parent_reaches_a_terminal_state_once_the_last_staggered_sibling_applies()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
         var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
@@ -116,7 +116,7 @@ public class StaggeredChildCompletionTests
     [Fact]
     public async Task Parent_is_not_completed_while_a_child_is_still_dead_lettered()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
         var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
@@ -165,7 +165,7 @@ public class StaggeredChildCompletionTests
     [Fact]
     public async Task Parent_is_not_completed_while_its_reconciled_workspace_proposal_awaits_review()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
         var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();

@@ -19,7 +19,7 @@ public class StuckWorkAndGoalRecoveryTests
     [Fact]
     public async Task Cancelling_a_work_unit_releases_its_file_leases_and_unblocks_the_waiter()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
@@ -57,7 +57,7 @@ public class StuckWorkAndGoalRecoveryTests
     [Fact]
     public async Task ForceResumeAsync_clears_an_orphaned_AwaitingFileLease_flag_even_with_no_matching_wait_queue_entry()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
@@ -86,7 +86,7 @@ public class StuckWorkAndGoalRecoveryTests
     [Fact]
     public async Task PauseAsync_synthesizes_a_GoalNode_instead_of_404ing_when_none_was_ever_recorded()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());

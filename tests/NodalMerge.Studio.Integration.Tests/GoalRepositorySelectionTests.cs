@@ -86,7 +86,7 @@ public class GoalRepositorySelectionTests : IDisposable
         Directory.CreateDirectory(_repoPath);
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "Program.cs"), "// from repo via mcp");
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [], configureServices: services => services.AddInMemoryStorage());
         var tools = ActivatorUtilities.CreateInstance<GoalTools>(app.Services);
         var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
@@ -101,7 +101,7 @@ public class GoalRepositorySelectionTests : IDisposable
     [Fact]
     public async Task MCP_goal_create_with_NewRepositoryPath_creates_and_uses_a_fresh_repo()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [], configureServices: services => services.AddInMemoryStorage());
         var tools = ActivatorUtilities.CreateInstance<GoalTools>(app.Services);
         var repositories = app.Services.GetRequiredService<IRepositoryRegistryService>();

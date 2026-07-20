@@ -25,7 +25,7 @@ public class WorkspaceUsageInstrumentationTests
         var hitPaths = new[] { "src/A.cs", "src/B.cs" };
         var fakeHandler = new WorkspaceUsageInstrumentationLlmHandler { Query = query, HitPaths = hitPaths };
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());

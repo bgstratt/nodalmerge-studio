@@ -25,7 +25,7 @@ public class WorkspaceReadWindowingTests
         var content = string.Join('\n', lines);
 
         var fakeHandler = new WorkspaceReadWindowingLlmHandler { Path = "big.txt", SecondOffset = 2001 };
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());

@@ -32,7 +32,7 @@ public class FullAgentCycleTests
         // human reviewer).
         var fakeHandler = new AutonomousReviewLlmHandler("Approved", "unused");
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             // Override DAG-backed storage with fully in-memory implementations so the

@@ -17,7 +17,7 @@ public class DeadLetterIntegrationTests
     [Fact]
     public async Task Max_iterations_writes_dead_letter_and_DeadLettered_status()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ExhaustingLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
@@ -78,7 +78,7 @@ public class DeadLetterIntegrationTests
     [Fact]
     public async Task Retry_from_dead_letter_re_enqueues_work_unit()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ExhaustingLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
@@ -162,7 +162,7 @@ public class DeadLetterIntegrationTests
     [Fact]
     public async Task Retry_with_context_folds_correction_into_goal_and_resets_attempt_count()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ExhaustingLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());

@@ -18,7 +18,7 @@ public class FanOutIntegrationTests
     {
         var fakeHandler = new FanOutLlmHandler();
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());
@@ -133,7 +133,7 @@ public class FanOutIntegrationTests
     {
         var fakeHandler = new FanOutLlmHandler(includeDependentSlice: true);
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());

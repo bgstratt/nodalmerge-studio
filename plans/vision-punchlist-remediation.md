@@ -436,7 +436,29 @@ the rehydrated `_goalRouting` twin → survives host restart identically to toda
       and registers), then continues into the normal re-link flow with the new id. The in-panel button
       relabels to **"Register…"** when unregistered — the same flow handles both, but "Re-link" does not
       read as the way to register something.
-- [ ] **Deferred: test-hygiene sweep.** 163 test sites build a `StudioWebApplication` without disposing it
+- [x] **Test-hygiene sweep — DONE 2026-07-20 (partial win; read the numbers before assuming it's solved).**
+      Categorised all 164 build sites by enclosing member rather than bulk-replacing: **131 are test
+      methods** (app is local — safe to dispose) and **33 are helpers that return services or tuples**, where
+      the container must outlive the helper and `await using` would dispose it before the caller ran. 95 of
+      the test-method sites lacked disposal and now have `await using`; the 33 helpers were deliberately left
+      (fixing them means changing what each helper hands back — a separate, larger refactor).
+      One compile fallout: `StudioHostSmokeTests.Build_registers_studio_services` was `void`, now `async Task`.
+      **Measured honestly.** Before: ~2/5 runs failed, on a *different* test each time
+      (`MultiUserMilestoneTests`, `FileScopeAmendmentTests`, `FileLeaseConflictIntegrationTests`,
+      `ScopedTreeFetchTests`, `ReadBeforeWriteEnforcementTests` — the signature of cross-test interference).
+      After: ~2/6 runs, but concentrated on **two specific tests**. The raw failure rate barely moved; what
+      collapsed is the *spread*. Cross-test interference is gone; what remains are intra-test races.
+      **The remaining failure is characterised, not mysterious:** `ReadBeforeWriteEnforcementTests` fails
+      reading `existing.txt` in **its own** temp root while it is "used by another process" — the test drives
+      a real `WorkerAgentLoop`, and the loop is still live (writing) when the test reads. Same family as the
+      shutdown-contract bug: work outliving the awaited call. `ScopedTreeFetchTests` builds no host at all,
+      so its failure is a third, separate cause. Both are now narrow enough to fix directly.
+- [ ] **Follow-ups this sweep exposed (not done):** (a) the 33 service-returning helpers still leak a host
+      each; (b) `ReadBeforeWriteEnforcementTests` / `ScopedTreeFetchTests` intra-test races above; (c) the
+      detector the flake investigation recommended — an assembly fixture failing the run on
+      `TaskScheduler.UnobservedTaskException`, which would surface the remaining `_ = SomethingAsync()` sites
+      instead of letting them show up as someone else's flake.
+- [ ] ~~Original sizing note~~: 163 test sites build a `StudioWebApplication` without disposing it
       (vs 33 that do), leaking background loops and file handles into whatever runs next — the cause of the
       residual "different test each run" flakiness that survived the shutdown-contract fix. Note 6 of those
       sites are helpers that `return app`, where a blind `await using` would dispose before use, so this
