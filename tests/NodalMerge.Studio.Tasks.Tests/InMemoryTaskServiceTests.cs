@@ -45,6 +45,17 @@ public class InMemoryTaskServiceTests
         return (new InMemoryTaskService(workUnits, new InMemoryStudioNodeStore()), workUnits);
     }
 
+    // Captures log entries so A4's refused-transition breadcrumb can be asserted on.
+    private sealed class CapturingLogger<T> : Microsoft.Extensions.Logging.ILogger<T>
+    {
+        public readonly List<string> Messages = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel,
+            Microsoft.Extensions.Logging.EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) => Messages.Add(formatter(state, exception));
+    }
+
     private static StudioTask MakeTask(string taskId, string workUnitId, TaskStatus status = TaskStatus.Open, int priority = 0) =>
         new(taskId, workUnitId, $"Task {taskId}", "desc", status, null, priority);
 
@@ -106,6 +117,29 @@ public class InMemoryTaskServiceTests
         // Open → Completed is not allowed; must go through InProgress
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             svc.UpdateAsync(MakeTask("T-1", "WU-1", TaskStatus.Completed)));
+    }
+
+    // A4 (plans/test-suite-remediation-plan.md): a refused transition must leave a breadcrumb, so a
+    // caller that swallows the throw (the exact way the Open->Completed caller bug stayed invisible)
+    // still records that the transition did not happen. This is the permanent version of the A1
+    // diagnostic.
+    [Fact]
+    public async Task UpdateAsync_logs_a_breadcrumb_when_it_refuses_a_transition()
+    {
+        var workUnits = new FakeWorkUnitService();
+        workUnits.Seed("WU-1");
+        var logger = new CapturingLogger<InMemoryTaskService>();
+        var svc = new InMemoryTaskService(workUnits, new InMemoryStudioNodeStore(), logger);
+
+        await svc.CreateAsync(MakeTask("T-1", "WU-1", TaskStatus.Open));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            svc.UpdateAsync(MakeTask("T-1", "WU-1", TaskStatus.Completed)));
+
+        Assert.Contains(logger.Messages, m =>
+            m.Contains("Refused task transition", StringComparison.Ordinal)
+            && m.Contains("Open", StringComparison.Ordinal)
+            && m.Contains("Completed", StringComparison.Ordinal));
     }
 
     [Fact]

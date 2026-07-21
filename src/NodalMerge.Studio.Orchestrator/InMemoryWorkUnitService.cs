@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Storage;
@@ -23,6 +24,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
     private readonly IStudioGraphPromoter? _graphPromoter;
     private readonly IParticipantEventBus? _eventBus;
     private readonly IServiceProvider? _serviceProvider;
+    private readonly ILogger<InMemoryWorkUnitService>? _logger;
 
     // IStudioGraphPromoter resolves RuntimeGraphPromoter → IRuntimeCommandBridge → FfiBridgeProcessor
     // → HostFfiClient → native P/Invoke. Defer until first use to avoid blocking startup.
@@ -44,7 +46,10 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IServiceProvider? serviceProvider = null,
         // L2.4 — optional: resolves a proposal's diff (CAS-ref'd off the replication plane). Null
         // falls back to the inline WorkspaceChanges (tests / no-CAS configs).
-        IMergeDiffResolver? diffResolver = null)
+        IMergeDiffResolver? diffResolver = null,
+        // A4 (plans/test-suite-remediation-plan.md): optional; logs a refused status transition at
+        // Debug so a swallowed illegal transition leaves a breadcrumb (see UpdateStatusAsync).
+        ILogger<InMemoryWorkUnitService>? logger = null)
     {
         _branchService         = branchService;
         _mergeService          = mergeService;
@@ -59,6 +64,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         _graphPromoter         = graphPromoter;
         _eventBus              = eventBus;
         _serviceProvider       = serviceProvider;
+        _logger                = logger;
     }
 
     public async Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken cancellationToken = default)
@@ -100,6 +106,11 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         var workUnit = GetRequired(workUnitId);
         if (!WorkUnitTransitions.CanTransition(workUnit.Status, status))
         {
+            _logger?.LogDebug(
+                "Refused work-unit transition {WorkUnitId}: {From} -> {To} (not a legal edge). Many "
+                + "convergence callers swallow this because the unit is often already where they want "
+                + "it; a swallowed refusal is otherwise invisible.",
+                workUnitId, workUnit.Status, status);
             throw new InvalidOperationException($"Cannot transition work unit from {workUnit.Status} to {status}.");
         }
 

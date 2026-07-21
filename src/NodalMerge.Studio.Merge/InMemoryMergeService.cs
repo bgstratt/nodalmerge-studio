@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -81,7 +82,10 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         ICandidateConflictResolutionService? candidateConflictResolution = null,
         ITaskConflictService? taskConflicts = null,
         // L2.4 — optional: when present, ProposeAsync moves the inlined diff to the CAS content plane.
-        IBlobStoreProvider? blobStore = null)
+        IBlobStoreProvider? blobStore = null,
+        // A4 (plans/test-suite-remediation-plan.md): optional; logs a refused proposal transition at
+        // Debug so a swallowed illegal transition leaves a breadcrumb (see LogRefusedTransition).
+        ILogger<InMemoryMergeService>? logger = null)
     {
         _nodeStore                    = nodeStore;
         _fileWorkspace                = fileWorkspace;
@@ -96,7 +100,20 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         _candidateConflictResolution  = candidateConflictResolution;
         _taskConflicts                = taskConflicts;
         _blobStore                    = blobStore;
+        _logger                       = logger;
     }
+
+    private readonly ILogger<InMemoryMergeService>? _logger;
+
+    // A4: a refused proposal transition is silent when a convergence caller swallows the throw (the
+    // supersede/reconcile loops do, because a constituent is often already past the target state). One
+    // Debug line at the source makes the benign case visible and a real bug findable, without changing
+    // what is legal.
+    private void LogRefusedTransition(string proposalId, MergeProposalStatus from, MergeProposalStatus to)
+        => _logger?.LogDebug(
+            "Refused merge-proposal transition {ProposalId}: {From} -> {To} (not a legal edge). "
+            + "If a caller swallows this, the transition simply did not happen.",
+            proposalId, from, to);
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
     {
@@ -154,6 +171,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.ReadyForReview))
         {
+            LogRefusedTransition(proposalId, proposal.Status, MergeProposalStatus.ReadyForReview);
             throw new InvalidOperationException(
                 $"Cannot validate proposal '{proposalId}': status {proposal.Status} cannot transition to ReadyForReview.");
         }
@@ -191,6 +209,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, decision))
         {
+            LogRefusedTransition(proposalId, proposal.Status, decision);
             throw new InvalidOperationException(
                 $"Cannot transition proposal '{proposalId}' from {proposal.Status} to {decision}. " +
                 $"Proposals must be in ReadyForReview before human review.");
@@ -463,6 +482,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         {
             if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.UnderReview))
             {
+                LogRefusedTransition(proposalId, proposal.Status, MergeProposalStatus.UnderReview);
                 throw new InvalidOperationException(
                     $"Cannot begin automated review for proposal '{proposalId}' in status {proposal.Status}.");
             }
@@ -500,6 +520,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, nextStatus))
         {
+            LogRefusedTransition(proposalId, proposal.Status, nextStatus);
             throw new InvalidOperationException(
                 $"Cannot transition proposal '{proposalId}' from {proposal.Status} to {nextStatus}.");
         }
@@ -652,6 +673,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.Merged))
         {
+            LogRefusedTransition(proposalId, proposal.Status, MergeProposalStatus.Merged);
             throw new InvalidOperationException(
                 $"Cannot apply proposal '{proposalId}': only Approved proposals can be merged (current: {proposal.Status}).");
         }
@@ -1822,6 +1844,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.Superseded))
         {
+            LogRefusedTransition(proposalId, proposal.Status, MergeProposalStatus.Superseded);
             throw new InvalidOperationException(
                 $"Cannot supersede proposal '{proposalId}': status {proposal.Status} cannot transition to Superseded.");
         }
