@@ -30,6 +30,13 @@ public sealed class WorkUnitCommandService(
     // session-less and ClarificationCommandService's synthetic-session fallback covers them.
     NodalMerge.Studio.Storage.IGoalNodeService? goalNodes = null) : IWorkUnitCommandService
 {
+    // "Not worth cancelling" — used by CancelAsync/CancelAllActiveAsync to skip units already done.
+    // This is intentionally a DIFFERENT set from the GC/retention-terminal set
+    // (SnapshotRetentionPolicy = {Completed, Merged}): it answers "should I issue a Cancel", not "can
+    // this unit's seed snapshot be deleted". Cancelled is here (re-cancelling is a no-op); Failed is
+    // deliberately NOT (a Failed unit still gets its leases/agents cleaned up by a subtree cancel, and
+    // Failed -> Cancelled is a legal edge). Do not "unify" these sets — see SnapshotRetentionPolicy's
+    // TerminalStatuses comment for why the divergence is load-bearing.
     private static readonly HashSet<WorkUnitStatus> TerminalStatuses = new()
     {
         WorkUnitStatus.Completed, WorkUnitStatus.Merged, WorkUnitStatus.Cancelled,

@@ -43,15 +43,19 @@ namespace NodalMerge.Studio.Storage;
 //   against a "base/{proposalId}" file-workspace branch copy, never a RepositorySnapshot id) tracks
 //   a separate proposal-time base generation.
 // - Terminal work-unit statuses (for both the Active-class non-terminal check and the Intermediate
-//   age-out clock): WorkUnitTransitions.CanTransition's switch has ZERO outgoing edges for
-//   Completed, Merged, and Failed — no code path ever revives a work unit from any of these three,
-//   so they're the true terminal set for retention purposes. This deliberately differs from
-//   WorkspaceCacheManager.TerminalEvictableStatuses ({Completed, Merged, Cancelled}), which answers
-//   a narrower question ("is this ephemeral working DIRECTORY safe to delete") — Cancelled's
-//   content was "never merged" so its dir is always safe to evict, but Cancelled itself still has
-//   live revival edges (Cancelled -> Queued/Executing) in the transition table, and DeadLettered
-//   has even more (-> Retrying/Proposed/Merged/Queued/Executing) — both can resume the SAME branch
-//   and would need its seed generation's bytes still present, so both count as non-terminal here.
+//   age-out clock): only Completed and Merged — the frozen `terminal_status_names` set (see the
+//   TerminalStatuses field below for the full rationale). This ORIGINALLY also listed Failed on the
+//   belief that it "has zero outgoing edges", but that was wrong: WorkUnit.cs's
+//   `(_, Cancelled) when from is not Completed and not Merged` rule gives Failed a live revival edge
+//   (Failed -> Cancelled -> Queued/Executing), so a failed work unit IS resumable and its seed must
+//   survive. finding #30 corrected the Rust GC and the frozen vector; this comment and the C# set
+//   are the belated C#-side correction. Also non-terminal for the same reason: Cancelled
+//   (-> Queued/Executing) and DeadLettered (-> Retrying/Proposed/Merged/Queued/Executing) — both can
+//   resume the SAME branch and would need its seed generation's bytes still present.
+//   This deliberately differs from WorkspaceCacheManager.TerminalEvictableStatuses
+//   ({Completed, Merged, Cancelled}), which answers a narrower question ("is this ephemeral working
+//   DIRECTORY safe to delete") — Cancelled's content was "never merged" so its dir is always safe to
+//   evict, even though Cancelled's seed generation (a different, CAS-plane thing) must be retained.
 // - Current head: not a separate sync-state pointer (RepositorySyncStateV1's own Generation field
 //   is a distinct per-BranchId external-drift counter, scoped to "main" only, and unrelated to
 //   RepositorySnapshot.Generation). Computed the same way
@@ -78,11 +82,24 @@ public sealed class SnapshotRetentionPolicy(
     RetentionPolicyOptions? retentionOptions = null,
     TimeProvider? clock = null) : ISnapshotRetentionPolicy
 {
+    // The GC/retention-terminal set: a work unit whose seed/merge-base snapshot can be aged out
+    // because the unit can never come back to need it. This MUST match the frozen contract
+    // `terminal_status_names` (work-unit-status-vectors.v1.json) = {Completed, Merged}, which nodalmerge's
+    // Rust GC coordinator (server/server/src/studio_live_hashes.rs) also uses — the two GC systems
+    // delete real blobs and must agree, or one deletes a seed the other considers live.
+    //
+    // Deliberately NOT terminal here (all have live revival edges in WorkUnitTransitions, so a human
+    // can bring them back and their seed must survive): Cancelled (-> Queued/Executing), DeadLettered
+    // (-> Retrying/Queued/Executing/...), and Failed. Failed was the straggler: finding #30 (slice 1.6)
+    // removed it from the Rust set and the frozen vector because `Failed -> Cancelled -> Queued`/
+    // `Executing` is a real human revival path ("a failed work unit IS resumable"), but this C# policy
+    // — which BlobGcService and WorkspaceCacheManager both delete/evict against — still listed it, so
+    // it aged out and deleted the seed blobs of revivable Failed units. Removing it aligns C# GC with
+    // the Rust GC and the contract, and errs toward retaining (never deleting a still-revivable seed).
     private static readonly HashSet<WorkUnitStatus> TerminalStatuses =
     [
         WorkUnitStatus.Completed,
         WorkUnitStatus.Merged,
-        WorkUnitStatus.Failed,
     ];
 
     public async Task<SnapshotRetentionReport> ClassifyAsync(CancellationToken ct = default)
