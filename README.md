@@ -122,7 +122,7 @@ From any completed work unit, **Run with different model** branches from that pr
 
 A typical autonomous run: you describe a goal, pick `Agent Approval` (or `Hybrid`) so it doesn't need you at the merge gate, turn on the candidate branch so nothing touches `main` directly, optionally require build+test evidence before any proposal is even accepted, and — if you're unsure which approach is best — launch it as a Multi-Model or Architecture experiment instead of a single run. You can walk away; when you come back, either a completed merge is waiting on `candidate` for you to promote, or a decision (a rejected proposal, a paused agent awaiting your steering input, or a set of forks awaiting **Pick Winner**) is waiting in the Decision Tree.
 
-See [docs/reference/ui-reference.md](docs/reference/ui-reference.md) for every control these features expose in the extension, and [docs/reference/api-reference.md](docs/reference/api-reference.md) for the full MCP/REST surface behind them.
+See [UI reference](https://docs.nodalmerge.com/studio/reference/ui-reference) for every control these features expose in the extension, and [API reference](https://docs.nodalmerge.com/studio/reference/api-reference) for the full MCP/REST surface behind them.
 
 ---
 
@@ -155,7 +155,7 @@ Agents receive compact projections — not full DAG history. Projections compres
 
 ### MCP-Native
 
-Full MCP v1 tool surface with 117 frozen tool names across 21 namespaces under `nm_v1_*`, plus a 14-tool `nms_v1_*` external-caller surface. Integrate any MCP-compatible client with the Studio host. See [docs/reference/api-reference.md](docs/reference/api-reference.md) for the verified catalog.
+Full MCP v1 tool surface with 117 frozen tool names across 21 namespaces under `nm_v1_*`, plus a 14-tool `nms_v1_*` external-caller surface. Integrate any MCP-compatible client with the Studio host. See [API reference](https://docs.nodalmerge.com/studio/reference/api-reference) for the verified catalog.
 
 ---
 
@@ -272,7 +272,7 @@ NodalMerge Studio serves as the **Control Tower** for human operators. The exten
 - Mark a checkpoint as Known Good, restore a branch to one, or fork a new exploration from one
 - View workspace summary (active work units, pending merges, failures, dead-letter queue)
 
-See [docs/reference/ui-reference.md](docs/reference/ui-reference.md) for the complete control-by-control inventory of every panel.
+See [UI reference](https://docs.nodalmerge.com/studio/reference/ui-reference) for the complete control-by-control inventory of every panel.
 
 ---
 
@@ -363,8 +363,8 @@ webhook triggers). Activate with `--mode peer`, `STUDIO_MODE=peer`, or `Peer:Ena
 config. In connected mode (set `Peer:HostUri`), the peer joins a NodalMerge room and its agents
 appear in the extension's Activity Center in real time.
 
-See [docs/guides/headless-peer.md](docs/guides/headless-peer.md) for configuration, use-case
-patterns, and the goal injection API. See [docs/guides/extending-goals.md](docs/guides/extending-goals.md)
+See [headless peer guide](https://docs.nodalmerge.com/studio/guides/headless-peer) for configuration, use-case
+patterns, and the goal injection API. See [extending goals guide](https://docs.nodalmerge.com/studio/guides/extending-goals)
 for the full goal creation surface and external trigger patterns.
 
 ---
@@ -378,19 +378,19 @@ share a working directory or compete for file locks — the CAS blob store is th
 per-branch directories are the write-isolated layer. The `nm_v1_workspace_path` MCP tool returns
 the effective filesystem path for any branch.
 
-See [docs/guides/repository-virtualization.md](docs/guides/repository-virtualization.md) for
+See [repository virtualization guide](https://docs.nodalmerge.com/studio/guides/repository-virtualization) for
 seeding strategies, scoped materialization (Phase 11), and the full `Workspace` config reference.
 
 ---
 
 ## MCP Integration
 
-NodalMerge Studio exposes an MCP v1 tool surface with **117 `nm_v1_*` tools** (canonical constants in `McpToolNames`), **72 of them** dispatched in-process to autonomous agents; the rest are available to external MCP clients and the VS Code extension only. A separate, smaller **`nms_v1_*` surface (14 tools, `McpServerToolNames`)** is the recommended entry point for external MCP clients (Claude Code, Cursor, scripts) — goal-centric, without requiring knowledge of work units or branches. See [docs/reference/api-reference.md](docs/reference/api-reference.md) for the full, verified catalog and coverage breakdown.
+NodalMerge Studio exposes an MCP v1 tool surface with **117 `nm_v1_*` tools** (canonical constants in `McpToolNames`), **72 of them** dispatched in-process to autonomous agents; the rest are available to external MCP clients and the VS Code extension only. A separate, smaller **`nms_v1_*` surface (14 tools, `McpServerToolNames`)** is the recommended entry point for external MCP clients (Claude Code, Cursor, scripts) — goal-centric, without requiring knowledge of work units or branches. See [API reference](https://docs.nodalmerge.com/studio/reference/api-reference) for the full, verified catalog and coverage breakdown.
 
 Core namespaces: `nm_v1_projection_*`, `nm_v1_workunit_*`, `nm_v1_task_*`, `nm_v1_branch_*`, `nm_v1_merge_*`, `nm_v1_workspace_*` (file I/O, build/test/run, semantic navigation, profile), `nm_v1_scheduler_*`, `nm_v1_artifact_*`. Phase 6.7+ adds `nm_v1_goal_*`, `nm_v1_decision_*`, `nm_v1_evidence_*`, `nm_v1_trajectory_*`, `nm_v1_hypothesis_*`, `nm_v1_reasoning_*`, `nm_v1_model_*` (none dispatched to agents yet). Phase 7 capabilities (Experiments, Steering, Counterfactuals, Review Policy, Promotion Branches) are REST-only.
 
 Full documentation:
-- [docs/reference/api-reference.md](docs/reference/api-reference.md) — complete 117-tool catalog with dispatch status, REST endpoint parity, and extension coverage analysis
+- [API reference](https://docs.nodalmerge.com/studio/reference/api-reference) — complete 117-tool catalog with dispatch status, REST endpoint parity, and extension coverage analysis
 - [docs/contracts/mcp-v1-contract.md](docs/contracts/mcp-v1-contract.md) — frozen design principles, request/response schemas, error envelope format, and Phase 6.7+/Phase 7 addendum
 
 ---
@@ -413,7 +413,7 @@ Layer 1: NodalMerge Core (Rust)   — DAG storage, CRDT convergence, replication
 
 The VS Code extension and headless peers both sit at Layer 3 — they use Studio services (Layer 2),
 not NodalMerge APIs directly. The extension exposes an HTTP server and MCP-over-HTTP; a headless
-peer does not. See [docs/guides/headless-peer.md](docs/guides/headless-peer.md).
+peer does not. See [headless peer guide](https://docs.nodalmerge.com/studio/guides/headless-peer).
 
 ### Key Architectural Principles
 
@@ -446,8 +446,7 @@ See [docs/architecture/v1-architecture-spec.md](docs/architecture/v1-architectur
 | `tests/` | Unit and integration tests |
 | `docs/architecture/` | Architecture spec, CRDT vs. cognition layer, node schemas, ADRs |
 | `docs/contracts/` | MCP v1 contract (frozen + Phase 6.7+ addendum), projection contract |
-| `docs/reference/` | [UI reference](docs/reference/ui-reference.md), [API reference](docs/reference/api-reference.md) |
-| `docs/guides/` | How-to guides: [headless peer](docs/guides/headless-peer.md), [extending goals](docs/guides/extending-goals.md), [domain observers](docs/guides/domain-observers.md), [repository virtualization](docs/guides/repository-virtualization.md) |
+| `docs/guides/` | Dev/smoke guides (e.g. the multi-user smoke test). User guides & references live at [docs.nodalmerge.com/studio](https://docs.nodalmerge.com/studio) |
 | `plans/` | Slice-based execution plans |
 | `scripts/` | Build, dev, and verify scripts |
 

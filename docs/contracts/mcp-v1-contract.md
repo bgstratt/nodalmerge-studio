@@ -5,7 +5,7 @@ Status: **Frozen for implementation** — updated for Phase 6.5 (command-surface
 > **Note:** This document predates Phase 6.7+ and Phase 7. It does not cover the `goal`, `decision`,
 > `evidence`, `trajectory`, `hypothesis`, `reasoning`, or `model` tool namespaces (all already in
 > code), nor the Phase 7 REST-only additions (Experiments, Steering, Counterfactuals, Review Policy,
-> Promotion Branches). See [docs/reference/api-reference.md](../reference/api-reference.md) for the
+> Promotion Branches). See [the API reference](https://docs.nodalmerge.com/studio/reference/api-reference) for the
 > complete, currently-accurate tool and endpoint catalog, including which tools are dispatched to
 > autonomous agents versus reachable only by external MCP clients or REST/the VS Code extension.
 > Tool naming and the design principles below remain frozen and accurate.
@@ -505,7 +505,7 @@ Every MCP tool has a corresponding REST endpoint via the Studio Host. The mappin
 > format, and all tool namespaces through `nm_v1_artifact_*` above remain frozen and accurate.
 > The sections below document tool namespaces and REST-only capabilities added after Phase 6.6.
 > For the complete, authoritative catalog — including dispatch status, REST endpoint parity, and
-> coverage analysis — see [docs/reference/api-reference.md](../reference/api-reference.md).
+> coverage analysis — see [the API reference](https://docs.nodalmerge.com/studio/reference/api-reference).
 
 ### New tool namespaces (Phase 6.7+)
 
@@ -557,7 +557,7 @@ well. C# constants live in `McpServerToolNames` (separate from `McpToolNames`).
 | `nms_v1_workspace_*` | `workspace_status`, `feedback_record` | Workspace snapshot and durable feedback injection |
 
 None of these tools are dispatched to in-process orchestrator/worker agents — they are external-caller
-only. See [docs/reference/api-reference.md](../reference/api-reference.md) for full descriptions,
+only. See [the API reference](https://docs.nodalmerge.com/studio/reference/api-reference) for full descriptions,
 parameter details, and the recommended call sequence.
 
 **This boundary is enforced at registration, not just by naming convention.** The external MCP
