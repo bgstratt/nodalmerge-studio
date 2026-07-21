@@ -242,9 +242,23 @@ intermittently sees 4 recorded fetches instead of 5. This is the most frequent f
 all runs, is fully independent of B2, and is a clean two-line thread-safety fix. Filed as **B2a**,
 fixed as a separate commit.
 
+### B2a — DONE (2026-07-20): locked the recorder. Verified by neuter (fails without the lock).
+After the fix: ScopedTreeFetch 20/20 clean, and 4 consecutive full-suite runs 760/760 with zero
+teardown failures and zero unobserved exceptions.
+
 ### Still pending in B2 (batch 2)
 
 The remaining ~48 `IDisposable` test classes (non-Sqlite-collection). Same mechanical migration.
+Lower urgency than batch 1 — those classes are not in the contended `"Sqlite"` collection — but the
+same un-retried-delete risk applies to any that leak a host.
+
+### Flake ledger (observed, for batch 2 / C-track triage)
+
+Tests seen flaking across B1/B2 verification, so batch 2 and C-track have a canary list:
+- `ScopedTreeFetchTests.PrefetchScopeAsync_warms_exactly_the_scoped_file_blobs` — **FIXED (B2a)**.
+- `RoomReplicationTests.Two_hosts_replicate_..._reconnect` — WebSocket reconnect timing; C1/C2 target.
+- `StudioHostSmokeTests.Build_registers_studio_services` — seen once; cause not yet captured. Only
+  builds the DI container and resolves 5 services (no host start, no DB). Watch for recurrence.
 
 ## B3. Close the structural host leaks (~131 sites)
 
