@@ -267,15 +267,22 @@ public class UnobservedTaskExceptionDetectorTests
 
         LeakARealFaultedTask();
 
-        Thread.Sleep(200);
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-
         static bool IsSentinel(UnobservedTaskExceptionDetector.Capture c) =>
             c.Exception.Flatten().InnerExceptions
                 .Any(e => e.Message.Contains(realLeakMarker, StringComparison.Ordinal));
+
+        // The UnobservedTaskException event only fires when the faulted task is *finalized*, and
+        // finalizer timing is nondeterministic — markedly more so on Linux CI than on Windows. A
+        // single fixed sleep + one GC pass loses that race, so poll a GC/finalize cycle until the
+        // planted leak is recorded (HasFindingMatching does NOT consume, so re-checking is safe).
+        for (var attempt = 0; attempt < 30 && !UnobservedTaskExceptionDetector.HasFindingMatching(IsSentinel); attempt++)
+        {
+            Thread.Sleep(100);
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
 
         try
         {
