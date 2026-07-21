@@ -83,6 +83,20 @@ retry helper. No new mechanism — same 5-attempt 25/50/75/100 ms schedule.
 
 **Verification:** neuter the retry; the contention test must fail. Restore; it must pass.
 
+### A2 — DONE (2026-07-20)
+
+- Added `RunWithRetryAsync(Action, ct)` — the copy/delete twin of the existing `ReadWithRetryAsync`,
+  same bounded budget (5 attempts, 25/50/75/100ms, last rethrows).
+- Wrapped `File.Delete` and `File.Copy` in **both** `ApplyBranchAsync` and `ApplyExternalPathAsync`
+  (the latter had the identical race and already returned `Task`, so making it `async` was
+  transparent to callers). Also covered the delete path, not just copy — same sharing violation.
+- New `FileSystemWorkspaceServiceApplyContentionTests` mirrors the read-contention test: holds the
+  target file exclusively for 120ms (inside the retry budget) and asserts the apply rides it out and
+  lands the merged content.
+
+**Verified by neuter:** removing the copy retry makes the contention test fail with the exact
+IOException; restored, it passes. Full suite 761/761, all other projects green.
+
 ## A3. Three `TerminalStatuses` definitions disagree
 
 **Severity:** low, but it is a latent correctness bug, not just duplication.

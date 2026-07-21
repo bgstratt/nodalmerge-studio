@@ -213,6 +213,29 @@ internal sealed class FileSystemWorkspaceService(
         }
     }
 
+    // The copy/delete twin of ReadWithRetryAsync, for the same sharing-violation reason. ApplyBranchAsync
+    // deletes and copies files in the target branch, and those files can be held open at that exact
+    // moment by the materializer snapshotting the branch or an agent/poll loop reading it — File.Copy
+    // opens the destination for write, File.Delete needs exclusive access, so an overlap throws a
+    // transient IOException. The read/write paths already ride this out; the branch-apply path did not,
+    // so a merge landing while its target was being read failed hard. Same bounded budget (5 attempts,
+    // 25/50/75/100ms), last attempt rethrows.
+    private static async Task RunWithRetryAsync(Action op, CancellationToken ct)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                op();
+                return;
+            }
+            catch (IOException) when (attempt < 4)
+            {
+                await Task.Delay(25 * (attempt + 1), ct).ConfigureAwait(false);
+            }
+        }
+    }
+
     // Byte-accurate read for the materialize/snapshot plumbing (see IFileWorkspaceService). No
     // MaxReadBytes cap and no UTF-8 round-trip: a binary or >MaxReadBytes file is returned exactly
     // as it sits on disk, so it can be hashed/stored/copied without corruption or loss. Reads the
@@ -600,7 +623,7 @@ internal sealed class FileSystemWorkspaceService(
                 var rel = Path.GetRelativePath(targetDir, targetFile).Replace('\\', '/');
                 if (IsPlanArtifact(rel)) continue;
                 if (!sourceRelative.Contains(rel))
-                    File.Delete(targetFile);
+                    await RunWithRetryAsync(() => File.Delete(targetFile), ct).ConfigureAwait(false);
             }
         }
 
@@ -613,7 +636,7 @@ internal sealed class FileSystemWorkspaceService(
             var dstDirPath = Path.GetDirectoryName(dstFull)!;
             if (!Directory.Exists(dstDirPath))
                 Directory.CreateDirectory(dstDirPath);
-            File.Copy(srcFull, dstFull, overwrite: true);
+            await RunWithRetryAsync(() => File.Copy(srcFull, dstFull, overwrite: true), ct).ConfigureAwait(false);
         }
     }
 
@@ -653,7 +676,7 @@ internal sealed class FileSystemWorkspaceService(
         return new WorkspaceDiff(added, modified, deleted, ComputeFingerprint(externalEntries));
     }
 
-    public Task ApplyExternalPathAsync(string branchId, string externalPath, CancellationToken ct = default)
+    public async Task ApplyExternalPathAsync(string branchId, string externalPath, CancellationToken ct = default)
     {
         var branchDir = BranchDir(branchId);
         if (!Directory.Exists(branchDir))
@@ -668,7 +691,7 @@ internal sealed class FileSystemWorkspaceService(
             var rel = Path.GetRelativePath(branchDir, targetFile).Replace('\\', '/');
             if (IsIgnoredDirSegment(rel) || IsPlanArtifact(rel)) continue;
             if (!sourceRelative.Contains(rel))
-                File.Delete(targetFile);
+                await RunWithRetryAsync(() => File.Delete(targetFile), ct).ConfigureAwait(false);
         }
 
         foreach (var rel in sourceRelative)
@@ -679,10 +702,8 @@ internal sealed class FileSystemWorkspaceService(
             var dstDirPath = Path.GetDirectoryName(dstFull)!;
             if (!Directory.Exists(dstDirPath))
                 Directory.CreateDirectory(dstDirPath);
-            File.Copy(srcFull, dstFull, overwrite: true);
+            await RunWithRetryAsync(() => File.Copy(srcFull, dstFull, overwrite: true), ct).ConfigureAwait(false);
         }
-
-        return Task.CompletedTask;
     }
 
     // ── Repository op emission (Phase 4 dual-write) ───────────────────────────
