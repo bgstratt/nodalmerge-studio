@@ -536,8 +536,25 @@ public sealed class RoomPeerClient(
         if (_lifetimeCts is not null)
         {
             await _lifetimeCts.CancelAsync();
-            _lifetimeCts.Dispose();
         }
+
+        // Await the loop, mirroring StopAsync above. Cancelling without awaiting only *requests*
+        // that the loop stop — it can still be mid-iteration, doing engine reads and SQLite work
+        // against providers the container is concurrently disposing (an ObjectDisposedException on
+        // an unobserved task, and on Windows a file handle that outlives the host). Any disposal
+        // path that isn't a clean StopAsync — container disposal, an in-process host restart —
+        // took exactly that route. Bounded so a wedged loop cannot hang disposal.
+        if (_membershipLoop is not null)
+        {
+            try { await _membershipLoop.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+            catch (TimeoutException)
+            {
+                logger.LogWarning("[RoomPeerClient] Membership loop did not stop within 10s of disposal.");
+            }
+        }
+
+        _lifetimeCts?.Dispose();
 
         foreach (var connection in _connections.Values)
             await connection.StopAsync().ConfigureAwait(false);

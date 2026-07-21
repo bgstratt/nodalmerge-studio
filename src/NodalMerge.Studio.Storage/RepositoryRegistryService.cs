@@ -7,6 +7,40 @@ using NodalMerge.Studio.Core.Services;
 
 namespace NodalMerge.Studio.Storage;
 
+// plans/vision-punchlist-remediation.md (Items 1+2).
+public enum RepositoryRelinkMode
+{
+    // Converge only on an unambiguous match. Commits nothing when the answer is genuinely unknown —
+    // a fork, a degraded signal, or several candidates — and hands back candidates for the human.
+    Auto,
+
+    // Bind the caller's explicit choice, or "register-new" to mint a fresh room (a deliberate split).
+    Manual,
+}
+
+// What will stop appearing if this re-link commits. Re-pointing a repository changes which room is
+// read and written from here on, but nothing migrates the content already in the old room — it stays
+// on disk and simply drops out of the read fan-out. Surfacing this is the difference between an
+// informed choice and a silent orphaning.
+public sealed record RepositoryRelinkImpact(
+    string RoomId,
+    int TotalNodes,
+    IReadOnlyDictionary<string, int> CountsByKind);
+
+public sealed record RepositoryRelinkResult(
+    string RepositoryId,
+    string? CurrentWorkgroupRepoId,
+    // What this re-link would bind (or did bind). Null when there is nothing to change, or when the
+    // answer needs a human — check Candidates.
+    string? ProposedWorkgroupRepoId,
+    bool Committed,
+    RepositoryBindingProvenance? Provenance,
+    IReadOnlyList<RepositoryDisambiguationCandidateV1> Candidates,
+    // Null when the binding would not actually move (nothing to lose).
+    RepositoryRelinkImpact? Impact,
+    // Plain-language reason, shown directly to the user — this flow is only ever driven by a human.
+    string Explanation);
+
 public interface IRepositoryRegistryService
 {
     Task<RepositoryV1> RegisterAsync(string path, string? label, CancellationToken ct = default);
@@ -21,6 +55,32 @@ public interface IRepositoryRegistryService
     /// repository unchanged) if it has no pending disambiguation.
     /// </summary>
     Task<RepositoryV1?> ResolveDisambiguationAsync(string repositoryId, string? chosenRepoId, CancellationToken ct = default);
+
+    /// <summary>
+    /// plans/vision-punchlist-remediation.md (Items 1+2) — USER-INITIATED re-link of a repository's
+    /// workgroup binding. Nothing calls this on its own: re-resolution never runs in the background,
+    /// on an inbound pack, or on a timer, so a binding that has settled stays settled unless a human
+    /// asks. That restriction is what makes re-reading git here safe, and it is the whole reason this
+    /// is separate from <see cref="ResolveDisambiguationAsync"/>.
+    ///
+    /// Unlike ResolveDisambiguationAsync — which no-ops unless a disambiguation is pending — this
+    /// works on an already-settled binding, which is the case that matters: two clones that diverged
+    /// before deterministic ids existed, or a clone that was shallow at register time and has since
+    /// gained its root history. Hints are re-read from git here (that fresh read is the point; a
+    /// cached degraded hint set could never converge).
+    ///
+    /// <paramref name="mode"/> Auto commits only an unambiguous match, and never moves a binding a
+    /// human chose. Manual commits <paramref name="chosenRepoId"/> (or "register-new" to mint a fresh
+    /// room, deliberately splitting this repo off). Pass <paramref name="commit"/> false for a dry run
+    /// — same evaluation, no writes — which is how a caller previews the impact before asking.
+    /// Returns null if the repository isn't registered.
+    /// </summary>
+    Task<RepositoryRelinkResult?> RelinkAsync(
+        string repositoryId,
+        RepositoryRelinkMode mode,
+        string? chosenRepoId = null,
+        bool commit = true,
+        CancellationToken ct = default);
 
     /// <summary>
     /// Creates a fresh repository at <paramref name="path"/> (creating the directory if needed),
@@ -173,7 +233,13 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
             RepositoryId: repositoryId,
             Path: path,
             Label: label,
-            RegisteredAt: DateTimeOffset.UtcNow);
+            RegisteredAt: DateTimeOffset.UtcNow,
+            Hints: hints,
+            // A deterministic id means the root-SHA signal was strong AND uncontested locally; the
+            // guid fallback above is exactly the provisional case a later re-link can converge.
+            Provenance: repositoryId == deterministicId
+                ? RepositoryBindingProvenance.Deterministic
+                : RepositoryBindingProvenance.ProvisionalMint);
 
         // Slice 6.2 (docs/STUDIO_ROOM_SCHEMA.md (b), D1/D2) — bind this local candidate to the
         // workgroup repositories map. RepositoryId above stays this repo's permanent local-candidate
@@ -292,10 +358,189 @@ public sealed class RepositoryRegistryService : IRepositoryRegistryService, IReh
             resolved = repository with { WorkgroupRepoId = chosenRepoId, PendingDisambiguation = null };
         }
 
+        // A human made this call — mark it so Auto re-link never second-guesses it later.
+        resolved = resolved with { Provenance = RepositoryBindingProvenance.HumanResolved };
+
         _repositories[repositoryId] = resolved;
         await _nodeStore.WriteNodeAsync(
             StudioNodeKind.RepositoryV1, repositoryId, JsonSerializer.Serialize(resolved), ct).ConfigureAwait(false);
         return resolved;
+    }
+
+    // See IRepositoryRegistryService.RelinkAsync. User-initiated only — nothing in the runtime calls
+    // this; it exists solely behind an explicit human action.
+    public async Task<RepositoryRelinkResult?> RelinkAsync(
+        string repositoryId,
+        RepositoryRelinkMode mode,
+        string? chosenRepoId = null,
+        bool commit = true,
+        CancellationToken ct = default)
+    {
+        if (!_repositories.TryGetValue(repositoryId, out var repository))
+            return null;
+
+        if (_workgroupDirectory is null)
+            throw new InvalidOperationException("No workgroup repository directory is configured — cannot re-link.");
+
+        var current = repository.WorkgroupRepoId;
+
+        // Re-read git NOW rather than trusting the cached hints. This is the one place that is
+        // allowed to, and it is the only thing that can rescue the stuck population: a clone that was
+        // shallow (or had no HEAD) at register time produced no root SHA and fell back to a guid; once
+        // it has real history, a fresh read yields the deterministic id and converges.
+        RepositoryIdentityHints hints;
+        try
+        {
+            hints = _identityHints is not null
+                ? await _identityHints.ComputeAsync(repository.Path, ct).ConfigureAwait(false)
+                : RepositoryIdentityHints.Empty;
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning(ex, "re-link: could not read identity hints for '{RepositoryId}'", repositoryId);
+            hints = repository.Hints ?? RepositoryIdentityHints.Empty;
+        }
+
+        string? proposed = null;
+        IReadOnlyList<RepositoryDisambiguationCandidateV1> candidates = [];
+        string explanation;
+        // "register-new" always moves (into a room that does not exist yet), but a preview must not
+        // mint one to find that out. Tracked separately so the impact report below still fires on a
+        // dry run — otherwise splitting an already-bound repository would be the one path that
+        // orphaned its old room's content with no warning.
+        var splitsIntoNewRoom = false;
+
+        if (mode == RepositoryRelinkMode.Manual)
+        {
+            if (string.IsNullOrWhiteSpace(chosenRepoId))
+                throw new ArgumentException("A manual re-link requires chosenRepoId (or \"register-new\").", nameof(chosenRepoId));
+
+            if (string.Equals(chosenRepoId, "register-new", StringComparison.OrdinalIgnoreCase))
+            {
+                splitsIntoNewRoom = true;
+                if (commit)
+                {
+                    var minted = await _workgroupDirectory
+                        .RegisterAsync(repository.Label, hints, preferredRepoId: null, ct).ConfigureAwait(false);
+                    proposed = minted.RepoId;
+                }
+                explanation = "Registers this repository as its own new room, splitting it from any repository it currently shares one with.";
+            }
+            else
+            {
+                proposed = chosenRepoId;
+                explanation = $"Binds this repository to '{chosenRepoId}'.";
+            }
+        }
+        else
+        {
+            // Auto. Never move a binding a human deliberately chose — that is precisely the settled
+            // decision the schema's no-re-derivation rule exists to protect.
+            if (repository.Provenance == RepositoryBindingProvenance.HumanResolved)
+            {
+                explanation = "This binding was set explicitly by a person, so automatic re-link leaves it alone. Use manual re-link to change it.";
+            }
+            else
+            {
+                var match = await _workgroupDirectory.MatchAsync(hints, ct).ConfigureAwait(false);
+                switch (match)
+                {
+                    case RepositoryMatchResult.Matched matched when matched.Entry.RepoId != current:
+                        proposed = matched.Entry.RepoId;
+                        explanation = $"Found a repository in this workgroup with the same history — converges onto '{matched.Entry.RepoId}'.";
+                        break;
+
+                    case RepositoryMatchResult.Matched:
+                        explanation = "Already bound to the matching workgroup repository — nothing to change.";
+                        break;
+
+                    case RepositoryMatchResult.NoMatch:
+                        explanation = hints.IsDegraded
+                            ? "No usable identity signal from this checkout (a shallow or empty clone has no root commit), and nothing in the workgroup matches. Fetch full history, or pick a repository manually."
+                            : "No other repository in this workgroup shares this history — the current binding is already the right one.";
+                        break;
+
+                    // Ambiguous: a fork sharing a root commit, or a degraded signal with several
+                    // registered candidates. Deliberately commits nothing.
+                    case RepositoryMatchResult.NeedsDisambiguation needs:
+                        candidates = needs.Candidates
+                            .Select(c => new RepositoryDisambiguationCandidateV1(c.RepoId, c.Label, c.Hints))
+                            // Stable, and the same order on every peer.
+                            .OrderBy(c => c.RepoId, StringComparer.Ordinal)
+                            .ToList();
+                        explanation = candidates.Count == 0
+                            ? "Nothing in the workgroup to match against yet."
+                            : "More than one repository could be the right match — choose one, or register this as its own.";
+                        break;
+
+                    default:
+                        explanation = "Nothing to change.";
+                        break;
+                }
+            }
+        }
+
+        var willMove = (proposed is not null && !string.Equals(proposed, current, StringComparison.Ordinal))
+            || splitsIntoNewRoom;
+
+        // Only meaningful when the binding actually moves — otherwise nothing leaves the fan-out.
+        RepositoryRelinkImpact? impact = null;
+        if (willMove && !string.IsNullOrWhiteSpace(current))
+        {
+            try
+            {
+                var counts = await _nodeStore.CountRepoRoomNodesByKindAsync(current!, ct).ConfigureAwait(false);
+                var total = counts.Values.Sum();
+                if (total > 0)
+                    impact = new RepositoryRelinkImpact($"repo/{current}", total, counts);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogDebug(ex, "re-link: could not count nodes in the current room for '{RepositoryId}'", repositoryId);
+            }
+        }
+
+        var provenance = repository.Provenance;
+        if (commit && willMove)
+        {
+            // A re-link is always a human decision, whichever mode produced it — mark it so nothing
+            // later treats the result as provisional.
+            provenance = RepositoryBindingProvenance.HumanResolved;
+            var updated = repository with
+            {
+                WorkgroupRepoId = proposed,
+                PendingDisambiguation = null,
+                Hints = hints,
+                Provenance = provenance,
+            };
+
+            _repositories[repositoryId] = updated;
+            await _nodeStore.WriteNodeAsync(
+                StudioNodeKind.RepositoryV1, repositoryId, JsonSerializer.Serialize(updated), ct).ConfigureAwait(false);
+
+            _logger?.LogInformation(
+                "re-link: '{RepositoryId}' re-pointed from '{Old}' to '{New}' ({Mode}, user-initiated)",
+                repositoryId, current ?? "(unbound)", proposed, mode);
+        }
+        else if (commit && !willMove && !hints.IsDegraded && !Equals(repository.Hints, hints))
+        {
+            // Binding unchanged, but the fresh read produced better hints than the ones on file —
+            // persist them so the next re-link (and the identity view) reflects reality.
+            var refreshed = repository with { Hints = hints };
+            _repositories[repositoryId] = refreshed;
+            await _nodeStore.WriteNodeAsync(
+                StudioNodeKind.RepositoryV1, repositoryId, JsonSerializer.Serialize(refreshed), ct).ConfigureAwait(false);
+        }
+
+        return new RepositoryRelinkResult(
+            RepositoryId: repositoryId,
+            CurrentWorkgroupRepoId: current,
+            ProposedWorkgroupRepoId: willMove ? proposed : null,
+            Committed: commit && willMove,
+            Provenance: provenance,
+            Candidates: candidates,
+            Impact: impact,
+            Explanation: explanation);
     }
 
     public async Task<RepositoryV1> CreateAsync(string path, string? label, CancellationToken ct = default)

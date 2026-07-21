@@ -155,6 +155,227 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.window.showErrorMessage(`NodalMerge: CAS reconcile failed — ${String(err)}`);
       }
     }),
+
+    // plans/vision-punchlist-remediation.md (Items 1+2) — user-initiated repository re-link. The
+    // backend has exposed identity/disambiguation for a while but nothing ever called it, so a
+    // repository bound to the wrong room (two clones that diverged before deterministic ids, or a
+    // shallow clone that minted a guid) could only be fixed by hand-editing. Deliberately a command
+    // + quickpick rather than a webview: the whole flow is list → pick → confirm, which showQuickPick
+    // does natively, and it mirrors handleAddReference's existing register-then-continue pattern.
+    // Re-pointing takes effect live — the membership loop joins the new room within ~5s, no restart.
+    vscode.commands.registerCommand(COMMANDS.RELINK_REPOSITORY, async () => {
+      const base = manager.hostBaseUrl;
+      const getJson = async (path: string) => {
+        const res = await fetch(`${base}${path}`);
+        if (!res.ok) { throw new Error(`GET ${path} → ${res.status}: ${await res.text()}`); }
+        return res.json() as Promise<any>;
+      };
+      const postJson = async (path: string, body: unknown) => {
+        const res = await fetch(`${base}${path}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) { throw new Error(`POST ${path} → ${res.status}: ${await res.text()}`); }
+        return res.json() as Promise<any>;
+      };
+
+      try {
+        const repos = await getJson('/studio/repositories') as
+          { repositoryId: string; path: string; label?: string | null; workgroupRepoId?: string | null }[];
+        const activeFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const normPath = (p: string) => p.replace(/[\\/]+$/, '').toLowerCase();
+        const activeRegistered = activeFolder
+          ? repos.find(r => normPath(r.path) === normPath(activeFolder))
+          : undefined;
+
+        type RepoPick = vscode.QuickPickItem & { repositoryId?: string; registerPath?: string };
+        const items: RepoPick[] = repos.map(r => ({
+          label: r.label || r.path,
+          description: activeFolder && normPath(r.path) === normPath(activeFolder) ? '(this workspace)' : r.path,
+          detail: r.workgroupRepoId ? `Currently in room repo/${r.workgroupRepoId}` : 'Not bound to a room yet',
+          repositoryId: r.repositoryId,
+        }));
+
+        // A freshly opened folder isn't registered yet, and registration otherwise only happens as a
+        // side effect of creating a goal — so without this the command dead-ends on exactly the case
+        // a new user hits first. Offered first because it is almost always what they want.
+        if (activeFolder && !activeRegistered) {
+          items.unshift({
+            label: '$(add) Register the open folder',
+            description: activeFolder,
+            detail: 'Not a NodalMerge repository yet — registering it gives it a replication room.',
+            registerPath: activeFolder,
+          });
+        }
+
+        if (!items.length) {
+          vscode.window.showInformationMessage(
+            'NodalMerge: no repositories are registered, and no folder is open to register.');
+          return;
+        }
+
+        const picked = await vscode.window.showQuickPick(items, {
+          title: 'Re-link repository',
+          placeHolder: activeRegistered || !activeFolder ? 'Which repository?' : 'Register this folder, or pick another repository',
+        });
+        if (!picked) { return; }
+
+        let repositoryId = picked.repositoryId;
+        if (picked.registerPath) {
+          const created = await postJson('/studio/repositories', { path: picked.registerPath }) as
+            { repositoryId: string };
+          repositoryId = created.repositoryId;
+          // Registering already binds it (match-or-mint), so the re-link below will usually report
+          // nothing to change — which is the correct outcome, and the flow still lets them split it
+          // off or pick a different room deliberately.
+          vscode.window.showInformationMessage(`NodalMerge: registered ${picked.registerPath}.`);
+          StudioShellPanel.current?.refresh();
+        }
+        if (!repositoryId) { return; }
+
+        // The quickpick label for the register entry is a UI affordance, not a name — use the path.
+        const displayName = picked.registerPath ?? picked.label;
+
+        // Preview first — same evaluation the commit would do, but no writes. This is what lets the
+        // confirmation below state exactly what changes and what stops appearing.
+        const preview = await postJson(
+          `/studio/repositories/${encodeURIComponent(repositoryId)}/identity/relink`,
+          { mode: 'auto', commit: false }) as {
+            currentWorkgroupRepoId?: string | null;
+            proposedWorkgroupRepoId?: string | null;
+            explanation: string;
+            candidates: { repoId: string; label?: string | null }[];
+            impact?: { roomId: string; totalNodes: number; countsByKind: Record<string, number> } | null;
+          };
+
+        const describeImpact = (impact: typeof preview.impact) => {
+          if (!impact || impact.totalNodes <= 0) { return ''; }
+          // Name the room being left and how much is in it. Nothing is deleted — it just stops
+          // being read — and the wording has to say that precisely.
+          return `\n\nThe room it is leaving (${impact.roomId}) holds ${impact.totalNodes} record(s). `
+            + 'They are not deleted, but they will no longer appear in this workspace.';
+        };
+
+        const choices: vscode.QuickPickItem[] = [];
+        if (preview.proposedWorkgroupRepoId) {
+          choices.push({
+            label: '$(check) Auto re-link',
+            description: `→ repo/${preview.proposedWorkgroupRepoId}`,
+            detail: preview.explanation,
+          });
+        }
+        choices.push({
+          label: '$(list-selection) Choose a repository manually…',
+          detail: preview.candidates.length
+            ? `${preview.candidates.length} candidate(s) offered`
+            : 'Pick from every repository registered in this workgroup',
+        });
+        choices.push({
+          label: '$(repo-forked) Register as its own repository',
+          detail: 'Splits this repository into a new room of its own. Use when it only looks like another repository.',
+        });
+
+        if (!preview.proposedWorkgroupRepoId) {
+          vscode.window.showInformationMessage(`NodalMerge: ${preview.explanation}`);
+        }
+
+        const action = await vscode.window.showQuickPick(choices, {
+          title: `Re-link ${displayName}`,
+          placeHolder: preview.currentWorkgroupRepoId
+            ? `Currently repo/${preview.currentWorkgroupRepoId}`
+            : 'Not bound to a room yet',
+        });
+        if (!action) { return; }
+
+        let body: Record<string, unknown>;
+        let summary: string;
+
+        if (action.label.includes('Auto re-link')) {
+          body = { mode: 'auto', commit: true };
+          summary = `Re-link to repo/${preview.proposedWorkgroupRepoId}?`;
+        } else if (action.label.includes('own repository')) {
+          body = { mode: 'manual', chosenRepoId: 'register-new', commit: true };
+          summary = `Register ${displayName} as its own separate repository?`;
+        } else {
+          // Offer the matcher's candidates when it produced any; otherwise every other registered
+          // repository, which is what makes the already-diverged case reachable at all.
+          const options = preview.candidates.length
+            ? preview.candidates.map(c => ({ label: c.repoId, description: c.label || undefined }))
+            : repos
+              .filter(r => r.workgroupRepoId && r.workgroupRepoId !== preview.currentWorkgroupRepoId)
+              .map(r => ({ label: r.workgroupRepoId!, description: r.label || r.path }));
+
+          if (!options.length) {
+            vscode.window.showInformationMessage('NodalMerge: no other repository is available to link to.');
+            return;
+          }
+
+          const chosen = await vscode.window.showQuickPick(options, {
+            title: 'Link to which repository?',
+            placeHolder: 'The room this repository should join',
+          });
+          if (!chosen) { return; }
+
+          body = { mode: 'manual', chosenRepoId: chosen.label, commit: true };
+          summary = `Link ${displayName} to repo/${chosen.label}?`;
+        }
+
+        // Preview THIS action, not the auto one evaluated earlier — each choice leaves a different
+        // room behind (and "register as its own" leaves one even when auto would have done nothing),
+        // so reusing the first preview's impact would understate or omit the cost.
+        const actionPreview = await postJson(
+          `/studio/repositories/${encodeURIComponent(repositoryId)}/identity/relink`,
+          { ...body, commit: false }) as { impact?: typeof preview.impact };
+
+        // Modal, because this is the point of no easy return: the old room's content stops being
+        // visible and nothing migrates it back.
+        const confirm = await vscode.window.showWarningMessage(
+          summary + describeImpact(actionPreview.impact), { modal: true }, 'Re-link');
+        if (confirm !== 'Re-link') { return; }
+
+        const result = await postJson(
+          `/studio/repositories/${encodeURIComponent(repositoryId)}/identity/relink`, body) as {
+            committed: boolean; proposedWorkgroupRepoId?: string | null; explanation: string;
+          };
+
+        if (result.committed) {
+          vscode.window.showInformationMessage(
+            `NodalMerge: re-linked to repo/${result.proposedWorkgroupRepoId}. `
+            + 'Joining the room takes a few seconds.');
+          StudioShellPanel.current?.refresh();
+        } else {
+          vscode.window.showInformationMessage(`NodalMerge: nothing changed — ${result.explanation}`);
+        }
+      } catch (err) {
+        vscode.window.showErrorMessage(`NodalMerge: re-link failed — ${String(err)}`);
+      }
+    }),
+
+    // plans/vision-punchlist-remediation.md (Items 1+2, R7) — until now nothing watched for the open
+    // folder or the repository-path setting changing, so the UI kept showing the repository (and
+    // room) it was started with. Refreshing repaints the room indicator against the new folder.
+    //
+    // Deliberately honest about the limit: the host bakes its data directory and workspace root at
+    // spawn, so a *folder* change genuinely needs a host restart to take effect. Rather than
+    // silently showing stale state or restarting behind the user's back, offer it.
+    vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+      StudioShellPanel.current?.refresh();
+      const choice = await vscode.window.showInformationMessage(
+        'NodalMerge: the workspace folders changed. Restart the local host so Studio points at the new folder?',
+        'Restart Host', 'Not Now');
+      if (choice === 'Restart Host') {
+        await vscode.commands.executeCommand(COMMANDS.RESTART_HOST);
+      }
+    }),
+
+    vscode.workspace.onDidChangeConfiguration(e => {
+      // repositoryPath is per-request, not baked at spawn, so this one needs no restart — just a
+      // repaint so the room indicator matches the repository now in effect.
+      if (e.affectsConfiguration('nodalmerge.repositoryPath')) {
+        StudioShellPanel.current?.refresh();
+      }
+    }),
   );
 
   const notificationManager = new NotificationManager(

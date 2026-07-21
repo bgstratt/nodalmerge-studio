@@ -19,7 +19,7 @@ public class ReconciliationAgentServiceTests
     [Fact]
     public async Task TriggerAsync_creates_a_work_unit_seeded_from_the_requested_branch_with_both_goals_context()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
 
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
@@ -63,7 +63,7 @@ public class ReconciliationAgentServiceTests
     [Fact]
     public async Task TriggerAsync_throws_with_fewer_than_two_proposals()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
         var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
@@ -90,7 +90,7 @@ public class ReconciliationAgentServiceTests
         var spawnCalls = new List<(string AgentType, string WorkUnitId, string? Model)>();
         var fakeAgentControl = new FakeAgentControlService(spawnCalls);
 
-        var app = StudioWebApplication.Build([], configureServices: services =>
+        await using var app = StudioWebApplication.Build([], configureServices: services =>
         {
             services.AddInMemoryStorage();
             services.AddSingleton<IAgentControlService>(fakeAgentControl);
@@ -134,7 +134,7 @@ public class ReconciliationAgentServiceTests
         var spawnCalls = new List<(string AgentType, string WorkUnitId, string? Model)>();
         var fakeAgentControl = new FakeAgentControlService(spawnCalls);
 
-        var app = StudioWebApplication.Build([], configureServices: services =>
+        await using var app = StudioWebApplication.Build([], configureServices: services =>
         {
             services.AddInMemoryStorage();
             services.AddSingleton<IAgentControlService>(fakeAgentControl);

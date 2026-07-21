@@ -42,19 +42,16 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("Sqlite")]
-public class RoomPerRepoTests : IDisposable
+public class RoomPerRepoTests : IAsyncLifetime
 {
     private readonly string _tempRoot =
         Path.Combine(Path.GetTempPath(), $"studio-room-per-repo-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        // See NodalMergeStudioNodeStoreEngineTests' Dispose for why ClearAllPools is required on
-        // Windows before deleting the temp directory.
-        SqliteConnection.ClearAllPools();
-        if (Directory.Exists(_tempRoot))
-            Directory.Delete(_tempRoot, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via the shared
+    // helper. See TestTeardown for why ClearAllPools + a retrying delete are required on Windows.
+    public Task DisposeAsync() => TestTeardown.ClearSqlitePoolsAndDeleteAsync(_tempRoot);
 
     private WebApplication BuildApp(string name, Action<IWebHostBuilder>? configureWebHost = null)
     {
@@ -731,6 +728,133 @@ public class RoomPerRepoTests : IDisposable
         // Idempotent: a second elevate is a no-op.
         var again = await artifacts.ElevateToWorkgroupAsync("c-elevate");
         Assert.Null(again!.RepositoryId);
+    }
+
+    /// <summary>
+    /// Items 1+2 (plans/vision-punchlist-remediation.md) — the orphan-impact report. Re-linking never
+    /// migrates content: whatever is already in the room being left stays there and drops out of the
+    /// read fan-out. A preview must therefore be able to say how much that is, BEFORE anything is
+    /// committed, so the user makes an informed choice instead of silently losing sight of work.
+    ///
+    /// Uses "register-new" deliberately: splitting an already-bound repository into its own room is
+    /// the case where a dry run has nothing to mint, so it was the one path that reported no impact
+    /// at all until the preview learned to treat a split as a move.
+    /// </summary>
+    [Fact]
+    public async Task Relink_preview_reports_what_the_repository_would_leave_behind()
+    {
+        await using var app = BuildApp("relink-impact");
+        var repo = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "impact-repo"), "impact");
+        var store = app.Services.GetRequiredService<IStudioNodeStore>();
+        var registry = app.Services.GetRequiredService<IRepositoryRegistryService>();
+
+        // Put some repo-scoped state in the room this repository currently occupies.
+        await store.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1, "WU-impact-1",
+            JsonSerializer.Serialize(new { WorkUnitId = "WU-impact-1", RepositoryId = repo.RepositoryId }),
+            repo.RepositoryId);
+        await store.WriteNodeAsync(
+            StudioNodeKind.WorkUnitV1, "WU-impact-2",
+            JsonSerializer.Serialize(new { WorkUnitId = "WU-impact-2", RepositoryId = repo.RepositoryId }),
+            repo.RepositoryId);
+
+        var preview = await registry.RelinkAsync(
+            repo.RepositoryId, RepositoryRelinkMode.Manual, "register-new", commit: false);
+
+        Assert.NotNull(preview);
+        Assert.False(preview!.Committed);                       // a preview writes nothing...
+        Assert.NotNull(preview.Impact);                          // ...but still knows the cost
+        Assert.Equal($"repo/{repo.WorkgroupRepoId}", preview.Impact!.RoomId);
+        Assert.True(preview.Impact.TotalNodes >= 2,
+            $"expected the two work units to be counted, got {preview.Impact.TotalNodes}");
+        Assert.Contains(StudioNodeKind.WorkUnitV1, preview.Impact.CountsByKind.Keys);
+
+        // And the binding really is untouched by the preview.
+        Assert.Equal(repo.WorkgroupRepoId, (await registry.GetAsync(repo.RepositoryId))!.WorkgroupRepoId);
+    }
+
+    /// <summary>
+    /// Item 3 (plans/vision-punchlist-remediation.md) — re-scoping re-routes an artifact into a new
+    /// room but cannot delete the copy left in the old one (EngineRoomMap has no per-entry eviction),
+    /// so the same ArtifactId lives in two rooms with divergent payloads. The read fan-out used to
+    /// resolve that purely by room precedence (workgroup &gt; repo &gt; studio), which meant every
+    /// *narrowing* move resolved to the STALE broader copy: a Workgroup+repo → Private constraint
+    /// read back as Workgroup on every peer and after any rehydrate, silently reverting the change.
+    /// ScopeVersion (bumped by every scope mutator) now decides the winner instead.
+    /// </summary>
+    [Fact]
+    public async Task Narrowing_a_constraints_scope_is_not_reverted_by_the_stale_room_copy()
+    {
+        await using var app = BuildApp("rescope-narrow");
+        var repo = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "rescope-repoA"), "repoA");
+        var repoRoomId = $"repo/{repo.WorkgroupRepoId}";
+        var bridge = app.Services.GetRequiredService<IRuntimeCommandBridge>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+        var store = app.Services.GetRequiredService<IStudioNodeStore>();
+
+        await artifacts.RecordAsync(new ArtifactRef(
+            ArtifactId: "c-narrow", Type: ArtifactType.Constraint, ParentArtifactId: null,
+            Status: ArtifactStatus.Approved, CreatedAt: DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null, Title: "c", Body: "b",
+            RepositoryId: repo.RepositoryId, Reach: ArtifactReach.Workgroup));
+
+        var key = NodalMergeStudioNodeStore.BuildKey(StudioNodeKind.ArtifactRefV1, "c-narrow");
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", key));   // starts repo-scoped
+
+        // The narrowing move: Workgroup + repo → Private (into the peer-private "studio" room).
+        var updated = await artifacts.SetScopeAsync("c-narrow", ArtifactReach.Private, null);
+        Assert.Equal(ArtifactReach.Private, updated!.Reach);
+        Assert.Equal(1, updated.ScopeVersion);
+
+        // Both copies genuinely exist now — this is what makes the collision real rather than
+        // hypothetical, and why read-side resolution (not eviction) is the fix.
+        Assert.NotNull(TryReadEngineMapValue(bridge, repoRoomId, "studio", key));   // stale, still there
+        Assert.NotNull(TryReadEngineMapValue(bridge, "studio", "studio", key));     // the live one
+
+        // The fan-out must collapse to the NEW copy. Under room precedence the repo-room copy wins
+        // and this reads Workgroup.
+        var all = await store.ReadAllNodesAsync(StudioNodeKind.ArtifactRefV1);
+        var payload = all.Single(e => e.EntityId == "c-narrow").PayloadJson;
+        var resolved = JsonSerializer.Deserialize<ArtifactRef>(payload);
+        Assert.Equal(ArtifactReach.Private, resolved!.Reach);
+
+        // ...and the user-visible path: a live refresh (what an inbound pack or a restart drives)
+        // repopulates from that same fan-out, so it must not revert either.
+        await ((IRehydratable)artifacts).RefreshAsync();
+        var afterRefresh = await artifacts.GetAsync("c-narrow");
+        Assert.Equal(ArtifactReach.Private, afterRefresh!.Reach);
+    }
+
+    /// <summary>
+    /// Item 3 — the repo→repo case, which room precedence resolved *nondeterministically* (both
+    /// copies sit in equal-precedence repo rooms, so the winner fell out of dictionary iteration
+    /// order). Highest ScopeVersion makes it deterministic.
+    /// </summary>
+    [Fact]
+    public async Task Re_scoping_a_constraint_between_two_repos_resolves_to_the_newer_room()
+    {
+        await using var app = BuildApp("rescope-repo-to-repo");
+        var repoA = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "r2r-repoA"), "repoA");
+        var repoB = await RegisterBoundRepoAsync(app.Services, Path.Combine(_tempRoot, "r2r-repoB"), "repoB");
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+        var store = app.Services.GetRequiredService<IStudioNodeStore>();
+
+        await artifacts.RecordAsync(new ArtifactRef(
+            ArtifactId: "c-move", Type: ArtifactType.Constraint, ParentArtifactId: null,
+            Status: ArtifactStatus.Approved, CreatedAt: DateTimeOffset.UtcNow,
+            OwnedByWorkUnitId: null, OwnedByAgentId: null, Title: "c", Body: "b",
+            RepositoryId: repoA.RepositoryId, Reach: ArtifactReach.Workgroup));
+
+        await artifacts.SetScopeAsync("c-move", ArtifactReach.Workgroup, repoB.RepositoryId);
+
+        var all = await store.ReadAllNodesAsync(StudioNodeKind.ArtifactRefV1);
+        var resolved = JsonSerializer.Deserialize<ArtifactRef>(
+            all.Single(e => e.EntityId == "c-move").PayloadJson);
+        Assert.Equal(repoB.RepositoryId, resolved!.RepositoryId);
+
+        await ((IRehydratable)artifacts).RefreshAsync();
+        var afterRefresh = await artifacts.GetAsync("c-move");
+        Assert.Equal(repoB.RepositoryId, afterRefresh!.RepositoryId);
     }
 
     /// <summary>

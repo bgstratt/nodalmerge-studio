@@ -22,7 +22,7 @@ public class AutonomousReviewTests
     public async Task AgentApproval_reviewer_approves_autoMerges_with_no_human_action()
     {
         var fakeHandler = new AutonomousReviewLlmHandler("Approved", "Looks good.");
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());
@@ -65,7 +65,7 @@ public class AutonomousReviewTests
     public async Task AgentApproval_reviewer_rejects_blocks_without_autoMerge()
     {
         var fakeHandler = new AutonomousReviewLlmHandler("Rejected", "Missing tests.");
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());
@@ -109,7 +109,7 @@ public class AutonomousReviewTests
     public async Task Hybrid_reviewer_approves_schedules_timer_then_expiry_autoApplies()
     {
         var fakeHandler = new AutonomousReviewLlmHandler("Approved", "Looks good.");
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());
@@ -181,7 +181,7 @@ public class AutonomousReviewTests
     public async Task Hybrid_human_applies_before_expiry_cancels_timer()
     {
         var fakeHandler = new AutonomousReviewLlmHandler("Approved", "Looks good.");
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());

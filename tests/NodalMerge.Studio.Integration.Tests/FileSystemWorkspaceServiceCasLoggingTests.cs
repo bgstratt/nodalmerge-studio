@@ -17,14 +17,16 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// Microsoft.Extensions.Logging's own generic ILogger&lt;T&gt; wiring resolves the right category.
 /// </summary>
 [Trait("Category", "Integration")]
-public class FileSystemWorkspaceServiceCasLoggingTests : IDisposable
+public class FileSystemWorkspaceServiceCasLoggingTests : IAsyncLifetime
 {
     private readonly string _rootPath = Path.Combine(Path.GetTempPath(), $"studio-cas-logging-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_rootPath)) Directory.Delete(_rootPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_rootPath);
 
     private sealed class RecordingLoggerProvider : ILoggerProvider
     {

@@ -14,16 +14,17 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// work unit's own RepositoryId instead.
 /// </summary>
 [Trait("Category", "Integration")]
-public class MultiRepoWriteBackTests : IDisposable
+public class MultiRepoWriteBackTests : IAsyncLifetime
 {
     private readonly string _repoAPath = Path.Combine(Path.GetTempPath(), $"studio-writeback-a-{Guid.NewGuid():N}");
     private readonly string _repoBPath = Path.Combine(Path.GetTempPath(), $"studio-writeback-b-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_repoAPath)) Directory.Delete(_repoAPath, recursive: true);
-        if (Directory.Exists(_repoBPath)) Directory.Delete(_repoBPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_repoAPath, _repoBPath);
 
     [Fact]
     public async Task ApplyAsync_writes_back_to_the_merging_work_units_own_repository_not_the_other_ones()
@@ -33,7 +34,7 @@ public class MultiRepoWriteBackTests : IDisposable
         await File.WriteAllTextAsync(Path.Combine(_repoAPath, "Program.cs"), "// repo A v1");
         await File.WriteAllTextAsync(Path.Combine(_repoBPath, "Program.cs"), "// repo B v1");
 
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands = app.Services.GetRequiredService<IMergeCommandService>();
         var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();

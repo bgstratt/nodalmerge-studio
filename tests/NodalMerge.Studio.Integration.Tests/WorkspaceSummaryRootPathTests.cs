@@ -15,7 +15,7 @@ public class WorkspaceSummaryRootPathTests
     [Fact]
     public async Task GetSummaryAsync_reports_configured_root_and_seed_repository_path()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services =>
             {

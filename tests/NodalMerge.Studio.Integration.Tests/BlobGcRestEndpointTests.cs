@@ -23,17 +23,19 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// guess). Follows CasReconcileRestEndpointTests' exercise-the-real-DI-wired-app pattern.
 /// </summary>
 [Trait("Category", "Integration")]
-public class BlobGcRestEndpointTests : IDisposable
+public class BlobGcRestEndpointTests : IAsyncLifetime
 {
     private readonly string _tempRoot = Path.Combine(Path.GetTempPath(), $"studio-blobgc-rest-{Guid.NewGuid():N}");
     private string CasRoot => Path.Combine(_tempRoot, "cas");
 
     private static readonly string RepositoryId = Path.GetFullPath(@"C:\fake\gc-rest-repo");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_tempRoot)) Directory.Delete(_tempRoot, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_tempRoot);
 
     private WebApplication BuildApp(BlobGcOptions? gcOptions = null)
     {

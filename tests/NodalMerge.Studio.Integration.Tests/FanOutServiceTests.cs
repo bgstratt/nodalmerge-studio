@@ -15,7 +15,7 @@ public class FanOutServiceTests
     [Fact]
     public async Task TryFanOutFromPlan_enqueues_only_slices_with_satisfied_dependencies()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
@@ -105,7 +105,7 @@ public class FanOutServiceTests
     [Fact]
     public async Task TryFanOutFromPlan_refreshes_dependent_branch_from_merged_dependency()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());

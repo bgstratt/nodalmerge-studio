@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Storage;
@@ -23,6 +24,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
     private readonly IStudioGraphPromoter? _graphPromoter;
     private readonly IParticipantEventBus? _eventBus;
     private readonly IServiceProvider? _serviceProvider;
+    private readonly ILogger<InMemoryWorkUnitService>? _logger;
 
     // IStudioGraphPromoter resolves RuntimeGraphPromoter → IRuntimeCommandBridge → FfiBridgeProcessor
     // → HostFfiClient → native P/Invoke. Defer until first use to avoid blocking startup.
@@ -44,7 +46,10 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IServiceProvider? serviceProvider = null,
         // L2.4 — optional: resolves a proposal's diff (CAS-ref'd off the replication plane). Null
         // falls back to the inline WorkspaceChanges (tests / no-CAS configs).
-        IMergeDiffResolver? diffResolver = null)
+        IMergeDiffResolver? diffResolver = null,
+        // A4 (plans/test-suite-remediation-plan.md): optional; logs a refused status transition at
+        // Debug so a swallowed illegal transition leaves a breadcrumb (see UpdateStatusAsync).
+        ILogger<InMemoryWorkUnitService>? logger = null)
     {
         _branchService         = branchService;
         _mergeService          = mergeService;
@@ -59,6 +64,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         _graphPromoter         = graphPromoter;
         _eventBus              = eventBus;
         _serviceProvider       = serviceProvider;
+        _logger                = logger;
     }
 
     public async Task<WorkUnit> CreateAsync(WorkUnit workUnit, CancellationToken cancellationToken = default)
@@ -100,6 +106,11 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         var workUnit = GetRequired(workUnitId);
         if (!WorkUnitTransitions.CanTransition(workUnit.Status, status))
         {
+            _logger?.LogDebug(
+                "Refused work-unit transition {WorkUnitId}: {From} -> {To} (not a legal edge). Many "
+                + "convergence callers swallow this because the unit is often already where they want "
+                + "it; a swallowed refusal is otherwise invisible.",
+                workUnitId, workUnit.Status, status);
             throw new InvalidOperationException($"Cannot transition work unit from {workUnit.Status} to {status}.");
         }
 
@@ -125,7 +136,32 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
 
         if (status is WorkUnitStatus.Completed or WorkUnitStatus.Merged)
         {
-            _ = GraphPromoter?.TryPromoteStudioCheckpointAsync(updated.RepositoryId);
+            // Deferred, but tracked (plans/vision-punchlist-remediation.md, shutdown contract): this
+            // used to be an untracked fire-and-forget that could still be writing after the host had
+            // been disposed.
+            var promotionRepositoryId = updated.RepositoryId;
+
+            // Resolve the promoter HERE and capture it, rather than touching the service provider
+            // from inside the queued closure. The queue can drain while the DI container is disposing
+            // (see StudioBackgroundWorkQueue), and resolving from a disposed provider throws — which
+            // is exactly what the unobserved-task-exception detector caught. This also restores the
+            // original timing: the pre-queue code resolved GraphPromoter synchronously right here,
+            // and only the promotion call itself was deferred.
+            var promoter = GraphPromoter;
+            if (promoter is null)
+            {
+                // nothing to promote with
+            }
+            else if (_serviceProvider?.GetService<IStudioBackgroundWork>() is { } queue)
+            {
+                queue.Enqueue(
+                    "workunit/promote-studio-checkpoint",
+                    _ => promoter.TryPromoteStudioCheckpointAsync(promotionRepositoryId));
+            }
+            else
+            {
+                _ = promoter.TryPromoteStudioCheckpointAsync(promotionRepositoryId);
+            }
         }
 
         _eventBus?.Publish(new WorkUnitStatusChangedEvent(workUnitId, previousStatus, status, DateTimeOffset.UtcNow));

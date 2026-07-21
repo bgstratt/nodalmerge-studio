@@ -225,7 +225,7 @@ internal sealed class ReviewerAgentLoop(
             new(McpToolNames.WorkUnitGet, "Get a work unit by ID.",
                 Schema(["workUnitId"], new() { ["workUnitId"] = Str("Work unit ID") })),
 
-            new(McpToolNames.ArtifactQuery, "Search knowledge artifacts (Research, Decision, Constraint) for this work unit and its ancestors. Check before approving — a change that violates a recorded Constraint is grounds for rejection.",
+            new(McpToolNames.ArtifactQuery, "Search knowledge artifacts (Research, Decision, Constraint) for this work unit and its ancestors. Check before approving — Constraints are durable guidance, not absolute rules, so a departure the work unit's goal actually required is correct work; reject only for a departure the goal does not justify, and otherwise call it out in verificationResults.",
                 Schema(["workUnitId"], new()
                 {
                     ["workUnitId"] = Str("Work unit ID to search from"),

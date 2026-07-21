@@ -189,7 +189,8 @@ record (2026-07-14)").
 - `repoRoomId` — see naming rule below.
 - `hints` — matching hints only, **never identity** (D2's core rule: "git supplies
   matching hints, never identity"). Consulted only at first-contact matching; never
-  re-derived to re-identify an already-bound repo.
+  re-derived to re-identify an already-bound repo **except on an explicit user-initiated
+  re-link** (see "User-initiated re-link" below).
 
 ### `repoId` mint format
 
@@ -249,7 +250,8 @@ A set, not a single value, because merged unrelated histories (`git merge
 **multiple** root commits for one working tree. Per D2: an exact-match on this set (or
 any member of it, for fork-ambiguity detection) is the strongest available hint, but
 still only a hint — it is consulted once, at first contact, and cached, never
-re-derived to re-identify a binding later.
+re-derived to re-identify a binding later **unless a person explicitly asks for a
+re-link** (see "User-initiated re-link" below).
 
 **Known gap, flagged for 6.2's implementer, not resolved here:** this rule assumes
 git's default SHA-1 object hashing. A repository configured with `extensions.objectFormat
@@ -324,12 +326,47 @@ typically `origin`, but not assumed to be named that).
 5. **No match** → mint a new `repoId`, register the entry, create the repo room.
 6. Cache the resolved binding in the peer's local workspace storage — hints are
    consulted only at first contact; a later rebase or remote rename never re-triggers
-   re-identification.
+   re-identification. The single exception is a user-initiated re-link (below); no
+   background, timer, event, or inbound-pack path may ever re-identify a binding.
 7. Degraded cases (shallow clone: empty root-SHA set; no remote: empty remotes set;
    empty repo: no `HEAD`) → one-time user prompt, same as an unresolved ambiguity.
 
 Full rationale for why no single signal is sufficient (and why identity is minted, not
 derived) is D2, not repeated here.
+
+### User-initiated re-link
+
+*Amendment, 2026-07-20 (plans/vision-punchlist-remediation.md, Items 1+2). Narrows the
+"never re-derived" rule above to "never re-derived **on its own**".*
+
+Deterministic ids (the earlier amendment) converge two clones that both have a root-SHA
+signal. Two populations are still left stranded, and no automatic mechanism can rescue
+them: a **degraded** checkout (shallow / empty / no `HEAD`) minted a guid and will keep
+it forever, and installs that **already diverged** before deterministic ids existed stay
+in separate rooms. Both need a human, because in both cases the machine genuinely cannot
+tell whether two entries are the same repository.
+
+A re-link may therefore re-read git and re-run matching for an already-bound repository,
+under these rules:
+
+1. **Explicit human action only.** No background sweep, timer, startup pass, inbound-pack
+   handler, or cache-refresh coordinator may trigger it. This is what keeps a settled
+   binding settled, which is D2's actual concern — a rebase or a remote rename must still
+   never move a binding on its own.
+2. **Fresh git read is permitted, and is the point.** A cached degraded hint set can never
+   converge; only re-reading can discover that a once-shallow clone now has its root
+   history.
+3. **Automatic mode commits only an unambiguous match**, and never moves a binding whose
+   provenance is `HumanResolved`. A fork, a degraded signal, or several candidates commits
+   nothing and returns the candidates for the person to choose from.
+4. **Content does not migrate.** Re-pointing changes which room is read and written from
+   here on; nodes already in the old room stay there and drop out of the read fan-out. The
+   flow MUST report what will stop appearing before committing — an informed choice, never
+   a silent orphaning. (Re-keying old content is deliberately not in scope; no such
+   machinery exists.)
+5. **Provenance is recorded.** `RepositoryV1.Provenance` distinguishes `Deterministic`,
+   `ProvisionalMint`, and `HumanResolved`, so re-link can tell a settled canonical binding
+   from a provisional one worth converging, rather than inferring it.
 
 ## (c) Pinned cross-repo reference triple
 

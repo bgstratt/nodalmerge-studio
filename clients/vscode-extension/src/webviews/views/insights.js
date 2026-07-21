@@ -294,7 +294,11 @@ export function init(ctx) {
             '<div class="in-constraint-main">' +
               '<div class="in-constraint-title">' + esc(c.title || c.artifactId) + '</div>' +
               (c.body ? '<div class="in-constraint-body">' + esc(c.body) + '</div>' : '') +
-              '<div class="in-constraint-badges">' + scope + '</div>' +
+              '<div class="in-constraint-badges">' + scope +
+                '<button class="in-constraint-usage-btn" data-constraint-id="' + esc(c.artifactId) + '" ' +
+                  'title="Where this constraint has actually been injected and weighed">Usage</button>' +
+              '</div>' +
+              '<div class="in-constraint-usage" data-usage-for="' + esc(c.artifactId) + '"></div>' +
             '</div>' +
           '</div>';
       }).join('');
@@ -345,6 +349,69 @@ export function init(ctx) {
         vscode.postMessage({ type: 'insightsToggleConstraint', artifactId: id, disabled: disabled });
       });
     });
+  }
+
+  // On-demand usage lookup — one request per constraint the user actually asks about, rather than N
+  // requests every time the tab opens.
+  function bindConstraintUsage() {
+    root.querySelectorAll('.in-constraint-usage-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var id = btn.getAttribute('data-constraint-id');
+        var panel = root.querySelector('[data-usage-for="' + id + '"]');
+        if (!panel) { return; }
+        // Second click collapses.
+        if (panel.classList.contains('in-usage-open')) {
+          panel.classList.remove('in-usage-open');
+          panel.innerHTML = '';
+          return;
+        }
+        panel.classList.add('in-usage-open');
+        panel.textContent = 'Loading usage…';
+        vscode.postMessage({ type: 'insightsLoadConstraintUsage', artifactId: id });
+      });
+    });
+  }
+
+  function renderConstraintUsage(artifactId, usage, error) {
+    var panel = root.querySelector('[data-usage-for="' + artifactId + '"]');
+    if (!panel || !panel.classList.contains('in-usage-open')) { return; }
+
+    if (error) {
+      panel.textContent = 'Could not load usage — ' + error;
+      return;
+    }
+
+    var surfaced = (usage && usage.surfaced) || [];
+    var considered = (usage && usage.consideredIn) || [];
+
+    if (!surfaced.length && !considered.length) {
+      panel.innerHTML = '<div class="in-usage-empty">Never injected into an agent and never cited by a reviewer. '
+        + 'It may be too new, scoped to a repository you have not run work in, or disabled for you.</div>';
+      return;
+    }
+
+    var html = '<div class="in-usage-line"><strong>' + surfaced.length + '</strong> injection'
+      + (surfaced.length === 1 ? '' : 's') + ' into agent context</div>';
+
+    if (considered.length) {
+      var rows = '';
+      for (var i = 0; i < considered.length; i++) {
+        var c = considered[i];
+        rows += '<li><code>' + esc(c.proposalId) + '</code> — ' + esc(c.decision) + '</li>';
+      }
+      html += '<div class="in-usage-line"><strong>' + considered.length + '</strong> review'
+        + (considered.length === 1 ? '' : 's') + ' that cited it</div><ul>' + rows + '</ul>';
+    } else {
+      html += '<div class="in-usage-line">No reviewer has cited it yet.</div>';
+    }
+
+    // Say exactly what this data does and does not prove — the reviewer attests it looked, never
+    // that the change complied, so an Approved row is identical whether the constraint was obeyed
+    // or knowingly departed from.
+    html += '<div class="in-usage-note">Reviews record that the constraint was weighed, not that it '
+      + 'was followed.</div>';
+
+    panel.innerHTML = html;
   }
 
   function bindConstraintScope() {
@@ -432,6 +499,11 @@ export function init(ctx) {
       $('in-constraints-list').innerHTML = renderConstraints(msg.constraints || []);
       bindConstraintToggles();
       bindConstraintScope();
+      bindConstraintUsage();
+      return;
+    }
+    if (msg.type === 'insightsConstraintUsage') {
+      renderConstraintUsage(msg.artifactId, msg.usage, msg.error);
       return;
     }
     if (msg.type === 'insightsConstraintsError') {

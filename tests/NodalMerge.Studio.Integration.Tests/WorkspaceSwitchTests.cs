@@ -21,16 +21,17 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// default (WorkspaceOptions.SeedRepositoryPath) that repo-less goals/proposals fall back to.
 /// </summary>
 [Trait("Category", "Integration")]
-public class WorkspaceSwitchTests : IDisposable
+public class WorkspaceSwitchTests : IAsyncLifetime
 {
     private readonly string _repoAPath = Path.Combine(Path.GetTempPath(), $"studio-switch-a-{Guid.NewGuid():N}");
     private readonly string _repoBPath = Path.Combine(Path.GetTempPath(), $"studio-switch-b-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_repoAPath)) Directory.Delete(_repoAPath, recursive: true);
-        if (Directory.Exists(_repoBPath)) Directory.Delete(_repoBPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_repoAPath, _repoBPath);
 
     [Fact]
     public async Task REST_switch_twice_between_two_repos_updates_sync_state_and_the_global_default()
@@ -118,7 +119,7 @@ public class WorkspaceSwitchTests : IDisposable
         Directory.CreateDirectory(_repoAPath);
         await File.WriteAllTextAsync(Path.Combine(_repoAPath, "Program.cs"), "// repo A via mcp");
 
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var repositories = app.Services.GetRequiredService<IRepositoryRegistryService>();
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();

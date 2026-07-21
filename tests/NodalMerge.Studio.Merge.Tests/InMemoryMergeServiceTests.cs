@@ -221,6 +221,10 @@ public class InMemoryMergeServiceTests
             throw new NotSupportedException();
         public Task<RepositoryV1?> ResolveDisambiguationAsync(string repoId, string? chosenRepoId, CancellationToken ct = default) =>
             throw new NotSupportedException();
+        public Task<RepositoryRelinkResult?> RelinkAsync(
+            string repositoryId, RepositoryRelinkMode mode, string? chosenRepoId = null,
+            bool commit = true, CancellationToken ct = default) =>
+            throw new NotSupportedException();
         // Slice 7.2 — no existing snapshot chain and no workgroup binding wired in this fake, so
         // resolution falls to the degraded local-path fallback (step 3 of the interface member's own
         // doc comment), same as this fake's other members: purely a path pass-through, since these

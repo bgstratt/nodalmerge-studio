@@ -15,7 +15,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// </summary>
 [Trait("Category", "Integration")]
 [Trait("Requires", "LocalCliProcess")]
-public class InsightCliScanTests : IDisposable
+public class InsightCliScanTests : IAsyncLifetime
 {
     private readonly string _stubDir = Path.Combine(Path.GetTempPath(), $"claude-oneshot-stub-{Guid.NewGuid():N}");
 
@@ -43,11 +43,12 @@ public class InsightCliScanTests : IDisposable
             "@echo off\r\nmore > \"%~dp0stdin-capture.txt\"\r\ntype \"%~dp0stub-oneshot.json\"\r\n");
     }
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_stubDir))
-            Directory.Delete(_stubDir, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_stubDir);
 
     [Fact]
     public async Task Insight_scan_with_a_claude_cli_provider_runs_via_the_one_shot_completer()

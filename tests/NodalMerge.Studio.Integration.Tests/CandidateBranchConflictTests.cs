@@ -20,7 +20,7 @@ public class CandidateBranchConflictTests
     [Fact]
     public async Task Two_independent_goals_with_non_overlapping_files_both_land_on_candidate()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
         // Every test here drives validate/review/apply manually — disable ProposeAsync's
@@ -62,7 +62,7 @@ public class CandidateBranchConflictTests
     [Fact]
     public async Task Two_independent_goals_with_overlapping_lines_the_second_apply_throws_and_records_a_conflict()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
         // Every test here drives validate/review/apply manually — disable ProposeAsync's
@@ -129,7 +129,7 @@ public class CandidateBranchConflictTests
     [Fact]
     public async Task Two_concurrent_applies_with_overlapping_lines_never_both_land_silently()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
         // Every test here drives validate/review/apply manually — disable ProposeAsync's
@@ -197,7 +197,7 @@ public class CandidateBranchConflictTests
     [Fact]
     public async Task Reconcile_folds_both_goals_changes_and_resolves_the_conflict()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
         // Every test here drives validate/review/apply manually — disable ProposeAsync's
@@ -270,7 +270,7 @@ public class CandidateBranchConflictTests
     [Fact]
     public async Task Reconcile_releases_the_losing_goals_file_lease_so_the_new_work_unit_is_not_blocked()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
         // Every test here drives validate/review/apply manually — disable ProposeAsync's
@@ -319,7 +319,7 @@ public class CandidateBranchConflictTests
     [Fact]
     public async Task Reconcile_is_a_no_op_re_entrancy_guard_when_already_reconciling_or_resolved()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
         // Every test here drives validate/review/apply manually — disable ProposeAsync's
@@ -362,7 +362,7 @@ public class CandidateBranchConflictTests
     [Fact]
     public async Task Conflict_between_two_AgentApproval_goals_auto_triggers_reconciliation_without_a_human()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
         // This test drives validate/review/apply manually — but AgentApproval goals (unlike the
@@ -406,7 +406,7 @@ public class CandidateBranchConflictTests
     [Fact]
     public async Task Two_goals_that_independently_arrive_at_identical_content_are_auto_resolved_without_throwing()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
         // Every test here drives validate/review/apply manually — disable ProposeAsync's
@@ -460,7 +460,7 @@ public class CandidateBranchConflictTests
     [Fact]
     public async Task ResolveManually_writes_combined_content_and_resolves_the_conflict()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
         // Every test here drives validate/review/apply manually — disable ProposeAsync's
@@ -513,7 +513,7 @@ public class CandidateBranchConflictTests
     [Fact]
     public async Task ResolveManually_throws_when_content_is_missing_for_a_conflicting_path()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
         // Every test here drives validate/review/apply manually — disable ProposeAsync's
@@ -558,7 +558,7 @@ public class CandidateBranchConflictTests
     [Fact]
     public async Task Restart_rejects_a_still_Approved_losing_proposal_after_a_conflict()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
         // Every test here drives validate/review/apply manually — disable ProposeAsync's

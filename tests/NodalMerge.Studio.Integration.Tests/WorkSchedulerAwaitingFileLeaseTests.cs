@@ -11,7 +11,7 @@ public class WorkSchedulerAwaitingFileLeaseTests
     [Fact]
     public async Task MarkAwaitingFileLeaseAsync_parks_the_item_instead_of_removing_it()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
@@ -50,7 +50,7 @@ public class WorkSchedulerAwaitingFileLeaseTests
     [Fact]
     public async Task ClearAwaitingFileLeaseAsync_on_an_item_not_parked_is_a_noop()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());

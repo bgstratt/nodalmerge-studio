@@ -307,6 +307,35 @@ export class GoalWorkspacePanel {
     } catch {
       // host not ready yet
     }
+    void this.sendRepositoryRoom();
+  }
+
+  // plans/vision-punchlist-remediation.md (Items 1+2, R6) — which replication room the repository
+  // Studio is pointed at actually belongs to. Sent separately from explorerSettings because it needs
+  // a REST round trip and must not block (or fail) the settings render. Matched by path rather than
+  // id: the panel knows the effective repository *path*, and the registry is the only thing that
+  // knows which registration and room that path maps to.
+  private async sendRepositoryRoom(): Promise<void> {
+    const { effectiveRepositoryPath } = this.getRepositoryPathSettings();
+    const normalize = (p: string) => p.replace(/[\\/]+$/, '').toLowerCase();
+
+    try {
+      const repos = await this.get<{ repositoryId: string; path: string; workgroupRepoId?: string | null }[]>(
+        '/studio/repositories');
+      const match = effectiveRepositoryPath
+        ? repos.find(r => normalize(r.path) === normalize(effectiveRepositoryPath))
+        : undefined;
+
+      void this.panel.webview.postMessage({
+        type: 'explorerRepositoryRoom',
+        // Undefined (rather than null) when the open folder isn't registered at all — a different
+        // state from "registered but not yet bound to a room", and the UI says so.
+        registered: match !== undefined,
+        workgroupRepoId: match?.workgroupRepoId ?? null,
+      });
+    } catch {
+      // host not ready — the next refresh re-sends.
+    }
   }
 
   // repositoryPath is extension-side config (nodalmerge.repositoryPath), not a backend
@@ -730,6 +759,13 @@ export class GoalWorkspacePanel {
           await vscode.workspace.getConfiguration('nodalmerge')
             .update('repositoryPath', '', vscode.ConfigurationTarget.Workspace);
           void this.panel.webview.postMessage({ type: 'explorerSettings', ...this.getRepositoryPathSettings() });
+          void this.sendRepositoryRoom();
+          break;
+        // Items 1+2 (R6) — delegates to the command so the whole flow (preview, candidate pick,
+        // orphan-impact confirmation) lives in exactly one place rather than being duplicated here.
+        case 'explorerRelinkRepository':
+          await vscode.commands.executeCommand(COMMANDS.RELINK_REPOSITORY);
+          void this.sendRepositoryRoom();
           break;
         case 'explorerSteeringAction':
           if ((msg.action as string) === 'steerDeadLetterRetrySend') {
@@ -1726,6 +1762,8 @@ const GW_CSS = `
   .gw-settings-row { display: flex; align-items: center; gap: 6px; font-size: 0.85em; cursor: pointer; }
   .gw-repo-path-row { cursor: default; }
   .gw-repo-path-row #gw-repo-path-display { flex: 1; min-width: 0; font-size: 0.85em; padding: 2px 6px; }
+  .gw-repo-room { font-size: 0.78em; opacity: 0.75; white-space: nowrap; }
+  .gw-repo-room.gw-repo-room-unbound { opacity: 0.9; font-style: italic; }
   /* Slice 21c — inline Review/Target controls */
   .gw-options-row {
     flex-shrink: 0; padding: 6px 14px; border-bottom: 1px solid var(--nm-border);
@@ -2012,6 +2050,12 @@ const GW_HTML = `
       <input type="text" id="gw-repo-path-display" readonly title="The repository Studio operates against"/>
       <button id="gw-repo-path-browse" class="ghost">Browse&hellip;</button>
       <button id="gw-repo-path-clear" class="ghost" title="Use the open VS Code folder instead">Use Open Folder</button>
+      <!-- plans/vision-punchlist-remediation.md (Items 1+2, R6) — which replication room this
+           repository is actually in, plus the way to change it. Without this the binding is
+           invisible: the room id appears nowhere in the UI, so "why don't I see my teammate's
+           work?" had no answer short of curling the REST API. -->
+      <span id="gw-repo-room" class="gw-repo-room" title="The replication room this repository is bound to"></span>
+      <button id="gw-repo-relink" class="ghost" title="Re-link this repository to a different room, or split it into its own">Re-link&hellip;</button>
     </div>
     <label class="gw-settings-row" style="margin-top:8px;border-top:1px solid var(--nm-border);padding-top:8px">
       <input type="checkbox" id="gw-llm-profile-checkbox"/>

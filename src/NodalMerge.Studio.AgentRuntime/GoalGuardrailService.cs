@@ -13,6 +13,13 @@ public sealed class GoalGuardrailService(
     IConversationLogService conversationLog,
     WorkspaceOptions options) : IGoalGuardrailService
 {
+    // "No longer actively running" — used by GetActiveGoalStatusesAsync to decide which goals the
+    // guardrail still watches (token/time budget). This is the BROADEST terminal set on purpose and
+    // is intentionally different from the GC/retention set (SnapshotRetentionPolicy = {Completed,
+    // Merged}): a Failed or Cancelled goal is not burning budget so the guardrail ignores it — but its
+    // seed snapshot must still be RETAINED because a human can revive it, which is a different
+    // question answered by a different set. If a human revives one, it returns to Executing and
+    // reappears here as active. Do not unify these sets.
     private static readonly WorkUnitStatus[] TerminalStatuses =
     [
         WorkUnitStatus.Completed,

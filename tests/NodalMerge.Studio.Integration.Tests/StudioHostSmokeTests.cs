@@ -8,9 +8,9 @@ namespace NodalMerge.Studio.Integration.Tests;
 public class StudioHostSmokeTests
 {
     [Fact]
-    public void Build_registers_studio_services()
+    public async Task Build_registers_studio_services()
     {
-        var app = StudioWebApplication.Build([]);
+        await using var app = StudioWebApplication.Build([]);
         Assert.NotNull(app.Services.GetService(typeof(IProjectionManager)));
         Assert.NotNull(app.Services.GetService(typeof(ITaskService)));
         Assert.NotNull(app.Services.GetService(typeof(IMergeService)));

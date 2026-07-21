@@ -14,7 +14,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// directory — this exercises that with real `dotnet build` invocations, not a mocked process.
 /// </summary>
 [Trait("Category", "Integration")]
-public class WorkspaceExecutionPerRootTests : IDisposable
+public class WorkspaceExecutionPerRootTests : IAsyncLifetime
 {
     private readonly string _rootPath = Path.Combine(Path.GetTempPath(), $"studio-exec-perroot-{Guid.NewGuid():N}");
 
@@ -27,11 +27,12 @@ public class WorkspaceExecutionPerRootTests : IDisposable
         </Project>
         """;
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_rootPath))
-            Directory.Delete(_rootPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_rootPath);
 
     private (IFileWorkspaceService FileWorkspace, IWorkspaceExecutionService Execution) Build()
     {

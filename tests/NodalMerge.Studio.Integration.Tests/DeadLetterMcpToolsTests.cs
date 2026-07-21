@@ -190,7 +190,7 @@ public class DeadLetterMcpToolsTests
         // Reuses the retry-path dead-letter fixtures indirectly isn't necessary here — build a
         // fresh app and record a non-MaxIterationsExceeded entry directly via IDeadLetterService,
         // proving DeadLetterTools surfaces IContinueService's own NotApplicable guard correctly.
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var deadLetter = app.Services.GetRequiredService<IDeadLetterService>();
         var orchestratorSvc = app.Services.GetRequiredService<IOrchestratorService>();
 

@@ -25,7 +25,7 @@ public class ProjectionDiffingIntegrationTests
         // artifact chain, so stall detection must never fire across the whole run.
         var fakeHandler = new ScheduledReinvocationLlmHandler();
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());

@@ -184,6 +184,57 @@ public class SnapshotRetentionPolicyTests
     }
 
     /// <summary>
+    /// A3 (plans/test-suite-remediation-plan.md): a Failed work unit's branch seed must be retained,
+    /// NOT aged out — a failed work unit is resumable (Failed -> Cancelled -> Queued/Executing is a
+    /// real human revival path), so its seed/merge base must survive for the revival. This matches the
+    /// frozen `terminal_status_names` = {Completed, Merged} contract and nodalmerge's Rust GC; the C#
+    /// SnapshotRetentionPolicy previously listed Failed as terminal and aged its seed out, so
+    /// BlobGcService/WorkspaceCacheManager would delete the very blobs a revived Failed unit needs.
+    /// </summary>
+    [Fact]
+    public async Task ClassifyAsync_retains_the_seed_of_a_Failed_work_unit_because_it_is_resumable()
+    {
+        var (nodeStore, registry) = await NewStoreAsync();
+
+        var now = new DateTimeOffset(2026, 7, 15, 12, 0, 0, TimeSpan.Zero);
+        var clock = new FixedTimeProvider(now);
+
+        var repoPath = @"C:\fake\repoFailedSeed";
+        var repoRegistration = await registry.RegisterAsync(repoPath, "Repo Failed");
+        var repoId = Path.GetFullPath(repoPath);
+
+        // A generation that was live when the (now Failed) work unit's branch was created 50 days ago
+        // — well past RetainIntermediateDays. If Failed were treated as terminal it would age out;
+        // because a Failed unit is resumable, its seed must come out Active/retained instead.
+        var snapSeed = new RepositorySnapshot(
+            SnapshotId: "snap-failed-seed", RepositoryId: repoId, TreeHash: "tf", Generation: 1,
+            CreatedAt: now - TimeSpan.FromDays(50));
+        await WriteSnapshotAsync(nodeStore, snapSeed);
+
+        var wuFailed = new WorkUnit(
+            WorkUnitId: "wu-failed", Goal: "test", BranchId: "branch-failed",
+            Status: WorkUnitStatus.Failed,
+            CreatedAt: now - TimeSpan.FromDays(49), UpdatedAt: now - TimeSpan.FromDays(45),
+            Owner: "test", AssignedAgent: null, SuccessCriteria: null, Metadata: null,
+            ParentWorkUnitId: null, DependsOn: [], FileScope: [],
+            RepositoryId: repoRegistration.RepositoryId);
+        await WriteWorkUnitAsync(nodeStore, wuFailed);
+
+        var policy = new SnapshotRetentionPolicy(
+            nodeStore, registry, options: null,
+            retentionOptions: new RetentionPolicyOptions { RetainIntermediateDays = RetainIntermediateDays },
+            clock: clock);
+
+        var report = await policy.ClassifyAsync();
+        var entry = report.Snapshots.Single(e => e.SnapshotId == "snap-failed-seed");
+
+        Assert.Equal(SnapshotRetentionClass.Active, entry.Class);
+        Assert.True(entry.Retained, "a resumable Failed work unit's seed must be retained, not aged out");
+        Assert.Contains("wu-failed", entry.Reason);
+        Assert.Contains("snap-failed-seed", report.RetainedSnapshotIds);
+    }
+
+    /// <summary>
     /// Slice 6.5 Part 2 — WorkUnit.SeedSnapshotId, once persisted, pins the EXACT generation a
     /// branch was seeded from, rather than the timestamp proxy's "latest snapshot with CreatedAt at
     /// or before the work unit's own CreatedAt" approximation. Proves the two can disagree and the

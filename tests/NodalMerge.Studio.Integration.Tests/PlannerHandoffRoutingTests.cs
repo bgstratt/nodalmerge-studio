@@ -34,7 +34,7 @@ public class PlannerHandoffRoutingTests
     [Fact]
     public async Task Planner_completing_on_a_parented_work_unit_fans_out_that_units_own_plan()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());

@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.15 — 2026-07-20
+
+Extension-only release — the bundled NodalMerge runtime is unchanged from 0.1.13.
+This entry also covers the 0.1.14 build, which shipped without its own changelog.
+
+- **Re-link a repository, from the panel.** When Studio can't match your open folder to
+  a registered repository — or matches it to the wrong one — you can now fix it without
+  leaving the editor. The Artifact Explorer shows which repository room you're in and adds
+  a **Re-link** action that offers an automatic re-link when the match is unambiguous and a
+  manual picker otherwise. Opening a brand-new folder that was never registered can register
+  it in place, and re-linking to a *new* repository (splitting one that was already linked)
+  now warns — with a modal confirmation — when doing so would orphan content in the old room.
+  Folder changes are watched, so switching workspaces offers a host restart instead of
+  silently drifting.
+- **Constraints are advisory, not a wall.** The agent reviewer no longer rejects finished,
+  working code just because it departs from a recorded constraint. A justified departure is
+  surfaced as a reviewer attestation on the result — the goal completes and the departure is
+  called out — rather than throwing away work the user already paid for. Constraints remain
+  guidance the pipeline respects; they no longer hard-block it.
+- **Knowledge scope: manage constraints across repos and the workgroup.** The Insights view
+  gains a **Constraints** sub-tab where each constraint has a local on/off toggle. You can
+  add a constraint by hand with an explicit 2×2 scope — Local vs. Workgroup × this repository
+  vs. all repositories — and promote a constraint discovered in one goal's lineage to global
+  policy so it applies everywhere. Finding-promotion destinations and constraint re-scoping
+  are clearer about where a promoted item will live.
+- **Run the Insights scan through a CLI profile.** Detecting findings with an LLM can now go
+  through a one-shot Claude or Codex CLI completer, not just an API-key provider, so a
+  `claude-cli`/`codex` Model Profile works here too. The scan gives clearer progress feedback
+  and, when a model returns something that doesn't parse, surfaces the raw output instead of
+  failing silently.
+- **File-scoped agents can run on their own model.** A file-scoped Execute or Plan Agent
+  Profile can bind its own Model Profile, so a domain worker (e.g. everything under `src/db`)
+  runs on the LLM you choose for it rather than the goal default.
+- **Fixes.** The Pathways live view reconnects correctly inside the webview (localhost access
+  is granted via port mapping). The host-readiness timeout is raised from 15s to 120s, so a
+  slow cold first launch (or a fresh build) no longer times out before the host is up.
+- Version bumped to 0.1.15 so a clean install supersedes any older build still registered in
+  VS Code.
+
 ## 0.1.13 — 2026-07-18
 
 - **Bundled runtime updated to the published NodalMerge host 0.2.4.** Fixes the

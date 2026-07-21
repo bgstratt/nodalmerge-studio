@@ -18,16 +18,17 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// superseded child proposal's SupersededBy pointer to the reconciliation proposal that replaced it.
 /// </summary>
 [Trait("Category", "Integration")]
-public class TaskConflictReconciliationTests : IDisposable
+public class TaskConflictReconciliationTests : IAsyncLifetime
 {
     private readonly string _tempRoot =
         Path.Combine(Path.GetTempPath(), $"studio-taskconflict-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_tempRoot))
-            Directory.Delete(_tempRoot, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_tempRoot);
 
     private Microsoft.AspNetCore.Builder.WebApplication BuildApp() => StudioWebApplication.Build(
         [],

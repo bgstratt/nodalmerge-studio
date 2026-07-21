@@ -20,7 +20,7 @@ public class RequeueGoalTests
     [Fact]
     public async Task RequeueAsync_reopens_a_cancelled_leaf_work_unit_and_re_enqueues_a_worker()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
@@ -48,7 +48,7 @@ public class RequeueGoalTests
     [Fact]
     public async Task RequeueAsync_on_a_cancelled_fan_out_parent_requeues_its_cancelled_child_and_re_attempts_reconciliation()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
@@ -79,7 +79,7 @@ public class RequeueGoalTests
     [Fact]
     public async Task RequeueAsync_resupplies_credentials_so_GetGoalDefaultCredentials_resolves_again()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
@@ -111,7 +111,7 @@ public class RequeueGoalTests
     [Fact]
     public async Task RequeueAsync_throws_when_the_work_unit_is_not_Cancelled()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ImmediateEndTurnLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());

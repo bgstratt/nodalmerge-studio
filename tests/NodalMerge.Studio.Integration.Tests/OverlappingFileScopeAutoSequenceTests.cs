@@ -28,7 +28,7 @@ public class OverlappingFileScopeAutoSequenceTests
     [Fact]
     public async Task Overlapping_siblings_with_no_declared_dependency_get_auto_sequenced()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -64,7 +64,7 @@ public class OverlappingFileScopeAutoSequenceTests
     [Fact]
     public async Task Auto_sequenced_sibling_enqueues_once_its_dependency_actually_merges()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -112,7 +112,7 @@ public class OverlappingFileScopeAutoSequenceTests
             }
             """;
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 

@@ -18,16 +18,17 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// the work-unit id and source "WorkUnitCompletion", so it can be materialized later.
 /// </summary>
 [Trait("Category", "Integration")]
-public class WorkUnitProducedSnapshotTests : IDisposable
+public class WorkUnitProducedSnapshotTests : IAsyncLifetime
 {
     private readonly string _repoPath = Path.Combine(Path.GetTempPath(), $"studio-produced-{Guid.NewGuid():N}");
     private readonly string _materializePath = Path.Combine(Path.GetTempPath(), $"studio-produced-out-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_repoPath)) Directory.Delete(_repoPath, recursive: true);
-        if (Directory.Exists(_materializePath)) Directory.Delete(_materializePath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_repoPath, _materializePath);
 
     [Fact]
     public async Task Proposed_workunit_mints_a_WorkUnitCompletion_snapshot_attributed_to_it()

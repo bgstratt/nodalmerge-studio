@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Host.Abstractions.Providers;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
@@ -13,6 +14,24 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 {
     private readonly ConcurrentDictionary<string, MergeProposal> _proposals = new();
     private readonly IStudioNodeStore _nodeStore;
+
+    // plans/vision-punchlist-remediation.md (shutdown contract) — deferred durable follow-ups run on
+    // the tracked queue so they are drained at shutdown instead of abandoned mid-write. Resolved
+    // lazily through the service provider, matching how IWorkUnitService/IWorkScheduler are handled
+    // above, so the many direct (non-DI) test constructions of this service need no changes.
+    private void RunDeferred(string name, Func<CancellationToken, Task> work)
+    {
+        if (_serviceProvider?.GetService<IStudioBackgroundWork>() is { } queue)
+        {
+            queue.Enqueue(name, work);
+            return;
+        }
+
+        // No queue available (direct construction in a test) — keep the previous behavior rather
+        // than silently skipping the write.
+        _ = Task.Run(() => work(CancellationToken.None), CancellationToken.None);
+    }
+
     private readonly IBlobStoreProvider? _blobStore;
     private readonly IFileWorkspaceService _fileWorkspace;
     private readonly WorkspaceOptions _workspaceOptions;
@@ -63,7 +82,10 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         ICandidateConflictResolutionService? candidateConflictResolution = null,
         ITaskConflictService? taskConflicts = null,
         // L2.4 — optional: when present, ProposeAsync moves the inlined diff to the CAS content plane.
-        IBlobStoreProvider? blobStore = null)
+        IBlobStoreProvider? blobStore = null,
+        // A4 (plans/test-suite-remediation-plan.md): optional; logs a refused proposal transition at
+        // Debug so a swallowed illegal transition leaves a breadcrumb (see LogRefusedTransition).
+        ILogger<InMemoryMergeService>? logger = null)
     {
         _nodeStore                    = nodeStore;
         _fileWorkspace                = fileWorkspace;
@@ -78,7 +100,20 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         _candidateConflictResolution  = candidateConflictResolution;
         _taskConflicts                = taskConflicts;
         _blobStore                    = blobStore;
+        _logger                       = logger;
     }
+
+    private readonly ILogger<InMemoryMergeService>? _logger;
+
+    // A4: a refused proposal transition is silent when a convergence caller swallows the throw (the
+    // supersede/reconcile loops do, because a constituent is often already past the target state). One
+    // Debug line at the source makes the benign case visible and a real bug findable, without changing
+    // what is legal.
+    private void LogRefusedTransition(string proposalId, MergeProposalStatus from, MergeProposalStatus to)
+        => _logger?.LogDebug(
+            "Refused merge-proposal transition {ProposalId}: {From} -> {To} (not a legal edge). "
+            + "If a caller swallows this, the transition simply did not happen.",
+            proposalId, from, to);
 
     public async Task<MergeProposal> ProposeAsync(MergeProposal proposal, CancellationToken cancellationToken = default)
     {
@@ -136,6 +171,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.ReadyForReview))
         {
+            LogRefusedTransition(proposalId, proposal.Status, MergeProposalStatus.ReadyForReview);
             throw new InvalidOperationException(
                 $"Cannot validate proposal '{proposalId}': status {proposal.Status} cannot transition to ReadyForReview.");
         }
@@ -173,6 +209,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, decision))
         {
+            LogRefusedTransition(proposalId, proposal.Status, decision);
             throw new InvalidOperationException(
                 $"Cannot transition proposal '{proposalId}' from {proposal.Status} to {decision}. " +
                 $"Proposals must be in ReadyForReview before human review.");
@@ -445,6 +482,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
         {
             if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.UnderReview))
             {
+                LogRefusedTransition(proposalId, proposal.Status, MergeProposalStatus.UnderReview);
                 throw new InvalidOperationException(
                     $"Cannot begin automated review for proposal '{proposalId}' in status {proposal.Status}.");
             }
@@ -482,6 +520,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, nextStatus))
         {
+            LogRefusedTransition(proposalId, proposal.Status, nextStatus);
             throw new InvalidOperationException(
                 $"Cannot transition proposal '{proposalId}' from {proposal.Status} to {nextStatus}.");
         }
@@ -634,6 +673,7 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.Merged))
         {
+            LogRefusedTransition(proposalId, proposal.Status, MergeProposalStatus.Merged);
             throw new InvalidOperationException(
                 $"Cannot apply proposal '{proposalId}': only Approved proposals can be merged (current: {proposal.Status}).");
         }
@@ -798,28 +838,34 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
 
         // Phase 4 (plans/first-class-goals-and-materialization.md): when this apply promoted the
         // integrated state to disk, that snapshot IS the goal's latest final state — stamp it onto the
-        // owning goal's GoalNode.FinalSnapshotId (last apply wins → the true final). Fire-and-forget on
+        // owning goal's GoalNode.FinalSnapshotId (last apply wins → the true final). Deferred on
         // purpose: the stamp is a materialization convenience and must never add latency to the apply
         // response (an extra repo-scoped node write can be slow on a large room) nor be cancelled when
-        // the caller aborts. Uses CancellationToken.None so it still completes past a client timeout.
+        // the caller aborts — so it survives a client timeout. It now rides the tracked background
+        // queue instead of an untracked Task.Run, so shutdown drains it rather than tearing it in half.
         if (promotedToDisk && !string.IsNullOrEmpty(appliedSnapshotId))
         {
             var stampWorkUnit = owningWorkUnit;
             var stampSnapshotId = appliedSnapshotId;
-            _ = Task.Run(() => TryStampGoalFinalSnapshotAsync(stampWorkUnit, stampSnapshotId, CancellationToken.None));
+            RunDeferred(
+                "merge/stamp-goal-final-snapshot",
+                ct => TryStampGoalFinalSnapshotAsync(stampWorkUnit, stampSnapshotId, ct));
         }
 
         // Integration checkpoint (plans/room-snapshot-checkpoint-redesign.md): a merge landing on
         // disk is the "last known good" boundary (lines up with a git commit / PR), so mint one
         // full-room snapshot for the repo room here. This is the ONLY place — besides the disconnect
         // flush — a full-room snapshot is taken now; per-write durability rides incremental deltas, so
-        // this bounds the delta chain the next hydrate replays. Fire-and-forget on CancellationToken.None
-        // for the same reason as the goal-final stamp above: it must never add latency to the apply
-        // response nor be cancelled when the caller aborts.
+        // this bounds the delta chain the next hydrate replays. Deferred for the same reason as the
+        // goal-final stamp above (never add latency to the apply response, survive a caller abort) and,
+        // like it, drained at shutdown — this write IS the durability boundary, so abandoning it
+        // half-finished on process exit is precisely the failure it exists to prevent.
         if (promotedToDisk && !string.IsNullOrWhiteSpace(updated.RepositoryId))
         {
             var checkpointRepositoryId = updated.RepositoryId;
-            _ = Task.Run(() => _nodeStore.CheckpointRepositoryRoomAsync(checkpointRepositoryId, CancellationToken.None));
+            RunDeferred(
+                "merge/checkpoint-repository-room",
+                ct => _nodeStore.CheckpointRepositoryRoomAsync(checkpointRepositoryId, ct));
         }
 
         // A reconciliation work unit's own proposal just landed — generic across every source
@@ -1782,8 +1828,23 @@ public sealed class InMemoryMergeService : IMergeService, IRehydratable
     {
         var proposal = GetRequired(proposalId);
 
+        // Idempotent re-application. Superseding a proposal that is ALREADY superseded by this same
+        // proposal is not a state transition at all — it is the caller arriving at a conclusion the
+        // system already reached. Reconciliation re-runs (a retry, a reinvoke, a second convergence
+        // pass over the same parent) hit this routinely, and throwing here aborted the entire
+        // reconciliation loop mid-way: the remaining constituents were never superseded and the
+        // stage was never advanced. Worse, the whole chain runs fire-and-forget from the scheduler,
+        // so the exception was swallowed and the goal simply stopped converging with no error
+        // anywhere. Found via the unobserved-task-exception detector.
+        if (proposal.Status == MergeProposalStatus.Superseded
+            && string.Equals(proposal.SupersededBy, supersededByProposalId, StringComparison.Ordinal))
+        {
+            return proposal;
+        }
+
         if (!MergeProposalTransitions.CanTransition(proposal.Status, MergeProposalStatus.Superseded))
         {
+            LogRefusedTransition(proposalId, proposal.Status, MergeProposalStatus.Superseded);
             throw new InvalidOperationException(
                 $"Cannot supersede proposal '{proposalId}': status {proposal.Status} cannot transition to Superseded.");
         }

@@ -20,7 +20,7 @@ public class SiblingProposalApplyTests
     [Fact]
     public async Task Applying_a_second_sibling_proposal_does_not_revert_the_first_siblings_files()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands    = app.Services.GetRequiredService<IMergeCommandService>();
         var fileWorkspace    = app.Services.GetRequiredService<IFileWorkspaceService>();
@@ -72,7 +72,7 @@ public class SiblingProposalApplyTests
     [Fact]
     public async Task Applying_a_sibling_proposal_that_genuinely_overlaps_an_already_landed_sibling_throws()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands    = app.Services.GetRequiredService<IMergeCommandService>();
         var fileWorkspace    = app.Services.GetRequiredService<IFileWorkspaceService>();

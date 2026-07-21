@@ -15,14 +15,16 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// promotion is on (and not bypassed), sourced from the candidate branch's own composed content.
 /// </summary>
 [Trait("Category", "Integration")]
-public class PromotionBranchWriteBackTests : IDisposable
+public class PromotionBranchWriteBackTests : IAsyncLifetime
 {
     private readonly string _repoPath = Path.Combine(Path.GetTempPath(), $"studio-promotion-writeback-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_repoPath)) Directory.Delete(_repoPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_repoPath);
 
     [Fact]
     public async Task ApplyAsync_with_promotion_branch_on_lands_on_candidate_and_does_not_write_disk()
@@ -30,7 +32,7 @@ public class PromotionBranchWriteBackTests : IDisposable
         Directory.CreateDirectory(_repoPath);
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "Program.cs"), "// v1");
 
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
 
@@ -65,7 +67,7 @@ public class PromotionBranchWriteBackTests : IDisposable
         Directory.CreateDirectory(_repoPath);
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "Program.cs"), "// v1");
 
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
 
@@ -104,7 +106,7 @@ public class PromotionBranchWriteBackTests : IDisposable
         Directory.CreateDirectory(_repoPath);
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "Program.cs"), "// v1");
 
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         options.UsePromotionBranch = true;
 
@@ -146,7 +148,7 @@ public class PromotionBranchWriteBackTests : IDisposable
     [Fact]
     public async Task Goal_merged_before_promotion_branch_was_enabled_never_appears_in_the_promotion_queue()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var options = app.Services.GetRequiredService<WorkspaceOptions>();
         // UsePromotionBranch starts (and stays, for this apply) off.
 

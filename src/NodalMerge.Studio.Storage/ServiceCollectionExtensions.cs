@@ -335,6 +335,16 @@ public static class ServiceCollectionExtensions
             sp.GetService<WorkspaceOptions>(),
             sp.GetService<RetentionPolicyOptions>()));
 
+        // plans/vision-punchlist-remediation.md (shutdown contract) — deferred durable work goes
+        // through here instead of `_ = Task.Run(..., CancellationToken.None)`, so it is drained on
+        // StopAsync and on container disposal rather than abandoned mid-write. Registered as
+        // IHostedService for the StopAsync drain; the container also disposes it (IAsyncDisposable),
+        // which is what covers hosts that are disposed without an explicit stop.
+        services.AddSingleton<StudioBackgroundWorkQueue>(sp => new StudioBackgroundWorkQueue(
+            sp.GetService<ILogger<StudioBackgroundWorkQueue>>()));
+        services.AddSingleton<IStudioBackgroundWork>(sp => sp.GetRequiredService<StudioBackgroundWorkQueue>());
+        services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<StudioBackgroundWorkQueue>());
+
         services.AddSingleton<WorkspaceCacheManager>(sp => new WorkspaceCacheManager(
             sp.GetRequiredService<IFileWorkspaceService>(),
             sp,
@@ -344,7 +354,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IRepositoryRegistryService>(),
             sp.GetRequiredService<ISnapshotTreeResolver>(),
             sp.GetRequiredService<ISnapshotRetentionPolicy>(),
-            sp.GetService<WorkspaceOptions>()));
+            sp.GetService<WorkspaceOptions>(),
+            sp.GetRequiredService<IStudioBackgroundWork>()));
         services.AddSingleton<IWorkspaceCacheManager>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
         services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<WorkspaceCacheManager>());
 

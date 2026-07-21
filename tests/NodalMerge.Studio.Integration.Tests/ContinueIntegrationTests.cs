@@ -20,7 +20,7 @@ public class ContinueIntegrationTests
     [Fact]
     public async Task ContinueWithPriorContextAsync_resumes_using_reconstructed_history_and_completes()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ContinueLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());

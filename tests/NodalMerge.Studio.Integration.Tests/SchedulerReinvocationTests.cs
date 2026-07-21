@@ -24,7 +24,7 @@ public class SchedulerReinvocationTests
     {
         var fakeHandler = new ScheduledReinvocationLlmHandler();
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services => services.AddInMemoryStorage());
@@ -107,7 +107,7 @@ public class SchedulerReinvocationTests
     [Fact]
     public async Task Converge_repairs_a_dead_lettered_root_back_to_Executing()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ScheduledReinvocationLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());

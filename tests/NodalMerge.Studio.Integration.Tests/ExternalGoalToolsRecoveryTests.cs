@@ -110,7 +110,7 @@ public class ExternalGoalToolsRecoveryTests
     [Fact]
     public async Task StatusAsync_reports_null_dead_letter_for_a_healthy_goal()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var orchestratorSvc = app.Services.GetRequiredService<IOrchestratorService>();
         var goalNodes = app.Services.GetRequiredService<IGoalNodeService>();
 
@@ -184,7 +184,7 @@ public class ExternalGoalToolsRecoveryTests
     [Fact]
     public async Task RecoverAsync_errors_when_the_goal_has_no_dead_letter_entry()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var orchestratorSvc = app.Services.GetRequiredService<IOrchestratorService>();
         var goalNodes = app.Services.GetRequiredService<IGoalNodeService>();
 

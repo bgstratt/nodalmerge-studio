@@ -18,18 +18,28 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// </summary>
 public sealed class RecordingBlobStoreProvider(IBlobStoreProvider inner) : IBlobStoreProvider
 {
+    // B2a (plans/test-suite-remediation-plan.md): the recorded callers fetch concurrently —
+    // WorkUnitPrefetchService and MaterializationEngine both fan out over Task.Run — so these Adds
+    // race. List<T>.Add is not thread-safe; a lost update dropped an entry and
+    // ScopedTreeFetchTests.PrefetchScopeAsync_warms_exactly_the_scoped_file_blobs intermittently saw
+    // 4 recorded fetches instead of 5. The lock serialises the writes. Test reads happen only after
+    // the awaited concurrent work has completed, so they need no lock (the await is a memory barrier).
+    private readonly object _gate = new();
+
     public List<string> PutHashes { get; } = [];
     public List<string> GetHashes { get; } = [];
 
     public ValueTask<BlobReadResult> TryGetBlobAsync(string hashHex, CancellationToken cancellationToken = default)
     {
-        GetHashes.Add(hashHex);
+        lock (_gate)
+            GetHashes.Add(hashHex);
         return inner.TryGetBlobAsync(hashHex, cancellationToken);
     }
 
     public ValueTask PutBlobAsync(string hashHex, byte[] bytes, string? contentType, CancellationToken cancellationToken = default)
     {
-        PutHashes.Add(hashHex);
+        lock (_gate)
+            PutHashes.Add(hashHex);
         return inner.PutBlobAsync(hashHex, bytes, contentType, cancellationToken);
     }
 }

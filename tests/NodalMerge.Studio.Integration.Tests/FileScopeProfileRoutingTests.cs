@@ -15,7 +15,7 @@ public class FileScopeProfileRoutingTests
     [Fact]
     public async Task Slice_with_fileScope_matching_exactly_one_profiles_patterns_routes_deterministically()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -56,7 +56,7 @@ public class FileScopeProfileRoutingTests
     [Fact]
     public async Task Slice_with_fileScope_matching_zero_profiles_falls_through_to_heuristic_default()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -95,7 +95,7 @@ public class FileScopeProfileRoutingTests
     [Fact]
     public async Task Slice_with_one_fileScope_path_unmatched_by_a_profiles_patterns_falls_through()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -137,7 +137,7 @@ public class FileScopeProfileRoutingTests
         // plans/scoped-execute-workers-per-profile-models.md — when a file-scope match routes a slice
         // to a profile whose bound Model Profile was resolved into profileCredentials at spawn, the
         // child enqueues on *that* model, not the Execute-stage default.
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -192,11 +192,130 @@ public class FileScopeProfileRoutingTests
     }
 
     [Fact]
+    public async Task Matched_profile_bound_model_resolves_for_grandchild_fanout()
+    {
+        // plans/vision-punchlist-remediation.md Item 4 — credential registrations (stage, goal
+        // default, per-profile) are written once at spawn keyed by the goal ROOT work unit. Fan-out
+        // used to resolve them by the *immediate* parent, so an orchestrator-type child fanning out
+        // its own children (a reconciliation/sub-plan unit, via GoalCoordinator's rescue sweep)
+        // found no registration and silently enqueued with no model at all. The grandchild must
+        // resolve the same bound Model Profile a depth-1 child does.
+        await using var app = StudioWebApplication.Build(
+            [],
+            configureServices: services => services.AddInMemoryStorage());
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+        var fanOut = app.Services.GetRequiredService<IFanOutService>();
+        var profiles = app.Services.GetRequiredService<IAgentProfileService>();
+        var agentControl = app.Services.GetRequiredService<IAgentControlService>();
+        var scheduler = app.Services.GetRequiredService<IWorkScheduler>();
+
+        await profiles.CreateAsync(new AgentProfile(
+            "frontend-worker", "Frontend Worker", PipelineStage.Execute, string.Empty, [], 20,
+            ["**/*.tsx"], ModelProfileId: "sonnet-frontend"));
+
+        var root = await orchestrator.CreateWorkUnitAsync("Build UI", "test");
+        // The intermediate unit — fan-out runs against *this*, so parentWorkUnitId is no longer the
+        // root and the credential lookup has to walk up to find the registration.
+        var mid = await orchestrator.CreateWorkUnitAsync(
+            "Subsystem", "test", parentWorkUnitId: root.WorkUnitId);
+
+        // Credentials registered on the ROOT only — exactly what orchestrator spawn does.
+        var stageCredentials = new Dictionary<PipelineStage, GoalDefaultCredentials>
+        {
+            [PipelineStage.Execute] = new("anthropic", "stage-model", "http://stage", "stage-key", null),
+        };
+        var profileCredentials = new Dictionary<string, GoalDefaultCredentials>
+        {
+            ["frontend-worker"] = new("anthropic", "sonnet-frontend", "http://frontend", "fe-key", "frontend-worker"),
+        };
+        await agentControl.SpawnAsync(
+            "orchestrator", root.WorkUnitId, model: "m", baseUrl: "http://fake-llm", apiKey: "k",
+            stageCredentials: stageCredentials, profileCredentials: profileCredentials);
+
+        var planJson = """
+            {
+              "slices": [
+                { "sliceId": "s1", "goal": "Implement Foo.tsx", "fileScope": ["src/Foo.tsx"], "dependsOn": [], "steps": ["edit"] }
+              ]
+            }
+            """;
+        // Plan recorded on the intermediate unit, so its fan-out produces a grandchild of the root.
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}", ArtifactType.Plan, mid.WorkUnitId,
+            ArtifactStatus.Active, DateTimeOffset.UtcNow, mid.WorkUnitId, null, "Plan", planJson));
+
+        var result = await fanOut.TryFanOutFromPlanAsync(mid.WorkUnitId);
+        var grandchildId = Assert.Single(result.EnqueuedWorkUnitIds);
+
+        var pending = await scheduler.ListPendingAsync();
+        var grandchildItem = pending.Single(i => i.WorkUnitId == grandchildId);
+        Assert.Equal("frontend-worker", grandchildItem.ProfileId);
+        // Before the root walk both of these were null — not merely the wrong model, but no
+        // credentials at all, since the stage default is keyed the same way.
+        Assert.Equal("sonnet-frontend", grandchildItem.Model);
+        Assert.Equal("http://frontend", grandchildItem.BaseUrl);
+    }
+
+    [Fact]
+    public async Task Grandchild_fanout_without_a_bound_model_inherits_the_stage_default()
+    {
+        // The other half of the root walk: with no per-profile binding, a grandchild must still find
+        // the root's Execute-stage default rather than enqueueing with nothing.
+        await using var app = StudioWebApplication.Build(
+            [],
+            configureServices: services => services.AddInMemoryStorage());
+
+        var orchestrator = app.Services.GetRequiredService<IOrchestratorService>();
+        var artifacts = app.Services.GetRequiredService<IArtifactLineageService>();
+        var fanOut = app.Services.GetRequiredService<IFanOutService>();
+        var profiles = app.Services.GetRequiredService<IAgentProfileService>();
+        var agentControl = app.Services.GetRequiredService<IAgentControlService>();
+        var scheduler = app.Services.GetRequiredService<IWorkScheduler>();
+
+        await profiles.CreateAsync(new AgentProfile(
+            "frontend-worker", "Frontend Worker", PipelineStage.Execute, string.Empty, [], 20,
+            ["**/*.tsx"]));
+
+        var root = await orchestrator.CreateWorkUnitAsync("Build UI", "test");
+        var mid = await orchestrator.CreateWorkUnitAsync(
+            "Subsystem", "test", parentWorkUnitId: root.WorkUnitId);
+
+        var stageCredentials = new Dictionary<PipelineStage, GoalDefaultCredentials>
+        {
+            [PipelineStage.Execute] = new("anthropic", "stage-model", "http://stage", "stage-key", null),
+        };
+        await agentControl.SpawnAsync(
+            "orchestrator", root.WorkUnitId, model: "m", baseUrl: "http://fake-llm", apiKey: "k",
+            stageCredentials: stageCredentials);
+
+        var planJson = """
+            {
+              "slices": [
+                { "sliceId": "s1", "goal": "Implement Foo.tsx", "fileScope": ["src/Foo.tsx"], "dependsOn": [], "steps": ["edit"] }
+              ]
+            }
+            """;
+        await artifacts.RecordAsync(new ArtifactRef(
+            $"PLAN-{Guid.NewGuid():N}", ArtifactType.Plan, mid.WorkUnitId,
+            ArtifactStatus.Active, DateTimeOffset.UtcNow, mid.WorkUnitId, null, "Plan", planJson));
+
+        var result = await fanOut.TryFanOutFromPlanAsync(mid.WorkUnitId);
+        var grandchildId = Assert.Single(result.EnqueuedWorkUnitIds);
+
+        var pending = await scheduler.ListPendingAsync();
+        var grandchildItem = pending.Single(i => i.WorkUnitId == grandchildId);
+        Assert.Equal("frontend-worker", grandchildItem.ProfileId);
+        Assert.Equal("stage-model", grandchildItem.Model);
+    }
+
+    [Fact]
     public async Task Matched_profile_without_a_bound_model_inherits_the_stage_default()
     {
         // Back-compat: a file-scope-matched profile that declared no Model Profile binding runs on
         // the Execute-stage default — the enqueue is identical to before this feature existed.
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 
@@ -244,7 +363,7 @@ public class FileScopeProfileRoutingTests
     [Fact]
     public async Task Slice_with_fileScope_matching_multiple_profiles_falls_through_to_heuristic_default()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             configureServices: services => services.AddInMemoryStorage());
 

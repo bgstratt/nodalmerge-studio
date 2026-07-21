@@ -16,15 +16,16 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// the first request's kickoff text actually contains the rule file's content.
 /// </summary>
 [Trait("Category", "Integration")]
-public class RuleFileKickoffInjectionTests : IDisposable
+public class RuleFileKickoffInjectionTests : IAsyncLifetime
 {
     private readonly string _rootPath = Path.Combine(Path.GetTempPath(), $"studio-rule-file-kickoff-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_rootPath))
-            Directory.Delete(_rootPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_rootPath);
 
     private sealed class CapturingLlmHandler : HttpMessageHandler
     {
@@ -56,7 +57,7 @@ public class RuleFileKickoffInjectionTests : IDisposable
     public async Task Worker_kickoff_message_includes_the_branchs_rule_file_content()
     {
         var fakeHandler = new CapturingLlmHandler();
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(fakeHandler),
             configureServices: services =>

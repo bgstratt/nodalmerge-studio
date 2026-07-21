@@ -57,19 +57,16 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("Sqlite")]
-public class RoomReplicationTests : IDisposable
+public class RoomReplicationTests : IAsyncLifetime
 {
     private readonly string _tempRoot =
         Path.Combine(Path.GetTempPath(), $"studio-room-replication-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        // See NodalMergeStudioNodeStoreEngineTests' Dispose for why ClearAllPools is required on
-        // Windows before deleting the temp directory.
-        SqliteConnection.ClearAllPools();
-        if (Directory.Exists(_tempRoot))
-            Directory.Delete(_tempRoot, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via the shared
+    // helper. See TestTeardown for why ClearAllPools + a retrying delete are required on Windows.
+    public Task DisposeAsync() => TestTeardown.ClearSqlitePoolsAndDeleteAsync(_tempRoot);
 
     private WebApplication BuildApp(
         string name,
@@ -365,7 +362,24 @@ public class RoomReplicationTests : IDisposable
         var liveCompleted = await Task.WhenAny(pending, Task.Delay(TimeSpan.FromSeconds(3)));
         var liveMessage = liveCompleted == pending ? await pending : null;
         Assert.Null(liveMessage);
+
+        // Passing this assertion means `pending` is still outstanding, and it cannot be cancelled
+        // (see ReceiveOneAsync — cancelling an in-flight ClientWebSocket receive aborts the whole
+        // socket). It will therefore fault when the host tears the connection down at the end of the
+        // test. Observe that fault deliberately: left alone it becomes an unobserved task exception,
+        // which the detector reports as a leak — correctly, but this one is intentional, and noise
+        // in that report is exactly what would train us to stop reading it.
+        ObserveExpectedFault(pending);
     }
+
+    // Marks a deliberately-abandoned task's exception as observed. Only for tasks a test knowingly
+    // walks away from — never as a way to quiet a leak that has not been understood.
+    private static void ObserveExpectedFault(Task task) =>
+        _ = task.ContinueWith(
+            t => _ = t.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
     /// <summary>
     /// Slice 7.3's other product decision: with the "studio"-room collision source gone,

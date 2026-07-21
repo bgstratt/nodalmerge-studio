@@ -847,7 +847,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
             if (!mapKey.StartsWith(prefix, StringComparison.Ordinal))
                 continue;
 
-            results[mapKey[prefix.Length..]] = ExtractPayloadRawText(valueRawJson);
+            UpsertResolvingScope(results, kind, mapKey[prefix.Length..], ExtractPayloadRawText(valueRawJson));
         }
 
         // Slice 6.3 — aggregate across every bound repo room too (see class comment note 2).
@@ -865,14 +865,14 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
                     if (!mapKey.StartsWith(prefix, StringComparison.Ordinal))
                         continue;
 
-                    results[mapKey[prefix.Length..]] = ExtractPayloadRawText(valueRawJson);
+                    UpsertResolvingScope(results, kind, mapKey[prefix.Length..], ExtractPayloadRawText(valueRawJson));
                 }
             }
         }
 
         // Phase 1 — aggregate the shared "workgroup" room too, for kinds that can carry Workgroup
-        // reach (global constraints). A given entity lives in exactly one room, so no override
-        // ordering concern with the repo/studio entries collected above.
+        // reach (global constraints). An entity normally lives in exactly one room; the exception is
+        // a re-scoped artifact, which UpsertResolvingScope disambiguates by ScopeVersion.
         if (StudioNodeKind.WorkgroupScopedKinds.Contains(kind))
         {
             var workgroupRoomMap = await GetOrCreateWorkgroupRoomMapAsync(cancellationToken).ConfigureAwait(false);
@@ -881,7 +881,7 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
                 if (!mapKey.StartsWith(prefix, StringComparison.Ordinal))
                     continue;
 
-                results[mapKey[prefix.Length..]] = ExtractPayloadRawText(valueRawJson);
+                UpsertResolvingScope(results, kind, mapKey[prefix.Length..], ExtractPayloadRawText(valueRawJson));
             }
         }
 
@@ -894,6 +894,108 @@ public sealed class NodalMergeStudioNodeStore : IStudioNodeStore, IStudioNodeSto
         }
 
         return results.Select(kv => (EntityId: kv.Key, PayloadJson: kv.Value)).ToList();
+    }
+
+    // plans/vision-punchlist-remediation.md (Items 1+2) — see IStudioNodeStore. Enumerates one repo
+    // room directly (not the bound-set fan-out) so a re-link can report exactly what lives in the
+    // room it is about to stop reading. Works for a room this peer has bound; an unknown/unbound id
+    // yields an empty result rather than throwing, since "nothing to lose" is the honest answer for a
+    // room with no local state.
+    public async Task<IReadOnlyDictionary<string, int>> CountRepoRoomNodesByKindAsync(
+        string workgroupRepoId, CancellationToken cancellationToken = default)
+    {
+        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(workgroupRepoId))
+            return counts;
+
+        await EnsureInitializedAsync(cancellationToken).ConfigureAwait(false);
+
+        var roomId = $"repo/{workgroupRepoId}";
+        EngineRoomMap roomMap;
+        try
+        {
+            roomMap = await GetOrCreateRepoRoomMapAsync(roomId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogDebug(ex, "[NodeStore] Could not open room {RoomId} to count nodes.", roomId);
+            return counts;
+        }
+
+        foreach (var (mapKey, _) in roomMap.AllEntries(MapNamespace))
+        {
+            // Keys are "{kind}/{entityId}" per the frozen schema — the kind is everything before the
+            // LAST separator, since kinds themselves contain slashes ("studio/artifact-ref/v1").
+            var lastSlash = mapKey.LastIndexOf('/');
+            if (lastSlash <= 0)
+                continue;
+
+            var kind = mapKey[..lastSlash];
+            counts[kind] = counts.GetValueOrDefault(kind) + 1;
+        }
+
+        return counts;
+    }
+
+    // Item 3 (plans/vision-punchlist-remediation.md) — collision resolution for the multi-room read
+    // fan-out above. Every kind except ArtifactRefV1 keeps the historical last-room-wins overwrite
+    // (studio → repo → workgroup precedence), which is correct for them: an entity lives in exactly
+    // one room and the later rooms hold the live copy.
+    //
+    // ArtifactRefV1 is the exception. SetScopeAsync/ElevateToWorkgroupAsync re-route an artifact into
+    // a different room but cannot delete the copy in the old one (EngineRoomMap has no per-entry
+    // eviction), so both rooms hold the same ArtifactId with divergent payloads. Under pure room
+    // precedence every *narrowing* re-scope resolves to the stale broader copy — a workgroup→private
+    // move would keep reading as workgroup on every peer and after any rehydrate, silently reverting
+    // the user's change. Highest ScopeVersion wins instead, which is the copy the last scope mutation
+    // wrote regardless of which room it went to.
+    //
+    // Ties keep the incoming value, so artifacts that were never re-scoped (all at version 0 — the
+    // overwhelming majority, including every legacy record) resolve exactly as before.
+    private static void UpsertResolvingScope(
+        Dictionary<string, string> results, string kind, string entityId, string payloadJson)
+    {
+        if (!string.Equals(kind, StudioNodeKind.ArtifactRefV1, StringComparison.Ordinal)
+            || !results.TryGetValue(entityId, out var existing))
+        {
+            results[entityId] = payloadJson;
+            return;
+        }
+
+        results[entityId] = ReadScopeVersion(existing) > ReadScopeVersion(payloadJson)
+            ? existing
+            : payloadJson;
+    }
+
+    // Deliberately defensive: a payload with no ScopeVersion (every pre-Item-3 record), a
+    // non-numeric one, or malformed JSON all read as 0 rather than throwing inside a read fan-out.
+    private static int ReadScopeVersion(string payloadJson)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(payloadJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                return 0;
+
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                if (!string.Equals(
+                        prop.Name,
+                        nameof(Contracts.Domain.ArtifactRef.ScopeVersion),
+                        StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                return prop.Value.ValueKind == JsonValueKind.Number && prop.Value.TryGetInt32(out var version)
+                    ? version
+                    : 0;
+            }
+        }
+        catch (JsonException)
+        {
+            // fall through
+        }
+
+        return 0;
     }
 
     // Slice 6.3 — targeted single-room read for callers that already know exactly which repo room

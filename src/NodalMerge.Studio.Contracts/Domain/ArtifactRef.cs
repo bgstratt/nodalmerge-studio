@@ -92,7 +92,17 @@ public sealed record ArtifactRef(
     // cascade couples the promotion to the source): this is a pure back-reference used to (a) show
     // where a policy came from and (b) dedupe — a source is "already promoted" iff some global's
     // PromotedFromArtifactId equals it. Additive/nullable = zero migration, same as Reach above.
-    string? PromotedFromArtifactId = null)
+    string? PromotedFromArtifactId = null,
+    // Item 3 (plans/vision-punchlist-remediation.md) — monotonic counter bumped on every scope change
+    // (SetScopeAsync / ElevateToWorkgroupAsync). Re-scoping re-routes the artifact into a different
+    // room but cannot delete the copy left in the old one (EngineRoomMap has no per-entry eviction),
+    // so the same ArtifactId genuinely exists in two rooms with divergent payloads. The read fan-out
+    // resolves that collision by highest ScopeVersion instead of room precedence — without it, every
+    // *narrowing* re-scope (workgroup→repo, workgroup/repo→private) resolves to the stale broader
+    // copy and silently reverts on other peers and after any rehydrate. Additive with a 0 default =
+    // zero migration, same as Reach/RepositoryId/PromotedFromArtifactId above; artifacts that were
+    // never re-scoped all sit at 0 and fall through to the pre-existing precedence order.
+    int ScopeVersion = 0)
 {
     public IReadOnlyList<string> Supersedes { get; init; } = Supersedes ?? [];
 }

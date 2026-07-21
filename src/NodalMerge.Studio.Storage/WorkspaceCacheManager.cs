@@ -19,7 +19,8 @@ public sealed class WorkspaceCacheManager(
     IRepositoryRegistryService repositories,
     ISnapshotTreeResolver treeResolver,
     ISnapshotRetentionPolicy retentionPolicy,
-    WorkspaceOptions? options = null) : IWorkspaceCacheManager, IHostedService
+    WorkspaceOptions? options = null,
+    IStudioBackgroundWork? backgroundWork = null) : IWorkspaceCacheManager, IHostedService
 {
     private static readonly HashSet<WorkUnitStatus> TerminalEvictableStatuses =
     [
@@ -28,10 +29,15 @@ public sealed class WorkspaceCacheManager(
         WorkUnitStatus.Cancelled,
     ];
 
-    // IHostedService.StartAsync — fire-and-forget orphan sweep so startup is not blocked.
+    // IHostedService.StartAsync — the orphan sweep is deferred so startup is not blocked, but it now
+    // runs on the tracked background queue rather than an untracked Task.Run, so shutdown drains it
+    // instead of tearing it in half. (Firing Task.Run from a constructor, as this originally did via
+    // the primary-constructor body, was also unsafe in a DI container: the instance can be published
+    // to other threads before construction completes.)
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        _ = Task.Run(() => EvictOrphanedAsync(CancellationToken.None), CancellationToken.None);
+        if (backgroundWork is not null)
+            backgroundWork.Enqueue("workspace-cache/evict-orphaned", ct => EvictOrphanedAsync(ct));
         return Task.CompletedTask;
     }
 

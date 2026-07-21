@@ -16,14 +16,16 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// exposes ForceSyncAsync specifically to bypass that gate for triggers that need "check again now".
 /// </summary>
 [Trait("Category", "Integration")]
-public class PostMergeResyncIntegrationTests : IDisposable
+public class PostMergeResyncIntegrationTests : IAsyncLifetime
 {
     private readonly string _repoPath = Path.Combine(Path.GetTempPath(), $"studio-postmerge-resync-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_repoPath)) Directory.Delete(_repoPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_repoPath);
 
     [Fact]
     public async Task ApplyAsync_auto_resync_advances_the_real_RepositorySnapshot_after_write_back()
@@ -31,7 +33,7 @@ public class PostMergeResyncIntegrationTests : IDisposable
         Directory.CreateDirectory(_repoPath);
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "Program.cs"), "// v1");
 
-        var app = StudioWebApplication.Build([], configureServices: services =>
+        await using var app = StudioWebApplication.Build([], configureServices: services =>
         {
             services.AddInMemoryStorage();
             services.AddSingleton(new WorkspaceOptions { SeedRepositoryPath = _repoPath });

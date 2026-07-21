@@ -20,15 +20,16 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// level sync behavior itself).
 /// </summary>
 [Trait("Category", "Integration")]
-public class WorkUnitCommandServiceRepositorySyncTests : IDisposable
+public class WorkUnitCommandServiceRepositorySyncTests : IAsyncLifetime
 {
     private readonly string _repoPath = Path.Combine(Path.GetTempPath(), $"studio-wucs-reposync-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_repoPath))
-            Directory.Delete(_repoPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_repoPath);
 
     private static WebApplication BuildTestApp() =>
         StudioWebApplication.Build(

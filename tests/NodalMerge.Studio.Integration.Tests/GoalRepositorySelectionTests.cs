@@ -19,16 +19,17 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// NewRepositoryPath through to it, since previously they didn't expose those fields at all.
 /// </summary>
 [Trait("Category", "Integration")]
-public class GoalRepositorySelectionTests : IDisposable
+public class GoalRepositorySelectionTests : IAsyncLifetime
 {
     private readonly string _repoPath = Path.Combine(Path.GetTempPath(), $"studio-goal-reposelect-{Guid.NewGuid():N}");
     private readonly string _newRepoPath = Path.Combine(Path.GetTempPath(), $"studio-goal-reposelect-new-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_repoPath)) Directory.Delete(_repoPath, recursive: true);
-        if (Directory.Exists(_newRepoPath)) Directory.Delete(_newRepoPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_repoPath, _newRepoPath);
 
     [Fact]
     public async Task REST_POST_goals_with_RepositoryPath_syncs_main_and_seeds_the_goals_branch()
@@ -86,7 +87,7 @@ public class GoalRepositorySelectionTests : IDisposable
         Directory.CreateDirectory(_repoPath);
         await File.WriteAllTextAsync(Path.Combine(_repoPath, "Program.cs"), "// from repo via mcp");
 
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [], configureServices: services => services.AddInMemoryStorage());
         var tools = ActivatorUtilities.CreateInstance<GoalTools>(app.Services);
         var fileWorkspace = app.Services.GetRequiredService<IFileWorkspaceService>();
@@ -101,7 +102,7 @@ public class GoalRepositorySelectionTests : IDisposable
     [Fact]
     public async Task MCP_goal_create_with_NewRepositoryPath_creates_and_uses_a_fresh_repo()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [], configureServices: services => services.AddInMemoryStorage());
         var tools = ActivatorUtilities.CreateInstance<GoalTools>(app.Services);
         var repositories = app.Services.GetRequiredService<IRepositoryRegistryService>();

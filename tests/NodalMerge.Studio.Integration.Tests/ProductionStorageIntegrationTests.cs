@@ -23,20 +23,18 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("Sqlite")]
-public class ProductionStorageIntegrationTests : IDisposable
+public class ProductionStorageIntegrationTests : IAsyncLifetime
 {
     private readonly string _tempRoot =
         Path.Combine(Path.GetTempPath(), $"studio-prodstorage-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        // Microsoft.Data.Sqlite pools native connections by default, which keeps the db file
-        // handle open on Windows even after every SqliteConnection we used has been disposed —
-        // clear the pool first or the temp directory delete below throws IOException.
-        SqliteConnection.ClearAllPools();
-        if (Directory.Exists(_tempRoot))
-            Directory.Delete(_tempRoot, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry. Microsoft.Data
+    // .Sqlite pools native connections by default, so the db handle stays open on Windows past our
+    // last SqliteConnection.Dispose; the old un-retried Directory.Delete raced that and flaked.
+    // ClearAllPools + retrying delete now live in the shared helper.
+    public Task DisposeAsync() => TestTeardown.ClearSqlitePoolsAndDeleteAsync(_tempRoot);
 
     private Microsoft.AspNetCore.Builder.WebApplication BuildApp()
     {

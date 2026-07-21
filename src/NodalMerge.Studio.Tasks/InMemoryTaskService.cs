@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using NodalMerge.Studio.Contracts.Domain;
 using NodalMerge.Studio.Core.Services;
 using NodalMerge.Studio.Storage;
@@ -13,11 +14,22 @@ public sealed class InMemoryTaskService : ITaskService, IRehydratable
     private readonly ConcurrentDictionary<string, StudioTask> _tasks = new();
     private readonly IWorkUnitService _workUnits;
     private readonly IStudioNodeStore _nodeStore;
+    private readonly ILogger<InMemoryTaskService>? _logger;
 
-    public InMemoryTaskService(IWorkUnitService workUnits, IStudioNodeStore nodeStore)
+    // A4 (plans/test-suite-remediation-plan.md): the optional logger exists so a refused task
+    // transition leaves a breadcrumb. Many callers wrap UpdateAsync/AssignAsync in
+    // `catch (InvalidOperationException) {}` because a convergent caller retrying an already-applied
+    // status is benign — but that same swallow hid a real caller bug (a task completed straight from
+    // Open, skipping InProgress). Logging the refusal at the source, at Debug, makes the benign case
+    // quiet-but-visible and the buggy case findable, without changing what is legal.
+    public InMemoryTaskService(
+        IWorkUnitService workUnits,
+        IStudioNodeStore nodeStore,
+        ILogger<InMemoryTaskService>? logger = null)
     {
         _workUnits = workUnits;
         _nodeStore  = nodeStore;
+        _logger     = logger;
     }
 
     public async Task<StudioTask> CreateAsync(StudioTask task, CancellationToken cancellationToken = default)
@@ -53,6 +65,10 @@ public sealed class InMemoryTaskService : ITaskService, IRehydratable
         if (current.Status != task.Status &&
             !TaskTransitions.CanTransition(current.Status, task.Status))
         {
+            _logger?.LogDebug(
+                "Refused task transition {TaskId}: {From} -> {To} (not a legal edge). If a caller "
+                + "swallows this, the transition simply did not happen.",
+                task.TaskId, current.Status, task.Status);
             throw new InvalidOperationException(
                 $"Cannot transition task from {current.Status} to {task.Status}.");
         }
@@ -89,6 +105,9 @@ public sealed class InMemoryTaskService : ITaskService, IRehydratable
 
         if (!TaskTransitions.CanTransition(task.Status, TaskStatus.InProgress))
         {
+            _logger?.LogDebug(
+                "Refused task assignment {TaskId}: {From} -> InProgress (not a legal edge).",
+                taskId, task.Status);
             throw new InvalidOperationException(
                 $"Cannot assign task '{taskId}': status {task.Status} cannot transition to InProgress.");
         }

@@ -101,17 +101,17 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("Sqlite")]
-public class MultiUserMilestoneTests : IDisposable
+public class MultiUserMilestoneTests : IAsyncLifetime
 {
     private readonly string _tempRoot =
         Path.Combine(Path.GetTempPath(), $"studio-multiuser-milestone-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        SqliteConnection.ClearAllPools();
-        if (Directory.Exists(_tempRoot))
-            Directory.Delete(_tempRoot, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry. The old
+    // synchronous Dispose ran an un-retried Directory.Delete that raced background writes to
+    // nodes.db and flaked; ClearAllPools + retrying delete now live in the shared helper.
+    public Task DisposeAsync() => TestTeardown.ClearSqlitePoolsAndDeleteAsync(_tempRoot);
 
     [Fact(Timeout = 120_000)]
     public async Task Two_peers_one_repo_goal_appears_cold_materializes_and_edits_land()
@@ -318,6 +318,14 @@ public class MultiUserMilestoneTests : IDisposable
         {
             await hostB.StopAsync();
             hostB.Dispose();
+
+            // Stop A explicitly rather than relying on `await using` alone. IHost.DisposeAsync
+            // disposes the container but does NOT run hosted services' StopAsync, which is where the
+            // background work queue drains the deferred writes ApplyAsync above just queued (the
+            // goal-final stamp and the integration checkpoint). Without this the test could reach
+            // Dispose() -> Directory.Delete while a checkpoint was still writing to hostA/nodes.db,
+            // which is exactly the IOException this suite kept flaking on.
+            await hostA.StopAsync();
         }
     }
 

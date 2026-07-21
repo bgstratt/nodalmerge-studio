@@ -343,6 +343,23 @@ public sealed class ProjectionManager : IProjectionManager
             enriched.Add(r);
         }
 
+        // Item 3 S2 — a constraint stops being injected once it is retired. Deliberately a BLOCKLIST,
+        // not an allowlist of {Active, Approved}: globals are created Approved and lineage constraints
+        // Active, so an allowlist that missed either would silently zero out the whole feature, and a
+        // status added to the enum later would be dropped by default rather than let through. Guidance
+        // is advisory, so failing open is the right default. InvalidatedByArtifactId mirrors the two
+        // closest existing precedents (ProjectionSnapshotService's staleness check and
+        // GET /studio/constraints/proposed).
+        //
+        // Not covered here: the *derived* "superseded by a newer artifact" relation. That is
+        // branch-relative and only computable by the EngineeringState fold's reverse index
+        // (ArtifactStatus.Superseded is never stored back onto the superseded record), so a constraint
+        // retired purely via another artifact's Supersedes list still injects. Closing that means
+        // reusing the EngineeringState machinery here — a larger change, tracked in the plan.
+        static bool IsInjectableConstraint(ArtifactRef c) =>
+            c.Status is not (ArtifactStatus.Invalidated or ArtifactStatus.Rejected or ArtifactStatus.Superseded)
+            && c.InvalidatedByArtifactId is null;
+
         // Knowledge artifacts (10g) are inherited down the WorkUnit DAG: walk ParentWorkUnitId
         // root-first and fold in every ancestor's own chain ahead of this work unit's, de-duping
         // by ArtifactId (IDs are globally unique, so the only possible duplicates are across levels).
@@ -362,8 +379,18 @@ public sealed class ProjectionManager : IProjectionManager
         var globalConstraints = (await _artifactLineage.GetGlobalConstraintsAsync(ct).ConfigureAwait(false))
             .Where(c => c.RepositoryId is null || c.RepositoryId == currentRepositoryId)
             .ToList();
+        // Item 3 S2 (plans/vision-punchlist-remediation.md) — drop retired constraints before they
+        // reach an agent's prompt. Applied to BOTH arms, but the arm that actually bites is the
+        // ancestor chain: a global is created Approved and no code path moves it off that, whereas a
+        // lineage constraint is created Active and CAN be retired (an agent calling
+        // nm_v1_artifact_invalidate, or the InvalidateAsync cascade stamping InvalidatedByArtifactId
+        // on a descendant). Until now an invalidated constraint kept being injected verbatim.
+        // This also reconciles two surfaces that disagreed: WorkspaceContractService already writes
+        // .workspace/constraints.json from EngineeringState facts filtered by IsCurrent, so a
+        // harness reading that file saw the retirement while the native prompt-injection path did not.
         var inheritedConstraints = globalConstraints
             .Concat(ancestorChain.Where(a => a.Type == ArtifactType.Constraint))
+            .Where(IsInjectableConstraint)
             .ToList();
 
         // Phase 3 — subtract this peer's locally-disabled constraints (the Insights "turn off" toggle).

@@ -20,7 +20,7 @@ public class FanOutChildTargetBranchTests
     [Fact]
     public async Task ProposeAsync_for_fan_out_child_redirects_target_branch_and_leaves_main_untouched()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands    = app.Services.GetRequiredService<IMergeCommandService>();
         var fileWorkspace    = app.Services.GetRequiredService<IFileWorkspaceService>();
@@ -50,7 +50,7 @@ public class FanOutChildTargetBranchTests
     [Fact]
     public async Task ProposeAsync_for_top_level_goal_respects_the_explicit_target_branch()
     {
-        var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
+        await using var app = StudioWebApplication.Build([], configureServices: services => services.AddInMemoryStorage());
         var workUnitCommands = app.Services.GetRequiredService<IWorkUnitCommandService>();
         var mergeCommands    = app.Services.GetRequiredService<IMergeCommandService>();
         var fileWorkspace    = app.Services.GetRequiredService<IFileWorkspaceService>();

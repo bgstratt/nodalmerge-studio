@@ -20,7 +20,7 @@ public class ReplanServiceIntegrationTests
     [Fact]
     public async Task ReplanFailedSliceAsync_creates_new_sibling_slices_and_cancels_the_original()
     {
-        var app = StudioWebApplication.Build(
+        await using var app = StudioWebApplication.Build(
             [],
             llmHttpClient: new HttpClient(new ReplanFailedSliceLlmHandler()),
             configureServices: services => services.AddInMemoryStorage());
