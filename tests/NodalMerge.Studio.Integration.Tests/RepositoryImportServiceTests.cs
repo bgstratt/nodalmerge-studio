@@ -22,7 +22,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// than the raw (now-null) TreeEntries field.
 /// </summary>
 [Trait("Category", "Integration")]
-public class RepositoryImportServiceTests : IDisposable
+public class RepositoryImportServiceTests : IAsyncLifetime
 {
     private readonly string _repoPath = Path.Combine(Path.GetTempPath(), $"studio-import-{Guid.NewGuid():N}");
 
@@ -31,10 +31,12 @@ public class RepositoryImportServiceTests : IDisposable
         Directory.CreateDirectory(_repoPath);
     }
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_repoPath)) Directory.Delete(_repoPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_repoPath);
 
     // IBlobStoreProvider has no in-memory registration of its own anywhere in this codebase
     // (production wiring only ever supplies it via the Rust host FFI bridge) — InMemoryBlobStoreProvider

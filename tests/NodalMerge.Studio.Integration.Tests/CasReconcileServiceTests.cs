@@ -15,7 +15,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// rather than a hand-rolled live set.
 /// </summary>
 [Trait("Category", "Integration")]
-public class CasReconcileServiceTests : IDisposable
+public class CasReconcileServiceTests : IAsyncLifetime
 {
     private readonly string _repoPath = Path.Combine(Path.GetTempPath(), $"studio-cas-reconcile-{Guid.NewGuid():N}");
     private readonly InMemoryBlobStoreProvider _blobStore = new();
@@ -25,10 +25,12 @@ public class CasReconcileServiceTests : IDisposable
         Directory.CreateDirectory(_repoPath);
     }
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_repoPath)) Directory.Delete(_repoPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_repoPath);
 
     private async Task<(ICasReconcileService Reconcile, IWorkspaceCacheManager Cache, IRepositorySnapshotService Snapshots, string RepositoryId)>
         BuildAndBootstrapAsync(FakeRemoteBlobPushTarget? remote)

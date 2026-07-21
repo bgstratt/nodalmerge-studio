@@ -30,6 +30,10 @@ internal static class TestTeardown
     /// Force-closes all pooled SQLite connections in the process, then deletes each root with a
     /// bounded retry. Safe to pass roots that do not exist. Throws if a root is still undeletable
     /// after the full retry budget — that is a real leaked handle, surfaced deliberately.
+    ///
+    /// Only for classes that actually open a file SQLite db (the "Sqlite" collection). ClearAllPools
+    /// is process-wide — calling it from a non-SQLite class would force-close connections belonging
+    /// to SQLite tests running in parallel. Non-SQLite classes use <see cref="DeleteDirectoriesAsync"/>.
     /// </summary>
     internal static async Task ClearSqlitePoolsAndDeleteAsync(params string[] roots)
     {
@@ -37,6 +41,17 @@ internal static class TestTeardown
         // before the delete or the very handle we need released is still in the pool.
         SqliteConnection.ClearAllPools();
 
+        await DeleteDirectoriesAsync(roots).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Deletes each root with the same bounded retry, but WITHOUT touching the process-wide SQLite
+    /// pool. For test classes that own a temp directory but do not open a file SQLite db, so they must
+    /// not disturb the connections of SQLite tests running concurrently. Safe to pass roots that do
+    /// not exist; throws if a root is still undeletable after the retry budget (a real leaked handle).
+    /// </summary>
+    internal static async Task DeleteDirectoriesAsync(params string[] roots)
+    {
         foreach (var root in roots)
             await DeleteWithRetryAsync(root).ConfigureAwait(false);
     }

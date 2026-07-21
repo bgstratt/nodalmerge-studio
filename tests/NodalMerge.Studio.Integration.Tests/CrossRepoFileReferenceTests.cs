@@ -22,7 +22,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// ListFilesAsync, not eagerly snapshotted at creation time.
 /// </summary>
 [Trait("Category", "Integration")]
-public class CrossRepoFileReferenceTests : IDisposable
+public class CrossRepoFileReferenceTests : IAsyncLifetime
 {
     private readonly string _otherRepoPath = Path.Combine(Path.GetTempPath(), $"studio-xref-other-{Guid.NewGuid():N}");
 
@@ -33,10 +33,12 @@ public class CrossRepoFileReferenceTests : IDisposable
         File.WriteAllText(Path.Combine(_otherRepoPath, "src", "Example.cs"), "// example style content");
     }
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_otherRepoPath)) Directory.Delete(_otherRepoPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_otherRepoPath);
 
     private static WebApplication BuildTestApp() =>
         StudioWebApplication.Build(

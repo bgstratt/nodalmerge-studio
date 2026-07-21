@@ -20,17 +20,19 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// reclamation at all (see the dedicated op-protection test below for that rule's own coverage).
 /// </summary>
 [Trait("Category", "Integration")]
-public class BlobGcServiceTests : IDisposable
+public class BlobGcServiceTests : IAsyncLifetime
 {
     private readonly string _tempRoot = Path.Combine(Path.GetTempPath(), $"studio-blobgc-{Guid.NewGuid():N}");
     private string CasRoot => Path.Combine(_tempRoot, "cas");
 
     private static readonly string RepositoryId = Path.GetFullPath(@"C:\fake\gc-repo");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_tempRoot)) Directory.Delete(_tempRoot, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_tempRoot);
 
     private Microsoft.AspNetCore.Builder.WebApplication BuildApp(
         BlobGcOptions? gcOptions = null, int retainIntermediateDays = 0)

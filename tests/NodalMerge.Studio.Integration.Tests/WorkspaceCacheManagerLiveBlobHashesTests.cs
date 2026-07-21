@@ -15,7 +15,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// — an incomplete live set is unsafe to hand to a GC sweep.
 /// </summary>
 [Trait("Category", "Integration")]
-public class WorkspaceCacheManagerLiveBlobHashesTests : IDisposable
+public class WorkspaceCacheManagerLiveBlobHashesTests : IAsyncLifetime
 {
     private readonly string _repoPath = Path.Combine(Path.GetTempPath(), $"studio-live-hashes-{Guid.NewGuid():N}");
     private readonly InMemoryBlobStoreProvider _blobStore = new();
@@ -25,10 +25,12 @@ public class WorkspaceCacheManagerLiveBlobHashesTests : IDisposable
         Directory.CreateDirectory(_repoPath);
     }
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_repoPath)) Directory.Delete(_repoPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_repoPath);
 
     private async Task<(IWorkspaceCacheManager Cache, IRepositorySnapshotService Snapshots, ISnapshotTreeResolver TreeResolver, string RepositoryId)>
         BuildAndBootstrapAsync()

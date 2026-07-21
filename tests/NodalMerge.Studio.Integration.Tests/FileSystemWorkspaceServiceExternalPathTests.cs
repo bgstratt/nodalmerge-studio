@@ -11,18 +11,17 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// RepositorySyncServiceTests for the higher-level sync behavior built on top of these).
 /// </summary>
 [Trait("Category", "Integration")]
-public class FileSystemWorkspaceServiceExternalPathTests : IDisposable
+public class FileSystemWorkspaceServiceExternalPathTests : IAsyncLifetime
 {
     private readonly string _rootPath = Path.Combine(Path.GetTempPath(), $"studio-extpath-{Guid.NewGuid():N}");
     private readonly string _externalPath = Path.Combine(Path.GetTempPath(), $"studio-extpath-repo-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_rootPath))
-            Directory.Delete(_rootPath, recursive: true);
-        if (Directory.Exists(_externalPath))
-            Directory.Delete(_externalPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_rootPath, _externalPath);
 
     private IFileWorkspaceService Build()
     {

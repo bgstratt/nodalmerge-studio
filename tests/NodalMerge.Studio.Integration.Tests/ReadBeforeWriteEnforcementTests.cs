@@ -14,15 +14,16 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// code path a real agent uses, not a hand-constructed fake.
 /// </summary>
 [Trait("Category", "Integration")]
-public class ReadBeforeWriteEnforcementTests : IDisposable
+public class ReadBeforeWriteEnforcementTests : IAsyncLifetime
 {
     private readonly string _rootPath = Path.Combine(Path.GetTempPath(), $"studio-read-before-write-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_rootPath))
-            Directory.Delete(_rootPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_rootPath);
 
     [Fact]
     public async Task Write_to_existing_unread_file_is_blocked_then_succeeds_after_read()

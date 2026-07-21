@@ -10,15 +10,16 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// rather than failing the whole call.
 /// </summary>
 [Trait("Category", "Integration")]
-public class FileSystemWorkspaceServiceReadManyTests : IDisposable
+public class FileSystemWorkspaceServiceReadManyTests : IAsyncLifetime
 {
     private readonly string _rootPath = Path.Combine(Path.GetTempPath(), $"studio-readmany-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_rootPath))
-            Directory.Delete(_rootPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_rootPath);
 
     private IFileWorkspaceService Build()
     {

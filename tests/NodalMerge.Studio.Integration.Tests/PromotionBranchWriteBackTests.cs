@@ -15,14 +15,16 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// promotion is on (and not bypassed), sourced from the candidate branch's own composed content.
 /// </summary>
 [Trait("Category", "Integration")]
-public class PromotionBranchWriteBackTests : IDisposable
+public class PromotionBranchWriteBackTests : IAsyncLifetime
 {
     private readonly string _repoPath = Path.Combine(Path.GetTempPath(), $"studio-promotion-writeback-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_repoPath)) Directory.Delete(_repoPath, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 batch 2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via
+    // the shared helper. No ClearAllPools -- this class does not open a file SQLite db, so it must
+    // not disturb the SQLite tests running in parallel.
+    public Task DisposeAsync() => TestTeardown.DeleteDirectoriesAsync(_repoPath);
 
     [Fact]
     public async Task ApplyAsync_with_promotion_branch_on_lands_on_candidate_and_does_not_write_disk()
