@@ -246,11 +246,16 @@ fixed as a separate commit.
 After the fix: ScopedTreeFetch 20/20 clean, and 4 consecutive full-suite runs 760/760 with zero
 teardown failures and zero unobserved exceptions.
 
-### Still pending in B2 (batch 2)
+### B2 batch 2 — DONE (2026-07-20): the remaining 48 `IDisposable` classes
 
-The remaining ~48 `IDisposable` test classes (non-Sqlite-collection). Same mechanical migration.
-Lower urgency than batch 1 — those classes are not in the contended `"Sqlite"` collection — but the
-same un-retried-delete risk applies to any that leak a host.
+Migrated all 48 non-Sqlite-collection classes `IDisposable` → `IAsyncLifetime`, routing through a new
+`TestTeardown.DeleteDirectoriesAsync` — the same bounded-retry delete **without** `ClearAllPools`
+(these classes open no file SQLite db, so they must not force-close pooled connections belonging to
+SQLite tests running in parallel). Done mechanically with a guard that skipped any Dispose holding
+unexpected statements; none did.
+
+**B2 is now complete: all 61 `IDisposable` test classes migrated.** Verified: clean build,
+760/760 across 3 consecutive full runs, zero teardown `IOException`.
 
 ### Flake ledger (observed, for batch 2 / C-track triage)
 
@@ -275,6 +280,37 @@ callers `await using` it. Combined with B2, teardown then stops the host before 
 **Sequencing:** after B2, so the teardown path exists to hand ownership to.
 
 **Verification:** no helper in `tests/` builds a host it does not return ownership of. Suite green.
+
+### B3/B4 assessment (2026-07-20) — reduced ROI after B2, and entangled
+
+Two findings from starting this:
+
+1. **ROI dropped after B2.** The active harm these caused was the teardown `Directory.Delete` race,
+   which B2's retry now absorbs. What remains is a leaked host lingering until GC — real (its
+   `IHostedService` loops keep running, adding cross-test load) but no longer producing an observed
+   failure. This is hygiene, not a live bug.
+
+2. **B3 and B4 are entangled and NOT mechanically separable.** Both the caller-leak sites (B4) and the
+   structural-leak helpers (B3) are the same token: `var app = StudioWebApplication.Build(`. A blunt
+   "prepend `await using`" pass is *wrong* for the B3 helpers — they do
+   `var app = Build(...); return (app.Services...);`, and `await using` there disposes the host on
+   return, handing back services from a disposed provider. It compiles clean (so the build won't
+   catch it) and only fails at runtime. Confirmed by trying it: it wrongly wrapped 6 helper files
+   (ArtifactInvalidation, FileScopeAmendment, ProjectionMaterialization, ProjectionSnapshot,
+   RepositoryRegistry, WorkUnitDag) whose helpers return the provider. Reverted.
+
+**Revised approach when we do this:**
+- **B3 first, not B4.** The ~6 tuple-returning helpers need a disposable context type
+  (`sealed class TestHost(WebApplication app) : IAsyncDisposable` exposing the services), and each of
+  their call sites becomes `await using var ctx = BuildServices(); var (a,b,c) = ctx;`. Only once a
+  helper hands back ownership can its `var app = Build` be safely scoped.
+- **B4 after**, and per-site: wrap only the `var app = Build(...)` that live in a `[Fact]` body and
+  are not returned. Cannot be a blind regex.
+
+**Recommendation:** defer B3/B4 as lower-priority hygiene now that B2 removed the active flake, and
+spend the next effort on the remaining **code defects** (A2 `ApplyBranchAsync` retry, A3
+`TerminalStatuses`) and the cheap test-correctness wins (C1, C3), which address real issues rather
+than leaked in-memory hosts. Revisit B3/B4 as a deliberate, non-mechanical pass.
 
 ## B4. Close the caller-side host leaks (~71 sites)
 
