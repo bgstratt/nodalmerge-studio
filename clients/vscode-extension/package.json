@@ -3,7 +3,7 @@
   "displayName": "NodalMerge Studio",
   "description": "Agent-native collaborative workspace — branch visualization, merge review, and agent orchestration for NodalMerge.",
   "publisher": "nodalmerge-studio",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "license": "MIT",
   "icon": "media/icon.png",
   "repository": {
