@@ -17,19 +17,19 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("Sqlite")]
-public class RepositorySyncServiceTests : IDisposable
+public class RepositorySyncServiceTests : IAsyncLifetime
 {
     private readonly string _rootPath = Path.Combine(Path.GetTempPath(), $"studio-reposync-{Guid.NewGuid():N}");
     private readonly List<string> _externalDirs = [];
 
-    public void Dispose()
-    {
-        if (Directory.Exists(_rootPath))
-            Directory.Delete(_rootPath, recursive: true);
-        foreach (var dir in _externalDirs)
-            if (Directory.Exists(dir))
-                Directory.Delete(dir, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via the shared
+    // helper — which also adds the ClearAllPools this class was missing (it is in the "Sqlite"
+    // collection but its old Dispose never cleared the pool). Deletes the root plus every external
+    // repo dir this test created.
+    public Task DisposeAsync() =>
+        TestTeardown.ClearSqlitePoolsAndDeleteAsync([_rootPath, .. _externalDirs]);
 
     private string NewExternalRepo()
     {

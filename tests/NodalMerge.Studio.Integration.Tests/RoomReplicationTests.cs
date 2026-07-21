@@ -57,19 +57,16 @@ namespace NodalMerge.Studio.Integration.Tests;
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("Sqlite")]
-public class RoomReplicationTests : IDisposable
+public class RoomReplicationTests : IAsyncLifetime
 {
     private readonly string _tempRoot =
         Path.Combine(Path.GetTempPath(), $"studio-room-replication-{Guid.NewGuid():N}");
 
-    public void Dispose()
-    {
-        // See NodalMergeStudioNodeStoreEngineTests' Dispose for why ClearAllPools is required on
-        // Windows before deleting the temp directory.
-        SqliteConnection.ClearAllPools();
-        if (Directory.Exists(_tempRoot))
-            Directory.Delete(_tempRoot, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry, via the shared
+    // helper. See TestTeardown for why ClearAllPools + a retrying delete are required on Windows.
+    public Task DisposeAsync() => TestTeardown.ClearSqlitePoolsAndDeleteAsync(_tempRoot);
 
     private WebApplication BuildApp(
         string name,

@@ -29,7 +29,7 @@ namespace NodalMerge.Studio.Integration.Tests;
 // "studio" room proves it for the repo rooms too.
 [Trait("Category", "Integration")]
 [Collection("Sqlite")]
-public class RoomSnapshotCheckpointTests : IDisposable
+public class RoomSnapshotCheckpointTests : IAsyncLifetime
 {
     private readonly string _tempRoot =
         Path.Combine(Path.GetTempPath(), $"studio-snapshot-checkpoint-{Guid.NewGuid():N}");
@@ -40,12 +40,12 @@ public class RoomSnapshotCheckpointTests : IDisposable
         _dbPath = Path.Combine(_tempRoot, "nodes.db");
     }
 
-    public void Dispose()
-    {
-        SqliteConnection.ClearAllPools();
-        if (Directory.Exists(_tempRoot))
-            Directory.Delete(_tempRoot, recursive: true);
-    }
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    // B2 (plans/test-suite-remediation-plan.md): async teardown with a bounded retry. The old
+    // synchronous Dispose ran an un-retried Directory.Delete that raced background writes to
+    // nodes.db and flaked; ClearAllPools + retrying delete now live in the shared helper.
+    public Task DisposeAsync() => TestTeardown.ClearSqlitePoolsAndDeleteAsync(_tempRoot);
 
     private WebApplication BuildApp() =>
         StudioWebApplication.Build(

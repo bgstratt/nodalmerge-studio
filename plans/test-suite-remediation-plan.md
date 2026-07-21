@@ -208,6 +208,44 @@ it and would undo B1's value.
 
 **Verification:** run the suite 5× consecutively; zero teardown `IOException`.
 
+### B2 batch 1 — DONE (2026-07-20): the 13 "Sqlite"-collection classes
+
+Shipped:
+- `TestTeardown.ClearSqlitePoolsAndDeleteAsync(params roots)` — `ClearAllPools()` then a **bounded
+  retry** delete (8 attempts, ~1.3s total). A transient handle-release race clears in the first
+  attempt or two; a real leaked handle exhausts the budget and **throws with the path named**, so a
+  leak surfaces loudly instead of being swallowed. Also folds in the read-only-attribute clear that
+  two tests previously hand-rolled for git's `.git/objects`.
+- Unit-tested the helper directly (`TestTeardownTests`), including verify-by-construction of both the
+  transient-race-succeeds and permanent-leak-throws cases.
+- Migrated all 13 classes from `IDisposable`/`Dispose` to `IAsyncLifetime`/`DisposeAsync`.
+  `RepositorySyncServiceTests` gains the `ClearAllPools()` it was previously missing.
+
+**Verification results:** zero teardown `IOException` across ~11 full-suite runs. Migrated classes
+pass. Full suite 759/759 on clean runs.
+
+**B2 exonerated of the residual flakes** (all pre-existing, none teardown-related):
+- Ruled out by A/B test: same 67-test filter → pre-B2 baseline 3/3 pass, B2 5/5 pass. The one
+  `RoomReplication` reconnect failure occurred only in a 72-test run where `TestTeardownTests` (one of
+  which deliberately holds a locked handle ~1.3s) added parallel load and tipped a known-fragile
+  WebSocket-reconnect timing test — a C1/C2 target, not a teardown fault.
+- `ScopedTreeFetchTests.PrefetchScopeAsync_warms_exactly_the_scoped_file_blobs` flaked pre-B2 (during
+  B1) and again after — it is **100% in-memory** (no SQLite/host/filesystem), so it cannot be a
+  teardown issue. Root cause found: see the new finding below.
+
+### New finding (B-track): `RecordingBlobStoreProvider.GetHashes` is a data race
+
+`RecordingBlobStoreProvider.GetHashes` is a plain `List<string>` (`RecordingBlobStoreProvider.cs:22`)
+appended at `:26` from `WorkUnitPrefetchService`'s concurrent `Task.Run` fetches. `List<T>.Add` is not
+thread-safe; a lost update drops an entry, so `PrefetchScopeAsync_warms_exactly_the_scoped_file_blobs`
+intermittently sees 4 recorded fetches instead of 5. This is the most frequent flake observed across
+all runs, is fully independent of B2, and is a clean two-line thread-safety fix. Filed as **B2a**,
+fixed as a separate commit.
+
+### Still pending in B2 (batch 2)
+
+The remaining ~48 `IDisposable` test classes (non-Sqlite-collection). Same mechanical migration.
+
 ## B3. Close the structural host leaks (~131 sites)
 
 **Severity:** high. **The important half of the leak problem** — these cannot be fixed by caller
