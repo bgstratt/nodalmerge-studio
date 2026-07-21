@@ -139,6 +139,28 @@ Whatever we conclude must agree with it, since it is the pinned contract.
 
 **Verification:** full suite green; the terminal-invariant test still passes unchanged.
 
+### A3 — DONE (2026-07-20): found a real GC bug, not cosmetic divergence
+
+Analyzed under the principle *a human should be able to revive almost anything; an agent should not*.
+The sets SHOULD differ — they answer different questions:
+- **SnapshotRetentionPolicy** (GC/retention seed-liveness): must match the frozen `terminal_status_names`
+  = `{Completed, Merged}` that the Rust GC coordinator also uses.
+- **WorkUnitCommandService** `{Completed, Merged, Cancelled}`: "worth issuing a Cancel?"
+- **GoalGuardrailService** `{Completed, Merged, Cancelled, Failed}`: "still burning budget to monitor?"
+- **WorkspaceCacheManager** `{Completed, Merged, Cancelled}`: "is this working DIRECTORY safe to evict?"
+
+**The bug:** `SnapshotRetentionPolicy` listed `Failed` as terminal. `BlobGcService` and
+`WorkspaceCacheManager` **delete/evict** against its classification, so a `Failed` unit's seed/merge-base
+blobs got aged out and deleted — but `Failed -> Cancelled -> Queued/Executing` is a real human revival
+path, so a revived `Failed` unit would find its seed gone. finding #30 already fixed the Rust GC + the
+frozen vector ("a failed work unit IS resumable"); the C# side was the straggler, its doc comment still
+falsely claiming `Failed` "has zero outgoing edges".
+
+Fix: `SnapshotRetentionPolicy.TerminalStatuses` → `{Completed, Merged}`; corrected the stale comment;
+regression test (a `Failed` unit's >30d seed classifies Active/retained). Errs toward retaining —
+deleting a revivable seed is the higher risk. Added cross-referencing comments to the other two sets so
+the load-bearing divergence isn't "unified" away. Neuter-proven. Integration 762/762.
+
 ## A4. Narrow the blind swallow (replaces the earlier FSM proposal)
 
 **Severity:** medium. **Risk:** low — additive logging, no behaviour change.
