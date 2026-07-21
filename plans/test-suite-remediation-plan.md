@@ -71,6 +71,25 @@ to avoid.
 
 **Verification:** the detector reports zero occurrences across 3 consecutive full runs.
 
+### A1 — INVESTIGATED (2026-07-20): not currently reproducing
+
+With the detector fixed (B1) and the A4 breadcrumb in place, I ran the full suite ~20 times looking
+for the `Open -> Completed` transition. **It did not recur once** — zero unobserved exceptions across
+all runs, and no detector report ever written.
+
+Static search backs this up: no production code sets a task to `Completed` directly. The only
+completion path is the agent `task.update` MCP tool, so the original occurrence was almost certainly a
+scripted test agent completing a task that was still `Open` (never assigned to `InProgress`), thrown
+inside fire-and-forget worker work and leaked — which is how the detector caught it originally. The
+substantial timing changes since (B2 async teardown, A2) appear to have stopped it manifesting.
+
+**Conclusion:** there is no active bug to fix, and manufacturing a speculative fix would violate the
+"don't change working code" rule. Two independent safety nets are now in place if it returns: the
+now-reliable detector captures it with a full stack (B1), and the A4 breadcrumb logs the exact
+`Open -> Completed` refusal at its source. If it recurs, the stack names the caller and we fix *that*.
+
+**Explicitly NOT done:** adding the `Open -> Completed` edge, or any speculative caller change.
+
 ## A2. `ApplyBranchAsync` has no retry
 
 **Severity:** low. **Risk:** low — mirrors an existing, proven pattern.
