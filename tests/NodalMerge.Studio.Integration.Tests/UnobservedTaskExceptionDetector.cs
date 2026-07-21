@@ -225,16 +225,28 @@ public class UnobservedTaskExceptionDetectorTests
 
         LeakAFaultedTask();
 
-        // Give the task a moment to actually fault before forcing collection.
-        Thread.Sleep(200);
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
+        // The UnobservedTaskException event only fires when the faulted task is *finalized*, and
+        // finalizer timing is nondeterministic — markedly more so on Linux CI than on Windows. A
+        // single fixed sleep + one GC pass loses that race and the queue comes back empty. Poll a
+        // GC/finalize cycle until the capture lands (or a generous budget elapses) instead.
+        static bool IsMarker(UnobservedTaskExceptionDetector.Capture c) =>
+            c.Exception.Flatten().InnerExceptions
+                .Any(e => e.Message.Contains(UnobservedTaskExceptionDetector.SelfTestMarker, StringComparison.Ordinal));
 
-        var caught = UnobservedTaskExceptionDetector.DrainSelfTestCaptures();
-        Assert.Contains(caught, c => c.Exception.Flatten().InnerExceptions
-            .Any(e => e.Message.Contains(UnobservedTaskExceptionDetector.SelfTestMarker, StringComparison.Ordinal)));
+        UnobservedTaskExceptionDetector.Capture? found = null;
+        for (var attempt = 0; attempt < 30 && found is null; attempt++)
+        {
+            Thread.Sleep(100);
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+
+            // DrainSelfTestCaptures dequeues, so capture the match before the queue is emptied.
+            found = UnobservedTaskExceptionDetector.DrainSelfTestCaptures().FirstOrDefault(IsMarker);
+        }
+
+        Assert.NotNull(found);
     }
 
     /// <summary>

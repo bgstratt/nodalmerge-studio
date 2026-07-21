@@ -80,6 +80,18 @@ public class TestTeardownTests
 
         using var handle = new FileStream(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
 
+        if (!OperatingSystem.IsWindows())
+        {
+            // Unix file locks are advisory: an open handle does NOT block unlink, so the delete
+            // succeeds and there is no leaked-handle failure to surface. The "throws when wedged"
+            // contract is only observable where the OS enforces mandatory locks (Windows), so on
+            // other platforms we assert the correct platform behaviour instead — deletion succeeds.
+            await TestTeardown.ClearSqlitePoolsAndDeleteAsync(root);
+            Assert.False(Directory.Exists(root));
+            handle.Dispose();
+            return;
+        }
+
         var ex = await Assert.ThrowsAsync<IOException>(
             () => TestTeardown.ClearSqlitePoolsAndDeleteAsync(root));
 
