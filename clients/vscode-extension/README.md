@@ -128,7 +128,7 @@ Agents don't have to run inside VS Code. A **headless peer** runs the full Studi
 
 Useful for CI/CD pipelines, always-on background workers, and external triggers (webhooks, alerts, scheduled tasks).
 
-See the [headless peer guide](../../docs/guides/headless-peer.md) for configuration and usage patterns.
+See the [headless peer guide](https://docs.nodalmerge.com/studio/guides/headless-peer) for configuration and usage patterns.
 
 ---
 
@@ -150,18 +150,18 @@ High-level tools designed for external MCP clients — Claude Code, Cursor, scri
 **`nm_v1_*` — Full internal surface (117 tools)**  
 The complete tool catalog used by autonomous agents in-process. Available to external clients that need low-level workspace access (file I/O, branch ops, artifact records, execution). Frozen by the MCP v1 contract.
 
-- [MCP v1 contract](../../docs/contracts/mcp-v1-contract.md) — frozen tool names, schemas, and error envelope
-- [API reference](../../docs/reference/api-reference.md) — complete tool catalog including external surface, dispatch status, and REST parity
+- [MCP v1 contract](https://github.com/bgstratt/nodalmerge-studio/blob/master/docs/contracts/mcp-v1-contract.md) — frozen tool names, schemas, and error envelope
+- [API reference](https://docs.nodalmerge.com/studio/reference/api-reference) — complete tool catalog including external surface, dispatch status, and REST parity
 
 ---
 
 ## Documentation
 
-- [UI reference](../../docs/reference/ui-reference.md) — every control in every panel
-- [API reference](../../docs/reference/api-reference.md) — MCP tools and REST endpoints
-- [Headless peer guide](../../docs/guides/headless-peer.md)
-- [Repository virtualization](../../docs/guides/repository-virtualization.md)
-- [Extending goals](../../docs/guides/extending-goals.md)
+- [UI reference](https://docs.nodalmerge.com/studio/reference/ui-reference) — every control in every panel
+- [API reference](https://docs.nodalmerge.com/studio/reference/api-reference) — MCP tools and REST endpoints
+- [Headless peer guide](https://docs.nodalmerge.com/studio/guides/headless-peer)
+- [Repository virtualization](https://docs.nodalmerge.com/studio/guides/repository-virtualization)
+- [Extending goals](https://docs.nodalmerge.com/studio/guides/extending-goals)
 - [Source repository](https://github.com/bgstratt/nodalmerge-studio)
 
 ---
