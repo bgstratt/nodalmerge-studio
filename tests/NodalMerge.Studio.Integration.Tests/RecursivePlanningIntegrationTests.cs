@@ -194,6 +194,59 @@ public class RecursivePlanningIntegrationTests
     }
 
     [Fact]
+    public async Task Compound_child_inherits_root_review_wiring()
+    {
+        var fakeHandler = new RecursivePlanningLlmHandler();
+
+        await using var app = StudioWebApplication.Build(
+            [],
+            llmHttpClient: new HttpClient(fakeHandler),
+            configureServices: ConfigureRecursive);
+
+        var orchestratorSvc = app.Services.GetRequiredService<IOrchestratorService>();
+        var agentControl    = app.Services.GetRequiredService<IAgentControlService>();
+        var agentRuntime    = app.Services.GetRequiredService<InMemoryAgentRuntimeService>();
+        var workUnits       = app.Services.GetRequiredService<IWorkUnitService>();
+        var decisionLog     = app.Services.GetRequiredService<IOrchestrationDecisionLogService>();
+
+        await agentRuntime.StartAsync(CancellationToken.None);
+        try
+        {
+            var root = await orchestratorSvc.CreateWorkUnitAsync(
+                goal: RecursivePlanningLlmHandler.RootGoal, owner: "integration-test");
+
+            // Spawn WITH a reviewer profile — the review wiring a real goal carries.
+            await agentControl.SpawnAsync(
+                agentType: "orchestrator", workUnitId: root.WorkUnitId,
+                model: "fake-model", baseUrl: "http://fake-llm", apiKey: "fake-key",
+                autoReviewProfileId: "reviewer");
+
+            // Wait for the compound child c1 to be spawned as a sub-planner.
+            WorkUnit? c1 = null;
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                c1 = (await workUnits.GetChildrenAsync(root.WorkUnitId)).FirstOrDefault(k => k.FanOutInfo?.SliceId == "c1");
+                if (c1 is not null &&
+                    (await decisionLog.GetEventsAsync(c1.WorkUnitId)).Any(e => e.Action == OrchestrationAction.SpawnPlanner))
+                    break;
+                await Task.Delay(100);
+            }
+            Assert.NotNull(c1);
+
+            // The fix: GetAutoReviewProfileId is a per-workUnitId lookup with no walk to root, so the
+            // compound child's own registration must carry the root's reviewer profile — otherwise its
+            // subtree's automated review resolves null and silently falls back to human review.
+            Assert.Equal("reviewer", agentControl.GetAutoReviewProfileId(c1!.WorkUnitId));
+            Assert.Equal("reviewer", agentControl.GetAutoReviewProfileId(root.WorkUnitId));
+        }
+        finally
+        {
+            await agentRuntime.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task Nonconformant_consumer_is_rejected_by_review()
     {
         var reconciled = await RunPeerContractAsync(nonConformantConsumer: true);

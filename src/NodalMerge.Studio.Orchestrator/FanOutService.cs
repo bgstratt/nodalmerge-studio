@@ -126,6 +126,13 @@ public sealed class FanOutService : IFanOutService
             var credRootId = await ResolveCredentialRootAsync(parentWorkUnitId, ct).ConfigureAwait(false);
             var creds = _agentControl.GetCredentialsForStage(credRootId, PipelineStage.Execute)
                 ?? _agentControl.GetGoalDefaultCredentials(credRootId);
+            // plans/recursive-planning-spike.md — review wiring the root goal carries. GetAutoReviewProfileId
+            // is a direct per-workUnitId lookup with NO walk to root, so a Compound child spawned as an
+            // orchestrator must be given the root's autoReviewProfileId / enabledDomainAgents explicitly —
+            // otherwise its own registration shadows the resolution with null and its subtree's automated
+            // review silently falls back. Resolved from credRootId (the goal root, which has the registration).
+            var rootAutoReviewProfileId = _agentControl.GetAutoReviewProfileId(credRootId);
+            var rootEnabledDomainAgents = _agentControl.GetEnabledDomainAgents(credRootId);
 
             // plans/recursive-planning-spike.md S2/S3 — the route decision reads the child's stored
             // slice Kind (WorkUnitFanOutInfo.Kind) and compares each child's depth (parentDepth + 1)
@@ -173,6 +180,8 @@ public sealed class FanOutService : IFanOutService
                         apiKey: creds?.ApiKey,
                         provider: creds?.Provider,
                         profileId: creds?.ProfileId,
+                        autoReviewProfileId: rootAutoReviewProfileId,
+                        enabledDomainAgents: rootEnabledDomainAgents,
                         credentialRef: creds?.CredentialRef,
                         cancellationToken: ct).ConfigureAwait(false);
 
