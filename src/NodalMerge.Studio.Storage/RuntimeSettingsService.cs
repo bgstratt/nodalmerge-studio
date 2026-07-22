@@ -11,7 +11,13 @@ public sealed record RuntimeSettingsSnapshot(
     int SchedulerPollIntervalMs = 2_000,
     bool UsePromotionBranch = false,
     string CandidateBranchId = "candidate",
-    bool DocFetchTools = false);
+    bool DocFetchTools = false,
+    // Recursive planning depth ceiling (plans/recursive-planning-spike.md). Trailing + defaulted to 1
+    // so a snapshot persisted before this field deserializes to today's flat behavior.
+    int MaxPlanDepth = 1,
+    // Automated retry/failure cap before dead-letter. Trailing + defaulted to 3 (the prior hardcoded
+    // value) so an older snapshot deserializes unchanged.
+    int MaxFailureAttempts = 3);
 
 // Persists WorkspaceOptions's runtime-mutable fields to the node store on every mutation and
 // reapplies them on startup, so toggling a setting via REST survives a host restart. A single
@@ -28,7 +34,9 @@ public sealed class RuntimeSettingsService(IStudioNodeStore nodeStore, Workspace
             options.SchedulerPollIntervalMs,
             options.UsePromotionBranch,
             options.CandidateBranchId,
-            options.DocFetchTools);
+            options.DocFetchTools,
+            options.MaxPlanDepth,
+            options.MaxFailureAttempts);
         await nodeStore.WriteNodeAsync(
             StudioNodeKind.RuntimeSettingsV1,
             EntityId,
@@ -52,5 +60,7 @@ public sealed class RuntimeSettingsService(IStudioNodeStore nodeStore, Workspace
         options.UsePromotionBranch = snapshot.UsePromotionBranch;
         options.CandidateBranchId = snapshot.CandidateBranchId;
         options.DocFetchTools = snapshot.DocFetchTools;
+        options.MaxPlanDepth = snapshot.MaxPlanDepth;
+        options.MaxFailureAttempts = snapshot.MaxFailureAttempts;
     }
 }

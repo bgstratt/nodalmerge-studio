@@ -85,7 +85,10 @@ internal sealed class NativeHarnessExecutor(
                 request.Profile, request.SessionId, request.OnActivity,
                 filesTouched: proposalForReview?.FilesTouched,
                 noFileChangesJustification: proposalForReview?.NoFileChangesJustification,
-                conversationLog: conversationLog, events: events, logger: logger);
+                conversationLog: conversationLog, events: events, logger: logger,
+                // S6 — the review branch previously dropped PromptGuidanceContext; carry it through
+                // so an injected peer contract reaches the reviewer.
+                promptGuidanceContext: request.PromptGuidanceContext);
             var reviewCompletion = await reviewerLoop.RunAsync(ct).ConfigureAwait(false);
             return new HarnessRunResult(reviewCompletion);
         }

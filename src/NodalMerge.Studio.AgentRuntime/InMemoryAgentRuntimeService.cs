@@ -365,7 +365,9 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var constraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var promptGuidanceContext = await BuildPromptGuidanceContextAsync(PipelineStage.Plan, ct).ConfigureAwait(false);
                     var engineeringStateContext = await BuildEngineeringStateContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
-                    var combinedContext = string.Join("\n\n", new[] { constraintsContext, promptGuidanceContext, engineeringStateContext }.Where(s => s is not null));
+                    // S4 — depth-budget guidance (null unless MaxPlanDepth > 1, so the default path is unchanged).
+                    var recursivePlanningContext = await BuildRecursivePlanningContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                    var combinedContext = string.Join("\n\n", new[] { constraintsContext, promptGuidanceContext, engineeringStateContext, recursivePlanningContext }.Where(s => s is not null));
 
                     var planExecutorResolver = _serviceProvider.GetRequiredService<IHarnessExecutorResolver>();
                     var planExecutor = planExecutorResolver.ResolveForProvider(provider, profile?.Executor);
@@ -414,10 +416,14 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     if (!reviewExecutor.Capabilities.SupportsReviewMode)
                         reviewExecutor = reviewExecutorResolver.Resolve("native");
 
+                    // S6 — inject the peer contract the reviewed slice declared so the reviewer can
+                    // reject a non-conformant peer (null when the slice declares none; the Review
+                    // branch previously always passed null here).
+                    var reviewContractContext = await BuildContractContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var reviewRequest = new HarnessRunRequest(
                         HarnessMode.Review, agentId, item.WorkUnitId, proposalId, profile, item.SessionId,
                         IsResume: item.AttemptCount > 0, ruleFileContext,
-                        PromptGuidanceContext: null,
+                        PromptGuidanceContext: reviewContractContext,
                         SelfVerifyBuild: false, SelfVerifyTest: false,
                         OnActivity: a => ReportActivity(agentId, a),
                         Provider: provider, Model: model, BaseUrl: baseUrl, ApiKey: apiKey,
@@ -446,7 +452,9 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                     var workerConstraintsContext = await BuildConstraintsContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
                     var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, ct).ConfigureAwait(false);
                     var workerEngineeringState = await BuildEngineeringStateContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
-                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerEngineeringState }.Where(s => s is not null));
+                    // S6 — the peer contracts this slice provides/consumes (null when it declares none).
+                    var workerContractContext = await BuildContractContextAsync(item.WorkUnitId, ct).ConfigureAwait(false);
+                    var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerEngineeringState, workerContractContext }.Where(s => s is not null));
                     // Snapshotted before the loop runs: if the task was already Completed coming
                     // in (e.g. re-queued after a rejection, before the underlying task got reset —
                     // see AutomatedReviewGateService), the agent can't legitimately transition it
@@ -1092,7 +1100,10 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
                 var workerConstraintsContext = await BuildConstraintsContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
                 var workerPromptGuidance = await BuildPromptGuidanceContextAsync(PipelineStage.Execute, cts.Token).ConfigureAwait(false);
                 var workerEngineeringState = await BuildEngineeringStateContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
-                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerEngineeringState }.Where(s => s is not null));
+                // S6 — peer contracts (mirrors the RunScheduledWorkerAsync Worker branch; both worker
+                // construction sites must inject the same contract context).
+                var workerContractContext = await BuildContractContextAsync(workUnitId, cts.Token).ConfigureAwait(false);
+                var workerCombinedGuidance = string.Join("\n\n", new[] { workerConstraintsContext, workerPromptGuidance, workerEngineeringState, workerContractContext }.Where(s => s is not null));
                 // plans/harness-hosting-architecture.md Phase B.1 — same seam as
                 // RunScheduledWorkerAsync's Worker branch. Preserves this site's exact existing
                 // behavior: no sessionId, completion discarded, no scheduler/dead-letter
@@ -1328,6 +1339,163 @@ public sealed class InMemoryAgentRuntimeService : IAgentRuntimeService, ISnapsho
 
             var lines = promptGuidance.Select(f => $"- {f.Title}: {f.Summary}");
             return "[Process guidance — promoted prompt improvements for this stage]\n" + string.Join("\n", lines);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // plans/recursive-planning-spike.md S4 — depth-aware planner context. Returns null on the
+    // default path (MaxPlanDepth <= 1) so a non-recursive install appends nothing and the planner
+    // kickoff is byte-for-byte unchanged. Otherwise it tells the planner its *remaining* depth
+    // budget (a single derived number, not the raw depth) and the regime that follows from it, so
+    // the model never has to do the subtraction or boundary reasoning itself.
+    private async Task<string?> BuildRecursivePlanningContextAsync(string workUnitId, CancellationToken ct)
+    {
+        try
+        {
+            // planDepth = ancestor count (root goal = 0). Same bounded parent-walk shape as
+            // FanOutService.ComputePlanDepthAsync — never an unbounded walk.
+            var workUnits = _serviceProvider.GetService<IWorkUnitService>();
+            if (workUnits is null) return null;
+
+            var planDepth = 0;
+            var currentId = workUnitId;
+            var isSubSlice = false;
+            int? overrideDepth = null;
+            for (var hop = 0; hop < 32; hop++)
+            {
+                var unit = await workUnits.GetAsync(currentId, ct).ConfigureAwait(false);
+                if (unit is null) break;
+                if (currentId == workUnitId)
+                {
+                    isSubSlice = unit.FanOutInfo?.SliceId is not null;
+                    overrideDepth = unit.MaxPlanDepthOverride; // propagated onto every unit at fan-out
+                }
+                if (unit.ParentWorkUnitId is not { } parentId) break;
+                planDepth++;
+                currentId = parentId;
+            }
+
+            // The effective ceiling: the goal's per-goal override when set, else the global default.
+            // Returns null (append nothing) on the default flat path so a non-recursive install is
+            // byte-for-byte unchanged.
+            var effectiveMax = overrideDepth ?? _options.MaxPlanDepth;
+            if (effectiveMax <= 1)
+                return null;
+
+            // Slices this planner emits land at planDepth + 1; the cap admits a Compound child iff
+            // its depth < effectiveMax. remainingLevels is how many further planning layers are still
+            // available *below this planner*.
+            var remainingLevels = effectiveMax - (planDepth + 1);
+            if (remainingLevels < 0) remainingLevels = 0;
+
+            var regime = remainingLevels switch
+            {
+                0 =>
+                    "you have NO further planning layers below you. Every slice you emit MUST be a leaf " +
+                    "(kind \"leaf\") handed straight to a worker. If a piece is too big for one worker, you " +
+                    "cannot defer it — decompose it fully *here* into more, smaller leaf slices (width " +
+                    "substitutes for depth).",
+                1 =>
+                    "you have exactly ONE further planning layer below you. You may mark a slice compound " +
+                    "(kind \"compound\") ONLY if a single further planning pass would get it to worker-sized " +
+                    "leaves — a compound slice's sub-plan will be forced all-leaf. Do not mark something " +
+                    "compound that is still several levels of complexity deep.",
+                _ =>
+                    $"you have {remainingLevels} further planning layers of budget below you. Decompose along " +
+                    "natural seams (separable subsystems, clear producer/consumer boundaries); mark those " +
+                    "seams compound and leave one-worker-sized work as leaf. The depth budget is a backstop, " +
+                    "NOT a target — if the work naturally bottoms out shallow, stop there; do not invent " +
+                    "hierarchy to spend the budget.",
+            };
+
+            var sb = new System.Text.StringBuilder();
+            sb.Append("[Recursive planning — depth budget] At this planning level, ").Append(regime);
+            if (isSubSlice && remainingLevels >= 1)
+                sb.Append("\nYou were marked compound by your parent and are expected to decompose: the general " +
+                    "\"a slice already decomposed once is almost never worth re-slicing\" guidance does NOT apply " +
+                    "to you here — that is exactly your job.");
+            return sb.ToString();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // plans/recursive-planning-spike.md S6 — peer-contract projection into a worker's kickoff.
+    // Resolves this worker's slice (workUnitId → FanOutInfo.SliceId → the parent plan that declared
+    // it) and injects the specific contracts it provides/consumes, so disjoint-fileScope peers build
+    // against the *same* declared interface instead of each inventing one. Deliberately narrow (only
+    // the slice's own contracts, never the whole goal) — the opposite of the removed blanket
+    // BuildOriginalGoalContextAsync. Returns null when the slice declares no contracts.
+    private async Task<string?> BuildContractContextAsync(string workUnitId, CancellationToken ct)
+    {
+        try
+        {
+            var workUnits = _serviceProvider.GetService<IWorkUnitService>();
+            var artifacts = _serviceProvider.GetService<IArtifactLineageService>();
+            if (workUnits is null || artifacts is null) return null;
+            var unit = await workUnits.GetAsync(workUnitId, ct).ConfigureAwait(false);
+            if (unit is null) return null;
+
+            async Task<PlanDocument?> ReadPlanOwnedByAsync(string ownerId)
+            {
+                var chain = await artifacts.GetChainAsync(ownerId, ct).ConfigureAwait(false);
+                var planArtifact = chain.LastOrDefault(a => a.Type == ArtifactType.Plan && a.OwnedByWorkUnitId == ownerId);
+                if (planArtifact?.Body is not { } body) return null;
+                try { return JsonSerializer.Deserialize<PlanDocument>(body, JsonSerializerOptions.Web); }
+                catch (JsonException) { return null; }
+            }
+
+            static string RenderContract(PlanContract c) =>
+                $"- {c.ContractId}: {c.Description}\n" + string.Join("\n", c.Schema.Select(line => $"    {line}"));
+
+            // Case A — a worker slice: inject only the contracts its slice provides/consumes, sourced
+            // from the PARENT plan that declared the slice.
+            if (unit.FanOutInfo?.SliceId is { } sliceId && unit.ParentWorkUnitId is { } parentId)
+            {
+                var parentPlan = await ReadPlanOwnedByAsync(parentId).ConfigureAwait(false);
+                if (parentPlan?.Contracts is { Count: > 0 } contracts)
+                {
+                    var slice = parentPlan.Slices.FirstOrDefault(s => string.Equals(s.SliceId, sliceId, StringComparison.Ordinal));
+                    var provides = slice?.Provides ?? [];
+                    var consumes = slice?.Consumes ?? [];
+                    string? RenderId(string id) =>
+                        contracts.FirstOrDefault(c => string.Equals(c.ContractId, id, StringComparison.Ordinal)) is { } c ? RenderContract(c) : null;
+
+                    var providedText = provides.Select(RenderId).Where(t => t is not null).ToList();
+                    var consumedText = consumes.Select(RenderId).Where(t => t is not null).ToList();
+                    if (providedText.Count > 0 || consumedText.Count > 0)
+                    {
+                        var sbA = new System.Text.StringBuilder();
+                        sbA.Append("[Peer contracts — the declared interface your slice must honor. Build against these " +
+                            "EXACTLY; a peer over separate files is building against the same declaration.]");
+                        if (providedText.Count > 0)
+                            sbA.Append("\nYou PROVIDE (other slices depend on this — implement it verbatim):\n").Append(string.Join("\n", providedText));
+                        if (consumedText.Count > 0)
+                            sbA.Append("\nYou CONSUME (call these exactly as declared — do not invent fields or shapes):\n").Append(string.Join("\n", consumedText));
+                        return sbA.ToString();
+                    }
+                }
+            }
+
+            // Case B — a planner/parent whose reconciled proposal is under review: inject ALL contracts
+            // it authored in its own plan, so the reviewer checks the aggregated changes conform.
+            var ownPlan = await ReadPlanOwnedByAsync(workUnitId).ConfigureAwait(false);
+            if (ownPlan?.Contracts is { Count: > 0 } ownContracts)
+            {
+                var sbB = new System.Text.StringBuilder();
+                sbB.Append("[Peer contracts declared for this work — every change under review must CONFORM: a " +
+                    "provider implements its contract as declared, a consumer calls it exactly as declared (no " +
+                    "undeclared fields/shapes). A non-conformant change is a Rejected review.]\n");
+                sbB.Append(string.Join("\n", ownContracts.Select(RenderContract)));
+                return sbB.ToString();
+            }
+
+            return null;
         }
         catch
         {

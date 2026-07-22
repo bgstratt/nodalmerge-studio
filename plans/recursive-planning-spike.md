@@ -10,13 +10,25 @@ Written 2026-07-21 after code recon (file:line refs verified that day).
 
 ## Status
 
-- [ ] S1 — `PlanSlice.Kind` (`leaf | compound`) contract + planner emits it
-- [ ] S2 — `MaxPlanDepth` setting + plan-depth computation + cap enforcement
-- [ ] S3 — route branch in FanOut: compound slice under the cap → sub-planner, not worker
-- [ ] S4 — depth-aware planner prompt (a sub-planner knows it *may* re-slice)
-- [ ] S5 — **the load-bearing test**: 2-level tree reconciles bottom-up to the root
-- [ ] S6 — **explicit peer contracts** (parent-authored interfaces shared by producer + consumer)
-- [ ] S7 — **blocking integration gate** on the reconciled branch *(may defer — captured so we don't lose it)*
+- [x] S1 — `PlanSlice.Kind` (`leaf | compound`) contract + planner emits it *(shipped 2026-07-22; + `contracts`/`provides`/`consumes` for S6, mirrored on `WorkspaceContractPlanSlice`, `ArtifactType.Contract`)*
+- [x] S2 — `MaxPlanDepth` setting (default 1) + `ComputePlanDepthAsync` + cap enforcement
+- [x] S3 — route branch in FanOut: compound slice under the cap → sub-planner via `SpawnAsync("orchestrator")` (the reconciliation-unit path), not a new method; `demotedFromCompound` counter
+- [x] S4 — depth-aware planner prompt (dynamic `remainingLevels` injection + static prompt edits)
+- [x] S5 — **the load-bearing test** — GREEN: 2-level tree reconciles bottom-up through the interior node to the root
+- [x] S6 — **explicit peer contracts** (data + worker projection + real reviewer context seam); S5.b GREEN (non-conformant consumer rejected, conformant pair passes)
+- [ ] S7 — **blocking integration gate** on the reconciled branch *(deferred as planned; the deterministic downstream net)*
+
+**Implementation notes (2026-07-22):** Executable plan in `~/.claude/plans/smooth-rolling-snowglobe.md`.
+Two things the recon missed, discovered during implementation and fixed:
+1. **`WorkSchedulerService.EnqueueAsync` has a guard that throws when a Plan-stage profile is enqueued
+   against any work unit with `FanOutInfo.SliceId` set** (to stop a leaf being re-planned). A Compound
+   slice legitimately needs re-planning, so this forced storing `Kind` on `WorkUnitFanOutInfo` (the
+   plan's documented fallback) and exempting Compound in the guard. Also simplified S3's route decision
+   to read `child.FanOutInfo.Kind` directly.
+2. **An interior node must be *applied* (→ Merged), not merely approved, for its reconciliation to
+   cascade to the parent** — a leaf under an interior node is approve-only (aggregated by its parent);
+   the interior node's reconciled proposal is approve+apply. Encoded in the S5 drive loop.
+Verified: Integration.Tests 765/765, Contracts 30/30, AgentRuntime 109/109, Merge 71/71.
 
 ## What this spike proves — and what it deliberately doesn't
 
@@ -47,6 +59,11 @@ mechanism runs end-to-end and the hard risk is retired.
 - **Plan quality.** Whether a planner makes *good* leaf/compound calls on real workloads is
   a prompt-eval problem, not a plumbing one. S4 ships a plausible prompt; it does not
   validate the judgment. This is the largest open item and it's evaluative, not structural.
+  Even with perfect depth context the planner is estimating "how many levels does this
+  slice need" *without having decomposed it yet* — no prompt makes that reliable, only
+  measurable. The spike's contribution is the measurement hook: the
+  `demotedFromCompound` counter (S3) counts depth-budget overshoots on real runs, so the
+  eval starts with data instead of intuition.
 - **Conflict roll-up.** S5 uses non-overlapping grandchild fileScopes (clean merge). What
   happens when two grandchildren conflict and the interior node has to surface a
   `merge-conflict-report.md` *at the interior level* is untested here (see Open questions).
@@ -125,6 +142,10 @@ S3 is that branch.
   iff `slice.Kind == Compound && planDepth(child) < MaxPlanDepth`. With `MaxPlanDepth=2`: a
   root slice (depth 1) may sub-plan; its grandchildren (depth 2) fail `2 < 2` and are forced
   to `Leaf` → worker. Exactly two planning layers, no runaway.
+- **Demotion is a signal, not a neutral routing event.** When the cap forces a `Compound`
+  slice to worker, that is the exact signature of "a planner didn't account for its remaining
+  depth budget" — the plan declared the slice too big for one worker, and one worker is
+  getting it anyway. S3 must log it distinctly (see below) so it's countable, not silent.
 
 ## S3 — route branch in FanOut (the producer for the rescue sweep)
 
@@ -141,6 +162,12 @@ S3 is that branch.
   - runs the same `PolicyCheckpoint.BeforeEnqueue` gate and writes the same
     `OrchestrationAction.Enqueue` decision-log entry (with `stage: Plan`) so a nested plan
     is auditable exactly like a fan-out.
+- **Log compound-demotion at the cap.** In the worker branch, when
+  `slice.Kind == Compound` but the cap rule failed (depth at/over the ceiling), write the
+  `Enqueue` decision-log entry with a `demotedFromCompound: true` marker. This is the free
+  measurable counter for the plan-quality eval later: it counts exactly the cases where a
+  planner overshot its remaining depth budget. Zero code beyond the log field — the routing
+  itself is unchanged.
 - **Nothing else is needed for recursion to close**: once the sub-planner runs and records
   its Plan artifact, `ConvergeAsync`'s existing rescue sweep (recon above) fans it out into
   grandchildren on the next release. Confirm this in S5 rather than adding a second
@@ -151,13 +178,29 @@ S3 is that branch.
 - `AgentLoopPrompts.Planner` currently *discourages* re-slicing (step 6a: "re-slicing …
   is almost never right"). That guard exists to stop a leaf being pointlessly re-planned; it
   must not fire for a legitimately compound sub-slice.
-- Give the planner two pieces of context in its kickoff: (a) its own `planDepth` and the
-  `MaxPlanDepth` ceiling, and (b) that it *may* mark slices `Compound` **only if
-  `planDepth < MaxPlanDepth`** — at the ceiling it must emit all `Leaf`. Seed a
-  count-based hint ("if this would exceed ~N atomic slices or spans clearly separable
-  subsystems, prefer Compound"), but frame the real test as *"can one worker hold this in
-  context and land it as one coherent change within its fileScope?"* — count is a proxy,
-  not the rule.
+- **The number to pass is `remainingLevels = MaxPlanDepth − (planDepth + 1)`** — the
+  planner's slices land at `planDepth + 1`, and S2's cap routes a child to a sub-planner
+  only if *the child's* depth clears the ceiling. Passing the planner's own depth with a
+  naive `planDepth < MaxPlanDepth` rule is **off by one**: with `MaxPlanDepth=2` the
+  interior sub-planner (depth 1) would pass `1 < 2` and be told it may still mark
+  `Compound`, but its children (depth 2) fail the cap and get silently demoted to workers —
+  a slice the plan itself declared too big for one worker, handed to one worker. Pass the
+  single derived `remainingLevels` rather than both raw numbers so the model never does the
+  subtraction or boundary semantics itself.
+- Prompt rules by regime:
+  - `remainingLevels == 0` — all slices **must be `Leaf`**, and if the work is too big for
+    one worker the only lever is **width**: decompose fully *here*, more/smaller slices.
+    Width substitutes for depth; there is no deferring.
+  - `remainingLevels == 1` — `Compound` is allowed **only for slices one further planning
+    pass away from worker-sized pieces**. The sub-plan below will be forced all-`Leaf`, so
+    don't mark something `Compound` that's still multiple levels of complexity deep.
+  - `remainingLevels >= 2` — decompose along natural seams (subsystems, contracts); **the
+    ceiling is a backstop, not a target**. If the task naturally bottoms out shallow, stop
+    there — do not invent hierarchy to spend the budget.
+- Seed a count-based hint ("if this would exceed ~N atomic slices or spans clearly
+  separable subsystems, prefer Compound"), but frame the real test as *"can one worker hold
+  this in context and land it as one coherent change within its fileScope?"* — count is a
+  proxy, not the rule.
 - This is the slice most likely to need iteration; the spike ships a plausible prompt and
   flags eval as follow-up (see "what this doesn't prove").
 
@@ -174,7 +217,11 @@ An integration test in `NodalMerge.Studio.Integration.Tests` (alongside
    non-overlapping fileScopes** (clean merge — conflict roll-up is explicitly out of scope,
    see Open questions).
 4. Assert grandchildren are forced to worker/execute (depth-2 cap), run, and produce merge
-   proposals.
+   proposals. Make one grandchild deliberately `Compound` in the scripted sub-plan and
+   assert (a) it is demoted to a worker anyway and (b) the decision log carries
+   `demotedFromCompound: true` (S3). This pins the ceiling boundary — and the root-goal=0
+   depth convention from Open questions — in a test rather than in prose, and proves the
+   overshoot counter actually fires.
 5. **Assert the roll-up**: grandchildren reconcile into the interior node's branch, the
    interior node reaches a completed/merged state, and *then* reconciles up into the root —
    i.e. the interior node is correctly both a merge **target** (for its children) and a

@@ -33,7 +33,9 @@ public static class StudioRestEndpoints
         string? SeedFromBranchId = null,
         WorkUnitExpectedOutputKind? ExpectedOutputKind = null,
         string? RepositoryId = null,
-        IReadOnlyList<FileReferenceV1>? ReferenceFiles = null);
+        IReadOnlyList<FileReferenceV1>? ReferenceFiles = null,
+        // plans/recursive-planning-spike.md — per-goal recursion-depth override (null = global default).
+        int? MaxPlanDepthOverride = null);
 
     private sealed record SpawnAgentBody(
         string AgentType,
@@ -255,7 +257,13 @@ public static class StudioRestEndpoints
         // Clarification timeout defaults — applied when an agent doesn't specify its own timeout.
         // 0 or null means wait indefinitely.
         int? DefaultClarificationTimeoutSeconds = null,
-        string DefaultClarificationTimeoutBehavior = "auto_continue");
+        string DefaultClarificationTimeoutBehavior = "auto_continue",
+        // Recursive planning depth ceiling (plans/recursive-planning-spike.md). 1 = flat fan-out
+        // (a slice is always a worker); >1 lets a Compound slice be re-planned by a sub-planner.
+        int MaxPlanDepth = 1,
+        // Automated retry/failure cap before dead-letter (governs review-rejection retries + worker
+        // failure attempts). 1 = one shot then escalate; higher = more lenient auto-fixing.
+        int MaxFailureAttempts = 3);
 
     private static object BuildOptionsResponse(WorkspaceOptions o) => new
     {
@@ -287,6 +295,8 @@ public static class StudioRestEndpoints
         allowAutoRequeue     = o.AllowAutoRequeue,
         defaultClarificationTimeoutSeconds  = o.DefaultClarificationTimeoutSeconds,
         defaultClarificationTimeoutBehavior = o.DefaultClarificationTimeoutBehavior,
+        maxPlanDepth              = o.MaxPlanDepth,
+        maxFailureAttempts        = o.MaxFailureAttempts,
     };
 
     private sealed record SyncDiffBody(string[] PeerNodeIdsHex);
@@ -545,6 +555,10 @@ public static class StudioRestEndpoints
                 return Results.BadRequest(new { error = "schedulerPollIntervalMs must be at least 100." });
             if (string.IsNullOrWhiteSpace(body.CandidateBranchId))
                 return Results.BadRequest(new { error = "candidateBranchId must not be empty." });
+            if (body.MaxPlanDepth < 1)
+                return Results.BadRequest(new { error = "maxPlanDepth must be at least 1." });
+            if (body.MaxFailureAttempts < 1)
+                return Results.BadRequest(new { error = "maxFailureAttempts must be at least 1." });
 
             options.UseLlmProfileSelection   = body.UseLlmProfileSelection;
             options.MaxConcurrentWorkers      = body.MaxConcurrentWorkers;
@@ -566,6 +580,8 @@ public static class StudioRestEndpoints
             options.AllowAutoRequeue          = body.AllowAutoRequeue;
             options.DefaultClarificationTimeoutSeconds  = body.DefaultClarificationTimeoutSeconds > 0 ? body.DefaultClarificationTimeoutSeconds : null;
             options.DefaultClarificationTimeoutBehavior = body.DefaultClarificationTimeoutBehavior;
+            options.MaxPlanDepth              = body.MaxPlanDepth;
+            options.MaxFailureAttempts        = body.MaxFailureAttempts;
             if (body.DocFetchAllowedDomains is not null)
                 options.DocFetchAllowedDomains = [.. body.DocFetchAllowedDomains];
             if (body.DocFetchDeniedDomains is not null)
@@ -1213,6 +1229,7 @@ public static class StudioRestEndpoints
         taskReviewHybridTimeoutMinutes = wu.TaskReviewHybridTimeoutMinutes,
         workspaceReviewHybridTimeoutMinutes = wu.WorkspaceReviewHybridTimeoutMinutes,
         bypassPromotionBranch = wu.BypassPromotionBranch,
+        maxPlanDepthOverride = wu.MaxPlanDepthOverride,
         expectedOutputKind = wu.ExpectedOutputKind,
         repositoryId = wu.RepositoryId,
         referenceFiles = wu.ReferenceFiles,
@@ -1533,7 +1550,8 @@ public static class StudioRestEndpoints
                         WorkspaceReviewHybridTimeoutMinutes: body.WorkspaceReviewHybridTimeoutMinutes,
                         BypassPromotionBranch: body.BypassPromotionBranch,
                         SeedFromBranchId: body.SeedFromBranchId, ExpectedOutputKind: body.ExpectedOutputKind,
-                        RepositoryId: body.RepositoryId, ReferenceFiles: body.ReferenceFiles),
+                        RepositoryId: body.RepositoryId, ReferenceFiles: body.ReferenceFiles,
+                        MaxPlanDepthOverride: body.MaxPlanDepthOverride),
                     ct).ConfigureAwait(false);
 
                 // First-class replicating goal (plans/first-class-goals-and-materialization.md Phase 1):

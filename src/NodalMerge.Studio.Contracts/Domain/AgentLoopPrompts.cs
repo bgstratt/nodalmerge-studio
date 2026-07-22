@@ -61,9 +61,20 @@ public static class AgentLoopPrompts
             your turn WITHOUT calling nm_v1_artifact_record_plan — the system detects that no plan
             was recorded and hands this same work unit straight to execution unchanged. This is a
             normal, successful outcome, not a failure to find something to slice.
+            EXCEPTION: if a "[Recursive planning — depth budget]" note appears in your context saying
+            you were marked compound by your parent with remaining budget, this does NOT apply — you
+            were deliberately handed a subsystem to decompose, and decomposing it is exactly your job.
         7. Otherwise, record the plan using nm_v1_artifact_record_plan with your workUnitId and the
            plan JSON content. The plan JSON must follow this exact shape:
            { "slices": [ { "sliceId": "...", "goal": "...", "fileScope": [...], "dependsOn": [...], "steps": [...] } ] }
+           Three fields are OPTIONAL — omit them and a slice behaves exactly as today:
+           - "kind": "leaf" (default) or "compound". Only emit "compound" when a "[Recursive planning
+             — depth budget]" note in your context grants remaining depth budget; a compound slice is
+             re-planned by a sub-planner instead of run by a worker. Without that note, all slices are leaf.
+           - "provides" / "consumes": lists of contractId strings (see the peer-contracts Rule). When
+             two peer slices must agree on an interface, declare a top-level "contracts" array beside
+             "slices":
+             { "slices": [...], "contracts": [ { "contractId": "...", "description": "...", "schema": [ "GET /api/x -> { id: string }" ] } ] }
         8. Stop — the runtime fans out child workers from your plan automatically.
           9. If key requirements are ambiguous and slicing would require guessing, call
               nm_v1_clarification_request and stop immediately.
@@ -81,6 +92,21 @@ public static class AgentLoopPrompts
           infer ordering — a worker is only allowed to start once every slice it dependsOn has
           actually been merged, so an undeclared dependency means it starts too early, against
           stale or missing content.
+        - Peer contracts: two slices in a producer/consumer relationship over DISJOINT files (a
+          backend endpoint and the frontend that calls it) share no files and often need no dependsOn
+          (they can build in parallel), so nothing otherwise forces their interfaces to agree — a
+          silent mismatch merges green and breaks at integration. When you see such a seam, author a
+          contract in the top-level "contracts" array (put the literal interface — endpoints,
+          signatures, field names — in its "schema"), set the producer slice's "provides" and the
+          consumer slice's "consumes" to its contractId. Both workers are handed the contract verbatim
+          and must build against it; a consumer that violates it is rejected at review.
+        - Choosing leaf vs compound (only when a "[Recursive planning — depth budget]" note grants
+          budget): the test is "can ONE worker hold this slice in context and land it as one coherent
+          change within its fileScope?" If yes, leaf. If it spans clearly separable subsystems (or
+          would otherwise force you to write ~5-8+ atomic sub-slices yourself), prefer compound and let
+          a sub-planner decompose it — but only within the stated budget. At budget 0 you cannot use
+          compound; split into leaves yourself. The budget is a ceiling, not a quota — don't manufacture
+          hierarchy to fill it.
         - Write valid JSON only — no markdown fences in the file content.
         - fileScope is a routing hint, not a hard permission boundary — workers are no longer
           blocked from writing outside it. Still make it the exact, real relative paths returned by

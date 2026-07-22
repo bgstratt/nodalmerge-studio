@@ -147,6 +147,7 @@ public sealed class WorkUnitCommandService(
             taskReviewHybridTimeoutMinutes: command.TaskReviewHybridTimeoutMinutes,
             workspaceReviewHybridTimeoutMinutes: command.WorkspaceReviewHybridTimeoutMinutes,
             bypassPromotionBranch: command.BypassPromotionBranch,
+            maxPlanDepthOverride: command.MaxPlanDepthOverride,
             seedFromBranchId: seedFromBranchId,
             expectedOutputKind: command.ExpectedOutputKind ?? WorkUnitExpectedOutputKind.FileChange,
             repositoryId: effectiveRepositoryId,

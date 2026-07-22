@@ -72,6 +72,10 @@ public sealed record WorkUnit(
     // Slice 21c — per-work-unit override: when true, applies always target the proposal's
     // TargetBranch directly even if WorkspaceOptions.UsePromotionBranch is on session-wide.
     bool BypassPromotionBranch = false,
+    // plans/recursive-planning-spike.md — per-goal recursion-depth override. Null = use the global
+    // WorkspaceOptions.MaxPlanDepth. Set on the goal root and propagated to children at fan-out, so
+    // any unit in the tree reads its own effective ceiling (`MaxPlanDepthOverride ?? global`).
+    int? MaxPlanDepthOverride = null,
     WorkUnitExpectedOutputKind ExpectedOutputKind = WorkUnitExpectedOutputKind.FileChange,
     // Slice 19 — which registered repository (IRepositoryRegistryService) a fresh top-level
     // goal's "main" content was synced from at creation time. Null for forks/children (they
@@ -131,7 +135,12 @@ public sealed record WorkUnitExecutionInfo(
 // (Overlapping sibling fileScope is handled separately and doesn't use this path — see
 // FanOutService.AutoSequenceOverlappingSiblingsAsync, which inserts a real dependsOn edge instead
 // of rejecting.)
-public sealed record WorkUnitFanOutInfo(string? SliceId, string? SeedFromBranchId, string? BlockedReason = null);
+// Kind carries the plan slice's leaf/compound classification onto the child work unit
+// (plans/recursive-planning-spike.md). Trailing + defaulted to Leaf so existing persisted FanOutInfo
+// deserializes unchanged. Stored (not recomputed from the parent plan) because WorkSchedulerService's
+// "can't re-plan a fanned-out leaf" enqueue guard needs it at enqueue time to let a Compound slice
+// through to a sub-planner while still blocking a leaf.
+public sealed record WorkUnitFanOutInfo(string? SliceId, string? SeedFromBranchId, string? BlockedReason = null, PlanSliceKind Kind = PlanSliceKind.Leaf);
 
 public static class WorkUnitTransitions
 {

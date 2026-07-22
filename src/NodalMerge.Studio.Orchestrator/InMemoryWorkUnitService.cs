@@ -425,6 +425,8 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
         IReadOnlyList<string>? reconciliationSourceProposalIds = null,
         IReadOnlyList<string>? reconciliationTargetPaths = null,
         string? reconciliationSourceRef = null,
+        PlanSliceKind sliceKind = PlanSliceKind.Leaf,
+        int? maxPlanDepthOverride = null,
         CancellationToken cancellationToken = default)
     {
         // repositoryPath (the extension's auto-detected/override nodalmerge.repositoryPath, sent on
@@ -484,7 +486,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             .ConfigureAwait(false);
 
         var fanOutInfo = sliceId is not null || seedFromBranchId is not null
-            ? new WorkUnitFanOutInfo(sliceId, seedFromBranchId)
+            ? new WorkUnitFanOutInfo(sliceId, seedFromBranchId, Kind: sliceKind)
             : null;
 
         var now = DateTimeOffset.UtcNow;
@@ -514,6 +516,7 @@ public sealed class InMemoryWorkUnitService : IWorkUnitService, IOrchestratorSer
             TaskReviewHybridTimeoutMinutes: taskReviewHybridTimeoutMinutes,
             WorkspaceReviewHybridTimeoutMinutes: workspaceReviewHybridTimeoutMinutes,
             BypassPromotionBranch: bypassPromotionBranch,
+            MaxPlanDepthOverride: maxPlanDepthOverride,
             ExpectedOutputKind: expectedOutputKind,
             RepositoryId: resolvedRepositoryId,
             ReferenceFiles: referenceFiles,
