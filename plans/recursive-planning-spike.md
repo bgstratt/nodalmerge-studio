@@ -15,6 +15,8 @@ Written 2026-07-21 after code recon (file:line refs verified that day).
 - [ ] S3 — route branch in FanOut: compound slice under the cap → sub-planner, not worker
 - [ ] S4 — depth-aware planner prompt (a sub-planner knows it *may* re-slice)
 - [ ] S5 — **the load-bearing test**: 2-level tree reconciles bottom-up to the root
+- [ ] S6 — **explicit peer contracts** (parent-authored interfaces shared by producer + consumer)
+- [ ] S7 — **blocking integration gate** on the reconciled branch *(may defer — captured so we don't lose it)*
 
 ## What this spike proves — and what it deliberately doesn't
 
@@ -60,6 +62,14 @@ Net: the spike wins the architecture bet and retires the reconciliation risk. Re
 Cursor-swarm scale (hundreds of workers, coherent reassembly under real conflict) is a
 meaningful amount more — but it's *hardening of known machinery plus plan-quality evals*,
 not another architecture. That's the honest shape of "how much further."
+
+**One correctness gap is promoted *into* the spike, not deferred: peer interface coherence
+(S6).** Reconciliation only coordinates slices that share files or a `dependsOn` edge; two
+peers across disjoint fileScopes (backend API ↔ frontend that calls it) share neither, so
+today they merge green whether or not their interface agrees. That's a self-consistent-but-
+wrong failure that *ships*, and it exists at flat depth 1 already — recursion only makes it
+worse. It is the thing that most needs an explicit contract, so S6/S5.b fold it in rather
+than leaving it to "hardening."
 
 ## Recon — what already exists (so the spike stays small)
 
@@ -175,6 +185,124 @@ An integration test in `NodalMerge.Studio.Integration.Tests` (alongside
 
 Green S5 is the milestone. It exercises the route decision, the existing rescue sweep, the
 depth cap, and — the point — one full interior-node roll-up.
+
+**Warning about S5's own blind spot:** S5 uses *non-overlapping* fileScopes to get a clean
+merge — which is the exact shape of the peer-contract gap S6 addresses. Two disjoint-scope
+slices merge green whether or not their interface actually agrees, so S5 alone gives *false
+confidence*: it proves the roll-up plumbing while silently passing an interface mismatch.
+S6 + S5.b are what stop that.
+
+## S6 — explicit peer contracts (the interface-coherence gap)
+
+**The problem (verified 2026-07-21).** `PlanSlice` is `{sliceId, goal, fileScope, dependsOn,
+steps}` (`PlanDocument.cs:11-16`) — **no interface field.** The planner can only coordinate
+peers via `dependsOn` (ordering) + branch seeding (the dependent inherits the dependency's
+files and *reads the code* to infer the interface, `FanOutService.cs:407-425`). So a contract
+today is **implicit — "read what my dependency produced" — and exists only along a dependsOn
+edge.** Worse: `AutoSequenceOverlappingSiblingsAsync` only inserts a dependency when sibling
+fileScopes **overlap** (`FanOutService.cs:295-296`). A backend API slice and a frontend slice
+that calls it touch *disjoint* files → no overlap → no auto-dependency → they run as
+uncoordinated peers with no shared contract, and because they never touch the same files
+their proposals **merge with zero conflict**. Reconciliation catches nothing. UI expects
+`/api/foo → {x}`, backend serves `/api/bar → {y}`, both green, both merge, integration broken.
+This is the self-consistent-but-wrong failure, and it *ships* rather than stalling. It is the
+single most important correctness gap for anything with a client/server or producer/consumer
+seam — which is most real work.
+
+**Note on scope independence.** This gap exists **today at flat depth 1** — it is not caused
+by recursion. Recursion only makes it *more* acute (more seams, across more layers). So S6 is
+independently valuable and could ship *before or alongside* the recursion spike; it also
+de-risks the harder tree case. Recommend sequencing S6 first or in parallel with S1–S3.
+
+**Design.**
+
+- Add a parent-level `contracts` collection to `PlanDocument`: each contract is an explicit
+  interface the parent planner authors (endpoint list / typed schema / IDL — start with a
+  simple structured shape, not a full OpenAPI parser). Each `PlanSlice` gains `provides` and
+  `consumes` naming the contract ids it implements or depends on.
+- Materialize each contract as an **artifact injected into *both* the producer's and
+  consumer's context** (and seeded into their branches), so both build against the *same
+  declared interface* instead of each inventing one. This is contract-first: producer and
+  consumer can now run **concurrently** against the shared contract rather than serializing
+  through `dependsOn`.
+- **Reviewer teeth.** The review/gate checks each slice's output *conforms to the contracts
+  it declared* (`provides` matched against the artifact; `consumes` calls checked against it).
+  This is the "conformance to the slice/projection" idea from the design thread — now with an
+  explicit object to conform to, instead of hoping two workers guessed the same shape.
+- **Recursion — this is the "contract coherence across the tree" mechanism.** A sub-planner
+  **inherits** the contracts its parent slice declared (as fixed `provides`/`consumes`
+  boundaries it must honor) and **may author new internal contracts** among its own children.
+  Contracts flow *down* as immutable boundaries; new ones are authored *locally*. This is what
+  keeps a deep tree from having each sub-planner reinvent a shared interface — the failure mode
+  that makes deep recursion collapse at integration.
+
+**S5.b — peer-contract test (add to S5).** Root plan declares one contract + a producer slice
+(`provides`) and a *peer* consumer slice (`consumes`) over **disjoint** fileScopes. Assert:
+(1) the contract artifact is injected into both workers; (2) a deliberately non-conformant
+consumer (calls a field the contract doesn't declare) is **flagged by review**, not merged
+green; (3) a conformant producer/consumer pair integrates and the goal completes. This is the
+case S5's clean-merge would otherwise pass while hiding — S5.b is what gives the "coherent
+reassembly" claim teeth for the peer seam, not just the dependency seam.
+
+## S7 — blocking integration gate on the reconciled branch (may defer)
+
+**The gap (verified 2026-07-21).** Merge/reconciliation is textual file-copy. The only
+composite build/test — `ExecuteCompositeAsync` (`MergeReconciliationService.cs:295-315`) — is
+opt-in *and* wrapped in `try { } catch { /* best-effort */ }`, so it **never blocks
+acceptance**. Cross-slice conflict detection is same-file line-range only
+(`MergeReconciliationService.cs:502-518`). So a rename in slice A's `Foo.cs` with a stale
+caller in slice B's `Bar.cs` has zero file overlap, zero line conflict, each branch built
+green *in isolation*, and the combined tree that won't compile gets accepted and (under
+AgentApproval/Hybrid) auto-applied. This is the contract gap's twin, generalized to *any*
+cross-file semantic dependency — not just declared interfaces.
+
+**Why this hasn't bitten us yet — and why it's about to.** Until recently every worker ran the
+**same model** against a **shared context cache**, so workers *implicitly agreed* on interfaces
+and symbol names — the shared model was doing cross-slice coordination for free, masking the
+missing gate. The file-scoped multi-profile work (`scoped-execute-workers-per-profile-models.md`)
+deliberately breaks that: frontend on one model, backend on another. Different models make
+different naming/interface choices, so cross-slice incoherence moves from *rare* to *likely*
+exactly as we adopt the feature this spike is built on. The gate stops being optional the moment
+workers stop sharing a brain.
+
+**Design.**
+
+- Make the reconciled-branch build/test **blocking, and on by default for real work** — a
+  reconciled proposal that fails to compile/test must not reach Approved/Applied. The machinery
+  largely exists (`ExecuteCompositeAsync`); the change is *promote best-effort → hard gate* and
+  flip the default, not build from scratch.
+- Failure surfaces like a conflict does today (a report on the parent branch + a task), so the
+  human/rework path is the one that already exists — don't invent a new escalation channel.
+- This is the **universal downstream net**: it catches the non-interface half of the
+  missing-dependency gap (internal symbol deps a contract can't express), anything the planner
+  missed entirely, and contract violations that slipped past review. Contracts (S6) *prevent*
+  upstream and cheaply; S7 *verifies* downstream and catches everything. Want both.
+
+**S5 amendment (do this even if S7's full default-flip is deferred).** Add an assertion that a
+deliberately-broken combination — slice A renames a symbol, peer slice B keeps calling the old
+name, disjoint fileScopes — is **rejected by the gate**, not accepted green. Without this, S5
+proves only that files got *copied together*, not that the combined result *builds* — i.e. the
+spike's "coherent reassembly" claim is hollow. A minimal blocking gate scoped to the spike's
+test goal is enough to make the assertion real, even if productionizing the default is a
+follow-up.
+
+## Related gaps — captured, not yet scheduled (so we don't lose them)
+
+Same textual-vs-semantic signature as S6/S7; noted here rather than slotted:
+
+- **Completion is self-declared.** A worker "succeeds" on `StopReason == "end_turn"`
+  (`WorkerAgentLoop.cs:138-213`) with no evidence — with defaults it can succeed having written
+  nothing. Green means "the agent stopped," not "it works." Fix direction: require evidence of a
+  passing check (ties to S7) before a slice counts as done.
+- **`fileScope` is trusted but never enforced.** The hard block was removed
+  (`McpToolDispatcher.cs:821`); actual writes are never reconciled against the declaration, and
+  `AutoSequenceOverlappingSiblingsAsync` sequences only on *declared* overlap — so an
+  under-declared scope silently defeats the one automated coordination mechanism. Fix direction:
+  detect out-of-scope writes and feed them back into sequencing/conflict detection.
+- **No independent oracle.** Worker and reviewer both reason from the same goal text and run the
+  *same existing* tests (`AgentLoopPrompts.cs:344-354`); nothing derives expected behavior
+  independently. This is the deepest one and only partially fixable — contract-conformance (S6)
+  and the integration gate (S7) are the closest thing to an external check we can manufacture.
 
 ## Out of scope for the spike (named so they're not silently assumed done)
 
