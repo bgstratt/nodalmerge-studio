@@ -96,11 +96,12 @@ public class AutomatedReviewIntegrationTests
     // that the auto-apply fired at propose time on a Draft proposal — which ApplyAsync rejects before the
     // inline reviewer gate runs — so the child sat at ReadyForReview forever. Single child = no concurrent
     // inline reviews, so this is deterministic.
-    [Fact(Skip = "Repro for the AgentApproval-child auto-review report. Root cause confirmed and partially " +
-        "fixed (MergeCommandService now validates Draft→ReadyForReview before the auto-apply so the inline " +
-        "reviewer gate can run — verified: a child that previously sat at ReadyForReview now auto-merges). A " +
-        "residual inline-review-vs-reconciliation ordering interaction still leaves some children Proposed; " +
-        "kept skipped until that ordering is resolved.")]
+    // Two fixes make this green: (1) MergeCommandService validates Draft→ReadyForReview before the
+    // auto-apply so the inline reviewer gate can run at all; (2) MergeReconciliationService no longer
+    // folds a self-applying (AgentApproval/Hybrid + AutoApplyOnPropose) child at merely Approved — it
+    // waits for Merged, so the eager child-approve-time reconcile can't Supersede the proposal out
+    // from under the child's own in-flight auto-apply and strand it at Proposed.
+    [Fact]
     public async Task AgentApproval_child_inline_auto_reviews_and_merges_without_manual_intervention()
     {
         var fakeHandler = new SingleChildAutoReviewLlmHandler();

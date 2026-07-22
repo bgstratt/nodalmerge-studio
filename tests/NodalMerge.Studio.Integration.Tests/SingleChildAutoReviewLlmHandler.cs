@@ -23,7 +23,7 @@ internal sealed class SingleChildAutoReviewLlmHandler : HttpMessageHandler
 
         var json =
             firstMsg.StartsWith("Plan work unit", StringComparison.Ordinal) ? PlannerStep(step, firstMsg) :
-            firstMsg.StartsWith("Review merge proposal", StringComparison.Ordinal) ? ReviewerStep(body, firstMsg) :
+            firstMsg.StartsWith("Review merge proposal", StringComparison.Ordinal) ? ReviewerStep(step, firstMsg) :
             firstMsg.StartsWith("Begin orchestrating", StringComparison.Ordinal) ? OrchestratorStep(step, firstMsg) :
             WorkerStep(step, firstMsg, messages);
 
@@ -98,19 +98,24 @@ internal sealed class SingleChildAutoReviewLlmHandler : HttpMessageHandler
         };
     }
 
-    private static string ReviewerStep(string body, string firstMsg)
+    private static string ReviewerStep(int step, string firstMsg)
     {
         var proposalId = ParseBetween(firstMsg, "Review merge proposal ", " for work unit");
-        // Robust against step miscounts: submit the review unless this conversation already has.
-        if (body.Contains("nm_v1_merge_review", StringComparison.Ordinal))
-            return EndTurn();
-        return ToolUse("tu-r-1", "nm_v1_merge_review", new
+        // Step-count, not a body substring scan: the reviewer's kickoff request already lists
+        // nm_v1_merge_review in its available-tools array, so a body.Contains(...) check
+        // false-positives on turn 0 and the reviewer EndTurns without ever deciding → Review
+        // dead-letter. Mirror AutomatedReviewFanOutLlmHandler: submit on step 0, EndTurn after.
+        return step switch
         {
-            proposalId,
-            decision = "Approved",
-            automated = true,
-            verificationResults = "Looks good; goal satisfied.",
-        });
+            0 => ToolUse("tu-r-1", "nm_v1_merge_review", new
+            {
+                proposalId,
+                decision = "Approved",
+                automated = true,
+                verificationResults = "Looks good; goal satisfied.",
+            }),
+            _ => EndTurn(),
+        };
     }
 
     private static string? ExtractFromToolResult(JsonElement messages, string key)
