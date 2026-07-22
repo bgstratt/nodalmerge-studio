@@ -305,6 +305,14 @@ public sealed class MergeCommandService(IMergeService merge, IFileWorkspaceServi
                     {
                         try
                         {
+                            // The proposal was just created as Draft (line ~212), but the inline reviewer
+                            // gate needs it ReadyForReview and ApplyAsync only accepts an Approved proposal
+                            // (see the MergeProposal transition table). Firing ApplyAsync on a Draft threw
+                            // immediately and got swallowed below, so AgentApproval/Hybrid *children* were
+                            // never inline-reviewed — they sat at ReadyForReview until a human clicked
+                            // Apply. Validate first (Draft→ReadyForReview) so the gate can run; idempotent
+                            // with the worker's own later merge_validate (a re-validate no-ops).
+                            await merge.ValidateAsync(proposalIdToApply, CancellationToken.None).ConfigureAwait(false);
                             await ApplyAsync(proposalIdToApply, CancellationToken.None, autoApplied: true).ConfigureAwait(false);
                         }
                         catch (InvalidOperationException)
