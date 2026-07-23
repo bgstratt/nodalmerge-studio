@@ -3,8 +3,8 @@ import type { ReplayState, ReplayAction } from './branchReplay';
 import { WsClient } from './wsClient';
 import type { WsStatus } from './wsClient';
 import { renderDag } from './dagRenderer';
-import { renderPlanTree, renderPlanNodeDetail } from './planTree';
-import type { PlanTreeData, PlanContractDef } from './planTree';
+import { renderPlanTree, renderPlanNodeDetail, fitView, MIN_ZOOM, MAX_ZOOM } from './planTree';
+import type { PlanTreeData, PlanContractDef, PlanView, PlanBounds } from './planTree';
 
 // ── State ──────────────────────────────────────────────────────────────────
 
@@ -239,6 +239,15 @@ let planPaneActive = false;
 let planData: PlanTreeData | null = null;
 let planContractsById = new Map<string, PlanContractDef>();
 
+// Persisted pan/zoom (a transform on the #pw-viewport group). Survives the 2s poll re-render because
+// renderPlan feeds it back into renderPlanTree; auto-fit runs once per session (planFittedSession).
+let planView: PlanView = { k: 1, tx: 0, ty: 0 };
+let planBounds: PlanBounds = { width: 0, height: 0 };
+let planFittedSession: string | null = null;
+// Set true when a pointer drag crosses the pan threshold, so the ensuing click doesn't also select
+// a node. Shared between the pan handler and the node-click handler; reset at each pointerdown.
+let planPanMoved = false;
+
 const planSvg = document.getElementById('plan-svg') as unknown as SVGSVGElement | null;
 const planEmpty = document.getElementById('plan-empty') as HTMLElement | null;
 const planDetail = document.getElementById('plan-detail') as HTMLElement | null;
@@ -247,6 +256,24 @@ const planDetailBody = document.getElementById('plan-detail-body') as HTMLElemen
 
 function requestPlanTree(): void {
   vscode.postMessage({ type: 'pathways.loadPlanTree' });
+}
+
+// Apply the current pan/zoom by updating only the viewport group's transform — no re-render, so
+// dragging/zooming stays smooth regardless of tree size.
+function applyPlanTransform(): void {
+  const vp = document.getElementById('pw-viewport');
+  if (vp) { vp.setAttribute('transform', `translate(${planView.tx} ${planView.ty}) scale(${planView.k})`); }
+}
+
+function planViewportSize(): { w: number; h: number } {
+  const r = planSvg?.getBoundingClientRect();
+  return { w: r?.width ?? 0, h: r?.height ?? 0 };
+}
+
+function fitPlan(): void {
+  const { w, h } = planViewportSize();
+  planView = fitView(planBounds, w, h);
+  applyPlanTransform();
 }
 
 // Sub-tab toggle: plain display swap of the two panes (the .active class is reserved for the outer
@@ -267,7 +294,7 @@ for (const tab of Array.from(document.querySelectorAll('.pw-tab'))) {
   });
 }
 
-function renderPlan(): void {
+function renderPlan(sessionId?: string): void {
   if (!planSvg) { return; }
   const hasNodes = !!planData && planData.nodes.length > 0;
   if (planEmpty) {
@@ -275,13 +302,64 @@ function renderPlan(): void {
     if (!hasNodes) { planEmpty.textContent = planData ? 'No plan recorded for this session yet.' : 'Select a session to view its plan.'; }
   }
   planSvg.style.display = hasNodes ? 'block' : 'none';
-  if (hasNodes && planData) { renderPlanTree(planSvg, planData); }
+  if (hasNodes && planData) {
+    planBounds = renderPlanTree(planSvg, planData, planView);
+    // Auto-fit once when a session's plan first appears; afterwards the user's pan/zoom is preserved
+    // across the poll re-renders (planView is passed straight back into renderPlanTree above).
+    if (sessionId && sessionId !== planFittedSession) {
+      planFittedSession = sessionId;
+      fitPlan();
+    }
+  }
 }
+
+// Scroll to zoom around the cursor; the world point under the cursor stays put.
+if (planSvg) {
+  planSvg.addEventListener('wheel', (ev) => {
+    if (!planData) { return; }
+    ev.preventDefault();
+    const r = planSvg.getBoundingClientRect();
+    const sx = ev.clientX - r.left, sy = ev.clientY - r.top;
+    const factor = Math.exp(-ev.deltaY * 0.0015);
+    const k2 = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, planView.k * factor));
+    planView = {
+      k: k2,
+      tx: sx - ((sx - planView.tx) / planView.k) * k2,
+      ty: sy - ((sy - planView.ty) / planView.k) * k2,
+    };
+    applyPlanTransform();
+  }, { passive: false });
+
+  // Drag anywhere to pan. Past a small threshold sets planPanMoved so the ensuing click is treated
+  // as the end of a pan (see the node-click handler) rather than a node select.
+  let panning = false, startX = 0, startY = 0, startTx = 0, startTy = 0;
+  planSvg.addEventListener('pointerdown', (ev) => {
+    panning = true; planPanMoved = false;
+    startX = ev.clientX; startY = ev.clientY; startTx = planView.tx; startTy = planView.ty;
+    try { planSvg.setPointerCapture(ev.pointerId); } catch { /* capture best-effort */ }
+  });
+  planSvg.addEventListener('pointermove', (ev) => {
+    if (!panning) { return; }
+    const dx = ev.clientX - startX, dy = ev.clientY - startY;
+    if (!planPanMoved && Math.hypot(dx, dy) > 3) { planPanMoved = true; planSvg.classList.add('pw-panning'); }
+    if (planPanMoved) { planView = { ...planView, tx: startTx + dx, ty: startTy + dy }; applyPlanTransform(); }
+  });
+  const endPan = (ev: PointerEvent): void => {
+    if (!panning) { return; }
+    panning = false; planSvg.classList.remove('pw-panning');
+    try { planSvg.releasePointerCapture(ev.pointerId); } catch { /* pointer already released */ }
+  };
+  planSvg.addEventListener('pointerup', endPan);
+  planSvg.addEventListener('pointercancel', endPan);
+}
+
+document.getElementById('plan-fit-btn')?.addEventListener('click', fitPlan);
 
 // Click a node → detail drawer, rendered from already-loaded data (no round-trip). Delegated so it
 // survives re-renders; reads data-wu off the node group (no inline handlers — CSP blocks them).
 if (planSvg) {
   planSvg.addEventListener('click', (ev) => {
+    if (planPanMoved) { planPanMoved = false; return; }  // this click ended a pan, not a select
     let node = ev.target as Element | null;
     while (node && node !== planSvg && !(node as HTMLElement).dataset?.wu) { node = node.parentElement; }
     const wu = node && (node as HTMLElement).dataset ? (node as HTMLElement).dataset.wu : undefined;
@@ -928,7 +1006,7 @@ window.addEventListener('message', (event: MessageEvent) => {
   if (msg.type === 'pathways.planTree') {
     planData = (msg.data as PlanTreeData | null) ?? null;
     planContractsById = new Map((planData?.contracts ?? []).map((c) => [c.contractId, c]));
-    renderPlan();
+    renderPlan(msg.sessionId as string | undefined);
     return;
   }
 

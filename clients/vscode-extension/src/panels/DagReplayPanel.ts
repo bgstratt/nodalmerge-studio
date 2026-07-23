@@ -704,13 +704,17 @@ const DAG_REPLAY_CSS = `
       padding: 3px 14px; font-size: 0.72em; opacity: 0.6;
       border-bottom: 1px solid var(--nm-border); flex-shrink: 0;
     }
-    #plan-scroll { flex: 1; overflow: auto; padding: 8px; position: relative; }
-    #plan-svg { display: block; min-width: 400px; min-height: 120px; }
+    /* The SVG fills the pane; pan/zoom is a transform on the inner viewport group, so there's no
+       scroll reflow and the view persists across the poll-driven re-render. */
+    #plan-scroll { flex: 1; overflow: hidden; position: relative; }
+    #plan-svg { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+    #plan-svg.pw-panning, #plan-svg.pw-panning .clickable { cursor: grabbing; }
     #plan-svg text { font-family: var(--nm-font); }
     /* Only the node label is themed to the fg color; the status/kind tags keep their own fill. A
        CSS rule is required because SVG presentation attributes can't resolve var(). */
     #plan-svg text.pw-node-label { fill: var(--nm-fg); }
     #plan-svg .clickable { cursor: pointer; }
+    .pw-fit-btn { font-size: 0.85em; padding: 1px 8px; margin-left: auto; flex-shrink: 0; }
     .pw-plan-empty { opacity: 0.6; padding: 24px; text-align: center; }
     #plan-detail {
       border-top: 1px solid var(--nm-border); max-height: 420px; overflow-y: auto;
@@ -799,6 +803,7 @@ const DAG_REPLAY_HTML = `
       <span style="opacity:0.85"><svg width="20" height="8" style="vertical-align:-1px"><line x1="0" y1="4" x2="20" y2="4" stroke="#8a8a8a" stroke-width="1.5"/></svg> decomposes</span>
       <span style="opacity:0.85"><svg width="20" height="8" style="vertical-align:-1px"><line x1="0" y1="4" x2="20" y2="4" stroke="#cca700" stroke-width="1.5" stroke-dasharray="3 2"/></svg> depends on</span>
       <span style="opacity:0.85"><svg width="20" height="8" style="vertical-align:-1px"><line x1="0" y1="4" x2="16" y2="4" stroke="#c586c0" stroke-width="1.5"/><path d="M16 1.5 L20 4 L16 6.5 Z" fill="#c586c0"/></svg> contract</span>
+      <button id="plan-fit-btn" class="pw-fit-btn ghost" title="Fit the whole plan to view (drag to pan, scroll to zoom)">⤢ Fit</button>
     </div>
     <div id="plan-scroll">
       <svg id="plan-svg"></svg>

@@ -42,6 +42,23 @@ export interface PlanTreeData {
   contracts: PlanContractDef[];
 }
 
+/** Persisted pan/zoom of the plan canvas (a transform on the viewport group). */
+export interface PlanView { k: number; tx: number; ty: number; }
+
+/** Content bounds in world units, returned so the caller can compute a fit transform. */
+export interface PlanBounds { width: number; height: number; }
+
+export const MIN_ZOOM = 0.2;
+export const MAX_ZOOM = 3;
+
+/** Center `bounds` in a `vw`×`vh` viewport at a scale that fits (never enlarging past 1:1). */
+export function fitView(bounds: PlanBounds, vw: number, vh: number): PlanView {
+  if (bounds.width <= 0 || bounds.height <= 0 || vw <= 0 || vh <= 0) { return { k: 1, tx: 0, ty: 0 }; }
+  const pad = 28;
+  const k = Math.max(MIN_ZOOM, Math.min(1, (vw - pad) / bounds.width, (vh - pad) / bounds.height));
+  return { k, tx: (vw - bounds.width * k) / 2, ty: (vh - bounds.height * k) / 2 };
+}
+
 // Layout constants (px).
 const NODE_W = 168;
 const NODE_H = 38;
@@ -147,18 +164,18 @@ function siblingPath(from: Box, to: Box): string {
 }
 
 /**
- * Render `data` into `svg`. Returns nothing; click handling is delegated by the caller reading
- * `data-wu` off `.clickable` node groups. `esc` is main.ts's escHtml (for the `<title>` tooltip text
- * we set via textContent it isn't strictly needed, but kept for any attribute use).
+ * Render `data` into `svg`, laying the tree out inside a transformed viewport group (id
+ * `pw-viewport`) so pan/zoom is a cheap attribute update the caller can drive without a re-render,
+ * and it survives the poll-driven re-render (the caller passes the persisted `view` back in).
+ * Returns the content bounds so the caller can compute a fit. Click handling is delegated by the
+ * caller reading `data-wu` off `.clickable` node groups.
  */
-export function renderPlanTree(svg: SVGSVGElement, data: PlanTreeData): void {
+export function renderPlanTree(svg: SVGSVGElement, data: PlanTreeData, view: PlanView): PlanBounds {
   svg.textContent = '';
   const { pos, width, height } = layout(data.nodes);
-  svg.setAttribute('width', String(width));
-  svg.setAttribute('height', String(height));
-  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
 
-  // Arrowhead for contract edges (direction = provider → consumer).
+  // Arrowhead for contract edges (direction = provider → consumer). Lives in <defs> outside the
+  // viewport — markers resolve by id regardless of tree position.
   const defs = el('defs', {});
   const marker = el('marker', {
     id: 'pw-arrow', viewBox: '0 0 8 8', refX: 7, refY: 4,
@@ -168,16 +185,19 @@ export function renderPlanTree(svg: SVGSVGElement, data: PlanTreeData): void {
   defs.appendChild(marker);
   svg.appendChild(defs);
 
+  const viewport = el('g', { id: 'pw-viewport', transform: `translate(${view.tx} ${view.ty}) scale(${view.k})` });
+  svg.appendChild(viewport);
+
   // Edges first (under the nodes).
   for (const edge of data.edges) {
     const from = pos.get(edge.from), to = pos.get(edge.to);
     if (!from || !to) { continue; }
     if (edge.kind === 'parent') {
-      svg.appendChild(el('path', { d: edgePath(from, to), fill: 'none', stroke: EDGE_COLORS.parent, 'stroke-width': 1.5, opacity: 0.7 }));
+      viewport.appendChild(el('path', { d: edgePath(from, to), fill: 'none', stroke: EDGE_COLORS.parent, 'stroke-width': 1.5, opacity: 0.7 }));
     } else if (edge.kind === 'depends') {
-      svg.appendChild(el('path', { d: siblingPath(from, to), fill: 'none', stroke: EDGE_COLORS.depends, 'stroke-width': 1.5, 'stroke-dasharray': '4 3', opacity: 0.8 }));
+      viewport.appendChild(el('path', { d: siblingPath(from, to), fill: 'none', stroke: EDGE_COLORS.depends, 'stroke-width': 1.5, 'stroke-dasharray': '4 3', opacity: 0.8 }));
     } else {
-      svg.appendChild(el('path', { d: siblingPath(from, to), fill: 'none', stroke: EDGE_COLORS.contract, 'stroke-width': 1.5, opacity: 0.9, 'marker-end': 'url(#pw-arrow)' }));
+      viewport.appendChild(el('path', { d: siblingPath(from, to), fill: 'none', stroke: EDGE_COLORS.contract, 'stroke-width': 1.5, opacity: 0.9, 'marker-end': 'url(#pw-arrow)' }));
     }
   }
 
@@ -216,8 +236,10 @@ export function renderPlanTree(svg: SVGSVGElement, data: PlanTreeData): void {
     title.textContent = `${n.goal}\n[${n.status}${n.currentStage ? ' · ' + n.currentStage : ''}${n.kind === 'compound' ? ' · compound' : ''}]`;
     g.appendChild(title);
 
-    svg.appendChild(g);
+    viewport.appendChild(g);
   }
+
+  return { width, height };
 }
 
 /** Detail-drawer HTML for a clicked node — the "actual goal from the metadata" plus slice detail. */
