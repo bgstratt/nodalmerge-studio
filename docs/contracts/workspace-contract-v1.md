@@ -163,11 +163,19 @@ the exact same shape `nm_v1_artifact_record_plan`/`ArtifactRecordPlan` already n
 native planner — `FanOutService.ReadPlanFromArtifactAsync` folds either source identically.
 
 ```csharp
-public sealed record WorkspaceContractPlan(IReadOnlyList<WorkspaceContractPlanSlice> Slices);
+public sealed record WorkspaceContractPlan(
+    IReadOnlyList<WorkspaceContractPlanSlice> Slices,
+    IReadOnlyList<PlanContract>? Contracts = null);
 
 public sealed record WorkspaceContractPlanSlice(
     string SliceId, string Goal, IReadOnlyList<string> FileScope,
-    IReadOnlyList<string> DependsOn, IReadOnlyList<string> Steps);
+    IReadOnlyList<string> DependsOn, IReadOnlyList<string> Steps,
+    PlanSliceKind Kind = PlanSliceKind.Leaf,          // "leaf" (default) | "compound"
+    IReadOnlyList<string>? Provides = null,           // contractIds this slice implements
+    IReadOnlyList<string>? Consumes = null);          // contractIds this slice depends on
+
+public sealed record PlanContract(
+    string ContractId, string Description, IReadOnlyList<string> Schema);
 ```
 
 JSON shape (property names are the wire contract, not the C# property names above):
@@ -191,6 +199,31 @@ non-empty `sliceId` and `goal`; `fileScope`/`dependsOn`/`steps` may be empty arr
 or a missing required field fails the run with a clear reason (native replan can pick it up) rather
 than silently folding a partial plan — this is the one place WC-3's "producers may add optional
 fields" principle does not extend to "consumers accept a structurally invalid document."
+
+**Optional recursive-planning / peer-contract fields (all default to today's flat behavior when
+omitted — see `plans/recursive-planning-spike.md`):**
+
+- `"kind"`: `"leaf"` (default) or `"compound"`. A `compound` slice is re-planned by a sub-planner
+  instead of run by a worker, subject to the runtime's `Workspace:MaxPlanDepth` cap (default `1` =
+  no compound routing, exactly today's behavior). A `compound` slice at the depth ceiling is demoted
+  to a worker.
+- `"provides"` / `"consumes"`: lists of `contractId` strings a slice implements or calls.
+- top-level `"contracts"`: parent-authored interfaces two peer slices agree on. Each is
+  `{ "contractId", "description", "schema": [...] }`. The contract is injected into both the producer
+  and consumer worker (so disjoint-fileScope peers build against the same declaration) and into the
+  reviewer, which rejects a change that does not conform.
+
+```json
+{
+  "slices": [
+    { "sliceId": "api", "goal": "user endpoint", "fileScope": ["src/Api.cs"], "dependsOn": [], "steps": ["…"], "provides": ["c-user"] },
+    { "sliceId": "ui",  "goal": "user page",     "fileScope": ["src/Ui.cs"],  "dependsOn": [], "steps": ["…"], "consumes": ["c-user"] }
+  ],
+  "contracts": [
+    { "contractId": "c-user", "description": "user endpoint", "schema": ["GET /api/user -> { id: string, name: string }"] }
+  ]
+}
+```
 
 A non-empty diff outside `.workspace/` on a Plan-mode run (the harness edited a source file despite
 the kickoff/allowlist) is discarded — never proposed, never merged — and recorded as a

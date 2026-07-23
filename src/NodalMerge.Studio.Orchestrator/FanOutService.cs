@@ -34,6 +34,7 @@ public sealed class FanOutService : IFanOutService
     private readonly IPolicyGateService _policyGate;
     private readonly IAgentProfileService _agentProfiles;
     private readonly IMergeService _merge;
+    private readonly WorkspaceOptions _options;
 
     public FanOutService(
         IWorkUnitService workUnits,
@@ -47,7 +48,8 @@ public sealed class FanOutService : IFanOutService
         IOrchestrationDecisionLogService decisionLog,
         IPolicyGateService policyGate,
         IAgentProfileService agentProfiles,
-        IMergeService merge)
+        IMergeService merge,
+        WorkspaceOptions options)
     {
         _workUnits         = workUnits;
         _orchestrator      = orchestrator;
@@ -61,6 +63,7 @@ public sealed class FanOutService : IFanOutService
         _agentProfiles     = agentProfiles;
         _policyGate        = policyGate;
         _merge             = merge;
+        _options           = options;
     }
 
     public Task<FanOutResult> TryFanOutFromPlanAsync(
@@ -123,6 +126,21 @@ public sealed class FanOutService : IFanOutService
             var credRootId = await ResolveCredentialRootAsync(parentWorkUnitId, ct).ConfigureAwait(false);
             var creds = _agentControl.GetCredentialsForStage(credRootId, PipelineStage.Execute)
                 ?? _agentControl.GetGoalDefaultCredentials(credRootId);
+            // plans/recursive-planning-spike.md — review wiring the root goal carries. GetAutoReviewProfileId
+            // is a direct per-workUnitId lookup with NO walk to root, so a Compound child spawned as an
+            // orchestrator must be given the root's autoReviewProfileId / enabledDomainAgents explicitly —
+            // otherwise its own registration shadows the resolution with null and its subtree's automated
+            // review silently falls back. Resolved from credRootId (the goal root, which has the registration).
+            var rootAutoReviewProfileId = _agentControl.GetAutoReviewProfileId(credRootId);
+            var rootEnabledDomainAgents = _agentControl.GetEnabledDomainAgents(credRootId);
+
+            // plans/recursive-planning-spike.md S2/S3 — the route decision reads the child's stored
+            // slice Kind (WorkUnitFanOutInfo.Kind) and compares each child's depth (parentDepth + 1)
+            // against the effective cap: the goal's per-goal override (propagated onto every unit)
+            // when set, else the global WorkspaceOptions.MaxPlanDepth.
+            var parentDepth = await ComputePlanDepthAsync(parentWorkUnitId, ct).ConfigureAwait(false);
+            var effectiveMaxDepth = parent.MaxPlanDepthOverride ?? _options.MaxPlanDepth;
+
             var children = await _workUnits.GetChildrenAsync(parentWorkUnitId, ct).ConfigureAwait(false);
             foreach (var child in children)
             {
@@ -138,7 +156,46 @@ public sealed class FanOutService : IFanOutService
 
                 await RefreshBranchFromDependenciesAsync(sequenced, parent.BranchId, ct).ConfigureAwait(false);
 
-                if (await EnqueueChildWorkerAsync(sequenced, parentWorkUnitId, credRootId, creds, sessionId, ct).ConfigureAwait(false))
+                var isCompound = sequenced.FanOutInfo?.Kind == PlanSliceKind.Compound;
+                var underCap = (parentDepth + 1) < effectiveMaxDepth;
+
+                if (isCompound && underCap)
+                {
+                    // Route a Compound slice under the cap to a *sub-planner* instead of a worker by
+                    // spawning it as an orchestrator — exactly what ReconciliationAgentService does for
+                    // a reconciliation unit. This runs StartGoalAsync → ConvergeAsync(ensurePlanner:
+                    // true) → EnsurePlannerAsync on the child, reusing the full Plan-stage credential
+                    // ladder and SpawnPlanner logging. The child then plans itself, fans out its own
+                    // grandchildren (via the Plan-stage release branch), reconciles them, and proposes
+                    // up to this parent — recursion and the bottom-up roll-up close with no new
+                    // machinery. The Execute-stage `creds` passed here only satisfy the spawn's
+                    // canStartLoop gate; EnsurePlannerAsync re-resolves Plan-stage creds keyed by the
+                    // goal root. Idempotent: EnsurePlannerAsync's enqueue transitions the child off
+                    // Created → Queued, so IsReadyToEnqueueAsync skips it on every later sweep.
+                    await _agentControl.SpawnAsync(
+                        "orchestrator",
+                        sequenced.WorkUnitId,
+                        model: creds?.Model,
+                        baseUrl: creds?.BaseUrl,
+                        apiKey: creds?.ApiKey,
+                        provider: creds?.Provider,
+                        profileId: creds?.ProfileId,
+                        autoReviewProfileId: rootAutoReviewProfileId,
+                        enabledDomainAgents: rootEnabledDomainAgents,
+                        credentialRef: creds?.CredentialRef,
+                        cancellationToken: ct).ConfigureAwait(false);
+
+                    actions.Add(FanOutAction.ChildEnqueued);
+                    enqueued.Add(sequenced.WorkUnitId);
+                    continue;
+                }
+
+                // A Compound slice that fails the cap (child depth at/over MaxPlanDepth) is forced to
+                // a worker. That is the signature of a planner overshooting its remaining depth budget
+                // — recorded as `demotedFromCompound` so the plan-quality eval can count it.
+                var demotedFromCompound = isCompound && !underCap;
+
+                if (await EnqueueChildWorkerAsync(sequenced, parentWorkUnitId, credRootId, creds, demotedFromCompound, sessionId, ct).ConfigureAwait(false))
                 {
                     actions.Add(FanOutAction.ChildEnqueued);
                     enqueued.Add(sequenced.WorkUnitId);
@@ -242,6 +299,10 @@ public sealed class FanOutService : IFanOutService
                     taskReviewPolicy: parent.TaskReviewPolicy,
                     taskReviewHybridTimeoutMinutes: parent.TaskReviewHybridTimeoutMinutes,
                     bypassPromotionBranch: parent.BypassPromotionBranch,
+                    sliceKind: slice.Kind,
+                    // Propagate the per-goal depth override down so every unit in the tree reads its own
+                    // effective ceiling (mirrors BypassPromotionBranch's propagation above).
+                    maxPlanDepthOverride: parent.MaxPlanDepthOverride,
                     cancellationToken: ct).ConfigureAwait(false);
 
                 sliceIdToWorkUnitId[slice.SliceId] = child.WorkUnitId;
@@ -450,6 +511,7 @@ public sealed class FanOutService : IFanOutService
         string parentWorkUnitId,
         string credRootId,
         GoalDefaultCredentials? creds,
+        bool demotedFromCompound,
         string? sessionId,
         CancellationToken ct)
     {
@@ -565,6 +627,9 @@ public sealed class FanOutService : IFanOutService
                 selectedProfileId = selection.ProfileId,
                 usedLlm = selection.UsedLlm,
                 matchedPattern,
+                // plans/recursive-planning-spike.md S3 — true when this child's slice was marked
+                // Compound but the depth cap forced it to a worker. The free depth-overshoot counter.
+                demotedFromCompound,
             }),
             OrchestrationAction.Enqueue,
             [child.WorkUnitId],
@@ -597,6 +662,26 @@ public sealed class FanOutService : IFanOutService
             rootId = parentId;
         }
         return rootId;
+    }
+
+    // plans/recursive-planning-spike.md S2 — planning depth = the number of ancestor work units.
+    // The root goal is depth 0, a root slice's unit is depth 1, a grandchild is depth 2. Same
+    // bounded parent-walk as ResolveCredentialRootAsync (never write a second unbounded walk); a
+    // missing parent mid-walk stops and returns the count so far. Used by the S3 route decision:
+    // a Compound slice's child (whose depth = parentDepth + 1) may sub-plan iff it is < MaxPlanDepth.
+    private async Task<int> ComputePlanDepthAsync(string workUnitId, CancellationToken ct)
+    {
+        var depth = 0;
+        var currentId = workUnitId;
+        for (var hop = 0; hop < 32; hop++)
+        {
+            var unit = await _workUnits.GetAsync(currentId, ct).ConfigureAwait(false);
+            if (unit?.ParentWorkUnitId is not { } parentId)
+                break;
+            depth++;
+            currentId = parentId;
+        }
+        return depth;
     }
 
     // Slice 14c — "matches every path" means every entry in the child's fileScope is covered by

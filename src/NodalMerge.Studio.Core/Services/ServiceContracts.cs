@@ -1012,6 +1012,11 @@ public interface IOrchestratorService
         IReadOnlyList<string>? reconciliationSourceProposalIds = null,
         IReadOnlyList<string>? reconciliationTargetPaths = null,
         string? reconciliationSourceRef = null,
+        // plans/recursive-planning-spike.md — the plan slice's leaf/compound kind, stored on the
+        // child's FanOutInfo so the scheduler's re-plan guard can admit a Compound sub-slice.
+        PlanSliceKind sliceKind = PlanSliceKind.Leaf,
+        // plans/recursive-planning-spike.md — per-goal recursion-depth override (null = global default).
+        int? maxPlanDepthOverride = null,
         CancellationToken cancellationToken = default);
 
     Task AssignWorkAsync(string workUnitId, string agentId, CancellationToken cancellationToken = default);
@@ -1037,6 +1042,8 @@ public sealed record WorkUnitCreateCommand(
     bool BypassPromotionBranch = false,
     string? SeedFromBranchId = null,
     WorkUnitExpectedOutputKind? ExpectedOutputKind = null,
+    // plans/recursive-planning-spike.md — per-goal recursion-depth override (null = global default).
+    int? MaxPlanDepthOverride = null,
     // Slice 19 — references an already-registered IRepositoryRegistryService entry by id.
     // Resolved to a path by WorkUnitCommandService.CreateAsync, which takes priority over
     // RepositoryPath when both are given.

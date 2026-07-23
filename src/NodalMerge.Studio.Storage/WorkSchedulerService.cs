@@ -89,7 +89,10 @@ public sealed class WorkSchedulerService : IWorkScheduler, IRehydratable
             var target = workUnitsForGuard is not null
                 ? await workUnitsForGuard.GetAsync(workUnitId, ct).ConfigureAwait(false)
                 : null;
-            if (target?.FanOutInfo?.SliceId is not null)
+            // plans/recursive-planning-spike.md — a Compound slice is *meant* to be re-planned by a
+            // sub-planner (that is what makes it compound), so it is exempt from this leaf guard.
+            // A Leaf slice (the default) still cannot be planned directly.
+            if (target?.FanOutInfo?.SliceId is not null && target.FanOutInfo.Kind != PlanSliceKind.Compound)
             {
                 throw new InvalidOperationException(
                     $"Work unit '{workUnitId}' is already an atomic leaf slice (sliceId " +

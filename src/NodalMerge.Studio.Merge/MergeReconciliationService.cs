@@ -110,6 +110,28 @@ public sealed class MergeReconciliationService(
                     Detail: $"Child {child.WorkUnitId}'s proposal record '{proposalRef.ArtifactId}' could not be loaded.");
             }
 
+            // Does this child individually auto-apply its own proposal (Approved -> Merged) the
+            // moment it's approved? That's exactly MergeCommandService.ProposeAsync's Slice-20b
+            // auto-apply condition, replicated here per-child: AutoApplyOnPropose on (default true)
+            // AND an AgentApproval/Hybrid effective policy. When true, the child finalizes itself
+            // staggered — the instant its inline reviewer approves, its own fire-and-forget
+            // ApplyAsync races to fold it into merge/{parent} and flip it to Merged. If this
+            // reconcile pass folded such a child at merely Approved (the eager child-approve-time
+            // trigger at InMemoryMergeService.AutomatedReviewAsync does fire TryReconcileAsync then),
+            // it would SupersedeAsync the live Approved proposal out from under that in-flight
+            // self-apply, whose ApplyAsync then throws on a Superseded proposal and strands the
+            // child. So for a self-applying child, wait for Merged — let its own apply finish first;
+            // the all-children-Merged reconcile that TryCompleteParentIfAllChildrenTerminalAsync
+            // re-drives on the LAST child's apply is the one that folds the batch. A child that does
+            // NOT self-apply (HumanRequired, or AutoApplyOnPropose off) never individually merges —
+            // it's folded at Approved exactly as before.
+            var childSelfApplies =
+                (options?.AutoApplyOnPropose ?? true)
+                && (WorkspaceReviewScope.AppliesToRealRepo(child)
+                        ? child.WorkspaceReviewPolicy
+                        : child.TaskReviewPolicy)
+                    is ReviewPolicy.AgentApproval or ReviewPolicy.Hybrid;
+
             if (proposal.Status is MergeProposalStatus.Superseded)
             {
                 // ITaskReconciliationTrigger superseded this child's own proposal after resolving a
@@ -140,12 +162,17 @@ public sealed class MergeReconciliationService(
             // the reconciled workspace proposal without a human ever having approved that task.
             // Rejected proposals are excluded too — a rejection means the task is being retried
             // (see AutomatedReviewGateService.HandleHumanRejectionAsync), not ready to fold in.
-            else if (proposal.Status is not (MergeProposalStatus.Approved or MergeProposalStatus.Merged))
+            // A self-applying child must be Merged, not merely Approved (see childSelfApplies above):
+            // folding it at Approved would race its own in-flight auto-apply and strand it.
+            else if (childSelfApplies
+                ? proposal.Status is not MergeProposalStatus.Merged
+                : proposal.Status is not (MergeProposalStatus.Approved or MergeProposalStatus.Merged))
             {
+                var requiredStates = childSelfApplies ? "Merged" : "Approved or Merged";
                 return new MergeReconciliationResult(
                     MergeReconciliationOutcome.WaitingForChildren,
                     Detail: $"Child {child.WorkUnitId}'s proposal {proposal.ProposalId} is {proposal.Status} — " +
-                        "it must clear its review gate (Approved or Merged) before its changes can be folded in.");
+                        $"it must clear its review gate ({requiredStates}) before its changes can be folded in.");
             }
 
             childProposals.Add((child, proposal));

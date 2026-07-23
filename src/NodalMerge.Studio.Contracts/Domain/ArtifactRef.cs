@@ -28,6 +28,12 @@ public enum ArtifactType
     // ProjectionType.EngineeringState fold from these forward Supersedes links, never stored back
     // onto the superseded artifact.
     Supersession,
+    // A parent-authored peer interface (PlanContract) two sibling slices agree on — a producer that
+    // provides it and a consumer that consumes it. The authoritative source is the parent plan.json's
+    // `contracts[]` (PlanDocument.Contracts); worker projection and reviewer conformance both read it
+    // from there. This enum value is the forward-looking materialization target for surfacing a
+    // contract as its own queryable/visualizable artifact — not yet recorded standalone.
+    Contract,
 }
 
 public enum ArtifactStatus

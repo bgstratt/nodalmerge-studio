@@ -95,14 +95,20 @@ public sealed record WorkspaceContractOutboxEntry(int Number, string Answer);
 /// that being a contract-breaking change for an external harness.
 /// </summary>
 public sealed record WorkspaceContractPlan(
-    [property: JsonPropertyName("slices")] IReadOnlyList<WorkspaceContractPlanSlice> Slices);
+    [property: JsonPropertyName("slices")] IReadOnlyList<WorkspaceContractPlanSlice> Slices,
+    [property: JsonPropertyName("contracts")] IReadOnlyList<PlanContract>? Contracts = null);
 
 public sealed record WorkspaceContractPlanSlice(
     [property: JsonPropertyName("sliceId")] string SliceId,
     [property: JsonPropertyName("goal")] string Goal,
     [property: JsonPropertyName("fileScope")] IReadOnlyList<string> FileScope,
     [property: JsonPropertyName("dependsOn")] IReadOnlyList<string> DependsOn,
-    [property: JsonPropertyName("steps")] IReadOnlyList<string> Steps);
+    [property: JsonPropertyName("steps")] IReadOnlyList<string> Steps,
+    // Mirrors PlanSlice field-for-field (see PlanDocument.cs); trailing + defaulted keeps the
+    // versioned external Workspace Contract surface back-compatible for existing harness plans.
+    [property: JsonPropertyName("kind")] PlanSliceKind Kind = PlanSliceKind.Leaf,
+    [property: JsonPropertyName("provides")] IReadOnlyList<string>? Provides = null,
+    [property: JsonPropertyName("consumes")] IReadOnlyList<string>? Consumes = null);
 
 /// <summary>
 /// The full set of runtime→harness files assembled for one work unit's spawn — what

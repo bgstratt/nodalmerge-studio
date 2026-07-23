@@ -60,6 +60,8 @@ interface StudioOptions {
   allowAutoRequeue?: boolean;
   blockConflictingOps?: boolean;
   materializerConcurrency?: number;
+  maxPlanDepth?: number;
+  maxFailureAttempts?: number;
   defaultClarificationTimeoutSeconds?: number | null;
   defaultClarificationTimeoutBehavior?: string;
 }
@@ -672,6 +674,7 @@ export class GoalWorkspacePanel {
             !!msg.bypassPromotionBranch,
             (msg.forkConfig as Array<{ profileId: string; constraintHint?: string }>) || [],
             (msg.referenceFiles as Array<{ repositoryId: string; path: string }>) || [],
+            (msg.maxPlanDepthOverride as number) || undefined,
           );
           break;
         case 'explorerAddReference':
@@ -745,6 +748,12 @@ export class GoalWorkspacePanel {
           break;
         case 'explorerSetMaterializerConcurrency':
           await this.updateOptions({ materializerConcurrency: msg.value as number });
+          break;
+        case 'explorerSetMaxPlanDepth':
+          await this.updateOptions({ maxPlanDepth: msg.value as number });
+          break;
+        case 'explorerSetMaxFailureAttempts':
+          await this.updateOptions({ maxFailureAttempts: msg.value as number });
           break;
         case 'explorerSetClarificationTimeoutSeconds':
           await this.updateOptions({ defaultClarificationTimeoutSeconds: msg.value as number });
@@ -1155,6 +1164,7 @@ export class GoalWorkspacePanel {
     bypassPromotionBranch?: boolean,
     forkConfig?: Array<{ profileId: string; constraintHint?: string }>,
     referenceFiles?: Array<{ repositoryId: string; path: string }>,
+    maxPlanDepthOverride?: number,
   ): Promise<void> {
     const referenceFilesPatch = referenceFiles && referenceFiles.length ? { referenceFiles } : {};
     if (!goal || !goal.trim()) {
@@ -1270,6 +1280,7 @@ export class GoalWorkspacePanel {
           ...(taskReviewHybridTimeoutMinutes ? { taskReviewHybridTimeoutMinutes } : {}),
           ...(workspaceReviewHybridTimeoutMinutes ? { workspaceReviewHybridTimeoutMinutes } : {}),
           bypassPromotionBranch: !!bypassPromotionBranch,
+          ...(maxPlanDepthOverride ? { maxPlanDepthOverride } : {}),
         };
         // Create a parent work unit to hold both model runs
         const parentWu = await this.post<{ workUnitId: string }>('/studio/workunits', {
@@ -1409,6 +1420,7 @@ export class GoalWorkspacePanel {
         ...(taskReviewHybridTimeoutMinutes ? { taskReviewHybridTimeoutMinutes } : {}),
         ...(workspaceReviewHybridTimeoutMinutes ? { workspaceReviewHybridTimeoutMinutes } : {}),
         bypassPromotionBranch: !!bypassPromotionBranch,
+        ...(maxPlanDepthOverride ? { maxPlanDepthOverride } : {}),
         ...(repositoryPath ? { repositoryPath } : {}),
         ...referenceFilesPatch,
       });
@@ -2033,6 +2045,10 @@ const GW_HTML = `
       <label class="gw-radio-option"><input type="radio" name="gw-target" value="candidate" checked/> Candidate Branch</label>
       <label class="gw-radio-option"><input type="radio" name="gw-target" value="direct"/> Direct</label>
     </div>
+    <div class="gw-radio-group" title="How many planning layers this goal may use (recursive planning). Pre-filled with the global default; change it to override just this goal.">
+      <span class="gw-radio-group-label">Plan depth</span>
+      <input type="number" id="gw-goal-plan-depth" min="1" max="10" step="1" style="width:56px"/>
+    </div>
   </div>
   <div class="gw-reference-row">
     <span class="gw-radio-group-label">References</span>
@@ -2068,6 +2084,17 @@ const GW_HTML = `
     <label class="gw-settings-row">
       Scheduler poll interval (ms)
       <input type="number" id="gw-scheduler-poll-interval" min="100" step="100" style="width:80px"/>
+    </label>
+    <label class="gw-settings-row">
+      Max auto-retries
+      <input type="number" id="gw-max-failure-attempts" min="1" max="10" step="1" style="width:60px" title="Automated attempts before a work unit dead-letters for a human. Governs review-rejection revises and worker failures. 1 = one shot then escalate; higher = more lenient auto-fixing. Human/explicit retries are never capped."/>
+    </label>
+    <label class="gw-settings-row" style="margin-top:8px;border-top:1px solid var(--nm-border);padding-top:8px">
+      Planning
+    </label>
+    <label class="gw-settings-row">
+      Max plan depth
+      <input type="number" id="gw-max-plan-depth" min="1" max="10" step="1" style="width:60px" title="1 = flat fan-out (a slice is always a worker). >1 lets a planner mark a slice 'compound' so a sub-planner re-slices it, up to this many levels."/>
     </label>
     <label class="gw-settings-row" style="margin-top:8px;border-top:1px solid var(--nm-border);padding-top:8px">
       Pipeline Gates

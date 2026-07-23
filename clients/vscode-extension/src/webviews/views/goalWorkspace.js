@@ -226,6 +226,12 @@ export function init(ctx) {
       ? parseInt(taskMinutesEl.value.trim(), 10) : undefined;
     var workspaceMinutes = (workspaceReviewPolicy === 'Hybrid' && workspaceMinutesEl && workspaceMinutesEl.value.trim())
       ? parseInt(workspaceMinutesEl.value.trim(), 10) : undefined;
+    var planDepthEl = $('gw-goal-plan-depth');
+    var planDepthVal = planDepthEl ? parseInt(planDepthEl.value, 10) : NaN;
+    var globalDepth = (state && state.globalMaxPlanDepth) || 1;
+    // Send a per-goal override only when the user set it to something other than the global default;
+    // otherwise the goal just follows the global setting.
+    var maxPlanDepthOverride = (!isNaN(planDepthVal) && planDepthVal >= 1 && planDepthVal !== globalDepth) ? planDepthVal : undefined;
     vscode.postMessage({
       type: 'explorerRun', strategy: strategy, goal: goal, forkConfig: forkConfig,
       taskReviewPolicy: taskReviewPolicy,
@@ -233,6 +239,7 @@ export function init(ctx) {
       taskReviewHybridTimeoutMinutes: (taskMinutes && !isNaN(taskMinutes)) ? taskMinutes : undefined,
       workspaceReviewHybridTimeoutMinutes: (workspaceMinutes && !isNaN(workspaceMinutes)) ? workspaceMinutes : undefined,
       bypassPromotionBranch: targetEl ? targetEl.value === 'direct' : false,
+      maxPlanDepthOverride: maxPlanDepthOverride,
       referenceFiles: (state.referenceFiles || []).map(function(r) { return { repositoryId: r.repositoryId, path: r.path }; }),
     });
   });
@@ -405,6 +412,18 @@ export function init(ctx) {
     var value = parseInt(ev.target.value, 10);
     if (!value || value < 1) { return; }
     vscode.postMessage({ type: 'explorerSetMaterializerConcurrency', value: value });
+  });
+
+  $('gw-max-plan-depth').addEventListener('change', function(ev) {
+    var value = parseInt(ev.target.value, 10);
+    if (!value || value < 1) { return; }
+    vscode.postMessage({ type: 'explorerSetMaxPlanDepth', value: value });
+  });
+
+  $('gw-max-failure-attempts').addEventListener('change', function(ev) {
+    var value = parseInt(ev.target.value, 10);
+    if (!value || value < 1) { return; }
+    vscode.postMessage({ type: 'explorerSetMaxFailureAttempts', value: value });
   });
 
   $('gw-clarification-timeout-seconds').addEventListener('change', function(ev) {
@@ -1746,6 +1765,19 @@ export function init(ctx) {
       $('gw-allow-agent-git-push-checkbox').checked = !!msg.allowAgentGitPush;
       if (msg.materializerConcurrency !== undefined) {
         $('gw-materializer-concurrency').value = msg.materializerConcurrency;
+      }
+      if (msg.maxPlanDepth !== undefined) {
+        $('gw-max-plan-depth').value = msg.maxPlanDepth;
+        // Per-goal input on the Goal Workspace: remember the global default and pre-fill it (unless
+        // the user is mid-edit or has already typed an override).
+        state.globalMaxPlanDepth = msg.maxPlanDepth;
+        var goalDepthEl = $('gw-goal-plan-depth');
+        if (goalDepthEl && document.activeElement !== goalDepthEl && !goalDepthEl.value) {
+          goalDepthEl.value = msg.maxPlanDepth;
+        }
+      }
+      if (msg.maxFailureAttempts !== undefined) {
+        $('gw-max-failure-attempts').value = msg.maxFailureAttempts;
       }
       var timeoutSecondsEl = $('gw-clarification-timeout-seconds');
       var timeoutBehaviorEl = $('gw-clarification-timeout-behavior');

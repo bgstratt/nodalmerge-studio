@@ -3,6 +3,8 @@ import type { ReplayState, ReplayAction } from './branchReplay';
 import { WsClient } from './wsClient';
 import type { WsStatus } from './wsClient';
 import { renderDag } from './dagRenderer';
+import { renderPlanTree, renderPlanNodeDetail, fitView, MIN_ZOOM, MAX_ZOOM } from './planTree';
+import type { PlanTreeData, PlanContractDef, PlanView, PlanBounds } from './planTree';
 
 // ── State ──────────────────────────────────────────────────────────────────
 
@@ -230,6 +232,155 @@ if (replayModeSelect) {
     }
   });
 }
+
+// ── Plan sub-tab (read-only plan decomposition) ────────────────────────────
+
+let planPaneActive = false;
+let planData: PlanTreeData | null = null;
+let planContractsById = new Map<string, PlanContractDef>();
+
+// Persisted pan/zoom (a transform on the #pw-viewport group). Survives the 2s poll re-render because
+// renderPlan feeds it back into renderPlanTree; auto-fit runs once per session (planFittedSession).
+let planView: PlanView = { k: 1, tx: 0, ty: 0 };
+let planBounds: PlanBounds = { width: 0, height: 0 };
+let planFittedSession: string | null = null;
+// Set true when a pointer drag crosses the pan threshold, so the ensuing click doesn't also select
+// a node. Shared between the pan handler and the node-click handler; reset at each pointerdown.
+let planPanMoved = false;
+
+const planSvg = document.getElementById('plan-svg') as unknown as SVGSVGElement | null;
+const planEmpty = document.getElementById('plan-empty') as HTMLElement | null;
+const planDetail = document.getElementById('plan-detail') as HTMLElement | null;
+const planDetailTitle = document.getElementById('plan-detail-title') as HTMLElement | null;
+const planDetailBody = document.getElementById('plan-detail-body') as HTMLElement | null;
+
+function requestPlanTree(): void {
+  vscode.postMessage({ type: 'pathways.loadPlanTree' });
+}
+
+// Apply the current pan/zoom by updating only the viewport group's transform — no re-render, so
+// dragging/zooming stays smooth regardless of tree size.
+function applyPlanTransform(): void {
+  const vp = document.getElementById('pw-viewport');
+  if (vp) { vp.setAttribute('transform', `translate(${planView.tx} ${planView.ty}) scale(${planView.k})`); }
+}
+
+function planViewportSize(): { w: number; h: number } {
+  const r = planSvg?.getBoundingClientRect();
+  return { w: r?.width ?? 0, h: r?.height ?? 0 };
+}
+
+function fitPlan(): void {
+  const { w, h } = planViewportSize();
+  planView = fitView(planBounds, w, h);
+  applyPlanTransform();
+}
+
+// Sub-tab toggle: plain display swap of the two panes (the .active class is reserved for the outer
+// shell tabs). Activating Plan requests its data immediately; the 2s poll keeps it fresh (see the
+// workUnits handler) so status colors track the roll-up live.
+for (const tab of Array.from(document.querySelectorAll('.pw-tab'))) {
+  tab.addEventListener('click', () => {
+    const pane = (tab as HTMLElement).dataset.pane;
+    planPaneActive = pane === 'plan';
+    for (const t of Array.from(document.querySelectorAll('.pw-tab'))) {
+      t.classList.toggle('pw-tab-active', t === tab);
+    }
+    const traj = document.getElementById('pw-pane-trajectory');
+    const plan = document.getElementById('pw-pane-plan');
+    if (traj) { traj.style.display = planPaneActive ? 'none' : 'flex'; }
+    if (plan) { plan.style.display = planPaneActive ? 'flex' : 'none'; }
+    if (planPaneActive) { requestPlanTree(); }
+  });
+}
+
+function renderPlan(sessionId?: string): void {
+  if (!planSvg) { return; }
+  const hasNodes = !!planData && planData.nodes.length > 0;
+  if (planEmpty) {
+    planEmpty.classList.toggle('hidden', hasNodes);
+    if (!hasNodes) { planEmpty.textContent = planData ? 'No plan recorded for this session yet.' : 'Select a session to view its plan.'; }
+  }
+  planSvg.style.display = hasNodes ? 'block' : 'none';
+  if (hasNodes && planData) {
+    planBounds = renderPlanTree(planSvg, planData, planView);
+    // Auto-fit once when a session's plan first appears; afterwards the user's pan/zoom is preserved
+    // across the poll re-renders (planView is passed straight back into renderPlanTree above).
+    if (sessionId && sessionId !== planFittedSession) {
+      planFittedSession = sessionId;
+      fitPlan();
+    }
+  }
+}
+
+// Scroll to zoom around the cursor; the world point under the cursor stays put.
+if (planSvg) {
+  planSvg.addEventListener('wheel', (ev) => {
+    if (!planData) { return; }
+    ev.preventDefault();
+    const r = planSvg.getBoundingClientRect();
+    const sx = ev.clientX - r.left, sy = ev.clientY - r.top;
+    const factor = Math.exp(-ev.deltaY * 0.0015);
+    const k2 = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, planView.k * factor));
+    planView = {
+      k: k2,
+      tx: sx - ((sx - planView.tx) / planView.k) * k2,
+      ty: sy - ((sy - planView.ty) / planView.k) * k2,
+    };
+    applyPlanTransform();
+  }, { passive: false });
+
+  // Drag anywhere to pan. No setPointerCapture — capturing the pointer retargets the ensuing click
+  // to the SVG and breaks node selection. Instead we listen for move/up on `window` for the duration
+  // of the drag, so panning still works if the pointer leaves the SVG and always ends on pointerup,
+  // while a plain (non-dragged) click reaches the node normally. Past a 3px threshold sets
+  // planPanMoved so the click that follows a real drag is treated as pan-end, not a node select.
+  let panning = false, startX = 0, startY = 0, startTx = 0, startTy = 0;
+  const onPanMove = (ev: PointerEvent): void => {
+    if (!panning) { return; }
+    const dx = ev.clientX - startX, dy = ev.clientY - startY;
+    if (!planPanMoved && Math.hypot(dx, dy) > 3) { planPanMoved = true; planSvg.classList.add('pw-panning'); }
+    if (planPanMoved) { planView = { ...planView, tx: startTx + dx, ty: startTy + dy }; applyPlanTransform(); }
+  };
+  const onPanUp = (): void => {
+    if (!panning) { return; }
+    panning = false; planSvg.classList.remove('pw-panning');
+    window.removeEventListener('pointermove', onPanMove);
+    window.removeEventListener('pointerup', onPanUp);
+  };
+  planSvg.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0) { return; }
+    panning = true; planPanMoved = false;
+    startX = ev.clientX; startY = ev.clientY; startTx = planView.tx; startTy = planView.ty;
+    window.addEventListener('pointermove', onPanMove);
+    window.addEventListener('pointerup', onPanUp);
+  });
+}
+
+document.getElementById('plan-fit-btn')?.addEventListener('click', fitPlan);
+
+// Click a node → detail drawer, rendered from already-loaded data (no round-trip). Delegated so it
+// survives re-renders; reads data-wu off the node group (no inline handlers — CSP blocks them).
+if (planSvg) {
+  planSvg.addEventListener('click', (ev) => {
+    if (planPanMoved) { planPanMoved = false; return; }  // this click ended a pan, not a select
+    // Hit-test via elementFromPoint, not ev.target: setPointerCapture (used for drag-pan) retargets
+    // the click to the SVG itself, so ev.target is never the node group. elementFromPoint ignores
+    // capture and returns the actual element under the cursor.
+    let node = document.elementFromPoint(ev.clientX, ev.clientY) as Element | null;
+    while (node && node !== planSvg && !(node as HTMLElement).dataset?.wu) { node = node.parentElement; }
+    const wu = node && (node as HTMLElement).dataset ? (node as HTMLElement).dataset.wu : undefined;
+    if (!wu || !planData || !planDetail || !planDetailBody || !planDetailTitle) { return; }
+    const n = planData.nodes.find((x) => x.workUnitId === wu);
+    if (!n) { return; }
+    planDetailTitle.textContent = n.goal.length > 80 ? n.goal.slice(0, 79) + '…' : n.goal;
+    planDetailBody.innerHTML = renderPlanNodeDetail(n, planContractsById, escHtml);
+    planDetail.classList.remove('hidden');
+  });
+}
+document.getElementById('plan-detail-close')?.addEventListener('click', () => {
+  planDetail?.classList.add('hidden');
+});
 
 // ── Alternate view renderers ──────────────────────────────────────────────
 
@@ -817,6 +968,9 @@ window.addEventListener('message', (event: MessageEvent) => {
       registerPathways(msg.pathways as PathwaysPayload);
     }
     render();
+    // Piggyback the Plan sub-tab's refresh on the host's existing 2s workUnits poll — only while
+    // it's the active pane — so status colors climb the tree live without a second timer.
+    if (planPaneActive) { requestPlanTree(); }
     return;
   }
 
@@ -853,6 +1007,13 @@ window.addEventListener('message', (event: MessageEvent) => {
         altView.style.display = 'none';
       }
     }
+    return;
+  }
+
+  if (msg.type === 'pathways.planTree') {
+    planData = (msg.data as PlanTreeData | null) ?? null;
+    planContractsById = new Map((planData?.contracts ?? []).map((c) => [c.contractId, c]));
+    renderPlan(msg.sessionId as string | undefined);
     return;
   }
 

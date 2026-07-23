@@ -27,7 +27,12 @@ internal sealed class ReviewerAgentLoop(
     IReadOnlyList<NmMessage>? priorTurns = null,
     // Observability-only — see ConversationCompactor. Optional/nullable so call sites and tests
     // that don't wire a logger keep compiling unchanged.
-    ILogger? logger = null)
+    ILogger? logger = null,
+    // plans/recursive-planning-spike.md S6 — the reviewer's first context-injection seam. Carries
+    // the peer contract(s) the reviewed slice declared it provides/consumes so the reviewer can
+    // check the output conforms and REJECT a non-conformant peer. Null/empty (every call site that
+    // doesn't wire it) = today's behavior, no extra kickoff text.
+    string? promptGuidanceContext = null)
 {
     internal static readonly string DefaultSystemPrompt = AgentLoopPrompts.Reviewer;
 
@@ -65,12 +70,18 @@ internal sealed class ReviewerAgentLoop(
             ? ""
             : $" Worker's justification for no file changes: \"{noFileChangesJustification}\"";
 
+        var contractNote = string.IsNullOrWhiteSpace(promptGuidanceContext)
+            ? ""
+            : $"\n\n{promptGuidanceContext}\n\nIf a peer contract is shown above, verify the changes CONFORM to it — a " +
+              "provider must implement it as declared, a consumer must call it exactly as declared (no undeclared " +
+              "fields or shapes). A non-conformant change is a Rejected review, even if the files otherwise look fine.";
+
         var messages = new List<NmMessage>
         {
             new("user", [new NmText(
                 $"Review merge proposal {proposalId} for work unit {workUnitId}. " +
                 $"Your agent ID is {agentId}. Files touched: {filesTouchedNote}{justificationNote} " +
-                "Submit automated review when done.")])
+                "Submit automated review when done." + contractNote)])
         };
 
         if (priorTurns is { Count: > 0 })

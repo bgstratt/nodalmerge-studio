@@ -15,12 +15,16 @@ public sealed class InMemoryDeadLetterService(
     IProjectionManager projections,
     ISteeringDecisionService steeringDecisions,
     IFileLeaseService fileLease,
+    WorkspaceOptions options,
     IRuntimeCredentialCache? credentialCache = null,
     // plans/phase-d-implementation.md D3 — cheapest correct hook for the "dead-lettered slices"
     // staleness signal: every terminal dead-letter (this method) passes through here. Optional/
     // nullable, same convention as credentialCache above.
     IPlanStalenessService? planStaleness = null) : IDeadLetterService, IRehydratable
 {
+    // Now configurable via WorkspaceOptions.MaxFailureAttempts (default 3). Kept as a public const
+    // for the documented default only — the live cap is read from `options` below, so a runtime
+    // change via /studio/options takes effect without a restart.
     public const int MaxFailureAttempts = 3;
 
     private readonly ConcurrentDictionary<string, DeadLetterEntry> _entries = new();
@@ -64,7 +68,7 @@ public sealed class InMemoryDeadLetterService(
             attemptCount,
             DateTimeOffset.UtcNow,
             taskId,
-            attemptCount >= MaxFailureAttempts,
+            attemptCount >= options.MaxFailureAttempts,
             model,
             baseUrl,
             apiKey,

@@ -14,7 +14,8 @@ public sealed class AutomatedReviewGateService(
     IDeadLetterService deadLetter,
     IArtifactCommandService artifactCommands,
     IFileWorkspaceService fileWorkspace,
-    IMergeDiffResolver diffResolver) : IAutomatedReviewGateService
+    IMergeDiffResolver diffResolver,
+    WorkspaceOptions options) : IAutomatedReviewGateService
 {
     public async Task<AutomatedReviewGateResult> TryEnqueueReviewerAsync(
         string parentWorkUnitId,
@@ -109,7 +110,7 @@ public sealed class AutomatedReviewGateService(
             .ConfigureAwait(false);
         var rejectionCount = updatedParent.ExecutionInfo!.AutomatedReviewRejectionCount;
 
-        if (rejectionCount >= InMemoryDeadLetterService.MaxFailureAttempts)
+        if (rejectionCount >= options.MaxFailureAttempts)
         {
             var profileId = agentControl.GetAutoReviewProfileId(parentWorkUnitId) ?? "reviewer";
             var reason = string.IsNullOrWhiteSpace(proposal.VerificationResults)
@@ -277,7 +278,7 @@ public sealed class AutomatedReviewGateService(
         // Revise click silently escalated to dead-letter instead of retrying, because earlier
         // automated cycles had already consumed the budget). Humans get warned by the count in the
         // UI; they never get blocked. Only automated cycles escalate here.
-        if (automated && rejectionCount >= InMemoryDeadLetterService.MaxFailureAttempts)
+        if (automated && rejectionCount >= options.MaxFailureAttempts)
         {
             var reason = string.IsNullOrWhiteSpace(reviewNotes)
                 ? $"{reviewerAttribution} rejected the proposal."

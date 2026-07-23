@@ -27,6 +27,15 @@ public sealed class WorkspaceOptions
     // an explicit per-stage Model Profile assignment always bypasses this entirely, flag or not.
     public bool UsePlannerExecutorSelection { get; set; } = false;
 
+    // plans/recursive-planning-spike.md — how many planning layers a goal may use. 1 (the default)
+    // = only the root plans, i.e. today's flat-and-wide fan-out: a slice is always handed to a
+    // worker, never re-planned. A Compound slice is routed to a sub-planner iff
+    // planDepth(child) < MaxPlanDepth (root goal = depth 0, a root slice's unit = 1), so with the
+    // default 1 no compound routing ever fires and FanOutService's enqueue path is byte-for-byte
+    // unchanged. Raising it (e.g. 2) enables recursive planning up to that depth; slices at the
+    // ceiling are forced to Leaf (demoted, and logged via `demotedFromCompound`).
+    public int MaxPlanDepth { get; set; } = 1;
+
     // plans/phase-d-implementation.md D3 — plan-staleness signal thresholds (IPlanStalenessService).
     // Signals only, never auto-replan — see ExecutionEventKind.PlanStalenessSignalRaised's own doc
     // comment. Defaults (3, 2) are deliberately small: a handful of superseding decisions or a
@@ -36,6 +45,13 @@ public sealed class WorkspaceOptions
 
     public int MaxConcurrentWorkers { get; set; } = 3;
     public int SchedulerPollIntervalMs { get; set; } = 2_000;
+
+    // How many automated attempts a work unit gets before it dead-letters for a human. Governs BOTH
+    // the automated review-rejection revise/retry loop (AutomatedReviewGateService) and the worker
+    // failure-attempt count (InMemoryDeadLetterService). Lower = stricter (e.g. 1 = one shot, then
+    // escalate); higher = more lenient auto-fixing before handing off. Human/explicit retries are
+    // never blocked by this cap. Default 3 preserves the previous hardcoded value.
+    public int MaxFailureAttempts { get; set; } = 3;
 
     // ── Slice 16e/16f/16m — workspace execution ───────────────────────────────
 

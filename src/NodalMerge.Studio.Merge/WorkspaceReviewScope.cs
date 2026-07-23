@@ -15,10 +15,23 @@ namespace NodalMerge.Studio.Merge;
 // any work unit given one, regardless of ParentWorkUnitId), which are deliberately independent,
 // repo-linked orchestrator runs sharing a comparison parent only for grouping in the UI.
 //
-// FanOutService's fanned-out task children and ExperimentService's generic comparison forks never
-// receive their own RepositoryId (both bypass WorkUnitCommandService and call
-// IOrchestratorService.CreateWorkUnitAsync directly with no repositoryId) — so they correctly stay
-// excluded and remain gated by TaskReviewPolicy, never touching disk.
+// The RepositoryId test alone is NO LONGER sufficient to identify those independent units. CAS
+// Slice 6.3a (InMemoryWorkUnitService.CreateWorkUnitAsync) makes EVERY fanned-out child inherit its
+// parent's RepositoryId — a fan-out child created with repositoryId:null now resolves the goal's id
+// so snapshot/CAS lookups work. Before 6.3a, "has a RepositoryId" implied "was explicitly linked to
+// a repo" implied "independent real-repo unit"; after it, ordinary task children carry one too. Left
+// as just `RepositoryId is not null`, this classified every fan-out child in a repo-linked goal as
+// real-repo — routing it to WorkspaceReviewPolicy (which is never propagated to children, so it
+// defaults to HumanRequired) instead of its inherited TaskReviewPolicy, stranding AgentApproval
+// children at review; and, symmetrically, marking its own apply eligible to write to disk / target
+// "main" instead of rolling up through merge/{parent}. Both are the same misclassification.
+//
+// The reliable discriminator is FanOutInfo.SliceId: it is set on (and only on) a fanned-out plan
+// slice child — leaf or compound sub-planner. The genuinely-independent repo-linked units
+// (Multi-Model comparison, ExperimentService/CounterfactualService/SteeringService forks) are
+// created via CreateWorkUnitAsync/CreateAsync with a repositoryId but NEVER a sliceId, so they still
+// qualify. So: a unit applies to the real repo iff it's top-level, OR it has its own RepositoryId
+// AND is not a fan-out slice child.
 //
 // A null workUnit means the proposal isn't tracked against any WorkUnit at all (no WorkUnitId, or
 // no IWorkUnitService registered) — the legacy/direct-spawn path predating work-unit tracking, not
@@ -27,5 +40,7 @@ namespace NodalMerge.Studio.Merge;
 public static class WorkspaceReviewScope
 {
     public static bool AppliesToRealRepo(WorkUnit? workUnit) =>
-        workUnit is null || workUnit.ParentWorkUnitId is null || workUnit.RepositoryId is not null;
+        workUnit is null
+        || workUnit.ParentWorkUnitId is null
+        || (workUnit.RepositoryId is not null && workUnit.FanOutInfo?.SliceId is null);
 }
