@@ -226,11 +226,6 @@ export function renderPlanTree(svg: SVGSVGElement, data: PlanTreeData, view: Pla
     t.textContent = label;
     g.appendChild(t);
 
-    // Kind tag (right side).
-    const tag = el('text', { x: p.x + NODE_W - 8, y: p.y + 12, 'text-anchor': 'end', fill: color, 'font-size': 8.5, opacity: 0.9 });
-    tag.textContent = n.kind === 'compound' ? 'SUB-PLAN' : '';
-    g.appendChild(tag);
-
     // Hover tooltip: full goal + status/stage.
     const title = document.createElementNS(SVG_NS, 'title');
     title.textContent = `${n.goal}\n[${n.status}${n.currentStage ? ' · ' + n.currentStage : ''}${n.kind === 'compound' ? ' · compound' : ''}]`;

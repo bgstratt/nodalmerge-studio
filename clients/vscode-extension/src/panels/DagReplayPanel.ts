@@ -799,7 +799,7 @@ const DAG_REPLAY_HTML = `
   <div id="pw-pane-plan" class="pw-pane" style="display:none">
     <div class="pw-plan-legend">
       <span><svg width="11" height="11" viewBox="0 0 12 12" style="vertical-align:-1px"><rect x="1.5" y="1.5" width="9" height="9" rx="2" fill="#8a8a8a"/></svg> Leaf (worker)</span>
-      <span><svg width="11" height="11" viewBox="0 0 12 12" style="vertical-align:-1px"><path d="M6 1 L11 6 L6 11 L1 6 Z" fill="#8a8a8a"/></svg> Compound (sub-planner)</span>
+      <span><svg width="12" height="12" viewBox="0 0 12 12" style="vertical-align:-1px"><rect x="3" y="3" width="8" height="8" rx="1.5" fill="#8a8a8a" fill-opacity="0.45"/><rect x="0.5" y="0.5" width="8" height="8" rx="1.5" fill="#8a8a8a"/></svg> Compound (sub-planner)</span>
       <span style="opacity:0.85"><svg width="20" height="8" style="vertical-align:-1px"><line x1="0" y1="4" x2="20" y2="4" stroke="#8a8a8a" stroke-width="1.5"/></svg> decomposes</span>
       <span style="opacity:0.85"><svg width="20" height="8" style="vertical-align:-1px"><line x1="0" y1="4" x2="20" y2="4" stroke="#cca700" stroke-width="1.5" stroke-dasharray="3 2"/></svg> depends on</span>
       <span style="opacity:0.85"><svg width="20" height="8" style="vertical-align:-1px"><line x1="0" y1="4" x2="16" y2="4" stroke="#c586c0" stroke-width="1.5"/><path d="M16 1.5 L20 4 L16 6.5 Z" fill="#c586c0"/></svg> contract</span>
