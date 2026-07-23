@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.1.16 — 2026-07-22
+
+Ships an updated NodalMerge runtime — the features below are runtime behavior the
+extension surfaces, so a clean install (superseding any 0.1.15 build) is needed to get them.
+
+- **Recursive planning — let a planner decompose a slice instead of forcing it into one
+  worker.** A plan slice can now be marked *compound*, which hands it to its own sub-planner
+  that re-slices it into a smaller sub-plan; the grandchildren fan out, execute, and
+  reconcile bottom-up through the interior node back to the goal — no different from a flat
+  fan-out, just deeper. It's gated by a **Max plan depth** setting (Goal Workspace → ⚙
+  Settings → Planning): `1` is the previous flat-and-wide behavior unchanged, `2+` lets the
+  planner go recursive up to that many layers. Each goal can override the global default from
+  the **Plan depth** control in the Goal Workspace's Review/Target row — pre-filled with the
+  default, change it to steer just that run. Use it for goals that are really several
+  subsystems (e.g. "a React UI, a .NET API, and the services behind it") so each piece gets
+  its own focused planning pass instead of one over-wide slice list.
+- **Peer contracts keep parallel slices coherent.** When a planner splits work into peers that
+  must agree on an interface (a backend endpoint and the frontend that calls it), it can now
+  author a small shared *contract* and mark which slices *provide* vs *consume* it. The
+  contract is injected into both workers so they build against the same shape, and into the
+  reviewer so a non-conformant peer is rejected rather than silently merged — closing a gap
+  where two slices over non-overlapping files could disagree on the interface and still merge
+  clean.
+- **Agent auto-review is reliable now on repository-linked goals.** Setting **Agent Approval**
+  (or **Hybrid**) on both the goal and workspace review policy previously left fan-out
+  children stranded at the review gate on a real repo — you had to Accept then Apply each one
+  by hand. Two fixes land it: children on a repo-linked goal are once again governed by their
+  inherited task review policy (an inherited repository id was misrouting them to a
+  human-required default), and multi-child reconciliation now waits for each self-approving
+  child to finish merging before folding it in, so a child's own auto-apply is never
+  superseded out from under it. Children now review and merge on their own, staggered as they
+  finish.
+- **Max auto-retries is now a setting.** Goal Workspace → ⚙ Settings → **Max auto-retries**
+  caps how many automated attempts (review-rejection revises and worker failures both) a work
+  unit gets before it dead-letters for a human. `1` = one shot then escalate; higher = more
+  lenient auto-fixing. Human/explicit retries are never capped.
+- Version bumped to 0.1.16 so a clean install supersedes any older build still registered in
+  VS Code.
+
 ## 0.1.15 — 2026-07-20
 
 Extension-only release — the bundled NodalMerge runtime is unchanged from 0.1.13.
