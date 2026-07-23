@@ -330,27 +330,31 @@ if (planSvg) {
     applyPlanTransform();
   }, { passive: false });
 
-  // Drag anywhere to pan. Past a small threshold sets planPanMoved so the ensuing click is treated
-  // as the end of a pan (see the node-click handler) rather than a node select.
+  // Drag anywhere to pan. No setPointerCapture — capturing the pointer retargets the ensuing click
+  // to the SVG and breaks node selection. Instead we listen for move/up on `window` for the duration
+  // of the drag, so panning still works if the pointer leaves the SVG and always ends on pointerup,
+  // while a plain (non-dragged) click reaches the node normally. Past a 3px threshold sets
+  // planPanMoved so the click that follows a real drag is treated as pan-end, not a node select.
   let panning = false, startX = 0, startY = 0, startTx = 0, startTy = 0;
-  planSvg.addEventListener('pointerdown', (ev) => {
-    panning = true; planPanMoved = false;
-    startX = ev.clientX; startY = ev.clientY; startTx = planView.tx; startTy = planView.ty;
-    try { planSvg.setPointerCapture(ev.pointerId); } catch { /* capture best-effort */ }
-  });
-  planSvg.addEventListener('pointermove', (ev) => {
+  const onPanMove = (ev: PointerEvent): void => {
     if (!panning) { return; }
     const dx = ev.clientX - startX, dy = ev.clientY - startY;
     if (!planPanMoved && Math.hypot(dx, dy) > 3) { planPanMoved = true; planSvg.classList.add('pw-panning'); }
     if (planPanMoved) { planView = { ...planView, tx: startTx + dx, ty: startTy + dy }; applyPlanTransform(); }
-  });
-  const endPan = (ev: PointerEvent): void => {
+  };
+  const onPanUp = (): void => {
     if (!panning) { return; }
     panning = false; planSvg.classList.remove('pw-panning');
-    try { planSvg.releasePointerCapture(ev.pointerId); } catch { /* pointer already released */ }
+    window.removeEventListener('pointermove', onPanMove);
+    window.removeEventListener('pointerup', onPanUp);
   };
-  planSvg.addEventListener('pointerup', endPan);
-  planSvg.addEventListener('pointercancel', endPan);
+  planSvg.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0) { return; }
+    panning = true; planPanMoved = false;
+    startX = ev.clientX; startY = ev.clientY; startTx = planView.tx; startTy = planView.ty;
+    window.addEventListener('pointermove', onPanMove);
+    window.addEventListener('pointerup', onPanUp);
+  });
 }
 
 document.getElementById('plan-fit-btn')?.addEventListener('click', fitPlan);
@@ -360,7 +364,10 @@ document.getElementById('plan-fit-btn')?.addEventListener('click', fitPlan);
 if (planSvg) {
   planSvg.addEventListener('click', (ev) => {
     if (planPanMoved) { planPanMoved = false; return; }  // this click ended a pan, not a select
-    let node = ev.target as Element | null;
+    // Hit-test via elementFromPoint, not ev.target: setPointerCapture (used for drag-pan) retargets
+    // the click to the SVG itself, so ev.target is never the node group. elementFromPoint ignores
+    // capture and returns the actual element under the cursor.
+    let node = document.elementFromPoint(ev.clientX, ev.clientY) as Element | null;
     while (node && node !== planSvg && !(node as HTMLElement).dataset?.wu) { node = node.parentElement; }
     const wu = node && (node as HTMLElement).dataset ? (node as HTMLElement).dataset.wu : undefined;
     if (!wu || !planData || !planDetail || !planDetailBody || !planDetailTitle) { return; }
