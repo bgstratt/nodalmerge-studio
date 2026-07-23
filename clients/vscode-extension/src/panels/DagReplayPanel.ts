@@ -256,6 +256,25 @@ export class TrajectoryReplayPanel {
       return;
     }
 
+    // Pathways → Plan sub-tab: fetch the read-only plan-decomposition tree for the effective
+    // session (server-composed nodes + edges + contracts). Namespaced because the shell broadcasts
+    // every webview message to every panel's handleMessage. Errors post null+error to the webview
+    // rather than a toast — this can fire on the 2s poll while the Plan tab is open.
+    if (msg.type === 'pathways.loadPlanTree') {
+      const sessionId = this.getEffectiveSessionId();
+      if (!sessionId) {
+        void this.panel.webview.postMessage({ type: 'pathways.planTree', data: null });
+        return;
+      }
+      try {
+        const data = await this.get<unknown>('/studio/sessions/' + encodeURIComponent(sessionId) + '/plan-tree');
+        void this.panel.webview.postMessage({ type: 'pathways.planTree', sessionId, data });
+      } catch (err) {
+        void this.panel.webview.postMessage({ type: 'pathways.planTree', data: null, error: String(err) });
+      }
+      return;
+    }
+
     if (msg.type === 'branchFromCursor') {
       const goal = await vscode.window.showInputBox({
         prompt:         'Goal for branch from cursor',
@@ -671,6 +690,52 @@ const DAG_REPLAY_CSS = `
     .diff-del  { color: var(--nm-error);   background: rgba(241, 76, 76, 0.12); }
     .diff-meta { color: var(--nm-info); opacity: 0.7; font-family: var(--nm-mono); font-size: 0.85em; padding: 2px 8px; }
     .diff-empty { opacity: 0.6; padding: 4px 8px; font-size: 0.9em; }
+    /* Pathways sub-tabs (Trajectory | Plan) + the read-only Plan pane. */
+    .pw-tabs { display: flex; gap: 2px; padding: 0 14px; border-bottom: 1px solid var(--nm-border); flex-shrink: 0; }
+    .pw-tab {
+      background: transparent; color: var(--nm-fg); border: none; border-radius: 0;
+      border-bottom: 2px solid transparent; padding: 5px 12px; font-size: 0.82em; opacity: 0.6;
+    }
+    .pw-tab:hover { background: transparent; opacity: 0.85; }
+    .pw-tab.pw-tab-active { opacity: 1; font-weight: 600; border-bottom-color: var(--nm-info); }
+    .pw-pane { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
+    .pw-plan-legend {
+      display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+      padding: 3px 14px; font-size: 0.72em; opacity: 0.6;
+      border-bottom: 1px solid var(--nm-border); flex-shrink: 0;
+    }
+    #plan-scroll { flex: 1; overflow: auto; padding: 8px; position: relative; }
+    #plan-svg { display: block; min-width: 400px; min-height: 120px; }
+    #plan-svg text { font-family: var(--nm-font); }
+    /* Only the node label is themed to the fg color; the status/kind tags keep their own fill. A
+       CSS rule is required because SVG presentation attributes can't resolve var(). */
+    #plan-svg text.pw-node-label { fill: var(--nm-fg); }
+    #plan-svg .clickable { cursor: pointer; }
+    .pw-plan-empty { opacity: 0.6; padding: 24px; text-align: center; }
+    #plan-detail {
+      border-top: 1px solid var(--nm-border); max-height: 420px; overflow-y: auto;
+      flex-shrink: 0; font-size: 0.82em; padding: 8px 14px;
+    }
+    #plan-detail-header {
+      display: flex; justify-content: space-between; align-items: center;
+      font-weight: 600; margin-bottom: 6px;
+    }
+    #plan-detail-close { background: transparent; padding: 0 6px; font-size: 0.9em; }
+    .pw-meta-row { margin: 3px 0; }
+    .pw-meta-label { opacity: 0.55; margin-right: 6px; }
+    .pw-chip {
+      display: inline-block; border-radius: 9px; padding: 0 8px; margin: 2px 4px 2px 0;
+      font-size: 0.85em; background: rgba(127,127,127,0.15);
+    }
+    .pw-goal-text {
+      white-space: pre-wrap; background: rgba(127,127,127,0.12);
+      border-radius: 3px; padding: 6px; margin-top: 4px;
+    }
+    .pw-plan-section { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--nm-border); }
+    .pw-plan-section h3 {
+      font-size: 0.78em; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.07em; opacity: 0.5; margin: 0 0 6px;
+    }
 `;
 
 const DAG_REPLAY_HTML = `
@@ -681,6 +746,11 @@ const DAG_REPLAY_HTML = `
     <span id="node-count"></span>
     <select id="dag-session-override" style="font-size:0.75em;padding:1px 4px;border:1px solid var(--nm-border);border-radius:3px;background:var(--vscode-input-background,#3c3c3c);color:var(--vscode-input-foreground,#ccc);max-width:150px;margin-left:auto;"><option value="">Follow Workspace</option></select>
   </div>
+  <div class="pw-tabs">
+    <button class="pw-tab pw-tab-active" data-pane="trajectory">Trajectory</button>
+    <button class="pw-tab" data-pane="plan" title="Read-only view of this session's plan decomposition">Plan</button>
+  </div>
+  <div id="pw-pane-trajectory" class="pw-pane">
   <div style="padding: 4px 14px; font-size: 0.8em; opacity: 0.55; border-bottom: 1px solid var(--nm-border); flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; gap: 8px;">
     <span>Workspace history — goals started, integrations, rejections, and external file updates. Not per-agent reasoning steps.</span>
     <button id="btn-sync-now" class="ghost" style="font-size:0.85em;padding:2px 8px;flex-shrink:0;" title="Check the working repository for external changes now, instead of waiting for the next goal creation">Sync now</button>
@@ -720,5 +790,26 @@ const DAG_REPLAY_HTML = `
     <button id="btn-branch">⎇ Branch from here</button>
     <button id="btn-kgs">📌 Mark Known Good</button>
     <button id="btn-restore-kgs">↩ Restore Known Good</button>
+  </div>
+  </div>
+  <div id="pw-pane-plan" class="pw-pane" style="display:none">
+    <div class="pw-plan-legend">
+      <span><svg width="11" height="11" viewBox="0 0 12 12" style="vertical-align:-1px"><rect x="1.5" y="1.5" width="9" height="9" rx="2" fill="#8a8a8a"/></svg> Leaf (worker)</span>
+      <span><svg width="11" height="11" viewBox="0 0 12 12" style="vertical-align:-1px"><path d="M6 1 L11 6 L6 11 L1 6 Z" fill="#8a8a8a"/></svg> Compound (sub-planner)</span>
+      <span style="opacity:0.85"><svg width="20" height="8" style="vertical-align:-1px"><line x1="0" y1="4" x2="20" y2="4" stroke="#8a8a8a" stroke-width="1.5"/></svg> decomposes</span>
+      <span style="opacity:0.85"><svg width="20" height="8" style="vertical-align:-1px"><line x1="0" y1="4" x2="20" y2="4" stroke="#cca700" stroke-width="1.5" stroke-dasharray="3 2"/></svg> depends on</span>
+      <span style="opacity:0.85"><svg width="20" height="8" style="vertical-align:-1px"><line x1="0" y1="4" x2="16" y2="4" stroke="#c586c0" stroke-width="1.5"/><path d="M16 1.5 L20 4 L16 6.5 Z" fill="#c586c0"/></svg> contract</span>
+    </div>
+    <div id="plan-scroll">
+      <svg id="plan-svg"></svg>
+      <div id="plan-empty" class="pw-plan-empty hidden"></div>
+    </div>
+    <div id="plan-detail" class="hidden">
+      <div id="plan-detail-header">
+        <span id="plan-detail-title"></span>
+        <button id="plan-detail-close">✕</button>
+      </div>
+      <div id="plan-detail-body"></div>
+    </div>
   </div>
 `;

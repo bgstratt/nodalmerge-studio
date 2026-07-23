@@ -1194,6 +1194,11 @@ public static class StudioRestEndpoints
 
     // ── /studio/workunits ─────────────────────────────────────────────────
 
+    // Mirrors FanOutService.JsonOpts so the Plan-tree endpoint reads a plan.json Body the same way
+    // the orchestrator that wrote it does. PlanDocument's records are [JsonPropertyName]-annotated,
+    // so case-insensitivity is belt-and-suspenders.
+    private static readonly JsonSerializerOptions PlanTreeJsonOptions = new() { PropertyNameCaseInsensitive = true };
+
     private static object ToWorkUnitResponse(WorkUnit wu, int proposalCount, ScheduledItem? scheduled = null) => new
     {
         workUnitId = wu.WorkUnitId,
@@ -3114,6 +3119,131 @@ public static class StudioRestEndpoints
 
             return Results.Ok(tree.Select(wu =>
                 ToWorkUnitResponse(wu, counts.GetValueOrDefault(wu.WorkUnitId), scheduled.GetValueOrDefault(wu.WorkUnitId))));
+        });
+
+        // Read-only aggregate for the Pathways → Plan view: the session's recursive plan
+        // decomposition as nodes + edges, assembled server-side so the webview never has to parse
+        // untyped plan JSON or re-derive the slice↔work-unit join. Each node's own slice metadata
+        // (authored goal, fileScope, steps, provides/consumes) lives in its PARENT's PlanDocument,
+        // keyed by this node's FanOutInfo.SliceId; kind is already stamped on the work unit's
+        // FanOutInfo. Contract edges pair every provider of a contractId with its consumers.
+        app.MapGet("/studio/sessions/{sessionId}/plan-tree", async (
+            string sessionId,
+            IExecutionSessionService sessions,
+            IWorkUnitService workUnits,
+            IArtifactLineageService artifacts,
+            CancellationToken ct) =>
+        {
+            var session = await sessions.GetAsync(sessionId, ct).ConfigureAwait(false);
+            if (session is null)
+                return Results.NotFound(new { error = $"Session '{sessionId}' not found." });
+
+            var root = await workUnits.GetAsync(session.RootWorkUnitId, ct).ConfigureAwait(false);
+            if (root is null)
+                return Results.NotFound(new { error = $"Root work unit '{session.RootWorkUnitId}' not found." });
+
+            // BFS the hierarchy (same walk as /workunits above), tracking depth for top-down layout.
+            var ordered = new List<WorkUnit>();
+            var depthById = new Dictionary<string, int>(StringComparer.Ordinal);
+            var frontier = new Queue<(WorkUnit Unit, int Depth)>();
+            frontier.Enqueue((root, 0));
+            while (frontier.Count > 0)
+            {
+                var (unit, depth) = frontier.Dequeue();
+                ordered.Add(unit);
+                depthById[unit.WorkUnitId] = depth;
+                foreach (var child in await workUnits.GetChildrenAsync(unit.WorkUnitId, ct).ConfigureAwait(false))
+                    frontier.Enqueue((child, depth + 1));
+            }
+
+            // A parent's PlanDocument, parsed once and cached (a node reads its PARENT's plan to
+            // recover its own slice). Missing/unparseable plan → null: the node still renders from
+            // work-unit fields, only slice-authored detail is absent (graceful, read-only view).
+            var planCache = new Dictionary<string, PlanDocument?>(StringComparer.Ordinal);
+            async Task<PlanDocument?> GetPlanAsync(string workUnitId)
+            {
+                if (planCache.TryGetValue(workUnitId, out var cached))
+                    return cached;
+                PlanDocument? plan = null;
+                var chain = await artifacts.GetChainAsync(workUnitId, ct).ConfigureAwait(false);
+                var planArtifact = chain.LastOrDefault(a => a.Type == ArtifactType.Plan);
+                if (planArtifact?.Body is not null)
+                {
+                    try { plan = JsonSerializer.Deserialize<PlanDocument>(planArtifact.Body, PlanTreeJsonOptions); }
+                    catch (JsonException) { /* leave null — node renders without slice detail */ }
+                }
+                planCache[workUnitId] = plan;
+                return plan;
+            }
+
+            var nodeIds = new HashSet<string>(ordered.Select(u => u.WorkUnitId), StringComparer.Ordinal);
+            var contractDefs = new Dictionary<string, PlanContract>(StringComparer.Ordinal);
+            var providersByContract = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            var consumersByContract = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            var nodes = new List<object>(ordered.Count);
+
+            foreach (var unit in ordered)
+            {
+                PlanSlice? slice = null;
+                if (unit.ParentWorkUnitId is { } parentId && unit.FanOutInfo?.SliceId is { } sliceId)
+                {
+                    var parentPlan = await GetPlanAsync(parentId).ConfigureAwait(false);
+                    slice = parentPlan?.Slices.FirstOrDefault(s => s.SliceId == sliceId);
+                    if (parentPlan?.Contracts is { } contracts)
+                        foreach (var contract in contracts)
+                            contractDefs[contract.ContractId] = contract;
+                }
+
+                var provides = slice?.Provides ?? [];
+                var consumes = slice?.Consumes ?? [];
+                foreach (var cid in provides)
+                    (providersByContract.TryGetValue(cid, out var l) ? l : providersByContract[cid] = []).Add(unit.WorkUnitId);
+                foreach (var cid in consumes)
+                    (consumersByContract.TryGetValue(cid, out var l) ? l : consumersByContract[cid] = []).Add(unit.WorkUnitId);
+
+                nodes.Add(new
+                {
+                    workUnitId = unit.WorkUnitId,
+                    parentWorkUnitId = unit.ParentWorkUnitId,
+                    goal = unit.Goal,
+                    status = unit.Status,
+                    currentStage = unit.CurrentStage,
+                    depth = depthById[unit.WorkUnitId],
+                    kind = (unit.FanOutInfo?.Kind ?? PlanSliceKind.Leaf).ToString().ToLowerInvariant(),
+                    sliceId = unit.FanOutInfo?.SliceId,
+                    sliceGoal = slice?.Goal,
+                    fileScope = slice is not null ? slice.FileScope : unit.FileScope,
+                    steps = slice?.Steps ?? [],
+                    provides,
+                    consumes,
+                    dependsOn = unit.DependsOn,
+                });
+            }
+
+            var edges = new List<object>();
+            foreach (var unit in ordered)
+            {
+                if (unit.ParentWorkUnitId is { } p && nodeIds.Contains(p))
+                    edges.Add(new { from = p, to = unit.WorkUnitId, kind = "parent" });
+                foreach (var dep in unit.DependsOn.Where(nodeIds.Contains))
+                    edges.Add(new { from = dep, to = unit.WorkUnitId, kind = "depends" });
+            }
+            foreach (var (contractId, providers) in providersByContract)
+            {
+                if (!consumersByContract.TryGetValue(contractId, out var consumers))
+                    continue;
+                foreach (var producer in providers)
+                    foreach (var consumer in consumers)
+                        edges.Add(new { from = producer, to = consumer, kind = "contract", contractId });
+            }
+
+            return Results.Ok(new
+            {
+                rootWorkUnitId = root.WorkUnitId,
+                nodes,
+                edges,
+                contracts = contractDefs.Values.Select(c => new { contractId = c.ContractId, description = c.Description }),
+            });
         });
 
         app.MapPost("/studio/sessions/{sessionId}/branch", async (

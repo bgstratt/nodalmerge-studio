@@ -3,6 +3,8 @@ import type { ReplayState, ReplayAction } from './branchReplay';
 import { WsClient } from './wsClient';
 import type { WsStatus } from './wsClient';
 import { renderDag } from './dagRenderer';
+import { renderPlanTree, renderPlanNodeDetail } from './planTree';
+import type { PlanTreeData, PlanContractDef } from './planTree';
 
 // ── State ──────────────────────────────────────────────────────────────────
 
@@ -230,6 +232,70 @@ if (replayModeSelect) {
     }
   });
 }
+
+// ── Plan sub-tab (read-only plan decomposition) ────────────────────────────
+
+let planPaneActive = false;
+let planData: PlanTreeData | null = null;
+let planContractsById = new Map<string, PlanContractDef>();
+
+const planSvg = document.getElementById('plan-svg') as unknown as SVGSVGElement | null;
+const planEmpty = document.getElementById('plan-empty') as HTMLElement | null;
+const planDetail = document.getElementById('plan-detail') as HTMLElement | null;
+const planDetailTitle = document.getElementById('plan-detail-title') as HTMLElement | null;
+const planDetailBody = document.getElementById('plan-detail-body') as HTMLElement | null;
+
+function requestPlanTree(): void {
+  vscode.postMessage({ type: 'pathways.loadPlanTree' });
+}
+
+// Sub-tab toggle: plain display swap of the two panes (the .active class is reserved for the outer
+// shell tabs). Activating Plan requests its data immediately; the 2s poll keeps it fresh (see the
+// workUnits handler) so status colors track the roll-up live.
+for (const tab of Array.from(document.querySelectorAll('.pw-tab'))) {
+  tab.addEventListener('click', () => {
+    const pane = (tab as HTMLElement).dataset.pane;
+    planPaneActive = pane === 'plan';
+    for (const t of Array.from(document.querySelectorAll('.pw-tab'))) {
+      t.classList.toggle('pw-tab-active', t === tab);
+    }
+    const traj = document.getElementById('pw-pane-trajectory');
+    const plan = document.getElementById('pw-pane-plan');
+    if (traj) { traj.style.display = planPaneActive ? 'none' : 'flex'; }
+    if (plan) { plan.style.display = planPaneActive ? 'flex' : 'none'; }
+    if (planPaneActive) { requestPlanTree(); }
+  });
+}
+
+function renderPlan(): void {
+  if (!planSvg) { return; }
+  const hasNodes = !!planData && planData.nodes.length > 0;
+  if (planEmpty) {
+    planEmpty.classList.toggle('hidden', hasNodes);
+    if (!hasNodes) { planEmpty.textContent = planData ? 'No plan recorded for this session yet.' : 'Select a session to view its plan.'; }
+  }
+  planSvg.style.display = hasNodes ? 'block' : 'none';
+  if (hasNodes && planData) { renderPlanTree(planSvg, planData); }
+}
+
+// Click a node → detail drawer, rendered from already-loaded data (no round-trip). Delegated so it
+// survives re-renders; reads data-wu off the node group (no inline handlers — CSP blocks them).
+if (planSvg) {
+  planSvg.addEventListener('click', (ev) => {
+    let node = ev.target as Element | null;
+    while (node && node !== planSvg && !(node as HTMLElement).dataset?.wu) { node = node.parentElement; }
+    const wu = node && (node as HTMLElement).dataset ? (node as HTMLElement).dataset.wu : undefined;
+    if (!wu || !planData || !planDetail || !planDetailBody || !planDetailTitle) { return; }
+    const n = planData.nodes.find((x) => x.workUnitId === wu);
+    if (!n) { return; }
+    planDetailTitle.textContent = n.goal.length > 80 ? n.goal.slice(0, 79) + '…' : n.goal;
+    planDetailBody.innerHTML = renderPlanNodeDetail(n, planContractsById, escHtml);
+    planDetail.classList.remove('hidden');
+  });
+}
+document.getElementById('plan-detail-close')?.addEventListener('click', () => {
+  planDetail?.classList.add('hidden');
+});
 
 // ── Alternate view renderers ──────────────────────────────────────────────
 
@@ -817,6 +883,9 @@ window.addEventListener('message', (event: MessageEvent) => {
       registerPathways(msg.pathways as PathwaysPayload);
     }
     render();
+    // Piggyback the Plan sub-tab's refresh on the host's existing 2s workUnits poll — only while
+    // it's the active pane — so status colors climb the tree live without a second timer.
+    if (planPaneActive) { requestPlanTree(); }
     return;
   }
 
@@ -853,6 +922,13 @@ window.addEventListener('message', (event: MessageEvent) => {
         altView.style.display = 'none';
       }
     }
+    return;
+  }
+
+  if (msg.type === 'pathways.planTree') {
+    planData = (msg.data as PlanTreeData | null) ?? null;
+    planContractsById = new Map((planData?.contracts ?? []).map((c) => [c.contractId, c]));
+    renderPlan();
     return;
   }
 
