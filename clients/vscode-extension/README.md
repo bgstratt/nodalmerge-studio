@@ -178,12 +178,12 @@ See the [headless peer guide](https://docs.nodalmerge.com/studio/guides/headless
 
 The Studio host exposes two MCP tool surfaces over the same connection (`http://127.0.0.1:5080` by default):
 
-**`nms_v1_*` — External caller surface (14 tools)**  
+**`nms_v1_*` — External caller surface (15 tools)**  
 High-level tools designed for external MCP clients — Claude Code, Cursor, scripts, CI agents — to orchestrate the workspace without knowing its internals. These tools cover the full human-in-the-loop lifecycle: register a repo, start a goal, respond to clarifications, inspect results, apply proposals.
 
 | Namespace | Tools |
 |---|---|
-| `nms_v1_goal_*` | `goal_run`, `goal_list`, `goal_status`, `goal_cancel`, `goal_pause`, `goal_resume`, `goal_recover` |
+| `nms_v1_goal_*` | `goal_run`, `goal_list`, `goal_status`, `goal_cancel`, `goal_requeue`, `goal_pause`, `goal_resume`, `goal_recover` |
 | `nms_v1_clarification_*` | `clarification_respond` |
 | `nms_v1_results_*` | `results_get`, `results_apply` |
 | `nms_v1_repo_*` | `repo_register`, `repo_list` |
