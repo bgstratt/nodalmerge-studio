@@ -3,7 +3,7 @@
   "displayName": "NodalMerge Studio",
   "description": "Agent-native collaborative workspace — branch visualization, merge review, and agent orchestration for NodalMerge.",
   "publisher": "nodalmerge-studio",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "license": "MIT",
   "icon": "media/icon.png",
   "repository": {
@@ -169,13 +169,35 @@
                 "enum": [
                   "anthropic",
                   "openai",
-                  "vscode-lm"
+                  "vscode-lm",
+                  "claude-cli",
+                  "codex-cli"
                 ],
-                "description": "LLM provider. vscode-lm is only valid for inline deploymentMode."
+                "enumDescriptions": [
+                  "Anthropic HTTP API (Claude models). Requires apiKeyRef.",
+                  "OpenAI HTTP API (GPT models). Requires apiKeyRef.",
+                  "VS Code's built-in Language Model API. No API key needed. Inline deploymentMode only.",
+                  "Local Claude Code CLI harness — routes the role to ClaudeCodeExecutor, spawning the local `claude` binary. No baseUrl; apiKeyRef optional (blank = the machine's ambient CLI login).",
+                  "Local Codex CLI harness — routes the role to CodexCliExecutor, spawning the local `codex` binary. No baseUrl; apiKeyRef optional (blank = the machine's ambient CLI login)."
+                ],
+                "description": "LLM provider. anthropic/openai/vscode-lm are HTTP API paths; claude-cli/codex-cli route to a local CLI harness executor instead. vscode-lm is only valid for inline deploymentMode."
               },
               "model": {
                 "type": "string",
-                "description": "Model identifier (e.g. claude-sonnet-4-6, gpt-4o)."
+                "description": "Model identifier (e.g. claude-sonnet-4-6, gpt-4o). For claude-cli/codex-cli, blank means the CLI's own default model."
+              },
+              "toolCallParsing": {
+                "type": "string",
+                "enum": [
+                  "strict",
+                  "lenient"
+                ],
+                "default": "strict",
+                "enumDescriptions": [
+                  "Honor only the structured tool_calls field (default).",
+                  "Additionally tolerate a model that emits its tool call as message text or a ```json fence — the failure mode of small quantized local models. Only meaningful on the openai HTTP path."
+                ],
+                "description": "How strictly to parse tool calls from this profile's model."
               },
               "baseUrl": {
                 "type": "string",

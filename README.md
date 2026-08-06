@@ -2,7 +2,7 @@
 
 **Branch ideas. Review reasoning. Materialize software.**
 
-NodalMerge Studio is a persistent collaborative runtime for human and AI development work, built on [NodalMerge](https://github.com/nodalmerge/nodalmerge). It provides the execution environment, decision history, artifact lineage, and coordination layer for a shared, evolving workspace — designed so that any agent harness, tool, or human collaborator can contribute, with every contribution reviewed, promoted, and replayable.
+NodalMerge Studio is a persistent collaborative runtime for human and AI development work, built on [NodalMerge](https://github.com/bgstratt/nodalmerge). It provides the execution environment, decision history, artifact lineage, and coordination layer for a shared, evolving workspace — designed so that any agent harness, tool, or human collaborator can contribute, with every contribution reviewed, promoted, and replayable.
 
 Every step an agent takes produces a durable artifact in a DAG. Every artifact can be inspected, branched, replayed, merged, and audited. The durable graph is the product; agents are features of it. The harness is just one participant.
 
@@ -182,7 +182,7 @@ The following are explicitly deferred from v1:
 
 - [.NET SDK 10.0](https://dotnet.microsoft.com/download)
 - [Node.js 22+](https://nodejs.org/) (for VS Code extension)
-- A sibling checkout of the [`nodalmerge`](https://github.com/nodalmerge/nodalmerge) repo (for embedded host and local NuGet packages)
+- A sibling checkout of the [`nodalmerge`](https://github.com/bgstratt/nodalmerge) repo (for embedded host and local NuGet packages)
 - [VS Code 1.90+](https://code.visualstudio.com/)
 
 ---
@@ -479,8 +479,8 @@ npm run package                      # production build + .vsix
 
 ## Related Repositories
 
-- [nodalmerge](https://github.com/nodalmerge/nodalmerge) — Core engine, host runtime, DAG storage, CRDT replication
-- [nodalmerge/docs](https://github.com/nodalmerge/docs) — Platform documentation
+- [nodalmerge](https://github.com/bgstratt/nodalmerge) — Core engine, host runtime, DAG storage, CRDT replication
+- [docs](https://github.com/bgstratt/docs) — Platform documentation (docs.nodalmerge.com + nodalmerge.com)
 
 ---
 
