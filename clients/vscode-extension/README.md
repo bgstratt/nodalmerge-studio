@@ -17,7 +17,11 @@ Create and manage goals across your team of agents. Set the review policy, targe
 Live view of all running work units and agents: status, current task, file leases, and the dead-letter queue. Spawn, pause, resume, or stop agents directly from the panel. Links to live transcripts and deep-link to Decision Convergence when a proposal is waiting. File leases are scoped per goal (an unrelated goal touching the same path never blocks) and a wait-for cycle between two work units is detected and resolved automatically instead of deadlocking. Retrying, continuing, or re-planning a dead-lettered work unit can resupply credentials on the spot — useful after a Host restart clears the in-memory credential registry.
 
 ### Model & Agent Studio
-Configure named agent profiles — provider (Anthropic, OpenAI, or VS Code built-in), model, system prompt, tool allowlist, and deployment mode (inline or headless peer). Build topology templates that define orchestrator + worker compositions you can reuse across goals.
+Configure named agent profiles — provider, model, system prompt, tool allowlist, and deployment mode (inline or headless peer). Build topology templates that define orchestrator + worker compositions you can reuse across goals.
+
+Five providers, in two shapes. **HTTP API** — `anthropic`, `openai`, and `vscode-lm` (VS Code's built-in Language Model API, no API key required). **Local CLI harness** — `claude-cli` and `codex-cli` route the role to a harness executor that spawns your local `claude` / `codex` binary in the work unit's branch directory, rather than calling an API. CLI providers take no `baseUrl`, and `apiKeyRef` is optional: leave it blank to use the machine's ambient CLI login, or store a key to have it injected as `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` for headless use. A blank `model` means the CLI's own default.
+
+Every provider enters through the same review gate, which is what makes them interchangeable.
 
 ### Decision Convergence (Review)
 Human merge-review gate. Inspect a proposal's diff, artifact lineage, execution timeline, build/test evidence, and confidence score. Accept, reject, or request changes. For multi-fork experiments, compare all candidates side by side and pick a winner — the rest are auto-rejected and recorded.
@@ -70,22 +74,44 @@ Side-by-side diff of two projection snapshots — useful for auditing what an ag
 
 ## Extension Settings
 
+**Runtime & connection**
+
 | Setting | Default | Description |
 |---|---|---|
 | `nodalmerge.runtimeUri` | `""` | Base URI the extension's own locally-managed runtime binds to. Empty = `127.0.0.1:5080`. Always local — see `nodalmerge.room.hostUri` to join a shared room. |
+| `nodalmerge.hostPort` | `5080` | Port the Studio Host listens on. |
 | `nodalmerge.room.hostUri` | `""` | WebSocket URI of a room server the local runtime should connect to (e.g. `wss://team.example.com`). Empty = standalone, no room connection attempted. |
 | `nodalmerge.room.workgroup` | `""` | Names the workgroup room this workspace's repository/goal state joins. Only meaningful once `nodalmerge.room.hostUri` is set. |
+
+**Storage**
+
+| Setting | Default | Description |
+|---|---|---|
 | `nodalmerge.workspaceDataPath` | `""` | Where Studio stores branch files and the node-store database. Empty = VS Code's per-workspace extension storage (outside your repo). Set a relative path (e.g. `.nodalmerge`) to store inside the repo. |
 | `nodalmerge.repositoryPath` | `""` | Absolute path to the repository agents operate against. Empty = first folder open in the window. |
+| `nodalmerge.blobOrigin.uri` | `""` | Base URL of a blob origin server the local runtime chains in front of, e.g. `https://blobs.example.com`. Empty (default) is local-only — the runtime's blob store never reaches out to the network. |
+| `nodalmerge.blobOrigin.token` | `""` | Optional bearer token sent with every request to `nodalmerge.blobOrigin.uri`, when that server requires auth. |
+| `nodalmerge.blobOrigin.s3Direct.enabled` | `false` | Adds an s3-direct chain link (peer ↔ bucket, resolved via `nodalmerge.blobOrigin.uri`'s presign endpoints) on top of the server-relay origin. Only meaningful when `nodalmerge.blobOrigin.uri` is also set. |
+
+**Agents & topology**
+
+| Setting | Default | Description |
+|---|---|---|
 | `nodalmerge.agentProfiles` | `[]` | Named agent profiles. Each maps an agent type to a provider, model, system prompt, and tool allowlist. |
 | `nodalmerge.topologyTemplates` | `[]` | Reusable orchestrator + worker compositions. |
 | `nodalmerge.defaultTopology` | `""` | Topology template applied when spawning a new workspace. |
-| `nodalmerge.defaultReviewPolicy` | `HumanRequired` | Default review policy for new goals: `HumanRequired`, `AgentApproval`, or `Hybrid`. |
+
+**Review & gates**
+
+| Setting | Default | Description |
+|---|---|---|
+| `nodalmerge.defaultTaskReviewPolicy` | `HumanRequired` | Whether worker proposals are automatically integrated into the agent session. Seeds the Task Review setting for new goals. One of `HumanRequired`, `AgentApproval`, `Hybrid`. |
+| `nodalmerge.defaultWorkspaceReviewPolicy` | `HumanRequired` | Whether session changes are automatically applied to your workspace. Seeds the Workspace Review setting for new goals. One of `HumanRequired`, `AgentApproval`, `Hybrid`. |
 | `nodalmerge.requireBuildBeforeProposal` | `false` | Require a passing build before a proposal can be submitted. |
 | `nodalmerge.requireTestBeforeProposal` | `false` | Require passing tests before a proposal can be submitted. |
 | `nodalmerge.buildCommand` | `""` | Global build command. Empty = auto-detect per branch. |
 | `nodalmerge.testCommand` | `""` | Global test command. Empty = auto-detect per branch. |
-| `nodalmerge.postMergeExecutionMode` | `Disabled` | Post-merge execution: `Disabled`, `Async` (background), or `Blocking` (synchronous with rollback on failure). |
+| `nodalmerge.postMergeExecutionMode` | `Disabled` | Post-merge execution: `Disabled`, `Async` (background fire-and-forget), or `Blocking` (synchronous with rollback on failure). |
 
 ### Agent Profile example
 
@@ -115,10 +141,26 @@ Side-by-side diff of two projection snapshots — useful for auditing what an ag
       "domain": "code",
       "provider": "vscode-lm",
       "deploymentMode": "inline"
+    },
+    {
+      "id": "claude-code-worker",
+      "label": "Worker (local Claude Code CLI)",
+      "domain": "code",
+      "provider": "claude-cli"
+    },
+    {
+      "id": "codex-worker",
+      "label": "Worker (local Codex CLI)",
+      "domain": "code",
+      "provider": "codex-cli"
     }
   ]
 }
 ```
+
+The last two profiles have no `model`, `baseUrl`, or `apiKeyRef`. That's deliberate: they spawn the
+`claude` / `codex` binary already installed and logged in on this machine, using the CLI's own
+default model. If `claude` works in your terminal, that profile works.
 
 ---
 
