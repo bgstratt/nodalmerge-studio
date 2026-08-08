@@ -194,14 +194,23 @@ export class ModelAgentStudioPanel {
       case 'setApiKey': {
         const profileId = msg.profileId as string;
         const key       = msg.key as string;
-        const profiles  = this.configService.getProfiles();
-        const profile   = profiles.find(p => p.id === profileId);
-        if (profile && key) {
+        if (!profileId || !key) { break; }
+        const profile = this.configService.getProfiles().find(p => p.id === profileId);
+        let apiKeyRef: string;
+        if (profile) {
           await this.configService.storeApiKey(profile, key, this.secrets);
-          const apiKeyRef = profile.apiKeyRef ?? `nodalmerge.apikey.${profileId}`;
-          void vscode.window.showInformationMessage(`NodalMerge: API key stored for profile "${profileId}".`);
-          void this.panel.webview.postMessage({ type: 'apiKeySaved', profileId, apiKeyRef });
+          apiKeyRef = profile.apiKeyRef ?? `nodalmerge.apikey.${profileId}`;
+        } else {
+          // The profile hasn't been saved yet — Store Key is reachable from the Add Profile form,
+          // and previously fell through this branch silently, so the key only stuck if you saved
+          // first and re-opened the row. Store under the same deterministic ref storeApiKey would
+          // have chosen; the webview holds onto it so the form's Save writes the matching
+          // apiKeyRef (there is no profile record to write it to yet).
+          apiKeyRef = `nodalmerge.apikey.${profileId}`;
+          await this.secrets.store(apiKeyRef, key);
         }
+        void vscode.window.showInformationMessage(`NodalMerge: API key stored for profile "${profileId}".`);
+        void this.panel.webview.postMessage({ type: 'apiKeySaved', profileId, apiKeyRef });
         break;
       }
 
@@ -222,6 +231,11 @@ export class ModelAgentStudioPanel {
             void vscode.window.showInformationMessage(`NodalMerge: API key removed for profile "${profileId}".`);
             this.onConfigChanged?.();
           }
+          void this.panel.webview.postMessage({ type: 'apiKeyRemoved', profileId });
+        } else if (profileId) {
+          // Unsaved profile — drop anything Store Key wrote before the profile was persisted, so
+          // "store then change my mind then cancel" can't leave an orphaned secret behind.
+          await this.secrets.delete(`nodalmerge.apikey.${profileId}`);
           void this.panel.webview.postMessage({ type: 'apiKeyRemoved', profileId });
         }
         break;
@@ -248,7 +262,7 @@ export class ModelAgentStudioPanel {
         const models = await this.fetchModels(
           msg.provider as string,
           msg.baseUrl as string | undefined,
-          msg.apiKey as string | undefined,
+          await this.resolveKeyForLookup(msg.apiKey as string | undefined, msg.profileId as string | undefined),
         );
         void this.panel.webview.postMessage({ type: 'models', models });
         break;
@@ -295,6 +309,28 @@ export class ModelAgentStudioPanel {
     }
   }
 
+  /**
+   * The key to authenticate a model-listing call with. Prefers whatever is currently typed in the
+   * API Key field (so a user can list models for a key before saving the profile) and otherwise
+   * falls back to the profile's stored secret — SecretStorage never round-trips to the webview, so
+   * for a saved profile the message carries no key at all.
+   */
+  private async resolveKeyForLookup(typedKey?: string, profileId?: string): Promise<string | undefined> {
+    if (typedKey) { return typedKey; }
+    if (!profileId) { return undefined; }
+    const profile = this.configService.getProfiles().find(p => p.id === profileId);
+    try {
+      if (profile) {
+        const stored = await this.configService.resolveApiKey(profile, this.secrets);
+        if (stored) { return stored; }
+      }
+      // No profile record yet (Store Key on the Add Profile form), or one whose apiKeyRef hasn't
+      // been written to settings yet — either way the secret is already at the deterministic ref,
+      // so read it directly rather than reporting "no key" until the profile round-trips.
+      return await this.secrets.get(`nodalmerge.apikey.${profileId}`);
+    } catch { return undefined; }
+  }
+
   private async fetchModels(provider: string, baseUrl?: string, apiKey?: string): Promise<string[]> {
     if (provider === 'vscode-lm') {
       try {
@@ -303,26 +339,32 @@ export class ModelAgentStudioPanel {
       } catch { return []; }
     }
     if (provider === 'anthropic') {
+      const live = apiKey ? await this.fetchAnthropicModels(baseUrl, apiKey) : [];
+      if (live.length) { return live; }
+      // No key available (new profile, or the stored secret is gone) or the endpoint failed —
+      // fall back to suggestions so the dropdown is never empty.
       return [
+        'claude-opus-5',
+        'claude-sonnet-5',
         'claude-fable-5',
         'claude-opus-4-8',
         'claude-sonnet-4-6',
-        'claude-haiku-4-5-20251001',
-        'claude-3-5-sonnet-20241022',
-        'claude-3-5-haiku-20241022',
+        'claude-haiku-4-5',
       ];
     }
     if (provider === 'claude-cli') {
       // The CLI accepts aliases as well as full model ids; blank (manual entry left empty)
-      // means "use the CLI's own configured default", so this list is suggestions only.
+      // means "use the CLI's own configured default", so this list is suggestions only. There is
+      // no model-listing subcommand to shell out to — model selection inside the CLI is the
+      // interactive /model command.
       return [
         'sonnet',
         'opus',
         'haiku',
+        'claude-opus-5',
+        'claude-sonnet-5',
         'claude-fable-5',
-        'claude-opus-4-8',
-        'claude-sonnet-4-6',
-        'claude-haiku-4-5-20251001',
+        'claude-haiku-4-5',
       ];
     }
     if (provider === 'codex-cli') {
@@ -331,22 +373,56 @@ export class ModelAgentStudioPanel {
       // from a live endpoint (codex has no local model-listing API this extension calls today).
       return ['gpt-5-codex', 'o4-mini', '(blank = CLI default)'];
     }
-    if (provider === 'openai' && baseUrl) {
+    if (provider === 'openai') {
+      // A blank Base URL means "the OpenAI default" everywhere else in this panel, so resolve it
+      // the same way here rather than returning an empty dropdown.
+      const host = baseUrl?.trim() || 'https://api.openai.com';
       try {
-        const url = `${baseUrl.replace(/\/+$/, '')}/v1/models`;
+        const url = `${host.replace(/\/+$/, '')}/v1/models`;
         const headers: Record<string, string> = {};
         if (apiKey) { headers['Authorization'] = `Bearer ${apiKey}`; }
         const res  = await fetch(url, { headers });
         if (!res.ok) { return []; }
         const data = await res.json() as { data?: Array<{ id: string }> };
         const ids  = (data.data ?? []).map((m: { id: string }) => m.id).sort();
-        if (baseUrl.includes('openai.com')) {
+        if (host.includes('openai.com')) {
           return ids.filter((id: string) => /^(gpt-|o\d)/.test(id));
         }
         return ids;
       } catch { return []; }
     }
     return [];
+  }
+
+  /**
+   * Live model list from Anthropic's Models API. Paginates on after_id/has_more (this endpoint
+   * uses the id-cursor scheme, not the page-cursor one) and returns [] on any failure so the
+   * caller can fall back to its suggestion list.
+   */
+  private async fetchAnthropicModels(baseUrl: string | undefined, apiKey: string): Promise<string[]> {
+    const host = baseUrl?.trim() || 'https://api.anthropic.com';
+    const headers = { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' };
+    const ids: string[] = [];
+    let after: string | undefined;
+    try {
+      // Bounded rather than while(has_more): a malformed cursor that never advances would
+      // otherwise spin here. Well past the real model count.
+      for (let page = 0; page < 10; page++) {
+        const url = `${host.replace(/\/+$/, '')}/v1/models?limit=100`
+          + (after ? `&after_id=${encodeURIComponent(after)}` : '');
+        const res = await fetch(url, { headers });
+        if (!res.ok) { return []; }
+        const body = await res.json() as {
+          data?: Array<{ id: string }>;
+          has_more?: boolean;
+          last_id?: string | null;
+        };
+        ids.push(...(body.data ?? []).map(m => m.id));
+        if (!body.has_more || !body.last_id) { break; }
+        after = body.last_id;
+      }
+    } catch { return []; }
+    return ids;
   }
 
   private async get<T>(path: string): Promise<T> {
