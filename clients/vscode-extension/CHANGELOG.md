@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.18 — 2026-08-08
+
+Extension-only release — the bundled NodalMerge runtime is unchanged from 0.1.16.
+This entry supersedes the 0.1.17 build, which was documentation-only and shipped without
+its own changelog. Everything here is in Model & Agent Studio → Model Profiles.
+
+- **The Model dropdown is fetched from the provider now, not hardcoded.** Picking
+  **Anthropic API** lists the models your key can actually reach (via the Models API), so
+  newly released models show up without waiting for an extension update and retired ones stop
+  being offered. It uses the key you've typed *or* the one already stored for the profile, and
+  falls back to a suggestion list when no key is available yet. **OpenAI compatible** already
+  listed live models but only when you'd filled in a Base URL — leaving it blank (meaning
+  "the OpenAI default") produced an empty dropdown; it now resolves the default and lists
+  normally. CLI providers (**Claude Code**, **Codex**) remain curated suggestions: those
+  binaries expose no model-listing command, and blank still means "use the CLI's own default".
+- **VS Code LM profiles now use the model you picked.** The dropdown lists model *ids*, but
+  the proxy resolved them against the model *family* — a different field — so a specific pick
+  usually matched nothing and quietly fell through to whichever model happened to be first in
+  VS Code's list. That fallback was easy to miss because it only surfaced in the "NodalMerge LM
+  Proxy" output channel. Selection now matches on id, falling back to family for a hand-typed
+  family name, and only then to any-available.
+- **Store Key works while creating a profile.** On the Add Profile form the button did nothing
+  at all — no key stored, no error — because the profile didn't exist in settings yet; the key
+  only stuck if you saved, reopened the row, and stored it there. It now stores immediately and
+  the profile keeps the key when you save. Remove Key cleans up correctly in that same
+  pre-save window, and storing a key re-lists the models right away instead of leaving the
+  dropdown on the no-key fallback until a save-and-reopen.
+- Model suggestions refreshed to current ids (`claude-opus-5`, `claude-sonnet-5`), replacing
+  the retired `claude-3-5-*` entries.
+
 ## 0.1.16 — 2026-07-22
 
 Ships an updated NodalMerge runtime — the features below are runtime behavior the
