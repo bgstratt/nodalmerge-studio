@@ -75,9 +75,24 @@ export class LmApiProxy implements vscode.Disposable {
   private async dispatch(req: OaiRequest): Promise<unknown> {
     const modelHint = req.model ?? '';
     this.output.appendLine(`[LmApiProxy] dispatch: modelHint="${modelHint}" messages=${(req.messages??[]).length} tools=${(req.tools??[]).length}`);
-    let models = await vscode.lm.selectChatModels(modelHint ? { family: modelHint } : undefined);
+    // The model picker in Agent Config lists LanguageModelChat.id values, so match on id
+    // first. `family` is the coarser grouping (several ids can share one family) and is kept
+    // as a fallback for profiles whose Model field was typed by hand — a family name there is
+    // a legitimate "any model of this kind" request.
+    let models: readonly vscode.LanguageModelChat[] = [];
+    if (modelHint) {
+      models = await vscode.lm.selectChatModels({ id: modelHint });
+      if (!models.length) {
+        models = await vscode.lm.selectChatModels({ family: modelHint });
+        if (models.length) {
+          this.output.appendLine(`[LmApiProxy] "${modelHint}" matched no model id; using family match.`);
+        }
+      }
+    } else {
+      models = await vscode.lm.selectChatModels(undefined);
+    }
     if (!models.length && modelHint) {
-      this.output.appendLine(`[LmApiProxy] WARN: No models match family="${modelHint}" — falling back to any available model.`);
+      this.output.appendLine(`[LmApiProxy] WARN: No model matches id or family "${modelHint}" — falling back to any available model.`);
       models = await vscode.lm.selectChatModels(undefined);
     }
     if (!models.length) {

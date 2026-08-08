@@ -20,6 +20,11 @@ export function init(ctx) {
   let templates = [];
   let defaultTopology = '';
   var onModelsLoaded = null;
+  // Set while a profile form is open, so the apiKeySaved/apiKeyRemoved messages can hand the ref
+  // back to that form. Needed for a new profile: Store Key persists the secret before the profile
+  // record exists, so there is no profiles[] entry to stamp the ref onto — the form has to carry
+  // it to Save itself, or the save writes no apiKeyRef and orphans the secret.
+  var onApiKeyRefChanged = null;
   // plans/harness-hosting-architecture.md Phase C.3 (phase-c-implementation.md C2) — CLI provider
   // options for the Model Profile dropdown, sent by AgentConfigPanel.sendConfig() from
   // GET /studio/executors (data-driven, falls back to a static claude-cli/codex-cli list
@@ -101,6 +106,16 @@ export function init(ctx) {
     const p = isNew
       ? { id: '', label: '', domain: '', deploymentMode: 'inline', provider: 'vscode-lm', model: '', baseUrl: '', systemPrompt: '', apiKeyRef: '' }
       : profiles[idx];
+    // Tracks the ref of a key stored via the Store Key button during this editing session, so Save
+    // can persist it even though the input is cleared after storing (and, for a new profile, no
+    // profiles[] entry existed to receive it).
+    var storedKeyRef = p.apiKeyRef || undefined;
+    onApiKeyRefChanged = function(ref) {
+      storedKeyRef = ref || undefined;
+      // Which key the model lookup can use just changed, so re-list. Without this, storing a key
+      // leaves the dropdown on the no-key fallback until you save, reopen, and hit Refresh.
+      requestModels();
+    };
     const curProvider = p.provider || 'anthropic';
     const isVsLm = curProvider === 'vscode-lm';
     const isCli = isCliProviderKey(curProvider);
@@ -145,7 +160,7 @@ export function init(ctx) {
         '<select id="pf-model-select"><option value="__custom__">— enter manually —</option>' +
           (p.model ? '<option value="' + esc(p.model) + '" selected>' + esc(p.model) + '</option>' : '') +
         '</select>' +
-        '<input type="text" id="pf-model-custom" style="margin-top:4px;' + (p.model ? 'display:none;' : '') + '" value="' + esc(p.model || '') + '" placeholder="' + (isVsLm ? 'blank = active VS Code model' : isCli ? 'blank = CLI default (or a CLI-specific alias/model id)' : 'e.g. claude-sonnet-4-6') + '">' +
+        '<input type="text" id="pf-model-custom" style="margin-top:4px;' + (p.model ? 'display:none;' : '') + '" value="' + esc(p.model || '') + '" placeholder="' + (isVsLm ? 'blank = active VS Code model' : isCli ? 'blank = CLI default (or a CLI-specific alias/model id)' : 'e.g. claude-opus-5') + '">' +
         '<div id="pf-model-loading" class="muted hidden" style="font-size:0.8em;padding:2px 0">Fetching models…</div>' +
       '</div>' +
       '<div id="pf-baseurl-row" class="' + baseUrlRowClass + '">' +
@@ -205,7 +220,7 @@ export function init(ctx) {
       if (m) {
         m.setAttribute('placeholder', isVs ? 'blank = active VS Code model'
           : cli ? 'blank = CLI default (or a CLI-specific alias/model id)'
-          : 'e.g. claude-sonnet-4-6 or gpt-4o');
+          : 'e.g. claude-opus-5 or gpt-4o');
       }
       requestModels();
     });
@@ -214,6 +229,7 @@ export function init(ctx) {
       var providerEl = $('pf-provider');
       var baseUrlEl  = $('pf-baseurl');
       var apiKeyEl   = $('pf-apikey');
+      var idEl       = $('pf-id');
       if (!providerEl) { return; }
       var loading = $('pf-model-loading');
       if (loading) { loading.classList.remove('hidden'); }
@@ -221,7 +237,10 @@ export function init(ctx) {
         type:     'getModels',
         provider: providerEl.value,
         baseUrl:  baseUrlEl ? baseUrlEl.value.trim() : undefined,
+        // Only ever the typed-but-unsaved key; a saved profile's key lives in SecretStorage and
+        // is resolved host-side from profileId (secrets never round-trip through the webview).
         apiKey:   apiKeyEl  ? apiKeyEl.value.trim()  : undefined,
+        profileId: idEl ? idEl.value.trim() : undefined,
       });
     }
     function getModelValue() {
@@ -297,7 +316,9 @@ export function init(ctx) {
       const keyEl     = $('pf-apikey');
       const pendingKey = (keyEl && provider !== 'vscode-lm') ? keyEl.value.trim() : '';
       const liveProfile = isNew ? null : profiles.find(function(pr) { return pr.id === p.id; });
-      const existingRef = liveProfile ? liveProfile.apiKeyRef : (isNew ? undefined : p.apiKeyRef);
+      // storedKeyRef covers the Store-Key-then-Save path, where the input has been cleared and (for
+      // a new profile) no profiles[] entry carries the ref yet.
+      const existingRef = (liveProfile ? liveProfile.apiKeyRef : (isNew ? undefined : p.apiKeyRef)) || storedKeyRef;
       const apiKeyRef   = provider === 'vscode-lm' ? undefined
         : (pendingKey ? ('nodalmerge.apikey.' + id) : existingRef);
       const profile = {
@@ -312,6 +333,7 @@ export function init(ctx) {
       if (isNew) { profiles.push(profile); }
       else       { profiles[idx] = profile; }
       onModelsLoaded = null;
+      onApiKeyRefChanged = null;
       $('profile-form-area').innerHTML = '';
       renderProfiles();
       vscode.postMessage({ type: 'saveProfiles', profiles: profiles });
@@ -321,6 +343,7 @@ export function init(ctx) {
     });
     $('pf-cancel').addEventListener('click', function() {
       onModelsLoaded = null;
+      onApiKeyRefChanged = null;
       $('profile-form-area').innerHTML = '';
     });
     setTimeout(function() { requestModels(); }, 0);
@@ -678,6 +701,8 @@ export function init(ctx) {
       if (msg.apiKeyRef) {
         const pi = profiles.findIndex(function(pr) { return pr.id === msg.profileId; });
         if (pi >= 0) { profiles[pi] = Object.assign({}, profiles[pi], { apiKeyRef: msg.apiKeyRef }); }
+        // pi < 0 for a not-yet-saved profile — the open form carries the ref to its Save instead.
+        if (onApiKeyRefChanged) { onApiKeyRefChanged(msg.apiKeyRef); }
       }
       credentialStatus[msg.profileId] = 'ok';
       renderProfiles();
@@ -696,6 +721,8 @@ export function init(ctx) {
         delete np.apiKeyRef;
         profiles[pi] = np;
       }
+      // Drop the ref the open form was holding, so a later Save doesn't re-point at a deleted secret.
+      if (onApiKeyRefChanged) { onApiKeyRefChanged(undefined); }
       delete credentialStatus[msg.profileId];
       renderProfiles();
       return;
